@@ -54,8 +54,8 @@ pub fn isPoolAllocator(t: []const u8) bool {
 /// Check if name is a known allocator name
 fn isKnownAllocatorName(name: []const u8) bool {
     const known = [_][]const u8{
-        "allocator", "alloc", "gpa", "arena",
-        "fba", "page_allocator", "testing_allocator", "self",
+        "allocator", "alloc",          "gpa",               "arena",
+        "fba",       "page_allocator", "testing_allocator", "self",
     };
     for (known) |n| {
         if (mem.eql(u8, name, n)) return true;

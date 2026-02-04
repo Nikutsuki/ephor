@@ -488,9 +488,9 @@ fn buildCFG(
                         break;
                     }
                 }
-                if (switch_idx) |_| {
+                if (switch_idx) |si| {
                     // Get the switch entry (don't pop, just peek)
-                    const switch_entry = block_stack.items[switch_idx.?];
+                    const switch_entry = block_stack.items[si];
                     const switch_header = switch_entry.catch_origin_block;
 
                     // If we're in an arm block (not the first arm), connect to merge
@@ -1113,7 +1113,8 @@ fn analyzeCFGMemorySafety(
                     if (c == '{') braces += 1;
                     if (c == '}') braces -= 1;
                 }
-                if (braces == 0) errdefer_depth -= 1; // Single line errdefer
+                // Single line errdefer - safe to decrement since we just incremented above
+                if (braces == 0 and errdefer_depth > 0) errdefer_depth -= 1;
                 continue;
             }
             if (errdefer_depth > 0) {
@@ -3188,6 +3189,10 @@ fn checkUndefinedUsage(
     }
     const col = mem.indexOf(u8, t, "= undefined") orelse return null;
     if (isInsideString(t, col)) return null;
+    // Skip if match is inside a trailing comment (but not if // is in a string)
+    if (mem.indexOf(u8, t, "//")) |comment_start| {
+        if (col > comment_start and !isInsideString(t, comment_start)) return null;
+    }
     if (isStructFieldPattern(t, col)) return null;
     if (extractVarDeclName(t)) |name| {
         pending.* = .{ .name = name, .line = line, .col = col + 1 };
@@ -3387,6 +3392,7 @@ fn checkPendingFields(
 
 /// Remove pending field at index
 fn removePendingField(state: *ErrorAnalysisState, i: usize) void {
+    if (state.pending_field_count == 0) return;
     state.pending_field_count -= 1;
     if (i < state.pending_field_count) {
         state.pending_struct_fields[i] =
@@ -4773,14 +4779,6 @@ fn trackDeferFrees(
     }
 }
 
-/// State for tracking catch/if blocks with early return
-const EarlyReturnState = struct {
-    in_catch: bool = false,
-    in_if: bool = false,
-    catch_has_return: bool = false,
-    brace_depth: usize = 0,
-};
-
 fn trackExplicitFrees(
     t: []const u8,
     actual_line: usize,
@@ -5345,6 +5343,12 @@ fn checkDecrementWithoutGuard(
             }
 
             if (!has_guard) {
+                // Skip if variable is declared as a signed type (can't overflow)
+                const check_start = if (current_idx > 10) current_idx - 10 else 0;
+                if (isSignedTypeDecl(context_lines[check_start .. current_idx + 1], var_name)) {
+                    continue;
+                }
+
                 try issues.append(allocator, .{
                     .file = path,
                     .line = line_num,
@@ -5360,14 +5364,31 @@ fn checkDecrementWithoutGuard(
     }
 }
 
+/// Check if variable is declared as a signed integer type in context
+fn isSignedTypeDecl(context_lines: []const []const u8, var_name: []const u8) bool {
+    const signed_types = [_][]const u8{ ": i8", ": i16", ": i32", ": i64", ": i128", ": isize" };
+    for (context_lines) |ctx_line| {
+        const ctx = mem.trim(u8, ctx_line, " \t\r");
+        // Look for "var varname: iXX" or "const varname: iXX"
+        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
+            const after_var = ctx[var_pos + var_name.len ..];
+            for (signed_types) |stype| {
+                if (mem.startsWith(u8, after_var, stype)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 /// Check if a line contains a guard for a variable
 fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
     // Must contain the variable name
     if (mem.indexOf(u8, line, var_name) == null) return false;
 
     // Check for common guard patterns:
-    // 1. x > 0, x >= 1 (simple guards)
+    // 1. x > 0, x > 1, x >= 1 (simple guards)
     if (mem.indexOf(u8, line, "> 0") != null) return true;
+    if (mem.indexOf(u8, line, "> 1") != null) return true;
     if (mem.indexOf(u8, line, ">= 1") != null) return true;
 
     // 2. while (x > ...) : (x -= 1) - guard in while condition
@@ -5377,8 +5398,8 @@ fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
     // 3. if (x == 0) break/return/continue - guard before decrement
     if (mem.indexOf(u8, line, "== 0") != null and
         (mem.indexOf(u8, line, "break") != null or
-        mem.indexOf(u8, line, "return") != null or
-        mem.indexOf(u8, line, "continue") != null))
+            mem.indexOf(u8, line, "return") != null or
+            mem.indexOf(u8, line, "continue") != null))
     {
         return true;
     }
@@ -5423,11 +5444,11 @@ fn checkSubtractionOverflow(
         while (j < t.len) : (j += 1) {
             if (t[j] == '[') depth += 1;
             if (t[j] == ']') {
-                depth -= 1;
-                if (depth == 0) {
+                if (depth == 1) {
                     bracket_end = j;
                     break;
                 }
+                if (depth > 1) depth -= 1;
             }
         }
         if (bracket_end) |end| {
@@ -5441,18 +5462,35 @@ fn checkSubtractionOverflow(
                 // Skip if it's using saturating subtraction -|
                 if (mem.indexOf(u8, inside, "-|") != null) continue;
 
-                // Check for guard in context
-                const check_start = if (current_idx > 5) current_idx - 5 else 0;
+                // Check for guard on current line first
                 var has_guard = false;
-                for (context_lines[check_start..current_idx]) |ctx_line| {
-                    const ctx = mem.trim(u8, ctx_line, " \t\r");
-                    // Look for bounds checking patterns
-                    if (mem.indexOf(u8, ctx, ">=") != null or
-                        mem.indexOf(u8, ctx, "> ") != null or
-                        mem.indexOf(u8, ctx, ".len") != null)
-                    {
-                        has_guard = true;
-                        break;
+                // Pattern: while (x > 0 and expr[x - 1])
+                if (mem.indexOf(u8, t, "while") != null and
+                    mem.indexOf(u8, t, "> 0") != null)
+                {
+                    has_guard = true;
+                }
+                // Pattern: (i == 0 or t[i - 1]) - short-circuit guards access
+                if (mem.indexOf(u8, t, "== 0 or") != null) {
+                    has_guard = true;
+                }
+
+                // Check for guard in context (previous lines)
+                if (!has_guard) {
+                    const check_start = if (current_idx > 5) current_idx - 5 else 0;
+                    for (context_lines[check_start..current_idx]) |ctx_line| {
+                        const ctx = mem.trim(u8, ctx_line, " \t\r");
+                        // Look for bounds checking patterns
+                        if (mem.indexOf(u8, ctx, ">=") != null or
+                            mem.indexOf(u8, ctx, "> ") != null or
+                            mem.indexOf(u8, ctx, ".len") != null or
+                            // endsWith/startsWith guarantee minimum length
+                            mem.indexOf(u8, ctx, "endsWith") != null or
+                            mem.indexOf(u8, ctx, "startsWith") != null)
+                        {
+                            has_guard = true;
+                            break;
+                        }
                     }
                 }
 
@@ -5483,11 +5521,20 @@ fn checkSubtractionOverflow(
             if (mem.indexOf(u8, before_sub, ")") != null) return;
 
             // Check for guard
-            const check_start = if (current_idx > 3) current_idx - 3 else 0;
+            const check_start = if (current_idx > 5) current_idx - 5 else 0;
             var has_guard = false;
             for (context_lines[check_start..current_idx]) |ctx_line| {
                 const ctx = mem.trim(u8, ctx_line, " \t\r");
-                if (mem.indexOf(u8, ctx, ">=") != null or mem.indexOf(u8, ctx, "> 0") != null) {
+                // Common guard patterns
+                if (mem.indexOf(u8, ctx, ">=") != null or
+                    mem.indexOf(u8, ctx, "> 0") != null or
+                    // Pattern: if (x == 0) return - early return guards later access
+                    (mem.indexOf(u8, ctx, "== 0") != null and
+                        mem.indexOf(u8, ctx, "return") != null) or
+                    // Pattern: endsWith/startsWith - guarantees minimum length
+                    mem.indexOf(u8, ctx, "endsWith") != null or
+                    mem.indexOf(u8, ctx, "startsWith") != null)
+                {
                     has_guard = true;
                     break;
                 }
@@ -5709,7 +5756,6 @@ fn parseGPADiagnostics(
                 .help = "accessing memory after it was freed",
             });
         }
-
     }
 }
 
@@ -6488,7 +6534,7 @@ fn parseArgs(allocator: Allocator) !Config {
 
 fn printHelp() void {
     const help =
-        \\Ephor v0.7.0 - The overseer of your Zig code
+        \\Ephor v0.7.1 - The overseer of your Zig code
         \\
         \\Static + Dynamic analysis for Zig (complements zig fmt/build/test)
         \\
@@ -6864,7 +6910,7 @@ pub fn main() !void {
 
     switch (cfg.command) {
         .help => printHelp(),
-        .version => std.debug.print("Ephor v0.7.0 - The overseer of your Zig code\n", .{}),
+        .version => std.debug.print("Ephor v0.7.1 - The overseer of your Zig code\n", .{}),
         .init => writeDefaultConfig() catch |err| {
             std.debug.print("error: failed to create config: {}\n", .{err});
             std.process.exit(1);

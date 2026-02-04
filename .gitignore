@@ -1,0 +1,26 @@
+# Zig
+zig-out/
+.zig-cache/
+zig-cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+
+# Ephor config (project-specific, not tracked)
+ephor.json
+*.swp
+*~
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib

@@ -101,6 +101,7 @@ pub const ImportInfo = struct {
     name: []const u8,
     line: usize,
     col: usize,
+    is_pub: bool = false, // True for `pub const X = @import()` re-exports
 };
 
 pub const Issue = struct {

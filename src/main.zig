@@ -1437,6 +1437,19 @@ fn analyzeCFGDeferCoverage(
     var allocs = std.ArrayListUnmanaged(CFGAlloc){};
     defer allocs.deinit(allocator);
 
+    // Check if function has arena parameter (first few lines)
+    var has_arena_param = false;
+    for (lines[0..@min(5, lines.len)]) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.indexOf(u8, t, "arena:") != null or
+            mem.indexOf(u8, t, "arena :") != null)
+        {
+            has_arena_param = true;
+            break;
+        }
+    }
+    if (has_arena_param) return issues; // Arena-based functions don't need local defer
+
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
@@ -1447,7 +1460,7 @@ fn analyzeCFGDeferCoverage(
         if (!has_alloc) continue;
         if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
 
-        // Skip arena allocators
+        // Skip arena allocators (by name in line)
         if (mem.indexOf(u8, t, "arena") != null) continue;
 
         const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
@@ -1996,6 +2009,9 @@ const ImportGraph = struct {
                 !mem.eql(u8, content[i .. i + 6], "const ");
             if (not_const) continue;
 
+            // Check if this is "pub const" (preceded by "pub ")
+            const is_pub = i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub ");
+
             const name_start = i + 6;
             const var_name = extractVarName(content, name_start) orelse {
                 continue;
@@ -2016,6 +2032,7 @@ const ImportGraph = struct {
                 .name = try self.allocator.dupe(u8, var_name),
                 .line = line_num,
                 .col = col,
+                .is_pub = is_pub,
             });
         }
     }
@@ -2350,6 +2367,12 @@ fn detectsArenaAllocator(t: []const u8) bool {
     };
     for (patterns) |p| {
         if (mem.indexOf(u8, t, p) != null) return true;
+    }
+    // Check for function parameter named "arena" (common pattern)
+    // Pattern: fn foo(arena: std.mem.Allocator) or fn foo(arena: Allocator)
+    if (mem.indexOf(u8, t, "fn ") != null) {
+        if (mem.indexOf(u8, t, "arena:") != null) return true;
+        if (mem.indexOf(u8, t, "arena :") != null) return true;
     }
     return false;
 }
@@ -3598,6 +3621,8 @@ fn checkUnusedImport(
     imp: ImportInfo,
 ) !void {
     if (imp.name.len > 0 and imp.name[0] == '_') return;
+    // Skip public re-exports - they're intentional library API
+    if (imp.is_pub) return;
     if (countIdentOccurrences(content, imp.name) > 1) return;
     const msg = try std.fmt.allocPrint(
         allocator,
@@ -3627,6 +3652,8 @@ fn checkUnusedDecl(
 ) !void {
     if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) return;
     if (mem.indexOf(u8, t, "@import(") != null) return;
+    // Skip @This() pattern - common idiom for self-referential types
+    if (mem.indexOf(u8, t, "@This()") != null) return;
     const is_const = mem.startsWith(u8, t, "const ");
     const is_var = mem.startsWith(u8, t, "var ");
     if (!is_const and !is_var) return;
@@ -3659,6 +3686,18 @@ fn analyzeUnused(
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const a = entry.value_ptr.*;
+        // Skip auto-generated C import files (many false positives)
+        if (mem.endsWith(u8, a.path, "cimport.zig")) continue;
+        if (mem.indexOf(u8, a.path, "/deps/") != null and
+            mem.endsWith(u8, a.path, ".zig"))
+        {
+            // Check for C translation markers
+            if (mem.indexOf(u8, a.content, "__builtin_") != null or
+                mem.indexOf(u8, a.content, "enum_unnamed_") != null)
+            {
+                continue;
+            }
+        }
         for (a.imports.items) |imp| {
             try checkUnusedImport(allocator, &issues, a.path, a.content, imp);
         }
@@ -5386,14 +5425,16 @@ fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
     if (mem.indexOf(u8, line, var_name) == null) return false;
 
     // Check for common guard patterns:
-    // 1. x > 0, x > 1, x >= 1 (simple guards)
+    // 1. x > 0, x > 1, x >= 1 (simple guards, with or without spaces)
     if (mem.indexOf(u8, line, "> 0") != null) return true;
+    if (mem.indexOf(u8, line, ">0") != null) return true;
     if (mem.indexOf(u8, line, "> 1") != null) return true;
+    if (mem.indexOf(u8, line, ">1") != null) return true;
     if (mem.indexOf(u8, line, ">= 1") != null) return true;
+    if (mem.indexOf(u8, line, ">=1") != null) return true;
 
     // 2. while (x > ...) : (x -= 1) - guard in while condition
     if (mem.indexOf(u8, line, "while") != null and mem.indexOf(u8, line, ">") != null) return true;
-    if (mem.indexOf(u8, line, "while") != null and mem.indexOf(u8, line, ">=") != null) return true;
 
     // 3. if (x == 0) break/return/continue - guard before decrement
     if (mem.indexOf(u8, line, "== 0") != null and
@@ -5406,12 +5447,24 @@ fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
 
     // 4. x != 0 (inverted guard)
     if (mem.indexOf(u8, line, "!= 0") != null) return true;
+    if (mem.indexOf(u8, line, "!=0") != null) return true;
 
-    // 5. assert(x > ...) - assertion as guard
-    if (mem.indexOf(u8, line, "assert") != null and
-        (mem.indexOf(u8, line, "> ") != null or mem.indexOf(u8, line, ">") != null))
-    {
-        return true;
+    // 5. assert(x > 0) - assertion as guard (TigerBeetle pattern)
+    if (mem.indexOf(u8, line, "assert") != null) {
+        if (mem.indexOf(u8, line, "> 0") != null) return true;
+        if (mem.indexOf(u8, line, ">0") != null) return true;
+        if (mem.indexOf(u8, line, "> 1") != null) return true;
+        if (mem.indexOf(u8, line, ">1") != null) return true;
+        if (mem.indexOf(u8, line, ">= 1") != null) return true;
+        if (mem.indexOf(u8, line, ">=1") != null) return true;
+        if (mem.indexOf(u8, line, "!= 0") != null) return true;
+        if (mem.indexOf(u8, line, "!=0") != null) return true;
+    }
+
+    // 6. std.debug.assert pattern
+    if (mem.indexOf(u8, line, "debug.assert") != null) {
+        if (mem.indexOf(u8, line, ">") != null) return true;
+        if (mem.indexOf(u8, line, "!=") != null) return true;
     }
 
     return false;
@@ -6534,7 +6587,7 @@ fn parseArgs(allocator: Allocator) !Config {
 
 fn printHelp() void {
     const help =
-        \\Ephor v0.7.1 - The overseer of your Zig code
+        \\Ephor v0.7.2 - The overseer of your Zig code
         \\
         \\Static + Dynamic analysis for Zig (complements zig fmt/build/test)
         \\
@@ -6910,7 +6963,7 @@ pub fn main() !void {
 
     switch (cfg.command) {
         .help => printHelp(),
-        .version => std.debug.print("Ephor v0.7.1 - The overseer of your Zig code\n", .{}),
+        .version => std.debug.print("Ephor v0.7.2 - The overseer of your Zig code\n", .{}),
         .init => writeDefaultConfig() catch |err| {
             std.debug.print("error: failed to create config: {}\n", .{err});
             std.process.exit(1);

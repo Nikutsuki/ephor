@@ -3432,83 +3432,32 @@ fn trackTestBlock(
     return .{ .in_test = in_block, .depth = brace_depth };
 }
 
-/// Check if a silent catch is for a best-effort operation where failure is acceptable
-/// These patterns are accepted Zig community best practices
+/// Best-effort operations where silent catch {} is acceptable
+/// Categories: filesystem, cleanup, collection, writer, network
+const best_effort_ops = [_][]const u8{
+    // Filesystem - might already exist/not exist
+    "makePath(",     "makeDir(",      "deleteFile(",   "deleteDir(",
+    "deleteTree(",   "unlink(",       "remove(",       "rename(",
+    "symLink(",
+    // Cleanup - best effort during teardown
+    ".close(",       ".deinit(",      ".destroy(",     ".free(",
+    ".flush(",       ".sync(",        ".reset(",       ".clear(",
+    // Collection - partial success acceptable
+    ".append(",      ".put(",         ".appendSlice(", ".appendAssumeCapacity(",
+    ".ensureTotalCapacity(",          ".ensureUnusedCapacity(",
+    // Writer - logging/debugging can fail
+    ".print(",       ".writeAll(",    ".writeByte(",   ".write(",
+    "std.debug.print(",
+    // Network - transient failures expected
+    ".send(",        ".recv(",        ".connect(",     ".bind(",
+    ".stream.write(",
+};
+
+/// Check if a silent catch is for a best-effort operation
 fn isBestEffortOperation(t: []const u8) bool {
-    // Filesystem operations where failure is often acceptable (file/dir might exist/not exist)
-    const fs_ops = [_][]const u8{
-        "makePath(", // Directory creation - might already exist
-        "makeDir(", // Directory creation - might already exist
-        "deleteFile(", // File deletion - might already be deleted
-        "deleteDir(", // Directory deletion - might already be deleted
-        "deleteTree(", // Tree deletion - best effort cleanup
-        "unlink(", // File unlink - might already be gone
-        "remove(", // File remove - might already be gone
-        "rename(", // Rename - might fail on cross-device
-        "symLink(", // Symlink creation - might exist
-    };
-    for (fs_ops) |op| {
+    for (best_effort_ops) |op| {
         if (mem.indexOf(u8, t, op) != null) return true;
     }
-
-    // Resource cleanup operations - best effort during teardown
-    const cleanup_ops = [_][]const u8{
-        ".close(", // Resource close - best effort
-        ".deinit(", // Deinitialization - best effort
-        ".destroy(", // Destruction - best effort
-        ".free(", // Free - best effort
-        ".flush(", // Buffer flush - best effort
-        ".sync(", // Sync - best effort
-        ".reset(", // Reset - best effort
-        ".clear(", // Clear - best effort
-    };
-    for (cleanup_ops) |op| {
-        if (mem.indexOf(u8, t, op) != null) return true;
-    }
-
-    // Collection operations in loops - partial success is often acceptable
-    // These are commonly used when building results where some failures are ok
-    const collection_ops = [_][]const u8{
-        ".append(", // ArrayList append - partial collection ok
-        ".put(", // HashMap put - partial collection ok
-        ".appendSlice(", // ArrayList appendSlice - partial collection ok
-        ".appendAssumeCapacity(", // Pre-allocated append - shouldn't fail but safe
-        ".ensureTotalCapacity(", // Capacity reservation - best effort
-        ".ensureUnusedCapacity(", // Capacity reservation - best effort
-    };
-    for (collection_ops) |op| {
-        if (mem.indexOf(u8, t, op) != null) return true;
-    }
-
-    // Writer operations - often used for logging/debugging where failure is ok
-    const writer_ops = [_][]const u8{
-        ".print(", // Print to writer - logging can fail
-        ".writeAll(", // Write to writer - logging can fail
-        ".writeByte(", // Write byte - logging can fail
-        ".write(", // Generic write - logging/response can fail
-        "std.debug.print(", // Debug print - always ok to ignore
-    };
-    for (writer_ops) |op| {
-        if (mem.indexOf(u8, t, op) != null) return true;
-    }
-
-    // Network operations where transient failures are expected
-    const network_ops = [_][]const u8{
-        ".send(", // Network send - might fail transiently
-        ".recv(", // Network receive - might fail transiently
-        ".connect(", // Connection - might fail
-        ".bind(", // Bind - might fail
-        ".stream.write(", // Stream write - response sending can fail
-    };
-    for (network_ops) |op| {
-        if (mem.indexOf(u8, t, op) != null) return true;
-    }
-
-    // NOTE: We intentionally do NOT skip "_ = ... catch {}" as a blanket pattern.
-    // That's exactly the ZA201 pattern we're trying to detect!
-    // The specific operations above (fs, cleanup, collection, writer, network)
-    // are the legitimate "best effort" cases - not everything with catch {}.
-
     return false;
 }
 

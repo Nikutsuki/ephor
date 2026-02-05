@@ -6677,6 +6677,11 @@ fn analyzeCFGPanicPatterns(
                     }
                 }
 
+                // Skip if endsWith/startsWith guard on prior lines
+                // Zig semantics: mem.endsWith(s, suffix) implies s.len >= suffix.len
+                // Pattern: assert(mem.endsWith(var, "X")) then var.len - "X".len
+                if (hasEndsWithStartsWithGuard(lines, idx)) continue;
+
                 try issues.append(allocator, .{
                     .file = file_path,
                     .line = line_num,
@@ -6857,6 +6862,31 @@ fn hasShortCircuitGuardOnPriorLines(lines: []const []const u8, current_idx: usiz
 
         // Stop at function boundary
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) break;
+    }
+    return false;
+}
+
+/// Check for endsWith/startsWith guard on prior lines
+/// Zig semantics: mem.endsWith(str, suffix) implies str.len >= suffix.len
+/// Pattern: assert(mem.endsWith(var, "X")) on prior line protects var.len - "X".len
+fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) bool {
+    // Look back within the same block (up to function boundary)
+    const check_start = if (current_idx > 10) current_idx - 10 else 0;
+    for (lines[check_start..current_idx]) |line| {
+        const ctx = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        // Stop at function boundary
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+
+        // Check for endsWith or startsWith patterns in assert
+        // Pattern: assert(mem.endsWith(...)) or std.debug.assert(std.mem.endsWith(...))
+        if (mem.indexOf(u8, ctx, "endsWith(") != null or mem.indexOf(u8, ctx, "startsWith(") != null) {
+            // If there's an assert on this line, it's a guard
+            if (mem.indexOf(u8, ctx, "assert(") != null) return true;
+            if (mem.indexOf(u8, ctx, "assert (") != null) return true;
+            // Also check for conditional early returns: if (!endsWith) return;
+            if (mem.indexOf(u8, ctx, "return") != null) return true;
+        }
     }
     return false;
 }

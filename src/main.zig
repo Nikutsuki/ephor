@@ -8010,7 +8010,7 @@ const Config = struct {
     init_build: bool, // For `init --build` to also output build.zig integration
     export_path: ?[]const u8, // --export=<filepath> to save issues to file
     known_issues_path: ?[]const u8, // --known-issues=<filepath> to filter known true positives
-    known_issues: std.StringHashMapUnmanaged(void), // Loaded known issues (file:line format)
+    known_issues: std.ArrayListUnmanaged([]const u8), // Loaded known issues (file:line format)
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -8026,8 +8026,7 @@ const Config = struct {
         self.enabled_rules.deinit(allocator);
         if (self.export_path) |p| allocator.free(p);
         if (self.known_issues_path) |p| allocator.free(p);
-        var ki_iter = self.known_issues.keyIterator();
-        while (ki_iter.next()) |key| allocator.free(key.*);
+        for (self.known_issues.items) |k| allocator.free(k);
         self.known_issues.deinit(allocator);
     }
 
@@ -9255,18 +9254,26 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
         // Format: file:line or file:line:rule
         // We store just file:line for matching
         const key = try allocator.dupe(u8, trimmed);
-        try cfg.known_issues.put(allocator, key, {});
+        cfg.known_issues.append(allocator, key) catch |err| {
+            allocator.free(key);
+            return err;
+        };
     }
 }
 
-/// Check if an issue is in the known issues set
+/// Check if an issue is in the known issues list
 fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
-    if (cfg.known_issues.count() == 0) return false;
+    if (cfg.known_issues.items.len == 0) return false;
 
     // Build key in format "file:line"
     var buf: [512]u8 = undefined;
     const key = std.fmt.bufPrint(&buf, "{s}:{d}", .{ issue.file, issue.line }) catch return false;
-    return cfg.known_issues.contains(key);
+
+    // Linear search through known issues
+    for (cfg.known_issues.items) |known| {
+        if (mem.eql(u8, known, key)) return true;
+    }
+    return false;
 }
 
 /// Export issues to a file with code snippets

@@ -4065,17 +4065,15 @@ fn checkLineErrors(
     allocator: Allocator,
 ) !void {
     // Skip silent catch in defer context - catch {} is intentional for cleanup
+    // NOTE: ZA201/ZA202/ZA203 are now handled by analyzeCFGErrors with proper test context
+    // The CFG-based analysis can detect nested functions inside test blocks
     if (!in_defer) {
         if (checkSilentCatchWithContext(t, path, ln, func_name)) |i| {
             try issues.append(allocator, i);
         }
     }
-    if (checkCatchUnreachable(t, path, ln)) |i| {
-        try issues.append(allocator, i);
-    }
-    if (checkOrelseUnreachable(t, path, ln)) |i| {
-        try issues.append(allocator, i);
-    }
+    // ZA202 (catch unreachable) and ZA203 (orelse unreachable) moved to analyzeCFGErrors
+    // to support test context detection for nested anonymous callbacks
     // Skip undefined checks in test/module-level context
     if (!skip_undefined) {
         if (checkUndefinedUsage(t, path, ln, pending)) |i| {
@@ -4992,6 +4990,11 @@ const CFGState = struct {
     brace_depth: usize = 0,
     in_func: bool = false,
     fn_returns_error: bool = false,
+    // Test block context tracking
+    in_test_block: bool = false,
+    test_brace_depth: usize = 0,
+    // Whether current function started inside a test block
+    func_in_test: bool = false,
 };
 
 /// Detect function start and initialize state
@@ -5053,6 +5056,7 @@ fn processFunction(
     func_start: usize,
     func_lines_items: []const []const u8,
     fn_returns_error: bool,
+    is_in_test_context: bool,
 ) !void {
     // Run memory analysis
     var func_issues = try analyzeFunction(
@@ -5164,6 +5168,7 @@ fn processFunction(
         func_start,
         file_path,
         func_name,
+        is_in_test_context,
     );
     defer error_issues.deinit(allocator);
     try issues.appendSlice(allocator, error_issues.items);
@@ -5183,27 +5188,46 @@ fn analyzeCFGFile(
     defer func_lines.deinit(allocator);
     var prev_func_name: []const u8 = "";
     var prev_func_start: usize = 0;
+    var prev_func_in_test: bool = false;
 
     while (lines.next()) |line| {
         defer line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
         const is_comment = isCommentOrMultilineString(t);
 
+        // Track test block context (before function detection)
+        if (!is_comment) {
+            const ts = trackTestBlock(t, state.in_test_block, state.test_brace_depth);
+            state.in_test_block = ts.in_test;
+            state.test_brace_depth = ts.depth;
+        }
+
         // Detect function start (skip comments for detection)
         // Returns true if we found a nested function - process previous function first
         if (!is_comment) {
-            // Save previous state in case we need to process it
+            const was_in_func = state.in_func;
+            // Save previous function's state in case we need to process it
             prev_func_name = state.func_name;
             prev_func_start = state.func_start;
+            prev_func_in_test = state.func_in_test;
             const found_nested = detectCFGFuncStart(t, &state, line_num);
 
-            if (found_nested and func_lines.items.len > 0) {
-                // Process the previous (outer) function before starting the nested one
-                // Skip if it's too short (likely just a type-returning stub)
-                if (func_lines.items.len >= 3) {
-                    try processFunction(allocator, issues, file_path, prev_func_name, prev_func_start, func_lines.items, false);
+            // If we started a new function (nested or not), record test context
+            if (state.in_func and !was_in_func) {
+                // New top-level function started
+                state.func_in_test = state.in_test_block;
+            } else if (found_nested) {
+                // Nested function found - new function starts in current test context
+                state.func_in_test = state.in_test_block;
+
+                if (func_lines.items.len > 0) {
+                    // Process the previous (outer) function before starting the nested one
+                    // Skip if it's too short (likely just a type-returning stub)
+                    if (func_lines.items.len >= 3) {
+                        try processFunction(allocator, issues, file_path, prev_func_name, prev_func_start, func_lines.items, false, prev_func_in_test);
+                    }
+                    func_lines.clearRetainingCapacity();
                 }
-                func_lines.clearRetainingCapacity();
             }
         }
         if (!state.in_func) continue;
@@ -5216,6 +5240,8 @@ fn analyzeCFGFile(
         if (!trackCFGBraces(t, &state)) continue;
 
         // Function ended - process it
+        // Pass test context: func started inside a test block OR file is a test file
+        const is_in_test = state.func_in_test or isInTestContext(file_path, false);
         try processFunction(
             allocator,
             issues,
@@ -5224,6 +5250,7 @@ fn analyzeCFGFile(
             state.func_start,
             func_lines.items,
             state.fn_returns_error,
+            is_in_test,
         );
 
         state.in_func = false;
@@ -6268,6 +6295,7 @@ fn analyzeCFGNullSafety(
 /// - Catch block context (error recovery - silent catch is intentional)
 /// - Cleanup function context (deinit, close, destroy, etc.)
 /// - Defer block context (best-effort cleanup)
+/// - Test block context (nested functions inside tests)
 fn analyzeCFGErrors(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
@@ -6275,6 +6303,7 @@ fn analyzeCFGErrors(
     func_line: usize,
     file_path: []const u8,
     func_name: []const u8,
+    is_in_test_context: bool,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
@@ -6330,33 +6359,40 @@ fn analyzeCFGErrors(
                 }
             }
 
-            // ZA202: catch unreachable - always warn (even in catch blocks)
-            if (mem.indexOf(u8, t, "catch unreachable")) |col| {
-                if (!isInsideString(t, col)) {
-                    try issues.append(allocator, .{
-                        .file = file_path,
-                        .line = line_num,
-                        .col = col + 1,
-                        .severity = .warning,
-                        .rule = RULE_CATCH_UNREACHABLE,
-                        .message = "catch unreachable will panic on error",
-                        .help = "use explicit error handling",
-                    });
+            // ZA202: catch unreachable - skip in test context (intentional fail-fast)
+            // In production code, catch unreachable is dangerous. In tests, it's common.
+            // Test context: func name starts with "test " OR function is nested inside a test block
+            const is_test_ctx = mem.startsWith(u8, func_name, "test ") or is_in_test_context;
+            if (!is_test_ctx) {
+                if (mem.indexOf(u8, t, "catch unreachable")) |col| {
+                    if (!isInsideString(t, col)) {
+                        try issues.append(allocator, .{
+                            .file = file_path,
+                            .line = line_num,
+                            .col = col + 1,
+                            .severity = .warning,
+                            .rule = RULE_CATCH_UNREACHABLE,
+                            .message = "catch unreachable will panic on error",
+                            .help = "use explicit error handling",
+                        });
+                    }
                 }
             }
 
-            // ZA203: orelse unreachable - always warn
-            if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
-                if (!isInsideString(t, col)) {
-                    try issues.append(allocator, .{
-                        .file = file_path,
-                        .line = line_num,
-                        .col = col + 1,
-                        .severity = .warning,
-                        .rule = RULE_ORELSE_UNREACHABLE,
-                        .message = "orelse unreachable will panic on null",
-                        .help = "use explicit null handling",
-                    });
+            // ZA203: orelse unreachable - skip in test context (intentional fail-fast)
+            if (!is_test_ctx) {
+                if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
+                    if (!isInsideString(t, col)) {
+                        try issues.append(allocator, .{
+                            .file = file_path,
+                            .line = line_num,
+                            .col = col + 1,
+                            .severity = .warning,
+                            .rule = RULE_ORELSE_UNREACHABLE,
+                            .message = "orelse unreachable will panic on null",
+                            .help = "use explicit null handling",
+                        });
+                    }
                 }
             }
         }
@@ -6597,6 +6633,9 @@ fn analyzeCFGPanicPatterns(
                 // Skip if guard pattern on same line
                 if (hasIndexGuardOnLine(t)) continue;
 
+                // Skip if short-circuit guard on prior lines (multi-line expressions)
+                if (hasShortCircuitGuardOnPriorLines(lines, idx)) continue;
+
                 // Skip if the array's .len is guarded via CFG
                 // Pattern: x[x.len - N] is safe if x.len is guarded
                 if (extractArrayBaseFromIndexArithmetic(t)) |base| {
@@ -6736,6 +6775,60 @@ fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bo
                 return true;
             }
         }
+    }
+    return false;
+}
+
+/// Check for short-circuit guard on prior lines (multi-line expressions)
+/// Pattern: assert(offset == 0 or switch { .x => values[offset - 1] });
+/// Based on Zig short-circuit evaluation - RHS only evaluated when LHS fails
+fn hasShortCircuitGuardOnPriorLines(lines: []const []const u8, current_idx: usize) bool {
+    // Track brace/paren balance going backwards to find expression start
+    var close_parens: usize = 0;
+    var close_braces: usize = 0;
+    var line_idx = current_idx;
+
+    while (line_idx > 0) {
+        line_idx -= 1;
+        const ctx = mem.trim(u8, lines[line_idx], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+
+        // Count brackets going backwards (closes before opens as we scan backward)
+        for (ctx) |c| {
+            if (c == ')') close_parens += 1;
+            if (c == '(') {
+                if (close_parens > 0) {
+                    close_parens -= 1;
+                } else {
+                    // Found unmatched open paren - we're inside this expression
+                    // Check for short-circuit guard patterns
+                    if (mem.indexOf(u8, ctx, "== 0 or") != null) return true;
+                    if (mem.indexOf(u8, ctx, "!= 0 and") != null) return true;
+                    if (mem.indexOf(u8, ctx, "> 0 and") != null) return true;
+                }
+            }
+            if (c == '}') close_braces += 1;
+            if (c == '{') {
+                if (close_braces > 0) {
+                    close_braces -= 1;
+                }
+            }
+        }
+
+        // Check for short-circuit patterns if we're inside multi-line expr
+        if (close_parens > 0 or close_braces > 0) {
+            if (mem.indexOf(u8, ctx, "== 0 or") != null) return true;
+            if (mem.indexOf(u8, ctx, "!= 0 and") != null) return true;
+            if (mem.indexOf(u8, ctx, "> 0 and") != null) return true;
+        }
+
+        // Stop at statement boundary (balanced and ends with semicolon)
+        if (close_parens == 0 and close_braces == 0 and ctx.len > 0 and ctx[ctx.len - 1] == ';') {
+            break;
+        }
+
+        // Stop at function boundary
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) break;
     }
     return false;
 }

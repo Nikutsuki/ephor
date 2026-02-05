@@ -888,6 +888,59 @@ fn hasUnconditionalFillBeforeUse(lines: []const []const u8, start_idx: usize, na
     return false; // No unconditional fill found
 }
 
+/// Compute gen set: which blocks assign a variable (includes loop fill patterns)
+fn computeGenSetForVar(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    var_name: []const u8,
+    num_blocks: usize,
+) ![]bool {
+    const gen = try allocator.alloc(bool, num_blocks);
+    errdefer allocator.free(gen); // Free on error; caller owns on success
+    @memset(gen, false);
+
+    // Check for multi-line loop fill pattern: var arr = undefined; for (...) arr[i] = ...
+    var in_for_loop = false;
+    var for_loop_start_bid: ?usize = null;
+    for (lines, 0..) |line, idx| {
+        const actual_line = func_line + idx;
+        const t = mem.trim(u8, line, " \t\r");
+
+        // Track for-loop scope
+        if (mem.startsWith(u8, t, "for ") or mem.startsWith(u8, t, "for(")) {
+            in_for_loop = true;
+            for_loop_start_bid = findBlockForLine(cfg, actual_line);
+        }
+
+        // Check for indexed assignment inside loop: var_name[...] =
+        if (in_for_loop) {
+            if (mem.indexOf(u8, t, var_name)) |pos| {
+                const end_pos = pos + var_name.len;
+                if (end_pos < t.len and t[end_pos] == '[') {
+                    if (for_loop_start_bid) |bid| gen[bid] = true;
+                }
+            }
+        }
+
+        // Track closing brace for loop
+        if (in_for_loop and mem.indexOf(u8, t, "}") != null) {
+            var brace_count: i32 = 0;
+            for (t) |c| {
+                if (c == '{') brace_count += 1;
+                if (c == '}') brace_count -= 1;
+            }
+            if (brace_count < 0) in_for_loop = false;
+        }
+
+        if (isAssignmentTarget(t, var_name, 0) or isFillPattern(t, var_name)) {
+            if (findBlockForLine(cfg, actual_line)) |bid| gen[bid] = true;
+        }
+    }
+    return gen;
+}
+
 /// Run definite assignment analysis on CFG
 /// Returns map of variable -> line where potentially uninitialized read occurs
 fn analyzeDefiniteAssignment(
@@ -963,50 +1016,8 @@ fn analyzeDefiniteAssignment(
         @memset(def_at_exit, false);
 
         // Compute gen set: which blocks assign this variable
-        var gen = try allocator.alloc(bool, num_blocks);
+        const gen = try computeGenSetForVar(allocator, cfg, lines, func_line, var_name, num_blocks);
         defer allocator.free(gen);
-        @memset(gen, false);
-
-        // Check for multi-line loop fill pattern: var arr = undefined; for (...) arr[i] = ...
-        var in_for_loop = false;
-        var for_loop_start_bid: ?usize = null;
-        for (lines, 0..) |line, idx| {
-            const actual_line = func_line + idx;
-            const t = mem.trim(u8, line, " \t\r");
-
-            // Track for-loop scope
-            if (mem.startsWith(u8, t, "for ") or mem.startsWith(u8, t, "for(")) {
-                in_for_loop = true;
-                for_loop_start_bid = findBlockForLine(cfg, actual_line);
-            }
-
-            // Check for indexed assignment inside loop: var_name[...] =
-            if (in_for_loop) {
-                if (mem.indexOf(u8, t, var_name)) |pos| {
-                    const end_pos = pos + var_name.len;
-                    if (end_pos < t.len and t[end_pos] == '[') {
-                        // This is arr[i] = pattern inside a loop
-                        if (for_loop_start_bid) |bid| gen[bid] = true;
-                    }
-                }
-            }
-
-            // Track closing brace for loop
-            if (in_for_loop and mem.indexOf(u8, t, "}") != null) {
-                // Simple heuristic: closing brace ends the loop
-                // (not perfect but catches most cases)
-                var brace_count: i32 = 0;
-                for (t) |c| {
-                    if (c == '{') brace_count += 1;
-                    if (c == '}') brace_count -= 1;
-                }
-                if (brace_count < 0) in_for_loop = false;
-            }
-
-            if (isAssignmentTarget(t, var_name, 0) or isFillPattern(t, var_name)) {
-                if (findBlockForLine(cfg, actual_line)) |bid| gen[bid] = true;
-            }
-        }
 
         // Worklist algorithm: iterate until fixed point
         // Max iterations = 2 * num_blocks (boolean lattice height * blocks)

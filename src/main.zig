@@ -658,6 +658,10 @@ fn hasPatternNotInString(t: []const u8, pattern: []const u8) bool {
 /// Check if the caller before .alloc() or .create() is a Type (starts uppercase)
 /// Type.alloc() is a factory method, not an allocator call
 /// Handles patterns like: Type.alloc(), module.Type.alloc(), Type(T).alloc()
+///
+/// NOTE: This is CONVENTION-BASED, not language semantics. Zig style guide recommends
+/// TitleCase for types, but it's not enforced by the compiler. This heuristic works
+/// for code following standard Zig naming conventions.
 fn isTypeAllocFactory(t: []const u8, alloc_pos: usize) bool {
     if (alloc_pos == 0) return false;
     var end = alloc_pos;
@@ -3177,6 +3181,7 @@ fn trackTestBlock(
 }
 
 /// Best-effort operations where silent catch {} is acceptable
+/// NOTE: This is HEURISTIC-BASED on common library patterns, not Zig language semantics.
 /// Categories: filesystem, cleanup, collection, writer, network, threading
 const best_effort_ops = [_][]const u8{
     // Filesystem - might already exist/not exist
@@ -3201,9 +3206,9 @@ const best_effort_ops = [_][]const u8{
     ".lock(",        ".unlock(",
     // State changes - best effort (display links, services)
     ".start(",       ".stop(",
-    // Threading - cosmetic operations where failure is acceptable
-    ".setName(",     ".notify(",      ".wakeup(",      ".signal(",
-    "_wakeup.set(",  "_wakeup.notify(",
+    // Threading - ONLY cosmetic operations (setName is purely for debugging)
+    // NOTE: notify/wakeup/signal are NOT included - they can be critical!
+    ".setName(",
 };
 
 /// Check if a silent catch is for a best-effort operation
@@ -6733,16 +6738,21 @@ fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bo
     return false;
 }
 
-/// Check for break/continue guard on prior lines within loop body
+/// Check for break/continue guard on prior lines within same loop body
 /// Pattern: while (true) { if (x == 0) break; x -= 1; }
+/// Based on Zig control flow semantics - break/continue/return exits prevent reaching decrement
 fn hasBreakGuardOnPriorLines(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
     // Look back up to 5 lines for a guard pattern
     const check_start = if (current_idx > 5) current_idx - 5 else 0;
     for (lines[check_start..current_idx]) |line| {
         const ctx = mem.trim(u8, line, " \t\r");
-        // Stop at function boundary or loop start
+        // Stop at function boundary - guard in different function doesn't apply
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
-        // Check for if (var == 0) break/continue pattern
+        // Stop at loop boundary - guard in outer loop doesn't apply to inner loop
+        // A new while/for creates a new scope where prior guards don't apply
+        if (mem.startsWith(u8, ctx, "while ") or mem.startsWith(u8, ctx, "while(")) return false;
+        if (mem.startsWith(u8, ctx, "for ") or mem.startsWith(u8, ctx, "for(")) return false;
+        // Check for if (var == 0) break/continue/return pattern
         if (mem.indexOf(u8, ctx, var_name)) |_| {
             if (mem.indexOf(u8, ctx, "== 0)") != null) {
                 if (mem.indexOf(u8, ctx, "break") != null) return true;

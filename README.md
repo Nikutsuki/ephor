@@ -192,7 +192,7 @@ Example config:
     "max_nesting": 4,
     "max_params": 5,
     "max_branches": 10,
-    "max_line_length": 80,
+    "max_line_length": 100,
     "max_file_bytes": 25000
   }
 }

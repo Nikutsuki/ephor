@@ -421,7 +421,7 @@ fn buildCFG(
 
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//")) continue;
+        if (isCommentOrMultilineString(t)) continue;
 
         const pattern = detectCFPattern(t);
         cfg.blocks.items[current_block].end_line = func_line + idx;
@@ -610,6 +610,11 @@ fn buildCFG(
 /// Uses centralized implementation from types.zig that handles escape sequences correctly
 fn isPatternInString(t: []const u8, pattern_pos: usize) bool {
     return types.isInsideString(t, pattern_pos);
+}
+
+/// Check if line is a comment or multiline string (should be skipped in analysis)
+fn isCommentOrMultilineString(t: []const u8) bool {
+    return mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\");
 }
 
 /// Check if line has a free/destroy pattern that's NOT inside a string
@@ -1084,8 +1089,8 @@ fn analyzeDefiniteAssignment(
 
 /// Check if line reads a variable (not just assigns)
 fn hasVarRead(t: []const u8, var_name: []const u8) bool {
-    // Skip comment lines entirely
-    if (mem.startsWith(u8, t, "//")) return false;
+    // Skip comment and multiline string lines entirely
+    if (isCommentOrMultilineString(t)) return false;
 
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
@@ -1297,8 +1302,7 @@ fn analyzeCFGMemorySafety(
             if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) continue;
             if (hasRealFreePattern(t)) continue; // Skip patterns in string literals
             if (mem.startsWith(u8, t, "defer")) continue;
-            if (mem.startsWith(u8, t, "//")) continue; // Skip comments
-            if (mem.startsWith(u8, t, "\\\\")) continue; // Skip multiline strings
+            if (isCommentOrMultilineString(t)) continue;
 
             // Check ALL occurrences of the variable on this line
             // Pattern: `data = transformData(data)` has UAF on RHS even though LHS is assignment
@@ -2175,7 +2179,7 @@ fn analyzeCFGErrdeferCoverage(
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
 
-        if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
+        if (isCommentOrMultilineString(t)) continue;
 
         // Handle multi-line errdefer/defer blocks
         if (block_depth > 0) {
@@ -2582,10 +2586,8 @@ const ImportGraph = struct {
     fn getOrphanIssues(
         self: *ImportGraph,
         allocator: Allocator,
-        base_path: []const u8,
         cfg: *const Config,
     ) !std.ArrayListUnmanaged(Issue) {
-        _ = base_path;
         var issues: std.ArrayListUnmanaged(Issue) = .{};
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
@@ -3197,9 +3199,7 @@ fn checkCatchUnreachable(
     t: []const u8,
     path: []const u8,
     line: usize,
-    in_test: bool,
 ) ?Issue {
-    _ = in_test;
     if (mem.indexOf(u8, t, "catch unreachable")) |col| {
         if (!isInsideString(t, col)) return .{
             .file = path,
@@ -3219,9 +3219,7 @@ fn checkOrelseUnreachable(
     t: []const u8,
     path: []const u8,
     line: usize,
-    in_test: bool,
 ) ?Issue {
-    _ = in_test;
     if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
         if (!isInsideString(t, col)) return .{
             .file = path,
@@ -3845,10 +3843,10 @@ fn checkLineErrors(
     if (!in_defer) {
         if (checkSilentCatch(t, path, ln)) |i| try issues.append(allocator, i);
     }
-    if (checkCatchUnreachable(t, path, ln, !skip_undefined)) |i| {
+    if (checkCatchUnreachable(t, path, ln)) |i| {
         try issues.append(allocator, i);
     }
-    if (checkOrelseUnreachable(t, path, ln, !skip_undefined)) |i| {
+    if (checkOrelseUnreachable(t, path, ln)) |i| {
         try issues.append(allocator, i);
     }
     // Skip undefined checks in test/module-level context
@@ -3900,8 +3898,7 @@ fn analyzeFileErrors(
     while (lines.next()) |line| {
         defer line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//")) continue;
-        if (mem.startsWith(u8, t, "\\\\")) continue;
+        if (isCommentOrMultilineString(t)) continue;
 
         const ts = trackTestBlock(
             t,
@@ -4028,7 +4025,7 @@ fn checkUnusedDecl(
     t: []const u8,
     line_num: usize,
 ) !void {
-    if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) return;
+    if (isCommentOrMultilineString(t)) return;
     if (mem.indexOf(u8, t, "@import(") != null) return;
     // Skip @This() pattern - common idiom for self-referential types
     if (mem.indexOf(u8, t, "@This()") != null) return;
@@ -4352,7 +4349,7 @@ fn analyzeFileComplexity(
     while (lines.next()) |line| {
         defer line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
+        if (isCommentOrMultilineString(t)) continue;
         detectFnStart(t, &state, line_num);
         if (!state.in_fn) continue;
         state.fn_lines += 1;
@@ -4659,7 +4656,7 @@ fn analyzeNaming(
         while (lines.next()) |line| {
             defer line_num += 1;
             const t = mem.trim(u8, line, " \t\r");
-            if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
+            if (isCommentOrMultilineString(t)) continue;
 
             if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const ")) {
                 try checkConstNaming(&issues, allocator, a.path, t, line_num);
@@ -4829,7 +4826,6 @@ fn processFunction(
     var func_issues = try analyzeFunction(
         allocator,
         file_path,
-        func_name,
         func_start,
         func_lines_items,
     );
@@ -4925,7 +4921,7 @@ fn analyzeCFGFile(
     while (lines.next()) |line| {
         defer line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
-        const is_comment = mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\");
+        const is_comment = isCommentOrMultilineString(t);
 
         // Detect function start (skip comments for detection)
         // Returns true if we found a nested function - process previous function first
@@ -5001,15 +4997,13 @@ fn detectErrorReturns(lines: []const []const u8) bool {
 /// Check if line contains allocation call
 fn findAllocCall(t: []const u8) ?struct { col: usize, is_create: bool } {
     if (isPoolAllocator(t)) return null;
-    const ac1 = mem.indexOf(u8, t, ".alloc(");
-    const alloc_col = ac1 orelse mem.indexOf(u8, t, "allocator.alloc(");
-    if (alloc_col) |col| {
-        if (!isInsideString(t, col)) return .{ .col = col, .is_create = false };
+    // Check for .alloc( (includes allocator.alloc( as suffix match)
+    if (mem.indexOf(u8, t, ".alloc(")) |col| {
+        if (!isPatternInString(t, col)) return .{ .col = col, .is_create = false };
     }
-    const cc1 = mem.indexOf(u8, t, ".create(");
-    const create_col = cc1 orelse mem.indexOf(u8, t, "allocator.create(");
-    if (create_col) |col| {
-        if (!isInsideString(t, col) and isAllocatorCreate(t))
+    // Check for .create( (includes allocator.create( as suffix match)
+    if (mem.indexOf(u8, t, ".create(")) |col| {
+        if (!isPatternInString(t, col) and isAllocatorCreate(t))
             return .{ .col = col, .is_create = true };
     }
     return null;
@@ -5036,9 +5030,7 @@ fn updateDefers(t: []const u8, allocs: []AllocInfo) void {
     for (allocs) |*alloc| {
         if (mem.indexOf(u8, t, alloc.name) == null) continue;
         // Check for cleanup patterns (skip if inside string literals)
-        if (hasRealFreePattern(t) or hasPatternNotInString(t, "free(") or
-            hasPatternNotInString(t, "destroy("))
-        {
+        if (hasRealCleanupPattern(t)) {
             alloc.has_defer = true;
         }
     }
@@ -5050,7 +5042,7 @@ fn updateErrdefers(t: []const u8, allocs: []AllocInfo) void {
     for (allocs) |*alloc| {
         if (mem.indexOf(u8, t, alloc.name) == null) continue;
         // Check for cleanup patterns (skip if inside string literals)
-        if (hasRealFreePattern(t)) {
+        if (hasRealCleanupPattern(t)) {
             alloc.has_errdefer = true;
         }
     }
@@ -5455,7 +5447,7 @@ fn buildAliasSets(
 
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//")) continue;
+        if (isCommentOrMultilineString(t)) continue;
 
         // Detect start of struct assignment
         if (!in_struct and mem.indexOf(u8, t, "{") != null and mem.indexOf(u8, t, "= ") != null) {
@@ -5528,12 +5520,10 @@ fn buildAliasSets(
 fn analyzeFunction(
     allocator: Allocator,
     file_path: []const u8,
-    func_name: []const u8,
     func_start: usize,
     lines: []const []const u8,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
-    _ = func_name;
     var allocs = std.ArrayListUnmanaged(AllocInfo){};
     defer allocs.deinit(allocator);
     var events = std.ArrayListUnmanaged(MemoryEvent){};
@@ -5551,7 +5541,7 @@ fn analyzeFunction(
     for (lines, 0..) |line, idx| {
         const actual_line = func_start + idx;
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//")) continue;
+        if (isCommentOrMultilineString(t)) continue;
 
         if (extractDeclVarName(t)) |var_name| {
             const ctx: AllocLineContext = .{
@@ -5574,7 +5564,7 @@ fn analyzeFunction(
     for (lines, 0..) |line, idx| {
         const actual_line = func_start + idx;
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//")) continue;
+        if (isCommentOrMultilineString(t)) continue;
 
         for (allocs.items) |*a| {
             if (isOwnershipTransfer(t, a.name)) a.ownership_transferred = true;
@@ -5740,8 +5730,7 @@ fn analyzeIgnoredErrors(
         while (lines.next()) |line| {
             defer line_num += 1;
             const t = mem.trim(u8, line, " \t\r");
-            const skip = t.len == 0 or mem.startsWith(u8, t, "//");
-            if (skip or mem.startsWith(u8, t, "\\\\")) continue;
+            if (t.len == 0 or isCommentOrMultilineString(t)) continue;
             try checkIgnoredError(allocator, &issues, file_path, t, line_num);
         }
     }
@@ -5835,7 +5824,7 @@ fn analyzeNullSafety(
         while (lines.next()) |line| {
             defer line_num += 1;
             const t = mem.trim(u8, line, " \t\r");
-            if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
+            if (isCommentOrMultilineString(t)) continue;
             try checkUnsafeUnwrap(&issues, allocator, file_path, t, line_num);
             try checkUnsafeDeref(&issues, allocator, file_path, t, line_num);
         }
@@ -6194,7 +6183,7 @@ fn analyzePanicPatterns(
             const t = mem.trim(u8, line, " \t\r");
 
             // Skip comments
-            if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
+            if (isCommentOrMultilineString(t)) continue;
 
             // Skip test blocks (intentional panic testing is common)
             if (mem.indexOf(u8, t, "testing.expect") != null) continue;
@@ -7865,7 +7854,7 @@ pub fn main() !void {
             defer g.deinit();
             try scanPath(&g, cfg.path);
             for (cfg.entries.items) |e| try g.markReachable(e);
-            var issues = try g.getOrphanIssues(alloc, base_path, &cfg);
+            var issues = try g.getOrphanIssues(alloc, &cfg);
             defer deinitIssues(&issues, alloc);
             sortIssuesByFile(issues.items);
 
@@ -7964,7 +7953,7 @@ pub fn main() !void {
             }
             for (cfg.entries.items) |e| try g.markReachable(e);
 
-            var orphan_issues = try g.getOrphanIssues(alloc, base_path, &cfg);
+            var orphan_issues = try g.getOrphanIssues(alloc, &cfg);
             defer deinitIssues(&orphan_issues, alloc);
             sortIssuesByFile(orphan_issues.items);
 

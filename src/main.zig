@@ -1040,6 +1040,11 @@ fn collectUndefinedVars(
                     continue; // Part of longer identifier
                 }
             }
+            // Skip if this is a struct field being set to undefined, not the variable itself
+            // Pattern: .field = undefined (inside a struct literal)
+            // The variable IS assigned, just with some undefined fields
+            if (isStructFieldUndefined(t, col)) continue;
+
             if (extractVarDeclName(t)) |name| {
                 if (!hasUnconditionalFillBeforeUse(lines, idx + 1, name)) {
                     try undef_vars.put(name, func_line + idx);
@@ -1048,6 +1053,29 @@ fn collectUndefinedVars(
         }
     }
     return undef_vars;
+}
+
+/// Check if `= undefined` is a struct field assignment, not a variable declaration
+/// Zig struct literals: `var x = .{ .field = undefined }` - x IS assigned, field is undefined
+/// Pattern: looks for `.identifier = undefined` indicating field, not top-level variable
+fn isStructFieldUndefined(t: []const u8, undefined_col: usize) bool {
+    // Look backwards from the `=` sign to find if there's a `.identifier` pattern
+    // The `= undefined` starts at undefined_col, so the `=` is at undefined_col
+    if (undefined_col == 0) return false;
+
+    // Scan backwards from the `=` to find preceding `.identifier` pattern
+    var i = undefined_col;
+    // Skip whitespace before `=`
+    while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) i -= 1;
+    if (i == 0) return false;
+
+    // Check for identifier characters
+    while (i > 0 and isIdent(t[i - 1])) i -= 1;
+
+    // Check for leading `.` (struct field notation)
+    if (i > 0 and t[i - 1] == '.') return true;
+
+    return false;
 }
 
 /// Run definite assignment analysis on CFG

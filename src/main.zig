@@ -1519,9 +1519,9 @@ fn analyzeCFGMemorySafety(
             }
 
             if (prev_free_in_block) {
-                // Check if there's a switch arm between the two frees
-                // If so, they're likely in different branches (not a real double-free)
-                var has_switch_arm_between = false;
+                // Check if there's a switch arm or mutually exclusive branch between the two frees
+                // If so, they're in different branches (not a real double-free)
+                var has_exclusive_branch = false;
                 if (alloc.freed_line < actual_line) {
                     for (alloc.freed_line + 1..actual_line) |between_line| {
                         if (between_line < func_line) continue;
@@ -1530,12 +1530,29 @@ fn analyzeCFGMemorySafety(
                         const between_t = mem.trim(u8, lines[between_idx], " \t\r");
                         // Switch arm patterns: "=> blk:", "=> {", ".X =>"
                         if (mem.indexOf(u8, between_t, "=>") != null) {
-                            has_switch_arm_between = true;
+                            has_exclusive_branch = true;
+                            break;
+                        }
+                        // catch/orelse pattern: "} orelse {" - mutually exclusive branches
+                        // Pattern: catch { ... return; } orelse { ... return; }
+                        if (mem.indexOf(u8, between_t, "} orelse {") != null or
+                            mem.indexOf(u8, between_t, "} orelse return") != null or
+                            mem.startsWith(u8, between_t, "orelse {") or
+                            mem.eql(u8, between_t, "} orelse {"))
+                        {
+                            has_exclusive_branch = true;
+                            break;
+                        }
+                        // else branch pattern: "} else {"
+                        if (mem.indexOf(u8, between_t, "} else {") != null or
+                            mem.eql(u8, between_t, "} else {"))
+                        {
+                            has_exclusive_branch = true;
                             break;
                         }
                     }
                 }
-                if (has_switch_arm_between) continue;
+                if (has_exclusive_branch) continue;
 
                 const col = mem.indexOf(u8, t, ".free(") orelse
                     mem.indexOf(u8, t, ".destroy(") orelse 0;
@@ -1583,9 +1600,9 @@ fn analyzeCFGMemorySafety(
             // Skip if no predecessors freed (first free is ok)
             if (!any_freed) continue;
 
-            // Check if there's a switch arm between the two frees
-            // If so, they're likely in different branches (not a real double-free)
-            var has_switch_arm = false;
+            // Check if there's a switch arm or mutually exclusive branch between the two frees
+            // If so, they're in different branches (not a real double-free)
+            var has_exclusive_branch_2 = false;
             const check_from_line = if (freed_pred_line > 0) freed_pred_line else alloc.freed_line;
             if (check_from_line > 0 and check_from_line < actual_line) {
                 for (check_from_line + 1..actual_line) |between_line| {
@@ -1593,13 +1610,30 @@ fn analyzeCFGMemorySafety(
                     const between_idx = between_line - func_line;
                     if (between_idx >= lines.len) continue;
                     const between_t = mem.trim(u8, lines[between_idx], " \t\r");
+                    // Switch arm patterns
                     if (mem.indexOf(u8, between_t, "=>") != null) {
-                        has_switch_arm = true;
+                        has_exclusive_branch_2 = true;
+                        break;
+                    }
+                    // catch/orelse pattern - mutually exclusive branches
+                    if (mem.indexOf(u8, between_t, "} orelse {") != null or
+                        mem.indexOf(u8, between_t, "} orelse return") != null or
+                        mem.startsWith(u8, between_t, "orelse {") or
+                        mem.eql(u8, between_t, "} orelse {"))
+                    {
+                        has_exclusive_branch_2 = true;
+                        break;
+                    }
+                    // else branch pattern
+                    if (mem.indexOf(u8, between_t, "} else {") != null or
+                        mem.eql(u8, between_t, "} else {"))
+                    {
+                        has_exclusive_branch_2 = true;
                         break;
                     }
                 }
             }
-            if (has_switch_arm) continue;
+            if (has_exclusive_branch_2) continue;
 
             const col = mem.indexOf(u8, t, ".free(") orelse
                 mem.indexOf(u8, t, ".destroy(") orelse 0;
@@ -9625,6 +9659,57 @@ test "analyzeCFGMemory no false positive for switch arm frees (ZA106)" {
     // Should NOT detect double-free for switch arm frees
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.file, "test_switch_free.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
+        }
+    }
+}
+
+test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
+    // This tests a standard Zig idiom for handling !?T (error union of optional).
+    // When a function returns !?T, you need BOTH catch (error) and orelse (null).
+    // These branches are MUTUALLY EXCLUSIVE by language design - only one executes.
+    // Freeing in both branches is CORRECT cleanup, not double-free.
+    //
+    // Pattern:
+    //   const result = tryGetOptionalValue() catch { cleanup(); return err; }
+    //                                        orelse { cleanup(); return null_err; };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn catch_orelse_free(allocator: std.mem.Allocator) !void {
+        \\    const arena = allocator.create(Arena) catch return error.OutOfMemory;
+        \\    // getValue returns !?T - can fail with error OR return null
+        \\    const result = getValue() catch {
+        \\        // Error path - cleanup and return error
+        \\        arena.deinit();
+        \\        allocator.destroy(arena);
+        \\        return error.Failed;
+        \\    } orelse {
+        \\        // Null path - cleanup and return different error
+        \\        arena.deinit();
+        \\        allocator.destroy(arena);
+        \\        return error.NullValue;
+        \\    };
+        \\    _ = result;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_catch_orelse.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_catch_orelse.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // Should NOT detect double-free for catch/orelse branch frees
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_catch_orelse.zig")) {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
         }
     }

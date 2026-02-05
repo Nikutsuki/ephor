@@ -4904,6 +4904,17 @@ fn processFunction(
     );
     defer null_safety_issues.deinit(allocator);
     try issues.appendSlice(allocator, null_safety_issues.items);
+
+    // Run CFG-based panic/overflow analysis (ZA901, ZA902, ZA903)
+    var panic_issues = try analyzeCFGPanicPatterns(
+        allocator,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+    );
+    defer panic_issues.deinit(allocator);
+    try issues.appendSlice(allocator, panic_issues.items);
 }
 
 /// Analyze a single file for CFG memory issues
@@ -6022,6 +6033,320 @@ fn extractDerefVar(t: []const u8, dot_star_pos: usize) ?[]const u8 {
     }
     if (start < end) return t[start..end];
     return null;
+}
+
+/// CFG-based panic/overflow pattern analysis (ZA901/ZA902/ZA903)
+/// Uses control flow graph to track guards across paths
+fn analyzeCFGPanicPatterns(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .{};
+
+    const num_blocks = cfg.blocks.items.len;
+    if (num_blocks == 0) return issues;
+
+    // Track guarded variables per block (variables with overflow guard)
+    var guarded_per_block = try allocator.alloc(std.StringHashMapUnmanaged(void), num_blocks);
+    defer {
+        for (guarded_per_block) |*map| map.deinit(allocator);
+        allocator.free(guarded_per_block);
+    }
+    for (guarded_per_block) |*map| map.* = .{};
+
+    // Phase 1: Identify guards in each block
+    for (cfg.blocks.items, 0..) |block, bid| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+        for (block.start_line..block.end_line + 1) |line_num| {
+            if (line_num < func_line) continue;
+            const idx = line_num - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+
+            // Detect guard patterns and extract variable names
+            if (extractGuardedVar(t)) |var_name| {
+                try guarded_per_block[bid].put(allocator, var_name, {});
+            }
+        }
+    }
+
+    // Phase 2: Propagate guard state through CFG (forward dataflow)
+    var changed = true;
+    var iterations: usize = 0;
+    while (changed and iterations < 100) {
+        changed = false;
+        iterations += 1;
+
+        for (cfg.blocks.items, 0..) |_, bid| {
+            var preds = std.ArrayListUnmanaged(usize){};
+            defer preds.deinit(allocator);
+            for (cfg.edges.items) |edge| {
+                if (edge.to == bid) {
+                    try preds.append(allocator, edge.from);
+                }
+            }
+
+            if (preds.items.len == 0) continue;
+
+            var first_pred = true;
+            var intersection: std.StringHashMapUnmanaged(void) = .{};
+            defer intersection.deinit(allocator);
+
+            for (preds.items) |pred| {
+                if (first_pred) {
+                    var iter = guarded_per_block[pred].iterator();
+                    while (iter.next()) |entry| {
+                        try intersection.put(allocator, entry.key_ptr.*, {});
+                    }
+                    first_pred = false;
+                } else {
+                    var to_remove = std.ArrayListUnmanaged([]const u8){};
+                    defer to_remove.deinit(allocator);
+                    var iter = intersection.iterator();
+                    while (iter.next()) |entry| {
+                        if (!guarded_per_block[pred].contains(entry.key_ptr.*)) {
+                            try to_remove.append(allocator, entry.key_ptr.*);
+                        }
+                    }
+                    for (to_remove.items) |key| {
+                        _ = intersection.remove(key);
+                    }
+                }
+            }
+
+            var iter = intersection.iterator();
+            while (iter.next()) |entry| {
+                const gop = try guarded_per_block[bid].getOrPut(allocator, entry.key_ptr.*);
+                if (!gop.found_existing) changed = true;
+            }
+        }
+    }
+
+    // Phase 3: Check for unguarded decrements and subtractions
+    for (cfg.blocks.items, 0..) |block, bid| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+        for (block.start_line..block.end_line + 1) |line_num| {
+            if (line_num < func_line) continue;
+            const idx = line_num - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+
+            // Skip test blocks
+            if (mem.indexOf(u8, t, "testing.expect") != null) continue;
+
+            // Check for decrement (-= 1) without guard
+            if (mem.indexOf(u8, t, "-= 1")) |col| {
+                if (isInsideString(t, col)) continue;
+
+                if (extractDecrementVar(t, col)) |var_name| {
+                    // Skip if guarded on all paths
+                    if (guarded_per_block[bid].contains(var_name)) continue;
+
+                    // Skip if guard on same line
+                    if (hasGuardOnLine(t, var_name)) continue;
+
+                    // Skip signed types (can go negative)
+                    if (isSignedVarInContext(lines, idx, var_name)) continue;
+
+                    // Skip if there's a paired increment
+                    if (hasPairedIncrementInLines(lines[0..idx], var_name)) continue;
+
+                    try issues.append(allocator, .{
+                        .file = file_path,
+                        .line = line_num,
+                        .col = col + 1,
+                        .severity = .warning,
+                        .rule = RULE_DECREMENT_WITHOUT_CHECK,
+                        .message = "decrement without overflow guard may panic",
+                        .help = "add guard (if/while/assert x > 0), use saturating arithmetic (-|), or document caller contract",
+                    });
+                }
+            }
+
+            // Check for array index arithmetic
+            if (hasArrayIndexSubtraction(t)) |col| {
+                if (isInsideString(t, col)) continue;
+
+                // Skip if saturating subtraction
+                if (mem.indexOf(u8, t, "-|") != null) continue;
+
+                // Skip if guard pattern on same line
+                if (hasIndexGuardOnLine(t)) continue;
+
+                try issues.append(allocator, .{
+                    .file = file_path,
+                    .line = line_num,
+                    .col = col + 1,
+                    .severity = .warning,
+                    .rule = RULE_INDEX_ARITHMETIC,
+                    .message = "arithmetic in array index may overflow",
+                    .help = "ensure index arithmetic cannot underflow, or use saturating subtraction -|",
+                });
+            }
+        }
+    }
+
+    return issues;
+}
+
+/// Extract variable name from guard pattern
+/// Patterns: "if (x > 0)", "while (x > 0)", "assert(x > 0)", "x >= 1"
+/// Also: "if (x == 0) return" (early return guard, inverted)
+fn extractGuardedVar(t: []const u8) ?[]const u8 {
+    // Pattern: x > 0 or x >= 1 or x != 0
+    const guard_patterns = [_][]const u8{ "> 0", ">0", ">= 1", ">=1", "!= 0", "!=0" };
+    for (guard_patterns) |pattern| {
+        if (mem.indexOf(u8, t, pattern)) |pos| {
+            // Look backwards for identifier
+            var end = pos;
+            while (end > 0 and t[end - 1] == ' ') end -= 1;
+            var start = end;
+            while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+                start -= 1;
+            }
+            if (start < end) return t[start..end];
+        }
+    }
+
+    // Pattern: if (x == 0) return - early return guard (inverted check)
+    // After this line, x != 0 is true
+    if (mem.indexOf(u8, t, "== 0) return")) |pos| {
+        // Find opening paren
+        if (mem.lastIndexOf(u8, t[0..pos], "(")) |paren_pos| {
+            const var_part = mem.trim(u8, t[paren_pos + 1 .. pos], " \t");
+            if (var_part.len > 0 and isIdent(var_part[0])) {
+                return var_part;
+            }
+        }
+    }
+
+    return null;
+}
+
+/// Extract variable being decremented
+fn extractDecrementVar(t: []const u8, decrement_pos: usize) ?[]const u8 {
+    var end = decrement_pos;
+    while (end > 0 and t[end - 1] == ' ') end -= 1;
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+        start -= 1;
+    }
+    if (start < end) return t[start..end];
+    return null;
+}
+
+/// Check if variable is signed type in context
+fn isSignedVarInContext(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+    const signed_types = [_][]const u8{ ": i8", ": i16", ": i32", ": i64", ": i128", ": isize" };
+    const check_start = if (current_idx > 10) current_idx - 10 else 0;
+    for (lines[check_start .. current_idx + 1]) |line| {
+        const ctx = mem.trim(u8, line, " \t\r");
+        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
+            const after_var = ctx[var_pos + var_name.len ..];
+            for (signed_types) |stype| {
+                if (mem.startsWith(u8, after_var, stype)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Check for paired increment in lines
+fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bool {
+    var i = lines.len;
+    while (i > 0) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) {
+            return false;
+        }
+        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
+            const after_var = ctx[var_pos + var_name.len ..];
+            if (mem.startsWith(u8, after_var, " += 1") or mem.startsWith(u8, after_var, "+=1")) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Check for array index subtraction pattern [x - y]
+/// Returns position of subtraction if unsafe, null if safe or not found
+fn hasArrayIndexSubtraction(t: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '[') continue;
+        const bracket_start = i;
+        var bracket_end: ?usize = null;
+        var depth: usize = 1;
+        var j = i + 1;
+        while (j < t.len) : (j += 1) {
+            if (t[j] == '[') depth += 1;
+            if (t[j] == ']') {
+                if (depth == 1) {
+                    bracket_end = j;
+                    break;
+                }
+                if (depth > 1) depth -= 1;
+            }
+        }
+        if (bracket_end) |end| {
+            const inside = t[bracket_start + 1 .. end];
+
+            // Skip slice range patterns [0 .. x - N] - bounded by 0 start
+            if (mem.indexOf(u8, inside, "..")) |range_pos| {
+                // If subtraction is after .., it's part of range end, not index
+                if (mem.indexOf(u8, inside, " - ")) |sub_pos| {
+                    if (sub_pos > range_pos) {
+                        // Check if range starts at 0 - safe pattern
+                        const before_range = mem.trim(u8, inside[0..range_pos], " ");
+                        if (mem.eql(u8, before_range, "0")) {
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if (mem.indexOf(u8, inside, " - ")) |sub_pos| {
+                return bracket_start + sub_pos + 1;
+            }
+            i = end;
+        }
+    }
+    return null;
+}
+
+/// Check for index guard patterns on same line
+fn hasIndexGuardOnLine(t: []const u8) bool {
+    // Pattern: while (x > 0 and expr[x - 1])
+    if (mem.indexOf(u8, t, "while") != null and mem.indexOf(u8, t, "> 0") != null) return true;
+    // Pattern: (i == 0 or t[i - 1]) - short-circuit
+    if (mem.indexOf(u8, t, "== 0 or") != null) return true;
+    // Pattern: x > N and - any numeric guard before array access
+    // This covers: > 0 and, > 1 and, >= 1 and, >= 4 and, etc.
+    if (mem.indexOf(u8, t, " and ") != null) {
+        // Check for any comparison guard: >, >=, !=
+        if (mem.indexOf(u8, t, " > ") != null) return true;
+        if (mem.indexOf(u8, t, " >= ") != null) return true;
+        if (mem.indexOf(u8, t, " != ") != null) return true;
+    }
+    // Pattern: if (x > N) check before array access on same line
+    if (mem.indexOf(u8, t, "if (") != null) {
+        if (mem.indexOf(u8, t, "> ") != null) return true;
+        if (mem.indexOf(u8, t, ">= ") != null) return true;
+    }
+    // Pattern: endsWith/startsWith guarantees minimum length
+    if (mem.indexOf(u8, t, "endsWith") != null) return true;
+    if (mem.indexOf(u8, t, "startsWith") != null) return true;
+    return false;
 }
 
 /// ZA801/ZA802: Detect unsafe optional unwrapping (legacy line-based - kept for comparison)
@@ -8173,16 +8498,12 @@ pub fn main() !void {
             var naming_issues = try analyzeNaming(alloc, &g);
             defer deinitIssues(&naming_issues, alloc);
 
-            // Phase 5: Error and null safety
+            // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
             var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
             defer deinitIssues(&ignored_err_issues, alloc);
 
-            var null_safety_issues = try analyzeNullSafety(alloc, &g);
-            defer deinitIssues(&null_safety_issues, alloc);
-
-            // Phase 6: Panic/Overflow detection (ZA9xx)
-            var panic_issues = try analyzePanicPatterns(alloc, &g);
-            defer deinitIssues(&panic_issues, alloc);
+            // Note: Null safety (ZA801/ZA802) and Panic (ZA9xx) are now CFG-based
+            // and included in cfg_mem_issues. We filter them out for categorization.
 
             const stats = g.getStats();
 
@@ -8194,8 +8515,26 @@ pub fn main() !void {
                 "orphans",
                 &cfg,
             );
+            // Filter cfg_mem_issues by rule category
+            var mem_only_issues = std.ArrayListUnmanaged(Issue){};
+            defer mem_only_issues.deinit(alloc);
+            var null_safety_issues = std.ArrayListUnmanaged(Issue){};
+            defer null_safety_issues.deinit(alloc);
+            var panic_issues = std.ArrayListUnmanaged(Issue){};
+            defer panic_issues.deinit(alloc);
+
+            for (cfg_mem_issues.items) |issue| {
+                if (mem.startsWith(u8, issue.rule, "ZA8")) {
+                    try null_safety_issues.append(alloc, issue);
+                } else if (mem.startsWith(u8, issue.rule, "ZA9")) {
+                    try panic_issues.append(alloc, issue);
+                } else {
+                    try mem_only_issues.append(alloc, issue);
+                }
+            }
+
             const mem_count = printIssues(
-                cfg_mem_issues.items,
+                mem_only_issues.items,
                 base_path,
                 cfg.format,
                 "memory",

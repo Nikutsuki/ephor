@@ -606,6 +606,113 @@ fn buildCFG(
     return cfg;
 }
 
+/// Check if a pattern at position is inside a string literal
+/// Uses centralized implementation from types.zig that handles escape sequences correctly
+fn isPatternInString(t: []const u8, pattern_pos: usize) bool {
+    return types.isInsideString(t, pattern_pos);
+}
+
+/// Check if line has a free/destroy pattern that's NOT inside a string
+fn hasRealFreePattern(t: []const u8) bool {
+    // Check for .free(
+    if (mem.indexOf(u8, t, ".free(")) |pos| {
+        if (!isPatternInString(t, pos)) return true;
+    }
+    // Check for .destroy(
+    if (mem.indexOf(u8, t, ".destroy(")) |pos| {
+        if (!isPatternInString(t, pos)) return true;
+    }
+    return false;
+}
+
+/// Check if line has any cleanup pattern (.free, .destroy, .deinit) NOT inside a string
+fn hasRealCleanupPattern(t: []const u8) bool {
+    const patterns = [_][]const u8{ ".free(", ".destroy(", ".deinit(" };
+    for (patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (!isPatternInString(t, pos)) return true;
+        }
+    }
+    return false;
+}
+
+/// Check if a specific pattern appears NOT inside a string literal
+fn hasPatternNotInString(t: []const u8, pattern: []const u8) bool {
+    if (mem.indexOf(u8, t, pattern)) |pos| {
+        return !isPatternInString(t, pos);
+    }
+    return false;
+}
+
+/// Check if line has an allocation pattern (.alloc or .create) NOT inside a string
+fn hasRealAllocPattern(t: []const u8) bool {
+    if (mem.indexOf(u8, t, ".alloc(")) |pos| {
+        if (!isPatternInString(t, pos)) return true;
+    }
+    if (mem.indexOf(u8, t, ".create(")) |pos| {
+        if (!isPatternInString(t, pos)) return true;
+    }
+    return false;
+}
+
+/// Get position of real allocation pattern (not in string), returns null if not found
+fn getRealAllocPos(t: []const u8) ?usize {
+    if (mem.indexOf(u8, t, ".alloc(")) |pos| {
+        if (!isPatternInString(t, pos)) return pos;
+    }
+    if (mem.indexOf(u8, t, ".create(")) |pos| {
+        if (!isPatternInString(t, pos)) return pos;
+    }
+    return null;
+}
+
+/// Check if this is a real .create( call (not in string)
+fn hasRealCreatePattern(t: []const u8) bool {
+    if (mem.indexOf(u8, t, ".create(")) |pos| {
+        return !isPatternInString(t, pos);
+    }
+    return false;
+}
+
+/// Check if a variable name appears as a LOCAL variable (not a struct field)
+/// Returns true if the name appears NOT preceded by '.' (which would be field access)
+fn isLocalVarOccurrence(t: []const u8, name: []const u8) bool {
+    var search_start: usize = 0;
+    while (mem.indexOf(u8, t[search_start..], name)) |rel_pos| {
+        const var_pos = search_start + rel_pos;
+        search_start = var_pos + name.len;
+
+        // Verify it's a full word match (not part of longer identifier)
+        if (var_pos + name.len < t.len and isIdent(t[var_pos + name.len])) continue;
+        if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
+
+        // If preceded by '.', it's a struct field access (self.field) - skip
+        if (var_pos > 0 and t[var_pos - 1] == '.') continue;
+
+        // Found a local variable occurrence
+        return true;
+    }
+    return false;
+}
+
+/// Check if an identifier appears in text with word boundaries
+/// Handles patterns like: pool.free(context, buffer) where we look for "buffer"
+fn containsIdentifier(text: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    var search_start: usize = 0;
+    while (mem.indexOf(u8, text[search_start..], name)) |rel_pos| {
+        const pos = search_start + rel_pos;
+        search_start = pos + name.len;
+
+        // Check word boundaries
+        const at_start = pos == 0 or !isIdent(text[pos - 1]);
+        const at_end = pos + name.len >= text.len or !isIdent(text[pos + name.len]);
+
+        if (at_start and at_end) return true;
+    }
+    return false;
+}
+
 /// Check if position is a DIRECT assignment (var = value), not subscript (var[i] = value)
 /// For use-after-free: var[i] = value IS a use of var (dereferences it)
 fn isDirectAssignment(t: []const u8, name: []const u8, pos: usize) bool {
@@ -1014,23 +1121,22 @@ fn analyzeCFGMemorySafety(
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
 
-        // Detect allocations: const x = ... .alloc( or .create(
-        const has_alloc = mem.indexOf(u8, t, ".alloc(") != null or
-            mem.indexOf(u8, t, ".create(") != null;
-        if (has_alloc and (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) {
+        // Detect allocations: const x = ... .alloc( or .create( (skip patterns in strings)
+        if (hasRealAllocPattern(t) and
+            (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")))
+        {
             const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
             var end = prefix;
             while (end < t.len and isIdent(t[end])) end += 1;
             if (end > prefix) {
                 const name = t[prefix..end];
-                const col = mem.indexOf(u8, t, ".alloc(") orelse
-                    mem.indexOf(u8, t, ".create(") orelse 0;
+                const col = getRealAllocPos(t) orelse 0;
                 try allocs.put(name, .{
                     .name = name,
                     .alloc_line = actual_line,
                     .alloc_col = col + 1,
                     .state = .allocated,
-                    .is_create = mem.indexOf(u8, t, ".create(") != null,
+                    .is_create = hasRealCreatePattern(t),
                 });
             }
         }
@@ -1040,6 +1146,71 @@ fn analyzeCFGMemorySafety(
 
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
+
+    // Pre-pass: Mark which lines are inside errdefer or defer blocks
+    // This is function-wide to handle blocks spanning CFG blocks
+    // Frees inside defer blocks don't happen until scope exit, so we skip them
+    // for use-after-free analysis (the use before the defer line is valid)
+    var in_errdefer = try allocator.alloc(bool, lines.len);
+    defer allocator.free(in_errdefer);
+    var in_defer = try allocator.alloc(bool, lines.len);
+    defer allocator.free(in_defer);
+    @memset(in_errdefer, false);
+    @memset(in_defer, false);
+    {
+        var errdefer_depth: usize = 0;
+        var defer_depth: usize = 0;
+        for (lines, 0..) |line, idx| {
+            const t = mem.trim(u8, line, " \t\r");
+
+            // Track errdefer blocks
+            if (mem.startsWith(u8, t, "errdefer ") or mem.startsWith(u8, t, "errdefer{")) {
+                errdefer_depth += 1;
+                // Check if single-line errdefer (balanced braces)
+                var braces: i32 = 0;
+                for (t) |c| {
+                    if (c == '{') braces += 1;
+                    if (c == '}') braces -= 1;
+                }
+                if (braces == 0 and errdefer_depth > 0) errdefer_depth -= 1;
+                in_errdefer[idx] = true;
+                continue;
+            }
+            if (errdefer_depth > 0) {
+                in_errdefer[idx] = true;
+                for (t) |c| {
+                    if (c == '{') errdefer_depth += 1;
+                    if (c == '}') {
+                        if (errdefer_depth > 0) errdefer_depth -= 1;
+                    }
+                }
+            }
+
+            // Track regular defer blocks (only multi-line, single-line defers are separate)
+            // Note: single-line `defer expr;` doesn't need tracking (handled elsewhere)
+            if (mem.startsWith(u8, t, "defer {") or mem.startsWith(u8, t, "defer{")) {
+                // Found start of multi-line defer block
+                in_defer[idx] = true;
+                // Count braces on this line too (the opening { is part of the defer)
+                for (t) |c| {
+                    if (c == '{') defer_depth += 1;
+                    if (c == '}') {
+                        if (defer_depth > 0) defer_depth -= 1;
+                    }
+                }
+                continue;
+            }
+            if (defer_depth > 0) {
+                in_defer[idx] = true;
+                for (t) |c| {
+                    if (c == '{') defer_depth += 1;
+                    if (c == '}') {
+                        if (defer_depth > 0) defer_depth -= 1;
+                    }
+                }
+            }
+        }
+    }
 
     // Phase 2: For each allocation, track freed state through CFG
     var alloc_iter = allocs.iterator();
@@ -1073,12 +1244,19 @@ fn analyzeCFGMemorySafety(
                 if (idx >= lines.len) continue;
                 const t = mem.trim(u8, lines[idx], " \t\r");
 
-                // Skip defer - it doesn't free immediately, only at scope exit
-                if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) continue;
+                // Skip lines inside errdefer blocks (frees only run on error path)
+                if (in_errdefer[idx]) continue;
 
-                const has_free = mem.indexOf(u8, t, ".free(") != null or
-                    mem.indexOf(u8, t, ".destroy(") != null;
-                if (has_free and mem.indexOf(u8, t, var_name) != null) {
+                // Skip lines inside defer blocks (frees happen at scope exit, not here)
+                // This prevents false use-after-free when code uses var before defer scope ends
+                if (in_defer[idx]) continue;
+
+                // Skip single-line defer - tracked separately
+                if (mem.startsWith(u8, t, "defer ")) continue;
+
+                // Check if this free is for our local variable (not a struct field)
+                // Skip patterns inside string literals (e.g., searching for ".free(")
+                if (hasRealFreePattern(t) and isLocalVarOccurrence(t, var_name)) {
                     free_seen = true;
                     free_line = line_num;
                 }
@@ -1131,8 +1309,7 @@ fn analyzeCFGMemorySafety(
 
             // Skip: declarations, frees, defers, comments
             if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) continue;
-            if (mem.indexOf(u8, t, ".free(") != null) continue;
-            if (mem.indexOf(u8, t, ".destroy(") != null) continue;
+            if (hasRealFreePattern(t)) continue; // Skip patterns in string literals
             if (mem.startsWith(u8, t, "defer")) continue;
             if (mem.startsWith(u8, t, "//")) continue; // Skip comments
             if (mem.startsWith(u8, t, "\\\\")) continue; // Skip multiline strings
@@ -1149,6 +1326,9 @@ fn analyzeCFGMemorySafety(
                 // Verify it's a full word match
                 if (var_pos + var_name.len < t.len and isIdent(t[var_pos + var_name.len])) continue;
                 if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
+
+                // Skip struct field access (self.field) - not a local variable use
+                if (var_pos > 0 and t[var_pos - 1] == '.') continue;
 
                 // Skip if inside a string literal
                 if (isInsideString(t, var_pos)) continue;
@@ -1177,12 +1357,18 @@ fn analyzeCFGMemorySafety(
                 if (check_idx >= lines.len) continue;
                 const check_t = mem.trim(u8, lines[check_idx], " \t\r");
 
-                // Skip defer/errdefer - they don't free immediately
-                if (mem.startsWith(u8, check_t, "defer ") or mem.startsWith(u8, check_t, "errdefer ")) continue;
+                // Skip lines inside errdefer blocks (frees only run on error path)
+                if (in_errdefer[check_idx]) continue;
 
-                const check_free = mem.indexOf(u8, check_t, ".free(") != null or
-                    mem.indexOf(u8, check_t, ".destroy(") != null;
-                if (check_free and mem.indexOf(u8, check_t, var_name) != null) {
+                // Skip lines inside defer blocks (frees happen at scope exit, not here)
+                if (in_defer[check_idx]) continue;
+
+                // Skip single-line defer - tracked separately
+                if (mem.startsWith(u8, check_t, "defer ")) continue;
+
+                const check_free = hasRealFreePattern(check_t);
+                // Only count frees of local variables (not struct fields)
+                if (check_free and isLocalVarOccurrence(check_t, var_name)) {
                     freed_same_block = true;
                     alloc.freed_line = check_line;
                 }
@@ -1256,10 +1442,8 @@ fn analyzeCFGMemorySafety(
             // Skip defer/errdefer - they don't free immediately
             if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) continue;
 
-            // Only look at free operations
-            const has_free = mem.indexOf(u8, t, ".free(") != null or
-                mem.indexOf(u8, t, ".destroy(") != null;
-            if (!has_free) continue;
+            // Only look at free operations (skip patterns in string literals)
+            if (!hasRealFreePattern(t)) continue;
             if (mem.indexOf(u8, t, var_name) == null) continue;
 
             const bid = findBlockForLine(cfg, actual_line) orelse continue;
@@ -1274,12 +1458,18 @@ fn analyzeCFGMemorySafety(
                 if (check_idx >= lines.len) continue;
                 const check_t = mem.trim(u8, lines[check_idx], " \t\r");
 
-                // Skip defer/errdefer - they don't free immediately
-                if (mem.startsWith(u8, check_t, "defer ") or mem.startsWith(u8, check_t, "errdefer ")) continue;
+                // Skip lines inside errdefer blocks (frees only run on error path)
+                if (in_errdefer[check_idx]) continue;
 
-                const check_free = mem.indexOf(u8, check_t, ".free(") != null or
-                    mem.indexOf(u8, check_t, ".destroy(") != null;
-                if (check_free and mem.indexOf(u8, check_t, var_name) != null) {
+                // Skip lines inside defer blocks (frees happen at scope exit, not here)
+                if (in_defer[check_idx]) continue;
+
+                // Skip single-line defer - tracked separately
+                if (mem.startsWith(u8, check_t, "defer ")) continue;
+
+                const check_free = hasRealFreePattern(check_t);
+                // Only count frees of local variables (not struct fields)
+                if (check_free and isLocalVarOccurrence(check_t, var_name)) {
                     prev_free_in_block = true;
                     alloc.freed_line = check_line;
                     break;
@@ -1454,14 +1644,17 @@ fn analyzeCFGDeferCoverage(
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
 
-        // Detect allocations
-        const has_alloc = mem.indexOf(u8, t, ".alloc(") != null or
-            mem.indexOf(u8, t, ".create(") != null;
-        if (!has_alloc) continue;
+        // Detect allocations (skip patterns inside string literals)
+        if (!hasRealAllocPattern(t)) continue;
         if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
 
-        // Skip arena allocators (by name in line)
+        // Skip no-free allocators (arena, scratch, temp, frame, fba, recycle)
         if (mem.indexOf(u8, t, "arena") != null) continue;
+        if (mem.indexOf(u8, t, "scratch") != null) continue;
+        if (mem.indexOf(u8, t, "temp") != null) continue;
+        if (mem.indexOf(u8, t, "frame") != null) continue;
+        if (mem.indexOf(u8, t, ".fba.") != null) continue;
+        if (mem.indexOf(u8, t, "recycle") != null) continue;
 
         const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
         var end = prefix;
@@ -1469,8 +1662,7 @@ fn analyzeCFGDeferCoverage(
         if (end <= prefix) continue;
 
         const name = t[prefix..end];
-        const col = mem.indexOf(u8, t, ".alloc(") orelse
-            mem.indexOf(u8, t, ".create(") orelse 0;
+        const col = getRealAllocPos(t) orelse 0;
         const block = findBlockForLine(cfg, actual_line) orelse continue;
 
         try allocs.append(allocator, .{
@@ -1478,8 +1670,68 @@ fn analyzeCFGDeferCoverage(
             .line = actual_line,
             .col = col + 1,
             .block = block,
-            .is_create = mem.indexOf(u8, t, ".create(") != null,
+            .is_create = hasRealCreatePattern(t),
         });
+    }
+
+    if (allocs.items.len == 0) return issues;
+
+    // Pre-pass: Check for immediate defer after multi-line allocations
+    // This handles cases where CFG incorrectly splits blocks at inline expressions
+    // Only matches defer at the SAME indentation level (not inside conditionals)
+    for (allocs.items) |*alloc| {
+        const alloc_idx = alloc.line - func_line;
+        if (alloc_idx >= lines.len) continue;
+
+        // Get indentation of allocation line
+        const alloc_line = lines[alloc_idx];
+        const alloc_indent = countIndent(alloc_line);
+
+        // First, find where the allocation statement ends (may span multiple lines)
+        var alloc_end_idx = alloc_idx;
+        var brace_depth: i32 = 0;
+        for (alloc_idx..lines.len) |idx| {
+            const scan_line = mem.trim(u8, lines[idx], " \t\r");
+            for (scan_line) |c| {
+                if (c == '{' or c == '(') brace_depth += 1;
+                if (c == '}' or c == ')') brace_depth -= 1;
+            }
+            // Allocation ends when we see semicolon at brace depth 0 (or negative)
+            if (mem.indexOf(u8, scan_line, ";") != null and brace_depth <= 0) {
+                alloc_end_idx = idx;
+                break;
+            }
+        }
+
+        // Now check the line immediately after the allocation for a defer
+        const defer_idx = alloc_end_idx + 1;
+        if (defer_idx >= lines.len) continue;
+
+        const raw_line = lines[defer_idx];
+        const scan_line = mem.trim(u8, raw_line, " \t\r");
+
+        // Must be a defer statement
+        if (!mem.startsWith(u8, scan_line, "defer ")) continue;
+
+        // Check indentation matches - defer must be at same level as alloc
+        const defer_indent = countIndent(raw_line);
+        if (defer_indent != alloc_indent) continue;
+
+        // Check if it frees this allocation (skip patterns in string literals)
+        const has_free = hasRealCleanupPattern(scan_line);
+        if (has_free and mem.indexOf(u8, scan_line, alloc.name) != null) {
+            alloc.line = 0; // Mark for removal
+        }
+    }
+
+    // Remove allocations that have immediate defer (marked with line = 0)
+    var i: usize = 0;
+    while (i < allocs.items.len) {
+        if (allocs.items[i].line == 0) {
+            _ = allocs.swapRemove(i);
+        } else {
+            i += 1;
+        }
     }
 
     if (allocs.items.len == 0) return issues;
@@ -1504,6 +1756,77 @@ fn analyzeCFGDeferCoverage(
         defer allocator.free(free_and_return_in_block);
         @memset(free_and_return_in_block, false);
 
+        // CFG-based ownership tracking: track variables that contain the allocation
+        // Start with the original allocation variable, add others as data flows
+        const OwnerVar = struct { name: []const u8 };
+        var owner_vars = std.ArrayListUnmanaged(OwnerVar){};
+        defer owner_vars.deinit(allocator);
+        try owner_vars.append(allocator, .{ .name = alloc.name });
+
+        // First pass: track data flow through all blocks to find all owner variables
+        // Pattern: const x = Type{ .field = alloc_name } -> x is an owner
+        // Pattern: x.* = Type{ .field = alloc_name } -> x is an owner
+        for (cfg.blocks.items) |block| {
+            if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+            for (block.start_line..block.end_line + 1) |line_num| {
+                if (line_num < func_line) continue;
+                const idx = line_num - func_line;
+                if (idx >= lines.len) continue;
+                const t = mem.trim(u8, lines[idx], " \t\r");
+
+                // Check if any current owner var appears in a struct assignment
+                var owner_appears = false;
+                for (owner_vars.items) |ov| {
+                    if (mem.indexOf(u8, t, ov.name) != null) {
+                        owner_appears = true;
+                        break;
+                    }
+                }
+                if (!owner_appears) continue;
+
+                // Pattern: const varname = Type{ ... owner_var ... }
+                if (mem.startsWith(u8, t, "const ") and mem.indexOf(u8, t, "{") != null) {
+                    var end: usize = 6;
+                    while (end < t.len and isIdent(t[end])) end += 1;
+                    if (end > 6) {
+                        const new_owner = t[6..end];
+                        // Don't add if already tracked
+                        var already_tracked = false;
+                        for (owner_vars.items) |ov| {
+                            if (mem.eql(u8, ov.name, new_owner)) {
+                                already_tracked = true;
+                                break;
+                            }
+                        }
+                        if (!already_tracked) {
+                            try owner_vars.append(allocator, .{ .name = new_owner });
+                        }
+                    }
+                }
+
+                // Pattern: varname.* = Type{ ... owner_var ... }
+                // Adds the base variable (before .*) as an owner
+                if (mem.indexOf(u8, t, ".* = ") != null and mem.indexOf(u8, t, "{") != null) {
+                    var end: usize = 0;
+                    while (end < t.len and isIdent(t[end])) end += 1;
+                    if (end > 0) {
+                        const new_owner = t[0..end];
+                        var already_tracked = false;
+                        for (owner_vars.items) |ov| {
+                            if (mem.eql(u8, ov.name, new_owner)) {
+                                already_tracked = true;
+                                break;
+                            }
+                        }
+                        if (!already_tracked) {
+                            try owner_vars.append(allocator, .{ .name = new_owner });
+                        }
+                    }
+                }
+            }
+        }
+
         // Scan for defers, ownership transfers, and free-return patterns
         for (cfg.blocks.items, 0..) |block, bid| {
             if (block.start_line == 0 or block.start_line > block.end_line) continue;
@@ -1517,20 +1840,16 @@ fn analyzeCFGDeferCoverage(
                 if (idx >= lines.len) continue;
                 const t = mem.trim(u8, lines[idx], " \t\r");
 
-                // Check for defer with this variable
+                // Check for defer with this variable (skip patterns in strings)
                 if (mem.startsWith(u8, t, "defer ")) {
-                    const has_free = mem.indexOf(u8, t, ".free(") != null or
-                        mem.indexOf(u8, t, ".destroy(") != null;
-                    if (has_free and mem.indexOf(u8, t, alloc.name) != null) {
+                    if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
                         has_defer_in_block[bid] = true;
                     }
                 }
 
                 // Check for manual free of this variable (not in defer)
                 if (!mem.startsWith(u8, t, "defer ") and !mem.startsWith(u8, t, "errdefer ")) {
-                    const has_free = mem.indexOf(u8, t, ".free(") != null or
-                        mem.indexOf(u8, t, ".destroy(") != null;
-                    if (has_free and mem.indexOf(u8, t, alloc.name) != null) {
+                    if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
                         freed_in_block = true;
                     }
                 }
@@ -1540,13 +1859,33 @@ fn analyzeCFGDeferCoverage(
                     return_after_free = true;
                 }
 
-                // Check for ownership transfer (return, store in self)
-                if (mem.indexOf(u8, t, alloc.name) != null) {
-                    if (mem.startsWith(u8, t, "return ") or
-                        mem.indexOf(u8, t, "self.") != null or
-                        mem.indexOf(u8, t, "result.") != null)
-                    {
+                // Check for ownership transfer using CFG-tracked owner variables
+                // If any owner variable is returned, stored in self, or assigned to module var
+                for (owner_vars.items) |ov| {
+                    if (mem.indexOf(u8, t, ov.name) == null) continue;
+
+                    // Direct return of owner variable
+                    if (mem.startsWith(u8, t, "return ")) {
                         ownership_transferred_in_block[bid] = true;
+                        break;
+                    }
+                    // Stored in self or ctx field
+                    if (mem.indexOf(u8, t, "self.") != null or mem.indexOf(u8, t, "ctx.") != null) {
+                        ownership_transferred_in_block[bid] = true;
+                        break;
+                    }
+                    // Module-level variable assignment (no const/var prefix, simple identifier)
+                    if (mem.indexOf(u8, t, " = ") != null and
+                        !mem.startsWith(u8, t, "const ") and
+                        !mem.startsWith(u8, t, "var "))
+                    {
+                        const eq_pos = mem.indexOf(u8, t, " = ").?;
+                        const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+                        if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null) {
+                            // Simple identifier on LHS - likely module-level var
+                            ownership_transferred_in_block[bid] = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -1676,6 +2015,15 @@ fn analyzeCFGErrdeferCoverage(
     // Only analyze functions that can return errors
     if (!fn_returns_error) return issues;
 
+    // Skip functions that use arena allocators (no errdefer needed)
+    // Pattern: ArenaAllocator.init + defer arena.deinit() + const allocator = arena.allocator()
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.indexOf(u8, t, "ArenaAllocator.init") != null) return issues;
+        if (mem.indexOf(u8, t, "arena.deinit()") != null) return issues;
+        if (mem.indexOf(u8, t, "arena.allocator()") != null) return issues;
+    }
+
     // Phase 1: Identify allocations with try and their positions
     const TryAlloc = struct {
         name: []const u8,
@@ -1689,9 +2037,13 @@ fn analyzeCFGErrdeferCoverage(
     defer try_allocs.deinit(allocator);
 
     // Phase 2: Identify errdefer statements and what they cover
+    // Store the entire content after errdefer/defer to support patterns like:
+    //   errdefer pool.free(context, buffer)  - buffer is not first arg
+    //   errdefer self.allocator.free(self.memory, cps)  - cps is second arg
+    //   errdefer { multiline block with cleanup inside }
     const ErrdeferInfo = struct {
         line: usize,
-        covers_name: []const u8,
+        content: []const u8, // Full content after errdefer/defer prefix (or block content)
     };
 
     var errdefers = std.ArrayListUnmanaged(ErrdeferInfo){};
@@ -1701,6 +2053,12 @@ fn analyzeCFGErrdeferCoverage(
     var try_lines = std.ArrayListUnmanaged(usize){};
     defer try_lines.deinit(allocator);
 
+    // Track multi-line errdefer/defer blocks
+    var errdefer_block_depth: usize = 0;
+    var errdefer_block_start: usize = 0;
+    var errdefer_block_content = std.ArrayListUnmanaged(u8){};
+    defer errdefer_block_content.deinit(allocator);
+
     // Single pass to collect all information
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
@@ -1709,53 +2067,104 @@ fn analyzeCFGErrdeferCoverage(
         // Skip comments
         if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
 
-        // Detect try allocations: const/var x = try allocator.alloc/create
-        const has_try = mem.indexOf(u8, t, "try ") != null;
-        const has_alloc = mem.indexOf(u8, t, ".alloc(") != null or
-            mem.indexOf(u8, t, ".create(") != null;
+        // Track multi-line errdefer/defer blocks
+        if (errdefer_block_depth > 0) {
+            // Accumulate content for multi-line blocks
+            try errdefer_block_content.appendSlice(allocator, t);
+            try errdefer_block_content.append(allocator, ' ');
+            // Track brace depth
+            for (t) |c| {
+                if (c == '{') errdefer_block_depth += 1;
+                if (c == '}') {
+                    if (errdefer_block_depth > 0) errdefer_block_depth -= 1;
+                    if (errdefer_block_depth == 0) {
+                        // End of multi-line block - store if has cleanup pattern
+                        const block_content = errdefer_block_content.items;
+                        if (hasRealCleanupPattern(block_content)) {
+                            try errdefers.append(allocator, .{
+                                .line = errdefer_block_start,
+                                .content = try allocator.dupe(u8, block_content),
+                            });
+                        }
+                        errdefer_block_content.clearRetainingCapacity();
+                    }
+                }
+            }
+            continue; // Don't process this line for other patterns while in block
+        }
 
-        if (has_try and has_alloc and
+        // Detect try allocations: const/var x = try allocator.alloc/create
+        // Skip patterns inside string literals
+        const has_try = mem.indexOf(u8, t, "try ") != null;
+        const has_alloc = hasPatternNotInString(t, ".alloc(");
+        const has_create = hasPatternNotInString(t, ".create(") and isAllocatorCreate(t);
+
+        if (has_try and (has_alloc or has_create) and
             (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")))
         {
-            // Skip arena allocators
+            // Skip no-free allocators (arena, scratch, temp, frame, fba, recycle)
             if (mem.indexOf(u8, t, "arena") != null) continue;
+            if (mem.indexOf(u8, t, "scratch") != null) continue;
+            if (mem.indexOf(u8, t, "temp") != null) continue;
+            if (mem.indexOf(u8, t, "frame") != null) continue;
+            if (mem.indexOf(u8, t, ".fba.") != null) continue;
+            if (mem.indexOf(u8, t, "recycle") != null) continue;
 
             const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
             var end = prefix;
             while (end < t.len and isIdent(t[end])) end += 1;
             if (end > prefix) {
                 const name = t[prefix..end];
-                const col = mem.indexOf(u8, t, ".alloc(") orelse
-                    mem.indexOf(u8, t, ".create(") orelse 0;
+                const col = getRealAllocPos(t) orelse 0;
                 try try_allocs.append(allocator, .{
                     .name = name,
                     .line = actual_line,
                     .col = col + 1,
-                    .is_create = mem.indexOf(u8, t, ".create(") != null,
+                    .is_create = hasRealCreatePattern(t),
                 });
             }
         }
 
-        // Detect errdefer statements
-        if (mem.startsWith(u8, t, "errdefer ")) {
-            const has_free = mem.indexOf(u8, t, ".free(") != null or
-                mem.indexOf(u8, t, ".destroy(") != null;
-            if (has_free) {
-                // Extract variable name from .free(name) or .destroy(name)
-                const free_pos = mem.indexOf(u8, t, ".free(") orelse mem.indexOf(u8, t, ".destroy(");
-                if (free_pos) |pos| {
-                    const open_paren = pos + (if (mem.indexOf(u8, t, ".free(") != null) @as(usize, 6) else 9);
-                    if (open_paren < t.len) {
-                        var name_end = open_paren;
-                        while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
-                        if (name_end > open_paren) {
-                            try errdefers.append(allocator, .{
-                                .line = actual_line,
-                                .covers_name = t[open_paren..name_end],
-                            });
-                        }
+        // Detect defer/errdefer statements (both provide cleanup on error)
+        // Handle both single-line and multi-line blocks
+        const is_errdefer = mem.startsWith(u8, t, "errdefer ");
+        const is_defer = mem.startsWith(u8, t, "defer ");
+        if (is_errdefer or is_defer) {
+            const prefix_len: usize = if (is_errdefer) 9 else 6;
+            const content_after_prefix = if (prefix_len < t.len) t[prefix_len..] else "";
+
+            // Check for multi-line block: errdefer { or defer {
+            if (mem.startsWith(u8, content_after_prefix, "{")) {
+                // Start tracking multi-line block
+                errdefer_block_start = actual_line;
+                errdefer_block_depth = 1;
+                errdefer_block_content.clearRetainingCapacity();
+                try errdefer_block_content.appendSlice(allocator, content_after_prefix);
+                try errdefer_block_content.append(allocator, ' ');
+                // Count additional braces on this line
+                for (content_after_prefix[1..]) |c| {
+                    if (c == '{') errdefer_block_depth += 1;
+                    if (c == '}') {
+                        if (errdefer_block_depth > 0) errdefer_block_depth -= 1;
                     }
                 }
+                // If block closed on same line, store it
+                if (errdefer_block_depth == 0) {
+                    const block_content = errdefer_block_content.items;
+                    if (hasRealCleanupPattern(block_content)) {
+                        try errdefers.append(allocator, .{
+                            .line = actual_line,
+                            .content = try allocator.dupe(u8, block_content),
+                        });
+                    }
+                    errdefer_block_content.clearRetainingCapacity();
+                }
+            } else if (hasRealCleanupPattern(t)) {
+                // Single-line errdefer/defer with cleanup pattern
+                try errdefers.append(allocator, .{
+                    .line = actual_line,
+                    .content = content_after_prefix,
+                });
             }
         }
 
@@ -1767,12 +2176,40 @@ fn analyzeCFGErrdeferCoverage(
 
     if (try_allocs.items.len == 0) return issues;
 
-    // Phase 4: For each allocation, check if errdefer exists before each subsequent try
+    // Phase 4: Check for ownership transfer patterns (break :value, alias assignment, etc.)
+    // If ownership is transferred, we don't need errdefer for that allocation
     for (try_allocs.items) |*alloc| {
+        // Scan lines after allocation for ownership transfer
+        const alloc_idx = alloc.line - func_line;
+        if (alloc_idx < lines.len) {
+            for (lines[alloc_idx..]) |line| {
+                const lt = mem.trim(u8, line, " \t\r");
+                // Check for break :label with the allocation name (ownership transfer)
+                if (mem.indexOf(u8, lt, "break :") != null and containsIdentifier(lt, alloc.name)) {
+                    alloc.has_errdefer = true; // Treat as covered - ownership transferred
+                    break;
+                }
+                // Check for other ownership transfer patterns
+                if (isOwnershipTransfer(lt, alloc.name)) {
+                    alloc.has_errdefer = true; // Treat as covered - ownership transferred
+                    break;
+                }
+            }
+        }
+    }
+
+    // Phase 5: For each allocation, check if errdefer exists before each subsequent try
+    for (try_allocs.items) |*alloc| {
+        // Skip if already marked as covered (ownership transfer or errdefer found)
+        if (alloc.has_errdefer) continue;
+
         // Check if there's an errdefer for this allocation
+        // Match if the allocation name appears anywhere in the errdefer content
+        // This handles patterns like: errdefer pool.free(context, buffer)
         var errdefer_line: usize = 0;
         for (errdefers.items) |ed| {
-            if (mem.eql(u8, ed.covers_name, alloc.name)) {
+            // Check if allocation name appears as a word boundary in content
+            if (containsIdentifier(ed.content, alloc.name)) {
                 errdefer_line = ed.line;
                 alloc.has_errdefer = true;
                 break;
@@ -2188,6 +2625,7 @@ fn isNoFreeAllocatorName(name: []const u8) bool {
     if (mem.indexOf(u8, name, "scratch") != null) return true;
     if (mem.indexOf(u8, name, "temp") != null) return true;
     if (mem.indexOf(u8, name, "frame") != null) return true;
+    if (mem.indexOf(u8, name, "recycle") != null) return true;
     if (mem.eql(u8, name, "fba")) return true;
     return false;
 }
@@ -2197,6 +2635,13 @@ fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
     const has_name = mem.indexOf(u8, t, alloc_name) != null;
     if (!has_name) return false;
 
+    // Labeled block break: break :value alloc_name (ownership transferred to block result)
+    // Pattern: @field(dst, name) = switch(Type) { X => value: { const buf = try alloc(); break :value buf; } }
+    if (mem.indexOf(u8, t, "break :") != null) return true;
+
+    // Out-parameter assignment: result.* = alloc_name, out.* = alloc_name, etc.
+    // C FFI functions often transfer ownership via out-parameters
+    if (mem.indexOf(u8, t, ".* = ") != null) return true;
     // @ptrCast transfers ownership
     if (mem.indexOf(u8, t, "@ptrCast") != null) return true;
     // @alignCast often paired with ownership transfer
@@ -2207,6 +2652,19 @@ fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
     if (mem.indexOf(u8, t, ".append(") != null) return true;
     if (mem.indexOf(u8, t, ".put(") != null) return true;
     if (mem.indexOf(u8, t, ".putNoClobber(") != null) return true;
+    // Ownership transfer via function call (callee takes ownership)
+    if (mem.indexOf(u8, t, ".submit(") != null) return true;
+    if (mem.indexOf(u8, t, ".enqueue(") != null) return true;
+    if (mem.indexOf(u8, t, ".push(") != null) return true;
+    if (mem.indexOf(u8, t, ".send(") != null) return true;
+    if (mem.indexOf(u8, t, ".emit(") != null) return true;
+    if (mem.indexOf(u8, t, ".dispatch(") != null) return true;
+    if (mem.indexOf(u8, t, ".transfer(") != null) return true;
+    if (mem.indexOf(u8, t, ".deliver(") != null) return true;
+    if (mem.indexOf(u8, t, ".publish(") != null) return true;
+    if (mem.indexOf(u8, t, ".broadcast(") != null) return true;
+    if (mem.indexOf(u8, t, ".post(") != null) return true;
+    if (mem.indexOf(u8, t, ".write(") != null) return true;
     return false;
 }
 
@@ -2247,22 +2705,51 @@ fn isKnownAllocatorName(name: []const u8) bool {
     return false;
 }
 
-/// Check if .create() is allocator.create() vs static method
+/// Check if name is known NON-allocator that calls .create()
+fn isKnownNonAllocatorCreate(name: []const u8) bool {
+    // Common non-allocator methods named .create() in Zig ecosystem
+    const non_allocator_creates = [_][]const u8{
+        "cgroup",     // Linux cgroup management (ghostty)
+        "os",         // OS file operations
+        "file",       // File system operations
+        "dir",        // Directory operations
+        "socket",     // Network socket creation
+        "thread",     // Thread spawning
+        "process",    // Process spawning
+        "pipe",       // Pipe creation
+        "event",      // Event creation
+        "signal",     // Signal handlers
+        "timer",      // Timer creation
+        "mutex",      // Mutex creation
+        "semaphore",  // Semaphore creation
+        "condvar",    // Condition variable creation
+        "internal_os", // Internal OS wrappers (ghostty)
+    };
+    for (non_allocator_creates) |known| {
+        if (mem.eql(u8, name, known)) return true;
+        // Also check dotted prefixes like internal_os.cgroup
+        if (mem.indexOf(u8, name, known) != null) return true;
+    }
+    return false;
+}
+
+/// Check if .create() is allocator.create() vs static method or non-allocator
 fn isAllocatorCreate(t: []const u8) bool {
     const pos = mem.indexOf(u8, t, ".create(") orelse return false;
     const name = extractCreateCaller(t, pos) orelse return false;
-    // Uppercase = Type.create() static method
+    // Uppercase = Type.create() static method (e.g., Parser.create())
     const is_upper = name.len > 0 and name[0] >= 'A' and name[0] <= 'Z';
     if (is_upper) return false;
+    // Check known non-allocator .create() patterns first
+    if (isKnownNonAllocatorCreate(name)) return false;
+    // Known allocator names
     if (isKnownAllocatorName(name)) return true;
-    // try before create suggests allocator
-    if (mem.indexOf(u8, t, "try ")) |try_pos| {
-        if (try_pos < pos) return true;
-    }
-    // Name contains allocator/alloc
+    // Name contains allocator/alloc - likely an allocator
     if (mem.indexOf(u8, name, "allocator") != null) return true;
     if (mem.indexOf(u8, name, "alloc") != null) return true;
-    return true;
+    // Default to false - be conservative about flagging .create()
+    // Only flag when we're confident it's an allocator
+    return false;
 }
 
 /// Extract the allocator name from an allocation line
@@ -2319,6 +2806,11 @@ const MemState = struct {
     // Multi-line self-assignment tracking
     in_self_assign: bool = false,
     self_assign_brace_depth: usize = 0,
+    // Local struct literal tracking (for return pattern)
+    in_local_struct: bool = false,
+    local_struct_name: []const u8 = "",
+    local_struct_brace_depth: usize = 0,
+    local_struct_has_alloc: bool = false,
 };
 
 /// Detect if allocation is returned (factory pattern)
@@ -2346,9 +2838,9 @@ fn isDirectFieldAssignment(t: []const u8, alloc_name: []const u8) bool {
     // LHS should be identifier.field (e.g., ctx.editing_buffer, self.buffer)
     if (mem.indexOf(u8, lhs, ".") == null) return false;
 
-    // RHS should contain alloc/create pattern
-    const has_alloc = mem.indexOf(u8, rhs, ".alloc(") != null or
-        mem.indexOf(u8, rhs, ".create(") != null;
+    // RHS should contain alloc/create pattern (skip patterns in strings)
+    const has_alloc = hasPatternNotInString(rhs, ".alloc(") or
+        hasPatternNotInString(rhs, ".create(");
     if (!has_alloc) return false;
 
     // Check if lhs field name matches alloc_name (e.g., ctx.editing_buffer with editing_buffer)
@@ -2375,6 +2867,95 @@ fn detectsArenaAllocator(t: []const u8) bool {
         if (mem.indexOf(u8, t, "arena :") != null) return true;
     }
     return false;
+}
+
+/// Detect ownership transfer via function call
+/// Pattern: foo.submit(alloc_name), queue.enqueue(alloc_name), etc.
+fn isOwnershipTransferCall(t: []const u8, alloc_name: []const u8) bool {
+    // Must contain alloc_name
+    const alloc_pos = mem.indexOf(u8, t, alloc_name) orelse return false;
+
+    // alloc_name must be followed by ) (argument to function)
+    if (alloc_pos + alloc_name.len >= t.len) return false;
+
+    // Check characters after alloc_name
+    var after_pos = alloc_pos + alloc_name.len;
+    while (after_pos < t.len and t[after_pos] == ' ') after_pos += 1;
+    if (after_pos >= t.len) return false;
+
+    // Must end with ) or , (part of argument list)
+    if (t[after_pos] != ')' and t[after_pos] != ',') return false;
+
+    // Check for ownership-transferring method names before (
+    const ownership_methods = [_][]const u8{
+        ".submit(",  ".enqueue(",   ".push(",     ".send(",
+        ".emit(",    ".dispatch(",  ".transfer(", ".deliver(",
+        ".publish(", ".broadcast(", ".post(",     ".write(",
+    };
+    for (ownership_methods) |method| {
+        if (mem.indexOf(u8, t, method) != null) return true;
+    }
+
+    return false;
+}
+
+/// Detect module-level variable assignment (singleton/global pattern)
+/// Pattern: identifier = alloc_name (no const/var keyword, no self./ctx. prefix)
+fn isModuleLevelAssignment(t: []const u8, alloc_name: []const u8) bool {
+    // Must contain alloc_name
+    if (mem.indexOf(u8, t, alloc_name) == null) return false;
+
+    // Must have an assignment
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
+
+    // Must not be a const/var declaration (those are local)
+    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return false;
+
+    // Extract lhs (the assigned-to variable)
+    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+    if (lhs.len == 0) return false;
+
+    // LHS must be a simple identifier OR have a dot for field access
+    // Skip if it's self.x or ctx.x (handled by other checks)
+    if (mem.startsWith(u8, lhs, "self.") or mem.startsWith(u8, lhs, "ctx.")) return false;
+
+    // If LHS is a simple identifier (no dots), it might be a module-level variable
+    if (mem.indexOf(u8, lhs, ".") == null) {
+        // Ensure alloc_name appears on RHS
+        const rhs = t[eq_pos + 3 ..];
+        return mem.indexOf(u8, rhs, alloc_name) != null;
+    }
+
+    return false;
+}
+
+/// Detect direct module-level allocation (not a local var, not a field)
+/// Pattern: identifier = try allocator.alloc/create(...) where identifier is module-level
+fn isDirectModuleLevelAlloc(t: []const u8) bool {
+    // Must have an assignment
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
+
+    // Extract lhs (the assigned-to variable)
+    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+    if (lhs.len == 0) return false;
+
+    // Must not be a const/var declaration (those are local)
+    if (mem.startsWith(u8, lhs, "const ") or mem.startsWith(u8, lhs, "var ")) return false;
+
+    // Skip if it's self.x or ctx.x (handled by other checks as field assignment)
+    if (mem.startsWith(u8, lhs, "self.") or mem.startsWith(u8, lhs, "ctx.")) return false;
+
+    // Skip if lhs contains a dot (field access like x.y)
+    if (mem.indexOf(u8, lhs, ".") != null) return false;
+
+    // LHS must be a valid identifier (letters, numbers, underscores)
+    for (lhs) |c| {
+        if (!isIdent(c)) return false;
+    }
+
+    // RHS must contain .alloc( or .create( (skip patterns in strings)
+    const rhs = t[eq_pos + 3 ..];
+    return hasPatternNotInString(rhs, ".alloc(") or hasPatternNotInString(rhs, ".create(");
 }
 
 fn extractAllocVarName(t: []const u8) []const u8 {
@@ -2405,10 +2986,16 @@ fn isFieldAssignmentAlloc(t: []const u8) bool {
 /// Check if allocation is directly returned (return alloc.alloc(...))
 /// Ownership transfers to caller, no defer needed
 fn isDirectReturnAlloc(t: []const u8) bool {
-    return mem.startsWith(u8, t, "return ");
+    // Direct return statement
+    if (mem.startsWith(u8, t, "return ")) return true;
+    // Part of return if-else expression (check if line ends with semicolon after alloc)
+    // Pattern: return if (...) ... else try alloc.alloc(...);
+    // The alloc line might not start with return but is part of return expression
+    if (mem.indexOf(u8, t, "return if") != null) return true;
+    return false;
 }
 
-fn checkMemoryAlloc(state: *MemState, t: []const u8, line_num: usize) void {
+fn checkMemoryAlloc(state: *MemState, t: []const u8, line_num: usize, in_return_context: bool) void {
     if (!state.in_fn) return;
 
     if (mem.indexOf(u8, t, ".alloc(")) |col| {
@@ -2416,8 +3003,10 @@ fn checkMemoryAlloc(state: *MemState, t: []const u8, line_num: usize) void {
         const has_defer = mem.indexOf(u8, t, "defer") != null;
         const is_pool = isPoolAllocator(t);
         const is_field_assign = isFieldAssignmentAlloc(t);
-        const is_return = isDirectReturnAlloc(t);
-        if (!in_str and !has_defer and !is_pool and !is_field_assign and !is_return) {
+        // Check both direct return AND multi-line return context
+        const is_return = isDirectReturnAlloc(t) or in_return_context;
+        const is_module_level = isDirectModuleLevelAlloc(t);
+        if (!in_str and !has_defer and !is_pool and !is_field_assign and !is_return and !is_module_level) {
             state.alloc_line = line_num;
             state.alloc_col = col + 1;
             state.is_create = false;
@@ -2430,8 +3019,10 @@ fn checkMemoryAlloc(state: *MemState, t: []const u8, line_num: usize) void {
         const is_pool = isPoolAllocator(t);
         const is_alloc = isAllocatorCreate(t);
         const is_field_assign = isFieldAssignmentAlloc(t);
-        const is_return = isDirectReturnAlloc(t);
-        if (!in_str and !has_defer and !is_pool and is_alloc and !is_field_assign and !is_return) {
+        // Check both direct return AND multi-line return context
+        const is_return = isDirectReturnAlloc(t) or in_return_context;
+        const is_module_level = isDirectModuleLevelAlloc(t);
+        if (!in_str and !has_defer and !is_pool and is_alloc and !is_field_assign and !is_return and !is_module_level) {
             state.alloc_line = line_num;
             state.alloc_col = col + 1;
             state.is_create = true;
@@ -2492,7 +3083,14 @@ fn trackMemoryBraces(
         if (c != '}' or state.depth == 0) continue;
         state.depth -= 1;
         if (state.depth != 0) continue;
-        const should_report = state.alloc_line > 0 and !state.has_defer;
+        // Skip warning if:
+        // - has defer/errdefer
+        // - uses arena allocator (bulk freed)
+        // - allocation was returned (ownership transfer to caller)
+        // - allocation was stored in self/ctx field (struct owns it)
+        const ownership_transferred = state.returned or state.stored_in_self;
+        const has_cleanup = state.has_defer or state.uses_arena or ownership_transferred;
+        const should_report = state.alloc_line > 0 and !has_cleanup;
         if (should_report) {
             try reportMemoryIssue(issues, allocator, path, state);
         }
@@ -2528,6 +3126,8 @@ fn analyzeFileMemory(
             state.has_defer = true;
         }
         // Track multi-line return statements
+        // IMPORTANT: Save state BEFORE updating so we can detect allocations in last line
+        const was_in_return = state.in_return;
         if (mem.startsWith(u8, t, "return ")) {
             state.in_return = true;
             state.return_brace_depth = 0;
@@ -2546,14 +3146,19 @@ fn analyzeFileMemory(
                 state.in_return = false;
             }
         }
+        // Restore for detection if we were in return before this line ended it
+        const in_return_context = was_in_return or state.in_return;
 
-        // Track multi-line self-assignment (self.x = .{...} or result.x = .{...})
+        // Track multi-line self-assignment (self.x = .{...} or self.* = TypeName{...})
         if (!state.in_self_assign) {
             const has_self_or_ctx = mem.indexOf(u8, t, "self.") != null or
                 mem.indexOf(u8, t, "ctx.") != null or
                 mem.indexOf(u8, t, "result.") != null;
+            // Match both anonymous struct literal (.{) and typed struct literal (TypeName{)
             const has_struct_literal = mem.indexOf(u8, t, "= .{") != null or
-                mem.indexOf(u8, t, "= .{ ") != null;
+                mem.indexOf(u8, t, "= .{ ") != null or
+                (mem.indexOf(u8, t, "{") != null and mem.indexOf(u8, t, "= ") != null and
+                mem.indexOf(u8, t, "fn ") == null);
             if (has_self_or_ctx and has_struct_literal) {
                 state.in_self_assign = true;
                 state.self_assign_brace_depth = 0;
@@ -2570,10 +3175,50 @@ fn analyzeFileMemory(
             }
         }
 
+        // Track local struct literals (const result = TypeName{...})
+        // Used to detect pattern: alloc stored in struct field, struct later returned
+        if (!state.in_local_struct and state.alloc_name.len > 0) {
+            // Look for: const varname = TypeName{ or const varname = .{
+            if (mem.startsWith(u8, t, "const ")) {
+                if (mem.indexOf(u8, t, "= .{") != null or
+                    mem.indexOf(u8, t, "= .{ ") != null or
+                    (mem.indexOf(u8, t, "{") != null and
+                    mem.indexOf(u8, t, "= ") != null and
+                    mem.indexOf(u8, t, "fn ") == null))
+                {
+                    // Extract the variable name
+                    const name_start: usize = 6; // After "const "
+                    var name_end = name_start;
+                    while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
+                    if (name_end > name_start) {
+                        state.local_struct_name = t[name_start..name_end];
+                        state.in_local_struct = true;
+                        state.local_struct_brace_depth = 0;
+                        state.local_struct_has_alloc = false;
+                    }
+                }
+            }
+        }
+        if (state.in_local_struct) {
+            // Track braces within local struct literal
+            for (t) |c| {
+                if (c == '{') state.local_struct_brace_depth += 1;
+                if (c == '}') {
+                    if (state.local_struct_brace_depth > 0) state.local_struct_brace_depth -= 1;
+                    if (state.local_struct_brace_depth == 0) state.in_local_struct = false;
+                }
+            }
+            // Check if our allocation is stored in this struct
+            if (state.alloc_name.len > 0 and mem.indexOf(u8, t, state.alloc_name) != null) {
+                state.local_struct_has_alloc = true;
+            }
+        }
+
         // Detect factory patterns: return or store in self
         if (state.alloc_name.len > 0) {
             // Check if alloc is in return statement (single or multi-line)
-            if (state.in_return or mem.startsWith(u8, t, "return ")) {
+            // Use in_return_context to catch allocations on last line of multi-line return
+            if (in_return_context or mem.startsWith(u8, t, "return ")) {
                 if (mem.indexOf(u8, t, state.alloc_name) != null) {
                     state.returned = true;
                 }
@@ -2591,8 +3236,27 @@ fn analyzeFileMemory(
             if (isSelfStoragePattern(t, state.alloc_name)) {
                 state.stored_in_self = true;
             }
+            // Module-level variable assignment: identifier = alloc_name (no self/ctx prefix)
+            if (isModuleLevelAssignment(t, state.alloc_name)) {
+                state.stored_in_self = true; // Reuse flag for "ownership transferred"
+            }
+            // Function call with allocation as argument (ownership transfer)
+            // Pattern: foo.submit(alloc_name) or foo.enqueue(alloc_name) etc.
+            if (isOwnershipTransferCall(t, state.alloc_name)) {
+                state.stored_in_self = true; // Ownership transferred to callee
+            }
+            // Check if local struct containing allocation is returned
+            // Pattern: const result = TypeName{ .field = alloc_name }; return result;
+            if (state.local_struct_has_alloc and state.local_struct_name.len > 0) {
+                if (mem.startsWith(u8, t, "return ")) {
+                    // Check if return statement contains the struct variable name
+                    if (mem.indexOf(u8, t, state.local_struct_name) != null) {
+                        state.returned = true;
+                    }
+                }
+            }
         }
-        checkMemoryAlloc(&state, t, line_num);
+        checkMemoryAlloc(&state, t, line_num, in_return_context);
     }
 }
 
@@ -4124,7 +4788,11 @@ const ErrdeferState = struct {
     fn_returns_error: bool = false,
     alloc_line: usize = 0,
     alloc_col: usize = 1,
+    alloc_name: []const u8 = "",
     has_errdefer: bool = false,
+    alloc_returned: bool = false,
+    has_try_after_alloc: bool = false,
+    uses_arena: bool = false, // Function uses arena allocator
     depth: usize = 0,
 };
 
@@ -4133,24 +4801,61 @@ fn errdeferResetForNewFn(state: *ErrdeferState, returns_error: bool) void {
     state.depth = 0;
     state.has_errdefer = false;
     state.alloc_line = 0;
+    state.alloc_name = "";
+    state.alloc_returned = false;
+    state.has_try_after_alloc = false;
+    state.uses_arena = false;
     state.fn_returns_error = returns_error;
 }
 
 fn errdeferCheckAlloc(state: *ErrdeferState, t: []const u8, line_num: usize) void {
-    if (!state.in_fn or !state.fn_returns_error or state.alloc_line > 0) return;
+    if (!state.in_fn or !state.fn_returns_error) return;
+
+    // If we already have an allocation, check for subsequent try statements
+    if (state.alloc_line > 0) {
+        if (mem.indexOf(u8, t, "try ") != null) state.has_try_after_alloc = true;
+        // Check if allocation is returned (ownership transfer)
+        if (mem.startsWith(u8, t, "return ") and state.alloc_name.len > 0) {
+            if (mem.indexOf(u8, t, state.alloc_name) != null) {
+                state.alloc_returned = true;
+            }
+        }
+        return;
+    }
+
     const has_try = mem.indexOf(u8, t, "try ") != null;
     const has_errdefer = mem.indexOf(u8, t, "errdefer") != null;
     if (!has_try or has_errdefer) return;
+
+    // Skip no-free allocators (arena, scratch, temp, frame, fba - bulk freed)
+    if (mem.indexOf(u8, t, "arena") != null) return;
+    if (mem.indexOf(u8, t, "scratch") != null) return;
+    if (mem.indexOf(u8, t, "temp") != null) return;
+    if (mem.indexOf(u8, t, "frame") != null) return;
+    if (mem.indexOf(u8, t, ".fba.") != null) return;
+
+    // Extract allocation name from const/var declaration
+    const prefix_len: usize = if (mem.startsWith(u8, t, "const "))
+        @as(usize, 6)
+    else if (mem.startsWith(u8, t, "var "))
+        @as(usize, 4)
+    else
+        return;
+    var end = prefix_len;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    const alloc_name = if (end > prefix_len) t[prefix_len..end] else "";
 
     if (mem.indexOf(u8, t, ".alloc(")) |col| {
         if (!isInsideString(t, col)) {
             state.alloc_line = line_num;
             state.alloc_col = col + 1;
+            state.alloc_name = alloc_name;
         }
     } else if (mem.indexOf(u8, t, ".create(")) |col| {
         if (!isInsideString(t, col) and isAllocatorCreate(t)) {
             state.alloc_line = line_num;
             state.alloc_col = col + 1;
+            state.alloc_name = alloc_name;
         }
     }
 }
@@ -4162,7 +4867,12 @@ fn checkErrdeferBraces(t: []const u8, state: *ErrdeferState) bool {
         if (c != '}' or state.depth == 0) continue;
         state.depth -= 1;
         if (state.depth != 0) continue;
-        const needs_errdefer = state.alloc_line > 0 and !state.has_errdefer;
+        // Need errdefer only if:
+        // - There's an allocation without errdefer/defer
+        // - Allocation is NOT returned (ownership transfer)
+        // - There ARE subsequent try statements that could fail
+        const needs_errdefer = state.alloc_line > 0 and !state.has_errdefer and
+            !state.alloc_returned and state.has_try_after_alloc;
         if (needs_errdefer and state.fn_returns_error) return true;
     }
     return false;
@@ -4207,7 +4917,15 @@ fn analyzeFileErrdefer(
         if (checkErrdeferBraces(t, &state)) {
             try reportErrdeferIssue(issues, allocator, a.path, &state);
         }
+        // Check for errdefer OR defer with free/destroy (both are valid cleanup)
         if (mem.indexOf(u8, t, "errdefer ") != null) state.has_errdefer = true;
+        if (mem.indexOf(u8, t, "defer ") != null) {
+            // defer allocator.free() or defer x.deinit() patterns are valid cleanup
+            // Skip patterns inside string literals
+            if (hasRealCleanupPattern(t)) {
+                state.has_errdefer = true;
+            }
+        }
         errdeferCheckAlloc(&state, t, line_num);
     }
 }
@@ -4497,25 +5215,42 @@ const CFGState = struct {
 };
 
 /// Detect function start and initialize state
-fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) void {
-    if (state.in_func or mem.indexOf(u8, t, "fn ") == null) return;
+/// Returns true if a nested function was detected (caller should process current func first)
+fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
+    if (mem.indexOf(u8, t, "fn ") == null) return false;
+
+    // Check if fn is inside a string or comment (basic check)
     const fn_pos = mem.indexOf(u8, t, "fn ").?;
+    if (fn_pos > 0) {
+        // Check for common non-function patterns
+        const before = t[0..fn_pos];
+        if (mem.indexOf(u8, before, "\"") != null) return false; // In string
+        if (mem.lastIndexOf(u8, before, "//")) |cp| {
+            if (cp < fn_pos) return false; // After comment start
+        }
+    }
+
     const name_start = fn_pos + 3;
     var name_end = name_start;
     while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
-    if (name_end > name_start) {
-        state.func_name = t[name_start..name_end];
-        state.func_start = line_num;
-        state.in_func = true;
-        state.brace_depth = 0;
-        // Detect if function returns errors: ) ! or !void, !bool, etc.
-        state.fn_returns_error = mem.indexOf(u8, t, ") !") != null or
-            mem.indexOf(u8, t, "!void") != null or
-            mem.indexOf(u8, t, "!bool") != null or
-            mem.indexOf(u8, t, "!usize") != null or
-            mem.indexOf(u8, t, "!*") != null or
-            mem.indexOf(u8, t, "![") != null;
-    }
+    if (name_end <= name_start) return false;
+
+    // If already in a function, this is a nested fn - signal to process current first
+    const was_in_func = state.in_func;
+
+    state.func_name = t[name_start..name_end];
+    state.func_start = line_num;
+    state.in_func = true;
+    state.brace_depth = 0;
+    // Detect if function returns errors: ) ! or !void, !bool, etc.
+    state.fn_returns_error = mem.indexOf(u8, t, ") !") != null or
+        mem.indexOf(u8, t, "!void") != null or
+        mem.indexOf(u8, t, "!bool") != null or
+        mem.indexOf(u8, t, "!usize") != null or
+        mem.indexOf(u8, t, "!*") != null or
+        mem.indexOf(u8, t, "![") != null;
+
+    return was_in_func; // True if we interrupted another function
 }
 
 /// Track braces and return true when function ends
@@ -4527,6 +5262,99 @@ fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
         if (state.brace_depth == 0) return true;
     }
     return false;
+}
+
+/// Process a single function's analysis (memory, CFG, etc.)
+fn processFunction(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+    func_name: []const u8,
+    func_start: usize,
+    func_lines_items: []const []const u8,
+    fn_returns_error: bool,
+) !void {
+    // Run memory analysis
+    var func_issues = try analyzeFunction(
+        allocator,
+        file_path,
+        func_name,
+        func_start,
+        func_lines_items,
+    );
+    defer func_issues.deinit(allocator);
+    try issues.appendSlice(allocator, func_issues.items);
+
+    // Run CFG-based definite assignment analysis (ZA607)
+    var cfg = try buildCFG(
+        allocator,
+        func_name,
+        func_start,
+        func_lines_items,
+    );
+    defer cfg.deinit();
+
+    var def_issues = try analyzeDefiniteAssignment(
+        allocator,
+        &cfg,
+        func_lines_items,
+        func_start,
+    );
+    defer def_issues.deinit();
+
+    // Convert definite assignment issues to ZA607 warnings
+    var def_iter = def_issues.iterator();
+    while (def_iter.next()) |entry| {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "variable '{s}' potentially read before assignment",
+            .{entry.key_ptr.*},
+        );
+        try issues.append(allocator, .{
+            .file = file_path,
+            .line = entry.value_ptr.*,
+            .col = 1,
+            .severity = .warning,
+            .rule = "ZA607",
+            .message = msg,
+            .help = "ensure variable is assigned on all code paths",
+            .message_owned = true,
+        });
+    }
+
+    // Run CFG-based path-sensitive memory safety analysis (ZA105, ZA106)
+    var mem_safety_issues = try analyzeCFGMemorySafety(
+        allocator,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+    );
+    defer mem_safety_issues.deinit(allocator);
+    try issues.appendSlice(allocator, mem_safety_issues.items);
+
+    // Run CFG-based defer coverage analysis (ZA101, ZA102)
+    var defer_issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+    );
+    defer defer_issues.deinit(allocator);
+    try issues.appendSlice(allocator, defer_issues.items);
+
+    // Run CFG-based errdefer coverage analysis (ZA103)
+    var errdefer_issues = try analyzeCFGErrdeferCoverage(
+        allocator,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+        fn_returns_error,
+    );
+    defer errdefer_issues.deinit(allocator);
+    try issues.appendSlice(allocator, errdefer_issues.items);
 }
 
 /// Analyze a single file for CFG memory issues
@@ -4541,14 +5369,31 @@ fn analyzeCFGFile(
     var lines = mem.splitScalar(u8, content, '\n');
     var func_lines = std.ArrayListUnmanaged([]const u8){};
     defer func_lines.deinit(allocator);
+    var prev_func_name: []const u8 = "";
+    var prev_func_start: usize = 0;
 
     while (lines.next()) |line| {
         defer line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
         const is_comment = mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\");
 
-        // Detect function start (skip comments for detection, but include in func_lines for line alignment)
-        if (!is_comment) detectCFGFuncStart(t, &state, line_num);
+        // Detect function start (skip comments for detection)
+        // Returns true if we found a nested function - process previous function first
+        if (!is_comment) {
+            // Save previous state in case we need to process it
+            prev_func_name = state.func_name;
+            prev_func_start = state.func_start;
+            const found_nested = detectCFGFuncStart(t, &state, line_num);
+
+            if (found_nested and func_lines.items.len > 0) {
+                // Process the previous (outer) function before starting the nested one
+                // Skip if it's too short (likely just a type-returning stub)
+                if (func_lines.items.len >= 3) {
+                    try processFunction(allocator, issues, file_path, prev_func_name, prev_func_start, func_lines.items, false);
+                }
+                func_lines.clearRetainingCapacity();
+            }
+        }
         if (!state.in_func) continue;
 
         // Always append to keep line numbers aligned (comments skipped during analysis)
@@ -4558,87 +5403,16 @@ fn analyzeCFGFile(
         if (is_comment) continue;
         if (!trackCFGBraces(t, &state)) continue;
 
-        // Run memory analysis
-        var func_issues = try analyzeFunction(
+        // Function ended - process it
+        try processFunction(
             allocator,
+            issues,
             file_path,
             state.func_name,
             state.func_start,
             func_lines.items,
-        );
-        defer func_issues.deinit(allocator);
-        try issues.appendSlice(allocator, func_issues.items);
-
-        // Run CFG-based definite assignment analysis (ZA607)
-        var cfg = try buildCFG(
-            allocator,
-            state.func_name,
-            state.func_start,
-            func_lines.items,
-        );
-        defer cfg.deinit();
-
-        var def_issues = try analyzeDefiniteAssignment(
-            allocator,
-            &cfg,
-            func_lines.items,
-            state.func_start,
-        );
-        defer def_issues.deinit();
-
-        // Convert definite assignment issues to ZA607 warnings
-        var def_iter = def_issues.iterator();
-        while (def_iter.next()) |entry| {
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "variable '{s}' potentially read before assignment",
-                .{entry.key_ptr.*},
-            );
-            try issues.append(allocator, .{
-                .file = file_path,
-                .line = entry.value_ptr.*,
-                .col = 1,
-                .severity = .warning,
-                .rule = "ZA607",
-                .message = msg,
-                .help = "ensure variable is assigned on all code paths",
-                .message_owned = true,
-            });
-        }
-
-        // Run CFG-based path-sensitive memory safety analysis (ZA105, ZA106)
-        var mem_safety_issues = try analyzeCFGMemorySafety(
-            allocator,
-            &cfg,
-            func_lines.items,
-            state.func_start,
-            file_path,
-        );
-        defer mem_safety_issues.deinit(allocator);
-        try issues.appendSlice(allocator, mem_safety_issues.items);
-
-        // Run CFG-based defer coverage analysis (ZA101, ZA102)
-        var defer_issues = try analyzeCFGDeferCoverage(
-            allocator,
-            &cfg,
-            func_lines.items,
-            state.func_start,
-            file_path,
-        );
-        defer defer_issues.deinit(allocator);
-        try issues.appendSlice(allocator, defer_issues.items);
-
-        // Run CFG-based errdefer coverage analysis (ZA103)
-        var errdefer_issues = try analyzeCFGErrdeferCoverage(
-            allocator,
-            &cfg,
-            func_lines.items,
-            state.func_start,
-            file_path,
             state.fn_returns_error,
         );
-        defer errdefer_issues.deinit(allocator);
-        try issues.appendSlice(allocator, errdefer_issues.items);
 
         state.in_func = false;
         func_lines.clearRetainingCapacity();
@@ -4716,10 +5490,9 @@ fn updateDefers(t: []const u8, allocs: []AllocInfo) void {
     if (mem.indexOf(u8, t, "defer ") == null) return;
     for (allocs) |*alloc| {
         if (mem.indexOf(u8, t, alloc.name) == null) continue;
-        if (mem.indexOf(u8, t, ".free(") != null or
-            mem.indexOf(u8, t, ".destroy(") != null or
-            mem.indexOf(u8, t, "free(") != null or
-            mem.indexOf(u8, t, "destroy(") != null)
+        // Check for cleanup patterns (skip if inside string literals)
+        if (hasRealFreePattern(t) or hasPatternNotInString(t, "free(") or
+            hasPatternNotInString(t, "destroy("))
         {
             alloc.has_defer = true;
         }
@@ -4731,9 +5504,8 @@ fn updateErrdefers(t: []const u8, allocs: []AllocInfo) void {
     if (mem.indexOf(u8, t, "errdefer ") == null) return;
     for (allocs) |*alloc| {
         if (mem.indexOf(u8, t, alloc.name) == null) continue;
-        if (mem.indexOf(u8, t, ".free(") != null or
-            mem.indexOf(u8, t, ".destroy(") != null)
-        {
+        // Check for cleanup patterns (skip if inside string literals)
+        if (hasRealFreePattern(t)) {
             alloc.has_errdefer = true;
         }
     }
@@ -4802,11 +5574,10 @@ fn trackDeferFrees(
 ) void {
     const keyword = if (is_errdefer) "errdefer " else "defer ";
     if (mem.indexOf(u8, t, keyword) == null) return;
-    const has_free = mem.indexOf(u8, t, ".free(") != null;
-    const has_destroy = mem.indexOf(u8, t, ".destroy(") != null;
-    const has_free2 = mem.indexOf(u8, t, "free(") != null;
-    const has_destroy2 = mem.indexOf(u8, t, "destroy(") != null;
-    if (!has_free and !has_destroy and !has_free2 and !has_destroy2) return;
+    // Check for cleanup patterns (skip if inside string literals)
+    const has_cleanup = hasRealFreePattern(t) or
+        hasPatternNotInString(t, "free(") or hasPatternNotInString(t, "destroy(");
+    if (!has_cleanup) return;
     for (allocs) |*alloc| {
         if (mem.indexOf(u8, t, alloc.name) != null) {
             if (is_errdefer) {
@@ -4828,9 +5599,8 @@ fn trackExplicitFrees(
     const has_defer = mem.indexOf(u8, t, "defer ") != null;
     const has_errdefer = mem.indexOf(u8, t, "errdefer ") != null;
     if (has_defer or has_errdefer) return;
-    const has_free = mem.indexOf(u8, t, ".free(") != null;
-    const has_destroy = mem.indexOf(u8, t, ".destroy(") != null;
-    if (!has_free and !has_destroy) return;
+    // Use hasRealFreePattern to skip patterns inside string literals
+    if (!hasRealFreePattern(t)) return;
 
     // Check if this free is in a catch/if block that also has a return
     // Pattern: catch { ... .free(...) ... return ...; }
@@ -4858,9 +5628,8 @@ fn trackUseAfterFree(
     allocator: Allocator,
 ) !void {
     const has_defer = mem.indexOf(u8, t, "defer ") != null;
-    const has_free = mem.indexOf(u8, t, ".free(") != null;
-    const has_destroy = mem.indexOf(u8, t, ".destroy(") != null;
-    if (has_defer or has_free or has_destroy) return;
+    // Use hasRealFreePattern to skip patterns inside string literals
+    if (has_defer or hasRealFreePattern(t)) return;
     const is_decl = mem.startsWith(u8, t, "const ");
     const is_var = mem.startsWith(u8, t, "var ");
     if (is_decl or is_var) return;
@@ -5100,6 +5869,35 @@ fn analyzeFunction(
     const uses_arena = isNoFreeAllocator(lines);
     var return_store_state = ReturnStoreState{};
 
+    // Pre-pass: Mark which lines are inside defer blocks
+    // Frees inside defer blocks execute at scope exit, not at the literal line number
+    // We need to skip these for use-after-free detection
+    var in_defer_block = try allocator.alloc(bool, lines.len);
+    defer allocator.free(in_defer_block);
+    @memset(in_defer_block, false);
+    {
+        var defer_depth: usize = 0;
+        for (lines, 0..) |line, idx| {
+            const t = mem.trim(u8, line, " \t\r");
+            if (mem.startsWith(u8, t, "defer {") or mem.startsWith(u8, t, "defer{")) {
+                in_defer_block[idx] = true;
+                for (t) |c| {
+                    if (c == '{') defer_depth += 1;
+                    if (c == '}' and defer_depth > 0) defer_depth -= 1;
+                }
+                continue;
+            }
+            if (defer_depth > 0) {
+                in_defer_block[idx] = true;
+                for (t) |c| {
+                    if (c == '{') defer_depth += 1;
+                    if (c == '}' and defer_depth > 0) defer_depth -= 1;
+                }
+            }
+        }
+    }
+
+    // Pass 1: Collect allocations
     for (lines, 0..) |line, idx| {
         const actual_line = func_start + idx;
         const t = mem.trim(u8, line, " \t\r");
@@ -5113,16 +5911,164 @@ fn analyzeFunction(
             };
             try detectAllocOnLine(t, ctx, &allocs, allocator);
         }
+    }
+
+    // Pass 2: CFG-based data flow - track aliases (variables that contain allocations)
+    // For each allocation, build set of variables that transitively contain it
+    const AliasSet = struct { names: std.ArrayListUnmanaged([]const u8) };
+    const alias_sets = try allocator.alloc(AliasSet, allocs.items.len);
+    defer {
+        for (alias_sets) |*as| as.names.deinit(allocator);
+        allocator.free(alias_sets);
+    }
+    for (alias_sets, 0..) |*as, i| {
+        as.* = .{ .names = .{} };
+        try as.names.append(allocator, allocs.items[i].name);
+    }
+
+    // Scan for data flow using brace-depth tracking (handles multi-line structs)
+    // Pattern: const x = Type{ ... alloc_name ... } or x.* = Type{ ... alloc_name ... }
+    var in_struct_assign = false;
+    var struct_brace_depth: i32 = 0;
+    var current_struct_var: []const u8 = "";
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.startsWith(u8, t, "//")) continue;
+
+        // Detect start of struct assignment
+        if (!in_struct_assign and mem.indexOf(u8, t, "{") != null and mem.indexOf(u8, t, "= ") != null) {
+            // const x = Type{ or var x = Type{
+            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) {
+                const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
+                var end = prefix;
+                while (end < t.len and isIdent(t[end])) end += 1;
+                if (end > prefix) {
+                    current_struct_var = t[prefix..end];
+                    in_struct_assign = true;
+                    struct_brace_depth = 0;
+                }
+            }
+            // x.* = Type{
+            else if (mem.indexOf(u8, t, ".* = ") != null) {
+                var end: usize = 0;
+                while (end < t.len and isIdent(t[end])) end += 1;
+                if (end > 0) {
+                    current_struct_var = t[0..end];
+                    in_struct_assign = true;
+                    struct_brace_depth = 0;
+                }
+            }
+        }
+
+        // Track brace depth within struct assignment
+        if (in_struct_assign) {
+            for (t) |c| {
+                if (c == '{') struct_brace_depth += 1;
+                if (c == '}') struct_brace_depth -= 1;
+            }
+
+            // Check if any allocation appears while we're inside the struct literal
+            // Collect indices of alias_sets that need the struct var added
+            // (can't modify while iterating - append may reallocate)
+            var sets_to_update: [64]usize = undefined;
+            var update_count: usize = 0;
+
+            for (alias_sets, 0..) |*as, ai| {
+                if (update_count >= 64) break; // Safety limit
+                var found_alloc = false;
+                for (as.names.items) |alias| {
+                    if (mem.indexOf(u8, t, alias) != null) {
+                        found_alloc = true;
+                        break;
+                    }
+                }
+                if (found_alloc and current_struct_var.len > 0 and
+                    !mem.eql(u8, current_struct_var, allocs.items[ai].name))
+                {
+                    var already_in = false;
+                    for (as.names.items) |existing| {
+                        if (mem.eql(u8, existing, current_struct_var)) {
+                            already_in = true;
+                            break;
+                        }
+                    }
+                    if (!already_in) {
+                        sets_to_update[update_count] = ai;
+                        update_count += 1;
+                    }
+                }
+            }
+
+            // Now safely add to the alias sets
+            for (sets_to_update[0..update_count]) |idx| {
+                try alias_sets[idx].names.append(allocator, current_struct_var);
+            }
+
+            // End of struct when braces balanced and semicolon found
+            if (struct_brace_depth <= 0 and mem.indexOf(u8, t, ";") != null) {
+                in_struct_assign = false;
+                current_struct_var = "";
+            }
+        }
+    }
+
+    // Pass 3: Process lines for defer, explicit free, ownership transfer, return/store
+    for (lines, 0..) |line, idx| {
+        const actual_line = func_start + idx;
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.startsWith(u8, t, "//")) continue;
 
         for (allocs.items) |*a| {
             if (isOwnershipTransfer(t, a.name)) a.ownership_transferred = true;
         }
         trackDeferFrees(t, allocs.items, false);
         trackDeferFrees(t, allocs.items, true);
-        try trackExplicitFrees(t, actual_line, allocs.items, &events, allocator);
-        // Note: use-after-free detection now handled by CFG-based analyzeCFGMemorySafety
-        // which provides path-sensitive analysis (handles catch { free; return; } correctly)
-        trackReturnAndStore(t, allocs.items, &return_store_state, actual_line);
+        // Skip tracking explicit frees inside defer blocks - they execute at scope exit
+        if (!in_defer_block[idx]) {
+            try trackExplicitFrees(t, actual_line, allocs.items, &events, allocator);
+        }
+
+        // CFG-based return/store tracking using alias sets
+        updateReturnStoreState(t, &return_store_state);
+        const in_return = return_store_state.in_return or mem.startsWith(u8, t, "return ");
+        const in_self = return_store_state.in_self_assign or
+            mem.indexOf(u8, t, "self.") != null or mem.indexOf(u8, t, "ctx.") != null;
+
+        for (alias_sets, 0..) |as, ai| {
+            for (as.names.items) |alias| {
+                if (mem.indexOf(u8, t, alias) == null) continue;
+
+                if (in_return) allocs.items[ai].returned = true;
+                if (in_self) allocs.items[ai].stored = true;
+
+                // Module-level assignment (no const/var prefix, simple identifier LHS)
+                if (mem.indexOf(u8, t, " = ") != null and
+                    !mem.startsWith(u8, t, "const ") and
+                    !mem.startsWith(u8, t, "var "))
+                {
+                    const eq_pos = mem.indexOf(u8, t, " = ").?;
+                    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+                    if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null and
+                        !mem.eql(u8, lhs, alias))
+                    {
+                        allocs.items[ai].stored = true;
+                    }
+                }
+
+                // Ownership transfer via method call: .put(alias), .append(alias), etc.
+                const transfer_methods = [_][]const u8{
+                    ".put(", ".putNoClobber(", ".append(", ".appendSlice(",
+                    ".insert(", ".add(", ".push(", ".enqueue(", ".submit(",
+                };
+                for (transfer_methods) |method| {
+                    if (mem.indexOf(u8, t, method) != null) {
+                        allocs.items[ai].ownership_transferred = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     try reportLeaks(allocs.items, has_err_return, file_path, &issues, allocator);
@@ -5227,6 +6173,11 @@ fn analyzeIgnoredErrors(
     while (iter.next()) |entry| {
         const content = entry.value_ptr.content;
         const file_path = entry.key_ptr.*;
+
+        // Skip auto-generated C import files (many false positives)
+        if (mem.endsWith(u8, file_path, "cimport.zig")) continue;
+        if (isCImportFile(file_path, content)) continue;
+
         var line_num: usize = 1;
         var lines = mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
@@ -5383,8 +6334,14 @@ fn checkDecrementWithoutGuard(
 
             if (!has_guard) {
                 // Skip if variable is declared as a signed type (can't overflow)
-                const check_start = if (current_idx > 10) current_idx - 10 else 0;
-                if (isSignedTypeDecl(context_lines[check_start .. current_idx + 1], var_name)) {
+                const check_start_signed = if (current_idx > 10) current_idx - 10 else 0;
+                if (isSignedTypeDecl(context_lines[check_start_signed .. current_idx + 1], var_name)) {
+                    continue;
+                }
+
+                // Skip if there's a paired increment earlier in the function scope
+                // Pattern: x += 1 followed by x -= 1 is safe (paired operations)
+                if (hasPairedIncrement(context_lines[0..current_idx], var_name)) {
                     continue;
                 }
 
@@ -5401,6 +6358,52 @@ fn checkDecrementWithoutGuard(
             }
         }
     }
+}
+
+/// Check if there's a paired increment for a variable (x += 1 before x -= 1)
+/// or if the variable was initialized to a positive value (x = 1, x = N > 0)
+fn hasPairedIncrement(context_lines: []const []const u8, var_name: []const u8) bool {
+    // Search backwards from current line for a matching increment or positive init
+    // within the same function scope (stop at fn declarations)
+    var i = context_lines.len;
+    while (i > 0) {
+        i -= 1;
+        const ctx = mem.trim(u8, context_lines[i], " \t\r");
+
+        // Stop at function boundary - increments in other functions don't count
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) {
+            return false;
+        }
+
+        // Look for var_name in this line
+        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
+            const after_var = ctx[var_pos + var_name.len ..];
+
+            // Pattern 1: x += 1 (paired increment)
+            if (mem.startsWith(u8, after_var, " += 1") or
+                mem.startsWith(u8, after_var, "+=1") or
+                mem.startsWith(u8, after_var, " += 1;") or
+                (mem.startsWith(u8, after_var, " = ") and mem.indexOf(u8, after_var, "+ 1") != null))
+            {
+                return true;
+            }
+
+            // Pattern 2: var x: usize = 1 or var x = 1 (positive initialization)
+            // This provides a "reserve" that can be decremented safely once
+            if (mem.startsWith(u8, ctx, "var ") or mem.startsWith(u8, ctx, "const ")) {
+                // Check for = N where N > 0
+                if (mem.indexOf(u8, after_var, "= 1") != null or
+                    mem.indexOf(u8, after_var, "= 2") != null or
+                    mem.indexOf(u8, after_var, "= 3") != null or
+                    mem.indexOf(u8, after_var, ": usize = 1") != null or
+                    mem.indexOf(u8, after_var, ":usize = 1") != null)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 /// Check if variable is declared as a signed integer type in context
@@ -5979,6 +6982,36 @@ fn isComment(trimmed: []const u8) bool {
     return mem.startsWith(u8, trimmed, "//");
 }
 
+/// Count leading whitespace (indentation level)
+fn countIndent(line: []const u8) usize {
+    var indent: usize = 0;
+    for (line) |c| {
+        if (c == ' ' or c == '\t') {
+            indent += 1;
+        } else {
+            break;
+        }
+    }
+    return indent;
+}
+
+/// Check if file is an auto-generated C import file (should be skipped)
+fn isCImportFile(file_path: []const u8, content: []const u8) bool {
+    // Skip files ending in cimport.zig
+    if (mem.endsWith(u8, file_path, "cimport.zig")) return true;
+
+    // Skip files in deps/ with C translation markers
+    if (mem.indexOf(u8, file_path, "/deps/") != null) {
+        if (mem.indexOf(u8, content, "__builtin_") != null or
+            mem.indexOf(u8, content, "enum_unnamed_") != null or
+            mem.indexOf(u8, content, "@cImport") != null)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Check if current line has disable directive for rule
 fn checkSameLineDisable(line: []const u8, rule: []const u8) bool {
     if (mem.indexOf(u8, line, "// ephor:disable") == null) return false;
@@ -6156,6 +7189,11 @@ fn tryLoadConfigFromDir(
     );
     defer allocator.free(config_path);
 
+    // Dupe dir BEFORE parsing config, since parseConfigJson might free cfg.path
+    // and dir might point to the same memory as cfg.path
+    const dir_copy = try allocator.dupe(u8, dir);
+    defer allocator.free(dir_copy);
+
     const file = fs.cwd().openFile(config_path, .{}) catch return false;
     defer file.close();
 
@@ -6170,7 +7208,7 @@ fn tryLoadConfigFromDir(
     if (cfg.path_owned) allocator.free(cfg.path);
     cfg.path = saved_path;
     cfg.path_owned = true;
-    try makeEntriesAbsolute(allocator, cfg, dir);
+    try makeEntriesAbsolute(allocator, cfg, dir_copy);
     return true;
 }
 
@@ -6427,34 +7465,315 @@ fn parseThreshold(arg: []const u8, prefix: []const u8, default: usize) ?usize {
     return std.fmt.parseInt(usize, arg[prefix.len..], 10) catch default;
 }
 
+/// Build a path with optional prefix (skips prefix if ".")
+fn buildPathWithPrefix(allocator: Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
+    const is_dot = prefix.len == 1 and prefix[0] == '.';
+    if (is_dot) {
+        return try allocator.dupe(u8, suffix);
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, suffix });
+}
+
 fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
     for (cfg.entries.items) |e| allocator.free(e);
     cfg.entries.clearRetainingCapacity();
     try loadConfigFromTargetPath(allocator, cfg, cfg.path);
     if (cfg.entries.items.len > 0) return;
 
+    // Track already-added entries
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+
+    // Standard entry point files in target path
     const files = [_][]const u8{ "main.zig", "lib.zig", "root.zig" };
     for (files) |f| {
-        const full = try std.fmt.allocPrint(
-            allocator,
-            "{s}/{s}",
-            .{ cfg.path, f },
-        );
+        const full = try buildPathWithPrefix(allocator, cfg.path, f);
         fs.cwd().access(full, .{}) catch {
             allocator.free(full);
             continue;
         };
         try cfg.entries.append(allocator, full);
+        try added.put(full, {});
+    }
+
+    // Also check src/ subdirectory
+    const src_files = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig" };
+    for (src_files) |sf| {
+        const full = try buildPathWithPrefix(allocator, cfg.path, sf);
+        fs.cwd().access(full, .{}) catch {
+            allocator.free(full);
+            continue;
+        };
+        if (!added.contains(full)) {
+            try cfg.entries.append(allocator, full);
+            try added.put(full, {});
+        } else {
+            allocator.free(full);
+        }
+    }
+
+    // Parse build.zig in target path for additional entries
+    const build_zig_path = try buildPathWithPrefix(allocator, cfg.path, "build.zig");
+    defer allocator.free(build_zig_path);
+    try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, &added);
+
+    // Scan common multi-entry directories in target path
+    // Based on patterns found in community projects (ghostty, sig, tigerbeetle, zap, zls, etc.)
+    const multi_entry_dirs = [_][]const u8{
+        "examples",  "example",   "samples",    "experiments",
+        "tools",     "test",      "tests",      "fuzz",
+        "benchmark", "benches",   "scripts",    "lib",
+        "clients",   "drivers",   "apps",       "cmd",
+        "bin",       "ci",        "user",
+    };
+    for (multi_entry_dirs) |dir| {
+        const dir_path = try buildPathWithPrefix(allocator, cfg.path, dir);
+        defer allocator.free(dir_path);
+        try scanDirForEntriesWithPrefix(allocator, cfg, dir_path, cfg.path, &added);
+    }
+}
+
+/// Extract entry points from build.zig by parsing common patterns
+fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
+    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return;
+    defer allocator.free(content);
+
+    // Track already-added entries to avoid duplicates
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    for (cfg.entries.items) |e| {
+        added.put(e, {}) catch {};
+    }
+
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        // Pattern 1: .root_source_file = b.path("path/to/file.zig")
+        // Pattern 2: .root_source_file = .{ .path = "path/to/file.zig" }
+        // Pattern 3: @import("src/something.zig")
+        try extractPathFromLine(allocator, cfg, line, &added);
+    }
+}
+
+/// Extract a .zig path from a build.zig line
+fn extractPathFromLine(
+    allocator: Allocator,
+    cfg: *Config,
+    line: []const u8,
+    added: *std.StringHashMap(void),
+) !void {
+    // Pattern: b.path("...")
+    if (mem.indexOf(u8, line, "b.path(\"")) |idx| {
+        const start = idx + 8; // len of 'b.path("'
+        if (extractQuotedPath(line, start)) |path| {
+            try addEntryIfValid(allocator, cfg, path, added);
+        }
+    }
+    // Pattern: .path = "..."
+    if (mem.indexOf(u8, line, ".path = \"")) |idx| {
+        const start = idx + 9; // len of '.path = "'
+        if (extractQuotedPath(line, start)) |path| {
+            try addEntryIfValid(allocator, cfg, path, added);
+        }
+    }
+    // Pattern: @import("src/...") at top of file (build module imports)
+    if (mem.indexOf(u8, line, "@import(\"src/")) |idx| {
+        const start = idx + 9; // len of '@import("'
+        if (extractQuotedPath(line, start)) |path| {
+            try addEntryIfValid(allocator, cfg, path, added);
+        }
+    }
+}
+
+/// Extract path string between quotes
+fn extractQuotedPath(line: []const u8, start: usize) ?[]const u8 {
+    if (start >= line.len) return null;
+    const end_quote = mem.indexOf(u8, line[start..], "\"") orelse return null;
+    const path = line[start .. start + end_quote];
+    // Only return .zig files
+    if (!mem.endsWith(u8, path, ".zig")) return null;
+    // Skip standard library imports
+    if (mem.startsWith(u8, path, "std")) return null;
+    if (mem.startsWith(u8, path, "builtin")) return null;
+    return path;
+}
+
+/// Add entry if the file exists and isn't already added
+fn addEntryIfValid(
+    allocator: Allocator,
+    cfg: *Config,
+    path: []const u8,
+    added: *std.StringHashMap(void),
+) !void {
+    if (added.contains(path)) return;
+    fs.cwd().access(path, .{}) catch return;
+    const duped = try allocator.dupe(u8, path);
+    try cfg.entries.append(allocator, duped);
+    try added.put(duped, {});
+}
+
+/// Add entry with prefix if the file exists
+fn addEntryWithPrefix(
+    allocator: Allocator,
+    cfg: *Config,
+    path: []const u8,
+    prefix: []const u8,
+    added: *std.StringHashMap(void),
+) !void {
+    // When prefix is ".", don't add it (avoid "./src/file.zig" paths)
+    const is_dot = prefix.len == 1 and prefix[0] == '.';
+    const full_path = if (is_dot)
+        try allocator.dupe(u8, path)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, path });
+    defer allocator.free(full_path);
+    if (added.contains(full_path)) return;
+    fs.cwd().access(full_path, .{}) catch return;
+    const duped = try allocator.dupe(u8, full_path);
+    try cfg.entries.append(allocator, duped);
+    try added.put(duped, {});
+}
+
+/// Extract entry points from a build.zig file at a specific path
+fn extractBuildZigEntriesFromPath(
+    allocator: Allocator,
+    cfg: *Config,
+    build_path: []const u8,
+    prefix: []const u8,
+    added: *std.StringHashMap(void),
+) !void {
+    const content = fs.cwd().readFileAlloc(allocator, build_path, 1024 * 1024) catch return;
+    defer allocator.free(content);
+
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        // Pattern: b.path("...")
+        if (mem.indexOf(u8, line, "b.path(\"")) |idx| {
+            const start = idx + 8;
+            if (extractQuotedPath(line, start)) |path| {
+                try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+            }
+        }
+        // Pattern: .path = "..."
+        if (mem.indexOf(u8, line, ".path = \"")) |idx| {
+            const start = idx + 9;
+            if (extractQuotedPath(line, start)) |path| {
+                try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+            }
+        }
+        // Pattern: @import("src/...")
+        if (mem.indexOf(u8, line, "@import(\"src/")) |idx| {
+            const start = idx + 9;
+            if (extractQuotedPath(line, start)) |path| {
+                try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+            }
+        }
+    }
+}
+
+/// Scan directory with prefix for entry paths
+fn scanDirForEntriesWithPrefix(
+    allocator: Allocator,
+    cfg: *Config,
+    dir_path: []const u8,
+    prefix: []const u8,
+    added: *std.StringHashMap(void),
+) !void {
+    var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .directory) {
+            const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+            defer allocator.free(subdir);
+            try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added);
+        } else if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig")) {
+            const is_entry = mem.eql(u8, entry.name, "main.zig") or
+                mem.eql(u8, entry.name, "lib.zig") or
+                mem.eql(u8, entry.name, "root.zig") or
+                mem.endsWith(u8, entry.name, "_test.zig");
+            if (is_entry) {
+                const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                if (!added.contains(full)) {
+                    fs.cwd().access(full, .{}) catch {
+                        allocator.free(full);
+                        continue;
+                    };
+                    try cfg.entries.append(allocator, full);
+                    try added.put(full, {});
+                } else {
+                    allocator.free(full);
+                }
+            }
+        }
+    }
+}
+
+/// Scan a directory for .zig entry points (main.zig, lib.zig, root.zig)
+fn scanDirForEntries(
+    allocator: Allocator,
+    cfg: *Config,
+    dir_path: []const u8,
+    added: *std.StringHashMap(void),
+) !void {
+    var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .directory) {
+            // Recurse into subdirectories
+            const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+            defer allocator.free(subdir);
+            try scanDirForEntries(allocator, cfg, subdir, added);
+        } else if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig")) {
+            // Check for entry point files
+            const is_entry = mem.eql(u8, entry.name, "main.zig") or
+                mem.eql(u8, entry.name, "lib.zig") or
+                mem.eql(u8, entry.name, "root.zig") or
+                mem.endsWith(u8, entry.name, "_test.zig");
+            if (is_entry) {
+                const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                try addEntryIfValid(allocator, cfg, path, added);
+                allocator.free(path);
+            }
+        }
     }
 }
 
 fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
+    // Track already-added entries
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+
     const entries = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig", "build.zig" };
     for (entries) |e| {
         fs.cwd().access(e, .{}) catch continue;
-        try cfg.entries.append(allocator, try allocator.dupe(u8, e));
+        const duped = try allocator.dupe(u8, e);
+        try cfg.entries.append(allocator, duped);
+        try added.put(duped, {});
     }
-    // Auto-discover test files
+
+    // Parse build.zig for additional entry points
+    try extractBuildZigEntries(allocator, cfg);
+
+    // Update added set with build.zig entries
+    for (cfg.entries.items) |e| {
+        added.put(e, {}) catch {};
+    }
+
+    // Scan common multi-entry directories
+    // Based on patterns found in community projects
+    const multi_entry_dirs = [_][]const u8{
+        "examples",  "example",   "samples",    "experiments",
+        "tools",     "test",      "tests",      "fuzz",
+        "benchmark", "benches",   "scripts",    "lib",
+        "clients",   "drivers",   "apps",       "cmd",
+        "bin",       "ci",        "user",
+    };
+    for (multi_entry_dirs) |dir| {
+        try scanDirForEntries(allocator, cfg, dir, &added);
+    }
+
+    // Auto-discover test files in src/
     var dir = fs.cwd().openDir("src", .{ .iterate = true }) catch return;
     defer dir.close();
     var iter = dir.iterate();
@@ -6466,7 +7785,12 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
             "src/{s}",
             .{entry.name},
         );
-        try cfg.entries.append(allocator, path);
+        if (!added.contains(path)) {
+            try cfg.entries.append(allocator, path);
+            try added.put(path, {});
+        } else {
+            allocator.free(path);
+        }
     }
 }
 
@@ -6975,6 +8299,10 @@ pub fn main() !void {
                 std.debug.print("  hint: create ephor.json with 'entries' array\n", .{});
                 std.debug.print("  run: ephor init\n", .{});
                 std.process.exit(1);
+            }
+            if (cfg.verbose) {
+                std.debug.print("Detected {d} entry points:\n", .{cfg.entries.items.len});
+                for (cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
             }
             var g = ImportGraph.init(alloc);
             defer g.deinit();

@@ -1767,6 +1767,22 @@ fn removeImmediateDeferAllocs(
 /// Pattern: const x = Type{ .field = alloc_name } -> x is an owner
 const OwnerVar = struct { name: []const u8 };
 
+/// Add a new owner if not already tracked
+fn tryAddOwner(allocator: Allocator, owner_vars: *std.ArrayListUnmanaged(OwnerVar), name: []const u8) !void {
+    for (owner_vars.items) |ov| {
+        if (mem.eql(u8, ov.name, name)) return;
+    }
+    try owner_vars.append(allocator, .{ .name = name });
+}
+
+/// Check if any owner var appears in line
+fn hasOwnerAppearance(owner_vars: []const OwnerVar, t: []const u8) bool {
+    for (owner_vars) |ov| {
+        if (mem.indexOf(u8, t, ov.name) != null) return true;
+    }
+    return false;
+}
+
 fn trackOwnerVariables(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
@@ -1786,52 +1802,20 @@ fn trackOwnerVariables(
             if (idx >= lines.len) continue;
             const t = mem.trim(u8, lines[idx], " \t\r");
 
-            // Check if any current owner var appears
-            var owner_appears = false;
-            for (owner_vars.items) |ov| {
-                if (mem.indexOf(u8, t, ov.name) != null) {
-                    owner_appears = true;
-                    break;
-                }
-            }
-            if (!owner_appears) continue;
+            if (!hasOwnerAppearance(owner_vars.items, t)) continue;
 
             // Pattern: const varname = Type{ ... owner_var ... }
             if (mem.startsWith(u8, t, "const ") and mem.indexOf(u8, t, "{") != null) {
                 var end: usize = 6;
                 while (end < t.len and isIdent(t[end])) end += 1;
-                if (end > 6) {
-                    const new_owner = t[6..end];
-                    var already_tracked = false;
-                    for (owner_vars.items) |ov| {
-                        if (mem.eql(u8, ov.name, new_owner)) {
-                            already_tracked = true;
-                            break;
-                        }
-                    }
-                    if (!already_tracked) {
-                        try owner_vars.append(allocator, .{ .name = new_owner });
-                    }
-                }
+                if (end > 6) try tryAddOwner(allocator, &owner_vars, t[6..end]);
             }
 
             // Pattern: varname.* = Type{ ... owner_var ... }
             if (mem.indexOf(u8, t, ".* = ") != null and mem.indexOf(u8, t, "{") != null) {
                 var end: usize = 0;
                 while (end < t.len and isIdent(t[end])) end += 1;
-                if (end > 0) {
-                    const new_owner = t[0..end];
-                    var already_tracked = false;
-                    for (owner_vars.items) |ov| {
-                        if (mem.eql(u8, ov.name, new_owner)) {
-                            already_tracked = true;
-                            break;
-                        }
-                    }
-                    if (!already_tracked) {
-                        try owner_vars.append(allocator, .{ .name = new_owner });
-                    }
-                }
+                if (end > 0) try tryAddOwner(allocator, &owner_vars, t[0..end]);
             }
         }
     }

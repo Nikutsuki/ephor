@@ -42,107 +42,21 @@ export PATH="$PATH:/path/to/ephor/zig-out/bin"
 
 Add ephor as a build step in your project so `zig build ephor` runs static analysis automatically.
 
-#### Quick Setup (Recommended)
-
-If you have ephor installed, run this in your project directory:
+### Integrate into Your Project
 
 ```bash
 cd /path/to/your-project
 ephor install
 ```
 
-This will:
-1. Add the ephor dependency to your `build.zig.zon` (via `zig fetch`)
-2. Automatically patch your `build.zig` to add the ephor step
+This automatically:
+1. Adds the ephor dependency to your `build.zig.zon`
+2. Patches your `build.zig` to add the ephor step
 
-Then run `zig build ephor` to verify it works.
-
-#### Manual Setup
-
-**Step 1: Add ephor as a dependency in your `build.zig.zon`:**
-
-```zig
-.{
-    .name = .my_project,
-    .version = "0.1.0",
-    .dependencies = .{
-        .ephor = .{
-            .url = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz",
-            // After first run, Zig will tell you the correct hash to add here:
-            // .hash = "...",
-        },
-    },
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
-}
-```
-
-> **Note:** On first build, Zig will error with the correct `.hash` value - copy it into your `build.zig.zon`.
-
-**Step 2: Add an ephor step in your `build.zig`:**
-
-```zig
-const std = @import("std");
-
-pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
-
-    // Your normal exe/lib setup...
-    const exe = b.addExecutable(.{
-        .name = "my_project",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(exe);
-
-    // === Add Ephor Static Analysis ===
-    const ephor_dep = b.dependency("ephor", .{
-        .target = target,
-        .optimize = .ReleaseSafe,
-    });
-    const ephor_exe = ephor_dep.artifact("ephor");
-
-    const ephor_cmd = b.addRunArtifact(ephor_exe);
-    ephor_cmd.addArgs(&.{ "check", "src/" });
-
-    const ephor_step = b.step("ephor", "Run ephor static analysis");
-    ephor_step.dependOn(&ephor_cmd.step);
-
-    // Optional: Make ephor run before build
-    // exe.step.dependOn(&ephor_cmd.step);
-}
-```
-
-**Step 3: Run it:**
+Then run:
 
 ```bash
-# Run static analysis
 zig build ephor
-
-# Run ephor before every build (if you uncommented the dependOn line)
-zig build
-```
-
-**Available ephor commands:**
-
-```zig
-// Check all (default)
-ephor_cmd.addArgs(&.{ "check", "src/" });
-
-// Check with summary
-ephor_cmd.addArgs(&.{ "check", "src/", "--summary" });
-
-// Memory analysis only
-ephor_cmd.addArgs(&.{ "memory", "src/" });
-
-// With custom thresholds
-ephor_cmd.addArgs(&.{ "check", "src/", "--max-lines=100", "--max-branches=15" });
-
-// Disable specific rules
-ephor_cmd.addArgs(&.{ "check", "src/", "--disable=ZA301" });
 ```
 
 ## Usage

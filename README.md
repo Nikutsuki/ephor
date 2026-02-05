@@ -40,7 +40,7 @@ export PATH="$PATH:/path/to/ephor/zig-out/bin"
 
 ### Integrate into Your Project's build.zig
 
-Add ephor as a build step in your project so `zig build lint` runs static analysis automatically.
+Add ephor as a build step in your project so `zig build ephor` runs static analysis automatically.
 
 **Step 1: Add ephor as a dependency in your `build.zig.zon`:**
 
@@ -61,7 +61,7 @@ Add ephor as a build step in your project so `zig build lint` runs static analys
 
 > **Note:** On first build, Zig will error with the correct `.hash` value - copy it into your `build.zig.zon`.
 
-**Step 2: Add a lint step in your `build.zig`:**
+**Step 2: Add an ephor step in your `build.zig`:**
 
 ```zig
 const std = @import("std");
@@ -81,22 +81,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // === Add Ephor Lint Step ===
+    // === Add Ephor Static Analysis ===
     const ephor_dep = b.dependency("ephor", .{
         .target = target,
         .optimize = .ReleaseSafe,
     });
     const ephor_exe = ephor_dep.artifact("ephor");
 
-    // Create the lint step
-    const lint_cmd = b.addRunArtifact(ephor_exe);
-    lint_cmd.addArgs(&.{ "check", "src/" });
+    const ephor_cmd = b.addRunArtifact(ephor_exe);
+    ephor_cmd.addArgs(&.{ "check", "src/" });
 
-    const lint_step = b.step("lint", "Run ephor static analysis");
-    lint_step.dependOn(&lint_cmd.step);
+    const ephor_step = b.step("ephor", "Run ephor static analysis");
+    ephor_step.dependOn(&ephor_cmd.step);
 
-    // Optional: Make lint run before build
-    // exe.step.dependOn(&lint_cmd.step);
+    // Optional: Make ephor run before build
+    // exe.step.dependOn(&ephor_cmd.step);
 }
 ```
 
@@ -104,29 +103,29 @@ pub fn build(b: *std.Build) void {
 
 ```bash
 # Run static analysis
-zig build lint
+zig build ephor
 
-# Run lint before every build (if you uncommented the dependOn line)
+# Run ephor before every build (if you uncommented the dependOn line)
 zig build
 ```
 
-**Available lint commands:**
+**Available ephor commands:**
 
 ```zig
 // Check all (default)
-lint_cmd.addArgs(&.{ "check", "src/" });
+ephor_cmd.addArgs(&.{ "check", "src/" });
 
 // Check with summary
-lint_cmd.addArgs(&.{ "check", "src/", "--summary" });
+ephor_cmd.addArgs(&.{ "check", "src/", "--summary" });
 
 // Memory analysis only
-lint_cmd.addArgs(&.{ "memory", "src/" });
+ephor_cmd.addArgs(&.{ "memory", "src/" });
 
 // With custom thresholds
-lint_cmd.addArgs(&.{ "check", "src/", "--max-lines=100", "--max-branches=15" });
+ephor_cmd.addArgs(&.{ "check", "src/", "--max-lines=100", "--max-branches=15" });
 
 // Disable specific rules
-lint_cmd.addArgs(&.{ "check", "src/", "--disable=ZA301" });
+ephor_cmd.addArgs(&.{ "check", "src/", "--disable=ZA301" });
 ```
 
 ## Usage

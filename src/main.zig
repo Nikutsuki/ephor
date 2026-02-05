@@ -1903,41 +1903,54 @@ fn analyzeCFGDeferCoverage(
     return issues;
 }
 
-/// Check defer coverage for a single allocation using CFG dataflow
-fn checkDeferCoverageForAlloc(
+/// Block coverage state for defer analysis
+const BlockCoverageState = struct {
+    has_defer: []bool,
+    ownership_transferred: []bool,
+    free_and_return: []bool,
+
+    fn deinit(self: *BlockCoverageState, allocator: Allocator) void {
+        allocator.free(self.has_defer);
+        allocator.free(self.ownership_transferred);
+        allocator.free(self.free_and_return);
+    }
+
+    fn isBlockCovered(self: BlockCoverageState, bid: usize) bool {
+        return self.has_defer[bid] or self.ownership_transferred[bid] or self.free_and_return[bid];
+    }
+
+    fn anyDeferExists(self: BlockCoverageState) bool {
+        for (self.has_defer) |has| {
+            if (has) return true;
+        }
+        return false;
+    }
+};
+
+/// Scan CFG blocks for defer, free, and ownership patterns
+fn scanBlocksForPatterns(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
     lines: []const []const u8,
     func_line: usize,
-    file_path: []const u8,
-    alloc: CFGAlloc,
+    alloc_name: []const u8,
+    owner_vars: []const OwnerVar,
     num_blocks: usize,
-) !?Issue {
-    // Track which blocks have a defer for this allocation
-    var has_defer_in_block = try allocator.alloc(bool, num_blocks);
-    defer allocator.free(has_defer_in_block);
-    @memset(has_defer_in_block, false);
+) !BlockCoverageState {
+    var state = BlockCoverageState{
+        .has_defer = try allocator.alloc(bool, num_blocks),
+        .ownership_transferred = try allocator.alloc(bool, num_blocks),
+        .free_and_return = try allocator.alloc(bool, num_blocks),
+    };
+    @memset(state.has_defer, false);
+    @memset(state.ownership_transferred, false);
+    @memset(state.free_and_return, false);
 
-    // Track blocks where ownership is transferred
-    var ownership_transferred = try allocator.alloc(bool, num_blocks);
-    defer allocator.free(ownership_transferred);
-    @memset(ownership_transferred, false);
-
-    // Track blocks that free and return
-    var free_and_return = try allocator.alloc(bool, num_blocks);
-    defer allocator.free(free_and_return);
-    @memset(free_and_return, false);
-
-    // Track owner variables through data flow
-    var owner_vars = try trackOwnerVariables(allocator, cfg, lines, func_line, alloc.name);
-    defer owner_vars.deinit(allocator);
-
-    // Scan blocks for defer, ownership transfer, and free-return patterns
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
 
-        var freed_in_block = false;
-        var return_after_free = false;
+        var freed = false;
+        var return_after = false;
 
         for (block.start_line..block.end_line + 1) |line_num| {
             if (line_num < func_line) continue;
@@ -1945,49 +1958,53 @@ fn checkDeferCoverageForAlloc(
             if (idx >= lines.len) continue;
             const t = mem.trim(u8, lines[idx], " \t\r");
 
-            // Check for defer with this variable
             if (mem.startsWith(u8, t, "defer ")) {
-                if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
-                    has_defer_in_block[bid] = true;
+                if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc_name) != null) {
+                    state.has_defer[bid] = true;
                 }
             }
 
-            // Check for manual free (not in defer)
             if (!mem.startsWith(u8, t, "defer ") and !mem.startsWith(u8, t, "errdefer ")) {
-                if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
-                    freed_in_block = true;
+                if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc_name) != null) {
+                    freed = true;
                 }
             }
 
-            // Check for return after free
-            if (freed_in_block and mem.startsWith(u8, t, "return")) {
-                return_after_free = true;
+            if (freed and mem.startsWith(u8, t, "return")) {
+                return_after = true;
             }
 
-            // Check for ownership transfer
-            if (checkOwnershipInLine(t, owner_vars.items)) {
-                ownership_transferred[bid] = true;
+            if (checkOwnershipInLine(t, owner_vars)) {
+                state.ownership_transferred[bid] = true;
             }
         }
 
-        if (freed_in_block and return_after_free) {
-            free_and_return[bid] = true;
+        if (freed and return_after) {
+            state.free_and_return[bid] = true;
         }
     }
 
-    // Propagate coverage through CFG
+    return state;
+}
+
+/// Propagate coverage backward through CFG
+fn propagateCoverageBackward(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    state: BlockCoverageState,
+    num_blocks: usize,
+) ![]bool {
     var covered = try allocator.alloc(bool, num_blocks);
-    defer allocator.free(covered);
     @memset(covered, false);
 
-    // Initialize covered blocks
+    // Initialize from state
     for (0..num_blocks) |bid| {
-        if (has_defer_in_block[bid] or ownership_transferred[bid] or free_and_return[bid]) {
+        if (state.isBlockCovered(bid)) {
             covered[bid] = true;
         }
     }
 
-    // Propagate backwards: if all successors covered, block is covered
+    // Propagate backwards
     var changed = true;
     var iters: usize = 0;
     const max_iters = num_blocks * 2 + 1;
@@ -2025,23 +2042,48 @@ fn checkDeferCoverageForAlloc(
         }
     }
 
-    // Check if allocation block is covered
+    return covered;
+}
+
+/// Check defer coverage for a single allocation using CFG dataflow
+fn checkDeferCoverageForAlloc(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    alloc: CFGAlloc,
+    num_blocks: usize,
+) !?Issue {
+    // Track owner variables through data flow
+    var owner_vars = try trackOwnerVariables(allocator, cfg, lines, func_line, alloc.name);
+    defer owner_vars.deinit(allocator);
+
+    // Scan blocks for patterns
+    var state = try scanBlocksForPatterns(
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        alloc.name,
+        owner_vars.items,
+        num_blocks,
+    );
+    defer state.deinit(allocator);
+
+    // Propagate coverage
+    const covered = try propagateCoverageBackward(allocator, cfg, state, num_blocks);
+    defer allocator.free(covered);
+
+    // Check result
     const alloc_block_covered = covered[alloc.block];
+    const any_defer = state.anyDeferExists();
 
-    var any_defer_exists = false;
-    for (has_defer_in_block) |has| {
-        if (has) {
-            any_defer_exists = true;
-            break;
-        }
-    }
-
-    // Only report if defer exists on some paths but not all
-    if (!alloc_block_covered and !any_defer_exists) {
+    if (!alloc_block_covered and !any_defer) {
         return null; // Let analyzeFunction handle no-defer-at-all case
     }
 
-    if (!alloc_block_covered and any_defer_exists) {
+    if (!alloc_block_covered and any_defer) {
         const rule = if (alloc.is_create) RULE_CREATE_NO_DEFER else RULE_ALLOC_NO_DEFER;
         const msg = if (alloc.is_create)
             "defer destroy() not on all code paths"

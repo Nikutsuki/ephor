@@ -831,6 +831,63 @@ fn getBlockPredecessors(
     return preds;
 }
 
+/// Check if a variable has an unconditional fill before any use
+/// Returns true if filled before use, false if used first or no fill found
+fn hasUnconditionalFillBeforeUse(lines: []const []const u8, start_idx: usize, name: []const u8) bool {
+    var nesting_depth: usize = 0;
+
+    for (start_idx..lines.len) |check_idx| {
+        const check_line = mem.trim(u8, lines[check_idx], " \t\r");
+
+        // Track conditional nesting (if/else blocks)
+        if (mem.startsWith(u8, check_line, "if ") or
+            mem.startsWith(u8, check_line, "if(") or
+            mem.startsWith(u8, check_line, "else ") or
+            mem.startsWith(u8, check_line, "else{"))
+        {
+            nesting_depth += 1;
+        }
+        for (check_line) |c| {
+            if (c == '}' and nesting_depth > 0) nesting_depth -= 1;
+        }
+
+        // Check for unconditional fill (at depth 0, or while/for loops)
+        const is_loop = mem.startsWith(u8, check_line, "while ") or
+            mem.startsWith(u8, check_line, "for ");
+        if (nesting_depth == 0 or is_loop) {
+            if (isFillPattern(check_line, name)) return true;
+        }
+
+        // Check for use of variable (excluding fills, assignments, declarations)
+        if (mem.indexOf(u8, check_line, name)) |pos| {
+            const end_pos = pos + name.len;
+            const is_word = (pos == 0 or !isIdent(check_line[pos - 1])) and
+                (end_pos >= check_line.len or !isIdent(check_line[end_pos]));
+            if (is_word) {
+                // Skip .len access - it's a type property, not a value read
+                const is_len_access = end_pos + 4 <= check_line.len and
+                    mem.eql(u8, check_line[end_pos .. end_pos + 4], ".len");
+
+                // Skip if it's a fill, assignment, declaration, or .len access
+                if (!is_len_access and
+                    !isFillPattern(check_line, name) and
+                    !isAssignmentTarget(check_line, name, pos) and
+                    !mem.startsWith(u8, check_line, "var ") and
+                    !mem.startsWith(u8, check_line, "const "))
+                {
+                    // This is a USE - if unconditional, it's a use-before-fill
+                    if (nesting_depth == 0) return false;
+                }
+            }
+        }
+
+        // Stop at return or function end
+        if (mem.startsWith(u8, check_line, "return ")) break;
+        if (mem.eql(u8, check_line, "}")) break;
+    }
+    return false; // No unconditional fill found
+}
+
 /// Run definite assignment analysis on CFG
 /// Returns map of variable -> line where potentially uninitialized read occurs
 fn analyzeDefiniteAssignment(
@@ -876,72 +933,8 @@ fn analyzeDefiniteAssignment(
 
         if (mem.indexOf(u8, t, "= undefined") != null) {
             if (extractVarDeclName(t)) |name| {
-                // Scan forward to find: is there an UNCONDITIONAL fill BEFORE any use?
-                // Strategy: scan until we find either a fill (OK) or a use (problem)
-                // Stop at: return, end of function, or first use
-                var filled_before_use = false;
-                var found_use_first = false;
-                var nesting_depth: usize = 0; // Track conditional nesting
-
-                for (idx + 1..lines.len) |check_idx| {
-                    const check_line = mem.trim(u8, lines[check_idx], " \t\r");
-
-                    // Track conditional nesting (if/else blocks)
-                    if (mem.startsWith(u8, check_line, "if ") or
-                        mem.startsWith(u8, check_line, "if(") or
-                        mem.startsWith(u8, check_line, "else ") or
-                        mem.startsWith(u8, check_line, "else{"))
-                    {
-                        nesting_depth += 1;
-                    }
-                    for (check_line) |c| {
-                        if (c == '}' and nesting_depth > 0) nesting_depth -= 1;
-                    }
-
-                    // Check for unconditional fill (at depth 0, or while/for loops)
-                    const is_loop = mem.startsWith(u8, check_line, "while ") or
-                        mem.startsWith(u8, check_line, "for ");
-                    if (nesting_depth == 0 or is_loop) {
-                        if (isFillPattern(check_line, name)) {
-                            filled_before_use = true;
-                            break;
-                        }
-                    }
-
-                    // Check for use of variable (excluding fills, assignments, declarations)
-                    if (mem.indexOf(u8, check_line, name)) |pos| {
-                        // Verify word boundary
-                        const end_pos = pos + name.len;
-                        const is_word = (pos == 0 or !isIdent(check_line[pos - 1])) and
-                            (end_pos >= check_line.len or !isIdent(check_line[end_pos]));
-                        if (is_word) {
-                            // Skip .len access - it's a type property, not a value read
-                            const is_len_access = end_pos + 4 <= check_line.len and
-                                mem.eql(u8, check_line[end_pos .. end_pos + 4], ".len");
-
-                            // Skip if it's a fill, assignment, declaration, or .len access
-                            if (!is_len_access and
-                                !isFillPattern(check_line, name) and
-                                !isAssignmentTarget(check_line, name, pos) and
-                                !mem.startsWith(u8, check_line, "var ") and
-                                !mem.startsWith(u8, check_line, "const "))
-                            {
-                                // This is a USE - check if we're in a conditional
-                                if (nesting_depth == 0) {
-                                    found_use_first = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Stop at return or function end
-                    if (mem.startsWith(u8, check_line, "return ")) break;
-                    if (mem.eql(u8, check_line, "}")) break; // Function end
-                }
-
-                // Only track as undefined if we didn't find an unconditional fill
-                if (!filled_before_use) {
+                // Only track as undefined if we didn't find an unconditional fill before use
+                if (!hasUnconditionalFillBeforeUse(lines, idx + 1, name)) {
                     try undef_vars.put(name, func_line + idx);
                 }
             }

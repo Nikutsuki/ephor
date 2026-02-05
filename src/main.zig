@@ -6277,6 +6277,10 @@ fn analyzeCFGNullSafety(
                     // Skip if variable is null-checked on all paths to this point
                     if (checked_per_block[bid].contains(var_name)) continue;
 
+                    // Skip if early return null guard on prior lines
+                    // Zig idiom: if (x == null) { return; } guarantees x is non-null after
+                    if (hasEarlyReturnNullGuard(lines, idx, var_name)) continue;
+
                     try issues.append(allocator, .{
                         .file = file_path,
                         .line = line_num,
@@ -6431,6 +6435,7 @@ fn analyzeCFGErrors(
 
 /// Extract variable name from null check pattern
 /// Patterns: "if (x != null)", "if (x) |_|", "while (x != null)"
+/// Also handles early return: "if (x == null) return" (negated check)
 fn extractNullCheckedVar(t: []const u8) ?[]const u8 {
     // Find opening paren
     const open_paren = mem.indexOf(u8, t, "(") orelse return null;
@@ -6444,8 +6449,20 @@ fn extractNullCheckedVar(t: []const u8) ?[]const u8 {
         }
     }
 
-    // Pattern: x == null (inverted check - variable NOT null in else branch)
-    // We can't easily track this without more complex analysis, skip for now
+    // Pattern: x == null with early return/continue/break (variable IS null-checked after)
+    // Zig idiom: if (x == null) return; guarantees x is non-null after
+    if (mem.indexOf(u8, after_paren, " == null)")) |eq_pos| {
+        // Check if this line has an early exit (return, continue, break)
+        if (mem.indexOf(u8, t, "return") != null or
+            mem.indexOf(u8, t, "continue") != null or
+            mem.indexOf(u8, t, "break") != null)
+        {
+            const var_part = mem.trim(u8, after_paren[0..eq_pos], " \t");
+            if (var_part.len > 0 and isIdent(var_part[0])) {
+                return var_part;
+            }
+        }
+    }
 
     // Pattern: if (x) |_| - capture means x is non-null inside
     if (mem.indexOf(u8, after_paren, ") |")) |pipe_pos| {
@@ -6469,6 +6486,47 @@ fn extractUnwrappedVar(t: []const u8, dot_q_pos: usize) ?[]const u8 {
     }
     if (start < end) return t[start..end];
     return null;
+}
+
+/// Check for early return null guard on prior lines
+/// Zig idiom: if (x == null) { return; } guarantees x is non-null after
+/// This is based on Zig control flow - early exit from null check guards subsequent code
+fn hasEarlyReturnNullGuard(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+    // Look backwards within the function
+    const check_start = if (current_idx > 20) current_idx - 20 else 0;
+
+    var i = current_idx;
+    while (i > check_start) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+
+        // Stop at function boundary
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+
+        // Look for: if (var_name == null) followed by early exit in next few lines
+        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
+            const after = ctx[var_pos + var_name.len ..];
+            // Check for "== null)" or "== null )"
+            if (mem.startsWith(u8, after, " == null)") or
+                mem.startsWith(u8, after, " == null )"))
+            {
+                // Check the next few lines for return/continue/break
+                var j = i + 1;
+                const check_end = @min(j + 3, current_idx);
+                while (j < check_end) {
+                    const next_line = mem.trim(u8, lines[j], " \t\r");
+                    if (mem.indexOf(u8, next_line, "return") != null) return true;
+                    if (mem.startsWith(u8, next_line, "continue")) return true;
+                    if (mem.startsWith(u8, next_line, "break")) return true;
+                    // Check for inline early exit: if (x == null) return y;
+                    if (mem.indexOf(u8, ctx, "return") != null) return true;
+                    j += 1;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 /// Extract variable name being dereferenced with .*
@@ -6681,6 +6739,11 @@ fn analyzeCFGPanicPatterns(
                 // Zig semantics: mem.endsWith(s, suffix) implies s.len >= suffix.len
                 // Pattern: assert(mem.endsWith(var, "X")) then var.len - "X".len
                 if (hasEndsWithStartsWithGuard(lines, idx)) continue;
+
+                // Skip if in else/else-if branch with inverted guard
+                // Pattern: if (x.len < 4) { ... } else { x[x.len - x.len/4] } - safe
+                // Pattern: if (x <= 30) { ... } else if (x <= 120) { arr[divFloor(x,10) - 1] } - safe
+                if (hasElseBranchGuard(lines, idx)) continue;
 
                 try issues.append(allocator, .{
                     .file = file_path,
@@ -6985,6 +7048,96 @@ fn extractArrayBaseFromIndexArithmetic(t: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Check for else/else-if branch guards
+/// Pattern: if (x < N) { ... } else { ... } - in else branch, x >= N is guaranteed
+/// Pattern: if (x <= N) { ... } else if (y <= M) { ... } - in else-if, x > N is guaranteed
+/// Zig semantics: The else branch executes only when the if condition is false
+fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
+    // Look backward to find if we're in an else or else-if branch
+    var brace_depth: i32 = 0;
+    var i = current_idx;
+
+    // First, find the start of the current block (the opening brace)
+    while (i > 0) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+
+        // Track braces to find block structure
+        for (ctx) |c| {
+            if (c == '{') brace_depth += 1;
+            if (c == '}') brace_depth -= 1;
+        }
+
+        // We found the line that starts our block
+        if (brace_depth > 0) {
+            // Check if this line is an else or else-if
+            if (mem.indexOf(u8, ctx, "} else ") != null or mem.indexOf(u8, ctx, "} else{") != null) {
+                // We're in an else block - look for the preceding if condition
+                // The pattern is: if (x < N) { ... } else { WE ARE HERE }
+                // Find the matching if
+                var if_search_depth: i32 = 1; // We need to match the else's if
+                var j = i;
+                while (j > 0 and if_search_depth > 0) {
+                    j -= 1;
+                    const if_ctx = mem.trim(u8, lines[j], " \t\r");
+                    if (isCommentOrMultilineString(if_ctx)) continue;
+
+                    // Count braces
+                    for (if_ctx) |c| {
+                        if (c == '}') if_search_depth += 1;
+                        if (c == '{') if_search_depth -= 1;
+                    }
+
+                    // When depth reaches 0, we found the if statement
+                    if (if_search_depth == 0) {
+                        // Check for length comparison patterns
+                        // Pattern: if (x.len < N) or if (x < N) - in else, x.len >= N
+                        if (mem.indexOf(u8, if_ctx, "if (") != null or mem.indexOf(u8, if_ctx, "if(") != null) {
+                            // Check for < comparison (inverted in else means >=)
+                            if (mem.indexOf(u8, if_ctx, ".len < ") != null) return true;
+                            if (mem.indexOf(u8, if_ctx, " < ") != null) return true;
+                            // Check for <= comparison (inverted in else means >)
+                            if (mem.indexOf(u8, if_ctx, ".len <= ") != null) return true;
+                            if (mem.indexOf(u8, if_ctx, " <= ") != null) return true;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Check for else-if: } else if (condition)
+            if (mem.indexOf(u8, ctx, "} else if") != null or mem.indexOf(u8, ctx, "}else if") != null) {
+                // We're in an else-if block - the prior if's condition is inverted
+                var if_search_depth_2: i32 = 1;
+                var j2 = i;
+                while (j2 > 0 and if_search_depth_2 > 0) {
+                    j2 -= 1;
+                    const if_ctx = mem.trim(u8, lines[j2], " \t\r");
+                    if (isCommentOrMultilineString(if_ctx)) continue;
+
+                    for (if_ctx) |c| {
+                        if (c == '}') if_search_depth_2 += 1;
+                        if (c == '{') if_search_depth_2 -= 1;
+                    }
+
+                    if (if_search_depth_2 == 0) {
+                        // Pattern: if (x <= N) { ... } else if (...) - we know x > N
+                        if (mem.indexOf(u8, if_ctx, "if (") != null or mem.indexOf(u8, if_ctx, "if(") != null) {
+                            if (mem.indexOf(u8, if_ctx, " <= ") != null) return true;
+                            if (mem.indexOf(u8, if_ctx, " < ") != null) return true;
+                        }
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    return false;
+}
+
 /// Check for index guard patterns on same line
 fn hasIndexGuardOnLine(t: []const u8) bool {
     // Pattern: while (x > 0 and expr[x - 1])
@@ -7006,6 +7159,27 @@ fn hasIndexGuardOnLine(t: []const u8) bool {
     if (mem.indexOf(u8, t, "if (") != null) {
         if (mem.indexOf(u8, t, "> ") != null) return true;
         if (mem.indexOf(u8, t, ">= ") != null) return true;
+    }
+    // Pattern: inline if-else expression with length guard in else branch
+    // if (x.len < N) ... else arr[x.len - ...] - in else, x.len >= N
+    // Zig semantics: In inline if-else, else branch only executes when condition is false
+    if (mem.indexOf(u8, t, " else ") != null) {
+        // Check for length comparison in if condition
+        if (mem.indexOf(u8, t, "if (") != null or mem.indexOf(u8, t, "if(") != null) {
+            if (mem.indexOf(u8, t, ".len < ") != null) return true;
+            if (mem.indexOf(u8, t, ".len <= ") != null) return true;
+            // Generic comparison with < or <= before else
+            if (mem.indexOf(u8, t, " < ")) |lt_pos| {
+                if (mem.indexOf(u8, t, " else ")) |else_pos| {
+                    if (lt_pos < else_pos) return true;
+                }
+            }
+            if (mem.indexOf(u8, t, " <= ")) |le_pos| {
+                if (mem.indexOf(u8, t, " else ")) |else_pos| {
+                    if (le_pos < else_pos) return true;
+                }
+            }
+        }
     }
     // Pattern: endsWith/startsWith guarantees minimum length
     if (mem.indexOf(u8, t, "endsWith") != null) return true;
@@ -7834,6 +8008,9 @@ const Config = struct {
     format: OutputFormat,
     thresholds: Thresholds,
     init_build: bool, // For `init --build` to also output build.zig integration
+    export_path: ?[]const u8, // --export=<filepath> to save issues to file
+    known_issues_path: ?[]const u8, // --known-issues=<filepath> to filter known true positives
+    known_issues: std.StringHashMapUnmanaged(void), // Loaded known issues (file:line format)
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -7847,6 +8024,11 @@ const Config = struct {
         self.disabled_rules.deinit(allocator);
         for (self.enabled_rules.items) |r| allocator.free(r);
         self.enabled_rules.deinit(allocator);
+        if (self.export_path) |p| allocator.free(p);
+        if (self.known_issues_path) |p| allocator.free(p);
+        var ki_iter = self.known_issues.keyIterator();
+        while (ki_iter.next()) |key| allocator.free(key.*);
+        self.known_issues.deinit(allocator);
     }
 
     /// Determine if a rule is enabled considering enable list and disable list
@@ -8869,6 +9051,16 @@ fn parseCliArg(
         try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, arg[9..]));
         return;
     }
+    if (mem.startsWith(u8, arg, "--export=")) {
+        if (cfg.export_path) |old| allocator.free(old);
+        cfg.export_path = try allocator.dupe(u8, arg[9..]);
+        return;
+    }
+    if (mem.startsWith(u8, arg, "--known-issues=")) {
+        if (cfg.known_issues_path) |old| allocator.free(old);
+        cfg.known_issues_path = try allocator.dupe(u8, arg[15..]);
+        return;
+    }
     if (arg[0] != '-') {
         if (cfg.path_owned) allocator.free(cfg.path);
         cfg.path = try allocator.dupe(u8, arg);
@@ -8894,6 +9086,9 @@ fn parseArgs(allocator: Allocator) !Config {
         .format = .text,
         .thresholds = .{},
         .init_build = false,
+        .export_path = null,
+        .known_issues_path = null,
+        .known_issues = .{},
     };
     try loadConfigFile(allocator, &cfg);
     var cli_entries = false;
@@ -8952,6 +9147,14 @@ fn printHelp() void {
         \\  -V, --verbose        Verbose output
         \\  -s, --summary        Show summary at end
         \\  -b, --build          With 'init': also show build.zig integration
+        \\  --export=<file>      Export issues to file with code snippets
+        \\  --known-issues=<file> Filter out known true positives (file:line format)
+        \\
+        \\KNOWN ISSUES FILE FORMAT:
+        \\  # One issue per line, format: file:line
+        \\  # Lines starting with # are comments
+        \\  src/main.zig:123
+        \\  src/util.zig:456
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
@@ -9021,6 +9224,125 @@ fn printHelp() void {
 }
 
 // ============================================================================
+// Known Issues / Export
+// ============================================================================
+
+/// Load known issues from file (file:line format, one per line)
+/// Supports .ephor-ignore auto-detection or --known-issues=<path>
+fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
+    const path = cfg.known_issues_path orelse blk: {
+        // Auto-detect .ephor-ignore in project root
+        const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
+        defer allocator.free(ignore_path);
+        if (std.fs.cwd().access(ignore_path, .{})) |_| {
+            cfg.known_issues_path = try allocator.dupe(u8, ignore_path);
+            break :blk cfg.known_issues_path.?;
+        } else |_| {
+            return; // No known issues file
+        }
+    };
+
+    const file = std.fs.cwd().openFile(path, .{}) catch return;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return;
+    defer allocator.free(content);
+
+    var iter = mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |line| {
+        const trimmed = mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (trimmed[0] == '#') continue; // Comment
+        // Format: file:line or file:line:rule
+        // We store just file:line for matching
+        const key = try allocator.dupe(u8, trimmed);
+        try cfg.known_issues.put(allocator, key, {});
+    }
+}
+
+/// Check if an issue is in the known issues set
+fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
+    if (cfg.known_issues.count() == 0) return false;
+
+    // Build key in format "file:line"
+    var buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s}:{d}", .{ issue.file, issue.line }) catch return false;
+    return cfg.known_issues.contains(key);
+}
+
+/// Export issues to a file with code snippets
+fn exportIssues(
+    allocator: Allocator,
+    export_path: []const u8,
+    all_issues: []const Issue,
+    cfg: *const Config,
+) !void {
+    var file = try std.fs.cwd().createFile(export_path, .{});
+    defer file.close();
+
+    // Build export content in memory
+    var output = std.ArrayListUnmanaged(u8){};
+    defer output.deinit(allocator);
+    var writer = output.writer(allocator);
+
+    // Write header
+    try writer.print("# Ephor Issues Export\n", .{});
+    try writer.print("# Generated: {d}\n", .{std.time.timestamp()});
+    try writer.print("# Path: {s}\n", .{cfg.path});
+    try writer.print("# Total issues: {d}\n\n", .{all_issues.len});
+
+    for (all_issues) |issue| {
+        if (!shouldPrintIssue(issue, cfg)) continue;
+
+        // Write issue header
+        try writer.print("## {s}:{d}:{d} [{s}]\n", .{
+            issue.file,
+            issue.line,
+            issue.col,
+            issue.rule,
+        });
+        try writer.print("**{s}**: {s}\n", .{
+            @tagName(issue.severity),
+            issue.message,
+        });
+        if (issue.help) |help| {
+            try writer.print("**Help**: {s}\n", .{help});
+        }
+
+        // Try to include code snippet
+        if (std.fs.cwd().openFile(issue.file, .{})) |f| {
+            defer f.close();
+            if (f.readToEndAlloc(allocator, 10 * 1024 * 1024)) |content| {
+                defer allocator.free(content);
+
+                var line_iter = mem.splitScalar(u8, content, '\n');
+                var line_num: usize = 1;
+                try writer.print("\n```zig\n", .{});
+
+                // Show context: 2 lines before, the issue line, 2 lines after
+                const start_line = if (issue.line > 2) issue.line - 2 else 1;
+                const end_line = issue.line + 2;
+
+                while (line_iter.next()) |line| {
+                    if (line_num >= start_line and line_num <= end_line) {
+                        const prefix: []const u8 = if (line_num == issue.line) ">>> " else "    ";
+                        try writer.print("{s}{d}: {s}\n", .{ prefix, line_num, line });
+                    }
+                    if (line_num > end_line) break;
+                    line_num += 1;
+                }
+
+                try writer.print("```\n\n", .{});
+            } else |_| {}
+        } else |_| {}
+
+        try writer.print("---\n\n", .{});
+    }
+
+    // Write to file
+    try file.writeAll(output.items);
+}
+
+// ============================================================================
 // Output
 // ============================================================================
 
@@ -9029,6 +9351,7 @@ fn shouldPrintIssue(issue: Issue, cfg: *const Config) bool {
     if (!std.mem.startsWith(u8, issue.file, cfg.path)) return false;
     if (cfg.isRuleDisabled(issue.rule)) return false;
     if (cfg.isPathExcluded(issue.file)) return false;
+    if (isKnownIssue(issue, cfg)) return false;
     return true;
 }
 
@@ -9416,6 +9739,10 @@ pub fn main() !void {
                 std.debug.print("  run: ephor init\n", .{});
                 std.process.exit(1);
             }
+
+            // Load known issues for filtering
+            try loadKnownIssues(alloc, &cfg);
+
             var g = ImportGraph.init(alloc);
             defer g.deinit();
 
@@ -9584,6 +9911,30 @@ pub fn main() !void {
                     .null_safety = null_safety_count,
                     .panic = panic_count,
                 }, stats, cfg.format);
+            }
+
+            // Export issues to file if requested
+            if (cfg.export_path) |export_path| {
+                // Collect all issues into one list for export
+                var all_issues = std.ArrayListUnmanaged(Issue){};
+                defer all_issues.deinit(alloc);
+
+                for (orphan_issues.items) |i| try all_issues.append(alloc, i);
+                for (mem_only_issues.items) |i| try all_issues.append(alloc, i);
+                for (err_issues.items) |i| try all_issues.append(alloc, i);
+                for (ignored_err_issues.items) |i| try all_issues.append(alloc, i);
+                for (unused_issues.items) |i| try all_issues.append(alloc, i);
+                for (cx_issues.items) |i| try all_issues.append(alloc, i);
+                for (fmt_issues.items) |i| try all_issues.append(alloc, i);
+                for (style_issues.items) |i| try all_issues.append(alloc, i);
+                for (naming_issues.items) |i| try all_issues.append(alloc, i);
+                for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
+                for (panic_issues.items) |i| try all_issues.append(alloc, i);
+
+                exportIssues(alloc, export_path, all_issues.items, &cfg) catch |err| {
+                    std.debug.print("error: failed to export issues: {}\n", .{err});
+                };
+                std.debug.print("exported {d} issues to {s}\n", .{ all_issues.items.len, export_path });
             }
 
             const total = orphan_count + mem_count +

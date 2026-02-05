@@ -5938,6 +5938,109 @@ fn markDeferBlockLines(
     return in_defer;
 }
 
+/// Alias set for tracking data flow through variables
+const AliasSet = struct {
+    names: std.ArrayListUnmanaged([]const u8),
+
+    fn deinit(self: *AliasSet, allocator: Allocator) void {
+        self.names.deinit(allocator);
+    }
+};
+
+/// Build alias sets by tracking data flow through struct assignments
+/// Pattern: const x = Type{ ... alloc_name ... } makes x an alias
+fn buildAliasSets(
+    allocator: Allocator,
+    lines: []const []const u8,
+    allocs: []const AllocInfo,
+) ![]AliasSet {
+    const alias_sets = try allocator.alloc(AliasSet, allocs.len);
+    for (alias_sets, 0..) |*as, i| {
+        as.* = .{ .names = .{} };
+        try as.names.append(allocator, allocs[i].name);
+    }
+
+    // Scan for data flow using brace-depth tracking
+    var in_struct = false;
+    var brace_depth: i32 = 0;
+    var struct_var: []const u8 = "";
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.startsWith(u8, t, "//")) continue;
+
+        // Detect start of struct assignment
+        if (!in_struct and mem.indexOf(u8, t, "{") != null and mem.indexOf(u8, t, "= ") != null) {
+            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) {
+                const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
+                var end = prefix;
+                while (end < t.len and isIdent(t[end])) end += 1;
+                if (end > prefix) {
+                    struct_var = t[prefix..end];
+                    in_struct = true;
+                    brace_depth = 0;
+                }
+            } else if (mem.indexOf(u8, t, ".* = ") != null) {
+                var end: usize = 0;
+                while (end < t.len and isIdent(t[end])) end += 1;
+                if (end > 0) {
+                    struct_var = t[0..end];
+                    in_struct = true;
+                    brace_depth = 0;
+                }
+            }
+        }
+
+        if (in_struct) {
+            for (t) |c| {
+                if (c == '{') brace_depth += 1;
+                if (c == '}') brace_depth -= 1;
+            }
+
+            // Find allocation references and add struct var as alias
+            var to_update: [64]usize = undefined;
+            var count: usize = 0;
+
+            for (alias_sets, 0..) |*as, ai| {
+                if (count >= 64) break;
+                var found = false;
+                for (as.names.items) |alias| {
+                    if (mem.indexOf(u8, t, alias) != null) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found and struct_var.len > 0 and
+                    !mem.eql(u8, struct_var, allocs[ai].name))
+                {
+                    var exists = false;
+                    for (as.names.items) |existing| {
+                        if (mem.eql(u8, existing, struct_var)) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) {
+                        to_update[count] = ai;
+                        count += 1;
+                    }
+                }
+            }
+
+            for (to_update[0..count]) |idx| {
+                try alias_sets[idx].names.append(allocator, struct_var);
+            }
+
+            if (brace_depth <= 0 and mem.indexOf(u8, t, ";") != null) {
+                in_struct = false;
+                struct_var = "";
+            }
+        }
+    }
+
+    return alias_sets;
+}
+
 /// Analyze a single function for memory issues
 fn analyzeFunction(
     allocator: Allocator,
@@ -5978,103 +6081,10 @@ fn analyzeFunction(
     }
 
     // Pass 2: CFG-based data flow - track aliases (variables that contain allocations)
-    // For each allocation, build set of variables that transitively contain it
-    const AliasSet = struct { names: std.ArrayListUnmanaged([]const u8) };
-    const alias_sets = try allocator.alloc(AliasSet, allocs.items.len);
+    const alias_sets = try buildAliasSets(allocator, lines, allocs.items);
     defer {
-        for (alias_sets) |*as| as.names.deinit(allocator);
+        for (alias_sets) |*as| as.deinit(allocator);
         allocator.free(alias_sets);
-    }
-    for (alias_sets, 0..) |*as, i| {
-        as.* = .{ .names = .{} };
-        try as.names.append(allocator, allocs.items[i].name);
-    }
-
-    // Scan for data flow using brace-depth tracking (handles multi-line structs)
-    // Pattern: const x = Type{ ... alloc_name ... } or x.* = Type{ ... alloc_name ... }
-    var in_struct_assign = false;
-    var struct_brace_depth: i32 = 0;
-    var current_struct_var: []const u8 = "";
-
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//")) continue;
-
-        // Detect start of struct assignment
-        if (!in_struct_assign and mem.indexOf(u8, t, "{") != null and mem.indexOf(u8, t, "= ") != null) {
-            // const x = Type{ or var x = Type{
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) {
-                const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
-                var end = prefix;
-                while (end < t.len and isIdent(t[end])) end += 1;
-                if (end > prefix) {
-                    current_struct_var = t[prefix..end];
-                    in_struct_assign = true;
-                    struct_brace_depth = 0;
-                }
-            }
-            // x.* = Type{
-            else if (mem.indexOf(u8, t, ".* = ") != null) {
-                var end: usize = 0;
-                while (end < t.len and isIdent(t[end])) end += 1;
-                if (end > 0) {
-                    current_struct_var = t[0..end];
-                    in_struct_assign = true;
-                    struct_brace_depth = 0;
-                }
-            }
-        }
-
-        // Track brace depth within struct assignment
-        if (in_struct_assign) {
-            for (t) |c| {
-                if (c == '{') struct_brace_depth += 1;
-                if (c == '}') struct_brace_depth -= 1;
-            }
-
-            // Check if any allocation appears while we're inside the struct literal
-            // Collect indices of alias_sets that need the struct var added
-            // (can't modify while iterating - append may reallocate)
-            var sets_to_update: [64]usize = undefined;
-            var update_count: usize = 0;
-
-            for (alias_sets, 0..) |*as, ai| {
-                if (update_count >= 64) break; // Safety limit
-                var found_alloc = false;
-                for (as.names.items) |alias| {
-                    if (mem.indexOf(u8, t, alias) != null) {
-                        found_alloc = true;
-                        break;
-                    }
-                }
-                if (found_alloc and current_struct_var.len > 0 and
-                    !mem.eql(u8, current_struct_var, allocs.items[ai].name))
-                {
-                    var already_in = false;
-                    for (as.names.items) |existing| {
-                        if (mem.eql(u8, existing, current_struct_var)) {
-                            already_in = true;
-                            break;
-                        }
-                    }
-                    if (!already_in) {
-                        sets_to_update[update_count] = ai;
-                        update_count += 1;
-                    }
-                }
-            }
-
-            // Now safely add to the alias sets
-            for (sets_to_update[0..update_count]) |idx| {
-                try alias_sets[idx].names.append(allocator, current_struct_var);
-            }
-
-            // End of struct when braces balanced and semicolon found
-            if (struct_brace_depth <= 0 and mem.indexOf(u8, t, ";") != null) {
-                in_struct_assign = false;
-                current_struct_var = "";
-            }
-        }
     }
 
     // Pass 3: Process lines for defer, explicit free, ownership transfer, return/store

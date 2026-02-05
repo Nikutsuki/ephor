@@ -179,7 +179,7 @@ pub const Thresholds = struct {
     max_nesting_depth: usize = 4,
     max_params: usize = 5,
     max_branches: usize = 10,
-    max_line_length: usize = 80,
+    max_line_length: usize = 100,
     max_file_bytes: ?usize = null,
 };
 

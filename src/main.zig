@@ -7464,7 +7464,7 @@ fn writeDefaultConfig() !void {
         \\    "max_nesting": 4,
         \\    "max_params": 5,
         \\    "max_branches": 10,
-        \\    "max_line_length": 80
+        \\    "max_line_length": 100
         \\  }
         \\}
         \\
@@ -7878,7 +7878,7 @@ fn parseThresholdArg(arg: []const u8, th: *Thresholds) bool {
         th.max_params = v;
         return true;
     }
-    if (parseThreshold(arg, "--max-line-length=", 80)) |v| {
+    if (parseThreshold(arg, "--max-line-length=", 100)) |v| {
         th.max_line_length = v;
         return true;
     }
@@ -7990,7 +7990,7 @@ fn printHelp() void {
         \\  --max-lines=N        Max function lines (default: 50)
         \\  --max-nesting=N      Max nesting depth (default: 4)
         \\  --max-params=N       Max parameters (default: 5)
-        \\  --max-line-length=N  Max columns per line (default: 80)
+        \\  --max-line-length=N  Max columns per line (default: 100)
         \\  --max-file-bytes=N   Max file size in bytes (optional)
         \\  -V, --verbose        Verbose output
         \\  -s, --summary        Show summary at end
@@ -8007,7 +8007,7 @@ fn printHelp() void {
         \\      "max_nesting": 4,
         \\      "max_params": 5,
         \\      "max_branches": 10,
-        \\      "max_line_length": 80,
+        \\      "max_line_length": 100,
         \\      "max_file_bytes": 25000
         \\    }
         \\  }

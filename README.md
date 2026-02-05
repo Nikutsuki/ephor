@@ -18,51 +18,50 @@
 
 ## Installation
 
-Add ephor to your project's `build.zig.zon`:
-
-```zig
-.dependencies = .{
-    .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz",
-        // Run `zig build` once - it will tell you the hash to add here
-    },
-},
+**macOS / Linux:**
+```bash
+cd /path/to/your-project
+curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
 ```
 
-Add the ephor step to your `build.zig` (after `installArtifact`):
-
-```zig
-// Ephor static analysis
-const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
-const ephor_step = b.step("ephor", "Run ephor static analysis");
-ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);
+**Windows (PowerShell):**
+```powershell
+cd C:\path\to\your-project
+irm https://bitbucket.org/rhyoslabs/ephor/raw/main/install.ps1 | iex
 ```
 
-Run static analysis:
+Then run:
 
 ```bash
 zig build ephor
 ```
 
-That's it - Zig fetches and builds ephor automatically.
+That's it.
 
-### Standalone CLI (Optional)
+### Manual Installation
 
-If you want ephor as a system-wide command:
+<details>
+<summary>Click to expand manual steps</summary>
 
-```bash
-git clone https://bitbucket.org/rhyoslabs/ephor.git
-cd ephor
-zig build -Doptimize=ReleaseSafe
-sudo cp zig-out/bin/ephor /usr/local/bin/
+Add to `build.zig.zon`:
+
+```zig
+.dependencies = .{
+    .ephor = .{
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz",
+    },
+},
 ```
 
-With the standalone CLI, you can auto-setup new projects:
+Run `zig build` once to get the hash, add it, then add to `build.zig`:
 
-```bash
-cd /path/to/your-project
-ephor install    # Adds dependency + patches build.zig automatically
+```zig
+const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
+const ephor_step = b.step("ephor", "Run ephor static analysis");
+ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);
 ```
+
+</details>
 
 ## Usage
 

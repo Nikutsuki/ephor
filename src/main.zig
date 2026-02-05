@@ -5907,6 +5907,37 @@ fn extractDeclVarName(t: []const u8) ?[]const u8 {
     return if (end > prefix) t[prefix..end] else null;
 }
 
+/// Mark which lines are inside defer blocks (for use-after-free detection)
+/// Frees inside defer blocks execute at scope exit, not at the literal line number
+fn markDeferBlockLines(
+    allocator: Allocator,
+    lines: []const []const u8,
+) ![]bool {
+    var in_defer = try allocator.alloc(bool, lines.len);
+    @memset(in_defer, false);
+
+    var defer_depth: usize = 0;
+    for (lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.startsWith(u8, t, "defer {") or mem.startsWith(u8, t, "defer{")) {
+            in_defer[idx] = true;
+            for (t) |c| {
+                if (c == '{') defer_depth += 1;
+                if (c == '}' and defer_depth > 0) defer_depth -= 1;
+            }
+            continue;
+        }
+        if (defer_depth > 0) {
+            in_defer[idx] = true;
+            for (t) |c| {
+                if (c == '{') defer_depth += 1;
+                if (c == '}' and defer_depth > 0) defer_depth -= 1;
+            }
+        }
+    }
+    return in_defer;
+}
+
 /// Analyze a single function for memory issues
 fn analyzeFunction(
     allocator: Allocator,
@@ -5927,32 +5958,8 @@ fn analyzeFunction(
     var return_store_state = ReturnStoreState{};
 
     // Pre-pass: Mark which lines are inside defer blocks
-    // Frees inside defer blocks execute at scope exit, not at the literal line number
-    // We need to skip these for use-after-free detection
-    var in_defer_block = try allocator.alloc(bool, lines.len);
+    const in_defer_block = try markDeferBlockLines(allocator, lines);
     defer allocator.free(in_defer_block);
-    @memset(in_defer_block, false);
-    {
-        var defer_depth: usize = 0;
-        for (lines, 0..) |line, idx| {
-            const t = mem.trim(u8, line, " \t\r");
-            if (mem.startsWith(u8, t, "defer {") or mem.startsWith(u8, t, "defer{")) {
-                in_defer_block[idx] = true;
-                for (t) |c| {
-                    if (c == '{') defer_depth += 1;
-                    if (c == '}' and defer_depth > 0) defer_depth -= 1;
-                }
-                continue;
-            }
-            if (defer_depth > 0) {
-                in_defer_block[idx] = true;
-                for (t) |c| {
-                    if (c == '{') defer_depth += 1;
-                    if (c == '}' and defer_depth > 0) defer_depth -= 1;
-                }
-            }
-        }
-    }
 
     // Pass 1: Collect allocations
     for (lines, 0..) |line, idx| {

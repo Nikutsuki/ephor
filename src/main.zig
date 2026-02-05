@@ -2173,6 +2173,11 @@ fn checkErrdeferOwnershipTransfer(
             alloc.has_errdefer = true;
             return;
         }
+        // Check for struct field storage (self.field = alloc_name)
+        if (isStructFieldStorage(lt, alloc.name)) {
+            alloc.has_errdefer = true;
+            return;
+        }
     }
 }
 
@@ -2747,6 +2752,24 @@ fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
     if (mem.indexOf(u8, t, alloc_name) == null) return false;
     for (ownership_transfer_patterns) |pattern| {
         if (mem.indexOf(u8, t, pattern) != null) return true;
+    }
+    return false;
+}
+
+/// Check if allocation is stored in a struct field (ownership transferred to struct)
+/// Patterns: self.field = alloc_name, self.*.field = alloc_name
+fn isStructFieldStorage(t: []const u8, alloc_name: []const u8) bool {
+    // Check for self.field = alloc_name or self.*.field = alloc_name
+    if (mem.indexOf(u8, t, "self.") == null) return false;
+    if (mem.indexOf(u8, t, alloc_name) == null) return false;
+
+    // Pattern: self.something = alloc_name (assignment to struct field)
+    // Look for = followed by alloc_name
+    if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+        // Check if alloc_name appears after the =
+        if (mem.indexOf(u8, t, alloc_name)) |name_pos| {
+            if (name_pos > eq_pos) return true;
+        }
     }
     return false;
 }
@@ -4854,6 +4877,10 @@ fn errdeferCheckAlloc(state: *ErrdeferState, t: []const u8, line_num: usize) voi
         }
         // Check for cross-line ownership transfer via collection methods
         if (state.alloc_name.len > 0 and isOwnershipTransfer(t, state.alloc_name)) {
+            state.alloc_returned = true;
+        }
+        // Check for struct field storage: self.field = alloc_name (ownership to struct)
+        if (state.alloc_name.len > 0 and isStructFieldStorage(t, state.alloc_name)) {
             state.alloc_returned = true;
         }
         return;

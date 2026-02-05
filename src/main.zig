@@ -3107,9 +3107,13 @@ const best_effort_ops = [_][]const u8{
     // Writer - logging/debugging can fail
     ".print(",       ".writeAll(",    ".writeByte(",   ".write(",
     "std.debug.print(",
+    "writePositionalAll(", "writeStreamingAll(",
+    "writeAllBuffer(",
     // Network - transient failures expected
     ".send(",        ".recv(",        ".connect(",     ".bind(",
     ".stream.write(",
+    // Locking - best effort
+    ".lock(",        ".unlock(",
 };
 
 /// Check if a silent catch is for a best-effort operation
@@ -3633,6 +3637,9 @@ const ErrorAnalysisState = struct {
     // Track defer/errdefer blocks (catch {} is intentional for cleanup)
     in_defer_block: bool = false,
     defer_brace_depth: usize = 0,
+    // Track current function name for context-sensitive checks
+    current_func_name: []const u8 = "",
+    func_brace_depth: usize = 0,
 };
 
 /// Check if line starts a static storage struct pattern
@@ -3684,6 +3691,45 @@ fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
             if (c == '}' and state.defer_brace_depth > 0) {
                 state.defer_brace_depth -= 1;
                 if (state.defer_brace_depth == 0) state.in_defer_block = false;
+            }
+        }
+    }
+}
+
+/// Extract function name from function declaration line
+fn extractFuncName(t: []const u8) ?[]const u8 {
+    // Pattern: "pub fn name(" or "fn name("
+    const fn_idx = mem.indexOf(u8, t, "fn ") orelse return null;
+    const start = fn_idx + 3;
+    if (start >= t.len) return null;
+    var end = start;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    if (end > start) return t[start..end];
+    return null;
+}
+
+/// Track current function context for context-sensitive checks
+fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState) void {
+    // Detect function declaration
+    if (extractFuncName(t)) |name| {
+        state.current_func_name = name;
+        state.func_brace_depth = 0;
+        // Count braces on the declaration line
+        for (t) |c| {
+            if (c == '{') state.func_brace_depth += 1;
+        }
+        return;
+    }
+
+    // Track braces to detect function end
+    if (state.current_func_name.len > 0) {
+        for (t) |c| {
+            if (c == '{') state.func_brace_depth += 1;
+            if (c == '}' and state.func_brace_depth > 0) {
+                state.func_brace_depth -= 1;
+                if (state.func_brace_depth == 0) {
+                    state.current_func_name = "";
+                }
             }
         }
     }
@@ -3826,13 +3872,16 @@ fn checkLineErrors(
     ln: usize,
     skip_undefined: bool,
     in_defer: bool,
+    func_name: []const u8,
     pending: *?PendingUndefined,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
 ) !void {
     // Skip silent catch in defer context - catch {} is intentional for cleanup
     if (!in_defer) {
-        if (checkSilentCatch(t, path, ln)) |i| try issues.append(allocator, i);
+        if (checkSilentCatchWithContext(t, path, ln, func_name)) |i| {
+            try issues.append(allocator, i);
+        }
     }
     if (checkCatchUnreachable(t, path, ln)) |i| {
         try issues.append(allocator, i);
@@ -3913,6 +3962,9 @@ fn analyzeFileErrors(
         const skip_undefined = in_test or isTestFilePath(a.path) or
             isModuleLevelDecl(line) or state.in_static_struct;
 
+        // Track function context for cleanup detection
+        trackFunctionContext(t, &state);
+
         // Track defer blocks for silent catch exclusion
         trackDeferBlock(t, &state);
 
@@ -3928,6 +3980,7 @@ fn analyzeFileErrors(
             line_num,
             skip_undefined,
             state.in_defer_block,
+            state.current_func_name,
             &state.pending_undefined,
             issues,
             allocator,

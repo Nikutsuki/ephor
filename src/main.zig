@@ -2894,31 +2894,6 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
 // Memory Analysis Helpers
 // ============================================================================
 
-const MemState = struct {
-    in_fn: bool = false,
-    depth: usize = 0,
-    has_defer: bool = false,
-    alloc_line: usize = 0,
-    alloc_col: usize = 1,
-    is_create: bool = false,
-    uses_arena: bool = false,
-    alloc_name: []const u8 = "",
-    allocator_name: []const u8 = "",
-    returned: bool = false,
-    stored_in_self: bool = false,
-    // Multi-line return tracking
-    in_return: bool = false,
-    return_brace_depth: usize = 0,
-    // Multi-line self-assignment tracking
-    in_self_assign: bool = false,
-    self_assign_brace_depth: usize = 0,
-    // Local struct literal tracking (for return pattern)
-    in_local_struct: bool = false,
-    local_struct_name: []const u8 = "",
-    local_struct_brace_depth: usize = 0,
-    local_struct_has_alloc: bool = false,
-};
-
 /// Detect if allocation is returned (factory pattern)
 fn isReturnPattern(t: []const u8, alloc_name: []const u8) bool {
     if (!mem.startsWith(u8, t, "return ")) return false;
@@ -3099,283 +3074,6 @@ fn isDirectReturnAlloc(t: []const u8) bool {
     // The alloc line might not start with return but is part of return expression
     if (mem.indexOf(u8, t, "return if") != null) return true;
     return false;
-}
-
-fn checkMemoryAlloc(state: *MemState, t: []const u8, line_num: usize, in_return_context: bool) void {
-    if (!state.in_fn) return;
-
-    if (mem.indexOf(u8, t, ".alloc(")) |col| {
-        const in_str = isInsideString(t, col);
-        const has_defer = mem.indexOf(u8, t, "defer") != null;
-        const is_pool = isPoolAllocator(t);
-        const is_field_assign = isFieldAssignmentAlloc(t);
-        // Check both direct return AND multi-line return context
-        const is_return = isDirectReturnAlloc(t) or in_return_context;
-        const is_module_level = isDirectModuleLevelAlloc(t);
-        if (!in_str and !has_defer and !is_pool and !is_field_assign and !is_return and !is_module_level) {
-            state.alloc_line = line_num;
-            state.alloc_col = col + 1;
-            state.is_create = false;
-            state.alloc_name = extractAllocVarName(t);
-            if (extractAllocatorName(t)) |n| state.allocator_name = n;
-        }
-    } else if (mem.indexOf(u8, t, ".create(")) |col| {
-        const in_str = isInsideString(t, col);
-        const has_defer = mem.indexOf(u8, t, "defer") != null;
-        const is_pool = isPoolAllocator(t);
-        const is_alloc = isAllocatorCreate(t);
-        const is_field_assign = isFieldAssignmentAlloc(t);
-        // Check both direct return AND multi-line return context
-        const is_return = isDirectReturnAlloc(t) or in_return_context;
-        const is_module_level = isDirectModuleLevelAlloc(t);
-        if (!in_str and !has_defer and !is_pool and is_alloc and !is_field_assign and !is_return and !is_module_level) {
-            state.alloc_line = line_num;
-            state.alloc_col = col + 1;
-            state.is_create = true;
-            state.alloc_name = extractAllocVarName(t);
-            if (extractAllocatorName(t)) |n| state.allocator_name = n;
-        }
-    }
-}
-
-fn reportMemoryIssue(
-    issues: *std.ArrayListUnmanaged(Issue),
-    alloc: Allocator,
-    path: []const u8,
-    state: *const MemState,
-) !void {
-    const is_no_free = isNoFreeAllocatorName(state.allocator_name);
-    if (state.uses_arena or is_no_free) return;
-
-    // Skip factory/builder patterns (ownership transferred to caller)
-    if (state.returned or state.stored_in_self) return;
-
-    const rule = if (state.is_create)
-        RULE_CREATE_NO_DEFER
-    else
-        RULE_ALLOC_NO_DEFER;
-
-    const msg = if (state.is_create)
-        "create() without defer destroy()"
-    else
-        "alloc() without defer free()";
-
-    const help = if (state.is_create)
-        "add 'defer allocator.destroy(ptr);'"
-    else
-        "add 'defer allocator.free(slice);'";
-
-    try issues.append(alloc, .{
-        .file = path,
-        .line = state.alloc_line,
-        .col = state.alloc_col,
-        .severity = .warning,
-        .rule = rule,
-        .message = msg,
-        .help = help,
-    });
-}
-
-/// Track brace depth and check for function end, returns true if function ended
-fn trackMemoryBraces(
-    t: []const u8,
-    state: *MemState,
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-) !bool {
-    for (t) |c| {
-        if (c == '{') state.depth += 1;
-        if (c != '}' or state.depth == 0) continue;
-        state.depth -= 1;
-        if (state.depth != 0) continue;
-        // Skip warning if:
-        // - has defer/errdefer
-        // - uses arena allocator (bulk freed)
-        // - allocation was returned (ownership transfer to caller)
-        // - allocation was stored in self/ctx field (struct owns it)
-        const ownership_transferred = state.returned or state.stored_in_self;
-        const has_cleanup = state.has_defer or state.uses_arena or ownership_transferred;
-        const should_report = state.alloc_line > 0 and !has_cleanup;
-        if (should_report) {
-            try reportMemoryIssue(issues, allocator, path, state);
-        }
-        return true;
-    }
-    return false;
-}
-
-/// Analyze a single file for memory issues
-fn analyzeFileMemory(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    a: FileAnalysis,
-) !void {
-    var state = MemState{};
-    var line_num: usize = 1;
-    var lines = mem.splitScalar(u8, a.content, '\n');
-    while (lines.next()) |line| {
-        defer line_num += 1;
-        const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "\\\\") or isComment(t)) continue;
-        if (mem.indexOf(u8, t, "fn ") != null) state = .{ .in_fn = true };
-        if (state.in_fn and detectsArenaAllocator(t)) {
-            state.uses_arena = true;
-        }
-        if (try trackMemoryBraces(t, &state, issues, allocator, a.path)) {
-            state = .{};
-        }
-        if (mem.indexOf(u8, t, "defer ") != null) state.has_defer = true;
-        const has_ownership = state.alloc_name.len > 0 and
-            isOwnershipTransfer(t, state.alloc_name);
-        if (has_ownership) {
-            state.has_defer = true;
-        }
-        // Track multi-line return statements
-        // IMPORTANT: Save state BEFORE updating so we can detect allocations in last line
-        const was_in_return = state.in_return;
-        if (mem.startsWith(u8, t, "return ")) {
-            state.in_return = true;
-            state.return_brace_depth = 0;
-        }
-        if (state.in_return) {
-            // Track braces within return statement
-            for (t) |c| {
-                if (c == '{') state.return_brace_depth += 1;
-                if (c == '}') {
-                    if (state.return_brace_depth > 0) state.return_brace_depth -= 1;
-                    if (state.return_brace_depth == 0) state.in_return = false;
-                }
-            }
-            // Single-line return without braces
-            if (state.return_brace_depth == 0 and mem.indexOf(u8, t, ";") != null) {
-                state.in_return = false;
-            }
-        }
-        // Restore for detection if we were in return before this line ended it
-        const in_return_context = was_in_return or state.in_return;
-
-        // Track multi-line self-assignment (self.x = .{...} or self.* = TypeName{...})
-        if (!state.in_self_assign) {
-            const has_self_or_ctx = mem.indexOf(u8, t, "self.") != null or
-                mem.indexOf(u8, t, "ctx.") != null or
-                mem.indexOf(u8, t, "result.") != null;
-            // Match both anonymous struct literal (.{) and typed struct literal (TypeName{)
-            const has_struct_literal = mem.indexOf(u8, t, "= .{") != null or
-                mem.indexOf(u8, t, "= .{ ") != null or
-                (mem.indexOf(u8, t, "{") != null and mem.indexOf(u8, t, "= ") != null and
-                mem.indexOf(u8, t, "fn ") == null);
-            if (has_self_or_ctx and has_struct_literal) {
-                state.in_self_assign = true;
-                state.self_assign_brace_depth = 0;
-            }
-        }
-        if (state.in_self_assign) {
-            // Track braces within self-assignment
-            for (t) |c| {
-                if (c == '{') state.self_assign_brace_depth += 1;
-                if (c == '}') {
-                    if (state.self_assign_brace_depth > 0) state.self_assign_brace_depth -= 1;
-                    if (state.self_assign_brace_depth == 0) state.in_self_assign = false;
-                }
-            }
-        }
-
-        // Track local struct literals (const result = TypeName{...})
-        // Used to detect pattern: alloc stored in struct field, struct later returned
-        if (!state.in_local_struct and state.alloc_name.len > 0) {
-            // Look for: const varname = TypeName{ or const varname = .{
-            if (mem.startsWith(u8, t, "const ")) {
-                if (mem.indexOf(u8, t, "= .{") != null or
-                    mem.indexOf(u8, t, "= .{ ") != null or
-                    (mem.indexOf(u8, t, "{") != null and
-                    mem.indexOf(u8, t, "= ") != null and
-                    mem.indexOf(u8, t, "fn ") == null))
-                {
-                    // Extract the variable name
-                    const name_start: usize = 6; // After "const "
-                    var name_end = name_start;
-                    while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
-                    if (name_end > name_start) {
-                        state.local_struct_name = t[name_start..name_end];
-                        state.in_local_struct = true;
-                        state.local_struct_brace_depth = 0;
-                        state.local_struct_has_alloc = false;
-                    }
-                }
-            }
-        }
-        if (state.in_local_struct) {
-            // Track braces within local struct literal
-            for (t) |c| {
-                if (c == '{') state.local_struct_brace_depth += 1;
-                if (c == '}') {
-                    if (state.local_struct_brace_depth > 0) state.local_struct_brace_depth -= 1;
-                    if (state.local_struct_brace_depth == 0) state.in_local_struct = false;
-                }
-            }
-            // Check if our allocation is stored in this struct
-            if (state.alloc_name.len > 0 and mem.indexOf(u8, t, state.alloc_name) != null) {
-                state.local_struct_has_alloc = true;
-            }
-        }
-
-        // Detect factory patterns: return or store in self
-        if (state.alloc_name.len > 0) {
-            // Check if alloc is in return statement (single or multi-line)
-            // Use in_return_context to catch allocations on last line of multi-line return
-            if (in_return_context or mem.startsWith(u8, t, "return ")) {
-                if (mem.indexOf(u8, t, state.alloc_name) != null) {
-                    state.returned = true;
-                }
-            }
-            // Check if alloc is in self/ctx assignment (single or multi-line)
-            if (state.in_self_assign) {
-                if (mem.indexOf(u8, t, state.alloc_name) != null) {
-                    state.stored_in_self = true;
-                }
-            }
-            // Direct field assignment: ctx.field = alloc_name or self.field = alloc_name
-            if (isDirectFieldAssignment(t, state.alloc_name)) {
-                state.stored_in_self = true;
-            }
-            if (isSelfStoragePattern(t, state.alloc_name)) {
-                state.stored_in_self = true;
-            }
-            // Module-level variable assignment: identifier = alloc_name (no self/ctx prefix)
-            if (isModuleLevelAssignment(t, state.alloc_name)) {
-                state.stored_in_self = true; // Reuse flag for "ownership transferred"
-            }
-            // Function call with allocation as argument (ownership transfer)
-            // Pattern: foo.submit(alloc_name) or foo.enqueue(alloc_name) etc.
-            if (isOwnershipTransferCall(t, state.alloc_name)) {
-                state.stored_in_self = true; // Ownership transferred to callee
-            }
-            // Check if local struct containing allocation is returned
-            // Pattern: const result = TypeName{ .field = alloc_name }; return result;
-            if (state.local_struct_has_alloc and state.local_struct_name.len > 0) {
-                if (mem.startsWith(u8, t, "return ")) {
-                    // Check if return statement contains the struct variable name
-                    if (mem.indexOf(u8, t, state.local_struct_name) != null) {
-                        state.returned = true;
-                    }
-                }
-            }
-        }
-        checkMemoryAlloc(&state, t, line_num, in_return_context);
-    }
-}
-
-fn analyzeMemory(
-    allocator: Allocator,
-    graph: *ImportGraph,
-) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        try analyzeFileMemory(allocator, &issues, entry.value_ptr.*);
-    }
-    return issues;
 }
 
 // ============================================================================
@@ -4830,177 +4528,6 @@ fn analyzeStyle(
                 );
             }
         }
-    }
-    return issues;
-}
-
-// ============================================================================
-// Errdefer Analysis Helpers
-// ============================================================================
-
-const ErrdeferState = struct {
-    in_fn: bool = false,
-    fn_returns_error: bool = false,
-    alloc_line: usize = 0,
-    alloc_col: usize = 1,
-    alloc_name: []const u8 = "",
-    has_errdefer: bool = false,
-    alloc_returned: bool = false,
-    has_try_after_alloc: bool = false,
-    uses_arena: bool = false, // Function uses arena allocator
-    depth: usize = 0,
-};
-
-fn errdeferResetForNewFn(state: *ErrdeferState, returns_error: bool) void {
-    state.in_fn = true;
-    state.depth = 0;
-    state.has_errdefer = false;
-    state.alloc_line = 0;
-    state.alloc_name = "";
-    state.alloc_returned = false;
-    state.has_try_after_alloc = false;
-    state.uses_arena = false;
-    state.fn_returns_error = returns_error;
-}
-
-fn errdeferCheckAlloc(state: *ErrdeferState, t: []const u8, line_num: usize) void {
-    if (!state.in_fn or !state.fn_returns_error) return;
-
-    // If we already have an allocation, check for subsequent try statements
-    if (state.alloc_line > 0) {
-        if (mem.indexOf(u8, t, "try ") != null) state.has_try_after_alloc = true;
-        // Check if allocation is returned (ownership transfer)
-        if (mem.startsWith(u8, t, "return ") and state.alloc_name.len > 0) {
-            if (mem.indexOf(u8, t, state.alloc_name) != null) {
-                state.alloc_returned = true;
-            }
-        }
-        // Check for cross-line ownership transfer via collection methods
-        if (state.alloc_name.len > 0 and isOwnershipTransfer(t, state.alloc_name)) {
-            state.alloc_returned = true;
-        }
-        // Check for struct field storage: self.field = alloc_name (ownership to struct)
-        if (state.alloc_name.len > 0 and isStructFieldStorage(t, state.alloc_name)) {
-            state.alloc_returned = true;
-        }
-        return;
-    }
-
-    const has_try = mem.indexOf(u8, t, "try ") != null;
-    const has_errdefer = mem.indexOf(u8, t, "errdefer") != null;
-    if (!has_try or has_errdefer) return;
-
-    // Skip no-free allocators (arena, scratch, temp, frame, fba - bulk freed)
-    if (mem.indexOf(u8, t, "arena") != null) return;
-    if (mem.indexOf(u8, t, "scratch") != null) return;
-    if (mem.indexOf(u8, t, "temp") != null) return;
-    if (mem.indexOf(u8, t, "frame") != null) return;
-    if (mem.indexOf(u8, t, ".fba.") != null) return;
-
-    // Extract allocation name from const/var declaration
-    const prefix_len: usize = if (mem.startsWith(u8, t, "const "))
-        @as(usize, 6)
-    else if (mem.startsWith(u8, t, "var "))
-        @as(usize, 4)
-    else
-        return;
-    var end = prefix_len;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    const alloc_name = if (end > prefix_len) t[prefix_len..end] else "";
-
-    if (mem.indexOf(u8, t, ".alloc(")) |col| {
-        if (!isInsideString(t, col)) {
-            state.alloc_line = line_num;
-            state.alloc_col = col + 1;
-            state.alloc_name = alloc_name;
-        }
-    } else if (mem.indexOf(u8, t, ".create(")) |col| {
-        if (!isInsideString(t, col) and isAllocatorCreate(t)) {
-            state.alloc_line = line_num;
-            state.alloc_col = col + 1;
-            state.alloc_name = alloc_name;
-        }
-    }
-}
-
-/// Check errdefer braces, returns true if function ended with missing errdefer
-fn checkErrdeferBraces(t: []const u8, state: *ErrdeferState) bool {
-    for (t) |c| {
-        if (c == '{') state.depth += 1;
-        if (c != '}' or state.depth == 0) continue;
-        state.depth -= 1;
-        if (state.depth != 0) continue;
-        // Need errdefer only if:
-        // - There's an allocation without errdefer/defer
-        // - Allocation is NOT returned (ownership transfer)
-        // - There ARE subsequent try statements that could fail
-        const needs_errdefer = state.alloc_line > 0 and !state.has_errdefer and
-            !state.alloc_returned and state.has_try_after_alloc;
-        if (needs_errdefer and state.fn_returns_error) return true;
-    }
-    return false;
-}
-
-/// Report missing errdefer issue
-fn reportErrdeferIssue(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    state: *ErrdeferState,
-) !void {
-    try issues.append(allocator, .{
-        .file = path,
-        .line = state.alloc_line,
-        .col = state.alloc_col,
-        .severity = .warning,
-        .rule = RULE_ALLOC_NO_ERRDEFER,
-        .message = "allocation without errdefer in error fn",
-        .help = "add errdefer to clean up on error",
-    });
-    state.in_fn = false;
-    state.alloc_line = 0;
-}
-
-/// Analyze a single file for errdefer issues
-fn analyzeFileErrdefer(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    a: FileAnalysis,
-) !void {
-    var state = ErrdeferState{};
-    var line_num: usize = 1;
-    var lines = mem.splitScalar(u8, a.content, '\n');
-    while (lines.next()) |line| {
-        defer line_num += 1;
-        const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
-        if (mem.indexOf(u8, t, "fn ") != null) {
-            errdeferResetForNewFn(&state, mem.indexOf(u8, t, "!") != null);
-        }
-        if (checkErrdeferBraces(t, &state)) {
-            try reportErrdeferIssue(issues, allocator, a.path, &state);
-        }
-        // Check for errdefer OR defer with free/destroy (both are valid cleanup)
-        if (mem.indexOf(u8, t, "errdefer ") != null) state.has_errdefer = true;
-        if (mem.indexOf(u8, t, "defer ") != null) {
-            // defer allocator.free() or defer x.deinit() patterns are valid cleanup
-            // Skip patterns inside string literals
-            if (hasRealCleanupPattern(t)) {
-                state.has_errdefer = true;
-            }
-        }
-        errdeferCheckAlloc(&state, t, line_num);
-    }
-}
-
-fn analyzeErrdefer(
-    allocator: Allocator,
-    graph: *ImportGraph,
-) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        try analyzeFileErrdefer(allocator, &issues, entry.value_ptr.*);
     }
     return issues;
 }
@@ -8400,7 +7927,7 @@ pub fn main() !void {
             var g = ImportGraph.init(alloc);
             defer g.deinit();
             try scanPath(&g, cfg.path);
-            var issues = try analyzeMemory(alloc, &g);
+            var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const count = printIssues(issues.items, base_path, cfg.format, "memory", &cfg);
             if (count > 0) std.process.exit(1);
@@ -8491,10 +8018,8 @@ pub fn main() !void {
             defer deinitIssues(&orphan_issues, alloc);
             sortIssuesByFile(orphan_issues.items);
 
-            var mem_issues = try analyzeMemory(alloc, &g);
-            defer deinitIssues(&mem_issues, alloc);
-
-            // CFG-based memory analysis (ZA104 - more accurate leak detection)
+            // CFG-based memory analysis (ZA101-ZA106)
+            // Covers: alloc/create without defer, errdefer gaps, leaks, UAF, double-free
             var cfg_mem_issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&cfg_mem_issues, alloc);
 
@@ -8515,9 +8040,6 @@ pub fn main() !void {
 
             var naming_issues = try analyzeNaming(alloc, &g);
             defer deinitIssues(&naming_issues, alloc);
-
-            var errdefer_issues = try analyzeErrdefer(alloc, &g);
-            defer deinitIssues(&errdefer_issues, alloc);
 
             // Phase 5: Error and null safety
             var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
@@ -8541,24 +8063,10 @@ pub fn main() !void {
                 &cfg,
             );
             const mem_count = printIssues(
-                mem_issues.items,
-                base_path,
-                cfg.format,
-                "memory",
-                &cfg,
-            );
-            const cfg_mem_count = printIssues(
                 cfg_mem_issues.items,
                 base_path,
                 cfg.format,
                 "memory",
-                &cfg,
-            );
-            const errdefer_count = printIssues(
-                errdefer_issues.items,
-                base_path,
-                cfg.format,
-                "errdefer",
                 &cfg,
             );
             const ignored_err_count = printIssues(
@@ -8628,7 +8136,7 @@ pub fn main() !void {
             if (cfg.show_summary) {
                 printSummary(.{
                     .orphan = orphan_count,
-                    .memory = mem_count + cfg_mem_count + errdefer_count,
+                    .memory = mem_count,
                     .err = err_count + ignored_err_count,
                     .unused = unused_count,
                     .complexity = cx_count,
@@ -8639,8 +8147,8 @@ pub fn main() !void {
                 }, stats, cfg.format);
             }
 
-            const total = orphan_count + mem_count + cfg_mem_count +
-                errdefer_count + err_count + ignored_err_count +
+            const total = orphan_count + mem_count +
+                err_count + ignored_err_count +
                 unused_count + cx_count + fmt_count +
                 style_count + naming_count + null_safety_count + panic_count;
             if (total > 0) std.process.exit(1);

@@ -1194,14 +1194,8 @@ fn analyzeCFGMemorySafety(
         const t = mem.trim(u8, line, " \t\r");
 
         // Detect allocations: const x = ... .alloc( or .create( (skip patterns in strings)
-        if (hasRealAllocPattern(t) and
-            (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")))
-        {
-            const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
-            var end = prefix;
-            while (end < t.len and isIdent(t[end])) end += 1;
-            if (end > prefix) {
-                const name = t[prefix..end];
+        if (hasRealAllocPattern(t)) {
+            if (extractVarDeclName(t)) |name| {
                 const col = getRealAllocPos(t) orelse 0;
                 try allocs.put(name, .{
                     .name = name,
@@ -1291,35 +1285,13 @@ fn analyzeCFGMemorySafety(
         // Phase 3: Detect use-after-free with path-sensitivity
         // Key insight: if free is in a block with return, subsequent blocks
         // are NOT reached via that path - free doesn't affect them
-        var errdefer_depth: usize = 0; // Track if we're inside errdefer block
         for (lines, 0..) |line, idx| {
             const actual_line = func_line + idx;
             const t = mem.trim(u8, line, " \t\r");
 
-            // Track errdefer block depth
-            if (mem.startsWith(u8, t, "errdefer ") or mem.startsWith(u8, t, "errdefer{")) {
-                errdefer_depth += 1;
-                // Check if it's a single-line errdefer (no opening brace or balanced braces)
-                var braces: i32 = 0;
-                for (t) |c| {
-                    if (c == '{') braces += 1;
-                    if (c == '}') braces -= 1;
-                }
-                // Single line errdefer - safe to decrement since we just incremented above
-                if (braces == 0 and errdefer_depth > 0) errdefer_depth -= 1;
-                continue;
-            }
-            if (errdefer_depth > 0) {
-                // Track brace depth within errdefer
-                for (t) |c| {
-                    if (c == '{') errdefer_depth += 1;
-                    if (c == '}') {
-                        if (errdefer_depth > 0) errdefer_depth -= 1;
-                    }
-                }
-                // Skip UAF detection inside errdefer - it's cleanup code
-                continue;
-            }
+            // Skip UAF detection inside errdefer - it's cleanup code
+            // (uses pre-computed in_errdefer[] from markDeferAndErrdeferBlocks)
+            if (in_errdefer[idx]) continue;
 
             // Skip: declarations, frees, defers, comments
             if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) continue;
@@ -1659,22 +1631,11 @@ fn collectCFGAllocations(
 
         // Detect allocations (skip patterns inside string literals)
         if (!hasRealAllocPattern(t)) continue;
-        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
 
         // Skip no-free allocators (arena, scratch, temp, frame, fba, recycle)
-        if (mem.indexOf(u8, t, "arena") != null) continue;
-        if (mem.indexOf(u8, t, "scratch") != null) continue;
-        if (mem.indexOf(u8, t, "temp") != null) continue;
-        if (mem.indexOf(u8, t, "frame") != null) continue;
-        if (mem.indexOf(u8, t, ".fba.") != null) continue;
-        if (mem.indexOf(u8, t, "recycle") != null) continue;
+        if (hasNoFreeAllocatorPattern(t)) continue;
 
-        const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
-        var end = prefix;
-        while (end < t.len and isIdent(t[end])) end += 1;
-        if (end <= prefix) continue;
-
-        const name = t[prefix..end];
+        const name = extractVarDeclName(t) orelse continue;
         const col = getRealAllocPos(t) orelse 0;
         const block = findBlockForLine(cfg, actual_line) orelse continue;
 
@@ -2142,12 +2103,7 @@ fn isTryAllocation(t: []const u8) bool {
     if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return false;
 
     // Skip no-free allocators
-    if (mem.indexOf(u8, t, "arena") != null) return false;
-    if (mem.indexOf(u8, t, "scratch") != null) return false;
-    if (mem.indexOf(u8, t, "temp") != null) return false;
-    if (mem.indexOf(u8, t, "frame") != null) return false;
-    if (mem.indexOf(u8, t, ".fba.") != null) return false;
-    if (mem.indexOf(u8, t, "recycle") != null) return false;
+    if (hasNoFreeAllocatorPattern(t)) return false;
 
     return true;
 }
@@ -2187,13 +2143,11 @@ fn checkErrdeferOwnershipTransfer(
 ///          const more = try alloc(); // If this fails, data leaks
 fn analyzeCFGErrdeferCoverage(
     allocator: Allocator,
-    cfg: *ControlFlowGraph,
     lines: []const []const u8,
     func_line: usize,
     file_path: []const u8,
     fn_returns_error: bool,
 ) !std.ArrayListUnmanaged(Issue) {
-    _ = cfg; // Available for future path-sensitive analysis
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
     // Early exit conditions
@@ -2248,12 +2202,9 @@ fn analyzeCFGErrdeferCoverage(
         // Collect try allocations
         const has_try = mem.indexOf(u8, t, "try ") != null;
         if (has_try and isTryAllocation(t)) {
-            const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
-            var end = prefix;
-            while (end < t.len and isIdent(t[end])) end += 1;
-            if (end > prefix) {
+            if (extractVarDeclName(t)) |name| {
                 try try_allocs.append(allocator, .{
-                    .name = t[prefix..end],
+                    .name = name,
                     .line = actual_line,
                     .col = (getRealAllocPos(t) orelse 0) + 1,
                     .is_create = hasRealCreatePattern(t),
@@ -2729,6 +2680,16 @@ fn isNoFreeAllocatorName(name: []const u8) bool {
     if (mem.indexOf(u8, name, "frame") != null) return true;
     if (mem.indexOf(u8, name, "recycle") != null) return true;
     if (mem.eql(u8, name, "fba")) return true;
+    return false;
+}
+
+/// Check if a line contains no-free allocator patterns (arena, scratch, temp, frame, fba, recycle)
+/// Used to skip allocations that don't need defer cleanup
+fn hasNoFreeAllocatorPattern(t: []const u8) bool {
+    const patterns = [_][]const u8{ "arena", "scratch", "temp", "frame", ".fba.", "recycle" };
+    for (patterns) |p| {
+        if (mem.indexOf(u8, t, p) != null) return true;
+    }
     return false;
 }
 
@@ -4937,7 +4898,6 @@ fn processFunction(
     // Run CFG-based errdefer coverage analysis (ZA103)
     var errdefer_issues = try analyzeCFGErrdeferCoverage(
         allocator,
-        &cfg,
         func_lines_items,
         func_start,
         file_path,
@@ -5057,16 +5017,11 @@ fn findAllocCall(t: []const u8) ?struct { col: usize, is_create: bool } {
 
 /// Try to extract allocation from a line
 fn tryExtractAllocation(t: []const u8, actual_line: usize, uses_arena: bool) ?AllocInfo {
-    const is_decl = mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ");
-    if (!is_decl) return null;
-    const prefix_len: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
-    var name_end = prefix_len;
-    while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
-    if (name_end <= prefix_len) return null;
+    const name = extractVarDeclName(t) orelse return null;
     const alloc_call = findAllocCall(t) orelse return null;
     const alloc_name = extractAllocatorName(t) orelse "";
     return AllocInfo{
-        .name = t[prefix_len..name_end],
+        .name = name,
         .allocator_name = alloc_name,
         .line = actual_line,
         .col = alloc_call.col + 1,
@@ -5504,15 +5459,10 @@ fn buildAliasSets(
 
         // Detect start of struct assignment
         if (!in_struct and mem.indexOf(u8, t, "{") != null and mem.indexOf(u8, t, "= ") != null) {
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) {
-                const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
-                var end = prefix;
-                while (end < t.len and isIdent(t[end])) end += 1;
-                if (end > prefix) {
-                    struct_var = t[prefix..end];
-                    in_struct = true;
-                    brace_depth = 0;
-                }
+            if (extractVarDeclName(t)) |name| {
+                struct_var = name;
+                in_struct = true;
+                brace_depth = 0;
             } else if (mem.indexOf(u8, t, ".* = ") != null) {
                 var end: usize = 0;
                 while (end < t.len and isIdent(t[end])) end += 1;

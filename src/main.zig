@@ -1604,41 +1604,40 @@ fn analyzeCFGMemorySafety(
     return issues;
 }
 
-/// CFG-based defer coverage analysis (ZA101/ZA102)
-/// Detects allocations where defer only exists on some paths
-fn analyzeCFGDeferCoverage(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+// ============================================================================
+// CFG Defer Coverage Analysis Helpers
+// ============================================================================
 
-    // Phase 1: Identify allocations
-    const CFGAlloc = struct {
-        name: []const u8,
-        line: usize,
-        col: usize,
-        block: usize,
-        is_create: bool,
-    };
+/// Allocation info for CFG-based defer analysis
+const CFGAlloc = struct {
+    name: []const u8,
+    line: usize,
+    col: usize,
+    block: usize,
+    is_create: bool,
+};
 
-    var allocs = std.ArrayListUnmanaged(CFGAlloc){};
-    defer allocs.deinit(allocator);
-
-    // Check if function has arena parameter (first few lines)
-    var has_arena_param = false;
+/// Check if function has arena parameter (first few lines)
+fn hasArenaParameter(lines: []const []const u8) bool {
     for (lines[0..@min(5, lines.len)]) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (mem.indexOf(u8, t, "arena:") != null or
             mem.indexOf(u8, t, "arena :") != null)
         {
-            has_arena_param = true;
-            break;
+            return true;
         }
     }
-    if (has_arena_param) return issues; // Arena-based functions don't need local defer
+    return false;
+}
+
+/// Collect allocations from function lines for CFG analysis
+fn collectCFGAllocations(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+) !std.ArrayListUnmanaged(CFGAlloc) {
+    var allocs = std.ArrayListUnmanaged(CFGAlloc){};
 
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
@@ -1674,57 +1673,72 @@ fn analyzeCFGDeferCoverage(
         });
     }
 
-    if (allocs.items.len == 0) return issues;
+    return allocs;
+}
 
-    // Pre-pass: Check for immediate defer after multi-line allocations
-    // This handles cases where CFG incorrectly splits blocks at inline expressions
-    // Only matches defer at the SAME indentation level (not inside conditionals)
-    for (allocs.items) |*alloc| {
-        const alloc_idx = alloc.line - func_line;
-        if (alloc_idx >= lines.len) continue;
+/// Check for immediate defer after multi-line allocations
+/// Returns true if allocation should be removed (has immediate defer)
+fn hasImmediateDefer(
+    alloc: *CFGAlloc,
+    lines: []const []const u8,
+    func_line: usize,
+) bool {
+    const alloc_idx = alloc.line - func_line;
+    if (alloc_idx >= lines.len) return false;
 
-        // Get indentation of allocation line
-        const alloc_line = lines[alloc_idx];
-        const alloc_indent = countIndent(alloc_line);
+    // Get indentation of allocation line
+    const alloc_line = lines[alloc_idx];
+    const alloc_indent = countIndent(alloc_line);
 
-        // First, find where the allocation statement ends (may span multiple lines)
-        var alloc_end_idx = alloc_idx;
-        var brace_depth: i32 = 0;
-        for (alloc_idx..lines.len) |idx| {
-            const scan_line = mem.trim(u8, lines[idx], " \t\r");
-            for (scan_line) |c| {
-                if (c == '{' or c == '(') brace_depth += 1;
-                if (c == '}' or c == ')') brace_depth -= 1;
-            }
-            // Allocation ends when we see semicolon at brace depth 0 (or negative)
-            if (mem.indexOf(u8, scan_line, ";") != null and brace_depth <= 0) {
-                alloc_end_idx = idx;
-                break;
-            }
+    // Find where the allocation statement ends (may span multiple lines)
+    var alloc_end_idx = alloc_idx;
+    var brace_depth: i32 = 0;
+    for (alloc_idx..lines.len) |idx| {
+        const scan_line = mem.trim(u8, lines[idx], " \t\r");
+        for (scan_line) |c| {
+            if (c == '{' or c == '(') brace_depth += 1;
+            if (c == '}' or c == ')') brace_depth -= 1;
         }
+        // Allocation ends when we see semicolon at brace depth 0 (or negative)
+        if (mem.indexOf(u8, scan_line, ";") != null and brace_depth <= 0) {
+            alloc_end_idx = idx;
+            break;
+        }
+    }
 
-        // Now check the line immediately after the allocation for a defer
-        const defer_idx = alloc_end_idx + 1;
-        if (defer_idx >= lines.len) continue;
+    // Check the line immediately after allocation for a defer
+    const defer_idx = alloc_end_idx + 1;
+    if (defer_idx >= lines.len) return false;
 
-        const raw_line = lines[defer_idx];
-        const scan_line = mem.trim(u8, raw_line, " \t\r");
+    const raw_line = lines[defer_idx];
+    const scan_line = mem.trim(u8, raw_line, " \t\r");
 
-        // Must be a defer statement
-        if (!mem.startsWith(u8, scan_line, "defer ")) continue;
+    // Must be a defer statement
+    if (!mem.startsWith(u8, scan_line, "defer ")) return false;
 
-        // Check indentation matches - defer must be at same level as alloc
-        const defer_indent = countIndent(raw_line);
-        if (defer_indent != alloc_indent) continue;
+    // Check indentation matches - defer must be at same level as alloc
+    const defer_indent = countIndent(raw_line);
+    if (defer_indent != alloc_indent) return false;
 
-        // Check if it frees this allocation (skip patterns in string literals)
-        const has_free = hasRealCleanupPattern(scan_line);
-        if (has_free and mem.indexOf(u8, scan_line, alloc.name) != null) {
+    // Check if it frees this allocation (skip patterns in string literals)
+    const has_free = hasRealCleanupPattern(scan_line);
+    return has_free and mem.indexOf(u8, scan_line, alloc.name) != null;
+}
+
+/// Remove allocations that have immediate defer (marked with line = 0)
+fn removeImmediateDeferAllocs(
+    allocs: *std.ArrayListUnmanaged(CFGAlloc),
+    lines: []const []const u8,
+    func_line: usize,
+) void {
+    // First pass: mark allocations with immediate defer
+    for (allocs.items) |*alloc| {
+        if (hasImmediateDefer(alloc, lines, func_line)) {
             alloc.line = 0; // Mark for removal
         }
     }
 
-    // Remove allocations that have immediate defer (marked with line = 0)
+    // Second pass: remove marked allocations
     var i: usize = 0;
     while (i < allocs.items.len) {
         if (allocs.items[i].line == 0) {
@@ -1733,267 +1747,319 @@ fn analyzeCFGDeferCoverage(
             i += 1;
         }
     }
+}
 
+/// Track owner variables through data flow
+/// Pattern: const x = Type{ .field = alloc_name } -> x is an owner
+const OwnerVar = struct { name: []const u8 };
+
+fn trackOwnerVariables(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    alloc_name: []const u8,
+) !std.ArrayListUnmanaged(OwnerVar) {
+    var owner_vars = std.ArrayListUnmanaged(OwnerVar){};
+    try owner_vars.append(allocator, .{ .name = alloc_name });
+
+    for (cfg.blocks.items) |block| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+        for (block.start_line..block.end_line + 1) |line_num| {
+            if (line_num < func_line) continue;
+            const idx = line_num - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+
+            // Check if any current owner var appears
+            var owner_appears = false;
+            for (owner_vars.items) |ov| {
+                if (mem.indexOf(u8, t, ov.name) != null) {
+                    owner_appears = true;
+                    break;
+                }
+            }
+            if (!owner_appears) continue;
+
+            // Pattern: const varname = Type{ ... owner_var ... }
+            if (mem.startsWith(u8, t, "const ") and mem.indexOf(u8, t, "{") != null) {
+                var end: usize = 6;
+                while (end < t.len and isIdent(t[end])) end += 1;
+                if (end > 6) {
+                    const new_owner = t[6..end];
+                    var already_tracked = false;
+                    for (owner_vars.items) |ov| {
+                        if (mem.eql(u8, ov.name, new_owner)) {
+                            already_tracked = true;
+                            break;
+                        }
+                    }
+                    if (!already_tracked) {
+                        try owner_vars.append(allocator, .{ .name = new_owner });
+                    }
+                }
+            }
+
+            // Pattern: varname.* = Type{ ... owner_var ... }
+            if (mem.indexOf(u8, t, ".* = ") != null and mem.indexOf(u8, t, "{") != null) {
+                var end: usize = 0;
+                while (end < t.len and isIdent(t[end])) end += 1;
+                if (end > 0) {
+                    const new_owner = t[0..end];
+                    var already_tracked = false;
+                    for (owner_vars.items) |ov| {
+                        if (mem.eql(u8, ov.name, new_owner)) {
+                            already_tracked = true;
+                            break;
+                        }
+                    }
+                    if (!already_tracked) {
+                        try owner_vars.append(allocator, .{ .name = new_owner });
+                    }
+                }
+            }
+        }
+    }
+
+    return owner_vars;
+}
+
+/// Check if ownership is transferred in a line using owner variables
+fn checkOwnershipInLine(
+    t: []const u8,
+    owner_vars: []const OwnerVar,
+) bool {
+    for (owner_vars) |ov| {
+        if (mem.indexOf(u8, t, ov.name) == null) continue;
+
+        // Direct return of owner variable
+        if (mem.startsWith(u8, t, "return ")) return true;
+
+        // Stored in self or ctx field
+        if (mem.indexOf(u8, t, "self.") != null or
+            mem.indexOf(u8, t, "ctx.") != null)
+        {
+            return true;
+        }
+
+        // Module-level variable assignment
+        if (mem.indexOf(u8, t, " = ") != null and
+            !mem.startsWith(u8, t, "const ") and
+            !mem.startsWith(u8, t, "var "))
+        {
+            const eq_pos = mem.indexOf(u8, t, " = ").?;
+            const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+            if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// CFG-based defer coverage analysis (ZA101/ZA102)
+/// Detects allocations where defer only exists on some paths
+fn analyzeCFGDeferCoverage(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .{};
+
+    // Skip arena-based functions (no defer needed)
+    if (hasArenaParameter(lines)) return issues;
+
+    // Phase 1: Collect allocations
+    var allocs = try collectCFGAllocations(allocator, cfg, lines, func_line);
+    defer allocs.deinit(allocator);
+    if (allocs.items.len == 0) return issues;
+
+    // Pre-pass: Remove allocations with immediate defer
+    removeImmediateDeferAllocs(&allocs, lines, func_line);
     if (allocs.items.len == 0) return issues;
 
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    // Phase 2: For each allocation, check defer coverage using CFG
+    // Phase 2-3: Check defer coverage for each allocation
     for (allocs.items) |alloc| {
-        // Track which blocks have a defer for this allocation
-        var has_defer_in_block = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(has_defer_in_block);
-        @memset(has_defer_in_block, false);
-
-        // Track blocks where allocation ownership is transferred (return, store)
-        var ownership_transferred_in_block = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(ownership_transferred_in_block);
-        @memset(ownership_transferred_in_block, false);
-
-        // Track blocks that free the variable then return (catch-free-return pattern)
-        var free_and_return_in_block = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(free_and_return_in_block);
-        @memset(free_and_return_in_block, false);
-
-        // CFG-based ownership tracking: track variables that contain the allocation
-        // Start with the original allocation variable, add others as data flows
-        const OwnerVar = struct { name: []const u8 };
-        var owner_vars = std.ArrayListUnmanaged(OwnerVar){};
-        defer owner_vars.deinit(allocator);
-        try owner_vars.append(allocator, .{ .name = alloc.name });
-
-        // First pass: track data flow through all blocks to find all owner variables
-        // Pattern: const x = Type{ .field = alloc_name } -> x is an owner
-        // Pattern: x.* = Type{ .field = alloc_name } -> x is an owner
-        for (cfg.blocks.items) |block| {
-            if (block.start_line == 0 or block.start_line > block.end_line) continue;
-
-            for (block.start_line..block.end_line + 1) |line_num| {
-                if (line_num < func_line) continue;
-                const idx = line_num - func_line;
-                if (idx >= lines.len) continue;
-                const t = mem.trim(u8, lines[idx], " \t\r");
-
-                // Check if any current owner var appears in a struct assignment
-                var owner_appears = false;
-                for (owner_vars.items) |ov| {
-                    if (mem.indexOf(u8, t, ov.name) != null) {
-                        owner_appears = true;
-                        break;
-                    }
-                }
-                if (!owner_appears) continue;
-
-                // Pattern: const varname = Type{ ... owner_var ... }
-                if (mem.startsWith(u8, t, "const ") and mem.indexOf(u8, t, "{") != null) {
-                    var end: usize = 6;
-                    while (end < t.len and isIdent(t[end])) end += 1;
-                    if (end > 6) {
-                        const new_owner = t[6..end];
-                        // Don't add if already tracked
-                        var already_tracked = false;
-                        for (owner_vars.items) |ov| {
-                            if (mem.eql(u8, ov.name, new_owner)) {
-                                already_tracked = true;
-                                break;
-                            }
-                        }
-                        if (!already_tracked) {
-                            try owner_vars.append(allocator, .{ .name = new_owner });
-                        }
-                    }
-                }
-
-                // Pattern: varname.* = Type{ ... owner_var ... }
-                // Adds the base variable (before .*) as an owner
-                if (mem.indexOf(u8, t, ".* = ") != null and mem.indexOf(u8, t, "{") != null) {
-                    var end: usize = 0;
-                    while (end < t.len and isIdent(t[end])) end += 1;
-                    if (end > 0) {
-                        const new_owner = t[0..end];
-                        var already_tracked = false;
-                        for (owner_vars.items) |ov| {
-                            if (mem.eql(u8, ov.name, new_owner)) {
-                                already_tracked = true;
-                                break;
-                            }
-                        }
-                        if (!already_tracked) {
-                            try owner_vars.append(allocator, .{ .name = new_owner });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Scan for defers, ownership transfers, and free-return patterns
-        for (cfg.blocks.items, 0..) |block, bid| {
-            if (block.start_line == 0 or block.start_line > block.end_line) continue;
-
-            var freed_in_block = false;
-            var return_after_free = false;
-
-            for (block.start_line..block.end_line + 1) |line_num| {
-                if (line_num < func_line) continue;
-                const idx = line_num - func_line;
-                if (idx >= lines.len) continue;
-                const t = mem.trim(u8, lines[idx], " \t\r");
-
-                // Check for defer with this variable (skip patterns in strings)
-                if (mem.startsWith(u8, t, "defer ")) {
-                    if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
-                        has_defer_in_block[bid] = true;
-                    }
-                }
-
-                // Check for manual free of this variable (not in defer)
-                if (!mem.startsWith(u8, t, "defer ") and !mem.startsWith(u8, t, "errdefer ")) {
-                    if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
-                        freed_in_block = true;
-                    }
-                }
-
-                // Check for return after free
-                if (freed_in_block and mem.startsWith(u8, t, "return")) {
-                    return_after_free = true;
-                }
-
-                // Check for ownership transfer using CFG-tracked owner variables
-                // If any owner variable is returned, stored in self, or assigned to module var
-                for (owner_vars.items) |ov| {
-                    if (mem.indexOf(u8, t, ov.name) == null) continue;
-
-                    // Direct return of owner variable
-                    if (mem.startsWith(u8, t, "return ")) {
-                        ownership_transferred_in_block[bid] = true;
-                        break;
-                    }
-                    // Stored in self or ctx field
-                    if (mem.indexOf(u8, t, "self.") != null or mem.indexOf(u8, t, "ctx.") != null) {
-                        ownership_transferred_in_block[bid] = true;
-                        break;
-                    }
-                    // Module-level variable assignment (no const/var prefix, simple identifier)
-                    if (mem.indexOf(u8, t, " = ") != null and
-                        !mem.startsWith(u8, t, "const ") and
-                        !mem.startsWith(u8, t, "var "))
-                    {
-                        const eq_pos = mem.indexOf(u8, t, " = ").?;
-                        const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-                        if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null) {
-                            // Simple identifier on LHS - likely module-level var
-                            ownership_transferred_in_block[bid] = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Block that frees and returns is considered covered
-            if (freed_in_block and return_after_free) {
-                free_and_return_in_block[bid] = true;
-            }
-        }
-
-        // Phase 3: Check if ALL paths from allocation have defer or ownership transfer
-        // Use forward dataflow: "covered" propagates from defer blocks
-        var covered_at_exit = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(covered_at_exit);
-        @memset(covered_at_exit, false);
-
-        // Initialize: blocks with defer, ownership transfer, or free-and-return are covered
-        for (0..num_blocks) |bid| {
-            if (has_defer_in_block[bid] or ownership_transferred_in_block[bid] or
-                free_and_return_in_block[bid])
-            {
-                covered_at_exit[bid] = true;
-            }
-        }
-
-        // Propagate backwards: if all successors are covered, block is covered
-        // (but only for blocks after the allocation)
-        var changed = true;
-        var iters: usize = 0;
-        const max_iters = num_blocks * 2 + 1;
-        while (changed and iters < max_iters) : (iters += 1) {
-            changed = false;
-            for (0..num_blocks) |bid| {
-                if (covered_at_exit[bid]) continue;
-
-                // Get successors
-                var all_succs_covered = true;
-                var has_succ = false;
-                for (cfg.edges.items) |edge| {
-                    if (edge.from != bid) continue;
-                    has_succ = true;
-                    if (!covered_at_exit[edge.to]) {
-                        all_succs_covered = false;
-                        break;
-                    }
-                }
-
-                // If no successors (exit block), check if it's an explicit exit
-                if (!has_succ) {
-                    // Exit blocks without defer coverage are problems
-                    // unless they're in the exit_blocks list (normal returns)
-                    var is_exit = false;
-                    for (cfg.exit_blocks.items) |exit_bid| {
-                        if (exit_bid == bid) {
-                            is_exit = true;
-                            break;
-                        }
-                    }
-                    if (is_exit) continue; // Exit without defer - potential issue
-                }
-
-                if (has_succ and all_succs_covered) {
-                    covered_at_exit[bid] = true;
-                    changed = true;
-                }
-            }
-        }
-
-        // Check if allocation block leads to any uncovered exit
-        // If the allocation block itself is not fully covered, report
-        const alloc_block_covered = covered_at_exit[alloc.block];
-
-        // For simple functions, check if ANY defer exists anywhere
-        var any_defer_exists = false;
-        for (has_defer_in_block) |has| {
-            if (has) {
-                any_defer_exists = true;
-                break;
-            }
-        }
-
-        // Only report if no defer at all, or defer only on some paths
-        if (!alloc_block_covered and !any_defer_exists) {
-            // No defer at all - let existing analyzeFunction handle this
-            continue;
-        }
-
-        // Defer exists but not on all paths - this is the CFG-specific case
-        if (!alloc_block_covered and any_defer_exists) {
-            const rule = if (alloc.is_create) RULE_CREATE_NO_DEFER else RULE_ALLOC_NO_DEFER;
-            const msg = if (alloc.is_create)
-                "defer destroy() not on all code paths"
-            else
-                "defer free() not on all code paths";
-
-            try issues.append(allocator, .{
-                .file = file_path,
-                .line = alloc.line,
-                .col = alloc.col,
-                .severity = .warning,
-                .rule = rule,
-                .message = msg,
-                .help = "move defer to outer scope or add defer on all branches",
-            });
+        const issue = try checkDeferCoverageForAlloc(
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            file_path,
+            alloc,
+            num_blocks,
+        );
+        if (issue) |iss| {
+            try issues.append(allocator, iss);
         }
     }
 
     return issues;
+}
+
+/// Check defer coverage for a single allocation using CFG dataflow
+fn checkDeferCoverageForAlloc(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    alloc: CFGAlloc,
+    num_blocks: usize,
+) !?Issue {
+    // Track which blocks have a defer for this allocation
+    var has_defer_in_block = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(has_defer_in_block);
+    @memset(has_defer_in_block, false);
+
+    // Track blocks where ownership is transferred
+    var ownership_transferred = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(ownership_transferred);
+    @memset(ownership_transferred, false);
+
+    // Track blocks that free and return
+    var free_and_return = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(free_and_return);
+    @memset(free_and_return, false);
+
+    // Track owner variables through data flow
+    var owner_vars = try trackOwnerVariables(allocator, cfg, lines, func_line, alloc.name);
+    defer owner_vars.deinit(allocator);
+
+    // Scan blocks for defer, ownership transfer, and free-return patterns
+    for (cfg.blocks.items, 0..) |block, bid| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+        var freed_in_block = false;
+        var return_after_free = false;
+
+        for (block.start_line..block.end_line + 1) |line_num| {
+            if (line_num < func_line) continue;
+            const idx = line_num - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+
+            // Check for defer with this variable
+            if (mem.startsWith(u8, t, "defer ")) {
+                if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
+                    has_defer_in_block[bid] = true;
+                }
+            }
+
+            // Check for manual free (not in defer)
+            if (!mem.startsWith(u8, t, "defer ") and !mem.startsWith(u8, t, "errdefer ")) {
+                if (hasRealFreePattern(t) and mem.indexOf(u8, t, alloc.name) != null) {
+                    freed_in_block = true;
+                }
+            }
+
+            // Check for return after free
+            if (freed_in_block and mem.startsWith(u8, t, "return")) {
+                return_after_free = true;
+            }
+
+            // Check for ownership transfer
+            if (checkOwnershipInLine(t, owner_vars.items)) {
+                ownership_transferred[bid] = true;
+            }
+        }
+
+        if (freed_in_block and return_after_free) {
+            free_and_return[bid] = true;
+        }
+    }
+
+    // Propagate coverage through CFG
+    var covered = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(covered);
+    @memset(covered, false);
+
+    // Initialize covered blocks
+    for (0..num_blocks) |bid| {
+        if (has_defer_in_block[bid] or ownership_transferred[bid] or free_and_return[bid]) {
+            covered[bid] = true;
+        }
+    }
+
+    // Propagate backwards: if all successors covered, block is covered
+    var changed = true;
+    var iters: usize = 0;
+    const max_iters = num_blocks * 2 + 1;
+    while (changed and iters < max_iters) : (iters += 1) {
+        changed = false;
+        for (0..num_blocks) |bid| {
+            if (covered[bid]) continue;
+
+            var all_succs_covered = true;
+            var has_succ = false;
+            for (cfg.edges.items) |edge| {
+                if (edge.from != bid) continue;
+                has_succ = true;
+                if (!covered[edge.to]) {
+                    all_succs_covered = false;
+                    break;
+                }
+            }
+
+            if (!has_succ) {
+                var is_exit = false;
+                for (cfg.exit_blocks.items) |exit_bid| {
+                    if (exit_bid == bid) {
+                        is_exit = true;
+                        break;
+                    }
+                }
+                if (is_exit) continue;
+            }
+
+            if (has_succ and all_succs_covered) {
+                covered[bid] = true;
+                changed = true;
+            }
+        }
+    }
+
+    // Check if allocation block is covered
+    const alloc_block_covered = covered[alloc.block];
+
+    var any_defer_exists = false;
+    for (has_defer_in_block) |has| {
+        if (has) {
+            any_defer_exists = true;
+            break;
+        }
+    }
+
+    // Only report if defer exists on some paths but not all
+    if (!alloc_block_covered and !any_defer_exists) {
+        return null; // Let analyzeFunction handle no-defer-at-all case
+    }
+
+    if (!alloc_block_covered and any_defer_exists) {
+        const rule = if (alloc.is_create) RULE_CREATE_NO_DEFER else RULE_ALLOC_NO_DEFER;
+        const msg = if (alloc.is_create)
+            "defer destroy() not on all code paths"
+        else
+            "defer free() not on all code paths";
+
+        return Issue{
+            .file = file_path,
+            .line = alloc.line,
+            .col = alloc.col,
+            .severity = .warning,
+            .rule = rule,
+            .message = msg,
+            .help = "move defer to outer scope or add defer on all branches",
+        };
+    }
+
+    return null;
 }
 
 /// CFG-based errdefer coverage analysis (ZA103)

@@ -7149,6 +7149,8 @@ const Command = enum {
     help,
     version,
     init,
+    install, // Add ephor to a project's build.zig
+    upgrade, // Update ephor to latest version
 };
 
 const Config = struct {
@@ -7164,6 +7166,7 @@ const Config = struct {
     show_summary: bool,
     format: OutputFormat,
     thresholds: Thresholds,
+    init_build: bool, // For `init --build` to also output build.zig integration
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -7497,6 +7500,268 @@ fn writeDefaultConfig() !void {
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
 }
 
+/// URL for ephor package (used by install command)
+const EPHOR_PACKAGE_URL = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz";
+
+/// Code snippet to add to build.zig
+const EPHOR_BUILD_SNIPPET =
+    \\
+    \\    // === Ephor Static Analysis ===
+    \\    const ephor_dep = b.dependency("ephor", .{
+    \\        .target = target,
+    \\        .optimize = .ReleaseSafe,
+    \\    });
+    \\    const ephor_exe = ephor_dep.artifact("ephor");
+    \\    const ephor_cmd = b.addRunArtifact(ephor_exe);
+    \\    ephor_cmd.addArgs(&.{ "check", "src/" });
+    \\    const ephor_step = b.step("ephor", "Run ephor static analysis");
+    \\    ephor_step.dependOn(&ephor_cmd.step);
+    \\
+;
+
+/// Run the install command: adds ephor to project's build system
+fn runInstallCommand(allocator: Allocator) !void {
+    // Check if build.zig.zon exists
+    const has_zon = blk: {
+        fs.cwd().access("build.zig.zon", .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (!has_zon) {
+        std.debug.print(
+            \\No build.zig.zon found in current directory.
+            \\
+            \\To add ephor to your project:
+            \\
+            \\1. Create build.zig.zon with:
+            \\
+            \\   .{{
+            \\       .name = .my_project,
+            \\       .version = "0.1.0",
+            \\       .dependencies = .{{
+            \\           .ephor = .{{
+            \\               .url = "{s}",
+            \\               // Run 'zig build' to get the hash
+            \\           }},
+            \\       }},
+            \\       .paths = .{{ "build.zig", "build.zig.zon", "src" }},
+            \\   }}
+            \\
+            \\2. Then run: ephor install
+            \\
+        , .{EPHOR_PACKAGE_URL});
+        return;
+    }
+
+    // Run zig fetch --save to add the dependency
+    std.debug.print("Adding ephor dependency to build.zig.zon...\n", .{});
+
+    var child = std.process.Child.init(
+        &.{ "zig", "fetch", "--save=ephor", EPHOR_PACKAGE_URL },
+        allocator,
+    );
+
+    const term = try child.spawnAndWait();
+
+    if (term.Exited != 0) {
+        std.debug.print(
+            \\
+            \\Failed to fetch ephor package. You can add it manually:
+            \\
+            \\1. Add to build.zig.zon dependencies:
+            \\   .ephor = .{{
+            \\       .url = "{s}",
+            \\       // Run 'zig build' to get the hash
+            \\   }},
+            \\
+        , .{EPHOR_PACKAGE_URL});
+        return;
+    }
+
+    std.debug.print("Done! Added ephor to build.zig.zon\n\n", .{});
+
+    // Now try to patch build.zig
+    const patched = patchBuildZig(allocator) catch |err| {
+        std.debug.print("Could not auto-patch build.zig: {}\n", .{err});
+        std.debug.print("\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_SNIPPET});
+        std.debug.print("Then run: zig build ephor\n", .{});
+        return;
+    };
+
+    if (patched) |line| {
+        std.debug.print("Added ephor step to build.zig at line {d}\n\n", .{line});
+        std.debug.print("Run: zig build ephor\n", .{});
+    } else {
+        std.debug.print("Ephor step already exists in build.zig\n\n", .{});
+        std.debug.print("Run: zig build ephor\n", .{});
+    }
+}
+
+/// Patch build.zig to add ephor step. Returns line number where inserted, or null if already exists.
+fn patchBuildZig(allocator: Allocator) !?usize {
+    const file = fs.cwd().openFile("build.zig", .{ .mode = .read_only }) catch |err| {
+        if (err == error.FileNotFound) {
+            std.debug.print("No build.zig found in current directory.\n", .{});
+            return err;
+        }
+        return err;
+    };
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
+    defer allocator.free(content);
+
+    // Check if ephor is already integrated
+    if (mem.indexOf(u8, content, "b.dependency(\"ephor\"") != null or
+        mem.indexOf(u8, content, "b.dependency( \"ephor\"") != null)
+    {
+        return null; // Already has ephor
+    }
+
+    // Find insertion point: after last b.installArtifact() or before final }
+    var lines: std.ArrayListUnmanaged([]const u8) = .{};
+    defer lines.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        try lines.append(allocator, line);
+    }
+
+    // Find best insertion point
+    var insert_after: ?usize = null;
+    var last_install_artifact: ?usize = null;
+    var build_fn_end: ?usize = null;
+    var brace_depth: i32 = 0;
+    var in_build_fn = false;
+
+    for (lines.items, 0..) |line, idx| {
+        const trimmed = mem.trim(u8, line, " \t");
+
+        // Track if we're in the build function
+        if (mem.indexOf(u8, trimmed, "pub fn build(") != null or
+            mem.indexOf(u8, trimmed, "fn build(") != null)
+        {
+            in_build_fn = true;
+        }
+
+        if (in_build_fn) {
+            // Count braces to find function end
+            for (trimmed) |c| {
+                if (c == '{') brace_depth += 1;
+                if (c == '}') {
+                    brace_depth -= 1;
+                    if (brace_depth == 0) {
+                        build_fn_end = idx;
+                        in_build_fn = false;
+                    }
+                }
+            }
+
+            // Look for installArtifact calls
+            if (mem.indexOf(u8, line, "installArtifact(") != null or
+                mem.indexOf(u8, line, "b.installArtifact(") != null)
+            {
+                last_install_artifact = idx;
+            }
+        }
+    }
+
+    // Prefer inserting after last installArtifact, otherwise before build function end
+    if (last_install_artifact) |idx| {
+        insert_after = idx;
+    } else if (build_fn_end) |idx| {
+        insert_after = if (idx > 0) idx - 1 else 0;
+    }
+
+    if (insert_after == null) {
+        std.debug.print("Could not find insertion point in build.zig\n", .{});
+        return error.NoInsertionPoint;
+    }
+
+    // Build new content
+    var new_content: std.ArrayListUnmanaged(u8) = .{};
+    defer new_content.deinit(allocator);
+
+    for (lines.items, 0..) |line, idx| {
+        try new_content.appendSlice(allocator, line);
+        try new_content.append(allocator, '\n');
+
+        if (idx == insert_after.?) {
+            try new_content.appendSlice(allocator, EPHOR_BUILD_SNIPPET);
+        }
+    }
+
+    // Write back to file
+    const out_file = try fs.cwd().createFile("build.zig", .{});
+    defer out_file.close();
+    try out_file.writeAll(new_content.items);
+
+    return insert_after.? + 2; // +2 for 1-based line number and the blank line
+}
+
+/// Run the upgrade command: updates ephor dependency in build.zig.zon
+fn runUpgradeCommand(allocator: Allocator) !void {
+    // Check if build.zig.zon exists and has ephor dependency
+    const has_ephor = blk: {
+        const file = fs.cwd().openFile("build.zig.zon", .{ .mode = .read_only }) catch break :blk false;
+        defer file.close();
+        const content = file.readToEndAlloc(allocator, 64 * 1024) catch break :blk false;
+        defer allocator.free(content);
+        break :blk mem.indexOf(u8, content, ".ephor") != null;
+    };
+
+    if (!has_ephor) {
+        std.debug.print(
+            \\No ephor dependency found in build.zig.zon.
+            \\
+            \\Run 'ephor install' first to add ephor to your project.
+            \\
+        , .{});
+        return;
+    }
+
+    std.debug.print("Upgrading ephor to latest version...\n", .{});
+
+    // Run zig fetch --save to update the dependency (fetches latest and updates hash)
+    var child = std.process.Child.init(
+        &.{ "zig", "fetch", "--save=ephor", EPHOR_PACKAGE_URL },
+        allocator,
+    );
+
+    const term = try child.spawnAndWait();
+
+    if (term.Exited != 0) {
+        std.debug.print("Failed to upgrade ephor.\n", .{});
+        return;
+    }
+
+    std.debug.print(
+        \\Done! Ephor updated to latest version.
+        \\
+        \\Run 'zig build ephor' to verify.
+        \\
+    , .{});
+}
+
+/// Current ephor version (set at compile time)
+const EPHOR_VERSION = "0.7.3";
+
+/// URL to check for latest version
+const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
+
+/// Check for new version at startup (non-blocking, best effort)
+/// NOTE: Version check requires the repo to be public. Once published,
+/// this will fetch build.zig.zon from EPHOR_VERSION_URL to compare versions.
+fn checkForUpdates(allocator: Allocator) void {
+    _ = allocator;
+    // TODO: Enable once repo is public
+    // Version checking is disabled until the repo is published to Bitbucket.
+    // Once public, this will:
+    // 1. Check ~/.ephor_update_check for cached version (once per day)
+    // 2. Fetch latest build.zig.zon from repo
+    // 3. Compare versions and show update notice if newer
+}
+
 // ============================================================================
 // Argument Parsing Helpers
 // ============================================================================
@@ -7513,6 +7778,9 @@ fn parseCommand(cmd: []const u8) ?Command {
         .{ .name = "check", .cmd = .check },
         .{ .name = "runtime", .cmd = .runtime },
         .{ .name = "init", .cmd = .init },
+        .{ .name = "install", .cmd = .install },
+        .{ .name = "upgrade", .cmd = .upgrade },
+        .{ .name = "update", .cmd = .upgrade }, // Alias
         .{ .name = "--help", .cmd = .help },
         .{ .name = "-h", .cmd = .help },
         .{ .name = "--version", .cmd = .version },
@@ -7876,6 +8144,10 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         cfg.format = .text;
         return true;
     }
+    if (mem.eql(u8, arg, "--build") or mem.eql(u8, arg, "-b")) {
+        cfg.init_build = true;
+        return true;
+    }
     return false;
 }
 
@@ -7954,6 +8226,7 @@ fn parseArgs(allocator: Allocator) !Config {
         .show_summary = false,
         .format = .text,
         .thresholds = .{},
+        .init_build = false,
     };
     try loadConfigFile(allocator, &cfg);
     var cli_entries = false;
@@ -7987,6 +8260,8 @@ fn printHelp() void {
         \\
         \\COMMANDS:
         \\  init        Create ephor.json config file
+        \\  install     Add ephor to project's build.zig (runs zig fetch)
+        \\  upgrade     Update ephor to latest version (alias: update)
         \\  check       Run all static checks (default)
         \\  runtime     Run tests with memory diagnostics (dynamic analysis)
         \\  orphans     Files not imported from entry points
@@ -8009,6 +8284,7 @@ fn printHelp() void {
         \\  --max-file-bytes=N   Max file size in bytes (optional)
         \\  -V, --verbose        Verbose output
         \\  -s, --summary        Show summary at end
+        \\  -b, --build          With 'init': also show build.zig integration
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
@@ -8345,15 +8621,40 @@ pub fn main() !void {
     var cfg = try parseArgs(alloc);
     defer cfg.deinit(alloc);
 
+    // Check for updates on analysis commands (not on help/version/init/install/upgrade)
+    switch (cfg.command) {
+        .help, .version, .init, .install, .upgrade => {},
+        else => checkForUpdates(alloc),
+    }
+
     // Get absolute base path for relative path calculation
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
     const base_path = std.fs.cwd().realpath(cfg.path, &base_buf) catch cfg.path;
 
     switch (cfg.command) {
         .help => printHelp(),
-        .version => std.debug.print("Ephor v0.7.2 - The overseer of your Zig code\n", .{}),
-        .init => writeDefaultConfig() catch |err| {
-            std.debug.print("error: failed to create config: {}\n", .{err});
+        .version => std.debug.print("Ephor v{s} - The overseer of your Zig code\n", .{EPHOR_VERSION}),
+        .init => {
+            writeDefaultConfig() catch |err| {
+                std.debug.print("error: failed to create config: {}\n", .{err});
+                std.process.exit(1);
+            };
+            // If --build flag, also print build integration info
+            if (cfg.init_build) {
+                runInstallCommand(alloc) catch |err| {
+                    std.debug.print("error: failed to run install: {}\n", .{err});
+                    std.process.exit(1);
+                };
+            }
+        },
+
+        .install => runInstallCommand(alloc) catch |err| {
+            std.debug.print("error: failed to install: {}\n", .{err});
+            std.process.exit(1);
+        },
+
+        .upgrade => runUpgradeCommand(alloc) catch |err| {
+            std.debug.print("error: failed to upgrade: {}\n", .{err});
             std.process.exit(1);
         },
 
@@ -9189,6 +9490,7 @@ test "Config.isRuleEnabled respects explicit enable" {
         .show_summary = false,
         .format = .text,
         .thresholds = .{},
+        .init_build = false,
     };
     defer cfg.deinit(allocator);
 
@@ -9217,6 +9519,7 @@ test "Config.isRuleEnabled respects disable prefix" {
         .show_summary = false,
         .format = .text,
         .thresholds = .{},
+        .init_build = false,
     };
     defer cfg.deinit(allocator);
 
@@ -9252,6 +9555,7 @@ test "Config.isRuleEnabled enable overrides disable" {
         .show_summary = false,
         .format = .text,
         .thresholds = .{},
+        .init_build = false,
     };
     defer cfg.deinit(allocator);
 

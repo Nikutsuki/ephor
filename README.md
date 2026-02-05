@@ -42,6 +42,23 @@ export PATH="$PATH:/path/to/ephor/zig-out/bin"
 
 Add ephor as a build step in your project so `zig build ephor` runs static analysis automatically.
 
+#### Quick Setup (Recommended)
+
+If you have ephor installed, run this in your project directory:
+
+```bash
+cd /path/to/your-project
+ephor install
+```
+
+This will:
+1. Add the ephor dependency to your `build.zig.zon` (via `zig fetch`)
+2. Print the code snippet to add to your `build.zig`
+
+Then run `zig build ephor` to verify it works.
+
+#### Manual Setup
+
 **Step 1: Add ephor as a dependency in your `build.zig.zon`:**
 
 ```zig
@@ -131,6 +148,13 @@ ephor_cmd.addArgs(&.{ "check", "src/", "--disable=ZA301" });
 ## Usage
 
 ```bash
+# Add ephor to your project (recommended)
+cd /path/to/your-project
+ephor install            # Adds dependency and patches build.zig
+
+# Update ephor to latest version
+ephor upgrade            # or: ephor update
+
 # Run all static checks
 ephor check
 

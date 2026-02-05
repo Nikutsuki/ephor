@@ -81,6 +81,7 @@ const countOccurrences = types.countOccurrences;
 const countLines = types.countLines;
 const isIdent = types.isIdent;
 const isInsideString = types.isInsideString;
+const skipWhitespace = types.skipWhitespace;
 
 const FileAnalysis = types.FileAnalysis;
 const Thresholds = types.Thresholds;
@@ -3002,16 +3003,6 @@ fn isDirectModuleLevelAlloc(t: []const u8) bool {
     return hasPatternNotInString(rhs, ".alloc(") or hasPatternNotInString(rhs, ".create(");
 }
 
-fn extractAllocVarName(t: []const u8) []const u8 {
-    const is_const = mem.startsWith(u8, t, "const ");
-    const is_var = mem.startsWith(u8, t, "var ");
-    if (!is_const and !is_var) return "";
-    const prefix_len: usize = if (is_const) 6 else 4;
-    var end = prefix_len;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    return if (end > prefix_len) t[prefix_len..end] else "";
-}
-
 /// Check if allocation is directly assigned to a struct field (x.field = alloc)
 /// These are managed by the struct's lifecycle and don't need local defer
 fn isFieldAssignmentAlloc(t: []const u8) bool {
@@ -3975,14 +3966,15 @@ fn countIdentOccurrences(content: []const u8, name: []const u8) usize {
     return count;
 }
 
-/// Extract variable name from const/var declaration
-fn extractDeclName(t: []const u8, is_const: bool) ?[]const u8 {
+/// Extract variable name for unused detection (filters out _ prefix and short names)
+fn extractUnusedDeclName(t: []const u8, is_const: bool) ?[]const u8 {
     const prefix_len: usize = if (is_const) 6 else 4;
     if (t.len <= prefix_len) return null;
     var end = prefix_len;
     while (end < t.len and isIdent(t[end])) end += 1;
     if (end <= prefix_len) return null;
     const name = t[prefix_len..end];
+    // Skip names that are intentionally unused (_ prefix) or too short to be meaningful
     if (name.len < 2 or name[0] == '_') return null;
     return name;
 }
@@ -4032,7 +4024,7 @@ fn checkUnusedDecl(
     const is_const = mem.startsWith(u8, t, "const ");
     const is_var = mem.startsWith(u8, t, "var ");
     if (!is_const and !is_var) return;
-    const name = extractDeclName(t, is_const) orelse return;
+    const name = extractUnusedDeclName(t, is_const) orelse return;
     if (countIdentOccurrences(content, name) != 1) return;
     const rule = if (is_const) RULE_UNUSED_CONST else RULE_UNUSED_VAR;
     const kind = if (is_const) "const" else "var";
@@ -5376,17 +5368,6 @@ fn reportMemEvents(
     }
 }
 
-/// Extract variable name from const/var declaration
-fn extractDeclVarName(t: []const u8) ?[]const u8 {
-    const is_const = mem.startsWith(u8, t, "const ");
-    const is_var = mem.startsWith(u8, t, "var ");
-    if (!is_const and !is_var) return null;
-    const prefix: usize = if (is_const) 6 else 4;
-    var end = prefix;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    return if (end > prefix) t[prefix..end] else null;
-}
-
 /// Mark which lines are inside defer blocks (for use-after-free detection)
 /// Frees inside defer blocks execute at scope exit, not at the literal line number
 fn markDeferBlockLines(
@@ -5543,7 +5524,7 @@ fn analyzeFunction(
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
 
-        if (extractDeclVarName(t)) |var_name| {
+        if (extractVarDeclName(t)) |var_name| {
             const ctx: AllocLineContext = .{
                 .var_name = var_name,
                 .actual_line = actual_line,
@@ -6523,11 +6504,6 @@ fn isOrphanExcluded(path: []const u8, cfg: *const Config) bool {
     return false;
 }
 
-/// Check if a trimmed line is a comment (starts with //)
-fn isComment(trimmed: []const u8) bool {
-    return mem.startsWith(u8, trimmed, "//");
-}
-
 /// Count leading whitespace (indentation level)
 fn countIndent(line: []const u8) usize {
     var indent: usize = 0;
@@ -6690,22 +6666,6 @@ const Config = struct {
 };
 
 const CONFIG_FILENAME = "ephor.json";
-
-// Helper to skip whitespace and commas in JSON parsing
-fn skipWhitespace(content: []const u8, start: usize, skip_comma: bool) usize {
-    var i = start;
-    while (i < content.len) {
-        const c = content[i];
-        if (c == ' ' or c == '\n' or c == '\r' or c == '\t') {
-            i += 1;
-        } else if (skip_comma and c == ',') {
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    return i;
-}
 
 fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
     // Try to load ephor.json config file from current directory

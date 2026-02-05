@@ -941,23 +941,17 @@ fn computeGenSetForVar(
     return gen;
 }
 
-/// Run definite assignment analysis on CFG
-/// Returns map of variable -> line where potentially uninitialized read occurs
-fn analyzeDefiniteAssignment(
+/// Collect variables declared with `= undefined`, skipping comptime blocks
+/// Returns map of var_name -> declaration line
+fn collectUndefinedVars(
     allocator: Allocator,
-    cfg: *ControlFlowGraph,
     lines: []const []const u8,
     func_line: usize,
 ) !std.StringHashMap(usize) {
-    var issues = std.StringHashMap(usize).init(allocator);
-
-    // Phase 1: Find all undefined variable declarations
-    // Skip variables inside comptime blocks (compiler catches undefined at comptime)
     var undef_vars = std.StringHashMap(usize).init(allocator);
-    defer undef_vars.deinit();
-
     var comptime_depth: usize = 0;
     var comptime_brace_depth: usize = 0;
+
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
 
@@ -986,13 +980,28 @@ fn analyzeDefiniteAssignment(
 
         if (mem.indexOf(u8, t, "= undefined") != null) {
             if (extractVarDeclName(t)) |name| {
-                // Only track as undefined if we didn't find an unconditional fill before use
                 if (!hasUnconditionalFillBeforeUse(lines, idx + 1, name)) {
                     try undef_vars.put(name, func_line + idx);
                 }
             }
         }
     }
+    return undef_vars;
+}
+
+/// Run definite assignment analysis on CFG
+/// Returns map of variable -> line where potentially uninitialized read occurs
+fn analyzeDefiniteAssignment(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+) !std.StringHashMap(usize) {
+    var issues = std.StringHashMap(usize).init(allocator);
+
+    // Phase 1: Find all undefined variable declarations (skipping comptime blocks)
+    var undef_vars = try collectUndefinedVars(allocator, lines, func_line);
+    defer undef_vars.deinit();
 
     if (undef_vars.count() == 0) return issues;
 

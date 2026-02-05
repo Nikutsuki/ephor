@@ -3369,6 +3369,23 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     if (mem.indexOf(u8, t, ".init(") != null and mem.indexOf(u8, t, var_name) != null)
         return true;
 
+    // Pattern 9: Method calls on var that may modify receiver (self parameter)
+    // Covers: var_name.update(...), var_name.set(...), var_name.reinit(...), etc.
+    const modifying_methods = [_][]const u8{
+        ".update(",   ".set(",      ".reinit(",  ".reset(",
+        ".assign(",   ".fill(",     ".clear(",   ".put(",
+        ".append(",   ".resize(",   ".ensureCapacity(",
+        ".replaceRange(", ".insertSlice(",
+    };
+    for (modifying_methods) |method| {
+        if (mem.indexOf(u8, t, var_name)) |var_pos| {
+            const after_var = var_pos + var_name.len;
+            if (after_var + method.len <= t.len) {
+                if (mem.startsWith(u8, t[after_var..], method)) return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -6171,8 +6188,11 @@ fn analyzeCFGErrors(
             const t = mem.trim(u8, lines[idx], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
 
-            // ZA201: Silent catch {} - skip in catch/cleanup context
-            if (!in_catch_context and !is_cleanup_func) {
+            // ZA201: Silent catch {} - skip in catch/cleanup/defer context
+            // defer catch {} is idiomatic for cleanup that shouldn't propagate errors
+            const in_defer_context = mem.startsWith(u8, t, "defer ") or
+                mem.startsWith(u8, t, "errdefer ");
+            if (!in_catch_context and !is_cleanup_func and !in_defer_context) {
                 if (!isBestEffortOperation(t)) {
                     if (mem.indexOf(u8, t, "catch {}")) |col| {
                         if (!isInsideString(t, col)) {

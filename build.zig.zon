@@ -1,0 +1,16 @@
+// Rhyos Labs - Ephor
+// The overseer of your Zig code
+// Copyright (C) 2025 Rhyos Labs LLC
+// SPDX-License-Identifier: MIT
+
+.{
+    .name = .ephor,
+    .version = "0.7.1",
+    .fingerprint = 0xe665525c8b28e1a7,
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

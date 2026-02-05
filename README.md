@@ -38,6 +38,97 @@ sudo cp zig-out/bin/ephor /usr/local/bin/
 export PATH="$PATH:/path/to/ephor/zig-out/bin"
 ```
 
+### Integrate into Your Project's build.zig
+
+Add ephor as a build step in your project so `zig build lint` runs static analysis automatically.
+
+**Step 1: Add ephor as a dependency in your `build.zig.zon`:**
+
+```zig
+.{
+    .name = .my_project,
+    .version = "0.1.0",
+    .dependencies = .{
+        .ephor = .{
+            .url = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz",
+            // After first run, Zig will tell you the correct hash to add here:
+            // .hash = "...",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+```
+
+> **Note:** On first build, Zig will error with the correct `.hash` value - copy it into your `build.zig.zon`.
+
+**Step 2: Add a lint step in your `build.zig`:**
+
+```zig
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Your normal exe/lib setup...
+    const exe = b.addExecutable(.{
+        .name = "my_project",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(exe);
+
+    // === Add Ephor Lint Step ===
+    const ephor_dep = b.dependency("ephor", .{
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const ephor_exe = ephor_dep.artifact("ephor");
+
+    // Create the lint step
+    const lint_cmd = b.addRunArtifact(ephor_exe);
+    lint_cmd.addArgs(&.{ "check", "src/" });
+
+    const lint_step = b.step("lint", "Run ephor static analysis");
+    lint_step.dependOn(&lint_cmd.step);
+
+    // Optional: Make lint run before build
+    // exe.step.dependOn(&lint_cmd.step);
+}
+```
+
+**Step 3: Run it:**
+
+```bash
+# Run static analysis
+zig build lint
+
+# Run lint before every build (if you uncommented the dependOn line)
+zig build
+```
+
+**Available lint commands:**
+
+```zig
+// Check all (default)
+lint_cmd.addArgs(&.{ "check", "src/" });
+
+// Check with summary
+lint_cmd.addArgs(&.{ "check", "src/", "--summary" });
+
+// Memory analysis only
+lint_cmd.addArgs(&.{ "memory", "src/" });
+
+// With custom thresholds
+lint_cmd.addArgs(&.{ "check", "src/", "--max-lines=100", "--max-branches=15" });
+
+// Disable specific rules
+lint_cmd.addArgs(&.{ "check", "src/", "--disable=ZA301" });
+```
+
 ## Usage
 
 ```bash

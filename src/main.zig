@@ -2062,6 +2062,80 @@ fn checkDeferCoverageForAlloc(
     return null;
 }
 
+// ============================================================================
+// CFG Errdefer Coverage Analysis Helpers
+// ============================================================================
+
+/// Allocation info for errdefer analysis
+const TryAlloc = struct {
+    name: []const u8,
+    line: usize,
+    col: usize,
+    has_errdefer: bool = false,
+    is_create: bool,
+};
+
+/// Errdefer/defer statement info
+const ErrdeferInfo = struct {
+    line: usize,
+    content: []const u8,
+};
+
+/// Check if function uses arena allocator (skip errdefer analysis)
+fn usesArenaAllocator(lines: []const []const u8) bool {
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.indexOf(u8, t, "ArenaAllocator.init") != null) return true;
+        if (mem.indexOf(u8, t, "arena.deinit()") != null) return true;
+        if (mem.indexOf(u8, t, "arena.allocator()") != null) return true;
+    }
+    return false;
+}
+
+/// Check if line contains a try allocation (not in no-free allocator)
+fn isTryAllocation(t: []const u8) bool {
+    const has_try = mem.indexOf(u8, t, "try ") != null;
+    const has_alloc = hasPatternNotInString(t, ".alloc(");
+    const has_create = hasPatternNotInString(t, ".create(") and isAllocatorCreate(t);
+
+    if (!has_try or !(has_alloc or has_create)) return false;
+    if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return false;
+
+    // Skip no-free allocators
+    if (mem.indexOf(u8, t, "arena") != null) return false;
+    if (mem.indexOf(u8, t, "scratch") != null) return false;
+    if (mem.indexOf(u8, t, "temp") != null) return false;
+    if (mem.indexOf(u8, t, "frame") != null) return false;
+    if (mem.indexOf(u8, t, ".fba.") != null) return false;
+    if (mem.indexOf(u8, t, "recycle") != null) return false;
+
+    return true;
+}
+
+/// Check ownership transfer for errdefer analysis
+fn checkErrdeferOwnershipTransfer(
+    alloc: *TryAlloc,
+    lines: []const []const u8,
+    func_line: usize,
+) void {
+    const alloc_idx = alloc.line - func_line;
+    if (alloc_idx >= lines.len) return;
+
+    for (lines[alloc_idx..]) |line| {
+        const lt = mem.trim(u8, line, " \t\r");
+        // Check for break :label ownership transfer
+        if (mem.indexOf(u8, lt, "break :") != null and containsIdentifier(lt, alloc.name)) {
+            alloc.has_errdefer = true;
+            return;
+        }
+        // Check other ownership transfer patterns
+        if (isOwnershipTransfer(lt, alloc.name)) {
+            alloc.has_errdefer = true;
+            return;
+        }
+    }
+}
+
 /// CFG-based errdefer coverage analysis (ZA103)
 /// Detects allocations where errdefer is missing before subsequent try statements
 /// Pattern: const data = try alloc(); // MISSING errdefer
@@ -2074,207 +2148,128 @@ fn analyzeCFGErrdeferCoverage(
     file_path: []const u8,
     fn_returns_error: bool,
 ) !std.ArrayListUnmanaged(Issue) {
-    // CFG available for future path-sensitive errdefer analysis
-    _ = cfg;
+    _ = cfg; // Available for future path-sensitive analysis
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
-    // Only analyze functions that can return errors
+    // Early exit conditions
     if (!fn_returns_error) return issues;
+    if (usesArenaAllocator(lines)) return issues;
 
-    // Skip functions that use arena allocators (no errdefer needed)
-    // Pattern: ArenaAllocator.init + defer arena.deinit() + const allocator = arena.allocator()
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (mem.indexOf(u8, t, "ArenaAllocator.init") != null) return issues;
-        if (mem.indexOf(u8, t, "arena.deinit()") != null) return issues;
-        if (mem.indexOf(u8, t, "arena.allocator()") != null) return issues;
-    }
-
-    // Phase 1: Identify allocations with try and their positions
-    const TryAlloc = struct {
-        name: []const u8,
-        line: usize,
-        col: usize,
-        has_errdefer: bool = false,
-        is_create: bool,
-    };
-
+    // Collect allocations, errdefers, and try statements
     var try_allocs = std.ArrayListUnmanaged(TryAlloc){};
     defer try_allocs.deinit(allocator);
-
-    // Phase 2: Identify errdefer statements and what they cover
-    // Store the entire content after errdefer/defer to support patterns like:
-    //   errdefer pool.free(context, buffer)  - buffer is not first arg
-    //   errdefer self.allocator.free(self.memory, cps)  - cps is second arg
-    //   errdefer { multiline block with cleanup inside }
-    const ErrdeferInfo = struct {
-        line: usize,
-        content: []const u8, // Full content after errdefer/defer prefix (or block content)
-    };
 
     var errdefers = std.ArrayListUnmanaged(ErrdeferInfo){};
     defer errdefers.deinit(allocator);
 
-    // Phase 3: Identify all try statements (potential error points)
-    var try_lines = std.ArrayListUnmanaged(usize){};
-    defer try_lines.deinit(allocator);
+    var try_lines_list = std.ArrayListUnmanaged(usize){};
+    defer try_lines_list.deinit(allocator);
 
-    // Track multi-line errdefer/defer blocks
-    var errdefer_block_depth: usize = 0;
-    var errdefer_block_start: usize = 0;
-    var errdefer_block_content = std.ArrayListUnmanaged(u8){};
-    defer errdefer_block_content.deinit(allocator);
+    // Multi-line block tracking state
+    var block_depth: usize = 0;
+    var block_start: usize = 0;
+    var block_content = std.ArrayListUnmanaged(u8){};
+    defer block_content.deinit(allocator);
 
     // Single pass to collect all information
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
 
-        // Skip comments
         if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
 
-        // Track multi-line errdefer/defer blocks
-        if (errdefer_block_depth > 0) {
-            // Accumulate content for multi-line blocks
-            try errdefer_block_content.appendSlice(allocator, t);
-            try errdefer_block_content.append(allocator, ' ');
-            // Track brace depth
+        // Handle multi-line errdefer/defer blocks
+        if (block_depth > 0) {
+            try block_content.appendSlice(allocator, t);
+            try block_content.append(allocator, ' ');
             for (t) |c| {
-                if (c == '{') errdefer_block_depth += 1;
+                if (c == '{') block_depth += 1;
                 if (c == '}') {
-                    if (errdefer_block_depth > 0) errdefer_block_depth -= 1;
-                    if (errdefer_block_depth == 0) {
-                        // End of multi-line block - store if has cleanup pattern
-                        const block_content = errdefer_block_content.items;
-                        if (hasRealCleanupPattern(block_content)) {
+                    if (block_depth > 0) block_depth -= 1;
+                    if (block_depth == 0) {
+                        if (hasRealCleanupPattern(block_content.items)) {
                             try errdefers.append(allocator, .{
-                                .line = errdefer_block_start,
-                                .content = try allocator.dupe(u8, block_content),
+                                .line = block_start,
+                                .content = try allocator.dupe(u8, block_content.items),
                             });
                         }
-                        errdefer_block_content.clearRetainingCapacity();
+                        block_content.clearRetainingCapacity();
                     }
                 }
             }
-            continue; // Don't process this line for other patterns while in block
+            continue;
         }
 
-        // Detect try allocations: const/var x = try allocator.alloc/create
-        // Skip patterns inside string literals
+        // Collect try allocations
         const has_try = mem.indexOf(u8, t, "try ") != null;
-        const has_alloc = hasPatternNotInString(t, ".alloc(");
-        const has_create = hasPatternNotInString(t, ".create(") and isAllocatorCreate(t);
-
-        if (has_try and (has_alloc or has_create) and
-            (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")))
-        {
-            // Skip no-free allocators (arena, scratch, temp, frame, fba, recycle)
-            if (mem.indexOf(u8, t, "arena") != null) continue;
-            if (mem.indexOf(u8, t, "scratch") != null) continue;
-            if (mem.indexOf(u8, t, "temp") != null) continue;
-            if (mem.indexOf(u8, t, "frame") != null) continue;
-            if (mem.indexOf(u8, t, ".fba.") != null) continue;
-            if (mem.indexOf(u8, t, "recycle") != null) continue;
-
+        if (has_try and isTryAllocation(t)) {
             const prefix: usize = if (mem.startsWith(u8, t, "const ")) 6 else 4;
             var end = prefix;
             while (end < t.len and isIdent(t[end])) end += 1;
             if (end > prefix) {
-                const name = t[prefix..end];
-                const col = getRealAllocPos(t) orelse 0;
                 try try_allocs.append(allocator, .{
-                    .name = name,
+                    .name = t[prefix..end],
                     .line = actual_line,
-                    .col = col + 1,
+                    .col = (getRealAllocPos(t) orelse 0) + 1,
                     .is_create = hasRealCreatePattern(t),
                 });
             }
         }
 
-        // Detect defer/errdefer statements (both provide cleanup on error)
-        // Handle both single-line and multi-line blocks
+        // Collect errdefer/defer statements
         const is_errdefer = mem.startsWith(u8, t, "errdefer ");
         const is_defer = mem.startsWith(u8, t, "defer ");
         if (is_errdefer or is_defer) {
             const prefix_len: usize = if (is_errdefer) 9 else 6;
-            const content_after_prefix = if (prefix_len < t.len) t[prefix_len..] else "";
+            const content = if (prefix_len < t.len) t[prefix_len..] else "";
 
-            // Check for multi-line block: errdefer { or defer {
-            if (mem.startsWith(u8, content_after_prefix, "{")) {
-                // Start tracking multi-line block
-                errdefer_block_start = actual_line;
-                errdefer_block_depth = 1;
-                errdefer_block_content.clearRetainingCapacity();
-                try errdefer_block_content.appendSlice(allocator, content_after_prefix);
-                try errdefer_block_content.append(allocator, ' ');
-                // Count additional braces on this line
-                for (content_after_prefix[1..]) |c| {
-                    if (c == '{') errdefer_block_depth += 1;
-                    if (c == '}') {
-                        if (errdefer_block_depth > 0) errdefer_block_depth -= 1;
-                    }
+            if (mem.startsWith(u8, content, "{")) {
+                block_start = actual_line;
+                block_depth = 1;
+                block_content.clearRetainingCapacity();
+                try block_content.appendSlice(allocator, content);
+                try block_content.append(allocator, ' ');
+                for (content[1..]) |c| {
+                    if (c == '{') block_depth += 1;
+                    if (c == '}' and block_depth > 0) block_depth -= 1;
                 }
-                // If block closed on same line, store it
-                if (errdefer_block_depth == 0) {
-                    const block_content = errdefer_block_content.items;
-                    if (hasRealCleanupPattern(block_content)) {
+                if (block_depth == 0) {
+                    if (hasRealCleanupPattern(block_content.items)) {
                         try errdefers.append(allocator, .{
                             .line = actual_line,
-                            .content = try allocator.dupe(u8, block_content),
+                            .content = try allocator.dupe(u8, block_content.items),
                         });
                     }
-                    errdefer_block_content.clearRetainingCapacity();
+                    block_content.clearRetainingCapacity();
                 }
             } else if (hasRealCleanupPattern(t)) {
-                // Single-line errdefer/defer with cleanup pattern
                 try errdefers.append(allocator, .{
                     .line = actual_line,
-                    .content = content_after_prefix,
+                    .content = content,
                 });
             }
         }
 
         // Track all try statements
         if (has_try) {
-            try try_lines.append(allocator, actual_line);
+            try try_lines_list.append(allocator, actual_line);
         }
     }
 
     if (try_allocs.items.len == 0) return issues;
 
-    // Phase 4: Check for ownership transfer patterns (break :value, alias assignment, etc.)
-    // If ownership is transferred, we don't need errdefer for that allocation
+    // Check ownership transfer for each allocation
     for (try_allocs.items) |*alloc| {
-        // Scan lines after allocation for ownership transfer
-        const alloc_idx = alloc.line - func_line;
-        if (alloc_idx < lines.len) {
-            for (lines[alloc_idx..]) |line| {
-                const lt = mem.trim(u8, line, " \t\r");
-                // Check for break :label with the allocation name (ownership transfer)
-                if (mem.indexOf(u8, lt, "break :") != null and containsIdentifier(lt, alloc.name)) {
-                    alloc.has_errdefer = true; // Treat as covered - ownership transferred
-                    break;
-                }
-                // Check for other ownership transfer patterns
-                if (isOwnershipTransfer(lt, alloc.name)) {
-                    alloc.has_errdefer = true; // Treat as covered - ownership transferred
-                    break;
-                }
-            }
-        }
+        checkErrdeferOwnershipTransfer(alloc, lines, func_line);
     }
 
-    // Phase 5: For each allocation, check if errdefer exists before each subsequent try
+    // Check errdefer gaps for each allocation
     for (try_allocs.items) |*alloc| {
-        // Skip if already marked as covered (ownership transfer or errdefer found)
         if (alloc.has_errdefer) continue;
 
-        // Check if there's an errdefer for this allocation
-        // Match if the allocation name appears anywhere in the errdefer content
-        // This handles patterns like: errdefer pool.free(context, buffer)
+        // Find errdefer for this allocation
         var errdefer_line: usize = 0;
         for (errdefers.items) |ed| {
-            // Check if allocation name appears as a word boundary in content
             if (containsIdentifier(ed.content, alloc.name)) {
                 errdefer_line = ed.line;
                 alloc.has_errdefer = true;
@@ -2282,18 +2277,14 @@ fn analyzeCFGErrdeferCoverage(
             }
         }
 
-        // Find try statements AFTER this allocation
-        for (try_lines.items) |try_line| {
-            if (try_line <= alloc.line) continue; // Skip try on same or earlier line
+        // Check for try statements after allocation without errdefer coverage
+        for (try_lines_list.items) |try_line| {
+            if (try_line <= alloc.line) continue;
 
-            // Check if errdefer exists BETWEEN allocation and this try
             if (alloc.has_errdefer and errdefer_line > alloc.line and errdefer_line < try_line) {
-                // Errdefer exists and is between allocation and this try - OK
-                continue;
+                continue; // Errdefer exists between allocation and try
             }
 
-            // If errdefer exists but is AFTER this try, or doesn't exist at all
-            // This is an errdefer gap
             if (!alloc.has_errdefer or errdefer_line >= try_line) {
                 try issues.append(allocator, .{
                     .file = file_path,
@@ -2304,7 +2295,7 @@ fn analyzeCFGErrdeferCoverage(
                     .message = "allocation without errdefer before next try",
                     .help = "add errdefer immediately after allocation",
                 });
-                break; // Only report once per allocation
+                break;
             }
         }
     }

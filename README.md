@@ -18,72 +18,70 @@
 
 ## Installation
 
-### From Source
+Add ephor to your project's `build.zig.zon`:
 
-```bash
-git clone https://bitbucket.org/rhyoslabs/ephor.git
-cd ephor
-zig build -Doptimize=ReleaseSafe
+```zig
+.dependencies = .{
+    .ephor = .{
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz",
+        // Run `zig build` once - it will tell you the hash to add here
+    },
+},
 ```
 
-Binary will be at `zig-out/bin/ephor`.
+Add the ephor step to your `build.zig` (after `installArtifact`):
 
-### Add to PATH
-
-```bash
-# Option 1: Copy to /usr/local/bin
-sudo cp zig-out/bin/ephor /usr/local/bin/
-
-# Option 2: Add to PATH in .zshrc/.bashrc
-export PATH="$PATH:/path/to/ephor/zig-out/bin"
+```zig
+// Ephor static analysis
+const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
+const ephor_step = b.step("ephor", "Run ephor static analysis");
+ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);
 ```
 
-### Integrate into Your Project's build.zig
-
-Add ephor as a build step in your project so `zig build ephor` runs static analysis automatically.
-
-### Integrate into Your Project
-
-```bash
-cd /path/to/your-project
-ephor install
-```
-
-This automatically:
-1. Adds the ephor dependency to your `build.zig.zon`
-2. Patches your `build.zig` to add the ephor step
-
-Then run:
+Run static analysis:
 
 ```bash
 zig build ephor
 ```
 
+That's it - Zig fetches and builds ephor automatically.
+
+### Standalone CLI (Optional)
+
+If you want ephor as a system-wide command:
+
+```bash
+git clone https://bitbucket.org/rhyoslabs/ephor.git
+cd ephor
+zig build -Doptimize=ReleaseSafe
+sudo cp zig-out/bin/ephor /usr/local/bin/
+```
+
+With the standalone CLI, you can auto-setup new projects:
+
+```bash
+cd /path/to/your-project
+ephor install    # Adds dependency + patches build.zig automatically
+```
+
 ## Usage
 
 ```bash
-# Add ephor to your project (recommended)
-cd /path/to/your-project
-ephor install            # Adds dependency and patches build.zig
+# Run all static checks (via build system)
+zig build ephor
 
-# Update ephor to latest version
-ephor upgrade            # or: ephor update
-
-# Run all static checks
-ephor check
-
-# Run all checks on specific directory
+# Or with standalone CLI
 ephor check src/
 
-# Run dynamic analysis (tests with memory diagnostics)
-ephor runtime
-
 # Individual analyzers
-ephor orphans
-ephor memory
-ephor errors
-ephor complexity
-ephor fmt-check
+ephor memory              # Alloc without defer patterns
+ephor errors              # Silent catch {} discards
+ephor orphans             # Files not imported
+ephor complexity          # Function complexity
+ephor fmt-check           # Files needing zig fmt
+
+# Dynamic analysis (runs tests with memory diagnostics)
+ephor runtime
 
 # Project statistics
 ephor stats

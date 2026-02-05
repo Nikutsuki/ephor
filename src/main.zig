@@ -1114,6 +1114,65 @@ fn hasVarRead(t: []const u8, var_name: []const u8) bool {
 // CFG-Based Path-Sensitive Memory Analysis (ZA105, ZA106)
 // ============================================================================
 
+/// Result of marking defer and errdefer block lines
+const DeferBlockMarkers = struct {
+    in_defer: []bool,
+    in_errdefer: []bool,
+};
+
+/// Mark which lines are inside defer and errdefer blocks
+fn markDeferAndErrdeferBlocks(allocator: Allocator, lines: []const []const u8) !DeferBlockMarkers {
+    var in_errdefer = try allocator.alloc(bool, lines.len);
+    errdefer allocator.free(in_errdefer);
+    var in_defer = try allocator.alloc(bool, lines.len);
+    @memset(in_errdefer, false);
+    @memset(in_defer, false);
+
+    var errdefer_depth: usize = 0;
+    var defer_depth: usize = 0;
+    for (lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+
+        // Track errdefer blocks
+        if (mem.startsWith(u8, t, "errdefer ") or mem.startsWith(u8, t, "errdefer{")) {
+            errdefer_depth += 1;
+            var braces: i32 = 0;
+            for (t) |c| {
+                if (c == '{') braces += 1;
+                if (c == '}') braces -= 1;
+            }
+            if (braces == 0 and errdefer_depth > 0) errdefer_depth -= 1;
+            in_errdefer[idx] = true;
+            continue;
+        }
+        if (errdefer_depth > 0) {
+            in_errdefer[idx] = true;
+            for (t) |c| {
+                if (c == '{') errdefer_depth += 1;
+                if (c == '}' and errdefer_depth > 0) errdefer_depth -= 1;
+            }
+        }
+
+        // Track regular defer blocks (multi-line only)
+        if (mem.startsWith(u8, t, "defer {") or mem.startsWith(u8, t, "defer{")) {
+            in_defer[idx] = true;
+            for (t) |c| {
+                if (c == '{') defer_depth += 1;
+                if (c == '}' and defer_depth > 0) defer_depth -= 1;
+            }
+            continue;
+        }
+        if (defer_depth > 0) {
+            in_defer[idx] = true;
+            for (t) |c| {
+                if (c == '{') defer_depth += 1;
+                if (c == '}' and defer_depth > 0) defer_depth -= 1;
+            }
+        }
+    }
+    return .{ .in_defer = in_defer, .in_errdefer = in_errdefer };
+}
+
 /// Analyze memory states through CFG for path-sensitive use-after-free and double-free
 /// This properly handles patterns like: catch { free(x); return; }
 /// where the free only occurs on the early-return path, not the main path
@@ -1161,69 +1220,11 @@ fn analyzeCFGMemorySafety(
     if (num_blocks == 0) return issues;
 
     // Pre-pass: Mark which lines are inside errdefer or defer blocks
-    // This is function-wide to handle blocks spanning CFG blocks
-    // Frees inside defer blocks don't happen until scope exit, so we skip them
-    // for use-after-free analysis (the use before the defer line is valid)
-    var in_errdefer = try allocator.alloc(bool, lines.len);
-    defer allocator.free(in_errdefer);
-    var in_defer = try allocator.alloc(bool, lines.len);
+    const markers = try markDeferAndErrdeferBlocks(allocator, lines);
+    const in_defer = markers.in_defer;
+    const in_errdefer = markers.in_errdefer;
     defer allocator.free(in_defer);
-    @memset(in_errdefer, false);
-    @memset(in_defer, false);
-    {
-        var errdefer_depth: usize = 0;
-        var defer_depth: usize = 0;
-        for (lines, 0..) |line, idx| {
-            const t = mem.trim(u8, line, " \t\r");
-
-            // Track errdefer blocks
-            if (mem.startsWith(u8, t, "errdefer ") or mem.startsWith(u8, t, "errdefer{")) {
-                errdefer_depth += 1;
-                // Check if single-line errdefer (balanced braces)
-                var braces: i32 = 0;
-                for (t) |c| {
-                    if (c == '{') braces += 1;
-                    if (c == '}') braces -= 1;
-                }
-                if (braces == 0 and errdefer_depth > 0) errdefer_depth -= 1;
-                in_errdefer[idx] = true;
-                continue;
-            }
-            if (errdefer_depth > 0) {
-                in_errdefer[idx] = true;
-                for (t) |c| {
-                    if (c == '{') errdefer_depth += 1;
-                    if (c == '}') {
-                        if (errdefer_depth > 0) errdefer_depth -= 1;
-                    }
-                }
-            }
-
-            // Track regular defer blocks (only multi-line, single-line defers are separate)
-            // Note: single-line `defer expr;` doesn't need tracking (handled elsewhere)
-            if (mem.startsWith(u8, t, "defer {") or mem.startsWith(u8, t, "defer{")) {
-                // Found start of multi-line defer block
-                in_defer[idx] = true;
-                // Count braces on this line too (the opening { is part of the defer)
-                for (t) |c| {
-                    if (c == '{') defer_depth += 1;
-                    if (c == '}') {
-                        if (defer_depth > 0) defer_depth -= 1;
-                    }
-                }
-                continue;
-            }
-            if (defer_depth > 0) {
-                in_defer[idx] = true;
-                for (t) |c| {
-                    if (c == '{') defer_depth += 1;
-                    if (c == '}') {
-                        if (defer_depth > 0) defer_depth -= 1;
-                    }
-                }
-            }
-        }
-    }
+    defer allocator.free(in_errdefer);
 
     // Phase 2: For each allocation, track freed state through CFG
     var alloc_iter = allocs.iterator();

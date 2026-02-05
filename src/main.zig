@@ -655,24 +655,58 @@ fn hasPatternNotInString(t: []const u8, pattern: []const u8) bool {
     return false;
 }
 
+/// Check if the caller before .alloc() or .create() is a Type (starts uppercase)
+/// Type.alloc() is a factory method, not an allocator call
+/// Handles patterns like: Type.alloc(), module.Type.alloc(), Type(T).alloc()
+fn isTypeAllocFactory(t: []const u8, alloc_pos: usize) bool {
+    if (alloc_pos == 0) return false;
+    var end = alloc_pos;
+    // Skip any whitespace before .alloc(
+    while (end > 0 and t[end - 1] == ' ') end -= 1;
+    // Skip past type parameters like ([]const u8) before .alloc(
+    // Pattern: Type(T).alloc() - need to skip the (T) part
+    if (end > 0 and t[end - 1] == ')') {
+        var paren_depth: usize = 1;
+        end -= 1;
+        while (end > 0 and paren_depth > 0) {
+            end -= 1;
+            if (t[end] == ')') paren_depth += 1;
+            if (t[end] == '(') paren_depth -= 1;
+        }
+    }
+    // Now find the identifier immediately before (or at position after skipping parens)
+    while (end > 0 and (t[end - 1] == '.' or t[end - 1] == ' ')) end -= 1;
+    // Walk backwards to find the full identifier chain
+    const id_end = end;
+    var id_start = end;
+    while (id_start > 0 and isIdent(t[id_start - 1])) {
+        id_start -= 1;
+    }
+    if (id_start >= id_end) return false;
+    // Check if this identifier starts with uppercase (Type name)
+    const first_char = t[id_start];
+    return first_char >= 'A' and first_char <= 'Z';
+}
+
 /// Check if line has an allocation pattern (.alloc or .create) NOT inside a string
+/// Skips Type.alloc() factory methods (uppercase first letter)
 fn hasRealAllocPattern(t: []const u8) bool {
     if (mem.indexOf(u8, t, ".alloc(")) |pos| {
-        if (!isPatternInString(t, pos)) return true;
+        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return true;
     }
     if (mem.indexOf(u8, t, ".create(")) |pos| {
-        if (!isPatternInString(t, pos)) return true;
+        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return true;
     }
     return false;
 }
 
-/// Get position of real allocation pattern (not in string), returns null if not found
+/// Get position of real allocation pattern (not in string, not Type.alloc()), returns null if not found
 fn getRealAllocPos(t: []const u8) ?usize {
     if (mem.indexOf(u8, t, ".alloc(")) |pos| {
-        if (!isPatternInString(t, pos)) return pos;
+        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return pos;
     }
     if (mem.indexOf(u8, t, ".create(")) |pos| {
-        if (!isPatternInString(t, pos)) return pos;
+        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return pos;
     }
     return null;
 }
@@ -3109,7 +3143,7 @@ fn trackTestBlock(
 }
 
 /// Best-effort operations where silent catch {} is acceptable
-/// Categories: filesystem, cleanup, collection, writer, network
+/// Categories: filesystem, cleanup, collection, writer, network, threading
 const best_effort_ops = [_][]const u8{
     // Filesystem - might already exist/not exist
     "makePath(",     "makeDir(",      "deleteFile(",   "deleteDir(",
@@ -3133,6 +3167,9 @@ const best_effort_ops = [_][]const u8{
     ".lock(",        ".unlock(",
     // State changes - best effort (display links, services)
     ".start(",       ".stop(",
+    // Threading - cosmetic operations where failure is acceptable
+    ".setName(",     ".notify(",      ".wakeup(",      ".signal(",
+    "_wakeup.set(",  "_wakeup.notify(",
 };
 
 /// Check if a silent catch is for a best-effort operation
@@ -5186,12 +5223,15 @@ fn detectErrorReturns(lines: []const []const u8) bool {
 fn findAllocCall(t: []const u8) ?struct { col: usize, is_create: bool } {
     if (isPoolAllocator(t)) return null;
     // Check for .alloc( (includes allocator.alloc( as suffix match)
+    // Skip Type.alloc() factory patterns (Type starts uppercase)
     if (mem.indexOf(u8, t, ".alloc(")) |col| {
-        if (!isPatternInString(t, col)) return .{ .col = col, .is_create = false };
+        if (!isPatternInString(t, col) and !isTypeAllocFactory(t, col))
+            return .{ .col = col, .is_create = false };
     }
     // Check for .create( (includes allocator.create( as suffix match)
+    // Skip Type.create() factory patterns (Type starts uppercase)
     if (mem.indexOf(u8, t, ".create(")) |col| {
-        if (!isPatternInString(t, col) and isAllocatorCreate(t))
+        if (!isPatternInString(t, col) and !isTypeAllocFactory(t, col) and isAllocatorCreate(t))
             return .{ .col = col, .is_create = true };
     }
     return null;
@@ -5469,6 +5509,24 @@ fn trackReturnAndStore(
         for (allocs) |*alloc| {
             if (mem.indexOf(u8, t, alloc.name)) |pos| {
                 if (pos > eq_pos) alloc.stored = true;
+            }
+        }
+    }
+
+    // Handle general struct.field = alloc patterns (not just self./result.)
+    // Pattern: identifier.field = alloc_name (ownership transferred to struct field)
+    if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+        // Check if LHS is a struct field access (has a dot before the =)
+        const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+        if (mem.indexOf(u8, lhs, ".") != null) {
+            // LHS has a dot, might be struct.field assignment
+            for (allocs) |*alloc| {
+                if (mem.indexOf(u8, t, alloc.name)) |pos| {
+                    if (pos > eq_pos) {
+                        // alloc_name is on RHS of assignment to struct field
+                        alloc.stored = true;
+                    }
+                }
             }
         }
     }
@@ -5777,6 +5835,15 @@ fn analyzeFunction(
                         !mem.eql(u8, lhs, alias))
                     {
                         allocs.items[ai].stored = true;
+                    }
+                    // Struct field assignment: struct.field = alloc (ownership transfer)
+                    // Pattern: deque.buffer = new_buffer, ctx.data = alloc_ptr
+                    if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") != null) {
+                        // Check if alias is on the RHS (after =)
+                        const rhs = t[eq_pos + 3 ..];
+                        if (mem.indexOf(u8, rhs, alias) != null) {
+                            allocs.items[ai].stored = true;
+                        }
                     }
                 }
 
@@ -6458,6 +6525,9 @@ fn analyzeCFGPanicPatterns(
                     // Skip if guard on same line
                     if (hasGuardOnLine(t, var_name)) continue;
 
+                    // Skip if guard on prior lines (if (x == 0) break; pattern)
+                    if (hasBreakGuardOnPriorLines(lines, idx, var_name)) continue;
+
                     // Skip signed types (can go negative)
                     if (isSignedVarInContext(lines, idx, var_name)) continue;
 
@@ -6564,14 +6634,17 @@ fn extractGuardedVar(t: []const u8) ?[]const u8 {
         }
     }
 
-    // Pattern: if (x == 0) return - early return guard (inverted check)
+    // Pattern: if (x == 0) return/break/continue - early exit guard (inverted check)
     // After this line, x != 0 is true
-    if (mem.indexOf(u8, t, "== 0) return")) |pos| {
-        // Find opening paren
-        if (mem.lastIndexOf(u8, t[0..pos], "(")) |paren_pos| {
-            const var_part = mem.trim(u8, t[paren_pos + 1 .. pos], " \t");
-            if (var_part.len > 0 and isIdent(var_part[0])) {
-                return var_part;
+    const early_exit_patterns = [_][]const u8{ "== 0) return", "== 0) break", "== 0) continue" };
+    for (early_exit_patterns) |pattern| {
+        if (mem.indexOf(u8, t, pattern)) |pos| {
+            // Find opening paren
+            if (mem.lastIndexOf(u8, t[0..pos], "(")) |paren_pos| {
+                const var_part = mem.trim(u8, t[paren_pos + 1 .. pos], " \t");
+                if (var_part.len > 0 and isIdent(var_part[0])) {
+                    return var_part;
+                }
             }
         }
     }
@@ -6620,6 +6693,27 @@ fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bo
             const after_var = ctx[var_pos + var_name.len ..];
             if (mem.startsWith(u8, after_var, " += 1") or mem.startsWith(u8, after_var, "+=1")) {
                 return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Check for break/continue guard on prior lines within loop body
+/// Pattern: while (true) { if (x == 0) break; x -= 1; }
+fn hasBreakGuardOnPriorLines(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+    // Look back up to 5 lines for a guard pattern
+    const check_start = if (current_idx > 5) current_idx - 5 else 0;
+    for (lines[check_start..current_idx]) |line| {
+        const ctx = mem.trim(u8, line, " \t\r");
+        // Stop at function boundary or loop start
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+        // Check for if (var == 0) break/continue pattern
+        if (mem.indexOf(u8, ctx, var_name)) |_| {
+            if (mem.indexOf(u8, ctx, "== 0)") != null) {
+                if (mem.indexOf(u8, ctx, "break") != null) return true;
+                if (mem.indexOf(u8, ctx, "continue") != null) return true;
+                if (mem.indexOf(u8, ctx, "return") != null) return true;
             }
         }
     }
@@ -6698,8 +6792,11 @@ fn extractArrayBaseFromIndexArithmetic(t: []const u8) ?[]const u8 {
 fn hasIndexGuardOnLine(t: []const u8) bool {
     // Pattern: while (x > 0 and expr[x - 1])
     if (mem.indexOf(u8, t, "while") != null and mem.indexOf(u8, t, "> 0") != null) return true;
-    // Pattern: (i == 0 or t[i - 1]) - short-circuit
+    // Pattern: (i == 0 or t[i - 1]) - short-circuit OR (safe: RHS only evaluated when LHS false)
     if (mem.indexOf(u8, t, "== 0 or") != null) return true;
+    // Pattern: (x != 0 and arr[x - 1]) - short-circuit AND (safe: RHS only evaluated when LHS true)
+    if (mem.indexOf(u8, t, "!= 0 and") != null) return true;
+    if (mem.indexOf(u8, t, "!=0 and") != null) return true;
     // Pattern: x > N and - any numeric guard before array access
     // This covers: > 0 and, > 1 and, >= 1 and, >= 4 and, etc.
     if (mem.indexOf(u8, t, " and ") != null) {
@@ -6903,11 +7000,14 @@ fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
         return true;
     }
 
-    // 4. x != 0 (inverted guard)
+    // 4. x != 0 (inverted guard) - includes short-circuit AND pattern
     if (mem.indexOf(u8, line, "!= 0") != null) return true;
     if (mem.indexOf(u8, line, "!=0") != null) return true;
 
-    // 5. assert(x > 0) - assertion as guard (TigerBeetle pattern)
+    // 5. Short-circuit OR pattern: x == 0 or expr - safe when RHS uses x-1
+    if (mem.indexOf(u8, line, "== 0 or") != null) return true;
+
+    // 6. assert(x > 0) - assertion as guard (TigerBeetle pattern)
     if (mem.indexOf(u8, line, "assert") != null) {
         if (mem.indexOf(u8, line, "> 0") != null) return true;
         if (mem.indexOf(u8, line, ">0") != null) return true;
@@ -6919,7 +7019,7 @@ fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
         if (mem.indexOf(u8, line, "!=0") != null) return true;
     }
 
-    // 6. std.debug.assert pattern
+    // 7. std.debug.assert pattern
     if (mem.indexOf(u8, line, "debug.assert") != null) {
         if (mem.indexOf(u8, line, ">") != null) return true;
         if (mem.indexOf(u8, line, "!=") != null) return true;

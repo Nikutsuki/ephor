@@ -4893,6 +4893,17 @@ fn processFunction(
     );
     defer errdefer_issues.deinit(allocator);
     try issues.appendSlice(allocator, errdefer_issues.items);
+
+    // Run CFG-based null safety analysis (ZA801, ZA802)
+    var null_safety_issues = try analyzeCFGNullSafety(
+        allocator,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+    );
+    defer null_safety_issues.deinit(allocator);
+    try issues.appendSlice(allocator, null_safety_issues.items);
 }
 
 /// Analyze a single file for CFG memory issues
@@ -5791,7 +5802,229 @@ fn checkUnsafeDeref(
     });
 }
 
-/// ZA801/ZA802: Detect unsafe optional unwrapping
+/// CFG-based null safety analysis (ZA801/ZA802)
+/// Uses control flow graph to track null checks across paths
+fn analyzeCFGNullSafety(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .{};
+
+    const num_blocks = cfg.blocks.items.len;
+    if (num_blocks == 0) return issues;
+
+    // Track null-checked variables per block (variables known to be non-null)
+    var checked_per_block = try allocator.alloc(std.StringHashMapUnmanaged(void), num_blocks);
+    defer {
+        for (checked_per_block) |*map| map.deinit(allocator);
+        allocator.free(checked_per_block);
+    }
+    for (checked_per_block) |*map| map.* = .{};
+
+    // Phase 1: Identify null checks in each block
+    for (cfg.blocks.items, 0..) |block, bid| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+        for (block.start_line..block.end_line + 1) |line_num| {
+            if (line_num < func_line) continue;
+            const idx = line_num - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+
+            // Detect null check patterns and extract variable names
+            // Pattern: if (x != null) or if (x) |_|
+            if (mem.startsWith(u8, t, "if (") or mem.startsWith(u8, t, "} else if (") or
+                mem.startsWith(u8, t, "while ("))
+            {
+                if (extractNullCheckedVar(t)) |var_name| {
+                    try checked_per_block[bid].put(allocator, var_name, {});
+                }
+            }
+        }
+    }
+
+    // Phase 2: Propagate null-check state through CFG (forward dataflow)
+    // A variable is checked if it's checked on ALL predecessor paths
+    var changed = true;
+    var iterations: usize = 0;
+    while (changed and iterations < 100) {
+        changed = false;
+        iterations += 1;
+
+        for (cfg.blocks.items, 0..) |_, bid| {
+            // Get all predecessors of this block
+            var preds = std.ArrayListUnmanaged(usize){};
+            defer preds.deinit(allocator);
+            for (cfg.edges.items) |edge| {
+                if (edge.to == bid) {
+                    try preds.append(allocator, edge.from);
+                }
+            }
+
+            // Skip entry block (no predecessors)
+            if (preds.items.len == 0) continue;
+
+            // For each variable checked in all predecessors, it's checked here too
+            // (unless this block re-assigns it)
+            var first_pred = true;
+            var intersection: std.StringHashMapUnmanaged(void) = .{};
+            defer intersection.deinit(allocator);
+
+            for (preds.items) |pred| {
+                if (first_pred) {
+                    // Start with first predecessor's set
+                    var iter = checked_per_block[pred].iterator();
+                    while (iter.next()) |entry| {
+                        try intersection.put(allocator, entry.key_ptr.*, {});
+                    }
+                    first_pred = false;
+                } else {
+                    // Intersect with other predecessors
+                    var to_remove = std.ArrayListUnmanaged([]const u8){};
+                    defer to_remove.deinit(allocator);
+                    var iter = intersection.iterator();
+                    while (iter.next()) |entry| {
+                        if (!checked_per_block[pred].contains(entry.key_ptr.*)) {
+                            try to_remove.append(allocator, entry.key_ptr.*);
+                        }
+                    }
+                    for (to_remove.items) |key| {
+                        _ = intersection.remove(key);
+                    }
+                }
+            }
+
+            // Add intersection to this block's checked set
+            var iter = intersection.iterator();
+            while (iter.next()) |entry| {
+                const gop = try checked_per_block[bid].getOrPut(allocator, entry.key_ptr.*);
+                if (!gop.found_existing) changed = true;
+            }
+        }
+    }
+
+    // Phase 3: Check for unsafe unwraps where variable isn't null-checked
+    for (cfg.blocks.items, 0..) |block, bid| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+        for (block.start_line..block.end_line + 1) |line_num| {
+            if (line_num < func_line) continue;
+            const idx = line_num - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+
+            // Check for .? unwrap
+            if (mem.indexOf(u8, t, ".?")) |col| {
+                // Skip if in safe context on this line
+                if (isInSafeContext(t)) continue;
+                if (!isUnsafeUnwrapUsage(t, col)) continue;
+
+                // Extract variable being unwrapped
+                if (extractUnwrappedVar(t, col)) |var_name| {
+                    // Skip if variable is null-checked on all paths to this point
+                    if (checked_per_block[bid].contains(var_name)) continue;
+
+                    try issues.append(allocator, .{
+                        .file = file_path,
+                        .line = line_num,
+                        .col = col + 1,
+                        .severity = .warning,
+                        .rule = RULE_OPTIONAL_UNWRAP_UNSAFE,
+                        .message = "optional unwrap (.?) may panic if null",
+                        .help = "use 'orelse' for safe unwrap, or check for null with 'if'",
+                    });
+                }
+            }
+
+            // Check for unsafe deref of optional pointer (maybe_/opt_ prefix)
+            if (mem.indexOf(u8, t, ".*")) |col| {
+                const before = t[0..col];
+                const has_maybe = mem.indexOf(u8, before, "maybe_") != null;
+                const has_opt = mem.indexOf(u8, before, "opt_") != null;
+                if (!has_maybe and !has_opt) continue;
+                if (isInSafeContext(t)) continue;
+
+                // Extract the variable name
+                if (extractDerefVar(t, col)) |var_name| {
+                    if (checked_per_block[bid].contains(var_name)) continue;
+
+                    try issues.append(allocator, .{
+                        .file = file_path,
+                        .line = line_num,
+                        .col = col + 1,
+                        .severity = .warning,
+                        .rule = RULE_ORELSE_QUESTION_UNSAFE,
+                        .message = "dereferencing optional pointer may panic if null",
+                        .help = "check for null before dereferencing, or use 'orelse'",
+                    });
+                }
+            }
+        }
+    }
+
+    return issues;
+}
+
+/// Extract variable name from null check pattern
+/// Patterns: "if (x != null)", "if (x) |_|", "while (x != null)"
+fn extractNullCheckedVar(t: []const u8) ?[]const u8 {
+    // Find opening paren
+    const open_paren = mem.indexOf(u8, t, "(") orelse return null;
+    const after_paren = t[open_paren + 1 ..];
+
+    // Pattern: x != null
+    if (mem.indexOf(u8, after_paren, " != null")) |ne_pos| {
+        const var_part = mem.trim(u8, after_paren[0..ne_pos], " \t");
+        if (var_part.len > 0 and isIdent(var_part[0])) {
+            return var_part;
+        }
+    }
+
+    // Pattern: x == null (inverted check - variable NOT null in else branch)
+    // We can't easily track this without more complex analysis, skip for now
+
+    // Pattern: if (x) |_| - capture means x is non-null inside
+    if (mem.indexOf(u8, after_paren, ") |")) |pipe_pos| {
+        const var_part = mem.trim(u8, after_paren[0..pipe_pos], " \t");
+        if (var_part.len > 0 and isIdent(var_part[0])) {
+            return var_part;
+        }
+    }
+
+    return null;
+}
+
+/// Extract variable name being unwrapped with .?
+fn extractUnwrappedVar(t: []const u8, dot_q_pos: usize) ?[]const u8 {
+    if (dot_q_pos == 0) return null;
+    // Look backwards for identifier
+    const end = dot_q_pos;
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+        start -= 1;
+    }
+    if (start < end) return t[start..end];
+    return null;
+}
+
+/// Extract variable name being dereferenced with .*
+fn extractDerefVar(t: []const u8, dot_star_pos: usize) ?[]const u8 {
+    if (dot_star_pos == 0) return null;
+    const end = dot_star_pos;
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+        start -= 1;
+    }
+    if (start < end) return t[start..end];
+    return null;
+}
+
+/// ZA801/ZA802: Detect unsafe optional unwrapping (legacy line-based - kept for comparison)
 fn analyzeNullSafety(
     allocator: Allocator,
     graph: *ImportGraph,
@@ -5801,8 +6034,8 @@ fn analyzeNullSafety(
     while (iter.next()) |entry| {
         const file_path = entry.key_ptr.*;
         var line_num: usize = 1;
-        var lines = mem.splitScalar(u8, entry.value_ptr.content, '\n');
-        while (lines.next()) |line| {
+        var lines_iter = mem.splitScalar(u8, entry.value_ptr.content, '\n');
+        while (lines_iter.next()) |line| {
             defer line_num += 1;
             const t = mem.trim(u8, line, " \t\r");
             if (isCommentOrMultilineString(t)) continue;

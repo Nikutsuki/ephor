@@ -989,7 +989,19 @@ fn collectUndefinedVars(
             continue; // Skip variables declared inside comptime
         }
 
-        if (mem.indexOf(u8, t, "= undefined") != null) {
+        if (mem.indexOf(u8, t, "= undefined")) |col| {
+            // Ensure "undefined" is complete token, not part of "undefined_col"
+            const after_undefined = col + "= undefined".len;
+            if (after_undefined < t.len) {
+                const next_char = t[after_undefined];
+                if ((next_char >= 'a' and next_char <= 'z') or
+                    (next_char >= 'A' and next_char <= 'Z') or
+                    (next_char >= '0' and next_char <= '9') or
+                    next_char == '_')
+                {
+                    continue; // Part of longer identifier
+                }
+            }
             if (extractVarDeclName(t)) |name| {
                 if (!hasUnconditionalFillBeforeUse(lines, idx + 1, name)) {
                     try undef_vars.put(name, func_line + idx);
@@ -3578,6 +3590,30 @@ fn isModuleLevelDecl(raw_line: []const u8) bool {
     return raw_line[0] != ' ' and raw_line[0] != '\t';
 }
 
+/// Check if `= undefined` is a cleanup pattern (intentional memory clearing)
+/// Patterns like `self.* = undefined;` or `ptr.* = undefined;` are cleanup ops
+fn isCleanupUndefinedPattern(t: []const u8, undefined_col: usize) bool {
+    // Look for `.* =` or `.*=` pattern before the `= undefined`
+    // The undefined_col points to the `=` in `= undefined`
+    if (undefined_col < 2) return false;
+
+    // Search backwards from the `=` to find `.*`
+    var i: usize = undefined_col;
+    // Skip whitespace before the `=`
+    while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) {
+        i -= 1;
+    }
+    // Check for `.*` pattern (pointer dereference)
+    if (i >= 2 and t[i - 2] == '.' and t[i - 1] == '*') {
+        return true;
+    }
+    // Check for `]` pattern (array index assignment)
+    if (i >= 1 and t[i - 1] == ']') {
+        return true;
+    }
+    return false;
+}
+
 /// Check for undefined usage (ZA204)
 fn checkUndefinedUsage(
     t: []const u8,
@@ -3589,12 +3625,26 @@ fn checkUndefinedUsage(
         return handlePendingUndefined(t, path, line, pending);
     }
     const col = mem.indexOf(u8, t, "= undefined") orelse return null;
+    // Ensure "undefined" is a complete token, not part of "undefined_col" etc.
+    const after_undefined = col + "= undefined".len;
+    if (after_undefined < t.len) {
+        const next_char = t[after_undefined];
+        if ((next_char >= 'a' and next_char <= 'z') or
+            (next_char >= 'A' and next_char <= 'Z') or
+            (next_char >= '0' and next_char <= '9') or
+            next_char == '_')
+        {
+            return null; // Part of longer identifier like "undefined_col"
+        }
+    }
     if (isInsideString(t, col)) return null;
     // Skip if match is inside a trailing comment (but not if // is in a string)
     if (mem.indexOf(u8, t, "//")) |comment_start| {
         if (col > comment_start and !isInsideString(t, comment_start)) return null;
     }
     if (isStructFieldPattern(t, col)) return null;
+    // Skip cleanup patterns like `self.* = undefined;` or `ptr.* = undefined;`
+    if (isCleanupUndefinedPattern(t, col)) return null;
     if (extractVarDeclName(t)) |name| {
         pending.* = .{ .name = name, .line = line, .col = col + 1 };
         return null;
@@ -6282,6 +6332,7 @@ fn analyzeCFGPanicPatterns(
     }
 
     // Phase 2: Propagate guard state through CFG (forward dataflow)
+    // Key insight: Guards in conditional blocks only apply to the `then` branch
     var changed = true;
     var iterations: usize = 0;
     while (changed and iterations < 100) {
@@ -6289,11 +6340,16 @@ fn analyzeCFGPanicPatterns(
         iterations += 1;
 
         for (cfg.blocks.items, 0..) |_, bid| {
-            var preds = std.ArrayListUnmanaged(usize){};
+            // Collect predecessors with their edge types
+            const PredInfo = struct { block: usize, via_true_branch: bool };
+            var preds = std.ArrayListUnmanaged(PredInfo){};
             defer preds.deinit(allocator);
             for (cfg.edges.items) |edge| {
                 if (edge.to == bid) {
-                    try preds.append(allocator, edge.from);
+                    try preds.append(allocator, .{
+                        .block = edge.from,
+                        .via_true_branch = edge.kind == .branch_true,
+                    });
                 }
             }
 
@@ -6303,10 +6359,28 @@ fn analyzeCFGPanicPatterns(
             var intersection: std.StringHashMapUnmanaged(void) = .{};
             defer intersection.deinit(allocator);
 
-            for (preds.items) |pred| {
+            for (preds.items) |pred_info| {
+                const pred = pred_info.block;
+
+                // Check if predecessor is a conditional (has both true and false edges)
+                const pred_has_both_branches = blk: {
+                    var has_true: bool = false;
+                    var has_false: bool = false;
+                    for (cfg.edges.items) |e| {
+                        if (e.from == pred) {
+                            if (e.kind == .branch_true) has_true = true;
+                            if (e.kind == .branch_false) has_false = true;
+                        }
+                    }
+                    break :blk has_true and has_false;
+                };
+
                 if (first_pred) {
                     var iter = guarded_per_block[pred].iterator();
                     while (iter.next()) |entry| {
+                        // If coming from conditional via false branch, don't inherit guards
+                        // because guards in conditions only apply to true branch
+                        if (pred_has_both_branches and !pred_info.via_true_branch) continue;
                         try intersection.put(allocator, entry.key_ptr.*, {});
                     }
                     first_pred = false;
@@ -6315,7 +6389,13 @@ fn analyzeCFGPanicPatterns(
                     defer to_remove.deinit(allocator);
                     var iter = intersection.iterator();
                     while (iter.next()) |entry| {
-                        if (!guarded_per_block[pred].contains(entry.key_ptr.*)) {
+                        // Check if this guard should come from this predecessor
+                        var should_have_guard = guarded_per_block[pred].contains(entry.key_ptr.*);
+                        // If coming via false branch from conditional, pred doesn't provide guard
+                        if (pred_has_both_branches and !pred_info.via_true_branch) {
+                            should_have_guard = false;
+                        }
+                        if (!should_have_guard) {
                             try to_remove.append(allocator, entry.key_ptr.*);
                         }
                     }
@@ -6386,6 +6466,19 @@ fn analyzeCFGPanicPatterns(
                 // Skip if guard pattern on same line
                 if (hasIndexGuardOnLine(t)) continue;
 
+                // Skip if the array's .len is guarded via CFG
+                // Pattern: x[x.len - N] is safe if x.len is guarded
+                if (extractArrayBaseFromIndexArithmetic(t)) |base| {
+                    // Check if {base}.len is guarded
+                    var buf: [128]u8 = undefined;
+                    if (base.len + 4 <= buf.len) {
+                        @memcpy(buf[0..base.len], base);
+                        @memcpy(buf[base.len..][0..4], ".len");
+                        const len_var = buf[0 .. base.len + 4];
+                        if (guarded_per_block[bid].contains(len_var)) continue;
+                    }
+                }
+
                 try issues.append(allocator, .{
                     .file = file_path,
                     .line = line_num,
@@ -6403,7 +6496,7 @@ fn analyzeCFGPanicPatterns(
 }
 
 /// Extract variable name from guard pattern
-/// Patterns: "if (x > 0)", "while (x > 0)", "assert(x > 0)", "x >= 1"
+/// Patterns: "if (x > 0)", "while (x > 0)", "assert(x > 0)", "x >= 1", "x.len > N"
 /// Also: "if (x == 0) return" (early return guard, inverted)
 fn extractGuardedVar(t: []const u8) ?[]const u8 {
     // Pattern: x > 0 or x >= 1 or x != 0
@@ -6418,6 +6511,36 @@ fn extractGuardedVar(t: []const u8) ?[]const u8 {
                 start -= 1;
             }
             if (start < end) return t[start..end];
+        }
+    }
+
+    // Pattern: x.len > N (any positive number) - length guards
+    // Find patterns like "x.len > " or "x.len >= " followed by digit
+    if (mem.indexOf(u8, t, ".len >")) |pos| {
+        // Check if followed by a digit (any threshold)
+        const after = pos + ".len >".len;
+        if (after < t.len) {
+            var check_pos = after;
+            // Skip optional '=' for >=
+            if (check_pos < t.len and t[check_pos] == '=') check_pos += 1;
+            // Skip space
+            while (check_pos < t.len and t[check_pos] == ' ') check_pos += 1;
+            // Must be followed by a digit
+            if (check_pos < t.len and t[check_pos] >= '0' and t[check_pos] <= '9') {
+                // Extract the variable before .len
+                var end = pos;
+                while (end > 0 and t[end - 1] == ' ') end -= 1;
+                var start = end;
+                while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+                    start -= 1;
+                }
+                if (start < end) {
+                    // Return "x.len" as the guarded variable
+                    const base = t[start..end];
+                    _ = base; // We want to return x.len, not just x
+                    return t[start .. pos + ".len".len];
+                }
+            }
         }
     }
 
@@ -6527,6 +6650,27 @@ fn hasArrayIndexSubtraction(t: []const u8) ?usize {
             i = end;
         }
     }
+    return null;
+}
+
+/// Extract array base variable from index arithmetic pattern
+/// e.g., "x[x.len - 8]" -> "x", "in[in.len - 4 ..]" -> "in"
+fn extractArrayBaseFromIndexArithmetic(t: []const u8) ?[]const u8 {
+    // Find pattern: identifier[identifier.len
+    // Look for ".len" inside brackets
+    const len_pos = mem.indexOf(u8, t, ".len") orelse return null;
+
+    // Must have [ before .len
+    const bracket_pos = mem.lastIndexOf(u8, t[0..len_pos], "[") orelse return null;
+
+    // Extract identifier before [
+    var end = bracket_pos;
+    while (end > 0 and t[end - 1] == ' ') end -= 1;
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+        start -= 1;
+    }
+    if (start < end) return t[start..end];
     return null;
 }
 

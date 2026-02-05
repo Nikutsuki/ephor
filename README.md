@@ -53,7 +53,7 @@ ephor install
 
 This will:
 1. Add the ephor dependency to your `build.zig.zon` (via `zig fetch`)
-2. Print the code snippet to add to your `build.zig`
+2. Automatically patch your `build.zig` to add the ephor step
 
 Then run `zig build ephor` to verify it works.
 

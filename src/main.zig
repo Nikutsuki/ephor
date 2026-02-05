@@ -119,6 +119,7 @@ const BasicBlock = struct {
     is_return: bool,
     is_error_return: bool,
     returns_value: bool,
+    is_catch_block: bool, // Block is in error recovery path (catch handler)
 
     fn init() BasicBlock {
         return .{
@@ -131,6 +132,7 @@ const BasicBlock = struct {
             .is_return = false,
             .is_error_return = false,
             .returns_value = false,
+            .is_catch_block = false,
         };
     }
 
@@ -579,6 +581,9 @@ fn buildCFG(
                 const origin_block = current_block;
                 const continuation_block = try cfg.addBlock();
                 const catch_block = try cfg.addBlock();
+
+                // Mark catch block for error recovery context detection
+                cfg.blocks.items[catch_block].is_catch_block = true;
 
                 // Edge: normal (non-error) path continues to code after catch
                 try cfg.addEdge(origin_block, continuation_block, .sequential);
@@ -3114,6 +3119,8 @@ const best_effort_ops = [_][]const u8{
     ".stream.write(",
     // Locking - best effort
     ".lock(",        ".unlock(",
+    // State changes - best effort (display links, services)
+    ".start(",       ".stop(",
 };
 
 /// Check if a silent catch is for a best-effort operation
@@ -3640,6 +3647,9 @@ const ErrorAnalysisState = struct {
     // Track current function name for context-sensitive checks
     current_func_name: []const u8 = "",
     func_brace_depth: usize = 0,
+    // Track catch blocks (error recovery context - silent catch is intentional)
+    in_catch_block: bool = false,
+    catch_brace_depth: usize = 0,
 };
 
 /// Check if line starts a static storage struct pattern
@@ -3691,6 +3701,38 @@ fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
             if (c == '}' and state.defer_brace_depth > 0) {
                 state.defer_brace_depth -= 1;
                 if (state.defer_brace_depth == 0) state.in_defer_block = false;
+            }
+        }
+    }
+}
+
+/// Track catch blocks for error recovery context detection
+/// Silent catch {} inside a catch block is intentional error handling
+fn trackCatchBlock(t: []const u8, state: *ErrorAnalysisState) void {
+    // Detect catch block start: "catch |err| {" or "} catch {"
+    // But NOT "catch {}" on same line (that's the pattern we're checking for)
+    if (mem.indexOf(u8, t, "catch |") != null or
+        (mem.indexOf(u8, t, "} catch {") != null and mem.indexOf(u8, t, "catch {}") == null))
+    {
+        if (mem.indexOf(u8, t, "{") != null) {
+            state.in_catch_block = true;
+            state.catch_brace_depth = 0;
+            for (t) |c| {
+                if (c == '{') state.catch_brace_depth += 1;
+                if (c == '}' and state.catch_brace_depth > 0) state.catch_brace_depth -= 1;
+            }
+            if (state.catch_brace_depth == 0) state.in_catch_block = false;
+        }
+        return;
+    }
+
+    // Track braces if inside catch block
+    if (state.in_catch_block) {
+        for (t) |c| {
+            if (c == '{') state.catch_brace_depth += 1;
+            if (c == '}' and state.catch_brace_depth > 0) {
+                state.catch_brace_depth -= 1;
+                if (state.catch_brace_depth == 0) state.in_catch_block = false;
             }
         }
     }
@@ -4968,6 +5010,18 @@ fn processFunction(
     );
     defer panic_issues.deinit(allocator);
     try issues.appendSlice(allocator, panic_issues.items);
+
+    // Run CFG-based error analysis (ZA201, ZA202, ZA203)
+    var error_issues = try analyzeCFGErrors(
+        allocator,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+        func_name,
+    );
+    defer error_issues.deinit(allocator);
+    try issues.appendSlice(allocator, error_issues.items);
 }
 
 /// Analyze a single file for CFG memory issues
@@ -6025,6 +6079,105 @@ fn analyzeCFGNullSafety(
                         .rule = RULE_ORELSE_QUESTION_UNSAFE,
                         .message = "dereferencing optional pointer may panic if null",
                         .help = "check for null before dereferencing, or use 'orelse'",
+                    });
+                }
+            }
+        }
+    }
+
+    return issues;
+}
+
+/// CFG-based error analysis (ZA201, ZA202, ZA203)
+/// Uses CFG to understand:
+/// - Catch block context (error recovery - silent catch is intentional)
+/// - Cleanup function context (deinit, close, destroy, etc.)
+/// - Defer block context (best-effort cleanup)
+fn analyzeCFGErrors(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    func_name: []const u8,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .{};
+
+    // Check if we're in a cleanup function (deinit, close, etc.)
+    const is_cleanup_func = isCleanupFunctionContext(func_name);
+
+    // Analyze each block
+    for (cfg.blocks.items) |block| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+
+        // Skip analysis inside catch blocks - error recovery context
+        const in_catch_context = block.is_catch_block;
+
+        for (block.start_line..block.end_line + 1) |line_num| {
+            if (line_num < func_line) continue;
+            const idx = line_num - func_line;
+            if (idx >= lines.len) continue;
+
+            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+
+            // ZA201: Silent catch {} - skip in catch/cleanup context
+            if (!in_catch_context and !is_cleanup_func) {
+                if (!isBestEffortOperation(t)) {
+                    if (mem.indexOf(u8, t, "catch {}")) |col| {
+                        if (!isInsideString(t, col)) {
+                            try issues.append(allocator, .{
+                                .file = file_path,
+                                .line = line_num,
+                                .col = col + 1,
+                                .severity = .warning,
+                                .rule = RULE_SILENT_CATCH,
+                                .message = "silent catch {} discards error",
+                                .help = "use catch |err| with logging, or propagate with try",
+                            });
+                        }
+                    } else if (mem.indexOf(u8, t, "catch |_| {}")) |col| {
+                        if (!isInsideString(t, col)) {
+                            try issues.append(allocator, .{
+                                .file = file_path,
+                                .line = line_num,
+                                .col = col + 1,
+                                .severity = .warning,
+                                .rule = RULE_SILENT_CATCH,
+                                .message = "silent catch |_| {} discards error",
+                                .help = "use catch |err| with logging, or propagate with try",
+                            });
+                        }
+                    }
+                }
+            }
+
+            // ZA202: catch unreachable - always warn (even in catch blocks)
+            if (mem.indexOf(u8, t, "catch unreachable")) |col| {
+                if (!isInsideString(t, col)) {
+                    try issues.append(allocator, .{
+                        .file = file_path,
+                        .line = line_num,
+                        .col = col + 1,
+                        .severity = .warning,
+                        .rule = RULE_CATCH_UNREACHABLE,
+                        .message = "catch unreachable will panic on error",
+                        .help = "use explicit error handling",
+                    });
+                }
+            }
+
+            // ZA203: orelse unreachable - always warn
+            if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
+                if (!isInsideString(t, col)) {
+                    try issues.append(allocator, .{
+                        .file = file_path,
+                        .line = line_num,
+                        .col = col + 1,
+                        .severity = .warning,
+                        .rule = RULE_ORELSE_UNREACHABLE,
+                        .message = "orelse unreachable will panic on null",
+                        .help = "use explicit null handling",
                     });
                 }
             }

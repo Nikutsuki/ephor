@@ -2729,41 +2729,27 @@ fn isNoFreeAllocatorName(name: []const u8) bool {
     return false;
 }
 
+/// Patterns indicating ownership transfer (casts, out-params, container methods)
+const ownership_transfer_patterns = [_][]const u8{
+    "break :",        // Labeled block break - ownership to block result
+    ".* = ",          // Out-parameter assignment (C FFI)
+    "@ptrCast",       // Pointer cast
+    "@alignCast",     // Alignment cast
+    ".ptr",           // Slice reassignment
+    // Container methods
+    ".append(",       ".put(",         ".putNoClobber(",
+    // Async/queue methods
+    ".submit(",       ".enqueue(",     ".push(",        ".send(",
+    ".emit(",         ".dispatch(",    ".transfer(",    ".deliver(",
+    ".publish(",      ".broadcast(",   ".post(",        ".write(",
+};
+
 /// Check if ownership is transferred via cast or reassignment
 fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
-    const has_name = mem.indexOf(u8, t, alloc_name) != null;
-    if (!has_name) return false;
-
-    // Labeled block break: break :value alloc_name (ownership transferred to block result)
-    // Pattern: @field(dst, name) = switch(Type) { X => value: { const buf = try alloc(); break :value buf; } }
-    if (mem.indexOf(u8, t, "break :") != null) return true;
-
-    // Out-parameter assignment: result.* = alloc_name, out.* = alloc_name, etc.
-    // C FFI functions often transfer ownership via out-parameters
-    if (mem.indexOf(u8, t, ".* = ") != null) return true;
-    // @ptrCast transfers ownership
-    if (mem.indexOf(u8, t, "@ptrCast") != null) return true;
-    // @alignCast often paired with ownership transfer
-    if (mem.indexOf(u8, t, "@alignCast") != null) return true;
-    // Slice reassignment (ptr field access)
-    if (mem.indexOf(u8, t, ".ptr") != null) return true;
-    // Ownership transfer to container
-    if (mem.indexOf(u8, t, ".append(") != null) return true;
-    if (mem.indexOf(u8, t, ".put(") != null) return true;
-    if (mem.indexOf(u8, t, ".putNoClobber(") != null) return true;
-    // Ownership transfer via function call (callee takes ownership)
-    if (mem.indexOf(u8, t, ".submit(") != null) return true;
-    if (mem.indexOf(u8, t, ".enqueue(") != null) return true;
-    if (mem.indexOf(u8, t, ".push(") != null) return true;
-    if (mem.indexOf(u8, t, ".send(") != null) return true;
-    if (mem.indexOf(u8, t, ".emit(") != null) return true;
-    if (mem.indexOf(u8, t, ".dispatch(") != null) return true;
-    if (mem.indexOf(u8, t, ".transfer(") != null) return true;
-    if (mem.indexOf(u8, t, ".deliver(") != null) return true;
-    if (mem.indexOf(u8, t, ".publish(") != null) return true;
-    if (mem.indexOf(u8, t, ".broadcast(") != null) return true;
-    if (mem.indexOf(u8, t, ".post(") != null) return true;
-    if (mem.indexOf(u8, t, ".write(") != null) return true;
+    if (mem.indexOf(u8, t, alloc_name) == null) return false;
+    for (ownership_transfer_patterns) |pattern| {
+        if (mem.indexOf(u8, t, pattern) != null) return true;
+    }
     return false;
 }
 

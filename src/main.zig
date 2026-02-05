@@ -3206,9 +3206,11 @@ const best_effort_ops = [_][]const u8{
     ".lock(",        ".unlock(",
     // State changes - best effort (display links, services)
     ".start(",       ".stop(",
-    // Threading - ONLY cosmetic operations (setName is purely for debugging)
-    // NOTE: notify/wakeup/signal are NOT included - they can be critical!
-    ".setName(",
+    // Threading - community pattern from Zig std lib (std/Thread.zig, std/Thread/Condition.zig)
+    // Event loops: missed wakeups are self-correcting on next iteration
+    // Zig std lib uses catch {} for yield(), timedWait(); ghostty uses .notify() catch {}
+    ".setName(",     ".notify(",      ".wakeup(",      ".signal(",
+    ".yield(",       ".timedWait(",
 };
 
 /// Check if a silent catch is for a best-effort operation

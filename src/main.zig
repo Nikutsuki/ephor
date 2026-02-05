@@ -4852,6 +4852,10 @@ fn errdeferCheckAlloc(state: *ErrdeferState, t: []const u8, line_num: usize) voi
                 state.alloc_returned = true;
             }
         }
+        // Check for cross-line ownership transfer via collection methods
+        if (state.alloc_name.len > 0 and isOwnershipTransfer(t, state.alloc_name)) {
+            state.alloc_returned = true;
+        }
         return;
     }
 

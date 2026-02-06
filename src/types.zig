@@ -177,9 +177,9 @@ pub const Issue = struct {
 
 pub const Thresholds = struct {
     max_function_lines: usize = 50,
-    max_nesting_depth: usize = 4,
-    max_params: usize = 5,
-    max_branches: usize = 10,
+    max_nesting_depth: usize = 3,
+    max_params: usize = 4,
+    max_branches: usize = 12,
     max_line_length: usize = 100,
     max_file_bytes: ?usize = null,
 };
@@ -319,17 +319,16 @@ fn checkDisableComment(line: []const u8, rule: []const u8) bool {
     };
 
     for (patterns) |pattern| {
-        if (mem.indexOf(u8, line, pattern)) |idx| {
-            const rest = line[idx + pattern.len ..];
-            // Disabled all rules
-            if (rest.len == 0 or rest[0] == '\n' or rest[0] == '\r') {
-                return true;
-            }
-            // Check specific rule
-            if (mem.indexOf(u8, rest, rule) != null) return true;
-            // "next-line" applies to next line
-            if (mem.indexOf(u8, rest, "next-line") != null) return true;
+        const idx = mem.indexOf(u8, line, pattern) orelse continue;
+        const rest = line[idx + pattern.len ..];
+        // Disabled all rules
+        if (rest.len == 0 or rest[0] == '\n' or rest[0] == '\r') {
+            return true;
         }
+        // Check specific rule
+        if (mem.indexOf(u8, rest, rule) != null) return true;
+        // "next-line" applies to next line
+        if (mem.indexOf(u8, rest, "next-line") != null) return true;
     }
     return false;
 }

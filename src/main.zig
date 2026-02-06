@@ -439,6 +439,20 @@ const CFGBuildCtx = struct {
         self.setStartLine(line);
     }
 
+    fn handleReturn(self: *CFGBuildCtx) !void {
+        self.cfg.blocks.items[self.current_block].is_return = true;
+        try self.cfg.exit_blocks.append(self.allocator, self.current_block);
+    }
+
+    fn handleSwitchStart(self: *CFGBuildCtx) !void {
+        const merge_block = try self.cfg.addBlock();
+        try self.block_stack.append(self.allocator, .{
+            .block_type = .switch_block,
+            .merge_block = merge_block,
+            .catch_origin_block = self.current_block,
+        });
+    }
+
     fn handleSwitchArm(self: *CFGBuildCtx, line: usize) !void {
         for (self.block_stack.items, 0..) |entry, i| {
             if (entry.block_type != .switch_block) continue;
@@ -564,20 +578,10 @@ fn buildCFG(
             .if_start => try ctx.handleBranch(.if_block, al),
             .while_start => try ctx.handleBranch(.while_block, al),
             .for_start => try ctx.handleBranch(.for_block, al),
-            .switch_start => {
-                const merge_block = try cfg.addBlock();
-                try block_stack.append(allocator, .{
-                    .block_type = .switch_block,
-                    .merge_block = merge_block,
-                    .catch_origin_block = ctx.current_block,
-                });
-            },
+            .switch_start => try ctx.handleSwitchStart(),
             .switch_arm => try ctx.handleSwitchArm(al),
             .else_start, .else_if => try ctx.handleElse(t, al),
-            .return_stmt => {
-                cfg.blocks.items[ctx.current_block].is_return = true;
-                try cfg.exit_blocks.append(allocator, ctx.current_block);
-            },
+            .return_stmt => try ctx.handleReturn(),
             .block_end => try ctx.handleBlockEnd(al),
             .catch_start => try ctx.handleCatchStart(al),
             else => {},
@@ -872,11 +876,9 @@ fn checkUndefinedReads(
     while (iter.next()) |entry| {
         const name = entry.key_ptr.*;
         if (def_vars.contains(name)) continue;
-        if (mem.indexOf(u8, t, name)) |pos| {
-            if (!isAssignmentTarget(t, name, pos)) {
-                try issues.put(name, line);
-            }
-        }
+        const pos = mem.indexOf(u8, t, name) orelse continue;
+        if (isAssignmentTarget(t, name, pos)) continue;
+        try issues.put(name, line);
     }
 }
 
@@ -1206,11 +1208,9 @@ fn collectUndefinedVars(
         if (!isCompleteUndefinedToken(t, col)) continue;
         if (isStructFieldUndefined(t, col)) continue;
 
-        if (extractVarDeclName(t)) |name| {
-            if (!hasUnconditionalFillBeforeUse(lines, idx + 1, name)) {
-                try undef_vars.put(name, func_line + idx);
-            }
-        }
+        const name = extractVarDeclName(t) orelse continue;
+        if (hasUnconditionalFillBeforeUse(lines, idx + 1, name)) continue;
+        try undef_vars.put(name, func_line + idx);
     }
     return undef_vars;
 }
@@ -1298,10 +1298,9 @@ fn removeAddressOfVars(
         for (lines) |line| {
             const t = mem.trim(u8, line, " \t\r");
             if (isCommentOrMultilineString(t)) continue;
-            if (hasAddressOfVar(t, vn)) {
-                try remove.append(allocator, vn);
-                break;
-            }
+            if (!hasAddressOfVar(t, vn)) continue;
+            try remove.append(allocator, vn);
+            break;
         }
     }
     for (remove.items) |vn| _ = undef_vars.remove(vn);
@@ -1379,12 +1378,10 @@ fn checkVarDefiniteAssignment(
         if (al <= var_line) continue;
         const t = mem.trim(u8, line, " \t\r");
         const bid = findBlockForLine(cfg, al) orelse continue;
-        if (!def_entry[bid] and !gen[bid]) {
-            if (hasVarRead(t, var_name)) {
-                try issues.put(var_name, al);
-                break;
-            }
-        }
+        if (def_entry[bid] or gen[bid]) continue;
+        if (!hasVarRead(t, var_name)) continue;
+        try issues.put(var_name, al);
+        break;
     }
 }
 
@@ -1403,11 +1400,10 @@ fn runDefiniteAssignmentWorklist(
         for (0..num_blocks) |bid| {
             const new_in = computeBlockEntry(cfg, def_exit, bid);
             const new_out = gen[bid] or new_in;
-            if (def_entry[bid] != new_in or def_exit[bid] != new_out) {
-                def_entry[bid] = new_in;
-                def_exit[bid] = new_out;
-                changed = true;
-            }
+            if (def_entry[bid] == new_in and def_exit[bid] == new_out) continue;
+            def_entry[bid] = new_in;
+            def_exit[bid] = new_out;
+            changed = true;
         }
     }
 }
@@ -1620,16 +1616,15 @@ fn collectMemSafetyAllocs(
             continue;
         const alloc_name = extractAllocatorName(t) orelse "";
         if (isNoFreeAllocatorName(alloc_name)) continue;
-        if (extractVarDeclName(t)) |name| {
-            const col = getRealAllocPos(t) orelse 0;
-            try allocs.put(name, .{
-                .name = name,
-                .alloc_line = actual_line,
-                .alloc_col = col + 1,
-                .state = .allocated,
-                .is_create = hasRealCreatePattern(t),
-            });
-        }
+        const name = extractVarDeclName(t) orelse continue;
+        const col = getRealAllocPos(t) orelse 0;
+        try allocs.put(name, .{
+            .name = name,
+            .alloc_line = actual_line,
+            .alloc_col = col + 1,
+            .state = .allocated,
+            .is_create = hasRealCreatePattern(t),
+        });
     }
     return allocs;
 }
@@ -1646,6 +1641,38 @@ fn shouldSkipForFreeAnalysis(
     return isCommentOrMultilineString(t);
 }
 
+const BlockScanResult = struct {
+    free_seen: bool = false,
+    return_after: bool = false,
+    free_line: usize = 0,
+};
+
+fn scanBlockForFreeOp(
+    block: BasicBlock,
+    lines: []const []const u8,
+    func_line: usize,
+    var_name: []const u8,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+) BlockScanResult {
+    var r = BlockScanResult{};
+    for (block.start_line..block.end_line + 1) |ln| {
+        if (ln < func_line) continue;
+        const idx = ln - func_line;
+        if (idx >= lines.len) continue;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (shouldSkipForFreeAnalysis(t, idx, in_defer, in_errdefer))
+            continue;
+        if (hasRealFreePattern(t) and isDirectFreeOfVar(t, var_name)) {
+            r.free_seen = true;
+            r.free_line = ln;
+        }
+        if (r.free_seen and mem.startsWith(u8, t, "return"))
+            r.return_after = true;
+    }
+    return r;
+}
+
 fn scanBlocksForFreeOps(
     cfg: *ControlFlowGraph,
     lines: []const []const u8,
@@ -1657,36 +1684,17 @@ fn scanBlocksForFreeOps(
     bstate: *BlockFreeState,
 ) void {
     for (cfg.blocks.items, 0..) |block, bid| {
-        var free_seen = false;
-        var return_after = false;
-        var free_line: usize = 0;
         if (block.start_line == 0 or
             block.start_line > block.end_line) continue;
-        for (block.start_line..block.end_line + 1) |ln| {
-            if (ln < func_line) continue;
-            const idx = ln - func_line;
-            if (idx >= lines.len) continue;
-            const t = mem.trim(u8, lines[idx], " \t\r");
-            if (shouldSkipForFreeAnalysis(
-                t,
-                idx,
-                in_defer,
-                in_errdefer,
-            )) continue;
-            if (hasRealFreePattern(t) and
-                isDirectFreeOfVar(t, var_name))
-            {
-                free_seen = true;
-                free_line = ln;
-            }
-            if (free_seen and mem.startsWith(u8, t, "return"))
-                return_after = true;
-        }
-        bstate.freed_in_block[bid] = free_seen;
-        bstate.freed_line_in_block[bid] = free_line;
-        bstate.block_returns_after_free[bid] = return_after;
-        if (free_seen and alloc_info.freed_line == 0)
-            alloc_info.freed_line = free_line;
+        const r = scanBlockForFreeOp(
+            block, lines, func_line,
+            var_name, in_defer, in_errdefer,
+        );
+        bstate.freed_in_block[bid] = r.free_seen;
+        bstate.freed_line_in_block[bid] = r.free_line;
+        bstate.block_returns_after_free[bid] = r.return_after;
+        if (r.free_seen and alloc_info.freed_line == 0)
+            alloc_info.freed_line = r.free_line;
     }
 }
 
@@ -2128,14 +2136,20 @@ fn findAllocStatementEnd(lines: []const []const u8, start: usize) usize {
     var brace_depth: i32 = 0;
     for (start..lines.len) |idx| {
         const scan_line = mem.trim(u8, lines[idx], " \t\r");
-        for (scan_line) |c| {
-            if (c == '{' or c == '(') brace_depth += 1;
-            if (c == '}' or c == ')') brace_depth -= 1;
-        }
+        brace_depth += countBraceBalance(scan_line);
         if (mem.indexOf(u8, scan_line, ";") != null and brace_depth <= 0)
             return idx;
     }
     return start;
+}
+
+fn countBraceBalance(line: []const u8) i32 {
+    var balance: i32 = 0;
+    for (line) |c| {
+        if (c == '{' or c == '(') balance += 1;
+        if (c == '}' or c == ')') balance -= 1;
+    }
+    return balance;
 }
 
 /// Check nearby lines after allocation for a matching defer
@@ -2296,16 +2310,13 @@ fn checkOwnershipInLine(
         }
 
         // Module-level variable assignment
-        if (mem.indexOf(u8, t, " = ") != null and
-            !mem.startsWith(u8, t, "const ") and
-            !mem.startsWith(u8, t, "var "))
-        {
-            const eq_pos = mem.indexOf(u8, t, " = ").?;
-            const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-            if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null) {
-                return true;
-            }
-        }
+        if (mem.indexOf(u8, t, " = ") == null) continue;
+        if (mem.startsWith(u8, t, "const ") or
+            mem.startsWith(u8, t, "var ")) continue;
+        const eq_pos = mem.indexOf(u8, t, " = ").?;
+        const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+        if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null)
+            return true;
     }
     return false;
 }
@@ -2456,10 +2467,9 @@ fn propagateCoverageBackward(
         changed = false;
         for (0..num_blocks) |bid| {
             if (covered[bid]) continue;
-            if (tryPropagateCoverage(cfg, covered, bid)) {
-                covered[bid] = true;
-                changed = true;
-            }
+            if (!tryPropagateCoverage(cfg, covered, bid)) continue;
+            covered[bid] = true;
+            changed = true;
         }
     }
     return covered;
@@ -2766,19 +2776,18 @@ fn checkErrdeferGaps(
             errdefer_line = el;
             alloc.has_errdefer = true;
         }
-        if (hasErrdeferGap(alloc, errdefer_line, try_lines)) {
-            try issues.append(allocator, .{
-                .file = file_path,
-                .line = alloc.line,
-                .col = alloc.col,
-                .severity = .warning,
-                .rule = RULE_ALLOC_NO_ERRDEFER,
-                .message = "allocation without errdefer " ++
-                    "before next try",
-                .help = "add errdefer immediately " ++
-                    "after allocation",
-            });
-        }
+        if (!hasErrdeferGap(alloc, errdefer_line, try_lines)) continue;
+        try issues.append(allocator, .{
+            .file = file_path,
+            .line = alloc.line,
+            .col = alloc.col,
+            .severity = .warning,
+            .rule = RULE_ALLOC_NO_ERRDEFER,
+            .message = "allocation without errdefer " ++
+                "before next try",
+            .help = "add errdefer immediately " ++
+                "after allocation",
+        });
     }
 }
 
@@ -2962,27 +2971,19 @@ const ImportGraph = struct {
 
             switch (entry.kind) {
                 .file => {
-                    if (mem.endsWith(u8, entry.name, ".zig")) {
+                    defer self.allocator.free(path);
+                    if (mem.endsWith(u8, entry.name, ".zig"))
                         try self.analyzeFile(path);
-                    }
-                    self.allocator.free(path);
                 },
                 .directory => {
-                    const skip = entry.name[0] == '.' or
-                        mem.eql(u8, entry.name, "zig-cache") or
-                        mem.eql(u8, entry.name, "zig-out");
-                    if (!skip) {
-                        const open_opts: fs.Dir.OpenOptions = .{
-                            .iterate = true,
-                        };
-                        var subdir = dir.openDir(entry.name, open_opts) catch {
-                            self.allocator.free(path);
-                            continue;
-                        };
-                        defer subdir.close();
-                        try self.scanRecursive(subdir, path);
-                    }
-                    self.allocator.free(path);
+                    defer self.allocator.free(path);
+                    if (isScanSkipDir(entry.name)) continue;
+                    var subdir = dir.openDir(
+                        entry.name,
+                        .{ .iterate = true },
+                    ) catch continue;
+                    defer subdir.close();
+                    try self.scanRecursive(subdir, path);
                 },
                 else => self.allocator.free(path),
             }
@@ -3392,13 +3393,20 @@ const ImportGraph = struct {
             for (entry.value_ptr.imports.items) |imp| {
                 if (!self.isUnresolvedModuleName(imp)) continue;
                 if (module_names.contains(imp.path)) continue;
-                const d = self.allocator.dupe(u8, imp.path) catch continue;
-                module_names.put(self.allocator, d, {}) catch {
-                    self.allocator.free(d);
-                    continue;
-                };
+                self.tryAddModuleName(module_names, imp.path);
             }
         }
+    }
+
+    fn tryAddModuleName(
+        self: *ImportGraph,
+        module_names: *std.StringHashMapUnmanaged(void),
+        path: []const u8,
+    ) void {
+        const d = self.allocator.dupe(u8, path) catch return;
+        module_names.put(self.allocator, d, {}) catch {
+            self.allocator.free(d);
+        };
     }
 
     /// Resolve a directory path and add it as a search root if valid.
@@ -3508,6 +3516,12 @@ const ImportGraph = struct {
         "deps",       ".packages", "vendor",
     };
 
+    fn isScanSkipDir(name: []const u8) bool {
+        if (name.len > 0 and name[0] == '.') return true;
+        return mem.eql(u8, name, "zig-cache") or
+            mem.eql(u8, name, "zig-out");
+    }
+
     fn isSkippableDir(name: []const u8) bool {
         for (skip_dirs) |d| {
             if (mem.eql(u8, name, d)) return true;
@@ -3565,9 +3579,8 @@ const ImportGraph = struct {
         {
             var iter = self.reachable.iterator();
             while (iter.next()) |entry| {
-                if (mem.startsWith(u8, entry.key_ptr.*, abs_subdir)) {
-                    try to_scan.append(self.allocator, entry.key_ptr.*);
-                }
+                if (!mem.startsWith(u8, entry.key_ptr.*, abs_subdir)) continue;
+                try to_scan.append(self.allocator, entry.key_ptr.*);
             }
         }
         for (to_scan.items) |path| {
@@ -3659,17 +3672,17 @@ const ImportGraph = struct {
         defer dir.close();
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
-            if (entry.kind == .directory and !isSkippableDir(entry.name)) {
-                const sub = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/{s}",
-                    .{ dir_path, entry.name },
-                ) catch continue;
-                defer self.allocator.free(sub);
-                self.markZigFilesRecursive(sub) catch continue;
-            } else if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig")) {
+            if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig"))
                 self.markSingleZigFile(dir_path, entry.name);
-            }
+            if (entry.kind != .directory or isSkippableDir(entry.name))
+                continue;
+            const sub = std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ dir_path, entry.name },
+            ) catch continue;
+            defer self.allocator.free(sub);
+            self.markZigFilesRecursive(sub) catch continue;
         }
     }
 
@@ -3700,19 +3713,16 @@ const ImportGraph = struct {
             if (isOrphanExcluded(key, cfg)) continue;
 
             const norm = fs.cwd().realpath(key, &buf) catch continue;
-            if (!self.reachable.contains(norm)) {
-                const help_msg =
-                    "add @import() or remove if unused";
-                try issues.append(allocator, .{
-                    .file = key,
-                    .line = 1,
-                    .col = 1,
-                    .severity = .warning,
-                    .rule = RULE_ORPHAN_FILE,
-                    .message = "file not imported",
-                    .help = help_msg,
-                });
-            }
+            if (self.reachable.contains(norm)) continue;
+            try issues.append(allocator, .{
+                .file = key,
+                .line = 1,
+                .col = 1,
+                .severity = .warning,
+                .rule = RULE_ORPHAN_FILE,
+                .message = "file not imported",
+                .help = "add @import() or remove if unused",
+            });
         }
         return issues;
     }
@@ -3738,13 +3748,12 @@ const ImportGraph = struct {
             var lines = mem.splitScalar(u8, a.content, '\n');
             while (lines.next()) |line| {
                 const t = mem.trim(u8, line, " \t\r");
-                if (t.len == 0) {
-                    s.blank_lines += 1;
-                } else if (mem.startsWith(u8, t, "//")) {
-                    s.comment_lines += 1;
-                } else {
+                if (t.len == 0)
+                    s.blank_lines += 1
+                else if (mem.startsWith(u8, t, "//"))
+                    s.comment_lines += 1
+                else
                     s.code_lines += 1;
-                }
             }
         }
         return s;
@@ -4281,13 +4290,12 @@ fn trackTestBlock(
         in_block = true;
         brace_depth = 0;
     }
-    if (in_block) {
-        for (t) |c| {
-            if (c == '{') brace_depth += 1;
-            if (c == '}') {
-                if (brace_depth > 0) brace_depth -= 1;
-                if (brace_depth == 0) in_block = false;
-            }
+    if (!in_block) return .{ .in_test = false, .depth = brace_depth };
+    for (t) |c| {
+        if (c == '{') brace_depth += 1;
+        if (c == '}') {
+            if (brace_depth > 0) brace_depth -= 1;
+            if (brace_depth == 0) in_block = false;
         }
     }
     return .{ .in_test = in_block, .depth = brace_depth };
@@ -5198,7 +5206,7 @@ fn reportEndOfFileIssues(
 ) !void {
     // Skip undefined reports for test files
     if (!isTestFilePath(path)) {
-        if (state.pending_undefined) |pending| {
+        if (state.pending_undefined) |pending|
             try issues.append(allocator, .{
                 .file = path,
                 .line = pending.line,
@@ -5208,7 +5216,6 @@ fn reportEndOfFileIssues(
                 .message = "undefined may leak data",
                 .help = "initialize or write before use",
             });
-        }
     }
     const fields = state.pending_struct_fields[0..state.pending_field_count];
     for (fields) |pf| {
@@ -5683,21 +5690,31 @@ fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     var first = true;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
-        if (lit.updateForChar(t, i)) |pos| {
-            const c = t[pos];
-            if (c == '{' and !(is_switch and first)) {
-                state.nest += 1;
-                if (state.nest > state.max_nest) state.max_nest = state.nest;
-                first = false;
-            }
-            if (c == '}' and state.nest > 0) {
-                state.nest -= 1;
-                if (state.nest == 0) return true;
-            }
-        } else if (lit.in_chr and i + 1 < t.len) {
+        const pos = lit.updateForChar(t, i) orelse {
             // Skip char literal content
-            i += 1;
-        }
+            if (lit.in_chr and i + 1 < t.len) i += 1;
+            continue;
+        };
+        if (updateBraceState(t[pos], is_switch, &first, state))
+            return true;
+    }
+    return false;
+}
+
+fn updateBraceState(
+    c: u8,
+    is_switch: bool,
+    first: *bool,
+    state: *ComplexityState,
+) bool {
+    if (c == '{' and !(is_switch and first.*)) {
+        state.nest += 1;
+        if (state.nest > state.max_nest) state.max_nest = state.nest;
+        first.* = false;
+    }
+    if (c == '}' and state.nest > 0) {
+        state.nest -= 1;
+        if (state.nest == 0) return true;
     }
     return false;
 }
@@ -5720,10 +5737,9 @@ fn analyzeFileComplexity(
         if (!state.in_fn) continue;
         state.fn_lines += 1;
         state.branches += countLineBranches(t);
-        if (trackBraceNesting(t, &state)) {
-            try reportComplexityIssues(issues, allocator, a.path, &state, th);
-            state = .{};
-        }
+        if (!trackBraceNesting(t, &state)) continue;
+        try reportComplexityIssues(issues, allocator, a.path, &state, th);
+        state = .{};
     }
 }
 
@@ -5821,7 +5837,7 @@ fn analyzeStyle(
 
         // ZA702: File too long
         if (th.max_file_bytes) |max_bytes| {
-            if (a.content.len > max_bytes) {
+            if (a.content.len > max_bytes)
                 try reportFileTooLong(
                     &issues,
                     allocator,
@@ -5829,7 +5845,6 @@ fn analyzeStyle(
                     a.content.len,
                     max_bytes,
                 );
-            }
         }
 
         // ZA701: Line too long
@@ -5841,16 +5856,15 @@ fn analyzeStyle(
             if (mem.startsWith(u8, trimmed, "\\\\")) continue;
 
             const visible_len = calculateVisibleLength(line);
-            if (visible_len > th.max_line_length) {
-                try reportLineTooLong(
-                    &issues,
-                    allocator,
-                    a.path,
-                    line_num,
-                    visible_len,
-                    th.max_line_length,
-                );
-            }
+            if (visible_len <= th.max_line_length) continue;
+            try reportLineTooLong(
+                &issues,
+                allocator,
+                a.path,
+                line_num,
+                visible_len,
+                th.max_line_length,
+            );
         }
     }
     return issues;
@@ -5922,7 +5936,7 @@ fn checkConstNaming(
     if (name.len > 0 and name[0] == '_') return;
 
     if (isTypeDefinition(t)) {
-        if (!isTitleCase(name)) {
+        if (!isTitleCase(name))
             try reportNamingIssue(issues, allocator, .{
                 .path = path,
                 .line = line_num,
@@ -5931,8 +5945,9 @@ fn checkConstNaming(
                 .name = name,
                 .expected = "TitleCase",
             });
-        }
-    } else if (!isValidConstName(t, name)) {
+        return;
+    }
+    if (!isValidConstName(t, name))
         try reportNamingIssue(issues, allocator, .{
             .path = path,
             .line = line_num,
@@ -5941,7 +5956,6 @@ fn checkConstNaming(
             .name = name,
             .expected = "snake_case",
         });
-    }
 }
 
 fn checkVarNaming(
@@ -6024,15 +6038,12 @@ fn analyzeNaming(
             const t = mem.trim(u8, line, " \t\r");
             if (isCommentOrMultilineString(t)) continue;
 
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const ")) {
+            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
                 try checkConstNaming(&issues, allocator, a.path, t, line_num);
-            }
-            if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var ")) {
+            if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var "))
                 try checkVarNaming(&issues, allocator, a.path, t, line_num);
-            }
-            if (mem.indexOf(u8, t, "fn ") != null) {
+            if (mem.indexOf(u8, t, "fn ") != null)
                 try checkFnNaming(&issues, allocator, a.path, t, line_num);
-            }
         }
     }
     return issues;
@@ -6565,13 +6576,11 @@ fn trackDeferFrees(
     const has_cleanup = hasRealCleanupPattern(t);
     if (!has_cleanup) return;
     for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name) != null) {
-            if (is_errdefer) {
-                alloc.has_errdefer = true;
-            } else {
-                alloc.has_defer = true;
-            }
-        }
+        if (mem.indexOf(u8, t, alloc.name) == null) continue;
+        if (is_errdefer)
+            alloc.has_errdefer = true
+        else
+            alloc.has_defer = true;
     }
 }
 
@@ -6628,16 +6637,15 @@ fn trackUseAfterFree(
         // The free only happens on the early-return path, not on the main path
         // TODO: Full CFG analysis would properly track path-sensitive freed state
         if (alloc.freed_in_early_return) continue;
-        if (mem.indexOf(u8, t, alloc.name)) |col| {
-            try events.append(allocator, .{
-                .kind = .use_after_free,
-                .alloc_name = alloc.name,
-                .alloc_line = alloc.line,
-                .freed_line = alloc.freed_line,
-                .event_line = actual_line,
-                .event_col = col + 1,
-            });
-        }
+        const col = mem.indexOf(u8, t, alloc.name) orelse continue;
+        try events.append(allocator, .{
+            .kind = .use_after_free,
+            .alloc_name = alloc.name,
+            .alloc_line = alloc.line,
+            .freed_line = alloc.freed_line,
+            .event_line = actual_line,
+            .event_col = col + 1,
+        });
     }
 }
 
@@ -6926,11 +6934,9 @@ fn scanSliceAliases(
         if (isCommentOrMultilineString(t)) continue;
         const alias_name = extractVarDeclName(t) orelse continue;
         for (alias_sets, 0..) |*as, ai| {
-            if (isSliceAlias(as, t, alias_name, allocs[ai].name) and
-                !aliasSetContains(as, alias_name))
-            {
-                try as.names.append(allocator, alias_name);
-            }
+            if (!isSliceAlias(as, t, alias_name, allocs[ai].name)) continue;
+            if (aliasSetContains(as, alias_name)) continue;
+            try as.names.append(allocator, alias_name);
         }
     }
 }
@@ -7008,10 +7014,10 @@ fn scanStructDataFlow(
         var count: usize = 0;
         for (alias_sets, 0..) |*as, ai| {
             if (count >= 64) break;
-            if (shouldAdoptStructVar(as, t, sfs.struct_var, allocs[ai].name)) {
-                to_update[count] = ai;
-                count += 1;
-            }
+            if (!shouldAdoptStructVar(as, t, sfs.struct_var, allocs[ai].name))
+                continue;
+            to_update[count] = ai;
+            count += 1;
         }
         for (to_update[0..count]) |idx| {
             try alias_sets[idx].names.append(allocator, sfs.struct_var);
@@ -7027,7 +7033,7 @@ fn buildAliasSets(
 ) ![]AliasSet {
     const alias_sets = try allocator.alloc(AliasSet, allocs.len);
     for (alias_sets, 0..) |*as, i| {
-        as.* = .{ .names = .{} };
+        as.names = .{};
         try as.names.append(allocator, allocs[i].name);
     }
     try scanSliceAliases(allocator, lines, alias_sets, allocs);
@@ -7130,14 +7136,13 @@ fn collectFuncAllocations(
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (extractVarDeclName(t)) |var_name| {
-            const ctx: AllocLineContext = .{
-                .var_name = var_name,
-                .actual_line = func_start + idx,
-                .uses_arena = uses_arena,
-            };
-            try detectAllocOnLine(t, ctx, &allocs, allocator);
-        }
+        const var_name = extractVarDeclName(t) orelse continue;
+        const ctx: AllocLineContext = .{
+            .var_name = var_name,
+            .actual_line = func_start + idx,
+            .uses_arena = uses_arena,
+        };
+        try detectAllocOnLine(t, ctx, &allocs, allocator);
     }
     return allocs;
 }
@@ -7303,13 +7308,10 @@ fn countDeferStartBraces(t: []const u8) usize {
     var depth: usize = 1;
     var saw_first = false;
     for (t) |c| {
-        if (c == '{') {
-            if (!saw_first) {
-                saw_first = true;
-                continue;
-            }
+        if (c == '{' and !saw_first)
+            saw_first = true
+        else if (c == '{')
             depth += 1;
-        }
         if (c == '}' and depth > 0) depth -= 1;
     }
     return depth;
@@ -7469,9 +7471,8 @@ fn collectNullChecksInBlock(
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (!isNullCheckConditional(t)) continue;
-        if (extractNullCheckedVar(t)) |var_name| {
-            try checked.put(allocator, var_name, {});
-        }
+        const var_name = extractNullCheckedVar(t) orelse continue;
+        try checked.put(allocator, var_name, {});
     }
 }
 
@@ -7718,9 +7719,8 @@ fn analyzeCFGErrors(
             if (isCommentOrMultilineString(t)) continue;
             if (is_test_ctx) continue;
 
-            if (checkCatchUnreachable(t, file_path, line_num)) |issue| {
+            if (checkCatchUnreachable(t, file_path, line_num)) |issue|
                 try issues.append(allocator, issue);
-            }
             if (checkOrelseUnreachable(
                 t,
                 file_path,
@@ -7728,9 +7728,8 @@ fn analyzeCFGErrors(
                 lines,
                 idx,
                 func_line,
-            )) |issue| {
+            )) |issue|
                 try issues.append(allocator, issue);
-            }
         }
     }
 
@@ -7834,6 +7833,13 @@ fn hasNullGuard(
     return false;
 }
 
+/// Extract variable name portion before a null-check keyword position
+fn extractVarFromNullCheck(after_paren: []const u8, pos: usize) ?[]const u8 {
+    const var_part = mem.trim(u8, after_paren[0..pos], " \t");
+    if (var_part.len > 0 and isIdent(var_part[0])) return var_part;
+    return null;
+}
+
 /// Extract variable name from null check pattern
 /// Patterns: "if (x != null)", "if (x) |_|", "while (x != null)"
 /// Also handles early return: "if (x == null) return" (negated check)
@@ -7843,35 +7849,22 @@ fn extractNullCheckedVar(t: []const u8) ?[]const u8 {
     const after_paren = t[open_paren + 1 ..];
 
     // Pattern: x != null
-    if (mem.indexOf(u8, after_paren, " != null")) |ne_pos| {
-        const var_part = mem.trim(u8, after_paren[0..ne_pos], " \t");
-        if (var_part.len > 0 and isIdent(var_part[0])) {
-            return var_part;
-        }
-    }
+    if (mem.indexOf(u8, after_paren, " != null")) |ne_pos|
+        if (extractVarFromNullCheck(after_paren, ne_pos)) |v| return v;
 
-    // Pattern: x == null with early return/continue/break (variable IS null-checked after)
+    // Pattern: x == null with early return/continue/break
     // Zig idiom: if (x == null) return; guarantees x is non-null after
     if (mem.indexOf(u8, after_paren, " == null)")) |eq_pos| {
-        // Check if this line has an early exit (return, continue, break)
-        if (mem.indexOf(u8, t, "return") != null or
+        const has_exit = mem.indexOf(u8, t, "return") != null or
             mem.indexOf(u8, t, "continue") != null or
-            mem.indexOf(u8, t, "break") != null)
-        {
-            const var_part = mem.trim(u8, after_paren[0..eq_pos], " \t");
-            if (var_part.len > 0 and isIdent(var_part[0])) {
-                return var_part;
-            }
-        }
+            mem.indexOf(u8, t, "break") != null;
+        if (has_exit)
+            if (extractVarFromNullCheck(after_paren, eq_pos)) |v| return v;
     }
 
     // Pattern: if (x) |_| - capture means x is non-null inside
-    if (mem.indexOf(u8, after_paren, ") |")) |pipe_pos| {
-        const var_part = mem.trim(u8, after_paren[0..pipe_pos], " \t");
-        if (var_part.len > 0 and isIdent(var_part[0])) {
-            return var_part;
-        }
-    }
+    if (mem.indexOf(u8, after_paren, ") |")) |pipe_pos|
+        if (extractVarFromNullCheck(after_paren, pipe_pos)) |v| return v;
 
     return null;
 }
@@ -7946,9 +7939,8 @@ fn scanLinesForGuards(
         if (idx >= lines.len) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (extractGuardedVar(t)) |var_name| {
-            try guards.put(allocator, var_name, {});
-        }
+        const var_name = extractGuardedVar(t) orelse continue;
+        try guards.put(allocator, var_name, {});
     }
 }
 
@@ -8029,12 +8021,11 @@ fn collectPredecessors(
 ) !std.ArrayListUnmanaged(PredInfo) {
     var preds = std.ArrayListUnmanaged(PredInfo){};
     for (cfg.edges.items) |edge| {
-        if (edge.to == bid) {
-            try preds.append(allocator, .{
-                .block = edge.from,
-                .via_true_branch = edge.kind == .branch_true,
-            });
-        }
+        if (edge.to != bid) continue;
+        try preds.append(allocator, .{
+            .block = edge.from,
+            .via_true_branch = edge.kind == .branch_true,
+        });
     }
     return preds;
 }
@@ -8425,11 +8416,10 @@ fn isSignedVarInContext(lines: []const []const u8, current_idx: usize, var_name:
     const check_start = if (current_idx > 10) current_idx - 10 else 0;
     for (lines[check_start .. current_idx + 1]) |line| {
         const ctx = mem.trim(u8, line, " \t\r");
-        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
-            const after_var = ctx[var_pos + var_name.len ..];
-            for (signed_types) |stype| {
-                if (mem.startsWith(u8, after_var, stype)) return true;
-            }
+        const var_pos = mem.indexOf(u8, ctx, var_name) orelse continue;
+        const after_var = ctx[var_pos + var_name.len ..];
+        for (signed_types) |stype| {
+            if (mem.startsWith(u8, after_var, stype)) return true;
         }
     }
     return false;
@@ -8444,12 +8434,10 @@ fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bo
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) {
             return false;
         }
-        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
-            const after_var = ctx[var_pos + var_name.len ..];
-            if (mem.startsWith(u8, after_var, " += 1") or mem.startsWith(u8, after_var, "+=1")) {
-                return true;
-            }
-        }
+        const var_pos = mem.indexOf(u8, ctx, var_name) orelse continue;
+        const after_var = ctx[var_pos + var_name.len ..];
+        if (mem.startsWith(u8, after_var, " += 1") or mem.startsWith(u8, after_var, "+=1"))
+            return true;
     }
     return false;
 }
@@ -8928,6 +8916,15 @@ fn checkElseGuardForCtx(lines: []const []const u8, ctx: []const u8, i: usize) bo
     return false;
 }
 
+fn countCurlyBalance(line: []const u8) i32 {
+    var b: i32 = 0;
+    for (line) |c| {
+        if (c == '{') b += 1;
+        if (c == '}') b -= 1;
+    }
+    return b;
+}
+
 fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
     var brace_depth: i32 = 0;
     var i = current_idx;
@@ -8935,10 +8932,7 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        for (ctx) |c| {
-            if (c == '{') brace_depth += 1;
-            if (c == '}') brace_depth -= 1;
-        }
+        brace_depth += countCurlyBalance(ctx);
         if (brace_depth <= 0) continue;
         return checkElseGuardForCtx(lines, ctx, i);
     }
@@ -9131,11 +9125,10 @@ fn isSignedTypeDecl(context_lines: []const []const u8, var_name: []const u8) boo
     for (context_lines) |ctx_line| {
         const ctx = mem.trim(u8, ctx_line, " \t\r");
         // Look for "var varname: iXX" or "const varname: iXX"
-        if (mem.indexOf(u8, ctx, var_name)) |var_pos| {
-            const after_var = ctx[var_pos + var_name.len ..];
-            for (signed_types) |stype| {
-                if (mem.startsWith(u8, after_var, stype)) return true;
-            }
+        const var_pos = mem.indexOf(u8, ctx, var_name) orelse continue;
+        const after_var = ctx[var_pos + var_name.len ..];
+        for (signed_types) |stype| {
+            if (mem.startsWith(u8, after_var, stype)) return true;
         }
     }
     return false;
@@ -9365,17 +9358,16 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
     var lines = mem.splitScalar(u8, result.stderr, '\n');
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (t.len > 0 and mem.endsWith(u8, t, ".zig")) {
-            try issues.append(allocator, .{
-                .file = t,
-                .line = 1,
-                .col = 1,
-                .severity = .warning,
-                .rule = RULE_NEEDS_FORMAT,
-                .message = "file needs formatting",
-                .help = "run 'zig fmt' to fix",
-            });
-        }
+        if (t.len == 0 or !mem.endsWith(u8, t, ".zig")) continue;
+        try issues.append(allocator, .{
+            .file = t,
+            .line = 1,
+            .col = 1,
+            .severity = .warning,
+            .rule = RULE_NEEDS_FORMAT,
+            .message = "file needs formatting",
+            .help = "run 'zig fmt' to fix",
+        });
     }
 
     return issues;
@@ -9386,6 +9378,66 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
 // ============================================================================
 
 /// Run tests with Zig's GeneralPurposeAllocator and parse memory diagnostics
+fn parseCommandIntoArgv(cmd: []const u8, argv_buf: *[64][]const u8) usize {
+    var in_quote = false;
+    var start: usize = 0;
+    var argc: usize = 0;
+    for (cmd, 0..) |c, i| {
+        if (c == '"' or c == '\'') {
+            in_quote = !in_quote;
+        } else if (c == ' ' and !in_quote and i > start) {
+            argv_buf[argc] = cmd[start..i];
+            argc += 1;
+            start = i + 1;
+        } else if (c == ' ' and !in_quote) {
+            start = i + 1;
+        }
+    }
+    if (start < cmd.len) {
+        argv_buf[argc] = cmd[start..];
+        argc += 1;
+    }
+    return argc;
+}
+
+fn buildRuntimeArgv(
+    custom_command: ?[]const u8,
+    argv_buf: *[64][]const u8,
+    verbose: bool,
+) usize {
+    if (custom_command) |cmd| {
+        if (verbose)
+            std.debug.print("Running: {s} (with GPA diagnostics)\n", .{cmd});
+        return parseCommandIntoArgv(cmd, argv_buf);
+    }
+    argv_buf[0] = "zig";
+    argv_buf[1] = "build";
+    argv_buf[2] = "test";
+    if (verbose)
+        std.debug.print("Running: zig build test (with GPA diagnostics)\n", .{});
+    return 3;
+}
+
+fn reportCommandFailure(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    is_custom: bool,
+) !void {
+    const help_msg = if (is_custom)
+        "check command output for details"
+    else
+        "run 'zig build test' to see details";
+    try issues.append(allocator, .{
+        .file = "build.zig",
+        .line = 1,
+        .col = 1,
+        .severity = .err,
+        .rule = RULE_RUNTIME_TEST_FAILURE,
+        .message = "command failed",
+        .help = help_msg,
+    });
+}
+
 fn runRuntimeAnalysis(
     allocator: Allocator,
     path: []const u8,
@@ -9393,50 +9445,14 @@ fn runRuntimeAnalysis(
     custom_command: ?[]const u8,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
-
-    // Build command arguments
     var argv_buf: [64][]const u8 = undefined;
-    var argv_len: usize = 0;
+    const argv_len = buildRuntimeArgv(custom_command, &argv_buf, verbose);
 
-    if (custom_command) |cmd| {
-        // Parse custom command into argv (split by spaces, respecting quotes)
-        var in_quote = false;
-        var start: usize = 0;
-        for (cmd, 0..) |c, i| {
-            if (c == '"' or c == '\'') {
-                in_quote = !in_quote;
-            } else if (c == ' ' and !in_quote) {
-                if (i > start) {
-                    argv_buf[argv_len] = cmd[start..i];
-                    argv_len += 1;
-                }
-                start = i + 1;
-            }
-        }
-        if (start < cmd.len) {
-            argv_buf[argv_len] = cmd[start..];
-            argv_len += 1;
-        }
-        if (verbose) {
-            std.debug.print("Running: {s} (with GPA diagnostics)\n", .{cmd});
-        }
-    } else {
-        // Default: zig build test
-        argv_buf[0] = "zig";
-        argv_buf[1] = "build";
-        argv_buf[2] = "test";
-        argv_len = 3;
-        if (verbose) {
-            std.debug.print("Running: zig build test (with GPA diagnostics)\n", .{});
-        }
-    }
-
-    // Run command - GPA produces diagnostics on stderr
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = argv_buf[0..argv_len],
         .cwd = path,
-        .max_output_bytes = 10 * 1024 * 1024, // 10MB limit for large output
+        .max_output_bytes = 10 * 1024 * 1024,
     }) catch |err| {
         const cmd_str = custom_command orelse "zig build test";
         std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
@@ -9445,33 +9461,11 @@ fn runRuntimeAnalysis(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    // Parse GPA memory leak output from stderr
-    // GPA format: "error(gpa): Memory leak detected at 0x..." or
-    //            "error: memory leak at ..."
     try parseGPADiagnostics(allocator, &issues, result.stderr, verbose);
-
-    // Also check stdout for panics and failures
     try parseTestOutput(allocator, &issues, result.stdout, verbose);
 
-    // Parse exit status - non-zero means failures
-    if (result.term.Exited != 0) {
-        // Check if we already captured specific failures
-        if (issues.items.len == 0) {
-            const help_msg = if (custom_command != null)
-                "check command output for details"
-            else
-                "run 'zig build test' to see details";
-            try issues.append(allocator, .{
-                .file = "build.zig",
-                .line = 1,
-                .col = 1,
-                .severity = .err,
-                .rule = RULE_RUNTIME_TEST_FAILURE,
-                .message = "command failed",
-                .help = help_msg,
-            });
-        }
-    }
+    if (result.term.Exited != 0 and issues.items.len == 0)
+        try reportCommandFailure(allocator, &issues, custom_command != null);
 
     return issues;
 }
@@ -9535,17 +9529,17 @@ fn handleMemoryLeak(
     if (verbose) std.debug.print("GPA: {s}\n", .{t});
     var msg: []const u8 = "memory leak detected at runtime";
     var owned = false;
-    if (line_iter.next()) |next_line| {
-        const next_t = mem.trim(u8, next_line, " \t\r");
-        const loc = extractFileLocation(next_t);
-        if (loc.line > 0) {
-            msg = try std.fmt.allocPrint(
-                allocator, "memory leak at {s}:{d}",
-                .{ loc.file, loc.line },
-            );
-            owned = true;
-            if (verbose) std.debug.print("  at: {s}:{d}\n", .{ loc.file, loc.line });
-        }
+    const loc = if (line_iter.next()) |next_line|
+        extractFileLocation(mem.trim(u8, next_line, " \t\r"))
+    else
+        FileLocation{ .file = "unknown", .line = 0 };
+    if (loc.line > 0) {
+        msg = try std.fmt.allocPrint(
+            allocator, "memory leak at {s}:{d}",
+            .{ loc.file, loc.line },
+        );
+        owned = true;
+        if (verbose) std.debug.print("  at: {s}:{d}\n", .{ loc.file, loc.line });
     }
     try issues.append(allocator, .{
         .file = "runtime",
@@ -9678,6 +9672,34 @@ fn emitTestIssue(
     });
 }
 
+fn handlePanicLine(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    t: []const u8,
+    verbose: bool,
+) !void {
+    if (verbose) std.debug.print("PANIC: {s}\n", .{t});
+    try emitTestIssue(
+        allocator, issues, t, RULE_RUNTIME_PANIC,
+        "panic detected during test execution",
+        "runtime panic - check for integer overflow, null pointer, or unreachable",
+    );
+}
+
+fn handleFailLine(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    t: []const u8,
+    verbose: bool,
+) !void {
+    if (verbose) std.debug.print("TEST FAIL: {s}\n", .{t});
+    try emitTestIssue(
+        allocator, issues, t, RULE_RUNTIME_TEST_FAILURE,
+        "test failed",
+        "check test assertions and expected values",
+    );
+}
+
 fn parseTestOutput(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
@@ -9688,22 +9710,10 @@ fn parseTestOutput(
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
-        if (isPanicLine(t)) {
-            if (verbose) std.debug.print("PANIC: {s}\n", .{t});
-            try emitTestIssue(
-                allocator, issues, t, RULE_RUNTIME_PANIC,
-                "panic detected during test execution",
-                "runtime panic - check for integer overflow, null pointer, or unreachable",
-            );
-        }
-        if (mem.startsWith(u8, t, "FAIL")) {
-            if (verbose) std.debug.print("TEST FAIL: {s}\n", .{t});
-            try emitTestIssue(
-                allocator, issues, t, RULE_RUNTIME_TEST_FAILURE,
-                "test failed",
-                "check test assertions and expected values",
-            );
-        }
+        if (isPanicLine(t))
+            try handlePanicLine(allocator, issues, t, verbose);
+        if (mem.startsWith(u8, t, "FAIL"))
+            try handleFailLine(allocator, issues, t, verbose);
     }
 }
 
@@ -10247,6 +10257,14 @@ fn isArrayKey(key: []const u8) bool {
     return false;
 }
 
+fn handleConfigCreateError(err: anyerror) !void {
+    if (err == error.PathAlreadyExists) {
+        std.debug.print("{s} already exists\n", .{CONFIG_FILENAME});
+        return;
+    }
+    return err;
+}
+
 fn writeDefaultConfig() !void {
     const default_config =
         \\{
@@ -10267,13 +10285,9 @@ fn writeDefaultConfig() !void {
         \\
     ;
 
-    const file = fs.cwd().createFile(CONFIG_FILENAME, .{ .exclusive = true }) catch |err| {
-        if (err == error.PathAlreadyExists) {
-            std.debug.print("{s} already exists\n", .{CONFIG_FILENAME});
-            return;
-        }
-        return err;
-    };
+    const file = fs.cwd().createFile(CONFIG_FILENAME, .{
+        .exclusive = true,
+    }) catch |err| return handleConfigCreateError(err);
     defer file.close();
     try file.writeAll(default_config);
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
@@ -10580,12 +10594,12 @@ fn tryAddEntryFiles(
             allocator.free(full);
             continue;
         };
-        if (!added.contains(full)) {
-            try cfg.entries.append(allocator, full);
-            try added.put(full, {});
-        } else {
+        if (added.contains(full)) {
             allocator.free(full);
+            continue;
         }
+        try cfg.entries.append(allocator, full);
+        try added.put(full, {});
     }
 }
 
@@ -10666,9 +10680,8 @@ fn extractPathFromLine(
     // Pattern: .path("...") - matches b.path("..."), dep.path("..."), dep.builder.path("...")
     if (mem.indexOf(u8, line, ".path(\"")) |idx| {
         const start = idx + 7; // len of '.path("'
-        if (extractQuotedPath(line, start)) |path| {
+        if (extractQuotedPath(line, start)) |path|
             try addEntryIfValid(allocator, cfg, path, added);
-        }
     }
     // Pattern: .path = "..." or .root_src = "..." or .root_source_file = "..."
     const path_patterns = [_]struct { tag: []const u8, len: usize }{
@@ -10677,21 +10690,18 @@ fn extractPathFromLine(
         .{ .tag = ".root_source_file = \"", .len = 20 },
     };
     for (path_patterns) |pat| {
-        if (mem.indexOf(u8, line, pat.tag)) |idx| {
-            const start = idx + pat.len;
-            if (extractQuotedPath(line, start)) |path| {
-                try addEntryIfValid(allocator, cfg, path, added);
-            }
-        }
+        const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
+        const start = idx + pat.len;
+        if (extractQuotedPath(line, start)) |path|
+            try addEntryIfValid(allocator, cfg, path, added);
     }
     // Pattern: @import("...") in build.zig (build module imports, entry points)
     var search_pos: usize = 0;
     while (mem.indexOf(u8, line[search_pos..], "@import(\"")) |rel_idx| {
         const idx = search_pos + rel_idx;
         const start = idx + 9; // len of '@import("'
-        if (extractQuotedPath(line, start)) |path| {
+        if (extractQuotedPath(line, start)) |path|
             try addEntryIfValid(allocator, cfg, path, added);
-        }
         search_pos = start;
     }
 }
@@ -10759,11 +10769,9 @@ fn extractPathTagEntries(
         .{ .tag = ".root_source_file = \"", .len = 20 },
     };
     for (path_tags) |pat| {
-        if (mem.indexOf(u8, line, pat.tag)) |idx| {
-            if (extractQuotedPath(line, idx + pat.len)) |path| {
-                try addEntryWithPrefix(allocator, cfg, path, prefix, added);
-            }
-        }
+        const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
+        if (extractQuotedPath(line, idx + pat.len)) |path|
+            try addEntryWithPrefix(allocator, cfg, path, prefix, added);
     }
 }
 
@@ -10787,13 +10795,11 @@ fn followImportsInLine(
     var imp_pos: usize = 0;
     while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
         const istart = imp_pos + rel + 9;
-        if (extractQuotedPath(line, istart)) |imp_path| {
-            if (isValidZigImport(imp_path)) {
-                try addEntryWithPrefix(allocator, cfg, imp_path, prefix, added);
-                try recurseNestedBuildModule(allocator, cfg, build_path, imp_path, prefix, added);
-            }
-        }
-        imp_pos = istart;
+        defer imp_pos = istart;
+        const imp_path = extractQuotedPath(line, istart) orelse continue;
+        if (!isValidZigImport(imp_path)) continue;
+        try addEntryWithPrefix(allocator, cfg, imp_path, prefix, added);
+        try recurseNestedBuildModule(allocator, cfg, build_path, imp_path, prefix, added);
     }
 }
 
@@ -10831,9 +10837,8 @@ fn extractBuildZigEntriesFromPath(
     var line_iter = mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| {
         if (mem.indexOf(u8, line, ".path(\"")) |idx| {
-            if (extractQuotedPath(line, idx + 7)) |path| {
+            if (extractQuotedPath(line, idx + 7)) |path|
                 try addEntryWithPrefix(allocator, cfg, path, prefix, added);
-            }
         }
         try extractPathTagEntries(allocator, cfg, line, prefix, added);
         try followImportsInLine(allocator, cfg, line, build_path, prefix, added);
@@ -10884,13 +10889,13 @@ fn scanDirForEntriesWithPrefix(
     defer dir.close();
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
-        if (entry.kind == .directory) {
-            const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-            defer allocator.free(subdir);
-            try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added);
-        } else if (entry.kind == .file and isEntryPointFile(entry.name)) {
+        if (entry.kind == .file and isEntryPointFile(entry.name)) {
             addDirEntry(allocator, cfg, dir_path, entry.name, added, true) catch continue;
         }
+        if (entry.kind != .directory) continue;
+        const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+        defer allocator.free(subdir);
+        try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added);
     }
 }
 
@@ -10905,13 +10910,13 @@ fn scanDirForEntries(
     defer dir.close();
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
-        if (entry.kind == .directory) {
-            const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-            defer allocator.free(subdir);
-            try scanDirForEntries(allocator, cfg, subdir, added);
-        } else if (entry.kind == .file and isEntryPointFile(entry.name)) {
+        if (entry.kind == .file and isEntryPointFile(entry.name)) {
             addDirEntry(allocator, cfg, dir_path, entry.name, added, false) catch continue;
         }
+        if (entry.kind != .directory) continue;
+        const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+        defer allocator.free(subdir);
+        try scanDirForEntries(allocator, cfg, subdir, added);
     }
 }
 
@@ -10956,17 +10961,13 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
     while (try iter.next()) |entry| {
         const is_test_file = entry.kind == .file and mem.endsWith(u8, entry.name, "_test.zig");
         if (!is_test_file) continue;
-        const path = try std.fmt.allocPrint(
-            allocator,
-            "src/{s}",
-            .{entry.name},
-        );
-        if (!added.contains(path)) {
-            try cfg.entries.append(allocator, path);
-            try added.put(path, {});
-        } else {
+        const path = try std.fmt.allocPrint(allocator, "src/{s}", .{entry.name});
+        if (added.contains(path)) {
             allocator.free(path);
+            continue;
         }
+        try cfg.entries.append(allocator, path);
+        try added.put(path, {});
     }
 }
 
@@ -11344,12 +11345,11 @@ fn writeCodeSnippet(
     const end_line = issue_line + 2;
 
     while (line_iter.next()) |line| {
-        if (line_num >= start_line and line_num <= end_line) {
-            const prefix: []const u8 = if (line_num == issue_line) ">>> " else "    ";
-            try writer.print("{s}{d}: {s}\n", .{ prefix, line_num, line });
-        }
+        defer line_num += 1;
         if (line_num > end_line) break;
-        line_num += 1;
+        if (line_num < start_line) continue;
+        const prefix: []const u8 = if (line_num == issue_line) ">>> " else "    ";
+        try writer.print("{s}{d}: {s}\n", .{ prefix, line_num, line });
     }
     try writer.print("```\n\n", .{});
 }

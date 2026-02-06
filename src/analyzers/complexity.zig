@@ -220,29 +220,32 @@ fn analyzeFunction(
     var line_num: usize = 0;
     var m = FnMetrics{};
     const lim = calcLimits(thresholds, is_type_factory);
+    const ctx = ReportCtx{
+        .allocator = allocator,
+        .issues = issues,
+        .path = path,
+        .line = fn_line,
+        .name = fn_name,
+        .th = thresholds,
+    };
 
     while (lines.next()) |line| {
         line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
 
+        if (line_num != fn_line and !m.in_fn) continue;
         if (line_num == fn_line) {
-            m = .{ .in_fn = true, .fn_start = line_num, .params = countParams(t) };
+            m.in_fn = true;
+            m.fn_start = line_num;
+            m.params = countParams(t);
         }
-        if (!m.in_fn) continue;
 
-        if (trackDepth(t, &m)) {
-            const ctx = ReportCtx{
-                .allocator = allocator,
-                .issues = issues,
-                .path = path,
-                .line = fn_line,
-                .name = fn_name,
-                .th = thresholds,
-            };
-            try reportIfNeeded(ctx, &m, lim, line_num - m.fn_start + 1);
-            return;
+        if (!trackDepth(t, &m)) {
+            m.branches += countBranchesInLine(t);
+            continue;
         }
-        m.branches += countBranchesInLine(t);
+        try reportIfNeeded(ctx, &m, lim, line_num - m.fn_start + 1);
+        return;
     }
 }
 

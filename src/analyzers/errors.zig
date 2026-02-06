@@ -65,20 +65,17 @@ pub fn checkSilentCatch(
     if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) {
         return null;
     }
-    if (mem.indexOf(u8, t, "catch {}")) |col| {
-        if (!types.isInsideString(t, col)) {
-            return .{
-                .file = path,
-                .line = line,
-                .col = col + 1,
-                .severity = .warning,
-                .rule = types.RULE_SILENT_CATCH,
-                .message = "silent catch {} discards error",
-                .help = "use catch |err| with logging, or propagate with try",
-            };
-        }
-    }
-    return null;
+    const col = mem.indexOf(u8, t, "catch {}") orelse return null;
+    if (types.isInsideString(t, col)) return null;
+    return .{
+        .file = path,
+        .line = line,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = types.RULE_SILENT_CATCH,
+        .message = "silent catch {} discards error",
+        .help = "use catch |err| with logging, or propagate with try",
+    };
 }
 
 /// Check for catch unreachable
@@ -89,20 +86,17 @@ pub fn checkCatchUnreachable(
     in_test: bool,
 ) ?Issue {
     _ = in_test;
-    if (mem.indexOf(u8, t, "catch unreachable")) |col| {
-        if (!types.isInsideString(t, col)) {
-            return .{
-                .file = path,
-                .line = line,
-                .col = col + 1,
-                .severity = .warning,
-                .rule = types.RULE_CATCH_UNREACHABLE,
-                .message = "catch unreachable will panic if error occurs",
-                .help = "consider explicit error handling",
-            };
-        }
-    }
-    return null;
+    const col = mem.indexOf(u8, t, "catch unreachable") orelse return null;
+    if (types.isInsideString(t, col)) return null;
+    return .{
+        .file = path,
+        .line = line,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = types.RULE_CATCH_UNREACHABLE,
+        .message = "catch unreachable will panic if error occurs",
+        .help = "consider explicit error handling",
+    };
 }
 
 /// Check for orelse unreachable
@@ -113,20 +107,17 @@ pub fn checkOrelseUnreachable(
     in_test: bool,
 ) ?Issue {
     _ = in_test;
-    if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
-        if (!types.isInsideString(t, col)) {
-            return .{
-                .file = path,
-                .line = line,
-                .col = col + 1,
-                .severity = .warning,
-                .rule = types.RULE_ORELSE_UNREACHABLE,
-                .message = "orelse unreachable will panic if null",
-                .help = "consider explicit null handling or validation",
-            };
-        }
-    }
-    return null;
+    const col = mem.indexOf(u8, t, "orelse unreachable") orelse return null;
+    if (types.isInsideString(t, col)) return null;
+    return .{
+        .file = path,
+        .line = line,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = types.RULE_ORELSE_UNREACHABLE,
+        .message = "orelse unreachable will panic if null",
+        .help = "consider explicit null handling or validation",
+    };
 }
 
 /// Check for undefined usage
@@ -135,20 +126,17 @@ pub fn checkUndefinedUsage(
     path: []const u8,
     line: usize,
 ) ?Issue {
-    if (mem.indexOf(u8, t, "= undefined")) |col| {
-        if (!types.isInsideString(t, col)) {
-            return .{
-                .file = path,
-                .line = line,
-                .col = col + 1,
-                .severity = .note,
-                .rule = types.RULE_UNDEFINED_USAGE,
-                .message = "uninitialized memory may cause UB",
-                .help = "use explicit initialization or std.mem.zeroes()",
-            };
-        }
-    }
-    return null;
+    const col = mem.indexOf(u8, t, "= undefined") orelse return null;
+    if (types.isInsideString(t, col)) return null;
+    return .{
+        .file = path,
+        .line = line,
+        .col = col + 1,
+        .severity = .note,
+        .rule = types.RULE_UNDEFINED_USAGE,
+        .message = "uninitialized memory may cause UB",
+        .help = "use explicit initialization or std.mem.zeroes()",
+    };
 }
 
 /// Check for discarded result
@@ -157,20 +145,17 @@ pub fn checkDiscardedResult(
     path: []const u8,
     line: usize,
 ) ?Issue {
-    if (mem.indexOf(u8, t, "_ = ")) |col| {
-        if (!types.isInsideString(t, col) and !isSafeToDiscard(t)) {
-            return .{
-                .file = path,
-                .line = line,
-                .col = col + 1,
-                .severity = .note,
-                .rule = types.RULE_IGNORED_ERROR,
-                .message = "discarded result may contain error",
-                .help = "consider handling the result or using try",
-            };
-        }
-    }
-    return null;
+    const col = mem.indexOf(u8, t, "_ = ") orelse return null;
+    if (types.isInsideString(t, col) or isSafeToDiscard(t)) return null;
+    return .{
+        .file = path,
+        .line = line,
+        .col = col + 1,
+        .severity = .note,
+        .rule = types.RULE_IGNORED_ERROR,
+        .message = "discarded result may contain error",
+        .help = "consider handling the result or using try",
+    };
 }
 
 /// Check if a discarded result is safe
@@ -225,15 +210,12 @@ pub fn analyze(
             test_depth = state.depth;
 
             // Check for issues
-            if (checkSilentCatch(t, a.path, line_num)) |issue| {
+            if (checkSilentCatch(t, a.path, line_num)) |issue|
                 try issues.append(allocator, issue);
-            }
-            if (checkCatchUnreachable(t, a.path, line_num, in_test)) |issue| {
+            if (checkCatchUnreachable(t, a.path, line_num, in_test)) |issue|
                 try issues.append(allocator, issue);
-            }
-            if (checkOrelseUnreachable(t, a.path, line_num, in_test)) |issue| {
+            if (checkOrelseUnreachable(t, a.path, line_num, in_test)) |issue|
                 try issues.append(allocator, issue);
-            }
         }
     }
 

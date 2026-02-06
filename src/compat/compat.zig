@@ -220,18 +220,14 @@ pub fn containsBuiltin(line: []const u8) bool {
 /// Returns replacement suggestion if found
 pub fn checkDeprecated(line: []const u8) ?v0_15.DeprecatedPattern {
     const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        // Both versions use compatible DeprecatedPattern struct
-        if (v0_16.checkDeprecated(line)) |dep| {
-            return .{
-                .pattern = dep.pattern,
-                .replacement = dep.replacement,
-                .rule = dep.rule,
-            };
-        }
-        return null;
-    }
-    return v0_15.checkDeprecated(line);
+    if (version.minor < 16) return v0_15.checkDeprecated(line);
+    // Both versions use compatible DeprecatedPattern struct
+    const dep = v0_16.checkDeprecated(line) orelse return null;
+    return .{
+        .pattern = dep.pattern,
+        .replacement = dep.replacement,
+        .rule = dep.rule,
+    };
 }
 
 // ============================================================================

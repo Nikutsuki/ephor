@@ -80,9 +80,8 @@ pub fn analyze(
         const a = entry.value_ptr.*;
 
         for (a.imports.items) |import| {
-            if (!isImportUsed(a.content, import.name)) {
-                try reportUnusedImport(&issues, allocator, a.path, import);
-            }
+            if (isImportUsed(a.content, import.name)) continue;
+            try reportUnusedImport(&issues, allocator, a.path, import);
         }
     }
 

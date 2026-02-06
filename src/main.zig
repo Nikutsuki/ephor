@@ -1108,6 +1108,82 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
+/// Check if a line calls a method on a variable: var_name.method(
+/// This covers patterns like: x.mul(...), x.initCapacity(...), x.div(...)
+fn hasMethodCallOnVar(t: []const u8, var_name: []const u8) bool {
+    var search_start: usize = 0;
+    while (search_start + var_name.len + 2 <= t.len) {
+        const pos = mem.indexOf(u8, t[search_start..], var_name) orelse return false;
+        const abs_pos = search_start + pos;
+        search_start = abs_pos + 1;
+
+        // Check word boundary before var_name
+        if (abs_pos > 0 and isIdent(t[abs_pos - 1])) continue;
+
+        // Must be followed by .method(
+        const after = abs_pos + var_name.len;
+        if (after >= t.len or t[after] != '.') continue;
+
+        // Find the ( after the method name
+        const rest = t[after + 1 ..];
+        const paren = mem.indexOf(u8, rest, "(") orelse continue;
+        // Verify the part between . and ( is a valid identifier
+        const method_name = rest[0..paren];
+        if (method_name.len == 0) continue;
+        var all_ident = true;
+        for (method_name) |c| {
+            if (!isIdent(c)) {
+                all_ident = false;
+                break;
+            }
+        }
+        if (!all_ident) continue;
+
+        // Make sure it's not inside a string or comment
+        if (isInsideString(t, abs_pos)) continue;
+        if (mem.indexOf(u8, t[0..abs_pos], "//")) |_| continue;
+
+        return true;
+    }
+    return false;
+}
+
+/// Check if a line has an inline assembly output constraint for a variable.
+/// Pattern: asm (...: [_] "={reg}" (var_name), ...)
+fn hasAsmOutputVar(t: []const u8, var_name: []const u8) bool {
+    // Look for (var_name) preceded by a constraint string like "={eax}"
+    if (mem.indexOf(u8, t, "asm") == null and mem.indexOf(u8, t, "\"=") == null) return false;
+    // Search for (var_name) pattern
+    const needle_start = "(";
+    var search_start: usize = 0;
+    while (search_start + 1 + var_name.len + 1 <= t.len) {
+        const paren_pos = mem.indexOf(u8, t[search_start..], needle_start) orelse return false;
+        const abs_pos = search_start + paren_pos;
+        search_start = abs_pos + 1;
+
+        // Check if the content inside parens matches var_name
+        const after = abs_pos + 1;
+        if (after + var_name.len > t.len) continue;
+        if (!mem.eql(u8, t[after .. after + var_name.len], var_name)) continue;
+
+        // Check closing paren
+        const end = after + var_name.len;
+        if (end >= t.len or t[end] != ')') continue;
+
+        // Check that there's a constraint string before this: "=something"
+        if (abs_pos >= 2) {
+            // Look backwards for ") or similar pattern indicating asm constraint
+            const before = t[0..abs_pos];
+            if (mem.lastIndexOf(u8, before, "\"") != null) {
+                if (mem.indexOf(u8, before, "\"=") != null or mem.indexOf(u8, before, "\"~") != null) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 /// Collect variables declared with `= undefined`, skipping comptime blocks
 /// Returns map of var_name -> declaration line
 fn collectUndefinedVars(
@@ -1211,6 +1287,61 @@ fn analyzeDefiniteAssignment(
     defer undef_vars.deinit();
 
     if (undef_vars.count() == 0) return issues;
+
+    // Phase 1b: Remove variables that are passed by reference (&var) anywhere.
+    // Out-parameter patterns (e.g., extract(&x), match(&x)) assign the variable
+    // through a pointer. We can't statically determine if the write happened,
+    // so suppress warnings for these variables to avoid false positives.
+    {
+        var remove_list = std.ArrayListUnmanaged([]const u8){};
+        defer remove_list.deinit(allocator);
+        var viter = undef_vars.iterator();
+        while (viter.next()) |entry| {
+            const vname = entry.key_ptr.*;
+            for (lines) |line| {
+                const t = mem.trim(u8, line, " \t\r");
+                if (isCommentOrMultilineString(t)) continue;
+                if (hasAddressOfVar(t, vname)) {
+                    try remove_list.append(allocator, vname);
+                    break;
+                }
+            }
+        }
+        for (remove_list.items) |vname| {
+            _ = undef_vars.remove(vname);
+        }
+        if (undef_vars.count() == 0) return issues;
+    }
+
+    // Phase 1c: Remove variables initialized via method call or inline asm.
+    // Pattern 1: var x: T = undefined; ... x.method(...) - method populates the variable
+    // Pattern 2: var x: T = undefined; asm (...: [_] "=reg" (x)) - asm output constraint
+    {
+        var remove_list2 = std.ArrayListUnmanaged([]const u8){};
+        defer remove_list2.deinit(allocator);
+        var viter2 = undef_vars.iterator();
+        while (viter2.next()) |entry| {
+            const vname = entry.key_ptr.*;
+            for (lines) |line| {
+                const t = mem.trim(u8, line, " \t\r");
+                if (isCommentOrMultilineString(t)) continue;
+                // Check for method call: vname.method(
+                if (hasMethodCallOnVar(t, vname)) {
+                    try remove_list2.append(allocator, vname);
+                    break;
+                }
+                // Check for inline assembly output constraint: "=reg" (vname)
+                if (hasAsmOutputVar(t, vname)) {
+                    try remove_list2.append(allocator, vname);
+                    break;
+                }
+            }
+        }
+        for (remove_list2.items) |vname| {
+            _ = undef_vars.remove(vname);
+        }
+        if (undef_vars.count() == 0) return issues;
+    }
 
     // Phase 2: For each undefined var, compute definitely-assigned at each block
     // Using forward data flow: out[B] = gen[B] ∪ in[B], in[B] = ∩ out[pred]
@@ -3861,7 +3992,34 @@ const best_effort_ops = [_][]const u8{
     // Zig std lib uses catch {} for yield(), timedWait(); ghostty uses .notify() catch {}
     ".setName(",              ".notify(",              ".wakeup(",               ".signal(",
     ".yield(",                ".timedWait(",
+    // Reader/stream - partial reads are best-effort
+    ".fillMore(",             ".skipUntilDelimiter",   ".discardDelimiter",
+    // Display/format - rendering failures are non-fatal
+    ".formatDiagram(",        ".printString(",
+    // State changes - setting attributes/selection/callbacks best-effort
+    ".setSelection(",         ".setAttribute(",        ".preeditCallback(",
+    // Error logging - logging an error that already happened
+    ".fromShader(",           ".fromProgram(",
+    // System calls - OS tuning best-effort
+    "setrlimit(",
 };
+
+/// Check if catch {} is on a continuation line of a multi-line function call.
+/// When a line starts with ) before the catch, the actual function call is on
+/// previous lines. These are overwhelmingly best-effort patterns in practice.
+/// Examples:
+///   ) catch {},      // multi-line .print(...\n) catch {}
+///   }, .on) catch {}; // multi-line .line(.{...}, .on) catch {};
+fn isMultiLineCatchContinuation(t: []const u8) bool {
+    // The trimmed line must start with a closing delimiter, indicating it's
+    // a continuation of a multi-line expression
+    if (t.len == 0) return false;
+    if (t[0] != ')' and t[0] != '}' and t[0] != ']') return false;
+    // And must contain catch {} or catch |_| {}
+    if (mem.indexOf(u8, t, "catch {}") != null) return true;
+    if (mem.indexOf(u8, t, "catch |_| {}") != null) return true;
+    return false;
+}
 
 /// Check if a silent catch is for a best-effort operation
 fn isBestEffortOperation(t: []const u8) bool {
@@ -3904,6 +4062,13 @@ fn checkSilentCatchWithContext(t: []const u8, path: []const u8, line: usize, fun
 
     // Best-effort operations where failure is acceptable
     if (isBestEffortOperation(t)) {
+        return null;
+    }
+
+    // Multi-line function call: when catch {} is on a line starting with ) or },
+    // the actual function call is on a previous line. These are overwhelmingly
+    // best-effort patterns (print, write, draw operations split across lines).
+    if (isMultiLineCatchContinuation(t)) {
         return null;
     }
 
@@ -9056,10 +9221,20 @@ fn isOrphanExcluded(path: []const u8, cfg: *const Config) bool {
     if (mem.indexOf(u8, path, "/demos/") != null) return true;
     if (mem.indexOf(u8, path, "/samples/") != null) return true;
     if (mem.indexOf(u8, path, "/tools/") != null) return true;
+    if (mem.indexOf(u8, path, "/mods/") != null) return true;
+    if (mem.indexOf(u8, path, "/init/") != null) return true;
+
+    // External/vendored dependencies - not project code
+    if (mem.indexOf(u8, path, "/deps/") != null) return true;
+    if (mem.indexOf(u8, path, "/vendor/") != null) return true;
+    if (mem.indexOf(u8, path, "/.packages/") != null) return true;
 
     // build.zig is always an entry point
     if (mem.endsWith(u8, path, "/build.zig")) return true;
     if (mem.eql(u8, path, "build.zig")) return true;
+
+    // Build helper files commonly referenced from build.zig
+    if (mem.endsWith(u8, path, "/build_options.zig")) return true;
 
     return false;
 }
@@ -9932,9 +10107,9 @@ fn extractPathFromLine(
     line: []const u8,
     added: *std.StringHashMap(void),
 ) !void {
-    // Pattern: b.path("...")
-    if (mem.indexOf(u8, line, "b.path(\"")) |idx| {
-        const start = idx + 8; // len of 'b.path("'
+    // Pattern: .path("...") - matches b.path("..."), dep.path("..."), dep.builder.path("...")
+    if (mem.indexOf(u8, line, ".path(\"")) |idx| {
+        const start = idx + 7; // len of '.path("'
         if (extractQuotedPath(line, start)) |path| {
             try addEntryIfValid(allocator, cfg, path, added);
         }
@@ -10027,9 +10202,9 @@ fn extractBuildZigEntriesFromPath(
 
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
-        // Pattern: b.path("...")
-        if (mem.indexOf(u8, line, "b.path(\"")) |idx| {
-            const start = idx + 8;
+        // Pattern: .path("...") - matches b.path("..."), dep.path("..."), dep.builder.path("...")
+        if (mem.indexOf(u8, line, ".path(\"")) |idx| {
+            const start = idx + 7;
             if (extractQuotedPath(line, start)) |path| {
                 try addEntryWithPrefix(allocator, cfg, path, prefix, added);
             }
@@ -10048,7 +10223,7 @@ fn extractBuildZigEntriesFromPath(
                 }
             }
         }
-        // Follow @import("...") to find b.path() entries in nested build modules
+        // Follow @import("...") - add as entry point AND recurse for nested build modules
         var imp_pos: usize = 0;
         while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
             const idx = imp_pos + rel;
@@ -10058,6 +10233,9 @@ fn extractBuildZigEntriesFromPath(
                     !mem.eql(u8, imp_path, "std") and
                     !mem.eql(u8, imp_path, "builtin"))
                 {
+                    // Add the imported file itself as an entry point
+                    try addEntryWithPrefix(allocator, cfg, imp_path, prefix, added);
+
                     // Resolve relative to current file's directory
                     const cur_dir = std.fs.path.dirname(build_path) orelse ".";
                     const nested = try std.fmt.allocPrint(

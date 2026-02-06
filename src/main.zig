@@ -1434,17 +1434,20 @@ fn analyzeDefiniteAssignment(
             changed = false;
             for (0..num_blocks) |bid| {
                 // in[B] = intersection of out[pred] (must be assigned on ALL paths)
-                var preds = try getBlockPredecessors(cfg, bid, allocator);
-                defer preds.deinit(allocator);
-
+                // Loop-back edges are excluded: once a variable is definitely
+                // assigned before a loop, iterating the loop cannot make it
+                // unassigned (since there's no = undefined in the loop body).
                 var new_in: bool = true;
-                if (preds.items.len == 0) {
-                    // Entry block: variable starts unassigned
+                var has_non_loopback_pred = false;
+                for (cfg.edges.items) |edge| {
+                    if (edge.to != bid) continue;
+                    if (edge.kind == .loop_back) continue;
+                    has_non_loopback_pred = true;
+                    if (!def_at_exit[edge.from]) new_in = false;
+                }
+                if (!has_non_loopback_pred) {
+                    // Entry block or only loop-back predecessors
                     new_in = false;
-                } else {
-                    for (preds.items) |pred| {
-                        if (!def_at_exit[pred]) new_in = false;
-                    }
                 }
 
                 // out[B] = gen[B] ∪ in[B]

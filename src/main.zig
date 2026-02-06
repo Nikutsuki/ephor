@@ -2557,11 +2557,18 @@ const ErrdeferInfo = struct {
 
 /// Check if function uses arena allocator (skip errdefer analysis)
 fn usesArenaAllocator(lines: []const []const u8) bool {
-    for (lines) |line| {
+    for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (mem.indexOf(u8, t, "ArenaAllocator.init") != null) return true;
         if (mem.indexOf(u8, t, "arena.deinit()") != null) return true;
         if (mem.indexOf(u8, t, "arena.allocator()") != null) return true;
+        // Function signature with arena parameter (first few lines only)
+        if (idx < 5) {
+            if (mem.indexOf(u8, t, "arena:") != null or
+                mem.indexOf(u8, t, "arena_allocator:") != null or
+                mem.indexOf(u8, t, "_arena:") != null)
+                return true;
+        }
     }
     return false;
 }
@@ -6336,8 +6343,8 @@ fn trackDeferFrees(
     const keyword = if (is_errdefer) "errdefer " else "defer ";
     if (mem.indexOf(u8, t, keyword) == null) return;
     // Check for cleanup patterns (skip if inside string literals)
-    const has_cleanup = hasRealFreePattern(t) or
-        hasPatternNotInString(t, "free(") or hasPatternNotInString(t, "destroy(");
+    // Use hasRealCleanupPattern which includes .free, .destroy, AND .deinit
+    const has_cleanup = hasRealCleanupPattern(t);
     if (!has_cleanup) return;
     for (allocs) |*alloc| {
         if (mem.indexOf(u8, t, alloc.name) != null) {
@@ -6672,6 +6679,37 @@ fn buildAliasSets(
         try as.names.append(allocator, allocs[i].name);
     }
 
+    // Scan for slice aliasing: var keys = buffer[0..N] means keys aliases buffer
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const alias_name = extractVarDeclName(t) orelse continue;
+        // Look for pattern: const/var X = alloc_name[... or alloc_name.items or alloc_name.ptr
+        for (alias_sets, 0..) |*as, ai| {
+            for (as.names.items) |existing_name| {
+                // Check: = existing_name[ or = existing_name.
+                const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
+                const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+                if (mem.startsWith(u8, rhs, existing_name) and rhs.len > existing_name.len) {
+                    const next_ch = rhs[existing_name.len];
+                    if (next_ch == '[' or next_ch == '.') {
+                        // alias_name derives from existing_name, add it
+                        if (!mem.eql(u8, alias_name, allocs[ai].name)) {
+                            var exists = false;
+                            for (as.names.items) |en| {
+                                if (mem.eql(u8, en, alias_name)) {
+                                    exists = true;
+                                    break;
+                                }
+                            }
+                            if (!exists) try as.names.append(allocator, alias_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Scan for data flow using brace-depth tracking
     var in_struct = false;
     var brace_depth: i32 = 0;
@@ -6846,9 +6884,10 @@ fn analyzeFunction(
 
                 // Ownership transfer via method call: .put(alias), .append(alias), etc.
                 const transfer_methods = [_][]const u8{
-                    ".put(",    ".putNoClobber(", ".append(", ".appendSlice(",
-                    ".insert(", ".add(",          ".push(",   ".enqueue(",
-                    ".submit(",
+                    ".put(",    ".putNoClobber(", ".append(",    ".appendSlice(",
+                    ".insert(", ".add(",          ".push(",      ".enqueue(",
+                    ".submit(", ".toJS(",         ".toValue(",   ".toSlice(",
+                    ".toOwnedSlice(",
                 };
                 for (transfer_methods) |method| {
                     if (mem.indexOf(u8, t, method) != null) {

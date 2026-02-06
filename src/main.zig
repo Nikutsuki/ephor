@@ -1909,23 +1909,44 @@ fn hasImmediateDefer(
         }
     }
 
-    // Check the line immediately after allocation for a defer
-    const defer_idx = alloc_end_idx + 1;
-    if (defer_idx >= lines.len) return false;
+    // Check nearby lines after allocation for a defer (within 5 lines).
+    // Patterns like `alloc(); for (...) init; defer free();` have non-branching
+    // statements between the alloc and its defer.
+    const search_end = @min(alloc_end_idx + 6, lines.len);
+    for (alloc_end_idx + 1..search_end) |check_idx| {
+        const raw_line = lines[check_idx];
+        const scan_line = mem.trim(u8, raw_line, " \t\r");
+        if (scan_line.len == 0) continue; // Skip blank lines
 
-    const raw_line = lines[defer_idx];
-    const scan_line = mem.trim(u8, raw_line, " \t\r");
+        // If we hit a branching statement or block at same indent, stop looking
+        const check_indent = countIndent(raw_line);
+        if (check_indent < alloc_indent) break; // Left the scope
 
-    // Must be a defer statement
-    if (!mem.startsWith(u8, scan_line, "defer ")) return false;
+        if (!mem.startsWith(u8, scan_line, "defer ")) continue;
 
-    // Check indentation matches - defer must be at same level as alloc
-    const defer_indent = countIndent(raw_line);
-    if (defer_indent != alloc_indent) return false;
+        // Found a defer - check indentation matches
+        if (check_indent != alloc_indent) continue;
 
-    // Check if it frees this allocation (skip patterns in string literals)
-    const has_free = hasRealCleanupPattern(scan_line);
-    return has_free and mem.indexOf(u8, scan_line, alloc.name) != null;
+        // Check if it frees this allocation
+        if (hasRealCleanupPattern(scan_line) and
+            mem.indexOf(u8, scan_line, alloc.name) != null) return true;
+    }
+
+    // Fallback: scan the function for a defer at an OUTER (shallower) scope that frees
+    // this variable. Handles labeled block expressions where alloc is inside
+    // `st: { ... break :st var; }` and the defer is at the outer scope level.
+    // Only matches defers at shallower indent to avoid false suppression of
+    // branch-specific defers (which would be a real bug).
+    for (0..lines.len) |check_idx| {
+        const raw_line = lines[check_idx];
+        const scan_line = mem.trim(u8, raw_line, " \t\r");
+        if (!mem.startsWith(u8, scan_line, "defer ")) continue;
+        const defer_indent = countIndent(raw_line);
+        if (defer_indent >= alloc_indent) continue; // Only match outer scope
+        if (hasRealCleanupPattern(scan_line) and
+            mem.indexOf(u8, scan_line, alloc.name) != null) return true;
+    }
+    return false;
 }
 
 /// Remove allocations that have immediate defer (marked with line = 0)

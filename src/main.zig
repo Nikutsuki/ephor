@@ -735,7 +735,8 @@ fn hasRealAllocPattern(t: []const u8) bool {
     return false;
 }
 
-/// Get position of real allocation pattern (not in string, not Type.alloc()), returns null if not found
+/// Get position of real allocation pattern
+/// (not in string, not Type.alloc()), returns null if not found
 fn getRealAllocPos(t: []const u8) ?usize {
     if (mem.indexOf(u8, t, ".alloc(")) |pos| {
         if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return pos;
@@ -775,9 +776,10 @@ fn isLocalVarOccurrence(t: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// Check if a variable is the DIRECT target of a free/destroy call on this line.
-/// Returns true for: varname.free(, varname.destroy(, allocator.free(varname), allocator.destroy(varname)
-/// Returns false for: varname.field.free( (field is being freed, not varname)
+/// Check if a variable is the DIRECT target of a free/destroy call.
+/// Returns true for: varname.free(, varname.destroy(,
+///   allocator.free(varname), allocator.destroy(varname)
+/// Returns false for: varname.field.free( (field freed, not var)
 fn isDirectFreeOfVar(t: []const u8, var_name: []const u8) bool {
     var search_start: usize = 0;
     while (mem.indexOf(u8, t[search_start..], var_name)) |rel_pos| {
@@ -909,7 +911,8 @@ fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
                             if (ic == '[') inner_depth += 1 else if (ic == ']') {
                                 if (inner_depth > 0) inner_depth -= 1;
                                 if (inner_depth == 0) {
-                                    const final_after = mem.trimLeft(u8, after_bracket[ii + 1 ..], " \t");
+                                    const rest = after_bracket[ii + 1 ..];
+                                    const final_after = mem.trimLeft(u8, rest, " \t");
                                     if (mem.startsWith(u8, final_after, "==")) return false;
                                     return mem.startsWith(u8, final_after, "=");
                                 }
@@ -987,7 +990,11 @@ fn getBlockPredecessors(
 
 /// Check if a variable has an unconditional fill before any use
 /// Returns true if filled before use, false if used first or no fill found
-fn hasUnconditionalFillBeforeUse(lines: []const []const u8, start_idx: usize, name: []const u8) bool {
+fn hasUnconditionalFillBeforeUse(
+    lines: []const []const u8,
+    start_idx: usize,
+    name: []const u8,
+) bool {
     var nesting_depth: usize = 0;
 
     for (start_idx..lines.len) |check_idx| {
@@ -1194,7 +1201,9 @@ fn hasAsmOutputVar(t: []const u8, var_name: []const u8) bool {
             // Look backwards for ") or similar pattern indicating asm constraint
             const before = t[0..abs_pos];
             if (mem.lastIndexOf(u8, before, "\"") != null) {
-                if (mem.indexOf(u8, before, "\"=") != null or mem.indexOf(u8, before, "\"~") != null) {
+                if (mem.indexOf(u8, before, "\"=") != null or
+                    mem.indexOf(u8, before, "\"~") != null)
+                {
                     return true;
                 }
             }
@@ -1584,459 +1593,548 @@ fn analyzeCFGMemorySafety(
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
-    // Phase 1: Identify all allocations in the function
-    var allocs = std.StringHashMap(CFGAllocation).init(allocator);
+    var allocs = try collectMemSafetyAllocs(
+        allocator,
+        lines,
+        func_line,
+    );
     defer allocs.deinit();
-
-    for (lines, 0..) |line, idx| {
-        const actual_line = func_line + idx;
-        const t = mem.trim(u8, line, " \t\r");
-
-        // Detect allocations: const x = ... .alloc( or .create( (skip patterns in strings)
-        if (hasRealAllocPattern(t)) {
-            // Skip arena/no-free allocator patterns
-            if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t)) continue;
-            const alloc_name = extractAllocatorName(t) orelse "";
-            if (isNoFreeAllocatorName(alloc_name)) continue;
-            if (extractVarDeclName(t)) |name| {
-                const col = getRealAllocPos(t) orelse 0;
-                try allocs.put(name, .{
-                    .name = name,
-                    .alloc_line = actual_line,
-                    .alloc_col = col + 1,
-                    .state = .allocated,
-                    .is_create = hasRealCreatePattern(t),
-                });
-            }
-        }
-    }
-
     if (allocs.count() == 0) return issues;
 
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    // Pre-pass: Mark which lines are inside errdefer or defer blocks
     const markers = try markDeferAndErrdeferBlocks(allocator, lines);
     const in_defer = markers.in_defer;
     const in_errdefer = markers.in_errdefer;
     defer allocator.free(in_defer);
     defer allocator.free(in_errdefer);
 
-    // Phase 2: For each allocation, track freed state through CFG
     var alloc_iter = allocs.iterator();
     while (alloc_iter.next()) |entry| {
-        const alloc = entry.value_ptr;
-        const var_name = alloc.name;
+        const alloc_info = entry.value_ptr;
+        const var_name = alloc_info.name;
 
-        // Track state per block: freed, has_return_after_free
-        var freed_in_block = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(freed_in_block);
-        var block_returns_after_free = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(block_returns_after_free);
-        var freed_line_in_block = try allocator.alloc(usize, num_blocks);
-        defer allocator.free(freed_line_in_block);
-        @memset(freed_in_block, false);
-        @memset(block_returns_after_free, false);
-        @memset(freed_line_in_block, 0);
+        var bstate = try initBlockFreeState(allocator, num_blocks);
+        defer bstate.deinit(allocator);
 
-        // Scan each block for free operations
-        for (cfg.blocks.items, 0..) |block, bid| {
-            var free_seen = false;
-            var return_after_free = false;
-            var free_line: usize = 0;
+        scanBlocksForFreeOps(
+            cfg,
+            lines,
+            func_line,
+            var_name,
+            in_defer,
+            in_errdefer,
+            alloc_info,
+            &bstate,
+        );
 
-            // Skip blocks with invalid line ranges
-            if (block.start_line == 0 or block.start_line > block.end_line) continue;
+        try detectUseAfterFree(
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            file_path,
+            var_name,
+            alloc_info,
+            in_errdefer,
+            in_defer,
+            &bstate,
+            &issues,
+        );
 
-            for (block.start_line..block.end_line + 1) |line_num| {
-                if (line_num < func_line) continue;
-                const idx = line_num - func_line;
-                if (idx >= lines.len) continue;
-                const t = mem.trim(u8, lines[idx], " \t\r");
-
-                // Skip lines inside errdefer blocks (frees only run on error path)
-                if (in_errdefer[idx]) continue;
-
-                // Skip lines inside defer blocks (frees happen at scope exit, not here)
-                // This prevents false use-after-free when code uses var before defer scope ends
-                if (in_defer[idx]) continue;
-
-                // Skip single-line defer - tracked separately
-                if (mem.startsWith(u8, t, "defer ")) continue;
-
-                // Skip comments and multiline strings
-                if (isCommentOrMultilineString(t)) continue;
-
-                // Check if this is a direct free/destroy of our variable
-                // Uses isDirectFreeOfVar to avoid false positives from field frees
-                // (e.g., ws.on_open.destroy() is NOT freeing ws)
-                if (hasRealFreePattern(t) and isDirectFreeOfVar(t, var_name)) {
-                    free_seen = true;
-                    free_line = line_num;
-                }
-
-                if (free_seen and mem.startsWith(u8, t, "return")) {
-                    return_after_free = true;
-                }
-            }
-
-            freed_in_block[bid] = free_seen;
-            freed_line_in_block[bid] = free_line;
-            block_returns_after_free[bid] = return_after_free;
-            if (free_seen and alloc.freed_line == 0) {
-                alloc.freed_line = free_line;
-            }
-        }
-
-        // Phase 3: Detect use-after-free with path-sensitivity
-        // Key insight: if free is in a block with return, subsequent blocks
-        // are NOT reached via that path - free doesn't affect them
-        for (lines, 0..) |line, idx| {
-            const actual_line = func_line + idx;
-            const t = mem.trim(u8, line, " \t\r");
-
-            // Skip UAF detection inside errdefer - it's cleanup code
-            // (uses pre-computed in_errdefer[] from markDeferAndErrdeferBlocks)
-            if (in_errdefer[idx]) continue;
-
-            // Skip: declarations, frees, defers, comments
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) continue;
-            if (hasRealFreePattern(t)) continue; // Skip patterns in string literals
-            if (mem.startsWith(u8, t, "defer")) continue;
-            if (isCommentOrMultilineString(t)) continue;
-
-            // Check ALL occurrences of the variable on this line
-            // Pattern: `data = transformData(data)` has UAF on RHS even though LHS is assignment
-            var has_use = false;
-            var use_col: usize = 0;
-            var search_start: usize = 0;
-            while (mem.indexOf(u8, t[search_start..], var_name)) |rel_pos| {
-                const var_pos = search_start + rel_pos;
-                search_start = var_pos + var_name.len;
-
-                // Verify it's a full word match
-                if (var_pos + var_name.len < t.len and isIdent(t[var_pos + var_name.len])) continue;
-                if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
-
-                // Skip struct field access (self.field) - not a local variable use
-                if (var_pos > 0 and t[var_pos - 1] == '.') continue;
-
-                // Skip if inside a string literal
-                if (isInsideString(t, var_pos)) continue;
-
-                // Skip if this occurrence is a DIRECT reassignment target (LHS of =)
-                // BUT: If it appears elsewhere on the line, that's a USE
-                if (isDirectAssignment(t, var_name, var_pos)) continue;
-
-                // This occurrence is a USE (not assignment, not in string)
-                has_use = true;
-                use_col = var_pos;
-                break;
-            }
-            if (!has_use) continue;
-
-            const bid = findBlockForLine(cfg, actual_line) orelse continue;
-
-            // Check if freed earlier in same block (without intervening return)
-            var freed_same_block = false;
-            var intervening_return = false;
-            const block_start = cfg.blocks.items[bid].start_line;
-            if (block_start == 0 or block_start > actual_line) continue;
-            for (block_start..actual_line) |check_line| {
-                if (check_line < func_line) continue;
-                const check_idx = check_line - func_line;
-                if (check_idx >= lines.len) continue;
-                const check_t = mem.trim(u8, lines[check_idx], " \t\r");
-
-                // Skip lines inside errdefer blocks (frees only run on error path)
-                if (in_errdefer[check_idx]) continue;
-
-                // Skip lines inside defer blocks (frees happen at scope exit, not here)
-                if (in_defer[check_idx]) continue;
-
-                // Skip single-line defer - tracked separately
-                if (mem.startsWith(u8, check_t, "defer ")) continue;
-
-                // Skip comments and multiline strings
-                if (isCommentOrMultilineString(check_t)) continue;
-
-                const check_free = hasRealFreePattern(check_t);
-                // Only count direct frees of this variable (not field frees)
-                if (check_free and isDirectFreeOfVar(check_t, var_name)) {
-                    freed_same_block = true;
-                    alloc.freed_line = check_line;
-                }
-                if (freed_same_block and mem.startsWith(u8, check_t, "return")) {
-                    intervening_return = true;
-                }
-            }
-
-            // Use-after-free in same block (no return between)
-            if (freed_same_block and !intervening_return) {
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "use-after-free: '{s}' freed on {d}",
-                    .{ var_name, alloc.freed_line },
-                );
-                try issues.append(allocator, .{
-                    .file = file_path,
-                    .line = actual_line,
-                    .col = use_col + 1,
-                    .severity = .err,
-                    .rule = RULE_USE_AFTER_FREE,
-                    .message = msg,
-                    .message_owned = true,
-                    .help = "don't access freed memory",
-                });
-                continue;
-            }
-
-            // Check if freed in ALL predecessor paths (excluding early-return paths)
-            var preds = try getBlockPredecessors(cfg, bid, allocator);
-            defer preds.deinit(allocator);
-
-            if (preds.items.len == 0) continue; // Entry block - can't have been freed
-
-            var definitely_freed = true;
-            var any_normal_pred = false;
-            for (preds.items) |pred| {
-                // Early-return path: block frees then returns - doesn't reach us
-                if (block_returns_after_free[pred]) continue;
-                any_normal_pred = true;
-                if (!freed_in_block[pred]) {
-                    definitely_freed = false;
-                }
-            }
-
-            // Only report if freed on all normal (non-returning) paths
-            if (any_normal_pred and definitely_freed and alloc.freed_line > 0) {
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "use-after-free: '{s}' freed on {d}",
-                    .{ var_name, alloc.freed_line },
-                );
-                try issues.append(allocator, .{
-                    .file = file_path,
-                    .line = actual_line,
-                    .col = use_col + 1,
-                    .severity = .err,
-                    .rule = RULE_USE_AFTER_FREE,
-                    .message = msg,
-                    .message_owned = true,
-                    .help = "don't access freed memory",
-                });
-            }
-        }
-
-        // Phase 4: Detect double-free with path-sensitivity
-        for (lines, 0..) |line, idx| {
-            const actual_line = func_line + idx;
-            const t = mem.trim(u8, line, " \t\r");
-
-            // Skip defer/errdefer - they don't free immediately
-            if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) continue;
-
-            // Skip comments and multiline strings
-            if (isCommentOrMultilineString(t)) continue;
-
-            // Only look at direct free operations on this variable
-            if (!hasRealFreePattern(t)) continue;
-            if (!isDirectFreeOfVar(t, var_name)) continue;
-
-            const bid = findBlockForLine(cfg, actual_line) orelse continue;
-
-            // Check if already freed in same block before this line
-            var prev_free_in_block = false;
-            const block_start_df = cfg.blocks.items[bid].start_line;
-            if (block_start_df == 0 or block_start_df > actual_line) continue;
-            for (block_start_df..actual_line) |check_line| {
-                if (check_line < func_line) continue;
-                const check_idx = check_line - func_line;
-                if (check_idx >= lines.len) continue;
-                const check_t = mem.trim(u8, lines[check_idx], " \t\r");
-
-                // Skip lines inside errdefer blocks (frees only run on error path)
-                if (in_errdefer[check_idx]) continue;
-
-                // Skip lines inside defer blocks (frees happen at scope exit, not here)
-                if (in_defer[check_idx]) continue;
-
-                // Skip single-line defer - tracked separately
-                if (mem.startsWith(u8, check_t, "defer ")) continue;
-
-                // Skip comments and multiline strings
-                if (isCommentOrMultilineString(check_t)) continue;
-
-                const check_free = hasRealFreePattern(check_t);
-                // Only count direct frees of this variable (not field frees)
-                if (check_free and isDirectFreeOfVar(check_t, var_name)) {
-                    prev_free_in_block = true;
-                    alloc.freed_line = check_line;
-                    break;
-                }
-            }
-
-            if (prev_free_in_block) {
-                // Check if there's a switch arm or mutually exclusive branch between the two frees
-                // If so, they're in different branches (not a real double-free)
-                var has_exclusive_branch = false;
-                if (alloc.freed_line < actual_line) {
-                    for (alloc.freed_line + 1..actual_line) |between_line| {
-                        if (between_line < func_line) continue;
-                        const between_idx = between_line - func_line;
-                        if (between_idx >= lines.len) continue;
-                        const between_t = mem.trim(u8, lines[between_idx], " \t\r");
-                        // Switch arm patterns: "=> blk:", "=> {", ".X =>"
-                        if (mem.indexOf(u8, between_t, "=>") != null) {
-                            has_exclusive_branch = true;
-                            break;
-                        }
-                        // catch/orelse pattern: "} orelse {" - mutually exclusive branches
-                        // Pattern: catch { ... return; } orelse { ... return; }
-                        if (mem.indexOf(u8, between_t, "} orelse {") != null or
-                            mem.indexOf(u8, between_t, "} orelse return") != null or
-                            mem.startsWith(u8, between_t, "orelse {") or
-                            mem.eql(u8, between_t, "} orelse {"))
-                        {
-                            has_exclusive_branch = true;
-                            break;
-                        }
-                        // else branch pattern: "} else {"
-                        if (mem.indexOf(u8, between_t, "} else {") != null or
-                            mem.eql(u8, between_t, "} else {"))
-                        {
-                            has_exclusive_branch = true;
-                            break;
-                        }
-                    }
-                }
-                if (has_exclusive_branch) continue;
-
-                const col = mem.indexOf(u8, t, ".free(") orelse
-                    mem.indexOf(u8, t, ".destroy(") orelse 0;
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "double-free: '{s}' freed on {d}",
-                    .{ var_name, alloc.freed_line },
-                );
-                try issues.append(allocator, .{
-                    .file = file_path,
-                    .line = actual_line,
-                    .col = col + 1,
-                    .severity = .err,
-                    .rule = RULE_DOUBLE_FREE,
-                    .message = msg,
-                    .message_owned = true,
-                    .help = "remove duplicate free",
-                });
-                continue;
-            }
-
-            // Check predecessors (excluding early-return paths)
-            var preds = try getBlockPredecessors(cfg, bid, allocator);
-            defer preds.deinit(allocator);
-
-            if (preds.items.len == 0) continue;
-
-            var definitely_freed = true;
-            var any_freed = false;
-            var any_normal_pred = false;
-            var freed_pred_line: usize = 0;
-            for (preds.items) |pred| {
-                if (block_returns_after_free[pred]) continue;
-                any_normal_pred = true;
-                if (freed_in_block[pred]) {
-                    any_freed = true;
-                    if (freed_line_in_block[pred] > freed_pred_line) {
-                        freed_pred_line = freed_line_in_block[pred];
-                    }
-                } else {
-                    definitely_freed = false;
-                }
-            }
-
-            // Skip if no predecessors freed (first free is ok)
-            if (!any_freed) continue;
-
-            // Check if there's a switch arm or mutually exclusive branch between the two frees
-            // If so, they're in different branches (not a real double-free)
-            var has_exclusive_branch_2 = false;
-            const check_from_line = if (freed_pred_line > 0) freed_pred_line else alloc.freed_line;
-            if (check_from_line > 0 and check_from_line < actual_line) {
-                for (check_from_line + 1..actual_line) |between_line| {
-                    if (between_line < func_line) continue;
-                    const between_idx = between_line - func_line;
-                    if (between_idx >= lines.len) continue;
-                    const between_t = mem.trim(u8, lines[between_idx], " \t\r");
-                    // Switch arm patterns
-                    if (mem.indexOf(u8, between_t, "=>") != null) {
-                        has_exclusive_branch_2 = true;
-                        break;
-                    }
-                    // catch/orelse pattern - mutually exclusive branches
-                    if (mem.indexOf(u8, between_t, "} orelse {") != null or
-                        mem.indexOf(u8, between_t, "} orelse return") != null or
-                        mem.startsWith(u8, between_t, "orelse {") or
-                        mem.eql(u8, between_t, "} orelse {"))
-                    {
-                        has_exclusive_branch_2 = true;
-                        break;
-                    }
-                    // else branch pattern
-                    if (mem.indexOf(u8, between_t, "} else {") != null or
-                        mem.eql(u8, between_t, "} else {"))
-                    {
-                        has_exclusive_branch_2 = true;
-                        break;
-                    }
-                }
-            }
-            if (has_exclusive_branch_2) continue;
-
-            const col = mem.indexOf(u8, t, ".free(") orelse
-                mem.indexOf(u8, t, ".destroy(") orelse 0;
-
-            // Definite double-free: all paths freed
-            if (any_normal_pred and definitely_freed) {
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "double-free: '{s}' freed on {d}",
-                    .{ var_name, if (freed_pred_line > 0) freed_pred_line else alloc.freed_line },
-                );
-                try issues.append(allocator, .{
-                    .file = file_path,
-                    .line = actual_line,
-                    .col = col + 1,
-                    .severity = .err,
-                    .rule = RULE_DOUBLE_FREE,
-                    .message = msg,
-                    .message_owned = true,
-                    .help = "remove duplicate free",
-                });
-            } else if (any_normal_pred and any_freed and !definitely_freed) {
-                // Conditional double-free: some paths freed, some didn't
-                // This is a potential double-free if the branch that freed is taken
-                const msg = try std.fmt.allocPrint(
-                    allocator,
-                    "conditional double-free: '{s}' may be freed on {d}",
-                    .{ var_name, if (freed_pred_line > 0) freed_pred_line else alloc.freed_line },
-                );
-                try issues.append(allocator, .{
-                    .file = file_path,
-                    .line = actual_line,
-                    .col = col + 1,
-                    .severity = .warning,
-                    .rule = RULE_DOUBLE_FREE,
-                    .message = msg,
-                    .message_owned = true,
-                    .help = "move free outside conditional or ensure only one path frees",
-                });
-            }
-        }
+        try detectDoubleFree(
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            file_path,
+            var_name,
+            alloc_info,
+            in_defer,
+            in_errdefer,
+            &bstate,
+            &issues,
+        );
     }
 
     return issues;
+}
+
+/// Per-block free tracking state for memory safety analysis.
+const BlockFreeState = struct {
+    freed_in_block: []bool,
+    block_returns_after_free: []bool,
+    freed_line_in_block: []usize,
+
+    fn deinit(self: *BlockFreeState, a: Allocator) void {
+        a.free(self.freed_in_block);
+        a.free(self.block_returns_after_free);
+        a.free(self.freed_line_in_block);
+    }
+};
+
+fn initBlockFreeState(
+    a: Allocator,
+    n: usize,
+) !BlockFreeState {
+    var s: BlockFreeState = undefined;
+    s.freed_in_block = try a.alloc(bool, n);
+    s.block_returns_after_free = try a.alloc(bool, n);
+    s.freed_line_in_block = try a.alloc(usize, n);
+    @memset(s.freed_in_block, false);
+    @memset(s.block_returns_after_free, false);
+    @memset(s.freed_line_in_block, 0);
+    return s;
+}
+
+fn collectMemSafetyAllocs(
+    allocator: Allocator,
+    lines: []const []const u8,
+    func_line: usize,
+) !std.StringHashMap(CFGAllocation) {
+    var allocs = std.StringHashMap(CFGAllocation).init(allocator);
+    for (lines, 0..) |line, idx| {
+        const actual_line = func_line + idx;
+        const t = mem.trim(u8, line, " \t\r");
+        if (!hasRealAllocPattern(t)) continue;
+        if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t))
+            continue;
+        const alloc_name = extractAllocatorName(t) orelse "";
+        if (isNoFreeAllocatorName(alloc_name)) continue;
+        if (extractVarDeclName(t)) |name| {
+            const col = getRealAllocPos(t) orelse 0;
+            try allocs.put(name, .{
+                .name = name,
+                .alloc_line = actual_line,
+                .alloc_col = col + 1,
+                .state = .allocated,
+                .is_create = hasRealCreatePattern(t),
+            });
+        }
+    }
+    return allocs;
+}
+
+fn shouldSkipForFreeAnalysis(
+    t: []const u8,
+    idx: usize,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+) bool {
+    if (in_errdefer[idx]) return true;
+    if (in_defer[idx]) return true;
+    if (mem.startsWith(u8, t, "defer ")) return true;
+    return isCommentOrMultilineString(t);
+}
+
+fn scanBlocksForFreeOps(
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    var_name: []const u8,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+    alloc_info: *CFGAllocation,
+    bstate: *BlockFreeState,
+) void {
+    for (cfg.blocks.items, 0..) |block, bid| {
+        var free_seen = false;
+        var return_after = false;
+        var free_line: usize = 0;
+        if (block.start_line == 0 or
+            block.start_line > block.end_line) continue;
+        for (block.start_line..block.end_line + 1) |ln| {
+            if (ln < func_line) continue;
+            const idx = ln - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (shouldSkipForFreeAnalysis(
+                t,
+                idx,
+                in_defer,
+                in_errdefer,
+            )) continue;
+            if (hasRealFreePattern(t) and
+                isDirectFreeOfVar(t, var_name))
+            {
+                free_seen = true;
+                free_line = ln;
+            }
+            if (free_seen and mem.startsWith(u8, t, "return"))
+                return_after = true;
+        }
+        bstate.freed_in_block[bid] = free_seen;
+        bstate.freed_line_in_block[bid] = free_line;
+        bstate.block_returns_after_free[bid] = return_after;
+        if (free_seen and alloc_info.freed_line == 0)
+            alloc_info.freed_line = free_line;
+    }
+}
+
+fn hasExclusiveBranchBetween(
+    lines: []const []const u8,
+    from_line: usize,
+    to_line: usize,
+    func_line: usize,
+) bool {
+    if (from_line == 0 or from_line >= to_line) return false;
+    for (from_line + 1..to_line) |ln| {
+        if (ln < func_line) continue;
+        const idx = ln - func_line;
+        if (idx >= lines.len) continue;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (mem.indexOf(u8, t, "=>") != null) return true;
+        if (mem.indexOf(u8, t, "} orelse {") != null or
+            mem.indexOf(u8, t, "} orelse return") != null or
+            mem.startsWith(u8, t, "orelse {"))
+            return true;
+        if (mem.indexOf(u8, t, "} else {") != null)
+            return true;
+    }
+    return false;
+}
+
+fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], vn)) |rel| {
+        const pos = s + rel;
+        s = pos + vn.len;
+        if (pos + vn.len < t.len and isIdent(t[pos + vn.len]))
+            continue;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos > 0 and t[pos - 1] == '.') continue;
+        if (isInsideString(t, pos)) continue;
+        if (isDirectAssignment(t, vn, pos)) continue;
+        return pos;
+    }
+    return null;
+}
+
+const SameBlockFreeResult = struct {
+    freed: bool,
+    intervening_return: bool,
+};
+
+fn checkSameBlockFree(
+    lines: []const []const u8,
+    func_line: usize,
+    block_start: usize,
+    actual_line: usize,
+    var_name: []const u8,
+    alloc_info: *CFGAllocation,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+) SameBlockFreeResult {
+    var freed = false;
+    var ret = false;
+    for (block_start..actual_line) |cl| {
+        if (cl < func_line) continue;
+        const ci = cl - func_line;
+        if (ci >= lines.len) continue;
+        const ct = mem.trim(u8, lines[ci], " \t\r");
+        if (shouldSkipForFreeAnalysis(ct, ci, in_defer, in_errdefer))
+            continue;
+        if (hasRealFreePattern(ct) and isDirectFreeOfVar(ct, var_name)) {
+            freed = true;
+            alloc_info.freed_line = cl;
+        }
+        if (freed and mem.startsWith(u8, ct, "return")) ret = true;
+    }
+    return .{ .freed = freed, .intervening_return = ret };
+}
+
+fn appendUAFIssue(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+    line: usize,
+    col: usize,
+    var_name: []const u8,
+    freed_line: usize,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "use-after-free: '{s}' freed on {d}",
+        .{ var_name, freed_line },
+    );
+    try issues.append(allocator, .{
+        .file = file_path,
+        .line = line,
+        .col = col + 1,
+        .severity = .err,
+        .rule = RULE_USE_AFTER_FREE,
+        .message = msg,
+        .message_owned = true,
+        .help = "don't access freed memory",
+    });
+}
+
+fn checkPredecessorsFreed(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    bid: usize,
+    bstate: *const BlockFreeState,
+) !bool {
+    var preds = try getBlockPredecessors(cfg, bid, allocator);
+    defer preds.deinit(allocator);
+    if (preds.items.len == 0) return false;
+    var def_freed = true;
+    var any_normal = false;
+    for (preds.items) |pred| {
+        if (bstate.block_returns_after_free[pred]) continue;
+        any_normal = true;
+        if (!bstate.freed_in_block[pred]) def_freed = false;
+    }
+    return any_normal and def_freed;
+}
+
+fn detectUseAfterFree(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    var_name: []const u8,
+    alloc_info: *CFGAllocation,
+    in_errdefer: []const bool,
+    in_defer: []const bool,
+    bstate: *const BlockFreeState,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    for (lines, 0..) |line, idx| {
+        const actual_line = func_line + idx;
+        const t = mem.trim(u8, line, " \t\r");
+        if (in_errdefer[idx]) continue;
+        if (mem.startsWith(u8, t, "const ") or
+            mem.startsWith(u8, t, "var ")) continue;
+        if (hasRealFreePattern(t)) continue;
+        if (mem.startsWith(u8, t, "defer")) continue;
+        if (isCommentOrMultilineString(t)) continue;
+
+        const use_col = findVarUseOnLine(t, var_name) orelse
+            continue;
+        const bid = findBlockForLine(cfg, actual_line) orelse
+            continue;
+        const bs = cfg.blocks.items[bid].start_line;
+        if (bs == 0 or bs > actual_line) continue;
+
+        const sbf = checkSameBlockFree(
+            lines,
+            func_line,
+            bs,
+            actual_line,
+            var_name,
+            alloc_info,
+            in_defer,
+            in_errdefer,
+        );
+        if (sbf.freed and !sbf.intervening_return) {
+            try appendUAFIssue(
+                allocator,
+                issues,
+                file_path,
+                actual_line,
+                use_col,
+                var_name,
+                alloc_info.freed_line,
+            );
+            continue;
+        }
+        if (try checkPredecessorsFreed(
+            allocator,
+            cfg,
+            bid,
+            bstate,
+        )) {
+            if (alloc_info.freed_line > 0) {
+                try appendUAFIssue(
+                    allocator,
+                    issues,
+                    file_path,
+                    actual_line,
+                    use_col,
+                    var_name,
+                    alloc_info.freed_line,
+                );
+            }
+        }
+    }
+}
+
+fn appendDoubleFreeIssue(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+    t: []const u8,
+    line: usize,
+    var_name: []const u8,
+    freed_line: usize,
+    severity: Severity,
+    help: []const u8,
+) !void {
+    const col = mem.indexOf(u8, t, ".free(") orelse
+        mem.indexOf(u8, t, ".destroy(") orelse 0;
+    const pfx = if (severity == .warning) "conditional " else "";
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "{s}double-free: '{s}' freed on {d}",
+        .{ pfx, var_name, freed_line },
+    );
+    try issues.append(allocator, .{
+        .file = file_path,
+        .line = line,
+        .col = col + 1,
+        .severity = severity,
+        .rule = RULE_DOUBLE_FREE,
+        .message = msg,
+        .message_owned = true,
+        .help = help,
+    });
+}
+
+fn detectDoubleFree(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    var_name: []const u8,
+    alloc_info: *CFGAllocation,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+    bstate: *const BlockFreeState,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    for (lines, 0..) |line, idx| {
+        const actual_line = func_line + idx;
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.startsWith(u8, t, "defer ") or
+            mem.startsWith(u8, t, "errdefer ")) continue;
+        if (isCommentOrMultilineString(t)) continue;
+        if (!hasRealFreePattern(t)) continue;
+        if (!isDirectFreeOfVar(t, var_name)) continue;
+
+        const bid = findBlockForLine(cfg, actual_line) orelse
+            continue;
+        const bs = cfg.blocks.items[bid].start_line;
+        if (bs == 0 or bs > actual_line) continue;
+
+        const sbf = checkSameBlockFree(
+            lines,
+            func_line,
+            bs,
+            actual_line,
+            var_name,
+            alloc_info,
+            in_defer,
+            in_errdefer,
+        );
+        if (sbf.freed) {
+            if (hasExclusiveBranchBetween(
+                lines,
+                alloc_info.freed_line,
+                actual_line,
+                func_line,
+            )) continue;
+            try appendDoubleFreeIssue(
+                allocator,
+                issues,
+                file_path,
+                t,
+                actual_line,
+                var_name,
+                alloc_info.freed_line,
+                .err,
+                "remove duplicate free",
+            );
+            continue;
+        }
+
+        try detectCrossBlockDoubleFree(
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            file_path,
+            t,
+            actual_line,
+            bid,
+            var_name,
+            alloc_info,
+            bstate,
+            issues,
+        );
+    }
+}
+
+fn detectCrossBlockDoubleFree(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    t: []const u8,
+    actual_line: usize,
+    bid: usize,
+    var_name: []const u8,
+    alloc_info: *CFGAllocation,
+    bstate: *const BlockFreeState,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var preds = try getBlockPredecessors(cfg, bid, allocator);
+    defer preds.deinit(allocator);
+    if (preds.items.len == 0) return;
+
+    var def_freed = true;
+    var any_freed = false;
+    var any_normal = false;
+    var freed_pred_line: usize = 0;
+    for (preds.items) |pred| {
+        if (bstate.block_returns_after_free[pred]) continue;
+        any_normal = true;
+        if (bstate.freed_in_block[pred]) {
+            any_freed = true;
+            const pl = bstate.freed_line_in_block[pred];
+            if (pl > freed_pred_line) freed_pred_line = pl;
+        } else {
+            def_freed = false;
+        }
+    }
+    if (!any_freed) return;
+
+    const ref = if (freed_pred_line > 0)
+        freed_pred_line
+    else
+        alloc_info.freed_line;
+    if (hasExclusiveBranchBetween(lines, ref, actual_line, func_line))
+        return;
+
+    if (any_normal and def_freed) {
+        try appendDoubleFreeIssue(
+            allocator,
+            issues,
+            file_path,
+            t,
+            actual_line,
+            var_name,
+            ref,
+            .err,
+            "remove duplicate free",
+        );
+    } else if (any_normal and any_freed and !def_freed) {
+        try appendDoubleFreeIssue(
+            allocator,
+            issues,
+            file_path,
+            t,
+            actual_line,
+            var_name,
+            ref,
+            .warning,
+            "move free outside conditional",
+        );
+    }
 }
 
 // ============================================================================
@@ -2202,7 +2300,11 @@ fn removeImmediateDeferAllocs(
 const OwnerVar = struct { name: []const u8 };
 
 /// Add a new owner if not already tracked
-fn tryAddOwner(allocator: Allocator, owner_vars: *std.ArrayListUnmanaged(OwnerVar), name: []const u8) !void {
+fn tryAddOwner(
+    allocator: Allocator,
+    owner_vars: *std.ArrayListUnmanaged(OwnerVar),
+    name: []const u8,
+) !void {
     for (owner_vars.items) |ov| {
         if (mem.eql(u8, ov.name, name)) return;
     }
@@ -3193,7 +3295,11 @@ const ImportGraph = struct {
             const trimmed = mem.trimRight(u8, cfg.path, "/");
             const parent = std.fs.path.dirname(trimmed) orelse ".";
             {
-                const check = std.fmt.allocPrint(self.allocator, "{s}/build.zig", .{parent}) catch return;
+                const check = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/build.zig",
+                    .{parent},
+                ) catch return;
                 defer self.allocator.free(check);
                 if (fs.cwd().access(check, .{})) |_| {
                     break :br fs.cwd().realpath(parent, &root_buf) catch return;
@@ -3201,7 +3307,11 @@ const ImportGraph = struct {
             }
             // 3. Try target path itself
             {
-                const check = std.fmt.allocPrint(self.allocator, "{s}/build.zig", .{trimmed}) catch return;
+                const check = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/build.zig",
+                    .{trimmed},
+                ) catch return;
                 defer self.allocator.free(check);
                 if (fs.cwd().access(check, .{})) |_| {
                     break :br fs.cwd().realpath(trimmed, &root_buf) catch return;
@@ -3270,6 +3380,134 @@ const ImportGraph = struct {
         // Sub-projects (e.g., tigerbeetle/src/docs_website/) have their own build.zig
         // that references their source files.
         try self.discoverNestedBuildFiles(cfg);
+
+        // Resolve build-system module imports to directories.
+        try self.markBuildModuleDirectories(cfg);
+    }
+
+    /// Scan reachable files for unresolved module-name imports
+    /// (e.g. @import("arch"), @import("kernel")) and resolve them
+    /// to matching directories in the project tree.
+    fn markBuildModuleDirectories(
+        self: *ImportGraph,
+        cfg: *const Config,
+    ) !void {
+        var module_names: std.StringHashMapUnmanaged(void) = .{};
+        defer {
+            var fi = module_names.iterator();
+            while (fi.next()) |fe| self.allocator.free(fe.key_ptr.*);
+            module_names.deinit(self.allocator);
+        }
+
+        var file_iter = self.files.iterator();
+        while (file_iter.next()) |entry| {
+            var rb: [fs.max_path_bytes]u8 = undefined;
+            const norm = fs.cwd().realpath(
+                entry.key_ptr.*,
+                &rb,
+            ) catch continue;
+            if (!self.reachable.contains(norm)) continue;
+            for (entry.value_ptr.imports.items) |imp| {
+                // Skip file-path imports that resolved to actual files
+                if (imp.resolved) |resolved| {
+                    // If resolved path is in our files map, it's a real import
+                    if (self.findImportsForPath(resolved) != null) continue;
+                    // Otherwise it might be a directory - treat as module
+                }
+                if (mem.endsWith(u8, imp.path, ".zig")) continue;
+                if (mem.indexOf(u8, imp.path, ".") != null) continue;
+                if (mem.indexOf(u8, imp.path, "/") != null) continue;
+                if (mem.eql(u8, imp.path, "std")) continue;
+                if (mem.eql(u8, imp.path, "builtin")) continue;
+                if (module_names.contains(imp.path)) continue;
+                const d = self.allocator.dupe(u8, imp.path) catch continue;
+                module_names.put(self.allocator, d, {}) catch {
+                    self.allocator.free(d);
+                    continue;
+                };
+            }
+        }
+
+        if (module_names.count() == 0) return;
+
+        const trimmed = mem.trimRight(u8, cfg.path, "/");
+        var search_roots: [2][]const u8 = undefined;
+        var rc: usize = 0;
+        const par = std.fs.path.dirname(trimmed) orelse ".";
+        var rb1: [fs.max_path_bytes]u8 = undefined;
+        if (fs.cwd().realpath(par, &rb1)) |r| {
+            const o = self.allocator.dupe(u8, r) catch "";
+            if (o.len > 0) {
+                search_roots[rc] = o;
+                rc += 1;
+            }
+        } else |_| {}
+        var rb2: [fs.max_path_bytes]u8 = undefined;
+        if (fs.cwd().realpath(trimmed, &rb2)) |r| {
+            const o = self.allocator.dupe(u8, r) catch "";
+            if (o.len > 0) {
+                search_roots[rc] = o;
+                rc += 1;
+            }
+        } else |_| {}
+        defer for (search_roots[0..rc]) |r| {
+            if (r.len > 0) self.allocator.free(r);
+        };
+
+        var mi = module_names.iterator();
+        while (mi.next()) |me| {
+            for (search_roots[0..rc]) |root| {
+                self.findAndMarkModuleDir(root, me.key_ptr.*, 3) catch continue;
+            }
+        }
+    }
+
+    /// Search for a directory matching mod_name and mark all .zig
+    /// files inside it as reachable. Depth-limited.
+    fn findAndMarkModuleDir(
+        self: *ImportGraph,
+        search_dir: []const u8,
+        mod_name: []const u8,
+        depth: usize,
+    ) !void {
+        if (depth == 0) return;
+        var dir = fs.cwd().openDir(
+            search_dir,
+            .{ .iterate = true },
+        ) catch return;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            if (isSkippableDir(entry.name)) continue;
+            const full = std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ search_dir, entry.name },
+            ) catch continue;
+            defer self.allocator.free(full);
+            if (mem.eql(u8, entry.name, mod_name)) {
+                self.markAllZigFilesReachable(full) catch continue;
+            } else {
+                self.findAndMarkModuleDir(
+                    full,
+                    mod_name,
+                    depth - 1,
+                ) catch continue;
+            }
+        }
+    }
+
+    fn isSkippableDir(name: []const u8) bool {
+        const skip = [_][]const u8{
+            ".git",       "zig-out",   "zig-cache",
+            ".zig-cache", ".build",    "node_modules",
+            "deps",       ".packages", "vendor",
+        };
+        for (skip) |s| {
+            if (mem.eql(u8, name, s)) return true;
+        }
+        return false;
     }
 
     /// Discover nested build.zig files in subdirectories and mark their
@@ -3897,8 +4135,9 @@ fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
                     if (name_end == 0) break;
                     // Check for function/method name character
                     if (isIdent(t[name_end - 1])) {
-                        // Skip: if the function IS the alloc_name itself (alloc_name.method() pattern)
-                        // or if this is the allocation itself (try allocator.alloc(T, size))
+                        // Skip: if the function IS the alloc_name itself
+                        // (alloc_name.method() pattern) or if this is
+                        // the allocation itself (try allocator.alloc(T, size))
                         var fname_start = name_end - 1;
                         while (fname_start > 0 and isIdent(t[fname_start - 1])) fname_start -= 1;
                         const fname = t[fname_start..name_end];
@@ -4115,13 +4354,15 @@ const best_effort_ops = [_][]const u8{
     ".setName(",              ".notify(",              ".wakeup(",               ".signal(",
     ".yield(",                ".timedWait(",
     // Reader/stream - partial reads are best-effort
-    ".fillMore(",             ".skipUntilDelimiter",   ".discardDelimiter",
+              ".fillMore(",             ".skipUntilDelimiter",
+    ".discardDelimiter",
     // Display/format - rendering failures are non-fatal
-    ".formatDiagram(",        ".printString(",
+         ".formatDiagram(",       ".printString(",
     // State changes - setting attributes/selection/callbacks best-effort
-    ".setSelection(",         ".setAttribute(",        ".preeditCallback(",
+             ".setSelection(",
+    ".setAttribute(",         ".preeditCallback(",
     // Error logging - logging an error that already happened
-    ".fromShader(",           ".fromProgram(",
+        ".fromShader(",           ".fromProgram(",
     // System calls - OS tuning best-effort
     "setrlimit(",
 };
@@ -4176,7 +4417,12 @@ fn checkSilentCatch(t: []const u8, path: []const u8, line: usize) ?Issue {
 }
 
 /// Context-aware silent catch check
-fn checkSilentCatchWithContext(t: []const u8, path: []const u8, line: usize, func_name: []const u8) ?Issue {
+fn checkSilentCatchWithContext(
+    t: []const u8,
+    path: []const u8,
+    line: usize,
+    func_name: []const u8,
+) ?Issue {
     // In defer/errdefer, catch {} is intentional for best-effort cleanup
     if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) {
         return null;
@@ -5151,7 +5397,8 @@ fn analyzeFileErrors(
                         .severity = .warning,
                         .rule = RULE_EXIT_BYPASSES_DEFER,
                         .message = "std.process.exit() bypasses all defers in current scope",
-                        .help = "set a flag and exit at end of function, or return error to let defers run",
+                        .help = "set a flag and exit at end of function, or " ++
+                            "return error to let defers run",
                     });
                 }
             }
@@ -6212,7 +6459,17 @@ fn analyzeCFGFile(
                     // Process the previous (outer) function before starting the nested one
                     // Skip if it's too short (likely just a type-returning stub)
                     if (func_lines.items.len >= 3) {
-                        try processFunction(allocator, issues, file_path, prev_func_name, prev_func_start, func_lines.items, false, prev_func_in_test, false);
+                        try processFunction(
+                            allocator,
+                            issues,
+                            file_path,
+                            prev_func_name,
+                            prev_func_start,
+                            func_lines.items,
+                            false,
+                            prev_func_in_test,
+                            false,
+                        );
                     }
                     func_lines.clearRetainingCapacity();
                 }
@@ -6554,7 +6811,10 @@ fn trackReturnAndStore(
     const debug_enabled = false;
     if (debug_enabled) {
         if (was_in_return or state.in_return) {
-            std.debug.print("LINE {}: was_in_return={}, now_in_return={}, brace_depth={}\n", .{ debug_line, was_in_return, state.in_return, state.brace_depth });
+            std.debug.print(
+                "LINE {}: was_ret={}, now_ret={}, depth={}\n",
+                .{ debug_line, was_in_return, state.in_return, state.brace_depth },
+            );
             std.debug.print("  content: {s}\n", .{t});
         }
     }
@@ -6954,10 +7214,10 @@ fn analyzeFunction(
 
                 // Ownership transfer via method call: .put(alias), .append(alias), etc.
                 const transfer_methods = [_][]const u8{
-                    ".put(",          ".putNoClobber(", ".append(",       ".appendSlice(",
-                    ".insert(",       ".add(",          ".push(",         ".enqueue(",
-                    ".submit(",       ".toJS(",         ".toValue(",      ".toSlice(",
-                    ".toOwnedSlice(", ".dependOn(",     ".setText(",      ".clone(",
+                    ".put(",          ".putNoClobber(", ".append(",  ".appendSlice(",
+                    ".insert(",       ".add(",          ".push(",    ".enqueue(",
+                    ".submit(",       ".toJS(",         ".toValue(", ".toSlice(",
+                    ".toOwnedSlice(", ".dependOn(",     ".setText(", ".clone(",
                     ".addText(",      ".strHash(",
                 };
                 for (transfer_methods) |method| {
@@ -6967,8 +7227,9 @@ fn analyzeFunction(
                     }
                 }
 
-                // Function argument ownership transfer: someFunc(alloc_name, ...) or someFunc(alloc_name)
-                // This catches cases where allocation is passed as argument to any function
+                // Function argument ownership transfer:
+                // someFunc(alloc_name, ...) or someFunc(alloc_name)
+                // Catches allocation passed as argument to any function
                 if (!allocs.items[ai].ownership_transferred) {
                     if (isFunctionArgTransfer(t, alias)) {
                         allocs.items[ai].ownership_transferred = true;
@@ -7426,19 +7687,36 @@ fn analyzeCFGErrors(
                 }
             }
 
-            // ZA203: orelse unreachable - skip in test context (intentional fail-fast)
+            // ZA203: orelse unreachable - skip in test context
+            // Also skip if variable was null-checked earlier in scope
             if (!is_test_ctx) {
                 if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
                     if (!isInsideString(t, col)) {
-                        try issues.append(allocator, .{
-                            .file = file_path,
-                            .line = line_num,
-                            .col = col + 1,
-                            .severity = .warning,
-                            .rule = RULE_ORELSE_UNREACHABLE,
-                            .message = "orelse unreachable will panic on null",
-                            .help = "use explicit null handling",
-                        });
+                        // Extract var name before "orelse unreachable"
+                        const guarded = blk: {
+                            const vn = extractOrelseVar(t, col);
+                            if (vn) |name| {
+                                // Scan backward for null guard
+                                if (hasNullGuard(
+                                    lines,
+                                    idx,
+                                    func_line,
+                                    name,
+                                )) break :blk true;
+                            }
+                            break :blk false;
+                        };
+                        if (!guarded) {
+                            try issues.append(allocator, .{
+                                .file = file_path,
+                                .line = line_num,
+                                .col = col + 1,
+                                .severity = .warning,
+                                .rule = RULE_ORELSE_UNREACHABLE,
+                                .message = "orelse unreachable will panic",
+                                .help = "use explicit null handling",
+                            });
+                        }
                     }
                 }
             }
@@ -7446,6 +7724,68 @@ fn analyzeCFGErrors(
     }
 
     return issues;
+}
+
+/// Extract variable name before "orelse unreachable"
+/// Pattern: "x orelse unreachable" or "x.field orelse unreachable"
+fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
+    if (orelse_col == 0) return null;
+    // Walk backward from "orelse" to find the variable name
+    var end = orelse_col;
+    // Skip whitespace before "orelse"
+    while (end > 0 and t[end - 1] == ' ') end -= 1;
+    if (end == 0) return null;
+    // Walk backward through identifier chars (and dots for field access)
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.'))
+        start -= 1;
+    if (start >= end) return null;
+    const name = t[start..end];
+    // Strip leading dot if present
+    if (name.len > 0 and name[0] == '.') return name[1..];
+    return name;
+}
+
+/// Check if a variable has a null guard earlier in the function
+/// Patterns: "if (name == null) return/continue/break"
+///           "if (name == null) { return/continue/break"
+fn hasNullGuard(
+    lines: []const []const u8,
+    current_idx: usize,
+    func_line: usize,
+    name: []const u8,
+) bool {
+    // Scan backward from current line
+    var i = current_idx;
+    while (i > 0) {
+        i -= 1;
+        const line = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(line)) continue;
+        // Check for: if (name == null) return/continue/break
+        if (mem.indexOf(u8, line, name)) |_| {
+            if (mem.indexOf(u8, line, "== null")) |_| {
+                // Has early exit after null check?
+                if (mem.indexOf(u8, line, "return") != null or
+                    mem.indexOf(u8, line, "continue") != null or
+                    mem.indexOf(u8, line, "break") != null)
+                {
+                    return true;
+                }
+                // Multi-line: check next line for the exit
+                if (i + 1 < current_idx) {
+                    const next = mem.trim(u8, lines[i + 1], " \t\r");
+                    if (mem.startsWith(u8, next, "return") or
+                        mem.startsWith(u8, next, "continue") or
+                        mem.startsWith(u8, next, "break"))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    _ = func_line;
+    return false;
 }
 
 /// Extract variable name from null check pattern
@@ -7506,7 +7846,11 @@ fn extractUnwrappedVar(t: []const u8, dot_q_pos: usize) ?[]const u8 {
 /// Check for early return null guard on prior lines
 /// Zig idiom: if (x == null) { return; } guarantees x is non-null after
 /// This is based on Zig control flow - early exit from null check guards subsequent code
-fn hasEarlyReturnNullGuard(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+fn hasEarlyReturnNullGuard(
+    lines: []const []const u8,
+    current_idx: usize,
+    var_name: []const u8,
+) bool {
     // Look backwards within the function
     const check_start = if (current_idx > 20) current_idx - 20 else 0;
 
@@ -7736,7 +8080,8 @@ fn analyzeCFGPanicPatterns(
                         .severity = .warning,
                         .rule = RULE_DECREMENT_WITHOUT_CHECK,
                         .message = "decrement without overflow guard may panic",
-                        .help = "add guard (if/while/assert x > 0), use saturating arithmetic (-|), or document caller contract",
+                        .help = "add guard (if/while/assert x > 0) " ++
+                            "or use saturating arithmetic (-|)",
                     });
                     try reported_lines.put(line_num, {});
                 }
@@ -7775,7 +8120,8 @@ fn analyzeCFGPanicPatterns(
 
                 // Skip if in else/else-if branch with inverted guard
                 // Pattern: if (x.len < 4) { ... } else { x[x.len - x.len/4] } - safe
-                // Pattern: if (x <= 30) { ... } else if (x <= 120) { arr[divFloor(x,10) - 1] } - safe
+                // Pattern: if (x <= 30) { ... } else if (x <= 120)
+                //   { arr[divFloor(x,10) - 1] } - safe
                 if (hasElseBranchGuard(lines, idx)) continue;
 
                 // Skip if in comptime block (compiler catches overflow at compile time)
@@ -7801,7 +8147,8 @@ fn analyzeCFGPanicPatterns(
                     .severity = .warning,
                     .rule = RULE_INDEX_ARITHMETIC,
                     .message = "arithmetic in array index may overflow",
-                    .help = "ensure index arithmetic cannot underflow, or use saturating subtraction -|",
+                    .help = "ensure index arithmetic cannot underflow" ++
+                        ", or use saturating subtraction -|",
                 });
                 try reported_lines.put(line_num, {});
             }
@@ -8013,7 +8360,9 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
 
         // Check for endsWith or startsWith patterns in assert
         // Pattern: assert(mem.endsWith(...)) or std.debug.assert(std.mem.endsWith(...))
-        if (mem.indexOf(u8, ctx, "endsWith(") != null or mem.indexOf(u8, ctx, "startsWith(") != null) {
+        if (mem.indexOf(u8, ctx, "endsWith(") != null or
+            mem.indexOf(u8, ctx, "startsWith(") != null)
+        {
             // If there's an assert on this line, it's a guard
             if (mem.indexOf(u8, ctx, "assert(") != null) return true;
             if (mem.indexOf(u8, ctx, "assert (") != null) return true;
@@ -8027,7 +8376,11 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
 /// Check for break/continue guard on prior lines within same loop body
 /// Pattern: while (true) { if (x == 0) break; x -= 1; }
 /// Based on Zig control flow semantics - break/continue/return exits prevent reaching decrement
-fn hasBreakGuardOnPriorLines(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+fn hasBreakGuardOnPriorLines(
+    lines: []const []const u8,
+    current_idx: usize,
+    var_name: []const u8,
+) bool {
     // Look back up to 10 lines for a guard pattern
     const check_start = if (current_idx > 10) current_idx - 10 else 0;
     var brace_depth: i32 = 0;
@@ -8049,8 +8402,10 @@ fn hasBreakGuardOnPriorLines(lines: []const []const u8, current_idx: usize, var_
         // Stop at loop boundary ONLY if we're at or above the same nesting level
         // If brace_depth < 0, we're inside the loop (it's our enclosing scope) - don't stop
         if (brace_depth >= 0) {
-            if (mem.startsWith(u8, ctx, "while ") or mem.startsWith(u8, ctx, "while(")) return false;
-            if (mem.startsWith(u8, ctx, "for ") or mem.startsWith(u8, ctx, "for(")) return false;
+            if (mem.startsWith(u8, ctx, "while ") or
+                mem.startsWith(u8, ctx, "while(")) return false;
+            if (mem.startsWith(u8, ctx, "for ") or
+                mem.startsWith(u8, ctx, "for(")) return false;
         }
 
         // Check for if (var == 0) break/continue/return pattern
@@ -8126,7 +8481,11 @@ fn hasAssertGeGuard(lines: []const []const u8, current_idx: usize, var_name: []c
 /// Pattern: if (x.len < N) return; ... x[x.len - M] where M <= N
 /// Pattern: if (x.len == 0) return; ... x[x.len - 1]
 /// Pattern: if (x.len == 1) { return null; } ... x[... x.len - 1]
-fn hasEarlyReturnLengthGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
+fn hasEarlyReturnLengthGuard(
+    lines: []const []const u8,
+    current_idx: usize,
+    current_line: []const u8,
+) bool {
     _ = current_line;
     const check_start = if (current_idx > 30) current_idx - 30 else 0;
 
@@ -8183,9 +8542,17 @@ fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line:
 
     // Get subtrahend (the number being subtracted)
     var sub_end = sub_pos + 3;
-    while (sub_end < current_line.len and current_line[sub_end] >= '0' and current_line[sub_end] <= '9') : (sub_end += 1) {}
+    while (sub_end < current_line.len and
+        current_line[sub_end] >= '0' and
+        current_line[sub_end] <= '9') : (sub_end += 1)
+    {}
     if (sub_end == sub_pos + 3) return false; // Not a numeric literal
-    const subtrahend = std.fmt.parseInt(usize, current_line[sub_pos + 3 .. sub_end], 10) catch return false;
+    const sub_slice = current_line[sub_pos + 3 .. sub_end];
+    const subtrahend = std.fmt.parseInt(
+        usize,
+        sub_slice,
+        10,
+    ) catch return false;
 
     // Search backwards for the loop init: var idx_var = N or var idx_var: T = N
     const check_start = if (current_idx > 20) current_idx - 20 else 0;
@@ -8236,7 +8603,11 @@ fn extractIndexSubVar(t: []const u8) ?[]const u8 {
 /// Check if current line is inside an enclosing block guarded by if/while (var > 0)
 /// Pattern: if (x > 0) { ... arr[x - 1] ... } - x guaranteed >= 1
 /// Pattern: while (cols_len > 0) { ... cells[cols_len - 1] ... }
-fn hasEnclosingBlockGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
+fn hasEnclosingBlockGuard(
+    lines: []const []const u8,
+    current_idx: usize,
+    current_line: []const u8,
+) bool {
     // Extract the variable being subtracted in the array index
     const sub_var = extractIndexSubVar(current_line) orelse return false;
 
@@ -8259,9 +8630,11 @@ fn hasEnclosingBlockGuard(lines: []const []const u8, current_idx: usize, current
             // Check if this line has a guard for our variable
             if (mem.indexOf(u8, ctx, sub_var)) |_| {
                 // if (var > 0) or while (var > 0)
-                if (mem.indexOf(u8, ctx, "if ") != null or mem.indexOf(u8, ctx, "if(") != null or
-                    mem.indexOf(u8, ctx, "while ") != null or mem.indexOf(u8, ctx, "while(") != null)
-                {
+                const has_cond = mem.indexOf(u8, ctx, "if ") != null or
+                    mem.indexOf(u8, ctx, "if(") != null or
+                    mem.indexOf(u8, ctx, "while ") != null or
+                    mem.indexOf(u8, ctx, "while(") != null;
+                if (has_cond) {
                     if (mem.indexOf(u8, ctx, "> 0") != null) return true;
                     if (mem.indexOf(u8, ctx, ">= 1") != null) return true;
                     if (mem.indexOf(u8, ctx, "!= 0") != null) return true;
@@ -8297,9 +8670,11 @@ fn hasEnclosingVarGuard(lines: []const []const u8, current_idx: usize, var_name:
 
         if (brace_depth < 0) {
             if (mem.indexOf(u8, ctx, var_name)) |_| {
-                if (mem.indexOf(u8, ctx, "if ") != null or mem.indexOf(u8, ctx, "if(") != null or
-                    mem.indexOf(u8, ctx, "while ") != null or mem.indexOf(u8, ctx, "while(") != null)
-                {
+                const has_cond = mem.indexOf(u8, ctx, "if ") != null or
+                    mem.indexOf(u8, ctx, "if(") != null or
+                    mem.indexOf(u8, ctx, "while ") != null or
+                    mem.indexOf(u8, ctx, "while(") != null;
+                if (has_cond) {
                     if (mem.indexOf(u8, ctx, "> 0") != null) return true;
                     if (mem.indexOf(u8, ctx, ">= 1") != null) return true;
                     if (mem.indexOf(u8, ctx, "!= 0") != null) return true;
@@ -8407,7 +8782,9 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
         // We found the line that starts our block
         if (brace_depth > 0) {
             // Check if this line is an else or else-if
-            if (mem.indexOf(u8, ctx, "} else ") != null or mem.indexOf(u8, ctx, "} else{") != null) {
+            if (mem.indexOf(u8, ctx, "} else ") != null or
+                mem.indexOf(u8, ctx, "} else{") != null)
+            {
                 // We're in an else block - look for the preceding if condition
                 // The pattern is: if (x < N) { ... } else { WE ARE HERE }
                 // Find the matching if
@@ -8426,8 +8803,10 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
 
                     // When depth reaches 0, we found the if statement
                     if (if_search_depth == 0) {
-                        // Check for comparison patterns in the if condition
-                        if (mem.indexOf(u8, if_ctx, "if (") != null or mem.indexOf(u8, if_ctx, "if(") != null) {
+                        // Check for comparison patterns in the if
+                        const has_if = mem.indexOf(u8, if_ctx, "if (") != null or
+                            mem.indexOf(u8, if_ctx, "if(") != null;
+                        if (has_if) {
                             // if (x < N) - in else, x >= N
                             if (mem.indexOf(u8, if_ctx, ".len < ") != null) return true;
                             if (mem.indexOf(u8, if_ctx, " < ") != null) return true;
@@ -8444,7 +8823,9 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
             }
 
             // Check for else-if: } else if (condition)
-            if (mem.indexOf(u8, ctx, "} else if") != null or mem.indexOf(u8, ctx, "}else if") != null) {
+            if (mem.indexOf(u8, ctx, "} else if") != null or
+                mem.indexOf(u8, ctx, "}else if") != null)
+            {
                 // We're in an else-if block - the prior if's condition is inverted
                 var if_search_depth_2: i32 = 1;
                 var j2 = i;
@@ -8459,8 +8840,10 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
                     }
 
                     if (if_search_depth_2 == 0) {
-                        // Pattern: if (x <= N) { ... } else if (...) - we know x > N
-                        if (mem.indexOf(u8, if_ctx, "if (") != null or mem.indexOf(u8, if_ctx, "if(") != null) {
+                        // if (x <= N) ... else if - we know x > N
+                        const has_if2 = mem.indexOf(u8, if_ctx, "if (") != null or
+                            mem.indexOf(u8, if_ctx, "if(") != null;
+                        if (has_if2) {
                             if (mem.indexOf(u8, if_ctx, " <= ") != null) return true;
                             if (mem.indexOf(u8, if_ctx, " < ") != null) return true;
                         }
@@ -8577,7 +8960,11 @@ fn checkDecrementWithoutGuard(
             var var_end = col;
             while (var_end > 0 and t[var_end - 1] == ' ') var_end -= 1;
             var var_start = var_end;
-            while (var_start > 0 and (isIdent(t[var_start - 1]) or t[var_start - 1] == '.')) var_start -= 1;
+            while (var_start > 0 and
+                (isIdent(t[var_start - 1]) or t[var_start - 1] == '.'))
+            {
+                var_start -= 1;
+            }
 
             if (var_start >= var_end) continue;
             const var_name = t[var_start..var_end];
@@ -8600,8 +8987,9 @@ fn checkDecrementWithoutGuard(
 
             if (!has_guard) {
                 // Skip if variable is declared as a signed type (can't overflow)
-                const check_start_signed = if (current_idx > 10) current_idx - 10 else 0;
-                if (isSignedTypeDecl(context_lines[check_start_signed .. current_idx + 1], var_name)) {
+                const cs = if (current_idx > 10) current_idx - 10 else 0;
+                const signed_ctx = context_lines[cs .. current_idx + 1];
+                if (isSignedTypeDecl(signed_ctx, var_name)) {
                     continue;
                 }
 
@@ -8630,7 +9018,9 @@ fn checkDecrementWithoutGuard(
                     .severity = .warning,
                     .rule = RULE_DECREMENT_WITHOUT_CHECK,
                     .message = "decrement without overflow guard may panic",
-                    .help = "add guard (if/while/assert x > 0), use saturating arithmetic (-|), or document caller contract",
+                    .help = "add guard (if/while/assert x > 0), " ++
+                        "use saturating arithmetic (-|), " ++
+                        "or document caller contract",
                 });
                 return; // One issue per line
             }
@@ -8661,7 +9051,8 @@ fn hasPairedIncrement(context_lines: []const []const u8, var_name: []const u8) b
             if (mem.startsWith(u8, after_var, " += 1") or
                 mem.startsWith(u8, after_var, "+=1") or
                 mem.startsWith(u8, after_var, " += 1;") or
-                (mem.startsWith(u8, after_var, " = ") and mem.indexOf(u8, after_var, "+ 1") != null))
+                (mem.startsWith(u8, after_var, " = ") and
+                    mem.indexOf(u8, after_var, "+ 1") != null))
             {
                 return true;
             }
@@ -8839,7 +9230,8 @@ fn checkSubtractionOverflow(
                         .severity = .warning,
                         .rule = RULE_INDEX_ARITHMETIC,
                         .message = "arithmetic in array index may overflow",
-                        .help = "ensure index arithmetic cannot underflow, or use saturating subtraction -|",
+                        .help = "ensure index arithmetic cannot " ++
+                            "underflow, or use saturating subtraction -|",
                     });
                     return;
                 }
@@ -8923,8 +9315,24 @@ fn analyzePanicPatterns(
             // Skip test blocks (intentional panic testing is common)
             if (mem.indexOf(u8, t, "testing.expect") != null) continue;
 
-            try checkDecrementWithoutGuard(&issues, allocator, file_path, t, line_num, context_lines, idx);
-            try checkSubtractionOverflow(&issues, allocator, file_path, t, line_num, context_lines, idx);
+            try checkDecrementWithoutGuard(
+                &issues,
+                allocator,
+                file_path,
+                t,
+                line_num,
+                context_lines,
+                idx,
+            );
+            try checkSubtractionOverflow(
+                &issues,
+                allocator,
+                file_path,
+                t,
+                line_num,
+                context_lines,
+                idx,
+            );
         }
     }
 
@@ -9313,7 +9721,8 @@ fn extractFileLocation(text: []const u8) FileLocation {
                     line_end += 1;
                 }
                 if (line_end > file_end + 1) {
-                    const line_num = std.fmt.parseInt(usize, text[file_end + 1 .. line_end], 10) catch 0;
+                    const line_slice = text[file_end + 1 .. line_end];
+                    const line_num = std.fmt.parseInt(usize, line_slice, 10) catch 0;
                     return .{
                         .file = text[start..file_end],
                         .line = line_num,
@@ -9414,6 +9823,13 @@ fn isOrphanExcluded(path: []const u8, cfg: *const Config) bool {
 
     // Build helper files commonly referenced from build.zig
     if (mem.endsWith(u8, path, "/build_options.zig")) return true;
+
+    // Standalone program directories (singular forms)
+    if (mem.indexOf(u8, path, "/tool/") != null) return true;
+    if (mem.indexOf(u8, path, "/user/") != null) return true;
+    if (mem.indexOf(u8, path, "/apps/") != null) return true;
+    if (mem.indexOf(u8, path, "/app/") != null) return true;
+    if (mem.indexOf(u8, path, "/cmd/") != null) return true;
 
     return false;
 }
@@ -9982,7 +10398,8 @@ fn runInstallCommand(allocator: Allocator) !void {
     }
 }
 
-/// Patch build.zig to add ephor step. Returns line number where inserted, or null if already exists.
+/// Patch build.zig to add ephor step. Returns line number
+/// where inserted, or null if already exists.
 fn patchBuildZig(allocator: Allocator) !?usize {
     const file = fs.cwd().openFile("build.zig", .{ .mode = .read_only }) catch |err| {
         if (err == error.FileNotFound) {
@@ -10088,7 +10505,10 @@ fn patchBuildZig(allocator: Allocator) !?usize {
 fn runUpgradeCommand(allocator: Allocator) !void {
     // Check if build.zig.zon exists and has ephor dependency
     const has_ephor = blk: {
-        const file = fs.cwd().openFile("build.zig.zon", .{ .mode = .read_only }) catch break :blk false;
+        const file = fs.cwd().openFile(
+            "build.zig.zon",
+            .{ .mode = .read_only },
+        ) catch break :blk false;
         defer file.close();
         const content = file.readToEndAlloc(allocator, 64 * 1024) catch break :blk false;
         defer allocator.free(content);
@@ -10465,7 +10885,11 @@ fn scanDirForEntriesWithPrefix(
                 mem.eql(u8, entry.name, "root.zig") or
                 mem.endsWith(u8, entry.name, "_test.zig");
             if (is_entry) {
-                const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                const full = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
                 if (!added.contains(full)) {
                     fs.cwd().access(full, .{}) catch {
                         allocator.free(full);
@@ -10504,7 +10928,11 @@ fn scanDirForEntries(
                 mem.eql(u8, entry.name, "root.zig") or
                 mem.endsWith(u8, entry.name, "_test.zig");
             if (is_entry) {
-                const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+                const path = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                );
                 try addEntryIfValid(allocator, cfg, path, added);
                 allocator.free(path);
             }
@@ -11226,7 +11654,10 @@ pub fn main() !void {
 
     switch (cfg.command) {
         .help => printHelp(),
-        .version => std.debug.print("Ephor v{s} - The overseer of your Zig code\n", .{EPHOR_VERSION}),
+        .version => std.debug.print(
+            "Ephor v{s} - The overseer of your Zig code\n",
+            .{EPHOR_VERSION},
+        ),
         .init => {
             writeDefaultConfig() catch |err| {
                 std.debug.print("error: failed to create config: {}\n", .{err});
@@ -11541,7 +11972,10 @@ pub fn main() !void {
                     exportIssues(alloc, export_path, all_issues.items, &cfg) catch |err| {
                         std.debug.print("error: failed to export issues: {}\n", .{err});
                     };
-                    std.debug.print("exported {d} issues to {s}\n", .{ all_issues.items.len, export_path });
+                    std.debug.print(
+                        "exported {d} issues to {s}\n",
+                        .{ all_issues.items.len, export_path },
+                    );
                 }
 
                 const total = orphan_count + mem_count +
@@ -11670,7 +12104,11 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_catch_free_return.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_catch_free_return.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_catch_free_return.zig"), {});
 
@@ -11683,7 +12121,10 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
             mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
         {
             // False positive found - this is the bug that CFG should prevent
-            std.debug.print("FALSE POSITIVE: {s}:{d}: {s}\n", .{ issue.file, issue.line, issue.message });
+            std.debug.print(
+                "FALSE POSITIVE: {s}:{d}: {s}\n",
+                .{ issue.file, issue.line, issue.message },
+            );
             try std.testing.expect(false);
         }
     }

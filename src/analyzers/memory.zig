@@ -202,7 +202,13 @@ fn isValidAlloc(t: []const u8, col: usize) bool {
 }
 
 /// Record allocation info into state
-fn recordAlloc(t: []const u8, state: *AnalysisState, line: usize, col: usize, is_create: bool) void {
+fn recordAlloc(
+    t: []const u8,
+    state: *AnalysisState,
+    line: usize,
+    col: usize,
+    is_create: bool,
+) void {
     state.alloc_line = line;
     state.alloc_col = col + 1;
     state.is_create = is_create;
@@ -280,7 +286,14 @@ fn checkFunctionEnd(
     for (t) |c| {
         if (c != '}' or state.depth != 1) continue;
         if (shouldReportMissingDefer(state)) {
-            try reportAlloc(issues, allocator, path, state.alloc_line, state.alloc_col, state.is_create);
+            try reportAlloc(
+                issues,
+                allocator,
+                path,
+                state.alloc_line,
+                state.alloc_col,
+                state.is_create,
+            );
         }
     }
 }

@@ -161,11 +161,48 @@ const ReportCtx = struct {
     th: Thresholds,
 };
 
-fn reportIfNeeded(ctx: ReportCtx, m: *const FnMetrics, lim: FnLimits, fn_len: usize) !void {
-    if (fn_len > lim.lines) try reportLongFunction(ctx.allocator, ctx.issues, ctx.path, ctx.line, ctx.name, fn_len, ctx.th.max_function_lines);
-    if (m.max_nest > lim.nesting) try reportDeepNesting(ctx.allocator, ctx.issues, ctx.path, ctx.line, ctx.name, m.max_nest, ctx.th.max_nesting_depth);
-    if (m.branches > lim.branches) try reportHighBranches(ctx.allocator, ctx.issues, ctx.path, ctx.line, ctx.name, m.branches, ctx.th.max_branches);
-    if (m.params > lim.params) try reportManyParams(ctx.allocator, ctx.issues, ctx.path, ctx.line, ctx.name, m.params, ctx.th.max_params);
+fn reportIfNeeded(
+    ctx: ReportCtx,
+    m: *const FnMetrics,
+    lim: FnLimits,
+    fn_len: usize,
+) !void {
+    if (fn_len > lim.lines) try reportLongFunction(
+        ctx.allocator,
+        ctx.issues,
+        ctx.path,
+        ctx.line,
+        ctx.name,
+        fn_len,
+        ctx.th.max_function_lines,
+    );
+    if (m.max_nest > lim.nesting) try reportDeepNesting(
+        ctx.allocator,
+        ctx.issues,
+        ctx.path,
+        ctx.line,
+        ctx.name,
+        m.max_nest,
+        ctx.th.max_nesting_depth,
+    );
+    if (m.branches > lim.branches) try reportHighBranches(
+        ctx.allocator,
+        ctx.issues,
+        ctx.path,
+        ctx.line,
+        ctx.name,
+        m.branches,
+        ctx.th.max_branches,
+    );
+    if (m.params > lim.params) try reportManyParams(
+        ctx.allocator,
+        ctx.issues,
+        ctx.path,
+        ctx.line,
+        ctx.name,
+        m.params,
+        ctx.th.max_params,
+    );
 }
 
 /// Analyze a single function's complexity
@@ -194,7 +231,14 @@ fn analyzeFunction(
         if (!m.in_fn) continue;
 
         if (trackDepth(t, &m)) {
-            const ctx = ReportCtx{ .allocator = allocator, .issues = issues, .path = path, .line = fn_line, .name = fn_name, .th = thresholds };
+            const ctx = ReportCtx{
+                .allocator = allocator,
+                .issues = issues,
+                .path = path,
+                .line = fn_line,
+                .name = fn_name,
+                .th = thresholds,
+            };
             try reportIfNeeded(ctx, &m, lim, line_num - m.fn_start + 1);
             return;
         }
@@ -330,7 +374,16 @@ fn analyzeFileComplexity(
         if (mem.startsWith(u8, t, "//")) continue;
         if (mem.indexOf(u8, t, "fn ") == null) continue;
         const name = extractFunctionName(t) orelse continue;
-        try analyzeFunction(allocator, issues, a.path, a.content, th, line_num, name, isTypeFactory(t));
+        try analyzeFunction(
+            allocator,
+            issues,
+            a.path,
+            a.content,
+            th,
+            line_num,
+            name,
+            isTypeFactory(t),
+        );
     }
 }
 

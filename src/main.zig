@@ -1072,8 +1072,40 @@ fn computeGenSetForVar(
         if (isAssignmentTarget(t, var_name, 0) or isFillPattern(t, var_name)) {
             if (findBlockForLine(cfg, actual_line)) |bid| gen[bid] = true;
         }
+
+        // Address-of pattern: &var_name passed to function (out-parameter)
+        // e.g., extract(&arg), cbor.match(..., tp.extract(&error_code), ...)
+        if (hasAddressOfVar(t, var_name)) {
+            if (findBlockForLine(cfg, actual_line)) |bid| gen[bid] = true;
+        }
     }
     return gen;
+}
+
+/// Check if a line takes the address of a variable (&var_name)
+/// This indicates out-parameter usage where the variable may be assigned
+fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
+    var search_start: usize = 0;
+    while (search_start + 1 + var_name.len <= t.len) {
+        const amp_pos = mem.indexOf(u8, t[search_start..], "&") orelse return false;
+        const pos = search_start + amp_pos;
+        search_start = pos + 1;
+
+        // Must be immediately followed by var_name (no space)
+        if (pos + 1 + var_name.len > t.len) continue;
+        if (!mem.eql(u8, t[pos + 1 .. pos + 1 + var_name.len], var_name)) continue;
+
+        // Check word boundary after var_name
+        const end = pos + 1 + var_name.len;
+        if (end < t.len and isIdent(t[end])) continue;
+
+        // Make sure it's not inside a string or comment
+        if (isInsideString(t, pos)) continue;
+        if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
+
+        return true;
+    }
+    return false;
 }
 
 /// Collect variables declared with `= undefined`, skipping comptime blocks
@@ -3094,7 +3126,14 @@ const ImportGraph = struct {
                 } else |_| {}
                 // Mark all .zig files under this sub-project directory
                 self.markAllZigFilesReachable(subdir) catch continue;
-            } else |_| {}
+            } else |_| {
+                // No build.zig but this is a build-system-managed directory
+                // (lib/, tools/, test/, etc.) - mark all files reachable if
+                // the directory is commonly used by build systems
+                if (isBuildManagedDir(entry.name)) {
+                    self.markAllZigFilesReachable(subdir) catch continue;
+                }
+            }
 
             // Recurse into subdirectory
             self.scanForNestedBuildZig(subdir) catch continue;
@@ -3165,6 +3204,18 @@ const ImportGraph = struct {
             }
             pos = str_end + 1;
         }
+    }
+
+    /// Check if a directory name is commonly managed by the build system
+    /// (contains files referenced via b.path() or .root_src in build.zig)
+    fn isBuildManagedDir(name: []const u8) bool {
+        const managed = [_][]const u8{
+            "lib", "tools", "test", "compiler_rt",
+        };
+        for (managed) |m| {
+            if (mem.eql(u8, name, m)) return true;
+        }
+        return false;
     }
 
     /// Mark all .zig files under a directory as reachable (for nested build.zig sub-projects
@@ -8996,6 +9047,20 @@ fn isOrphanExcluded(path: []const u8, cfg: *const Config) bool {
     if (mem.indexOf(u8, path, "/testing/") != null) return true;
     if (mem.indexOf(u8, path, "localhost_testing/") != null) return true;
 
+    // Standalone program directories - each file is its own entry point
+    if (mem.indexOf(u8, path, "/examples/") != null) return true;
+    if (mem.indexOf(u8, path, "/example/") != null) return true;
+    if (mem.indexOf(u8, path, "/bench/") != null) return true;
+    if (mem.indexOf(u8, path, "/benchmarks/") != null) return true;
+    if (mem.indexOf(u8, path, "/demo/") != null) return true;
+    if (mem.indexOf(u8, path, "/demos/") != null) return true;
+    if (mem.indexOf(u8, path, "/samples/") != null) return true;
+    if (mem.indexOf(u8, path, "/tools/") != null) return true;
+
+    // build.zig is always an entry point
+    if (mem.endsWith(u8, path, "/build.zig")) return true;
+    if (mem.eql(u8, path, "build.zig")) return true;
+
     return false;
 }
 
@@ -9874,11 +9939,18 @@ fn extractPathFromLine(
             try addEntryIfValid(allocator, cfg, path, added);
         }
     }
-    // Pattern: .path = "..."
-    if (mem.indexOf(u8, line, ".path = \"")) |idx| {
-        const start = idx + 9; // len of '.path = "'
-        if (extractQuotedPath(line, start)) |path| {
-            try addEntryIfValid(allocator, cfg, path, added);
+    // Pattern: .path = "..." or .root_src = "..." or .root_source_file = "..."
+    const path_patterns = [_]struct { tag: []const u8, len: usize }{
+        .{ .tag = ".path = \"", .len = 9 },
+        .{ .tag = ".root_src = \"", .len = 13 },
+        .{ .tag = ".root_source_file = \"", .len = 20 },
+    };
+    for (path_patterns) |pat| {
+        if (mem.indexOf(u8, line, pat.tag)) |idx| {
+            const start = idx + pat.len;
+            if (extractQuotedPath(line, start)) |path| {
+                try addEntryIfValid(allocator, cfg, path, added);
+            }
         }
     }
     // Pattern: @import("...") in build.zig (build module imports, entry points)
@@ -9962,11 +10034,18 @@ fn extractBuildZigEntriesFromPath(
                 try addEntryWithPrefix(allocator, cfg, path, prefix, added);
             }
         }
-        // Pattern: .path = "..."
-        if (mem.indexOf(u8, line, ".path = \"")) |idx| {
-            const start = idx + 9;
-            if (extractQuotedPath(line, start)) |path| {
-                try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+        // Pattern: .path = "..." or .root_src = "..." or .root_source_file = "..."
+        const path_tags = [_]struct { tag: []const u8, len: usize }{
+            .{ .tag = ".path = \"", .len = 9 },
+            .{ .tag = ".root_src = \"", .len = 13 },
+            .{ .tag = ".root_source_file = \"", .len = 20 },
+        };
+        for (path_tags) |pat| {
+            if (mem.indexOf(u8, line, pat.tag)) |idx| {
+                const start = idx + pat.len;
+                if (extractQuotedPath(line, start)) |path| {
+                    try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+                }
             }
         }
         // Follow @import("...") to find b.path() entries in nested build modules

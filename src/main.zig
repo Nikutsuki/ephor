@@ -44,6 +44,7 @@ const RULE_CATCH_UNREACHABLE = types.RULE_CATCH_UNREACHABLE;
 const RULE_ORELSE_UNREACHABLE = types.RULE_ORELSE_UNREACHABLE;
 const RULE_UNDEFINED_USAGE = types.RULE_UNDEFINED_USAGE;
 const RULE_IGNORED_ERROR = types.RULE_IGNORED_ERROR;
+const RULE_EXIT_BYPASSES_DEFER = types.RULE_EXIT_BYPASSES_DEFER;
 const RULE_FUNC_TOO_LONG = types.RULE_FUNC_TOO_LONG;
 const RULE_NESTING_TOO_DEEP = types.RULE_NESTING_TOO_DEEP;
 const RULE_TOO_MANY_PARAMS = types.RULE_TOO_MANY_PARAMS;
@@ -386,7 +387,18 @@ fn detectCFPattern(t: []const u8) CFPattern {
     // Special cases requiring two checks
     if (mem.indexOf(u8, trimmed, "catch ") != null and
         mem.indexOf(u8, trimmed, "{") != null)
-        return .catch_start;
+    {
+        // Only treat as catch_start if braces are unbalanced (block opener).
+        // Balanced braces like catch return &[_]u8{} or catch |e| { return e; };
+        // are inline catches, not block openers.
+        var open: usize = 0;
+        var close: usize = 0;
+        for (trimmed) |c| {
+            if (c == '{') open += 1;
+            if (c == '}') close += 1;
+        }
+        if (open > close) return .catch_start;
+    }
     if (mem.indexOf(u8, trimmed, "try ") != null)
         return .try_expr;
 
@@ -744,6 +756,47 @@ fn isLocalVarOccurrence(t: []const u8, name: []const u8) bool {
     return false;
 }
 
+/// Check if a variable is the DIRECT target of a free/destroy call on this line.
+/// Returns true for: varname.free(, varname.destroy(, allocator.free(varname), allocator.destroy(varname)
+/// Returns false for: varname.field.free( (field is being freed, not varname)
+fn isDirectFreeOfVar(t: []const u8, var_name: []const u8) bool {
+    var search_start: usize = 0;
+    while (mem.indexOf(u8, t[search_start..], var_name)) |rel_pos| {
+        const var_pos = search_start + rel_pos;
+        search_start = var_pos + var_name.len;
+
+        // Word boundary checks
+        if (var_pos + var_name.len < t.len and isIdent(t[var_pos + var_name.len])) continue;
+        if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
+        if (var_pos > 0 and t[var_pos - 1] == '.') continue; // struct field
+
+        const after_var = var_pos + var_name.len;
+
+        // Pattern 1: varname.free( or varname.destroy( (direct free)
+        if (after_var < t.len and t[after_var] == '.') {
+            const rest = t[after_var + 1 ..];
+            if (mem.startsWith(u8, rest, "free(") or mem.startsWith(u8, rest, "destroy(") or
+                mem.startsWith(u8, rest, "deinit("))
+            {
+                return true;
+            }
+            // varname.field.something - intermediate field access, not a direct free
+            continue;
+        }
+
+        // Pattern 2: allocator.free(varname) or allocator.destroy(varname)
+        if (var_pos >= 1 and t[var_pos - 1] == '(') {
+            const before_paren = mem.trimRight(u8, t[0 .. var_pos - 1], " ");
+            if (mem.endsWith(u8, before_paren, ".free") or
+                mem.endsWith(u8, before_paren, ".destroy"))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /// Check if an identifier appears in text with word boundaries
 /// Handles patterns like: pool.free(context, buffer) where we look for "buffer"
 fn containsIdentifier(text: []const u8, name: []const u8) bool {
@@ -784,6 +837,39 @@ fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
 
     // Direct assignment: `name = value`
     if (mem.startsWith(u8, trimmed, "=")) return true;
+
+    // Field chain assignment: `name.field = value` or `name.field.sub = value`
+    // Also handles `name.field[i] = value`
+    if (mem.startsWith(u8, trimmed, ".")) {
+        var j: usize = 0;
+        while (j < trimmed.len and trimmed[j] == '.') {
+            j += 1; // skip dot
+            while (j < trimmed.len and isIdent(trimmed[j])) j += 1;
+        }
+        const after_fields = mem.trimLeft(u8, trimmed[j..], " \t");
+        if (mem.startsWith(u8, after_fields, "==")) return false;
+        if (mem.startsWith(u8, after_fields, "=")) return true;
+        // name.field[i] = value
+        if (mem.startsWith(u8, after_fields, "[")) {
+            var depth: usize = 0;
+            for (after_fields, 0..) |c, fi| {
+                if (c == '[') depth += 1 else if (c == ']') {
+                    if (depth > 0) depth -= 1;
+                    if (depth == 0) {
+                        const ab = mem.trimLeft(u8, after_fields[fi + 1 ..], " \t");
+                        if (mem.startsWith(u8, ab, "==")) return false;
+                        return mem.startsWith(u8, ab, "=");
+                    }
+                }
+            }
+        }
+        // name.* = value (pointer dereference assignment)
+        if (mem.startsWith(u8, after_fields, "*")) {
+            const after_star = mem.trimLeft(u8, after_fields[1..], " \t");
+            if (mem.startsWith(u8, after_star, "==")) return false;
+            if (mem.startsWith(u8, after_star, "=")) return true;
+        }
+    }
 
     // Subscript assignment: `name[i] = value`
     // Need to check if there's an `=` after the closing `]`
@@ -1284,6 +1370,10 @@ fn analyzeCFGMemorySafety(
 
         // Detect allocations: const x = ... .alloc( or .create( (skip patterns in strings)
         if (hasRealAllocPattern(t)) {
+            // Skip arena/no-free allocator patterns
+            if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t)) continue;
+            const alloc_name = extractAllocatorName(t) orelse "";
+            if (isNoFreeAllocatorName(alloc_name)) continue;
             if (extractVarDeclName(t)) |name| {
                 const col = getRealAllocPos(t) orelse 0;
                 try allocs.put(name, .{
@@ -1351,9 +1441,13 @@ fn analyzeCFGMemorySafety(
                 // Skip single-line defer - tracked separately
                 if (mem.startsWith(u8, t, "defer ")) continue;
 
-                // Check if this free is for our local variable (not a struct field)
-                // Skip patterns inside string literals (e.g., searching for ".free(")
-                if (hasRealFreePattern(t) and isLocalVarOccurrence(t, var_name)) {
+                // Skip comments and multiline strings
+                if (isCommentOrMultilineString(t)) continue;
+
+                // Check if this is a direct free/destroy of our variable
+                // Uses isDirectFreeOfVar to avoid false positives from field frees
+                // (e.g., ws.on_open.destroy() is NOT freeing ws)
+                if (hasRealFreePattern(t) and isDirectFreeOfVar(t, var_name)) {
                     free_seen = true;
                     free_line = line_num;
                 }
@@ -1440,9 +1534,12 @@ fn analyzeCFGMemorySafety(
                 // Skip single-line defer - tracked separately
                 if (mem.startsWith(u8, check_t, "defer ")) continue;
 
+                // Skip comments and multiline strings
+                if (isCommentOrMultilineString(check_t)) continue;
+
                 const check_free = hasRealFreePattern(check_t);
-                // Only count frees of local variables (not struct fields)
-                if (check_free and isLocalVarOccurrence(check_t, var_name)) {
+                // Only count direct frees of this variable (not field frees)
+                if (check_free and isDirectFreeOfVar(check_t, var_name)) {
                     freed_same_block = true;
                     alloc.freed_line = check_line;
                 }
@@ -1516,9 +1613,12 @@ fn analyzeCFGMemorySafety(
             // Skip defer/errdefer - they don't free immediately
             if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) continue;
 
-            // Only look at free operations (skip patterns in string literals)
+            // Skip comments and multiline strings
+            if (isCommentOrMultilineString(t)) continue;
+
+            // Only look at direct free operations on this variable
             if (!hasRealFreePattern(t)) continue;
-            if (mem.indexOf(u8, t, var_name) == null) continue;
+            if (!isDirectFreeOfVar(t, var_name)) continue;
 
             const bid = findBlockForLine(cfg, actual_line) orelse continue;
 
@@ -1541,9 +1641,12 @@ fn analyzeCFGMemorySafety(
                 // Skip single-line defer - tracked separately
                 if (mem.startsWith(u8, check_t, "defer ")) continue;
 
+                // Skip comments and multiline strings
+                if (isCommentOrMultilineString(check_t)) continue;
+
                 const check_free = hasRealFreePattern(check_t);
-                // Only count frees of local variables (not struct fields)
-                if (check_free and isLocalVarOccurrence(check_t, var_name)) {
+                // Only count direct frees of this variable (not field frees)
+                if (check_free and isDirectFreeOfVar(check_t, var_name)) {
                     prev_free_in_block = true;
                     alloc.freed_line = check_line;
                     break;
@@ -1756,6 +1859,9 @@ fn collectCFGAllocations(
 
         // Skip no-free allocators (arena, scratch, temp, frame, fba, recycle)
         if (hasNoFreeAllocatorPattern(t)) continue;
+        if (isArenaAllocLine(t)) continue;
+        const aname = extractAllocatorName(t) orelse "";
+        if (isNoFreeAllocatorName(aname)) continue;
 
         const name = extractVarDeclName(t) orelse continue;
         const col = getRealAllocPos(t) orelse 0;
@@ -2281,7 +2387,10 @@ fn analyzeCFGErrdeferCoverage(
     defer try_allocs.deinit(allocator);
 
     var errdefers = std.ArrayListUnmanaged(ErrdeferInfo){};
-    defer errdefers.deinit(allocator);
+    defer {
+        for (errdefers.items) |e| allocator.free(e.content);
+        errdefers.deinit(allocator);
+    }
 
     var try_lines_list = std.ArrayListUnmanaged(usize){};
     defer try_lines_list.deinit(allocator);
@@ -2324,6 +2433,16 @@ fn analyzeCFGErrdeferCoverage(
         // Collect try allocations
         const has_try = mem.indexOf(u8, t, "try ") != null;
         if (has_try and isTryAllocation(t)) {
+            // Skip arena/no-free allocations at the line level
+            if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t)) {
+                if (has_try) try try_lines_list.append(allocator, actual_line);
+                continue;
+            }
+            const aname_e = extractAllocatorName(t) orelse "";
+            if (isNoFreeAllocatorName(aname_e)) {
+                if (has_try) try try_lines_list.append(allocator, actual_line);
+                continue;
+            }
             if (extractVarDeclName(t)) |name| {
                 try try_allocs.append(allocator, .{
                     .name = name,
@@ -2363,7 +2482,7 @@ fn analyzeCFGErrdeferCoverage(
             } else if (hasRealCleanupPattern(t)) {
                 try errdefers.append(allocator, .{
                     .line = actual_line,
-                    .content = content,
+                    .content = try allocator.dupe(u8, content),
                 });
             }
         }
@@ -2441,6 +2560,7 @@ const AllocInfo = struct {
     stored: bool = false,
     ownership_transferred: bool = false,
     is_arena_alloc: bool = false,
+    no_error_path: bool = false, // alloc uses non-try error handling (no error path)
 };
 
 /// Memory event types for use-after-free and double-free
@@ -2576,7 +2696,7 @@ const ImportGraph = struct {
         var end = start;
         while (end < content.len) : (end += 1) {
             const c = content[end];
-            if (c == ' ' or c == '=' or c == '\n') break;
+            if (c == ' ' or c == '=' or c == ':' or c == '\n') break;
         }
         return if (end > start) content[start..end] else null;
     }
@@ -2606,6 +2726,7 @@ const ImportGraph = struct {
         var line_num: usize = 1;
         var col: usize = 1;
         var i: usize = 0;
+        var in_comment = false;
 
         while (i < content.len) : ({
             col += 1;
@@ -2614,12 +2735,47 @@ const ImportGraph = struct {
             if (content[i] == '\n') {
                 line_num += 1;
                 col = 1;
+                in_comment = false;
                 continue;
             }
+
+            // Skip comment lines: once we see //, skip rest of line
+            if (!in_comment and i + 1 < content.len and
+                content[i] == '/' and content[i + 1] == '/')
+            {
+                in_comment = true;
+                continue;
+            }
+            if (in_comment) continue;
 
             const not_const = i + 6 >= content.len or
                 !mem.eql(u8, content[i .. i + 6], "const ");
             if (not_const) continue;
+
+            // "const " must be at start of statement: preceded by newline,
+            // start-of-file, whitespace at line start, or "pub "
+            // This prevents matching "const" inside function parameter types
+            // like "arg: ?[]const u8"
+            const is_statement_start = blk: {
+                if (i == 0) break :blk true;
+                // Check if "pub const" (preceded by "pub ")
+                if (i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub "))
+                    break :blk true;
+                // Walk backwards to find the start of this line
+                var j = i;
+                while (j > 0 and content[j - 1] != '\n') j -= 1;
+                // Check if only whitespace before "const"
+                var only_ws = true;
+                var k = j;
+                while (k < i) : (k += 1) {
+                    if (content[k] != ' ' and content[k] != '\t') {
+                        only_ws = false;
+                        break;
+                    }
+                }
+                break :blk only_ws;
+            };
+            if (!is_statement_start) continue;
 
             // Check if this is "pub const" (preceded by "pub ")
             const is_pub = i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub ");
@@ -2646,6 +2802,84 @@ const ImportGraph = struct {
                 .col = col,
                 .is_pub = is_pub,
             });
+        }
+
+        // Second pass: find ALL @import("...") patterns regardless of context
+        // This catches imports in switch arms, array inits, embedFile, etc.
+        try self.extractBareImports(content, file_path, analysis);
+    }
+
+    /// Extract @import("...") patterns that aren't preceded by `const`
+    /// Catches switch arms like `=> @import("x.zig")`, array inits, etc.
+    fn extractBareImports(
+        self: *ImportGraph,
+        content: []const u8,
+        file_path: []const u8,
+        analysis: *FileAnalysis,
+    ) !void {
+        const import_tag = "@import(\"";
+        var pos: usize = 0;
+        var in_line_comment = false;
+
+        while (pos < content.len) {
+            if (content[pos] == '\n') {
+                in_line_comment = false;
+                pos += 1;
+                continue;
+            }
+            if (!in_line_comment and pos + 1 < content.len and
+                content[pos] == '/' and content[pos + 1] == '/')
+            {
+                in_line_comment = true;
+                pos += 2;
+                continue;
+            }
+            if (in_line_comment) {
+                pos += 1;
+                continue;
+            }
+
+            if (pos + import_tag.len < content.len and
+                mem.eql(u8, content[pos .. pos + import_tag.len], import_tag))
+            {
+                const path_start = pos + import_tag.len;
+                var path_end = path_start;
+                while (path_end < content.len and content[path_end] != '"') {
+                    path_end += 1;
+                }
+                if (path_end > path_start) {
+                    const imp = content[path_start..path_end];
+                    const is_std = mem.eql(u8, imp, "std");
+                    const is_builtin = mem.eql(u8, imp, "builtin");
+                    if (!is_std and !is_builtin) {
+                        // Check if already in imports list
+                        var already = false;
+                        for (analysis.imports.items) |existing| {
+                            if (mem.eql(u8, existing.path, imp)) {
+                                already = true;
+                                break;
+                            }
+                        }
+                        if (!already) {
+                            const resolved = try self.resolveImport(
+                                file_path,
+                                imp,
+                            );
+                            try analysis.imports.append(self.allocator, .{
+                                .path = try self.allocator.dupe(u8, imp),
+                                .resolved = resolved,
+                                .name = try self.allocator.dupe(u8, "_"),
+                                .line = 0,
+                                .col = 0,
+                                .is_pub = false,
+                            });
+                        }
+                    }
+                }
+                pos = path_end + 1;
+                continue;
+            }
+            pos += 1;
         }
     }
 
@@ -2686,6 +2920,270 @@ const ImportGraph = struct {
         for (imports) |imp| {
             const resolved = imp.resolved orelse continue;
             try self.markReachableRecursive(resolved);
+        }
+    }
+
+    /// After markReachable, scan reachable files for b.path("...") references
+    /// and mark those targets as reachable too. This handles build modules that
+    /// reference source files via b.path() instead of @import().
+    fn markBuildPathReferences(self: *ImportGraph, cfg: *const Config) !void {
+        // Find the build root (directory containing build.zig)
+        var root_buf: [fs.max_path_bytes]u8 = undefined;
+        const build_root: []const u8 = br: {
+            // 1. Check entries for build.zig
+            for (cfg.entries.items) |e| {
+                if (mem.endsWith(u8, e, "build.zig")) {
+                    const dir = std.fs.path.dirname(e) orelse ".";
+                    break :br fs.cwd().realpath(dir, &root_buf) catch continue;
+                }
+            }
+            // 2. Try parent of target path (common: target is src/, build.zig is at parent)
+            const trimmed = mem.trimRight(u8, cfg.path, "/");
+            const parent = std.fs.path.dirname(trimmed) orelse ".";
+            {
+                const check = std.fmt.allocPrint(self.allocator, "{s}/build.zig", .{parent}) catch return;
+                defer self.allocator.free(check);
+                if (fs.cwd().access(check, .{})) |_| {
+                    break :br fs.cwd().realpath(parent, &root_buf) catch return;
+                } else |_| {}
+            }
+            // 3. Try target path itself
+            {
+                const check = std.fmt.allocPrint(self.allocator, "{s}/build.zig", .{trimmed}) catch return;
+                defer self.allocator.free(check);
+                if (fs.cwd().access(check, .{})) |_| {
+                    break :br fs.cwd().realpath(trimmed, &root_buf) catch return;
+                } else |_| {}
+            }
+            return; // No build.zig found
+        };
+
+        // Collect current reachable paths (snapshot to avoid modify-while-iterate)
+        var to_scan: std.ArrayListUnmanaged([]const u8) = .{};
+        defer to_scan.deinit(self.allocator);
+        {
+            var iter = self.reachable.iterator();
+            while (iter.next()) |entry| {
+                try to_scan.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        const bp_tag = "b.path(\"";
+        // Scan each reachable file for b.path("...") patterns
+        for (to_scan.items) |path| {
+            const content = fs.cwd().readFileAlloc(
+                self.allocator,
+                path,
+                4 * 1024 * 1024,
+            ) catch continue;
+            defer self.allocator.free(content);
+
+            var pos: usize = 0;
+            while (pos + bp_tag.len < content.len) {
+                const rest = content[pos..];
+                const rel = mem.indexOf(u8, rest, bp_tag) orelse break;
+                const str_start = pos + rel + bp_tag.len;
+                var str_end = str_start;
+                while (str_end < content.len and content[str_end] != '"') str_end += 1;
+                if (str_end > str_start) {
+                    const ref_path = content[str_start..str_end];
+                    if (mem.endsWith(u8, ref_path, ".zig")) {
+                        const full = std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}/{s}",
+                            .{ build_root, ref_path },
+                        ) catch {
+                            pos = str_end + 1;
+                            continue;
+                        };
+                        defer self.allocator.free(full);
+                        var rbuf: [fs.max_path_bytes]u8 = undefined;
+                        if (fs.cwd().realpath(full, &rbuf)) |resolved| {
+                            if (!self.reachable.contains(resolved)) {
+                                // Use markReachableRecursive to also follow
+                                // the file's @import() chain
+                                self.markReachableRecursive(resolved) catch {
+                                    pos = str_end + 1;
+                                    continue;
+                                };
+                            }
+                        } else |_| {}
+                    }
+                }
+                pos = str_end + 1;
+            }
+        }
+
+        // Also discover nested build.zig files in subdirectories of the scan target.
+        // Sub-projects (e.g., tigerbeetle/src/docs_website/) have their own build.zig
+        // that references their source files.
+        try self.discoverNestedBuildFiles(cfg);
+    }
+
+    /// Discover nested build.zig files in subdirectories and mark their
+    /// @import and b.path references as reachable.
+    fn discoverNestedBuildFiles(self: *ImportGraph, cfg: *const Config) !void {
+        const trimmed = mem.trimRight(u8, cfg.path, "/");
+        var rbuf: [fs.max_path_bytes]u8 = undefined;
+        const target_abs = fs.cwd().realpath(trimmed, &rbuf) catch return;
+        const target_owned = self.allocator.dupe(u8, target_abs) catch return;
+        defer self.allocator.free(target_owned);
+
+        self.scanForNestedBuildZig(target_owned) catch return;
+    }
+
+    fn scanForNestedBuildZig(self: *ImportGraph, dir_path: []const u8) !void {
+        var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            // Skip common non-source directories
+            if (mem.eql(u8, entry.name, ".git") or
+                mem.eql(u8, entry.name, "zig-out") or
+                mem.eql(u8, entry.name, "zig-cache") or
+                mem.eql(u8, entry.name, ".zig-cache") or
+                mem.eql(u8, entry.name, "node_modules") or
+                mem.eql(u8, entry.name, ".build")) continue;
+
+            const subdir = std.fmt.allocPrint(
+                self.allocator,
+                "{s}/{s}",
+                .{ dir_path, entry.name },
+            ) catch continue;
+            defer self.allocator.free(subdir);
+
+            // Check for build.zig in this subdirectory
+            const build_path = std.fmt.allocPrint(
+                self.allocator,
+                "{s}/build.zig",
+                .{subdir},
+            ) catch continue;
+            defer self.allocator.free(build_path);
+
+            if (fs.cwd().access(build_path, .{})) |_| {
+                // Found a nested build.zig - mark it and ALL .zig files under this
+                // sub-project as reachable. We can't statically resolve b.path(variable)
+                // calls, so we treat the entire sub-project as build-system-managed.
+                var buf2: [fs.max_path_bytes]u8 = undefined;
+                if (fs.cwd().realpath(build_path, &buf2)) |resolved| {
+                    if (!self.reachable.contains(resolved)) {
+                        self.markReachableRecursive(resolved) catch continue;
+                    }
+                } else |_| {}
+                // Mark all .zig files under this sub-project directory
+                self.markAllZigFilesReachable(subdir) catch continue;
+            } else |_| {}
+
+            // Recurse into subdirectory
+            self.scanForNestedBuildZig(subdir) catch continue;
+        }
+    }
+
+    /// Scan all reachable files under a sub-project directory for b.path() references
+    fn scanSubprojectBuildPaths(self: *ImportGraph, subdir: []const u8) !void {
+        var rbuf: [fs.max_path_bytes]u8 = undefined;
+        const abs_subdir = fs.cwd().realpath(subdir, &rbuf) catch return;
+
+        // Snapshot reachable paths to check which are in this sub-project
+        var to_scan: std.ArrayListUnmanaged([]const u8) = .{};
+        defer to_scan.deinit(self.allocator);
+        {
+            var iter = self.reachable.iterator();
+            while (iter.next()) |entry| {
+                if (mem.startsWith(u8, entry.key_ptr.*, abs_subdir)) {
+                    try to_scan.append(self.allocator, entry.key_ptr.*);
+                }
+            }
+        }
+        for (to_scan.items) |path| {
+            self.scanBuildPathRefs(path, subdir) catch continue;
+        }
+    }
+
+    /// Scan a specific file for b.path("...") references and resolve them
+    /// relative to the given base directory
+    fn scanBuildPathRefs(self: *ImportGraph, file_path: []const u8, base_dir: []const u8) !void {
+        const content = fs.cwd().readFileAlloc(
+            self.allocator,
+            file_path,
+            4 * 1024 * 1024,
+        ) catch return;
+        defer self.allocator.free(content);
+
+        const bp_tag = "b.path(\"";
+        var pos: usize = 0;
+        while (pos + bp_tag.len < content.len) {
+            const rest = content[pos..];
+            const rel = mem.indexOf(u8, rest, bp_tag) orelse break;
+            const str_start = pos + rel + bp_tag.len;
+            var str_end = str_start;
+            while (str_end < content.len and content[str_end] != '"') str_end += 1;
+            if (str_end > str_start) {
+                const ref_path = content[str_start..str_end];
+                if (mem.endsWith(u8, ref_path, ".zig")) {
+                    const full = std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}/{s}",
+                        .{ base_dir, ref_path },
+                    ) catch {
+                        pos = str_end + 1;
+                        continue;
+                    };
+                    defer self.allocator.free(full);
+                    var rbuf: [fs.max_path_bytes]u8 = undefined;
+                    if (fs.cwd().realpath(full, &rbuf)) |resolved| {
+                        if (!self.reachable.contains(resolved)) {
+                            self.markReachableRecursive(resolved) catch {
+                                pos = str_end + 1;
+                                continue;
+                            };
+                        }
+                    } else |_| {}
+                }
+            }
+            pos = str_end + 1;
+        }
+    }
+
+    /// Mark all .zig files under a directory as reachable (for nested build.zig sub-projects
+    /// where we can't statically resolve b.path(variable) calls)
+    fn markAllZigFilesReachable(self: *ImportGraph, dir_path: []const u8) !void {
+        self.markZigFilesRecursive(dir_path) catch return;
+    }
+
+    fn markZigFilesRecursive(self: *ImportGraph, dir_path: []const u8) !void {
+        var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind == .directory) {
+                if (mem.eql(u8, entry.name, ".git") or
+                    mem.eql(u8, entry.name, "zig-out") or
+                    mem.eql(u8, entry.name, "zig-cache") or
+                    mem.eql(u8, entry.name, ".zig-cache") or
+                    mem.eql(u8, entry.name, ".build")) continue;
+                const sub = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                ) catch continue;
+                defer self.allocator.free(sub);
+                self.markZigFilesRecursive(sub) catch continue;
+            } else if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig")) {
+                const full = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}/{s}",
+                    .{ dir_path, entry.name },
+                ) catch continue;
+                defer self.allocator.free(full);
+                var rbuf: [fs.max_path_bytes]u8 = undefined;
+                if (fs.cwd().realpath(full, &rbuf)) |resolved| {
+                    if (!self.reachable.contains(resolved)) {
+                        self.markReachableRecursive(resolved) catch continue;
+                    }
+                } else |_| {}
+            }
         }
     }
 
@@ -2803,6 +3301,27 @@ fn isNoFreeAllocatorName(name: []const u8) bool {
     return false;
 }
 
+/// Check if the allocation line uses an arena allocator via dotted path
+/// Handles patterns like sema.arena.alloc(), comp.arena.alloc(), tc.driver.comp.arena.alloc()
+/// where extractAllocatorName only returns the first segment (e.g., "sema")
+fn isArenaAllocLine(t: []const u8) bool {
+    const no_free_segments = [_][]const u8{
+        ".arena.alloc(",
+        ".arena.create(",
+        ".arena.dupe(",
+        ".arena.dupeZ(",
+        ".arena.realloc(",
+        ".scratch.alloc(",
+        ".scratch.create(",
+        ".temp.alloc(",
+        ".temp.create(",
+    };
+    for (no_free_segments) |pat| {
+        if (mem.indexOf(u8, t, pat) != null) return true;
+    }
+    return false;
+}
+
 /// Check if a line contains no-free allocator patterns (arena, scratch, temp, frame, fba, recycle)
 /// Used to skip allocations that don't need defer cleanup
 fn hasNoFreeAllocatorPattern(t: []const u8) bool {
@@ -2815,17 +3334,28 @@ fn hasNoFreeAllocatorPattern(t: []const u8) bool {
 
 /// Patterns indicating ownership transfer (casts, out-params, container methods)
 const ownership_transfer_patterns = [_][]const u8{
-    "break :",        // Labeled block break - ownership to block result
-    ".* = ",          // Out-parameter assignment (C FFI)
-    "@ptrCast",       // Pointer cast
-    "@alignCast",     // Alignment cast
-    ".ptr",           // Slice reassignment
+    "break :", // Labeled block break - ownership to block result
+    ".* = ", // Out-parameter assignment (C FFI)
+    "@ptrCast", // Pointer cast
+    "@alignCast", // Alignment cast
+    ".ptr", // Slice reassignment
     // Container methods
-    ".append(",       ".put(",         ".putNoClobber(",
+    ".append(",
+    ".put(",
+    ".putNoClobber(",
     // Async/queue methods
-    ".submit(",       ".enqueue(",     ".push(",        ".send(",
-    ".emit(",         ".dispatch(",    ".transfer(",    ".deliver(",
-    ".publish(",      ".broadcast(",   ".post(",        ".write(",
+    ".submit(",
+    ".enqueue(",
+    ".push(",
+    ".send(",
+    ".emit(",
+    ".dispatch(",
+    ".transfer(",
+    ".deliver(",
+    ".publish(",
+    ".broadcast(",
+    ".post(",
+    ".write(",
 };
 
 /// Check if ownership is transferred via cast or reassignment
@@ -2838,15 +3368,16 @@ fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
 }
 
 /// Check if allocation is stored in a struct field (ownership transferred to struct)
-/// Patterns: self.field = alloc_name, self.*.field = alloc_name
+/// Patterns: self.field = alloc_name, this.field = alloc_name, identifier.field = alloc_name
 fn isStructFieldStorage(t: []const u8, alloc_name: []const u8) bool {
-    // Check for self.field = alloc_name or self.*.field = alloc_name
-    if (mem.indexOf(u8, t, "self.") == null) return false;
     if (mem.indexOf(u8, t, alloc_name) == null) return false;
 
-    // Pattern: self.something = alloc_name (assignment to struct field)
-    // Look for = followed by alloc_name
+    // Check for any struct.field = alloc_name (not just self.)
     if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+        // LHS must have a dot (struct field access)
+        const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+        if (mem.indexOf(u8, lhs, ".") == null) return false;
+
         // Check if alloc_name appears after the =
         if (mem.indexOf(u8, t, alloc_name)) |name_pos| {
             if (name_pos > eq_pos) return true;
@@ -2896,20 +3427,20 @@ fn isKnownAllocatorName(name: []const u8) bool {
 fn isKnownNonAllocatorCreate(name: []const u8) bool {
     // Common non-allocator methods named .create() in Zig ecosystem
     const non_allocator_creates = [_][]const u8{
-        "cgroup",     // Linux cgroup management (ghostty)
-        "os",         // OS file operations
-        "file",       // File system operations
-        "dir",        // Directory operations
-        "socket",     // Network socket creation
-        "thread",     // Thread spawning
-        "process",    // Process spawning
-        "pipe",       // Pipe creation
-        "event",      // Event creation
-        "signal",     // Signal handlers
-        "timer",      // Timer creation
-        "mutex",      // Mutex creation
-        "semaphore",  // Semaphore creation
-        "condvar",    // Condition variable creation
+        "cgroup", // Linux cgroup management (ghostty)
+        "os", // OS file operations
+        "file", // File system operations
+        "dir", // Directory operations
+        "socket", // Network socket creation
+        "thread", // Thread spawning
+        "process", // Process spawning
+        "pipe", // Pipe creation
+        "event", // Event creation
+        "signal", // Signal handlers
+        "timer", // Timer creation
+        "mutex", // Mutex creation
+        "semaphore", // Semaphore creation
+        "condvar", // Condition variable creation
         "internal_os", // Internal OS wrappers (ghostty)
     };
     for (non_allocator_creates) |known| {
@@ -3170,9 +3701,28 @@ fn isSafeToDiscard(t: []const u8) bool {
         ".clearRetainingCapacity(", // Returns void
         ".reset(", // Usually returns void
         ".skip(", // Iterator skip - returns bool, not error
+        ".remove(", // HashMap/list remove - returns ?T
+        ".ordered_remove(", // OrderedHashMap remove - returns ?T
+        ".swapRemove(", // List swapRemove - returns T
+        ".orderedRemove(", // List orderedRemove - returns T
+        ".deinit(", // Deinit - returns void or diagnostic info
+        ".close(", // Close - returns void
+        ".check(", // Check/validate - returns diagnostic info
+        ".write(", // Write operations - return usize
+        ".print(", // Print operations - return !void
+        ".parseEscapeSequence(", // Parser returning parsed value
+        "A(", // C FFI / Windows API (uppercase = external)
     };
     for (skip_patterns) |pattern| {
         if (mem.indexOf(u8, t, pattern) != null) return true;
+    }
+    // C FFI: _ = ExternalFunction(...) - uppercase function name after _ =
+    if (t.len > 4) {
+        const after_discard = t[4..]; // Skip "_ = "
+        if (after_discard.len > 0 and after_discard[0] >= 'A' and after_discard[0] <= 'Z') {
+            // Starts with uppercase - likely C FFI or extern function
+            return true;
+        }
     }
     return false;
 }
@@ -3213,32 +3763,32 @@ fn trackTestBlock(
 /// Categories: filesystem, cleanup, collection, writer, network, threading
 const best_effort_ops = [_][]const u8{
     // Filesystem - might already exist/not exist
-    "makePath(",     "makeDir(",      "deleteFile(",   "deleteDir(",
-    "deleteTree(",   "unlink(",       "remove(",       "rename(",
+    "makePath(",              "makeDir(",              "deleteFile(",            "deleteDir(",
+    "deleteTree(",            "unlink(",               "remove(",                "rename(",
     "symLink(",
     // Cleanup - best effort during teardown
-    ".close(",       ".deinit(",      ".destroy(",     ".free(",
-    ".flush(",       ".sync(",        ".reset(",       ".clear(",
+                  ".close(",               ".deinit(",               ".destroy(",
+    ".free(",                 ".flush(",               ".sync(",                 ".reset(",
+    ".clear(",
     // Collection - partial success acceptable
-    ".append(",      ".put(",         ".appendSlice(", ".appendAssumeCapacity(",
-    ".ensureTotalCapacity(",          ".ensureUnusedCapacity(",
+                   ".append(",              ".put(",                  ".appendSlice(",
+    ".appendAssumeCapacity(", ".ensureTotalCapacity(", ".ensureUnusedCapacity(",
     // Writer - logging/debugging can fail
-    ".print(",       ".writeAll(",    ".writeByte(",   ".write(",
-    "std.debug.print(",
-    "writePositionalAll(", "writeStreamingAll(",
-    "writeAllBuffer(",
+    ".print(",
+    ".writeAll(",             ".writeByte(",           ".write(",                "std.debug.print(",
+    "writePositionalAll(",    "writeStreamingAll(",    "writeAllBuffer(",
     // Network - transient failures expected
-    ".send(",        ".recv(",        ".connect(",     ".bind(",
-    ".stream.write(",
+           ".send(",
+    ".recv(",                 ".connect(",             ".bind(",                 ".stream.write(",
     // Locking - best effort
-    ".lock(",        ".unlock(",
+    ".lock(",                 ".unlock(",
     // State changes - best effort (display links, services)
-    ".start(",       ".stop(",
+                 ".start(",                ".stop(",
     // Threading - community pattern from Zig std lib (std/Thread.zig, std/Thread/Condition.zig)
     // Event loops: missed wakeups are self-correcting on next iteration
     // Zig std lib uses catch {} for yield(), timedWait(); ghostty uses .notify() catch {}
-    ".setName(",     ".notify(",      ".wakeup(",      ".signal(",
-    ".yield(",       ".timedWait(",
+    ".setName(",              ".notify(",              ".wakeup(",               ".signal(",
+    ".yield(",                ".timedWait(",
 };
 
 /// Check if a silent catch is for a best-effort operation
@@ -3478,10 +4028,10 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // Pattern 9: Method calls on var that may modify receiver (self parameter)
     // Covers: var_name.update(...), var_name.set(...), var_name.reinit(...), etc.
     const modifying_methods = [_][]const u8{
-        ".update(",   ".set(",      ".reinit(",  ".reset(",
-        ".assign(",   ".fill(",     ".clear(",   ".put(",
-        ".append(",   ".resize(",   ".ensureCapacity(",
-        ".replaceRange(", ".insertSlice(",
+        ".update(",      ".set(",    ".reinit(",         ".reset(",
+        ".assign(",      ".fill(",   ".clear(",          ".put(",
+        ".append(",      ".resize(", ".ensureCapacity(", ".replaceRange(",
+        ".insertSlice(",
     };
     for (modifying_methods) |method| {
         if (mem.indexOf(u8, t, var_name)) |var_pos| {
@@ -3772,7 +4322,31 @@ fn checkUndefinedUsage(
         pending.* = .{ .name = name, .line = line, .col = col + 1 };
         return null;
     }
+    // Skip struct type field defaults: `field_name: Type = undefined,`
+    // These don't start with var/const; they have `identifier: type` before `= undefined`
+    if (isStructFieldDefault(t, col)) return null;
     return makeUndefinedIssue(path, line, col + 1);
+}
+
+/// Detect struct type field defaults: `field_name: Type = undefined`
+/// Not a variable declaration - no `var`/`const` prefix.
+/// Has pattern: `identifier: type_expr = undefined`
+fn isStructFieldDefault(t: []const u8, undefined_col: usize) bool {
+    // Must not start with var/const (those are variable declarations)
+    if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "const ")) return false;
+    // Look for a colon between start and the `= undefined`
+    // Pattern: `identifier: type = undefined`
+    if (undefined_col == 0) return false;
+    var i: usize = 0;
+    while (i < undefined_col) : (i += 1) {
+        if (t[i] == ':') {
+            // Verify identifier before colon
+            if (i > 0 and (isIdent(t[i - 1]) or t[i - 1] == '@' or t[i - 1] == '"')) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Check for discarded error union results
@@ -3796,9 +4370,9 @@ fn checkDiscardedResult(
         .line = line,
         .col = 1,
         .severity = .note,
-        .rule = RULE_SILENT_CATCH,
-        .message = "discarded result - errors may be lost",
-        .help = "use try or catch to handle",
+        .rule = RULE_IGNORED_ERROR,
+        .message = "function result discarded with '_ ='",
+        .help = "if error union, use try/catch; if intentional discard, this can be ignored",
     };
 }
 
@@ -3823,6 +4397,8 @@ const ErrorAnalysisState = struct {
     // Track catch blocks (error recovery context - silent catch is intentional)
     in_catch_block: bool = false,
     catch_brace_depth: usize = 0,
+    // Track if current function has any defer statements (for ZA206)
+    has_defer_in_func: bool = false,
 };
 
 /// Check if line starts a static storage struct pattern
@@ -3852,6 +4428,8 @@ fn trackStaticStructBraces(t: []const u8, state: *ErrorAnalysisState) void {
 fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
     // Detect defer/errdefer start
     if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) {
+        // Mark that current function has defers (for ZA206 exit detection)
+        state.has_defer_in_func = true;
         // Check if it's a block defer (has { on same line)
         if (mem.indexOf(u8, t, "{") != null) {
             state.in_defer_block = true;
@@ -3929,6 +4507,7 @@ fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState) void {
     if (extractFuncName(t)) |name| {
         state.current_func_name = name;
         state.func_brace_depth = 0;
+        state.has_defer_in_func = false; // Reset for new function (ZA206)
         // Count braces on the declaration line
         for (t) |c| {
             if (c == '{') state.func_brace_depth += 1;
@@ -4092,16 +4671,13 @@ fn checkLineErrors(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
 ) !void {
-    // Skip silent catch in defer context - catch {} is intentional for cleanup
-    // NOTE: ZA201/ZA202/ZA203 are now handled by analyzeCFGErrors with proper test context
-    // The CFG-based analysis can detect nested functions inside test blocks
+    // ZA201 (silent catch) - only from line-based analyzer (not duplicated in CFG)
+    // ZA202/ZA203 are handled only in analyzeCFGErrors to support test context detection
     if (!in_defer) {
         if (checkSilentCatchWithContext(t, path, ln, func_name)) |i| {
             try issues.append(allocator, i);
         }
     }
-    // ZA202 (catch unreachable) and ZA203 (orelse unreachable) moved to analyzeCFGErrors
-    // to support test context detection for nested anonymous callbacks
     // Skip undefined checks in test/module-level context
     if (!skip_undefined) {
         if (checkUndefinedUsage(t, path, ln, pending)) |i| {
@@ -4198,6 +4774,29 @@ fn analyzeFileErrors(
             issues,
             allocator,
         );
+
+        // ZA206: Check for std.process.exit() bypassing defers
+        if (state.has_defer_in_func and state.current_func_name.len > 0) {
+            if (mem.indexOf(u8, t, "std.process.exit(") != null or
+                mem.indexOf(u8, t, "process.exit(") != null)
+            {
+                // Make sure it's not in a comment or string, and not inline disabled
+                const exit_pos = mem.indexOf(u8, t, "exit(") orelse 0;
+                if (!isInsideString(t, exit_pos) and
+                    !isInlineDisabled(a.content, line_num, RULE_EXIT_BYPASSES_DEFER))
+                {
+                    try issues.append(allocator, .{
+                        .file = a.path,
+                        .line = line_num,
+                        .col = exit_pos + 1,
+                        .severity = .warning,
+                        .rule = RULE_EXIT_BYPASSES_DEFER,
+                        .message = "std.process.exit() bypasses all defers in current scope",
+                        .help = "set a flag and exit at end of function, or return error to let defers run",
+                    });
+                }
+            }
+        }
     }
     try reportEndOfFileIssues(&state, a.path, issues, allocator);
 }
@@ -4319,18 +4918,8 @@ fn analyzeUnused(
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const a = entry.value_ptr.*;
-        // Skip auto-generated C import files (many false positives)
-        if (mem.endsWith(u8, a.path, "cimport.zig")) continue;
-        if (mem.indexOf(u8, a.path, "/deps/") != null and
-            mem.endsWith(u8, a.path, ".zig"))
-        {
-            // Check for C translation markers
-            if (mem.indexOf(u8, a.content, "__builtin_") != null or
-                mem.indexOf(u8, a.content, "enum_unnamed_") != null)
-            {
-                continue;
-            }
-        }
+        // Skip auto-generated C import/translation files (many false positives)
+        if (isCImportFile(a.path, a.content)) continue;
         for (a.imports.items) |imp| {
             try checkUnusedImport(allocator, &issues, a.path, a.content, imp);
         }
@@ -5156,13 +5745,17 @@ fn processFunction(
     try issues.appendSlice(allocator, defer_issues.items);
 
     // Run CFG-based errdefer coverage analysis (ZA103)
-    var errdefer_issues = try analyzeCFGErrdeferCoverage(
-        allocator,
-        func_lines_items,
-        func_start,
-        file_path,
-        fn_returns_error,
-    );
+    // Skip in test context - test functions don't need errdefer (test abort handles cleanup)
+    var errdefer_issues = if (is_in_test_context)
+        std.ArrayListUnmanaged(Issue){}
+    else
+        try analyzeCFGErrdeferCoverage(
+            allocator,
+            func_lines_items,
+            func_start,
+            file_path,
+            fn_returns_error,
+        );
     defer errdefer_issues.deinit(allocator);
     try issues.appendSlice(allocator, errdefer_issues.items);
 
@@ -5338,13 +5931,18 @@ fn tryExtractAllocation(t: []const u8, actual_line: usize, uses_arena: bool) ?Al
     const name = extractVarDeclName(t) orelse return null;
     const alloc_call = findAllocCall(t) orelse return null;
     const alloc_name = extractAllocatorName(t) orelse "";
+    // Detect catch unreachable/return/panic: no error path, errdefer unneeded
+    const has_no_err_path = mem.indexOf(u8, t, "catch unreachable") != null or
+        mem.indexOf(u8, t, "catch return") != null or
+        mem.indexOf(u8, t, "catch @panic") != null;
     return AllocInfo{
         .name = name,
         .allocator_name = alloc_name,
         .line = actual_line,
         .col = alloc_call.col + 1,
         .is_create = alloc_call.is_create,
-        .is_arena_alloc = uses_arena or isNoFreeAllocatorName(alloc_name),
+        .is_arena_alloc = uses_arena or isNoFreeAllocatorName(alloc_name) or isArenaAllocLine(t),
+        .no_error_path = has_no_err_path,
     };
 }
 
@@ -5418,13 +6016,17 @@ fn detectAllocOnLine(
 ) !void {
     const alloc_call = findAllocCall(t) orelse return;
     const aname = extractAllocatorName(t) orelse "";
+    const has_no_err = mem.indexOf(u8, t, "catch unreachable") != null or
+        mem.indexOf(u8, t, "catch return") != null or
+        mem.indexOf(u8, t, "catch @panic") != null;
     try allocs.append(allocator, .{
         .name = ctx.var_name,
         .allocator_name = aname,
         .line = ctx.actual_line,
         .col = alloc_call.col + 1,
         .is_create = alloc_call.is_create,
-        .is_arena_alloc = ctx.uses_arena or isNoFreeAllocatorName(aname),
+        .is_arena_alloc = ctx.uses_arena or isNoFreeAllocatorName(aname) or isArenaAllocLine(t),
+        .no_error_path = has_no_err,
     });
 }
 
@@ -5662,6 +6264,7 @@ fn reportLeaks(
         });
 
         const needs_errdefer = has_err_return and
+            !alloc.no_error_path and // non-try alloc has no error path to protect
             !alloc.has_errdefer and !alloc.returned and
             !alloc.stored and !alloc.ownership_transferred;
 
@@ -5945,8 +6548,9 @@ fn analyzeFunction(
 
                 // Ownership transfer via method call: .put(alias), .append(alias), etc.
                 const transfer_methods = [_][]const u8{
-                    ".put(", ".putNoClobber(", ".append(", ".appendSlice(",
-                    ".insert(", ".add(", ".push(", ".enqueue(", ".submit(",
+                    ".put(",    ".putNoClobber(", ".append(", ".appendSlice(",
+                    ".insert(", ".add(",          ".push(",   ".enqueue(",
+                    ".submit(",
                 };
                 for (transfer_methods) |method| {
                     if (mem.indexOf(u8, t, method) != null) {
@@ -6066,11 +6670,42 @@ fn analyzeIgnoredErrors(
         if (isCImportFile(file_path, content)) continue;
 
         var line_num: usize = 1;
+        var defer_depth: usize = 0;
         var lines = mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             defer line_num += 1;
             const t = mem.trim(u8, line, " \t\r");
             if (t.len == 0 or isCommentOrMultilineString(t)) continue;
+
+            // Track defer block depth: `try` is illegal in defer,
+            // so `_ = expr` is the only way to call fallible functions
+            if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) {
+                if (mem.indexOf(u8, t, "{") == null) {
+                    continue; // Single-line defer, skip
+                }
+                // Multi-line defer: count braces on this line
+                defer_depth = 1; // Account for the opening {
+                var saw_first = false;
+                for (t) |c| {
+                    if (c == '{') {
+                        if (!saw_first) {
+                            saw_first = true;
+                            continue;
+                        }
+                        defer_depth += 1;
+                    }
+                    if (c == '}' and defer_depth > 0) defer_depth -= 1;
+                }
+                continue;
+            }
+            if (defer_depth > 0) {
+                for (t) |c| {
+                    if (c == '{') defer_depth += 1;
+                    if (c == '}' and defer_depth > 0) defer_depth -= 1;
+                }
+                continue; // Inside defer block, skip ZA205
+            }
+
             try checkIgnoredError(allocator, &issues, file_path, t, line_num);
         }
     }
@@ -6339,15 +6974,9 @@ fn analyzeCFGErrors(
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
-    // Check if we're in a cleanup function (deinit, close, etc.)
-    const is_cleanup_func = isCleanupFunctionContext(func_name);
-
     // Analyze each block
     for (cfg.blocks.items) |block| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
-
-        // Skip analysis inside catch blocks - error recovery context
-        const in_catch_context = block.is_catch_block;
 
         for (block.start_line..block.end_line + 1) |line_num| {
             if (line_num < func_line) continue;
@@ -6357,39 +6986,9 @@ fn analyzeCFGErrors(
             const t = mem.trim(u8, lines[idx], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
 
-            // ZA201: Silent catch {} - skip in catch/cleanup/defer context
-            // defer catch {} is idiomatic for cleanup that shouldn't propagate errors
-            const in_defer_context = mem.startsWith(u8, t, "defer ") or
-                mem.startsWith(u8, t, "errdefer ");
-            if (!in_catch_context and !is_cleanup_func and !in_defer_context) {
-                if (!isBestEffortOperation(t)) {
-                    if (mem.indexOf(u8, t, "catch {}")) |col| {
-                        if (!isInsideString(t, col)) {
-                            try issues.append(allocator, .{
-                                .file = file_path,
-                                .line = line_num,
-                                .col = col + 1,
-                                .severity = .warning,
-                                .rule = RULE_SILENT_CATCH,
-                                .message = "silent catch {} discards error",
-                                .help = "use catch |err| with logging, or propagate with try",
-                            });
-                        }
-                    } else if (mem.indexOf(u8, t, "catch |_| {}")) |col| {
-                        if (!isInsideString(t, col)) {
-                            try issues.append(allocator, .{
-                                .file = file_path,
-                                .line = line_num,
-                                .col = col + 1,
-                                .severity = .warning,
-                                .rule = RULE_SILENT_CATCH,
-                                .message = "silent catch |_| {} discards error",
-                                .help = "use catch |err| with logging, or propagate with try",
-                            });
-                        }
-                    }
-                }
-            }
+            // ZA201: Silent catch {} is handled by the line-based analyzer
+            // (checkSilentCatchWithContext in checkLineErrors) to avoid duplicates.
+            // The line-based analyzer already handles defer context, best-effort ops, etc.
 
             // ZA202: catch unreachable - skip in test context (intentional fail-fast)
             // In production code, catch unreachable is dangerous. In tests, it's common.
@@ -6664,11 +7263,16 @@ fn analyzeCFGPanicPatterns(
     }
 
     // Phase 3: Check for unguarded decrements and subtractions
+    // Track reported lines to avoid duplicates from overlapping CFG blocks
+    var reported_lines = std.AutoHashMap(usize, void).init(allocator);
+    defer reported_lines.deinit();
+
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
 
         for (block.start_line..block.end_line + 1) |line_num| {
             if (line_num < func_line) continue;
+            if (reported_lines.contains(line_num)) continue;
             const idx = line_num - func_line;
             if (idx >= lines.len) continue;
             const t = mem.trim(u8, lines[idx], " \t\r");
@@ -6697,6 +7301,18 @@ fn analyzeCFGPanicPatterns(
                     // Skip if there's a paired increment
                     if (hasPairedIncrementInLines(lines[0..idx], var_name)) continue;
 
+                    // Skip if in comptime block
+                    if (isInComptimeBlock(lines, idx)) continue;
+
+                    // Skip if assert(var >= N) on prior lines
+                    if (hasAssertGeGuard(lines, idx, var_name)) continue;
+
+                    // Skip if inside enclosing if/while (var > 0) block
+                    if (hasEnclosingVarGuard(lines, idx, var_name)) continue;
+
+                    // Skip if in else branch of if (var == 0) / if (var < N)
+                    if (hasElseBranchGuard(lines, idx)) continue;
+
                     try issues.append(allocator, .{
                         .file = file_path,
                         .line = line_num,
@@ -6706,6 +7322,7 @@ fn analyzeCFGPanicPatterns(
                         .message = "decrement without overflow guard may panic",
                         .help = "add guard (if/while/assert x > 0), use saturating arithmetic (-|), or document caller contract",
                     });
+                    try reported_lines.put(line_num, {});
                 }
             }
 
@@ -6745,6 +7362,22 @@ fn analyzeCFGPanicPatterns(
                 // Pattern: if (x <= 30) { ... } else if (x <= 120) { arr[divFloor(x,10) - 1] } - safe
                 if (hasElseBranchGuard(lines, idx)) continue;
 
+                // Skip if in comptime block (compiler catches overflow at compile time)
+                if (isInComptimeBlock(lines, idx)) continue;
+
+                // Skip if early-return guard protects length
+                // Pattern: if (x.len < N) return; ... arr[x.len - M] where M < N
+                if (hasEarlyReturnLengthGuard(lines, idx, t)) continue;
+
+                // Skip if loop init guarantees minimum value
+                // Pattern: var i: T = N; while (...) { arr[i - K] } where N >= K
+                if (hasLoopInitGuard(lines, idx, t)) continue;
+
+                // Skip if inside an enclosing block guarded by if/while (var > 0)
+                // Pattern: if (x > 0) { ... arr[x - 1] ... }
+                // Pattern: while (cols_len > 0) { ... cells[cols_len - 1] ... }
+                if (hasEnclosingBlockGuard(lines, idx, t)) continue;
+
                 try issues.append(allocator, .{
                     .file = file_path,
                     .line = line_num,
@@ -6754,6 +7387,7 @@ fn analyzeCFGPanicPatterns(
                     .message = "arithmetic in array index may overflow",
                     .help = "ensure index arithmetic cannot underflow, or use saturating subtraction -|",
                 });
+                try reported_lines.put(line_num, {});
             }
         }
     }
@@ -6806,6 +7440,26 @@ fn extractGuardedVar(t: []const u8) ?[]const u8 {
                     _ = base; // We want to return x.len, not just x
                     return t[start .. pos + ".len".len];
                 }
+            }
+        }
+    }
+
+    // Pattern: x > variable or x >= variable (not just literal 0)
+    // Handles: while (i > check_start), if (x > min_val)
+    const var_guard_patterns = [_][]const u8{ "> ", ">= " };
+    for (var_guard_patterns) |pattern| {
+        if (mem.indexOf(u8, t, pattern)) |pos| {
+            // Check that RHS is an identifier (not a literal 0 - already handled above)
+            const rhs_start = pos + pattern.len;
+            if (rhs_start < t.len and isIdent(t[rhs_start])) {
+                // Extract LHS variable
+                var end = pos;
+                while (end > 0 and t[end - 1] == ' ') end -= 1;
+                var start = end;
+                while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+                    start -= 1;
+                }
+                if (start < end) return t[start..end];
             }
         }
     }
@@ -6958,24 +7612,289 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
 /// Pattern: while (true) { if (x == 0) break; x -= 1; }
 /// Based on Zig control flow semantics - break/continue/return exits prevent reaching decrement
 fn hasBreakGuardOnPriorLines(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
-    // Look back up to 5 lines for a guard pattern
-    const check_start = if (current_idx > 5) current_idx - 5 else 0;
-    for (lines[check_start..current_idx]) |line| {
-        const ctx = mem.trim(u8, line, " \t\r");
-        // Stop at function boundary - guard in different function doesn't apply
+    // Look back up to 10 lines for a guard pattern
+    const check_start = if (current_idx > 10) current_idx - 10 else 0;
+    var brace_depth: i32 = 0;
+    var i = current_idx;
+    while (i > check_start) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+
+        // Track brace depth going backwards
+        for (ctx) |c| {
+            if (c == '}') brace_depth += 1;
+            if (c == '{') brace_depth -= 1;
+        }
+
+        // Stop at function boundary
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
-        // Stop at loop boundary - guard in outer loop doesn't apply to inner loop
-        // A new while/for creates a new scope where prior guards don't apply
-        if (mem.startsWith(u8, ctx, "while ") or mem.startsWith(u8, ctx, "while(")) return false;
-        if (mem.startsWith(u8, ctx, "for ") or mem.startsWith(u8, ctx, "for(")) return false;
+
+        // Stop at loop boundary ONLY if we're at or above the same nesting level
+        // If brace_depth < 0, we're inside the loop (it's our enclosing scope) - don't stop
+        if (brace_depth >= 0) {
+            if (mem.startsWith(u8, ctx, "while ") or mem.startsWith(u8, ctx, "while(")) return false;
+            if (mem.startsWith(u8, ctx, "for ") or mem.startsWith(u8, ctx, "for(")) return false;
+        }
+
         // Check for if (var == 0) break/continue/return pattern
         if (mem.indexOf(u8, ctx, var_name)) |_| {
             if (mem.indexOf(u8, ctx, "== 0)") != null) {
+                // Single-line: if (var == 0) return;
                 if (mem.indexOf(u8, ctx, "break") != null) return true;
                 if (mem.indexOf(u8, ctx, "continue") != null) return true;
                 if (mem.indexOf(u8, ctx, "return") != null) return true;
+                // Multi-line: if (var == 0) { ... return/continue/break; }
+                // Scan ahead a few lines for the exit statement
+                const block_end = if (i + 6 < current_idx) i + 6 else current_idx;
+                var j = i + 1;
+                while (j < block_end) : (j += 1) {
+                    const inner = mem.trim(u8, lines[j], " \t\r");
+                    if (mem.indexOf(u8, inner, "return") != null) return true;
+                    if (mem.indexOf(u8, inner, "break") != null) return true;
+                    if (mem.indexOf(u8, inner, "continue") != null) return true;
+                    if (mem.eql(u8, inner, "}")) break;
+                }
             }
         }
+    }
+    return false;
+}
+
+/// Check if current line is inside a comptime block
+/// Comptime code is evaluated at compile time - the compiler catches overflow errors
+fn isInComptimeBlock(lines: []const []const u8, current_idx: usize) bool {
+    var brace_depth: i32 = 0;
+    var i = current_idx;
+    while (i > 0) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        // Count braces going backward
+        for (ctx) |c| {
+            if (c == '}') brace_depth += 1;
+            if (c == '{') brace_depth -= 1;
+        }
+        // If we're at negative depth, we're inside an enclosing block
+        if (brace_depth < 0) {
+            // Check if this line contains "comptime" before the opening brace
+            if (mem.indexOf(u8, ctx, "comptime") != null) return true;
+            // Reset - we're inside a non-comptime block
+            return false;
+        }
+        // Stop at function boundary
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+    }
+    return false;
+}
+
+/// Check for assert(var >= n) on prior lines as guard for var -= n
+/// Pattern: assert(item.meta.ref >= n); ... item.meta.ref -= n;
+fn hasAssertGeGuard(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+    const check_start = if (current_idx > 5) current_idx - 5 else 0;
+    for (lines[check_start..current_idx]) |line| {
+        const ctx = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+
+        // Check for assert(var >= ...) pattern
+        if (mem.indexOf(u8, ctx, "assert") != null and mem.indexOf(u8, ctx, var_name) != null) {
+            if (mem.indexOf(u8, ctx, ">=") != null) return true;
+            if (mem.indexOf(u8, ctx, "> ") != null) return true;
+        }
+    }
+    return false;
+}
+
+/// Check for early-return length guards that protect array index arithmetic
+/// Pattern: if (x.len < N) return; ... x[x.len - M] where M <= N
+/// Pattern: if (x.len == 0) return; ... x[x.len - 1]
+/// Pattern: if (x.len == 1) { return null; } ... x[... x.len - 1]
+fn hasEarlyReturnLengthGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
+    _ = current_line;
+    const check_start = if (current_idx > 30) current_idx - 30 else 0;
+
+    var i = check_start;
+    while (i < current_idx) : (i += 1) {
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+
+        // Check for .len guard in if condition
+        if (mem.indexOf(u8, ctx, ".len") == null) continue;
+        if (mem.indexOf(u8, ctx, "if ") == null and mem.indexOf(u8, ctx, "if(") == null) continue;
+
+        const has_len_guard = mem.indexOf(u8, ctx, "< ") != null or
+            mem.indexOf(u8, ctx, "<= ") != null or
+            mem.indexOf(u8, ctx, "== 0") != null or
+            mem.indexOf(u8, ctx, "== 1") != null;
+        if (!has_len_guard) continue;
+
+        // Single-line: if (x.len < N) return/break/continue
+        const has_exit = mem.indexOf(u8, ctx, "return") != null or
+            mem.indexOf(u8, ctx, "break") != null or
+            mem.indexOf(u8, ctx, "continue") != null;
+        if (has_exit) return true;
+
+        // Multi-line: if (x.len < N) { ... return ...; }
+        // Check the next few lines for return/break/continue inside the block
+        var j = i + 1;
+        const block_end = if (i + 6 < current_idx) i + 6 else current_idx;
+        while (j < block_end) : (j += 1) {
+            const inner = mem.trim(u8, lines[j], " \t\r");
+            if (mem.indexOf(u8, inner, "return") != null) return true;
+            if (mem.indexOf(u8, inner, "break") != null) return true;
+            if (mem.indexOf(u8, inner, "continue") != null) return true;
+            // Stop at closing brace of the if block
+            if (mem.eql(u8, inner, "}")) break;
+        }
+    }
+    return false;
+}
+
+/// Check if loop initialization guarantees minimum index value
+/// Pattern: var i: T = N; while (...) : (i += 1) { ... arr[i - K] } where N >= K
+/// Pattern: var i: T = best_idx + 1; while (...) { ... arr[i - 1] }
+fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
+    // Extract the index variable from the subtraction pattern [VAR - N]
+    const bracket_pos = mem.indexOf(u8, current_line, "[") orelse return false;
+    const sub_pos = mem.indexOf(u8, current_line, " - ") orelse return false;
+    if (sub_pos <= bracket_pos) return false;
+
+    // Get variable name between [ and -
+    const idx_var = mem.trim(u8, current_line[bracket_pos + 1 .. sub_pos], " ");
+    if (idx_var.len == 0 or !isIdent(idx_var[0])) return false;
+
+    // Get subtrahend (the number being subtracted)
+    var sub_end = sub_pos + 3;
+    while (sub_end < current_line.len and current_line[sub_end] >= '0' and current_line[sub_end] <= '9') : (sub_end += 1) {}
+    if (sub_end == sub_pos + 3) return false; // Not a numeric literal
+    const subtrahend = std.fmt.parseInt(usize, current_line[sub_pos + 3 .. sub_end], 10) catch return false;
+
+    // Search backwards for the loop init: var idx_var = N or var idx_var: T = N
+    const check_start = if (current_idx > 20) current_idx - 20 else 0;
+    for (lines[check_start..current_idx]) |line| {
+        const ctx = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+
+        // Look for: var idx_var ... = INIT_VALUE
+        if ((mem.indexOf(u8, ctx, "var ") != null or mem.indexOf(u8, ctx, "const ") != null) and
+            mem.indexOf(u8, ctx, idx_var) != null and
+            mem.indexOf(u8, ctx, "= ") != null)
+        {
+            // Find the init value after the last =
+            if (mem.lastIndexOf(u8, ctx, "= ")) |eq_pos| {
+                const after_eq = mem.trim(u8, ctx[eq_pos + 2 ..], " ;");
+                // Direct numeric literal: var i = 32
+                if (after_eq.len > 0 and after_eq[0] >= '0' and after_eq[0] <= '9') {
+                    const init_val = std.fmt.parseInt(usize, after_eq, 10) catch return false;
+                    if (init_val >= subtrahend) return true;
+                }
+                // Expression ending in + N: var i = best_idx + 1
+                if (mem.indexOf(u8, after_eq, "+ ")) |plus_pos| {
+                    const after_plus = mem.trim(u8, after_eq[plus_pos + 2 ..], " ;");
+                    if (after_plus.len > 0 and after_plus[0] >= '0' and after_plus[0] <= '9') {
+                        const offset = std.fmt.parseInt(usize, after_plus, 10) catch return false;
+                        if (offset >= subtrahend) return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Extract the subtraction variable from an array index pattern [VAR - N]
+/// Returns the variable name between [ and -
+fn extractIndexSubVar(t: []const u8) ?[]const u8 {
+    const bracket_pos = mem.indexOf(u8, t, "[") orelse return null;
+    const sub_pos = mem.indexOf(u8, t, " - ") orelse return null;
+    if (sub_pos <= bracket_pos) return null;
+    const idx_var = mem.trim(u8, t[bracket_pos + 1 .. sub_pos], " ");
+    if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
+    // Make sure it's a simple identifier (no dots for .len which are handled elsewhere)
+    return idx_var;
+}
+
+/// Check if current line is inside an enclosing block guarded by if/while (var > 0)
+/// Pattern: if (x > 0) { ... arr[x - 1] ... } - x guaranteed >= 1
+/// Pattern: while (cols_len > 0) { ... cells[cols_len - 1] ... }
+fn hasEnclosingBlockGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
+    // Extract the variable being subtracted in the array index
+    const sub_var = extractIndexSubVar(current_line) orelse return false;
+
+    // Walk backwards tracking brace depth to find enclosing blocks
+    var brace_depth: i32 = 0;
+    var i = current_idx;
+    while (i > 0) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+
+        // Count braces going backward
+        for (ctx) |c| {
+            if (c == '}') brace_depth += 1;
+            if (c == '{') brace_depth -= 1;
+        }
+
+        // Found an enclosing block opening
+        if (brace_depth < 0) {
+            // Check if this line has a guard for our variable
+            if (mem.indexOf(u8, ctx, sub_var)) |_| {
+                // if (var > 0) or while (var > 0)
+                if (mem.indexOf(u8, ctx, "if ") != null or mem.indexOf(u8, ctx, "if(") != null or
+                    mem.indexOf(u8, ctx, "while ") != null or mem.indexOf(u8, ctx, "while(") != null)
+                {
+                    if (mem.indexOf(u8, ctx, "> 0") != null) return true;
+                    if (mem.indexOf(u8, ctx, ">= 1") != null) return true;
+                    if (mem.indexOf(u8, ctx, "!= 0") != null) return true;
+                    if (mem.indexOf(u8, ctx, "> 1") != null) return true;
+                    if (mem.indexOf(u8, ctx, ">= 2") != null) return true;
+                }
+            }
+            // Reset depth for next enclosing level
+            brace_depth = 0;
+        }
+
+        // Stop at function boundary
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+    }
+    return false;
+}
+
+/// Check if current line is inside an enclosing block guarded by if/while (var > 0) for decrements
+/// Pattern: if (count > 0) { ... count -= 1; ... }
+/// Pattern: while (remaining > 0) { ... remaining -= 1; ... }
+fn hasEnclosingVarGuard(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+    var brace_depth: i32 = 0;
+    var i = current_idx;
+    while (i > 0) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+
+        for (ctx) |c| {
+            if (c == '}') brace_depth += 1;
+            if (c == '{') brace_depth -= 1;
+        }
+
+        if (brace_depth < 0) {
+            if (mem.indexOf(u8, ctx, var_name)) |_| {
+                if (mem.indexOf(u8, ctx, "if ") != null or mem.indexOf(u8, ctx, "if(") != null or
+                    mem.indexOf(u8, ctx, "while ") != null or mem.indexOf(u8, ctx, "while(") != null)
+                {
+                    if (mem.indexOf(u8, ctx, "> 0") != null) return true;
+                    if (mem.indexOf(u8, ctx, ">= 1") != null) return true;
+                    if (mem.indexOf(u8, ctx, "!= 0") != null) return true;
+                    if (mem.indexOf(u8, ctx, "> 1") != null) return true;
+                    if (mem.indexOf(u8, ctx, ">= 2") != null) return true;
+                }
+            }
+            brace_depth = 0;
+        }
+
+        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
     }
     return false;
 }
@@ -7091,15 +8010,17 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
 
                     // When depth reaches 0, we found the if statement
                     if (if_search_depth == 0) {
-                        // Check for length comparison patterns
-                        // Pattern: if (x.len < N) or if (x < N) - in else, x.len >= N
+                        // Check for comparison patterns in the if condition
                         if (mem.indexOf(u8, if_ctx, "if (") != null or mem.indexOf(u8, if_ctx, "if(") != null) {
-                            // Check for < comparison (inverted in else means >=)
+                            // if (x < N) - in else, x >= N
                             if (mem.indexOf(u8, if_ctx, ".len < ") != null) return true;
                             if (mem.indexOf(u8, if_ctx, " < ") != null) return true;
-                            // Check for <= comparison (inverted in else means >)
+                            // if (x <= N) - in else, x > N
                             if (mem.indexOf(u8, if_ctx, ".len <= ") != null) return true;
                             if (mem.indexOf(u8, if_ctx, " <= ") != null) return true;
+                            // if (x == 0) - in else, x != 0 so x >= 1
+                            if (mem.indexOf(u8, if_ctx, "== 0)") != null) return true;
+                            if (mem.indexOf(u8, if_ctx, "== 0 ") != null) return true;
                         }
                         break;
                     }
@@ -7160,14 +8081,20 @@ fn hasIndexGuardOnLine(t: []const u8) bool {
         if (mem.indexOf(u8, t, "> ") != null) return true;
         if (mem.indexOf(u8, t, ">= ") != null) return true;
     }
-    // Pattern: inline if-else expression with length guard in else branch
+    // Pattern: inline if-else expression with guard in else branch
     // if (x.len < N) ... else arr[x.len - ...] - in else, x.len >= N
+    // if (x == 0) val else arr[x - 1] - in else, x != 0, so x >= 1
     // Zig semantics: In inline if-else, else branch only executes when condition is false
     if (mem.indexOf(u8, t, " else ") != null) {
-        // Check for length comparison in if condition
         if (mem.indexOf(u8, t, "if (") != null or mem.indexOf(u8, t, "if(") != null) {
             if (mem.indexOf(u8, t, ".len < ") != null) return true;
             if (mem.indexOf(u8, t, ".len <= ") != null) return true;
+            // if (x == 0) ... else arr[x - 1] - else guarantees x >= 1
+            if (mem.indexOf(u8, t, "== 0)")) |eq_pos| {
+                if (mem.indexOf(u8, t, " else ")) |else_pos| {
+                    if (eq_pos < else_pos) return true;
+                }
+            }
             // Generic comparison with < or <= before else
             if (mem.indexOf(u8, t, " < ")) |lt_pos| {
                 if (mem.indexOf(u8, t, " else ")) |else_pos| {
@@ -7267,6 +8194,18 @@ fn checkDecrementWithoutGuard(
                 if (hasPairedIncrement(context_lines[0..current_idx], var_name)) {
                     continue;
                 }
+
+                // Skip if in comptime block
+                if (isInComptimeBlock(context_lines, current_idx)) continue;
+
+                // Skip if assert(var >= N) on prior lines
+                if (hasAssertGeGuard(context_lines, current_idx, var_name)) continue;
+
+                // Skip if inside enclosing if/while (var > 0) block
+                if (hasEnclosingVarGuard(context_lines, current_idx, var_name)) continue;
+
+                // Skip if in else branch of if (var == 0) / if (var < N)
+                if (hasElseBranchGuard(context_lines, current_idx)) continue;
 
                 try issues.append(allocator, .{
                     .file = path,
@@ -7617,21 +8556,56 @@ fn runRuntimeAnalysis(
     allocator: Allocator,
     path: []const u8,
     verbose: bool,
+    custom_command: ?[]const u8,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
-    if (verbose) {
-        std.debug.print("Running: zig build test (with GPA diagnostics)\n", .{});
+    // Build command arguments
+    var argv_buf: [64][]const u8 = undefined;
+    var argv_len: usize = 0;
+
+    if (custom_command) |cmd| {
+        // Parse custom command into argv (split by spaces, respecting quotes)
+        var in_quote = false;
+        var start: usize = 0;
+        for (cmd, 0..) |c, i| {
+            if (c == '"' or c == '\'') {
+                in_quote = !in_quote;
+            } else if (c == ' ' and !in_quote) {
+                if (i > start) {
+                    argv_buf[argv_len] = cmd[start..i];
+                    argv_len += 1;
+                }
+                start = i + 1;
+            }
+        }
+        if (start < cmd.len) {
+            argv_buf[argv_len] = cmd[start..];
+            argv_len += 1;
+        }
+        if (verbose) {
+            std.debug.print("Running: {s} (with GPA diagnostics)\n", .{cmd});
+        }
+    } else {
+        // Default: zig build test
+        argv_buf[0] = "zig";
+        argv_buf[1] = "build";
+        argv_buf[2] = "test";
+        argv_len = 3;
+        if (verbose) {
+            std.debug.print("Running: zig build test (with GPA diagnostics)\n", .{});
+        }
     }
 
-    // Run zig build test - GPA produces diagnostics on stderr
+    // Run command - GPA produces diagnostics on stderr
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "zig", "build", "test" },
+        .argv = argv_buf[0..argv_len],
         .cwd = path,
-        .max_output_bytes = 10 * 1024 * 1024, // 10MB limit for large test output
+        .max_output_bytes = 10 * 1024 * 1024, // 10MB limit for large output
     }) catch |err| {
-        std.debug.print("error: cannot run zig build test: {}\n", .{err});
+        const cmd_str = custom_command orelse "zig build test";
+        std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
         return issues;
     };
     defer allocator.free(result.stdout);
@@ -7642,21 +8616,25 @@ fn runRuntimeAnalysis(
     //            "error: memory leak at ..."
     try parseGPADiagnostics(allocator, &issues, result.stderr, verbose);
 
-    // Also check stdout for test failures and panics
+    // Also check stdout for panics and failures
     try parseTestOutput(allocator, &issues, result.stdout, verbose);
 
-    // Parse exit status - non-zero means test failures
+    // Parse exit status - non-zero means failures
     if (result.term.Exited != 0) {
         // Check if we already captured specific failures
         if (issues.items.len == 0) {
+            const help_msg = if (custom_command != null)
+                "check command output for details"
+            else
+                "run 'zig build test' to see details";
             try issues.append(allocator, .{
                 .file = "build.zig",
                 .line = 1,
                 .col = 1,
                 .severity = .err,
                 .rule = RULE_RUNTIME_TEST_FAILURE,
-                .message = "test suite failed",
-                .help = "run 'zig build test' to see details",
+                .message = "command failed",
+                .help = help_msg,
             });
         }
     }
@@ -7678,23 +8656,42 @@ fn parseGPADiagnostics(
         if (t.len == 0) continue;
 
         // Check for memory leak indicators
+        // GPA format: "error(gpa): memory address 0x... leaked:"
+        // followed by stack trace with file:line:col on next line
         if (mem.indexOf(u8, t, "memory leak") != null or
-            mem.indexOf(u8, t, "Memory leak") != null)
+            mem.indexOf(u8, t, "Memory leak") != null or
+            mem.indexOf(u8, t, "leaked:") != null)
         {
             if (verbose) {
                 std.debug.print("GPA: {s}\n", .{t});
             }
 
-            // Try to extract file:line from stack trace
-            const loc = extractFileLocation(t);
+            // File location is on the NEXT line (stack trace)
+            var msg: []const u8 = "memory leak detected at runtime";
+            if (lines.next()) |next_line| {
+                const next_t = mem.trim(u8, next_line, " \t\r");
+                const loc = extractFileLocation(next_t);
+                if (loc.line > 0) {
+                    // Create message with file location
+                    msg = try std.fmt.allocPrint(
+                        allocator,
+                        "memory leak at {s}:{d}",
+                        .{ loc.file, loc.line },
+                    );
+                    if (verbose) {
+                        std.debug.print("  at: {s}:{d}\n", .{ loc.file, loc.line });
+                    }
+                }
+            }
             try issues.append(allocator, .{
-                .file = loc.file,
-                .line = loc.line,
+                .file = "runtime",
+                .line = 1,
                 .col = 1,
                 .severity = .err,
                 .rule = RULE_RUNTIME_MEMORY_LEAK,
-                .message = "memory leak detected at runtime",
+                .message = msg,
                 .help = "allocation not freed - check for missing defer or error path",
+                .message_owned = msg.ptr != "memory leak detected at runtime".ptr,
             });
         }
 
@@ -7736,6 +8733,84 @@ fn parseGPADiagnostics(
                 .rule = RULE_RUNTIME_USE_AFTER_FREE,
                 .message = "use after free detected at runtime",
                 .help = "accessing memory after it was freed",
+            });
+        }
+
+        // Check for invalid free (freeing non-allocated memory)
+        if (mem.indexOf(u8, t, "Invalid free") != null or
+            mem.indexOf(u8, t, "invalid free") != null)
+        {
+            if (verbose) {
+                std.debug.print("GPA: {s}\n", .{t});
+            }
+
+            const loc = extractFileLocation(t);
+            try issues.append(allocator, .{
+                .file = loc.file,
+                .line = loc.line,
+                .col = 1,
+                .severity = .err,
+                .rule = RULE_RUNTIME_DOUBLE_FREE, // Reuse - similar issue
+                .message = "invalid free detected - memory was not allocated",
+                .help = "freeing memory that was never allocated or already freed",
+            });
+        }
+
+        // Check for segmentation fault
+        if (mem.indexOf(u8, t, "Segmentation fault") != null or
+            mem.indexOf(u8, t, "segmentation fault") != null or
+            mem.indexOf(u8, t, "SIGSEGV") != null)
+        {
+            if (verbose) {
+                std.debug.print("SEGFAULT: {s}\n", .{t});
+            }
+
+            try issues.append(allocator, .{
+                .file = "runtime",
+                .line = 1,
+                .col = 1,
+                .severity = .err,
+                .rule = RULE_RUNTIME_PANIC,
+                .message = "segmentation fault - invalid memory access",
+                .help = "check for null pointer dereference, use after free, or buffer overflow",
+            });
+        }
+
+        // Check for stack overflow
+        if (mem.indexOf(u8, t, "stack overflow") != null or
+            mem.indexOf(u8, t, "Stack overflow") != null)
+        {
+            if (verbose) {
+                std.debug.print("STACK: {s}\n", .{t});
+            }
+
+            try issues.append(allocator, .{
+                .file = "runtime",
+                .line = 1,
+                .col = 1,
+                .severity = .err,
+                .rule = RULE_RUNTIME_PANIC,
+                .message = "stack overflow - infinite recursion or large stack allocation",
+                .help = "check for unbounded recursion or use heap allocation for large data",
+            });
+        }
+
+        // Check for out of memory
+        if (mem.indexOf(u8, t, "OutOfMemory") != null or
+            mem.indexOf(u8, t, "out of memory") != null)
+        {
+            if (verbose) {
+                std.debug.print("OOM: {s}\n", .{t});
+            }
+
+            try issues.append(allocator, .{
+                .file = "runtime",
+                .line = 1,
+                .col = 1,
+                .severity = .err,
+                .rule = RULE_RUNTIME_PANIC,
+                .message = "out of memory - allocation failed",
+                .help = "check for memory leaks or reduce memory usage",
             });
         }
     }
@@ -7921,14 +8996,13 @@ fn isCImportFile(file_path: []const u8, content: []const u8) bool {
     // Skip files ending in cimport.zig
     if (mem.endsWith(u8, file_path, "cimport.zig")) return true;
 
-    // Skip files in deps/ with C translation markers
-    if (mem.indexOf(u8, file_path, "/deps/") != null) {
-        if (mem.indexOf(u8, content, "__builtin_") != null or
-            mem.indexOf(u8, content, "enum_unnamed_") != null or
-            mem.indexOf(u8, content, "@cImport") != null)
-        {
-            return true;
-        }
+    // Skip any file with C translation markers (not just /deps/)
+    // Auto-generated C bindings can be anywhere (e.g., capy's gtk.zig)
+    if (mem.indexOf(u8, content, "__builtin_") != null or
+        mem.indexOf(u8, content, "enum_unnamed_") != null or
+        mem.indexOf(u8, content, "@cImport") != null)
+    {
+        return true;
     }
     return false;
 }
@@ -8011,6 +9085,7 @@ const Config = struct {
     export_path: ?[]const u8, // --export=<filepath> to save issues to file
     known_issues_path: ?[]const u8, // --known-issues=<filepath> to filter known true positives
     known_issues: std.ArrayListUnmanaged([]const u8), // Loaded known issues (file:line format)
+    runtime_command: ?[]const u8, // --command=<cmd> for runtime analysis
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -8028,6 +9103,7 @@ const Config = struct {
         if (self.known_issues_path) |p| allocator.free(p);
         for (self.known_issues.items) |k| allocator.free(k);
         self.known_issues.deinit(allocator);
+        if (self.runtime_command) |c| allocator.free(c);
     }
 
     /// Determine if a rule is enabled considering enable list and disable list
@@ -8057,7 +9133,28 @@ const Config = struct {
             // ZAVxx version checks are OFF by default
             return false;
         }
-        // ZA9xx panic/overflow detection is ON by default (critical safety checks)
+        // ZA205 is OFF by default: in compiling Zig code, `_ = func()` without
+        // `catch` means the function does NOT return an error union (compiler
+        // enforces this), so these are always intentional value discards.
+        if (mem.eql(u8, rule, RULE_IGNORED_ERROR)) return false;
+
+        // ZA204 is OFF by default: `= undefined` is a fundamental Zig pattern
+        // for struct initialization, buffer pre-declaration, inline for field
+        // assignment, and comptime type introspection. Near-100% false positive
+        // rate on real-world code. Needs CFG-based data flow analysis to be useful.
+        if (mem.eql(u8, rule, RULE_UNDEFINED_USAGE)) return false;
+
+        // ZA8xx (null safety) is OFF by default: `.?` unwrap is a common Zig
+        // idiom where the developer knows the optional is set. Without
+        // interprocedural data flow analysis, we cannot track null guards.
+        // Near-100% false positive rate on community projects.
+        if (mem.startsWith(u8, rule, "ZA8")) return false;
+
+        // ZA9xx (overflow/panic detection) is OFF by default: static analysis
+        // cannot track guards (assertions, loop bounds, short-circuit evaluation,
+        // conditional checks) that protect arithmetic operations. Near-100% false
+        // positive rate on community projects. Needs CFG-based guard tracking.
+        if (mem.startsWith(u8, rule, "ZA9")) return false;
 
         return true;
     }
@@ -8697,14 +9794,22 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
     defer allocator.free(build_zig_path);
     try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, &added);
 
+    // Also try parent directory for build.zig (common: target is src/ but build.zig is at root)
+    const parent = std.fs.path.dirname(
+        mem.trimRight(u8, cfg.path, "/"),
+    ) orelse ".";
+    const parent_build = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{parent});
+    defer allocator.free(parent_build);
+    try extractBuildZigEntriesFromPath(allocator, cfg, parent_build, parent, &added);
+
     // Scan common multi-entry directories in target path
     // Based on patterns found in community projects (ghostty, sig, tigerbeetle, zap, zls, etc.)
     const multi_entry_dirs = [_][]const u8{
-        "examples",  "example",   "samples",    "experiments",
-        "tools",     "test",      "tests",      "fuzz",
-        "benchmark", "benches",   "scripts",    "lib",
-        "clients",   "drivers",   "apps",       "cmd",
-        "bin",       "ci",        "user",
+        "examples",  "example", "samples", "experiments",
+        "tools",     "test",    "tests",   "fuzz",
+        "benchmark", "benches", "scripts", "lib",
+        "clients",   "drivers", "apps",    "cmd",
+        "bin",       "ci",      "user",
     };
     for (multi_entry_dirs) |dir| {
         const dir_path = try buildPathWithPrefix(allocator, cfg.path, dir);
@@ -8755,12 +9860,15 @@ fn extractPathFromLine(
             try addEntryIfValid(allocator, cfg, path, added);
         }
     }
-    // Pattern: @import("src/...") at top of file (build module imports)
-    if (mem.indexOf(u8, line, "@import(\"src/")) |idx| {
+    // Pattern: @import("...") in build.zig (build module imports, entry points)
+    var search_pos: usize = 0;
+    while (mem.indexOf(u8, line[search_pos..], "@import(\"")) |rel_idx| {
+        const idx = search_pos + rel_idx;
         const start = idx + 9; // len of '@import("'
         if (extractQuotedPath(line, start)) |path| {
             try addEntryIfValid(allocator, cfg, path, added);
         }
+        search_pos = start;
     }
 }
 
@@ -8840,12 +9948,40 @@ fn extractBuildZigEntriesFromPath(
                 try addEntryWithPrefix(allocator, cfg, path, prefix, added);
             }
         }
-        // Pattern: @import("src/...")
-        if (mem.indexOf(u8, line, "@import(\"src/")) |idx| {
-            const start = idx + 9;
-            if (extractQuotedPath(line, start)) |path| {
-                try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+        // Follow @import("...") to find b.path() entries in nested build modules
+        var imp_pos: usize = 0;
+        while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
+            const idx = imp_pos + rel;
+            const istart = idx + 9;
+            if (extractQuotedPath(line, istart)) |imp_path| {
+                if (mem.endsWith(u8, imp_path, ".zig") and
+                    !mem.eql(u8, imp_path, "std") and
+                    !mem.eql(u8, imp_path, "builtin"))
+                {
+                    // Resolve relative to current file's directory
+                    const cur_dir = std.fs.path.dirname(build_path) orelse ".";
+                    const nested = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}/{s}",
+                        .{ cur_dir, imp_path },
+                    );
+                    defer allocator.free(nested);
+                    // Recurse: find b.path() entries in nested build module
+                    extractBuildZigEntriesFromPath(
+                        allocator,
+                        cfg,
+                        nested,
+                        prefix,
+                        added,
+                    ) catch |err| {
+                        if (cfg.verbose) std.debug.print(
+                            "note: could not parse nested build module {s}: {}\n",
+                            .{ nested, err },
+                        );
+                    };
+                }
             }
+            imp_pos = istart;
         }
     }
 }
@@ -8943,11 +10079,11 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
     // Scan common multi-entry directories
     // Based on patterns found in community projects
     const multi_entry_dirs = [_][]const u8{
-        "examples",  "example",   "samples",    "experiments",
-        "tools",     "test",      "tests",      "fuzz",
-        "benchmark", "benches",   "scripts",    "lib",
-        "clients",   "drivers",   "apps",       "cmd",
-        "bin",       "ci",        "user",
+        "examples",  "example", "samples", "experiments",
+        "tools",     "test",    "tests",   "fuzz",
+        "benchmark", "benches", "scripts", "lib",
+        "clients",   "drivers", "apps",    "cmd",
+        "bin",       "ci",      "user",
     };
     for (multi_entry_dirs) |dir| {
         try scanDirForEntries(allocator, cfg, dir, &added);
@@ -9060,6 +10196,11 @@ fn parseCliArg(
         cfg.known_issues_path = try allocator.dupe(u8, arg[15..]);
         return;
     }
+    if (mem.startsWith(u8, arg, "--command=")) {
+        if (cfg.runtime_command) |old| allocator.free(old);
+        cfg.runtime_command = try allocator.dupe(u8, arg[10..]);
+        return;
+    }
     if (arg[0] != '-') {
         if (cfg.path_owned) allocator.free(cfg.path);
         cfg.path = try allocator.dupe(u8, arg);
@@ -9088,6 +10229,7 @@ fn parseArgs(allocator: Allocator) !Config {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
+        .runtime_command = null,
     };
     try loadConfigFile(allocator, &cfg);
     var cli_entries = false;
@@ -9148,6 +10290,12 @@ fn printHelp() void {
         \\  -b, --build          With 'init': also show build.zig integration
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
+        \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
+        \\
+        \\RUNTIME COMMAND EXAMPLES:
+        \\  ephor runtime .                         # Run 'zig build test'
+        \\  ephor runtime . --command="./myapp"     # Run custom command
+        \\  ephor runtime . --command="zig run src/main.zig"
         \\
         \\KNOWN ISSUES FILE FORMAT:
         \\  # One issue per line, format: file:line
@@ -9246,6 +10394,16 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
     const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
 
+    // Track how many keys we've successfully added for cleanup on error
+    var keys_added: usize = 0;
+    errdefer {
+        // On error, clean up any keys we already added
+        for (cfg.known_issues.items[0..keys_added]) |k| {
+            allocator.free(k);
+        }
+        cfg.known_issues.shrinkRetainingCapacity(0);
+    }
+
     var iter = mem.splitScalar(u8, content, '\n');
     while (iter.next()) |line| {
         const trimmed = mem.trim(u8, line, " \t\r");
@@ -9254,10 +10412,9 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
         // Format: file:line or file:line:rule
         // We store just file:line for matching
         const key = try allocator.dupe(u8, trimmed);
-        cfg.known_issues.append(allocator, key) catch |err| {
-            allocator.free(key);
-            return err;
-        };
+        errdefer allocator.free(key);
+        try cfg.known_issues.append(allocator, key);
+        keys_added += 1;
     }
 }
 
@@ -9355,9 +10512,11 @@ fn exportIssues(
 
 /// Check if issue should be printed based on config filters
 fn shouldPrintIssue(issue: Issue, cfg: *const Config) bool {
-    if (!std.mem.startsWith(u8, issue.file, cfg.path)) return false;
+    // Runtime issues (ZR1xx) use absolute paths from stack traces - skip path filter
+    const is_runtime_issue = std.mem.startsWith(u8, issue.rule, "ZR1");
+    if (!is_runtime_issue and !std.mem.startsWith(u8, issue.file, cfg.path)) return false;
     if (cfg.isRuleDisabled(issue.rule)) return false;
-    if (cfg.isPathExcluded(issue.file)) return false;
+    if (!is_runtime_issue and cfg.isPathExcluded(issue.file)) return false;
     if (isKnownIssue(issue, cfg)) return false;
     return true;
 }
@@ -9583,29 +10742,6 @@ fn scanPath(g: *ImportGraph, path: []const u8) !void {
     }
 }
 
-/// Run a single analyzer command and exit with appropriate code
-fn runSingleAnalyzer(
-    alloc: Allocator,
-    cfg: *const Config,
-    base_path: []const u8,
-    comptime analyzer_fn: anytype,
-    comptime needs_thresholds: bool,
-    name: []const u8,
-) !void {
-    var g = ImportGraph.init(alloc);
-    defer g.deinit();
-    try scanPath(&g, cfg.path);
-
-    var issues = if (needs_thresholds)
-        try analyzer_fn(alloc, &g, cfg.thresholds)
-    else
-        try analyzer_fn(alloc, &g);
-    defer deinitIssues(&issues, alloc);
-
-    const count = printIssues(issues.items, base_path, cfg.format, name, cfg);
-    if (count > 0) std.process.exit(1);
-}
-
 // ============================================================================
 // Main
 // ============================================================================
@@ -9617,6 +10753,9 @@ pub fn main() !void {
 
     var cfg = try parseArgs(alloc);
     defer cfg.deinit(alloc);
+
+    // Track if we should exit with error (checked at end of main after defers)
+    var should_exit_error = false;
 
     // Check for updates on analysis commands (not on help/version/init/install/upgrade)
     switch (cfg.command) {
@@ -9634,25 +10773,25 @@ pub fn main() !void {
         .init => {
             writeDefaultConfig() catch |err| {
                 std.debug.print("error: failed to create config: {}\n", .{err});
-                std.process.exit(1);
+                should_exit_error = true;
             };
             // If --build flag, also print build integration info
-            if (cfg.init_build) {
+            if (cfg.init_build and !should_exit_error) {
                 runInstallCommand(alloc) catch |err| {
                     std.debug.print("error: failed to run install: {}\n", .{err});
-                    std.process.exit(1);
+                    should_exit_error = true;
                 };
             }
         },
 
         .install => runInstallCommand(alloc) catch |err| {
             std.debug.print("error: failed to install: {}\n", .{err});
-            std.process.exit(1);
+            should_exit_error = true;
         },
 
         .upgrade => runUpgradeCommand(alloc) catch |err| {
             std.debug.print("error: failed to upgrade: {}\n", .{err});
-            std.process.exit(1);
+            should_exit_error = true;
         },
 
         .orphans => {
@@ -9660,22 +10799,24 @@ pub fn main() !void {
                 std.debug.print("error: no entry points found\n", .{});
                 std.debug.print("  hint: create ephor.json with 'entries' array\n", .{});
                 std.debug.print("  run: ephor init\n", .{});
-                std.process.exit(1);
-            }
-            if (cfg.verbose) {
-                std.debug.print("Detected {d} entry points:\n", .{cfg.entries.items.len});
-                for (cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
-            }
-            var g = ImportGraph.init(alloc);
-            defer g.deinit();
-            try scanPath(&g, cfg.path);
-            for (cfg.entries.items) |e| try g.markReachable(e);
-            var issues = try g.getOrphanIssues(alloc, &cfg);
-            defer deinitIssues(&issues, alloc);
-            sortIssuesByFile(issues.items);
+                should_exit_error = true;
+            } else {
+                if (cfg.verbose) {
+                    std.debug.print("Detected {d} entry points:\n", .{cfg.entries.items.len});
+                    for (cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
+                }
+                var g = ImportGraph.init(alloc);
+                defer g.deinit();
+                try scanPath(&g, cfg.path);
+                for (cfg.entries.items) |e| try g.markReachable(e);
+                try g.markBuildPathReferences(&cfg);
+                var issues = try g.getOrphanIssues(alloc, &cfg);
+                defer deinitIssues(&issues, alloc);
+                sortIssuesByFile(issues.items);
 
-            const count = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg);
-            if (count > 0) std.process.exit(1);
+                const count = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg);
+                if (count > 0) should_exit_error = true;
+            }
         },
 
         .memory => {
@@ -9685,7 +10826,7 @@ pub fn main() !void {
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const count = printIssues(issues.items, base_path, cfg.format, "memory", &cfg);
-            if (count > 0) std.process.exit(1);
+            if (count > 0) should_exit_error = true;
         },
 
         .errors => {
@@ -9695,7 +10836,7 @@ pub fn main() !void {
             var issues = try analyzeErrors(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const count = printIssues(issues.items, base_path, cfg.format, "errors", &cfg);
-            if (count > 0) std.process.exit(1);
+            if (count > 0) should_exit_error = true;
         },
 
         .unused => {
@@ -9705,7 +10846,7 @@ pub fn main() !void {
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const count = printIssues(issues.items, base_path, cfg.format, "unused", &cfg);
-            if (count > 0) std.process.exit(1);
+            if (count > 0) should_exit_error = true;
         },
 
         .complexity => {
@@ -9715,14 +10856,14 @@ pub fn main() !void {
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
             const count = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg);
-            if (count > 0) std.process.exit(1);
+            if (count > 0) should_exit_error = true;
         },
 
         .fmt_check => {
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
             const count = printIssues(issues.items, base_path, cfg.format, "format", &cfg);
-            if (count > 0) std.process.exit(1);
+            if (count > 0) should_exit_error = true;
         },
 
         .stats => {
@@ -9733,10 +10874,10 @@ pub fn main() !void {
         },
 
         .runtime => {
-            var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose);
+            var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
             const count = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg);
-            if (count > 0) std.process.exit(1);
+            if (count > 0) should_exit_error = true;
         },
 
         .check => {
@@ -9744,213 +10885,221 @@ pub fn main() !void {
                 std.debug.print("error: no entry points found\n", .{});
                 std.debug.print("  hint: create ephor.json with 'entries' array\n", .{});
                 std.debug.print("  run: ephor init\n", .{});
-                std.process.exit(1);
+                should_exit_error = true;
             }
 
-            // Load known issues for filtering
-            try loadKnownIssues(alloc, &cfg);
+            if (!should_exit_error) {
+                // Load known issues for filtering
+                try loadKnownIssues(alloc, &cfg);
 
-            var g = ImportGraph.init(alloc);
-            defer g.deinit();
+                var g = ImportGraph.init(alloc);
+                defer g.deinit();
 
-            try scanPath(&g, cfg.path);
+                try scanPath(&g, cfg.path);
 
-            // Also scan entry point files to build complete import graph
-            // This ensures orphan detection works when checking subdirectories
-            for (cfg.entries.items) |e| {
-                // Only scan if not already in scanned path
-                if (!std.mem.startsWith(u8, e, cfg.path)) {
-                    // Entry file may not exist, that's ok - just skip it
-                    g.scanSingleFile(e) catch |err| {
-                        if (cfg.verbose) {
-                            std.debug.print(
-                                "note: entry {s} not found: {}\n",
-                                .{ e, err },
-                            );
-                        }
+                // Also scan entry point files to build complete import graph
+                // This ensures orphan detection works when checking subdirectories
+                for (cfg.entries.items) |e| {
+                    // Only scan if not already in scanned path
+                    if (!std.mem.startsWith(u8, e, cfg.path)) {
+                        // Entry file may not exist, that's ok - just skip it
+                        g.scanSingleFile(e) catch |err| {
+                            if (cfg.verbose) {
+                                std.debug.print(
+                                    "note: entry {s} not found: {}\n",
+                                    .{ e, err },
+                                );
+                            }
+                        };
+                    }
+                }
+                for (cfg.entries.items) |e| try g.markReachable(e);
+                try g.markBuildPathReferences(&cfg);
+
+                var orphan_issues = try g.getOrphanIssues(alloc, &cfg);
+                defer deinitIssues(&orphan_issues, alloc);
+                sortIssuesByFile(orphan_issues.items);
+
+                // CFG-based memory analysis (ZA101-ZA106)
+                // Covers: alloc/create without defer, errdefer gaps, leaks, UAF, double-free
+                var cfg_mem_issues = try analyzeCFGMemory(alloc, &g);
+                defer deinitIssues(&cfg_mem_issues, alloc);
+
+                var err_issues = try analyzeErrors(alloc, &g);
+                defer deinitIssues(&err_issues, alloc);
+
+                var unused_issues = try analyzeUnused(alloc, &g);
+                defer deinitIssues(&unused_issues, alloc);
+
+                var cx_issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
+                defer deinitIssues(&cx_issues, alloc);
+
+                var fmt_issues = try runFmtCheck(alloc, cfg.path);
+                defer deinitIssues(&fmt_issues, alloc);
+
+                var style_issues = try analyzeStyle(alloc, &g, cfg.thresholds);
+                defer deinitIssues(&style_issues, alloc);
+
+                var naming_issues = try analyzeNaming(alloc, &g);
+                defer deinitIssues(&naming_issues, alloc);
+
+                // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
+                var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
+                defer deinitIssues(&ignored_err_issues, alloc);
+
+                // Note: Null safety (ZA801/ZA802) and Panic (ZA9xx) are now CFG-based
+                // and included in cfg_mem_issues. We filter them out for categorization.
+
+                const stats = g.getStats();
+
+                // Print all issues (returns filtered count)
+                const orphan_count = printIssues(
+                    orphan_issues.items,
+                    base_path,
+                    cfg.format,
+                    "orphans",
+                    &cfg,
+                );
+                // Filter cfg_mem_issues by rule category
+                var mem_only_issues = std.ArrayListUnmanaged(Issue){};
+                defer mem_only_issues.deinit(alloc);
+                var null_safety_issues = std.ArrayListUnmanaged(Issue){};
+                defer null_safety_issues.deinit(alloc);
+                var panic_issues = std.ArrayListUnmanaged(Issue){};
+                defer panic_issues.deinit(alloc);
+
+                for (cfg_mem_issues.items) |issue| {
+                    if (mem.startsWith(u8, issue.rule, "ZA8")) {
+                        try null_safety_issues.append(alloc, issue);
+                    } else if (mem.startsWith(u8, issue.rule, "ZA9")) {
+                        try panic_issues.append(alloc, issue);
+                    } else {
+                        try mem_only_issues.append(alloc, issue);
+                    }
+                }
+
+                const mem_count = printIssues(
+                    mem_only_issues.items,
+                    base_path,
+                    cfg.format,
+                    "memory",
+                    &cfg,
+                );
+                const ignored_err_count = printIssues(
+                    ignored_err_issues.items,
+                    base_path,
+                    cfg.format,
+                    "errors",
+                    &cfg,
+                );
+                const err_count = printIssues(
+                    err_issues.items,
+                    base_path,
+                    cfg.format,
+                    "errors",
+                    &cfg,
+                );
+                const null_safety_count = printIssues(
+                    null_safety_issues.items,
+                    base_path,
+                    cfg.format,
+                    "null-safety",
+                    &cfg,
+                );
+                const panic_count = printIssues(
+                    panic_issues.items,
+                    base_path,
+                    cfg.format,
+                    "panic",
+                    &cfg,
+                );
+                const unused_count = printIssues(
+                    unused_issues.items,
+                    base_path,
+                    cfg.format,
+                    "unused",
+                    &cfg,
+                );
+                const cx_count = printIssues(
+                    cx_issues.items,
+                    base_path,
+                    cfg.format,
+                    "complexity",
+                    &cfg,
+                );
+                const fmt_count = printIssues(
+                    fmt_issues.items,
+                    base_path,
+                    cfg.format,
+                    "format",
+                    &cfg,
+                );
+                const naming_count = printIssues(
+                    naming_issues.items,
+                    base_path,
+                    cfg.format,
+                    "naming",
+                    &cfg,
+                );
+                const style_count = printIssues(
+                    style_issues.items,
+                    base_path,
+                    cfg.format,
+                    "style",
+                    &cfg,
+                );
+
+                if (cfg.show_summary) {
+                    printSummary(.{
+                        .orphan = orphan_count,
+                        .memory = mem_count,
+                        .err = err_count + ignored_err_count,
+                        .unused = unused_count,
+                        .complexity = cx_count,
+                        .fmt = fmt_count,
+                        .style = style_count + naming_count,
+                        .null_safety = null_safety_count,
+                        .panic = panic_count,
+                    }, stats, cfg.format);
+                }
+
+                // Export issues to file if requested
+                if (cfg.export_path) |export_path| {
+                    // Collect all issues into one list for export
+                    var all_issues = std.ArrayListUnmanaged(Issue){};
+                    defer all_issues.deinit(alloc);
+
+                    for (orphan_issues.items) |i| try all_issues.append(alloc, i);
+                    for (mem_only_issues.items) |i| try all_issues.append(alloc, i);
+                    for (err_issues.items) |i| try all_issues.append(alloc, i);
+                    for (ignored_err_issues.items) |i| try all_issues.append(alloc, i);
+                    for (unused_issues.items) |i| try all_issues.append(alloc, i);
+                    for (cx_issues.items) |i| try all_issues.append(alloc, i);
+                    for (fmt_issues.items) |i| try all_issues.append(alloc, i);
+                    for (style_issues.items) |i| try all_issues.append(alloc, i);
+                    for (naming_issues.items) |i| try all_issues.append(alloc, i);
+                    for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
+                    for (panic_issues.items) |i| try all_issues.append(alloc, i);
+
+                    exportIssues(alloc, export_path, all_issues.items, &cfg) catch |err| {
+                        std.debug.print("error: failed to export issues: {}\n", .{err});
                     };
+                    std.debug.print("exported {d} issues to {s}\n", .{ all_issues.items.len, export_path });
                 }
+
+                const total = orphan_count + mem_count +
+                    err_count + ignored_err_count +
+                    unused_count + cx_count + fmt_count +
+                    style_count + naming_count + null_safety_count + panic_count;
+                if (total > 0) should_exit_error = true;
             }
-            for (cfg.entries.items) |e| try g.markReachable(e);
-
-            var orphan_issues = try g.getOrphanIssues(alloc, &cfg);
-            defer deinitIssues(&orphan_issues, alloc);
-            sortIssuesByFile(orphan_issues.items);
-
-            // CFG-based memory analysis (ZA101-ZA106)
-            // Covers: alloc/create without defer, errdefer gaps, leaks, UAF, double-free
-            var cfg_mem_issues = try analyzeCFGMemory(alloc, &g);
-            defer deinitIssues(&cfg_mem_issues, alloc);
-
-            var err_issues = try analyzeErrors(alloc, &g);
-            defer deinitIssues(&err_issues, alloc);
-
-            var unused_issues = try analyzeUnused(alloc, &g);
-            defer deinitIssues(&unused_issues, alloc);
-
-            var cx_issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
-            defer deinitIssues(&cx_issues, alloc);
-
-            var fmt_issues = try runFmtCheck(alloc, cfg.path);
-            defer deinitIssues(&fmt_issues, alloc);
-
-            var style_issues = try analyzeStyle(alloc, &g, cfg.thresholds);
-            defer deinitIssues(&style_issues, alloc);
-
-            var naming_issues = try analyzeNaming(alloc, &g);
-            defer deinitIssues(&naming_issues, alloc);
-
-            // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
-            var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
-            defer deinitIssues(&ignored_err_issues, alloc);
-
-            // Note: Null safety (ZA801/ZA802) and Panic (ZA9xx) are now CFG-based
-            // and included in cfg_mem_issues. We filter them out for categorization.
-
-            const stats = g.getStats();
-
-            // Print all issues (returns filtered count)
-            const orphan_count = printIssues(
-                orphan_issues.items,
-                base_path,
-                cfg.format,
-                "orphans",
-                &cfg,
-            );
-            // Filter cfg_mem_issues by rule category
-            var mem_only_issues = std.ArrayListUnmanaged(Issue){};
-            defer mem_only_issues.deinit(alloc);
-            var null_safety_issues = std.ArrayListUnmanaged(Issue){};
-            defer null_safety_issues.deinit(alloc);
-            var panic_issues = std.ArrayListUnmanaged(Issue){};
-            defer panic_issues.deinit(alloc);
-
-            for (cfg_mem_issues.items) |issue| {
-                if (mem.startsWith(u8, issue.rule, "ZA8")) {
-                    try null_safety_issues.append(alloc, issue);
-                } else if (mem.startsWith(u8, issue.rule, "ZA9")) {
-                    try panic_issues.append(alloc, issue);
-                } else {
-                    try mem_only_issues.append(alloc, issue);
-                }
-            }
-
-            const mem_count = printIssues(
-                mem_only_issues.items,
-                base_path,
-                cfg.format,
-                "memory",
-                &cfg,
-            );
-            const ignored_err_count = printIssues(
-                ignored_err_issues.items,
-                base_path,
-                cfg.format,
-                "errors",
-                &cfg,
-            );
-            const err_count = printIssues(
-                err_issues.items,
-                base_path,
-                cfg.format,
-                "errors",
-                &cfg,
-            );
-            const null_safety_count = printIssues(
-                null_safety_issues.items,
-                base_path,
-                cfg.format,
-                "null-safety",
-                &cfg,
-            );
-            const panic_count = printIssues(
-                panic_issues.items,
-                base_path,
-                cfg.format,
-                "panic",
-                &cfg,
-            );
-            const unused_count = printIssues(
-                unused_issues.items,
-                base_path,
-                cfg.format,
-                "unused",
-                &cfg,
-            );
-            const cx_count = printIssues(
-                cx_issues.items,
-                base_path,
-                cfg.format,
-                "complexity",
-                &cfg,
-            );
-            const fmt_count = printIssues(
-                fmt_issues.items,
-                base_path,
-                cfg.format,
-                "format",
-                &cfg,
-            );
-            const naming_count = printIssues(
-                naming_issues.items,
-                base_path,
-                cfg.format,
-                "naming",
-                &cfg,
-            );
-            const style_count = printIssues(
-                style_issues.items,
-                base_path,
-                cfg.format,
-                "style",
-                &cfg,
-            );
-
-            if (cfg.show_summary) {
-                printSummary(.{
-                    .orphan = orphan_count,
-                    .memory = mem_count,
-                    .err = err_count + ignored_err_count,
-                    .unused = unused_count,
-                    .complexity = cx_count,
-                    .fmt = fmt_count,
-                    .style = style_count + naming_count,
-                    .null_safety = null_safety_count,
-                    .panic = panic_count,
-                }, stats, cfg.format);
-            }
-
-            // Export issues to file if requested
-            if (cfg.export_path) |export_path| {
-                // Collect all issues into one list for export
-                var all_issues = std.ArrayListUnmanaged(Issue){};
-                defer all_issues.deinit(alloc);
-
-                for (orphan_issues.items) |i| try all_issues.append(alloc, i);
-                for (mem_only_issues.items) |i| try all_issues.append(alloc, i);
-                for (err_issues.items) |i| try all_issues.append(alloc, i);
-                for (ignored_err_issues.items) |i| try all_issues.append(alloc, i);
-                for (unused_issues.items) |i| try all_issues.append(alloc, i);
-                for (cx_issues.items) |i| try all_issues.append(alloc, i);
-                for (fmt_issues.items) |i| try all_issues.append(alloc, i);
-                for (style_issues.items) |i| try all_issues.append(alloc, i);
-                for (naming_issues.items) |i| try all_issues.append(alloc, i);
-                for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
-                for (panic_issues.items) |i| try all_issues.append(alloc, i);
-
-                exportIssues(alloc, export_path, all_issues.items, &cfg) catch |err| {
-                    std.debug.print("error: failed to export issues: {}\n", .{err});
-                };
-                std.debug.print("exported {d} issues to {s}\n", .{ all_issues.items.len, export_path });
-            }
-
-            const total = orphan_count + mem_count +
-                err_count + ignored_err_count +
-                unused_count + cx_count + fmt_count +
-                style_count + naming_count + null_safety_count + panic_count;
-            if (total > 0) std.process.exit(1);
         },
     }
+
+    // Exit with error code AFTER all defers have run (cfg.deinit, gpa.deinit)
+    // This is at the end of main() so defers execute first, then we exit
+    // ephor:disable-next-line ZA206
+    if (should_exit_error) std.process.exit(1);
 }
 
 // ============================================================================
@@ -10567,6 +11716,10 @@ test "Config.isRuleEnabled respects explicit enable" {
         .format = .text,
         .thresholds = .{},
         .init_build = false,
+        .export_path = null,
+        .known_issues_path = null,
+        .known_issues = .{},
+        .runtime_command = null,
     };
     defer cfg.deinit(allocator);
 
@@ -10596,6 +11749,10 @@ test "Config.isRuleEnabled respects disable prefix" {
         .format = .text,
         .thresholds = .{},
         .init_build = false,
+        .export_path = null,
+        .known_issues_path = null,
+        .known_issues = .{},
+        .runtime_command = null,
     };
     defer cfg.deinit(allocator);
 
@@ -10632,6 +11789,10 @@ test "Config.isRuleEnabled enable overrides disable" {
         .format = .text,
         .thresholds = .{},
         .init_build = false,
+        .export_path = null,
+        .known_issues_path = null,
+        .known_issues = .{},
+        .runtime_command = null,
     };
     defer cfg.deinit(allocator);
 

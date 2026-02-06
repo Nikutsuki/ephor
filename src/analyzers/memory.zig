@@ -25,7 +25,7 @@ pub fn isNoFreeAllocatorName(name: []const u8) bool {
     return false;
 }
 
-/// Check if ownership is transferred via cast or reassignment
+/// Check if ownership is transferred via cast, reassignment, or return
 pub fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
     if (mem.indexOf(u8, t, "@ptrCast") != null and
         mem.indexOf(u8, t, alloc_name) != null) return true;
@@ -39,6 +39,26 @@ pub fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
         mem.indexOf(u8, t, alloc_name) != null) return true;
     if (mem.indexOf(u8, t, ".putNoClobber(") != null and
         mem.indexOf(u8, t, alloc_name) != null) return true;
+    // Ownership transfer via return: return alloc_name; or return alloc_name[...]
+    if (isReturnOwnership(t, alloc_name)) return true;
+    return false;
+}
+
+/// Check if line returns the allocated variable (ownership transfer to caller)
+fn isReturnOwnership(t: []const u8, alloc_name: []const u8) bool {
+    const ret_pos = mem.indexOf(u8, t, "return ") orelse return false;
+    const after_return = t[ret_pos + 7 ..];
+    const trimmed = mem.trimLeft(u8, after_return, " ");
+    // Direct return: "return alloc_name;" or "return alloc_name[..."
+    if (mem.startsWith(u8, trimmed, alloc_name)) {
+        const after_name = trimmed[alloc_name.len..];
+        if (after_name.len == 0) return true;
+        const next = after_name[0];
+        // return alloc_name; or return alloc_name[0..N]
+        if (next == ';' or next == '[' or next == ',' or next == ' ') return true;
+        // return alloc_name.items or return alloc_name.ptr - not ownership transfer
+        // (accessing a field of the alloc, not transferring the alloc itself)
+    }
     return false;
 }
 

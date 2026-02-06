@@ -25,6 +25,7 @@ pub const RULE_CATCH_UNREACHABLE = "ZA202";
 pub const RULE_ORELSE_UNREACHABLE = "ZA203";
 pub const RULE_UNDEFINED_USAGE = "ZA204";
 pub const RULE_IGNORED_ERROR = "ZA205";
+pub const RULE_EXIT_BYPASSES_DEFER = "ZA206";
 
 // ZA3xx - Complexity
 pub const RULE_FUNC_TOO_LONG = "ZA301";

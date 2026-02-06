@@ -19,6 +19,9 @@ ephor.json
 *.swp
 *~
 
+# Temp files
+.tmp/
+
 # Build artifacts
 *.o
 *.a

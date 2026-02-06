@@ -531,13 +531,32 @@ fn buildCFG(
                     const else_block = entry.merge_block;
                     const merge_block = try cfg.addBlock();
                     try cfg.addEdge(current_block, merge_block, .sequential);
-                    try block_stack.append(allocator, .{
-                        .block_type = .else_block,
-                        .merge_block = merge_block,
-                        .catch_origin_block = 0,
-                    });
-                    current_block = else_block;
-                    cfg.blocks.items[current_block].start_line = func_line + idx;
+
+                    // Check for single-line else-return: "} else return ..."
+                    // This is both else_start + return + implicit block_end
+                    const has_inline_return = blk: {
+                        const else_pos = mem.indexOf(u8, t, "else") orelse break :blk false;
+                        const after_else = mem.trimLeft(u8, t[else_pos + 4 ..], " \t");
+                        break :blk mem.startsWith(u8, after_else, "return ");
+                    };
+
+                    if (has_inline_return) {
+                        // Else block immediately returns - mark it and go to merge
+                        cfg.blocks.items[else_block].start_line = func_line + idx;
+                        cfg.blocks.items[else_block].end_line = func_line + idx;
+                        cfg.blocks.items[else_block].is_return = true;
+                        try cfg.exit_blocks.append(allocator, else_block);
+                        current_block = merge_block;
+                        cfg.blocks.items[current_block].start_line = func_line + idx + 1;
+                    } else {
+                        try block_stack.append(allocator, .{
+                            .block_type = .else_block,
+                            .merge_block = merge_block,
+                            .catch_origin_block = 0,
+                        });
+                        current_block = else_block;
+                        cfg.blocks.items[current_block].start_line = func_line + idx;
+                    }
                 }
             },
             .return_stmt => {
@@ -1184,6 +1203,40 @@ fn hasAsmOutputVar(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
+/// Detect comptime field assignment: @field(var_name, ...) = ...
+/// This pattern is used in inline for/while loops over struct fields to populate a variable.
+/// Handles both single-line: @field(result, field.name) = value
+/// And multi-line: @field(result, switch (i) { ... }) = value
+fn hasComptimeFieldAssignment(t: []const u8, var_name: []const u8) bool {
+    const prefix = "@field(";
+    var search_start: usize = 0;
+    while (search_start + prefix.len + var_name.len + 1 <= t.len) {
+        const pos = mem.indexOf(u8, t[search_start..], prefix) orelse return false;
+        const abs_pos = search_start + pos;
+        search_start = abs_pos + 1;
+
+        // Check if inside string or comment
+        if (isInsideString(t, abs_pos)) continue;
+        if (mem.indexOf(u8, t[0..abs_pos], "//")) |_| continue;
+
+        // After @field(, expect var_name followed by comma or )
+        const after_paren = abs_pos + prefix.len;
+        if (after_paren + var_name.len > t.len) continue;
+        if (!mem.eql(u8, t[after_paren .. after_paren + var_name.len], var_name)) continue;
+
+        // After var_name, expect comma or whitespace (not another identifier char)
+        const after_name = after_paren + var_name.len;
+        if (after_name >= t.len) continue;
+        const next_ch = t[after_name];
+        if (next_ch != ',' and next_ch != ')' and next_ch != ' ' and next_ch != '\t') continue;
+
+        // @field(var_name, ...) found - this indicates comptime field population.
+        // The closing ) and = may be on a later line (multi-line switch expression).
+        return true;
+    }
+    return false;
+}
+
 /// Collect variables declared with `= undefined`, skipping comptime blocks
 /// Returns map of var_name -> declaration line
 fn collectUndefinedVars(
@@ -1332,6 +1385,11 @@ fn analyzeDefiniteAssignment(
                 }
                 // Check for inline assembly output constraint: "=reg" (vname)
                 if (hasAsmOutputVar(t, vname)) {
+                    try remove_list2.append(allocator, vname);
+                    break;
+                }
+                // Check for comptime field assignment: @field(vname, ...) =
+                if (hasComptimeFieldAssignment(t, vname)) {
                     try remove_list2.append(allocator, vname);
                     break;
                 }

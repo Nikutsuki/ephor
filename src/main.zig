@@ -1344,150 +1344,184 @@ fn analyzeDefiniteAssignment(
 ) !std.StringHashMap(usize) {
     var issues = std.StringHashMap(usize).init(allocator);
 
-    // Phase 1: Find all undefined variable declarations (skipping comptime blocks)
-    var undef_vars = try collectUndefinedVars(allocator, lines, func_line);
+    var undef_vars = try collectUndefinedVars(
+        allocator,
+        lines,
+        func_line,
+    );
     defer undef_vars.deinit();
-
     if (undef_vars.count() == 0) return issues;
 
-    // Phase 1b: Remove variables that are passed by reference (&var) anywhere.
-    // Out-parameter patterns (e.g., extract(&x), match(&x)) assign the variable
-    // through a pointer. We can't statically determine if the write happened,
-    // so suppress warnings for these variables to avoid false positives.
-    {
-        var remove_list = std.ArrayListUnmanaged([]const u8){};
-        defer remove_list.deinit(allocator);
-        var viter = undef_vars.iterator();
-        while (viter.next()) |entry| {
-            const vname = entry.key_ptr.*;
-            for (lines) |line| {
-                const t = mem.trim(u8, line, " \t\r");
-                if (isCommentOrMultilineString(t)) continue;
-                if (hasAddressOfVar(t, vname)) {
-                    try remove_list.append(allocator, vname);
-                    break;
-                }
-            }
-        }
-        for (remove_list.items) |vname| {
-            _ = undef_vars.remove(vname);
-        }
-        if (undef_vars.count() == 0) return issues;
-    }
+    try removeAddressOfVars(allocator, &undef_vars, lines);
+    if (undef_vars.count() == 0) return issues;
 
-    // Phase 1c: Remove variables initialized via method call or inline asm.
-    // Pattern 1: var x: T = undefined; ... x.method(...) - method populates the variable
-    // Pattern 2: var x: T = undefined; asm (...: [_] "=reg" (x)) - asm output constraint
-    {
-        var remove_list2 = std.ArrayListUnmanaged([]const u8){};
-        defer remove_list2.deinit(allocator);
-        var viter2 = undef_vars.iterator();
-        while (viter2.next()) |entry| {
-            const vname = entry.key_ptr.*;
-            for (lines) |line| {
-                const t = mem.trim(u8, line, " \t\r");
-                if (isCommentOrMultilineString(t)) continue;
-                // Check for method call: vname.method(
-                if (hasMethodCallOnVar(t, vname)) {
-                    try remove_list2.append(allocator, vname);
-                    break;
-                }
-                // Check for inline assembly output constraint: "=reg" (vname)
-                if (hasAsmOutputVar(t, vname)) {
-                    try remove_list2.append(allocator, vname);
-                    break;
-                }
-                // Check for comptime field assignment: @field(vname, ...) =
-                if (hasComptimeFieldAssignment(t, vname)) {
-                    try remove_list2.append(allocator, vname);
-                    break;
-                }
-            }
-        }
-        for (remove_list2.items) |vname| {
-            _ = undef_vars.remove(vname);
-        }
-        if (undef_vars.count() == 0) return issues;
-    }
+    try removeIndirectlyInitVars(allocator, &undef_vars, lines);
+    if (undef_vars.count() == 0) return issues;
 
-    // Phase 2: For each undefined var, compute definitely-assigned at each block
-    // Using forward data flow: out[B] = gen[B] ∪ in[B], in[B] = ∩ out[pred]
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    // For each variable, track which blocks have it definitely assigned (bitmap)
     var var_iter = undef_vars.iterator();
     while (var_iter.next()) |entry| {
         const var_name = entry.key_ptr.*;
         const var_line = entry.value_ptr.*;
-
-        // Initialize: all blocks start with var unassigned except after def line
-        var def_at_entry = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(def_at_entry);
-        var def_at_exit = try allocator.alloc(bool, num_blocks);
-        defer allocator.free(def_at_exit);
-        @memset(def_at_entry, false);
-        @memset(def_at_exit, false);
-
-        // Compute gen set: which blocks assign this variable
-        const gen = try computeGenSetForVar(allocator, cfg, lines, func_line, var_name, num_blocks);
-        defer allocator.free(gen);
-
-        // Worklist algorithm: iterate until fixed point
-        // Max iterations = 2 * num_blocks (boolean lattice height * blocks)
-        // Use saturating arithmetic to avoid overflow on very large CFGs
-        var changed = true;
-        var iters: usize = 0;
-        const max_iters = @min(num_blocks, std.math.maxInt(usize) / 2 - 1) *| 2 +| 1;
-        while (changed and iters < max_iters) : (iters += 1) {
-            changed = false;
-            for (0..num_blocks) |bid| {
-                // in[B] = intersection of out[pred] (must be assigned on ALL paths)
-                // Loop-back edges are excluded: once a variable is definitely
-                // assigned before a loop, iterating the loop cannot make it
-                // unassigned (since there's no = undefined in the loop body).
-                var new_in: bool = true;
-                var has_non_loopback_pred = false;
-                for (cfg.edges.items) |edge| {
-                    if (edge.to != bid) continue;
-                    if (edge.kind == .loop_back) continue;
-                    has_non_loopback_pred = true;
-                    if (!def_at_exit[edge.from]) new_in = false;
-                }
-                if (!has_non_loopback_pred) {
-                    // Entry block or only loop-back predecessors
-                    new_in = false;
-                }
-
-                // out[B] = gen[B] ∪ in[B]
-                const new_out = gen[bid] or new_in;
-
-                if (def_at_entry[bid] != new_in or def_at_exit[bid] != new_out) {
-                    def_at_entry[bid] = new_in;
-                    def_at_exit[bid] = new_out;
-                    changed = true;
-                }
-            }
-        }
-
-        // Phase 3: Check for reads when variable might be uninitialized
-        for (lines, 0..) |line, idx| {
-            const actual_line = func_line + idx;
-            if (actual_line <= var_line) continue; // Before declaration
-            const t = mem.trim(u8, line, " \t\r");
-            const bid = findBlockForLine(cfg, actual_line) orelse continue;
-
-            // If var not definitely assigned at this block and is read
-            if (!def_at_entry[bid] and !gen[bid]) {
-                if (hasVarRead(t, var_name)) {
-                    try issues.put(var_name, actual_line);
-                    break; // One issue per variable
-                }
-            }
-        }
+        try checkVarDefiniteAssignment(
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            var_name,
+            var_line,
+            num_blocks,
+            &issues,
+        );
     }
 
     return issues;
+}
+
+/// Remove vars passed by reference (&var) - can't track pointer writes.
+fn removeAddressOfVars(
+    allocator: Allocator,
+    undef_vars: *std.StringHashMap(usize),
+    lines: []const []const u8,
+) !void {
+    var remove = std.ArrayListUnmanaged([]const u8){};
+    defer remove.deinit(allocator);
+    var it = undef_vars.iterator();
+    while (it.next()) |entry| {
+        const vn = entry.key_ptr.*;
+        for (lines) |line| {
+            const t = mem.trim(u8, line, " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            if (hasAddressOfVar(t, vn)) {
+                try remove.append(allocator, vn);
+                break;
+            }
+        }
+    }
+    for (remove.items) |vn| _ = undef_vars.remove(vn);
+}
+
+/// Remove vars initialized via method call, asm, or comptime field.
+fn removeIndirectlyInitVars(
+    allocator: Allocator,
+    undef_vars: *std.StringHashMap(usize),
+    lines: []const []const u8,
+) !void {
+    var remove = std.ArrayListUnmanaged([]const u8){};
+    defer remove.deinit(allocator);
+    var it = undef_vars.iterator();
+    while (it.next()) |entry| {
+        const vn = entry.key_ptr.*;
+        if (isIndirectlyInitialized(lines, vn))
+            try remove.append(allocator, vn);
+    }
+    for (remove.items) |vn| _ = undef_vars.remove(vn);
+}
+
+fn isIndirectlyInitialized(
+    lines: []const []const u8,
+    vn: []const u8,
+) bool {
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (hasMethodCallOnVar(t, vn)) return true;
+        if (hasAsmOutputVar(t, vn)) return true;
+        if (hasComptimeFieldAssignment(t, vn)) return true;
+    }
+    return false;
+}
+
+/// Run data flow analysis for one variable.
+fn checkVarDefiniteAssignment(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    var_name: []const u8,
+    var_line: usize,
+    num_blocks: usize,
+    issues: *std.StringHashMap(usize),
+) !void {
+    const def_entry = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(def_entry);
+    const def_exit = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(def_exit);
+    @memset(def_entry, false);
+    @memset(def_exit, false);
+
+    const gen = try computeGenSetForVar(
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        var_name,
+        num_blocks,
+    );
+    defer allocator.free(gen);
+
+    runDefiniteAssignmentWorklist(
+        cfg,
+        gen,
+        def_entry,
+        def_exit,
+        num_blocks,
+    );
+
+    for (lines, 0..) |line, idx| {
+        const al = func_line + idx;
+        if (al <= var_line) continue;
+        const t = mem.trim(u8, line, " \t\r");
+        const bid = findBlockForLine(cfg, al) orelse continue;
+        if (!def_entry[bid] and !gen[bid]) {
+            if (hasVarRead(t, var_name)) {
+                try issues.put(var_name, al);
+                break;
+            }
+        }
+    }
+}
+
+fn runDefiniteAssignmentWorklist(
+    cfg: *ControlFlowGraph,
+    gen: []const bool,
+    def_entry: []bool,
+    def_exit: []bool,
+    num_blocks: usize,
+) void {
+    const max = @min(num_blocks, std.math.maxInt(usize) / 2 - 1) *| 2 +| 1;
+    var changed = true;
+    var iters: usize = 0;
+    while (changed and iters < max) : (iters += 1) {
+        changed = false;
+        for (0..num_blocks) |bid| {
+            const new_in = computeBlockEntry(cfg, def_exit, bid);
+            const new_out = gen[bid] or new_in;
+            if (def_entry[bid] != new_in or def_exit[bid] != new_out) {
+                def_entry[bid] = new_in;
+                def_exit[bid] = new_out;
+                changed = true;
+            }
+        }
+    }
+}
+
+fn computeBlockEntry(
+    cfg: *ControlFlowGraph,
+    def_exit: []const bool,
+    bid: usize,
+) bool {
+    var result: bool = true;
+    var has_pred = false;
+    for (cfg.edges.items) |edge| {
+        if (edge.to != bid) continue;
+        if (edge.kind == .loop_back) continue;
+        has_pred = true;
+        if (!def_exit[edge.from]) result = false;
+    }
+    return if (has_pred) result else false;
 }
 
 /// Check if line reads a variable (not just assigns)
@@ -2719,10 +2753,168 @@ fn checkErrdeferOwnershipTransfer(
     }
 }
 
+/// State for multi-line errdefer/defer block collection
+const BlockCollectState = struct {
+    depth: usize = 0,
+    start: usize = 0,
+    content: std.ArrayListUnmanaged(u8) = .{},
+
+    fn deinit(self: *BlockCollectState, a: Allocator) void {
+        self.content.deinit(a);
+    }
+};
+
+/// Continue collecting a multi-line errdefer/defer block.
+/// Returns true if still inside the block.
+fn continueBlockCollection(
+    t: []const u8,
+    bs: *BlockCollectState,
+    errdefers: *std.ArrayListUnmanaged(ErrdeferInfo),
+    allocator: Allocator,
+) !bool {
+    if (bs.depth == 0) return false;
+    try bs.content.appendSlice(allocator, t);
+    try bs.content.append(allocator, ' ');
+    for (t) |c| {
+        if (c == '{') bs.depth += 1;
+        if (c == '}') {
+            if (bs.depth > 0) bs.depth -= 1;
+            if (bs.depth == 0) {
+                if (hasRealCleanupPattern(bs.content.items)) {
+                    try errdefers.append(allocator, .{
+                        .line = bs.start,
+                        .content = try allocator.dupe(
+                            u8,
+                            bs.content.items,
+                        ),
+                    });
+                }
+                bs.content.clearRetainingCapacity();
+            }
+        }
+    }
+    return true;
+}
+
+/// Collect a try allocation from a line, skipping arena/no-free.
+fn collectTryAllocFromLine(
+    t: []const u8,
+    actual_line: usize,
+    try_allocs: *std.ArrayListUnmanaged(TryAlloc),
+    try_lines: *std.ArrayListUnmanaged(usize),
+    allocator: Allocator,
+) !void {
+    if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t)) {
+        try try_lines.append(allocator, actual_line);
+        return;
+    }
+    const aname_e = extractAllocatorName(t) orelse "";
+    if (isNoFreeAllocatorName(aname_e)) {
+        try try_lines.append(allocator, actual_line);
+        return;
+    }
+    if (extractVarDeclName(t)) |name| {
+        try try_allocs.append(allocator, .{
+            .name = name,
+            .line = actual_line,
+            .col = (getRealAllocPos(t) orelse 0) + 1,
+            .is_create = hasRealCreatePattern(t),
+        });
+    }
+}
+
+/// Start collecting an errdefer/defer block.
+fn collectDeferFromLine(
+    t: []const u8,
+    actual_line: usize,
+    bs: *BlockCollectState,
+    errdefers: *std.ArrayListUnmanaged(ErrdeferInfo),
+    allocator: Allocator,
+) !void {
+    const is_errdefer = mem.startsWith(u8, t, "errdefer ");
+    const is_defer = mem.startsWith(u8, t, "defer ");
+    if (!is_errdefer and !is_defer) return;
+
+    const prefix_len: usize = if (is_errdefer) 9 else 6;
+    const content = if (prefix_len < t.len) t[prefix_len..] else "";
+
+    if (!mem.startsWith(u8, content, "{")) {
+        if (hasRealCleanupPattern(t)) {
+            try errdefers.append(allocator, .{
+                .line = actual_line,
+                .content = try allocator.dupe(u8, content),
+            });
+        }
+        return;
+    }
+    bs.start = actual_line;
+    bs.depth = 1;
+    bs.content.clearRetainingCapacity();
+    try bs.content.appendSlice(allocator, content);
+    try bs.content.append(allocator, ' ');
+    for (content[1..]) |c| {
+        if (c == '{') bs.depth += 1;
+        if (c == '}' and bs.depth > 0) bs.depth -= 1;
+    }
+    if (bs.depth == 0) {
+        if (hasRealCleanupPattern(bs.content.items)) {
+            try errdefers.append(allocator, .{
+                .line = actual_line,
+                .content = try allocator.dupe(
+                    u8,
+                    bs.content.items,
+                ),
+            });
+        }
+        bs.content.clearRetainingCapacity();
+    }
+}
+
+/// Check for errdefer gaps and report issues.
+fn checkErrdeferGaps(
+    allocator: Allocator,
+    try_allocs: []TryAlloc,
+    errdefers_list: []const ErrdeferInfo,
+    try_lines: []const usize,
+    file_path: []const u8,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    for (try_allocs) |*alloc| {
+        if (alloc.has_errdefer) continue;
+        var errdefer_line: usize = 0;
+        for (errdefers_list) |ed| {
+            if (containsIdentifier(ed.content, alloc.name)) {
+                errdefer_line = ed.line;
+                alloc.has_errdefer = true;
+                break;
+            }
+        }
+        for (try_lines) |try_line| {
+            if (try_line <= alloc.line) continue;
+            if (alloc.has_errdefer and
+                errdefer_line > alloc.line and
+                errdefer_line < try_line) continue;
+            if (!alloc.has_errdefer or
+                errdefer_line >= try_line)
+            {
+                try issues.append(allocator, .{
+                    .file = file_path,
+                    .line = alloc.line,
+                    .col = alloc.col,
+                    .severity = .warning,
+                    .rule = RULE_ALLOC_NO_ERRDEFER,
+                    .message = "allocation without errdefer " ++
+                        "before next try",
+                    .help = "add errdefer immediately " ++
+                        "after allocation",
+                });
+                break;
+            }
+        }
+    }
+}
+
 /// CFG-based errdefer coverage analysis (ZA103)
-/// Detects allocations where errdefer is missing before subsequent try statements
-/// Pattern: const data = try alloc(); // MISSING errdefer
-///          const more = try alloc(); // If this fails, data leaks
 fn analyzeCFGErrdeferCoverage(
     allocator: Allocator,
     lines: []const []const u8,
@@ -2731,166 +2923,64 @@ fn analyzeCFGErrdeferCoverage(
     fn_returns_error: bool,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
-
-    // Early exit conditions
     if (!fn_returns_error) return issues;
     if (usesArenaAllocator(lines)) return issues;
 
-    // Collect allocations, errdefers, and try statements
     var try_allocs = std.ArrayListUnmanaged(TryAlloc){};
     defer try_allocs.deinit(allocator);
-
     var errdefers = std.ArrayListUnmanaged(ErrdeferInfo){};
     defer {
         for (errdefers.items) |e| allocator.free(e.content);
         errdefers.deinit(allocator);
     }
-
     var try_lines_list = std.ArrayListUnmanaged(usize){};
     defer try_lines_list.deinit(allocator);
+    var bs = BlockCollectState{};
+    defer bs.deinit(allocator);
 
-    // Multi-line block tracking state
-    var block_depth: usize = 0;
-    var block_start: usize = 0;
-    var block_content = std.ArrayListUnmanaged(u8){};
-    defer block_content.deinit(allocator);
-
-    // Single pass to collect all information
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
-
         if (isCommentOrMultilineString(t)) continue;
-
-        // Handle multi-line errdefer/defer blocks
-        if (block_depth > 0) {
-            try block_content.appendSlice(allocator, t);
-            try block_content.append(allocator, ' ');
-            for (t) |c| {
-                if (c == '{') block_depth += 1;
-                if (c == '}') {
-                    if (block_depth > 0) block_depth -= 1;
-                    if (block_depth == 0) {
-                        if (hasRealCleanupPattern(block_content.items)) {
-                            try errdefers.append(allocator, .{
-                                .line = block_start,
-                                .content = try allocator.dupe(u8, block_content.items),
-                            });
-                        }
-                        block_content.clearRetainingCapacity();
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Collect try allocations
+        if (try continueBlockCollection(
+            t,
+            &bs,
+            &errdefers,
+            allocator,
+        )) continue;
         const has_try = mem.indexOf(u8, t, "try ") != null;
         if (has_try and isTryAllocation(t)) {
-            // Skip arena/no-free allocations at the line level
-            if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t)) {
-                if (has_try) try try_lines_list.append(allocator, actual_line);
-                continue;
-            }
-            const aname_e = extractAllocatorName(t) orelse "";
-            if (isNoFreeAllocatorName(aname_e)) {
-                if (has_try) try try_lines_list.append(allocator, actual_line);
-                continue;
-            }
-            if (extractVarDeclName(t)) |name| {
-                try try_allocs.append(allocator, .{
-                    .name = name,
-                    .line = actual_line,
-                    .col = (getRealAllocPos(t) orelse 0) + 1,
-                    .is_create = hasRealCreatePattern(t),
-                });
-            }
+            try collectTryAllocFromLine(
+                t,
+                actual_line,
+                &try_allocs,
+                &try_lines_list,
+                allocator,
+            );
         }
-
-        // Collect errdefer/defer statements
-        const is_errdefer = mem.startsWith(u8, t, "errdefer ");
-        const is_defer = mem.startsWith(u8, t, "defer ");
-        if (is_errdefer or is_defer) {
-            const prefix_len: usize = if (is_errdefer) 9 else 6;
-            const content = if (prefix_len < t.len) t[prefix_len..] else "";
-
-            if (mem.startsWith(u8, content, "{")) {
-                block_start = actual_line;
-                block_depth = 1;
-                block_content.clearRetainingCapacity();
-                try block_content.appendSlice(allocator, content);
-                try block_content.append(allocator, ' ');
-                for (content[1..]) |c| {
-                    if (c == '{') block_depth += 1;
-                    if (c == '}' and block_depth > 0) block_depth -= 1;
-                }
-                if (block_depth == 0) {
-                    if (hasRealCleanupPattern(block_content.items)) {
-                        try errdefers.append(allocator, .{
-                            .line = actual_line,
-                            .content = try allocator.dupe(u8, block_content.items),
-                        });
-                    }
-                    block_content.clearRetainingCapacity();
-                }
-            } else if (hasRealCleanupPattern(t)) {
-                try errdefers.append(allocator, .{
-                    .line = actual_line,
-                    .content = try allocator.dupe(u8, content),
-                });
-            }
-        }
-
-        // Track all try statements
+        try collectDeferFromLine(
+            t,
+            actual_line,
+            &bs,
+            &errdefers,
+            allocator,
+        );
         if (has_try) {
             try try_lines_list.append(allocator, actual_line);
         }
     }
-
     if (try_allocs.items.len == 0) return issues;
-
-    // Check ownership transfer for each allocation
     for (try_allocs.items) |*alloc| {
         checkErrdeferOwnershipTransfer(alloc, lines, func_line);
     }
-
-    // Check errdefer gaps for each allocation
-    for (try_allocs.items) |*alloc| {
-        if (alloc.has_errdefer) continue;
-
-        // Find errdefer for this allocation
-        var errdefer_line: usize = 0;
-        for (errdefers.items) |ed| {
-            if (containsIdentifier(ed.content, alloc.name)) {
-                errdefer_line = ed.line;
-                alloc.has_errdefer = true;
-                break;
-            }
-        }
-
-        // Check for try statements after allocation without errdefer coverage
-        for (try_lines_list.items) |try_line| {
-            if (try_line <= alloc.line) continue;
-
-            if (alloc.has_errdefer and errdefer_line > alloc.line and errdefer_line < try_line) {
-                continue; // Errdefer exists between allocation and try
-            }
-
-            if (!alloc.has_errdefer or errdefer_line >= try_line) {
-                try issues.append(allocator, .{
-                    .file = file_path,
-                    .line = alloc.line,
-                    .col = alloc.col,
-                    .severity = .warning,
-                    .rule = RULE_ALLOC_NO_ERRDEFER,
-                    .message = "allocation without errdefer before next try",
-                    .help = "add errdefer immediately after allocation",
-                });
-                break;
-            }
-        }
-    }
-
+    try checkErrdeferGaps(
+        allocator,
+        try_allocs.items,
+        errdefers.items,
+        try_lines_list.items,
+        file_path,
+        &issues,
+    );
     return issues;
 }
 
@@ -3071,6 +3161,51 @@ const ImportGraph = struct {
         return null;
     }
 
+    /// Check if "const " at position i is at the start of a statement
+    /// (not inside a parameter type like "arg: ?[]const u8").
+    fn isConstStatementStart(content: []const u8, i: usize) bool {
+        if (i == 0) return true;
+        if (i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub ")) return true;
+        // Walk backwards to find the start of this line
+        var j = i;
+        while (j > 0 and content[j - 1] != '\n') j -= 1;
+        // Check if only whitespace before "const"
+        var k = j;
+        while (k < i) : (k += 1) {
+            if (content[k] != ' ' and content[k] != '\t') return false;
+        }
+        return true;
+    }
+
+    /// Try to extract a const import at position i, recording it in analysis.
+    fn tryRecordConstImport(
+        self: *ImportGraph,
+        content: []const u8,
+        file_path: []const u8,
+        analysis: *FileAnalysis,
+        i: usize,
+        line_num: usize,
+        col: usize,
+    ) !void {
+        const is_pub = i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub ");
+        const name_start = i + 6;
+        const var_name = extractVarName(content, name_start) orelse return;
+        const path_start = name_start + var_name.len;
+        const import_path = findImportPath(content, path_start) orelse return;
+        if (mem.eql(u8, import_path, "std")) return;
+        if (mem.eql(u8, import_path, "builtin")) return;
+
+        const resolved = try self.resolveImport(file_path, import_path);
+        try analysis.imports.append(self.allocator, .{
+            .path = try self.allocator.dupe(u8, import_path),
+            .resolved = resolved,
+            .name = try self.allocator.dupe(u8, var_name),
+            .line = line_num,
+            .col = col,
+            .is_pub = is_pub,
+        });
+    }
+
     fn extractImports(
         self: *ImportGraph,
         content: []const u8,
@@ -3092,8 +3227,6 @@ const ImportGraph = struct {
                 in_comment = false;
                 continue;
             }
-
-            // Skip comment lines: once we see //, skip rest of line
             if (!in_comment and i + 1 < content.len and
                 content[i] == '/' and content[i + 1] == '/')
             {
@@ -3105,62 +3238,48 @@ const ImportGraph = struct {
             const not_const = i + 6 >= content.len or
                 !mem.eql(u8, content[i .. i + 6], "const ");
             if (not_const) continue;
+            if (!isConstStatementStart(content, i)) continue;
 
-            // "const " must be at start of statement: preceded by newline,
-            // start-of-file, whitespace at line start, or "pub "
-            // This prevents matching "const" inside function parameter types
-            // like "arg: ?[]const u8"
-            const is_statement_start = blk: {
-                if (i == 0) break :blk true;
-                // Check if "pub const" (preceded by "pub ")
-                if (i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub "))
-                    break :blk true;
-                // Walk backwards to find the start of this line
-                var j = i;
-                while (j > 0 and content[j - 1] != '\n') j -= 1;
-                // Check if only whitespace before "const"
-                var only_ws = true;
-                var k = j;
-                while (k < i) : (k += 1) {
-                    if (content[k] != ' ' and content[k] != '\t') {
-                        only_ws = false;
-                        break;
-                    }
-                }
-                break :blk only_ws;
-            };
-            if (!is_statement_start) continue;
-
-            // Check if this is "pub const" (preceded by "pub ")
-            const is_pub = i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub ");
-
-            const name_start = i + 6;
-            const var_name = extractVarName(content, name_start) orelse {
-                continue;
-            };
-            const path_start = name_start + var_name.len;
-            const import_path = findImportPath(content, path_start) orelse {
-                continue;
-            };
-
-            const is_std = mem.eql(u8, import_path, "std");
-            const is_builtin = mem.eql(u8, import_path, "builtin");
-            if (is_std or is_builtin) continue;
-
-            const resolved = try self.resolveImport(file_path, import_path);
-            try analysis.imports.append(self.allocator, .{
-                .path = try self.allocator.dupe(u8, import_path),
-                .resolved = resolved,
-                .name = try self.allocator.dupe(u8, var_name),
-                .line = line_num,
-                .col = col,
-                .is_pub = is_pub,
-            });
+            try self.tryRecordConstImport(
+                content,
+                file_path,
+                analysis,
+                i,
+                line_num,
+                col,
+            );
         }
 
-        // Second pass: find ALL @import("...") patterns regardless of context
-        // This catches imports in switch arms, array inits, embedFile, etc.
         try self.extractBareImports(content, file_path, analysis);
+    }
+
+    /// Check if an import path is already recorded in the analysis.
+    fn hasImportPath(analysis: *const FileAnalysis, path: []const u8) bool {
+        for (analysis.imports.items) |existing| {
+            if (mem.eql(u8, existing.path, path)) return true;
+        }
+        return false;
+    }
+
+    /// Try to add a bare import (not preceded by const) to analysis.
+    fn tryAddBareImport(
+        self: *ImportGraph,
+        file_path: []const u8,
+        analysis: *FileAnalysis,
+        imp: []const u8,
+    ) !void {
+        if (mem.eql(u8, imp, "std")) return;
+        if (mem.eql(u8, imp, "builtin")) return;
+        if (hasImportPath(analysis, imp)) return;
+        const resolved = try self.resolveImport(file_path, imp);
+        try analysis.imports.append(self.allocator, .{
+            .path = try self.allocator.dupe(u8, imp),
+            .resolved = resolved,
+            .name = try self.allocator.dupe(u8, "_"),
+            .line = 0,
+            .col = 0,
+            .is_pub = false,
+        });
     }
 
     /// Extract @import("...") patterns that aren't preceded by `const`
@@ -3202,33 +3321,11 @@ const ImportGraph = struct {
                     path_end += 1;
                 }
                 if (path_end > path_start) {
-                    const imp = content[path_start..path_end];
-                    const is_std = mem.eql(u8, imp, "std");
-                    const is_builtin = mem.eql(u8, imp, "builtin");
-                    if (!is_std and !is_builtin) {
-                        // Check if already in imports list
-                        var already = false;
-                        for (analysis.imports.items) |existing| {
-                            if (mem.eql(u8, existing.path, imp)) {
-                                already = true;
-                                break;
-                            }
-                        }
-                        if (!already) {
-                            const resolved = try self.resolveImport(
-                                file_path,
-                                imp,
-                            );
-                            try analysis.imports.append(self.allocator, .{
-                                .path = try self.allocator.dupe(u8, imp),
-                                .resolved = resolved,
-                                .name = try self.allocator.dupe(u8, "_"),
-                                .line = 0,
-                                .col = 0,
-                                .is_pub = false,
-                            });
-                        }
-                    }
+                    try self.tryAddBareImport(
+                        file_path,
+                        analysis,
+                        content[path_start..path_end],
+                    );
                 }
                 pos = path_end + 1;
                 continue;
@@ -3277,61 +3374,103 @@ const ImportGraph = struct {
         }
     }
 
-    /// After markReachable, scan reachable files for b.path("...") references
-    /// and mark those targets as reachable too. This handles build modules that
-    /// reference source files via b.path() instead of @import().
-    fn markBuildPathReferences(self: *ImportGraph, cfg: *const Config) !void {
-        // Find the build root (directory containing build.zig)
-        var root_buf: [fs.max_path_bytes]u8 = undefined;
-        const build_root: []const u8 = br: {
-            // 1. Check entries for build.zig
-            for (cfg.entries.items) |e| {
-                if (mem.endsWith(u8, e, "build.zig")) {
-                    const dir = std.fs.path.dirname(e) orelse ".";
-                    break :br fs.cwd().realpath(dir, &root_buf) catch continue;
-                }
-            }
-            // 2. Try parent of target path (common: target is src/, build.zig is at parent)
-            const trimmed = mem.trimRight(u8, cfg.path, "/");
-            const parent = std.fs.path.dirname(trimmed) orelse ".";
-            {
-                const check = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/build.zig",
-                    .{parent},
-                ) catch return;
-                defer self.allocator.free(check);
-                if (fs.cwd().access(check, .{})) |_| {
-                    break :br fs.cwd().realpath(parent, &root_buf) catch return;
-                } else |_| {}
-            }
-            // 3. Try target path itself
-            {
-                const check = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}/build.zig",
-                    .{trimmed},
-                ) catch return;
-                defer self.allocator.free(check);
-                if (fs.cwd().access(check, .{})) |_| {
-                    break :br fs.cwd().realpath(trimmed, &root_buf) catch return;
-                } else |_| {}
-            }
-            return; // No build.zig found
-        };
-
-        // Collect current reachable paths (snapshot to avoid modify-while-iterate)
-        var to_scan: std.ArrayListUnmanaged([]const u8) = .{};
-        defer to_scan.deinit(self.allocator);
-        {
-            var iter = self.reachable.iterator();
-            while (iter.next()) |entry| {
-                try to_scan.append(self.allocator, entry.key_ptr.*);
+    /// Find the build root directory containing build.zig.
+    fn findBuildRoot(
+        self: *ImportGraph,
+        cfg: *const Config,
+        buf: *[fs.max_path_bytes]u8,
+    ) ?[]const u8 {
+        // 1. Check entries for build.zig
+        for (cfg.entries.items) |e| {
+            if (mem.endsWith(u8, e, "build.zig")) {
+                const dir = std.fs.path.dirname(e) orelse ".";
+                return fs.cwd().realpath(dir, buf) catch continue;
             }
         }
+        // 2. Try parent of target path
+        const trimmed = mem.trimRight(u8, cfg.path, "/");
+        if (self.checkBuildZigAt(
+            std.fs.path.dirname(trimmed) orelse ".",
+            buf,
+        )) |r| return r;
+        // 3. Try target path itself
+        return self.checkBuildZigAt(trimmed, buf);
+    }
 
+    /// Check if dir/build.zig exists and return realpath of dir.
+    fn checkBuildZigAt(
+        self: *ImportGraph,
+        dir: []const u8,
+        buf: *[fs.max_path_bytes]u8,
+    ) ?[]const u8 {
+        const check = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/build.zig",
+            .{dir},
+        ) catch return null;
+        defer self.allocator.free(check);
+        fs.cwd().access(check, .{}) catch return null;
+        return fs.cwd().realpath(dir, buf) catch null;
+    }
+
+    /// Scan already-loaded content for b.path("...zig") refs, marking reachable.
+    fn scanContentBuildPathRefs(
+        self: *ImportGraph,
+        content: []const u8,
+        build_root: []const u8,
+    ) void {
         const bp_tag = "b.path(\"";
-        // Scan each reachable file for b.path("...") patterns
+        var pos: usize = 0;
+        while (pos + bp_tag.len < content.len) {
+            const rest = content[pos..];
+            const rel = mem.indexOf(u8, rest, bp_tag) orelse break;
+            const str_start = pos + rel + bp_tag.len;
+            var str_end = str_start;
+            while (str_end < content.len and content[str_end] != '"') str_end += 1;
+            if (str_end > str_start) {
+                self.tryMarkBuildPath(
+                    content[str_start..str_end],
+                    build_root,
+                );
+            }
+            pos = str_end + 1;
+        }
+    }
+
+    /// Resolve a single b.path ref and mark it reachable if it's a .zig file.
+    fn tryMarkBuildPath(
+        self: *ImportGraph,
+        ref_path: []const u8,
+        build_root: []const u8,
+    ) void {
+        if (!mem.endsWith(u8, ref_path, ".zig")) return;
+        const full = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ build_root, ref_path },
+        ) catch return;
+        defer self.allocator.free(full);
+        var rbuf: [fs.max_path_bytes]u8 = undefined;
+        const resolved = fs.cwd().realpath(full, &rbuf) catch return;
+        if (!self.reachable.contains(resolved)) {
+            self.markReachableRecursive(resolved) catch return;
+        }
+    }
+
+    /// After markReachable, scan reachable files for b.path("...") references
+    /// and mark those targets as reachable too.
+    fn markBuildPathReferences(self: *ImportGraph, cfg: *const Config) !void {
+        var root_buf: [fs.max_path_bytes]u8 = undefined;
+        const build_root = self.findBuildRoot(cfg, &root_buf) orelse return;
+
+        // Snapshot reachable paths to avoid modify-while-iterate
+        var to_scan: std.ArrayListUnmanaged([]const u8) = .{};
+        defer to_scan.deinit(self.allocator);
+        var iter = self.reachable.iterator();
+        while (iter.next()) |entry| {
+            try to_scan.append(self.allocator, entry.key_ptr.*);
+        }
+
         for (to_scan.items) |path| {
             const content = fs.cwd().readFileAlloc(
                 self.allocator,
@@ -3339,55 +3478,70 @@ const ImportGraph = struct {
                 4 * 1024 * 1024,
             ) catch continue;
             defer self.allocator.free(content);
-
-            var pos: usize = 0;
-            while (pos + bp_tag.len < content.len) {
-                const rest = content[pos..];
-                const rel = mem.indexOf(u8, rest, bp_tag) orelse break;
-                const str_start = pos + rel + bp_tag.len;
-                var str_end = str_start;
-                while (str_end < content.len and content[str_end] != '"') str_end += 1;
-                if (str_end > str_start) {
-                    const ref_path = content[str_start..str_end];
-                    if (mem.endsWith(u8, ref_path, ".zig")) {
-                        const full = std.fmt.allocPrint(
-                            self.allocator,
-                            "{s}/{s}",
-                            .{ build_root, ref_path },
-                        ) catch {
-                            pos = str_end + 1;
-                            continue;
-                        };
-                        defer self.allocator.free(full);
-                        var rbuf: [fs.max_path_bytes]u8 = undefined;
-                        if (fs.cwd().realpath(full, &rbuf)) |resolved| {
-                            if (!self.reachable.contains(resolved)) {
-                                // Use markReachableRecursive to also follow
-                                // the file's @import() chain
-                                self.markReachableRecursive(resolved) catch {
-                                    pos = str_end + 1;
-                                    continue;
-                                };
-                            }
-                        } else |_| {}
-                    }
-                }
-                pos = str_end + 1;
-            }
+            self.scanContentBuildPathRefs(content, build_root);
         }
 
-        // Also discover nested build.zig files in subdirectories of the scan target.
-        // Sub-projects (e.g., tigerbeetle/src/docs_website/) have their own build.zig
-        // that references their source files.
         try self.discoverNestedBuildFiles(cfg);
-
-        // Resolve build-system module imports to directories.
         try self.markBuildModuleDirectories(cfg);
     }
 
+    /// Check if an import looks like an unresolved module name.
+    fn isUnresolvedModuleName(
+        self: *ImportGraph,
+        imp: types.ImportInfo,
+    ) bool {
+        if (imp.resolved) |resolved| {
+            if (self.findImportsForPath(resolved) != null) return false;
+        }
+        if (mem.endsWith(u8, imp.path, ".zig")) return false;
+        if (mem.indexOf(u8, imp.path, ".") != null) return false;
+        if (mem.indexOf(u8, imp.path, "/") != null) return false;
+        if (mem.eql(u8, imp.path, "std")) return false;
+        if (mem.eql(u8, imp.path, "builtin")) return false;
+        return true;
+    }
+
+    /// Collect unresolved module names from reachable files.
+    fn collectUnresolvedModuleNames(
+        self: *ImportGraph,
+        module_names: *std.StringHashMapUnmanaged(void),
+    ) void {
+        var file_iter = self.files.iterator();
+        while (file_iter.next()) |entry| {
+            var rb: [fs.max_path_bytes]u8 = undefined;
+            const norm = fs.cwd().realpath(
+                entry.key_ptr.*,
+                &rb,
+            ) catch continue;
+            if (!self.reachable.contains(norm)) continue;
+            for (entry.value_ptr.imports.items) |imp| {
+                if (!self.isUnresolvedModuleName(imp)) continue;
+                if (module_names.contains(imp.path)) continue;
+                const d = self.allocator.dupe(u8, imp.path) catch continue;
+                module_names.put(self.allocator, d, {}) catch {
+                    self.allocator.free(d);
+                    continue;
+                };
+            }
+        }
+    }
+
+    /// Resolve a directory path and add it as a search root if valid.
+    fn addSearchRoot(
+        self: *ImportGraph,
+        dir: []const u8,
+        buf: *[fs.max_path_bytes]u8,
+        roots: *[2][]const u8,
+        rc: *usize,
+    ) void {
+        const r = fs.cwd().realpath(dir, buf) catch return;
+        const o = self.allocator.dupe(u8, r) catch return;
+        roots[rc.*] = o;
+        rc.* += 1;
+    }
+
     /// Scan reachable files for unresolved module-name imports
-    /// (e.g. @import("arch"), @import("kernel")) and resolve them
-    /// to matching directories in the project tree.
+    /// and resolve them to matching directories in the project tree.
     fn markBuildModuleDirectories(
         self: *ImportGraph,
         cfg: *const Config,
@@ -3399,60 +3553,22 @@ const ImportGraph = struct {
             module_names.deinit(self.allocator);
         }
 
-        var file_iter = self.files.iterator();
-        while (file_iter.next()) |entry| {
-            var rb: [fs.max_path_bytes]u8 = undefined;
-            const norm = fs.cwd().realpath(
-                entry.key_ptr.*,
-                &rb,
-            ) catch continue;
-            if (!self.reachable.contains(norm)) continue;
-            for (entry.value_ptr.imports.items) |imp| {
-                // Skip file-path imports that resolved to actual files
-                if (imp.resolved) |resolved| {
-                    // If resolved path is in our files map, it's a real import
-                    if (self.findImportsForPath(resolved) != null) continue;
-                    // Otherwise it might be a directory - treat as module
-                }
-                if (mem.endsWith(u8, imp.path, ".zig")) continue;
-                if (mem.indexOf(u8, imp.path, ".") != null) continue;
-                if (mem.indexOf(u8, imp.path, "/") != null) continue;
-                if (mem.eql(u8, imp.path, "std")) continue;
-                if (mem.eql(u8, imp.path, "builtin")) continue;
-                if (module_names.contains(imp.path)) continue;
-                const d = self.allocator.dupe(u8, imp.path) catch continue;
-                module_names.put(self.allocator, d, {}) catch {
-                    self.allocator.free(d);
-                    continue;
-                };
-            }
-        }
-
+        self.collectUnresolvedModuleNames(&module_names);
         if (module_names.count() == 0) return;
 
         const trimmed = mem.trimRight(u8, cfg.path, "/");
         var search_roots: [2][]const u8 = undefined;
         var rc: usize = 0;
-        const par = std.fs.path.dirname(trimmed) orelse ".";
         var rb1: [fs.max_path_bytes]u8 = undefined;
-        if (fs.cwd().realpath(par, &rb1)) |r| {
-            const o = self.allocator.dupe(u8, r) catch "";
-            if (o.len > 0) {
-                search_roots[rc] = o;
-                rc += 1;
-            }
-        } else |_| {}
+        self.addSearchRoot(
+            std.fs.path.dirname(trimmed) orelse ".",
+            &rb1,
+            &search_roots,
+            &rc,
+        );
         var rb2: [fs.max_path_bytes]u8 = undefined;
-        if (fs.cwd().realpath(trimmed, &rb2)) |r| {
-            const o = self.allocator.dupe(u8, r) catch "";
-            if (o.len > 0) {
-                search_roots[rc] = o;
-                rc += 1;
-            }
-        } else |_| {}
-        defer for (search_roots[0..rc]) |r| {
-            if (r.len > 0) self.allocator.free(r);
-        };
+        self.addSearchRoot(trimmed, &rb2, &search_roots, &rc);
+        defer for (search_roots[0..rc]) |r| self.allocator.free(r);
 
         var mi = module_names.iterator();
         while (mi.next()) |me| {
@@ -3594,13 +3710,17 @@ const ImportGraph = struct {
             }
         }
         for (to_scan.items) |path| {
-            self.scanBuildPathRefs(path, subdir) catch continue;
+            self.scanFileBuildPathRefs(path, subdir) catch continue;
         }
     }
 
     /// Scan a specific file for b.path("...") references and resolve them
     /// relative to the given base directory
-    fn scanBuildPathRefs(self: *ImportGraph, file_path: []const u8, base_dir: []const u8) !void {
+    fn scanFileBuildPathRefs(
+        self: *ImportGraph,
+        file_path: []const u8,
+        base_dir: []const u8,
+    ) !void {
         const content = fs.cwd().readFileAlloc(
             self.allocator,
             file_path,
@@ -4469,46 +4589,6 @@ fn checkSilentCatchWithContext(
     return null;
 }
 
-/// Check for catch unreachable (ZA202)
-fn checkCatchUnreachable(
-    t: []const u8,
-    path: []const u8,
-    line: usize,
-) ?Issue {
-    if (mem.indexOf(u8, t, "catch unreachable")) |col| {
-        if (!isInsideString(t, col)) return .{
-            .file = path,
-            .line = line,
-            .col = col + 1,
-            .severity = .warning,
-            .rule = RULE_CATCH_UNREACHABLE,
-            .message = "catch unreachable will panic",
-            .help = "use explicit error handling",
-        };
-    }
-    return null;
-}
-
-/// Check for orelse unreachable (ZA203)
-fn checkOrelseUnreachable(
-    t: []const u8,
-    path: []const u8,
-    line: usize,
-) ?Issue {
-    if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
-        if (!isInsideString(t, col)) return .{
-            .file = path,
-            .line = line,
-            .col = col + 1,
-            .severity = .warning,
-            .rule = RULE_ORELSE_UNREACHABLE,
-            .message = "orelse unreachable will panic",
-            .help = "use explicit null handling",
-        };
-    }
-    return null;
-}
-
 /// Extract variable name from "var x" or "const x" declaration (for ZA204)
 fn extractVarDeclName(t: []const u8) ?[]const u8 {
     const is_var = mem.startsWith(u8, t, "var ");
@@ -5319,6 +5399,62 @@ fn reportEndOfFileIssues(
     }
 }
 
+/// ZA206: Check for std.process.exit() bypassing defers
+fn checkExitBypassesDefer(
+    t: []const u8,
+    content: []const u8,
+    path: []const u8,
+    line_num: usize,
+    has_defer: bool,
+    func_name: []const u8,
+) ?Issue {
+    if (!has_defer or func_name.len == 0) return null;
+    const has_exit = mem.indexOf(u8, t, "std.process.exit(") != null or
+        mem.indexOf(u8, t, "process.exit(") != null;
+    if (!has_exit) return null;
+
+    const exit_pos = mem.indexOf(u8, t, "exit(") orelse 0;
+    if (isInsideString(t, exit_pos)) return null;
+    if (isInlineDisabled(content, line_num, RULE_EXIT_BYPASSES_DEFER)) return null;
+
+    return .{
+        .file = path,
+        .line = line_num,
+        .col = exit_pos + 1,
+        .severity = .warning,
+        .rule = RULE_EXIT_BYPASSES_DEFER,
+        .message = "std.process.exit() bypasses all defers in current scope",
+        .help = "set a flag and exit at end of function, or " ++
+            "return error to let defers run",
+    };
+}
+
+/// Update error analysis state for a single line (tracking only)
+fn updateErrorState(
+    t: []const u8,
+    line: []const u8,
+    state: *ErrorAnalysisState,
+    path: []const u8,
+) struct { skip_undefined: bool } {
+    const ts = trackTestBlock(t, state.in_test_block, state.test_brace_depth);
+    state.in_test_block = ts.in_test;
+    state.test_brace_depth = ts.depth;
+    const in_test = isInTestContext(path, state.in_test_block);
+
+    if (isStaticStorageStruct(t)) {
+        state.in_static_struct = true;
+        state.static_struct_depth = 0;
+    }
+    if (state.in_static_struct) trackStaticStructBraces(t, state);
+
+    const skip = in_test or isTestFilePath(path) or
+        isModuleLevelDecl(line) or state.in_static_struct;
+
+    trackFunctionContext(t, state);
+    trackDeferBlock(t, state);
+    return .{ .skip_undefined = skip };
+}
+
 /// Analyze a single file for error issues
 fn analyzeFileErrors(
     allocator: Allocator,
@@ -5334,36 +5470,9 @@ fn analyzeFileErrors(
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
 
-        const ts = trackTestBlock(
-            t,
-            state.in_test_block,
-            state.test_brace_depth,
-        );
-        state.in_test_block = ts.in_test;
-        state.test_brace_depth = ts.depth;
-        const in_test = isInTestContext(a.path, state.in_test_block);
+        const s = updateErrorState(t, line, &state, a.path);
 
-        // Track static storage struct pattern (const S = struct { var x; })
-        if (isStaticStorageStruct(t)) {
-            state.in_static_struct = true;
-            state.static_struct_depth = 0;
-        }
-        if (state.in_static_struct) {
-            trackStaticStructBraces(t, &state);
-        }
-
-        // Skip undefined checks in tests, module-level, and static storage
-        const skip_undefined = in_test or isTestFilePath(a.path) or
-            isModuleLevelDecl(line) or state.in_static_struct;
-
-        // Track function context for cleanup detection
-        trackFunctionContext(t, &state);
-
-        // Track defer blocks for silent catch exclusion
-        trackDeferBlock(t, &state);
-
-        // Track struct fields only outside tests
-        if (!skip_undefined) {
+        if (!s.skip_undefined) {
             trackStructLiteral(t, line_num, &state);
             activatePendingFields(&state);
             try checkPendingFields(t, a.path, &state, issues, allocator);
@@ -5372,7 +5481,7 @@ fn analyzeFileErrors(
             t,
             a.path,
             line_num,
-            skip_undefined,
+            s.skip_undefined,
             state.in_defer_block,
             state.current_func_name,
             &state.pending_undefined,
@@ -5380,28 +5489,15 @@ fn analyzeFileErrors(
             allocator,
         );
 
-        // ZA206: Check for std.process.exit() bypassing defers
-        if (state.has_defer_in_func and state.current_func_name.len > 0) {
-            if (mem.indexOf(u8, t, "std.process.exit(") != null or
-                mem.indexOf(u8, t, "process.exit(") != null)
-            {
-                // Make sure it's not in a comment or string, and not inline disabled
-                const exit_pos = mem.indexOf(u8, t, "exit(") orelse 0;
-                if (!isInsideString(t, exit_pos) and
-                    !isInlineDisabled(a.content, line_num, RULE_EXIT_BYPASSES_DEFER))
-                {
-                    try issues.append(allocator, .{
-                        .file = a.path,
-                        .line = line_num,
-                        .col = exit_pos + 1,
-                        .severity = .warning,
-                        .rule = RULE_EXIT_BYPASSES_DEFER,
-                        .message = "std.process.exit() bypasses all defers in current scope",
-                        .help = "set a flag and exit at end of function, or " ++
-                            "return error to let defers run",
-                    });
-                }
-            }
+        if (checkExitBypassesDefer(
+            t,
+            a.content,
+            a.path,
+            line_num,
+            state.has_defer_in_func,
+            state.current_func_name,
+        )) |issue| {
+            try issues.append(allocator, issue);
         }
     }
     try reportEndOfFileIssues(&state, a.path, issues, allocator);
@@ -6275,6 +6371,84 @@ fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
 }
 
 /// Process a single function's analysis (memory, CFG, etc.)
+/// Convert definite assignment issues to ZA607 warnings
+fn emitDefiniteAssignmentIssues(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    def_issues: *std.StringHashMap(usize),
+    file_path: []const u8,
+) !void {
+    var def_iter = def_issues.iterator();
+    while (def_iter.next()) |entry| {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "variable '{s}' potentially read " ++
+                "before assignment",
+            .{entry.key_ptr.*},
+        );
+        try issues.append(allocator, .{
+            .file = file_path,
+            .line = entry.value_ptr.*,
+            .col = 1,
+            .severity = .warning,
+            .rule = "ZA607",
+            .message = msg,
+            .help = "ensure variable is assigned " ++
+                "on all code paths",
+            .message_owned = true,
+        });
+    }
+}
+
+/// Run memory-related CFG analyses
+fn runCFGMemoryAnalyses(
+    a: Allocator,
+    out: *std.ArrayListUnmanaged(Issue),
+    cfg: *ControlFlowGraph,
+    fl: []const []const u8,
+    fstart: usize,
+    fp: []const u8,
+    fn_ret_err: bool,
+    in_test: bool,
+) !void {
+    var r1 = try analyzeCFGMemorySafety(a, cfg, fl, fstart, fp);
+    defer r1.deinit(a);
+    try out.appendSlice(a, r1.items);
+    var r2 = try analyzeCFGDeferCoverage(a, cfg, fl, fstart, fp);
+    defer r2.deinit(a);
+    try out.appendSlice(a, r2.items);
+    var r3 = if (in_test)
+        std.ArrayListUnmanaged(Issue){}
+    else
+        try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err);
+    defer r3.deinit(a);
+    try out.appendSlice(a, r3.items);
+}
+
+/// Run safety and error CFG analyses
+fn runCFGSafetyAnalyses(
+    a: Allocator,
+    out: *std.ArrayListUnmanaged(Issue),
+    cfg: *ControlFlowGraph,
+    fl: []const []const u8,
+    fstart: usize,
+    fp: []const u8,
+    fn_name: []const u8,
+    in_test: bool,
+) !void {
+    var r1 = try analyzeCFGNullSafety(a, cfg, fl, fstart, fp);
+    defer r1.deinit(a);
+    try out.appendSlice(a, r1.items);
+    var r2 = try analyzeCFGPanicPatterns(a, cfg, fl, fstart, fp);
+    defer r2.deinit(a);
+    try out.appendSlice(a, r2.items);
+    var r3 = try analyzeCFGErrors(
+        a, cfg, fl, fstart, fp, fn_name, in_test,
+    );
+    defer r3.deinit(a);
+    try out.appendSlice(a, r3.items);
+}
+
 fn processFunction(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
@@ -6286,7 +6460,6 @@ fn processFunction(
     is_in_test_context: bool,
     fn_is_noreturn: bool,
 ) !void {
-    // Run memory analysis (skip for noreturn functions - leaks don't matter)
     var func_issues = if (fn_is_noreturn)
         std.ArrayListUnmanaged(Issue){}
     else
@@ -6299,7 +6472,6 @@ fn processFunction(
     defer func_issues.deinit(allocator);
     try issues.appendSlice(allocator, func_issues.items);
 
-    // Run CFG-based definite assignment analysis (ZA607)
     var cfg = try buildCFG(
         allocator,
         func_name,
@@ -6315,89 +6487,26 @@ fn processFunction(
         func_start,
     );
     defer def_issues.deinit();
-
-    // Convert definite assignment issues to ZA607 warnings
-    var def_iter = def_issues.iterator();
-    while (def_iter.next()) |entry| {
-        const msg = try std.fmt.allocPrint(
-            allocator,
-            "variable '{s}' potentially read before assignment",
-            .{entry.key_ptr.*},
-        );
-        try issues.append(allocator, .{
-            .file = file_path,
-            .line = entry.value_ptr.*,
-            .col = 1,
-            .severity = .warning,
-            .rule = "ZA607",
-            .message = msg,
-            .help = "ensure variable is assigned on all code paths",
-            .message_owned = true,
-        });
-    }
-
-    // Run CFG-based path-sensitive memory safety analysis (ZA105, ZA106)
-    var mem_safety_issues = try analyzeCFGMemorySafety(
+    try emitDefiniteAssignmentIssues(
         allocator,
+        issues,
+        &def_issues,
+        file_path,
+    );
+
+    try runCFGMemoryAnalyses(
+        allocator,
+        issues,
         &cfg,
         func_lines_items,
         func_start,
         file_path,
+        fn_returns_error,
+        is_in_test_context,
     );
-    defer mem_safety_issues.deinit(allocator);
-    try issues.appendSlice(allocator, mem_safety_issues.items);
-
-    // Run CFG-based defer coverage analysis (ZA101, ZA102)
-    var defer_issues = try analyzeCFGDeferCoverage(
+    try runCFGSafetyAnalyses(
         allocator,
-        &cfg,
-        func_lines_items,
-        func_start,
-        file_path,
-    );
-    defer defer_issues.deinit(allocator);
-    try issues.appendSlice(allocator, defer_issues.items);
-
-    // Run CFG-based errdefer coverage analysis (ZA103)
-    // Skip in test context - test functions don't need errdefer (test abort handles cleanup)
-    var errdefer_issues = if (is_in_test_context)
-        std.ArrayListUnmanaged(Issue){}
-    else
-        try analyzeCFGErrdeferCoverage(
-            allocator,
-            func_lines_items,
-            func_start,
-            file_path,
-            fn_returns_error,
-        );
-    defer errdefer_issues.deinit(allocator);
-    try issues.appendSlice(allocator, errdefer_issues.items);
-
-    // Run CFG-based null safety analysis (ZA801, ZA802)
-    var null_safety_issues = try analyzeCFGNullSafety(
-        allocator,
-        &cfg,
-        func_lines_items,
-        func_start,
-        file_path,
-    );
-    defer null_safety_issues.deinit(allocator);
-    try issues.appendSlice(allocator, null_safety_issues.items);
-
-    // Run CFG-based panic/overflow analysis (ZA901, ZA902, ZA903)
-    var panic_issues = try analyzeCFGPanicPatterns(
-        allocator,
-        &cfg,
-        func_lines_items,
-        func_start,
-        file_path,
-    );
-    defer panic_issues.deinit(allocator);
-    try issues.appendSlice(allocator, panic_issues.items);
-
-    // Run CFG-based error analysis (ZA201, ZA202, ZA203)
-    var error_issues = try analyzeCFGErrors(
-        allocator,
+        issues,
         &cfg,
         func_lines_items,
         func_start,
@@ -6405,8 +6514,6 @@ fn processFunction(
         func_name,
         is_in_test_context,
     );
-    defer error_issues.deinit(allocator);
-    try issues.appendSlice(allocator, error_issues.items);
 }
 
 /// Analyze a single file for CFG memory issues
@@ -7116,6 +7223,81 @@ fn buildAliasSets(
     return alias_sets;
 }
 
+/// Check if line has assignment pattern for ownership
+fn checkAssignmentOwnership(
+    t: []const u8,
+    alias: []const u8,
+    alloc: *AllocInfo,
+) void {
+    if (mem.indexOf(u8, t, " = ") == null) return;
+    if (mem.startsWith(u8, t, "const ")) return;
+    if (mem.startsWith(u8, t, "var ")) return;
+    const eq_pos = mem.indexOf(u8, t, " = ").?;
+    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+    if (lhs.len == 0) return;
+    if (mem.indexOf(u8, lhs, ".") == null and
+        !mem.eql(u8, lhs, alias))
+    {
+        alloc.stored = true;
+    }
+    if (mem.indexOf(u8, lhs, ".") != null) {
+        const rhs = t[eq_pos + 3 ..];
+        if (mem.indexOf(u8, rhs, alias) != null) {
+            alloc.stored = true;
+        }
+    }
+}
+
+/// Check method-call ownership transfer patterns
+fn checkMethodTransfer(t: []const u8, alloc: *AllocInfo) void {
+    const methods = [_][]const u8{
+        ".put(",          ".putNoClobber(",
+        ".append(",       ".appendSlice(",
+        ".insert(",       ".add(",
+        ".push(",         ".enqueue(",
+        ".submit(",       ".toJS(",
+        ".toValue(",      ".toSlice(",
+        ".toOwnedSlice(", ".dependOn(",
+        ".setText(",      ".clone(",
+        ".addText(",      ".strHash(",
+    };
+    for (methods) |m| {
+        if (mem.indexOf(u8, t, m) != null) {
+            alloc.ownership_transferred = true;
+            return;
+        }
+    }
+}
+
+/// Track alias-based ownership transfers for a line
+fn trackAliasOwnership(
+    t: []const u8,
+    rss: *const ReturnStoreState,
+    alias_sets: []const AliasSet,
+    allocs: []AllocInfo,
+) void {
+    const in_ret = rss.in_return or
+        mem.startsWith(u8, t, "return ");
+    const in_self = rss.in_self_assign or
+        mem.indexOf(u8, t, "self.") != null or
+        mem.indexOf(u8, t, "ctx.") != null;
+
+    for (alias_sets, 0..) |as, ai| {
+        for (as.names.items) |alias| {
+            if (mem.indexOf(u8, t, alias) == null) continue;
+            if (in_ret) allocs[ai].returned = true;
+            if (in_self) allocs[ai].stored = true;
+            checkAssignmentOwnership(t, alias, &allocs[ai]);
+            checkMethodTransfer(t, &allocs[ai]);
+            if (!allocs[ai].ownership_transferred) {
+                if (isFunctionArgTransfer(t, alias)) {
+                    allocs[ai].ownership_transferred = true;
+                }
+            }
+        }
+    }
+}
+
 /// Analyze a single function for memory issues
 fn analyzeFunction(
     allocator: Allocator,
@@ -7176,71 +7358,28 @@ fn analyzeFunction(
             try trackExplicitFrees(t, actual_line, allocs.items, &events, allocator);
         }
 
-        // CFG-based return/store tracking using alias sets
         updateReturnStoreState(t, &return_store_state);
-        const in_return = return_store_state.in_return or mem.startsWith(u8, t, "return ");
-        const in_self = return_store_state.in_self_assign or
-            mem.indexOf(u8, t, "self.") != null or mem.indexOf(u8, t, "ctx.") != null;
-
-        for (alias_sets, 0..) |as, ai| {
-            for (as.names.items) |alias| {
-                if (mem.indexOf(u8, t, alias) == null) continue;
-
-                if (in_return) allocs.items[ai].returned = true;
-                if (in_self) allocs.items[ai].stored = true;
-
-                // Module-level assignment (no const/var prefix, simple identifier LHS)
-                if (mem.indexOf(u8, t, " = ") != null and
-                    !mem.startsWith(u8, t, "const ") and
-                    !mem.startsWith(u8, t, "var "))
-                {
-                    const eq_pos = mem.indexOf(u8, t, " = ").?;
-                    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-                    if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null and
-                        !mem.eql(u8, lhs, alias))
-                    {
-                        allocs.items[ai].stored = true;
-                    }
-                    // Struct field assignment: struct.field = alloc (ownership transfer)
-                    // Pattern: deque.buffer = new_buffer, ctx.data = alloc_ptr
-                    if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") != null) {
-                        // Check if alias is on the RHS (after =)
-                        const rhs = t[eq_pos + 3 ..];
-                        if (mem.indexOf(u8, rhs, alias) != null) {
-                            allocs.items[ai].stored = true;
-                        }
-                    }
-                }
-
-                // Ownership transfer via method call: .put(alias), .append(alias), etc.
-                const transfer_methods = [_][]const u8{
-                    ".put(",          ".putNoClobber(", ".append(",  ".appendSlice(",
-                    ".insert(",       ".add(",          ".push(",    ".enqueue(",
-                    ".submit(",       ".toJS(",         ".toValue(", ".toSlice(",
-                    ".toOwnedSlice(", ".dependOn(",     ".setText(", ".clone(",
-                    ".addText(",      ".strHash(",
-                };
-                for (transfer_methods) |method| {
-                    if (mem.indexOf(u8, t, method) != null) {
-                        allocs.items[ai].ownership_transferred = true;
-                        break;
-                    }
-                }
-
-                // Function argument ownership transfer:
-                // someFunc(alloc_name, ...) or someFunc(alloc_name)
-                // Catches allocation passed as argument to any function
-                if (!allocs.items[ai].ownership_transferred) {
-                    if (isFunctionArgTransfer(t, alias)) {
-                        allocs.items[ai].ownership_transferred = true;
-                    }
-                }
-            }
-        }
+        trackAliasOwnership(
+            t,
+            &return_store_state,
+            alias_sets,
+            allocs.items,
+        );
     }
 
-    try reportLeaks(allocs.items, has_err_return, file_path, &issues, allocator);
-    try reportMemEvents(events.items, file_path, &issues, allocator);
+    try reportLeaks(
+        allocs.items,
+        has_err_return,
+        file_path,
+        &issues,
+        allocator,
+    );
+    try reportMemEvents(
+        events.items,
+        file_path,
+        &issues,
+        allocator,
+    );
     return issues;
 }
 
@@ -7464,6 +7603,133 @@ fn checkUnsafeDeref(
 
 /// CFG-based null safety analysis (ZA801/ZA802)
 /// Uses control flow graph to track null checks across paths
+/// Phase 1: Identify null checks in each block
+fn collectNullChecksPerBlock(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    checked: []std.StringHashMapUnmanaged(void),
+) !void {
+    for (cfg.blocks.items, 0..) |block, bid| {
+        if (block.start_line == 0 or
+            block.start_line > block.end_line) continue;
+        for (block.start_line..block.end_line + 1) |ln| {
+            if (ln < func_line) continue;
+            const idx = ln - func_line;
+            if (idx >= lines.len) continue;
+            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            const is_cond = mem.startsWith(u8, t, "if (") or
+                mem.startsWith(u8, t, "} else if (") or
+                mem.startsWith(u8, t, "while (");
+            if (!is_cond) continue;
+            if (extractNullCheckedVar(t)) |var_name| {
+                try checked[bid].put(allocator, var_name, {});
+            }
+        }
+    }
+}
+
+/// Intersect predecessor null-check sets into a block
+fn intersectPredChecks(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    bid: usize,
+    checked: []std.StringHashMapUnmanaged(void),
+) !bool {
+    var preds = std.ArrayListUnmanaged(usize){};
+    defer preds.deinit(allocator);
+    for (cfg.edges.items) |edge| {
+        if (edge.to == bid) try preds.append(allocator, edge.from);
+    }
+    if (preds.items.len == 0) return false;
+
+    var intersection: std.StringHashMapUnmanaged(void) = .{};
+    defer intersection.deinit(allocator);
+    var first = true;
+    for (preds.items) |pred| {
+        if (first) {
+            var it = checked[pred].iterator();
+            while (it.next()) |e| {
+                try intersection.put(allocator, e.key_ptr.*, {});
+            }
+            first = false;
+        } else {
+            var rm = std.ArrayListUnmanaged([]const u8){};
+            defer rm.deinit(allocator);
+            var it = intersection.iterator();
+            while (it.next()) |e| {
+                if (!checked[pred].contains(e.key_ptr.*)) {
+                    try rm.append(allocator, e.key_ptr.*);
+                }
+            }
+            for (rm.items) |key| _ = intersection.remove(key);
+        }
+    }
+    var any_changed = false;
+    var it = intersection.iterator();
+    while (it.next()) |e| {
+        const gop = try checked[bid].getOrPut(allocator, e.key_ptr.*);
+        if (!gop.found_existing) any_changed = true;
+    }
+    return any_changed;
+}
+
+/// Phase 3: Check for unsafe unwraps on a line
+fn checkLineForUnsafeUnwrap(
+    allocator: Allocator,
+    t: []const u8,
+    line_num: usize,
+    idx: usize,
+    lines: []const []const u8,
+    file_path: []const u8,
+    checked_set: *const std.StringHashMapUnmanaged(void),
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    if (mem.indexOf(u8, t, ".?")) |col| {
+        if (isInSafeContext(t)) return;
+        if (!isUnsafeUnwrapUsage(t, col)) return;
+        if (extractUnwrappedVar(t, col)) |var_name| {
+            if (checked_set.contains(var_name)) return;
+            if (hasEarlyReturnNullGuard(lines, idx, var_name))
+                return;
+            try issues.append(allocator, .{
+                .file = file_path,
+                .line = line_num,
+                .col = col + 1,
+                .severity = .warning,
+                .rule = RULE_OPTIONAL_UNWRAP_UNSAFE,
+                .message = "optional unwrap (.?) may " ++
+                    "panic if null",
+                .help = "use 'orelse' for safe unwrap" ++
+                    ", or check for null with 'if'",
+            });
+        }
+    }
+    if (mem.indexOf(u8, t, ".*")) |col| {
+        const before = t[0..col];
+        const has_opt_prefix = mem.indexOf(u8, before, "maybe_") != null or
+            mem.indexOf(u8, before, "opt_") != null;
+        if (!has_opt_prefix) return;
+        if (isInSafeContext(t)) return;
+        if (extractDerefVar(t, col)) |var_name| {
+            if (checked_set.contains(var_name)) return;
+            try issues.append(allocator, .{
+                .file = file_path,
+                .line = line_num,
+                .col = col + 1,
+                .severity = .warning,
+                .rule = RULE_ORELSE_QUESTION_UNSAFE,
+                .message = "dereferencing optional pointer " ++
+                    "may panic if null",
+                .help = "check for null before " ++
+                    "dereferencing, or use 'orelse'",
+            });
+        }
+    }
+}
+
 fn analyzeCFGNullSafety(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
@@ -7472,165 +7738,56 @@ fn analyzeCFGNullSafety(
     file_path: []const u8,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
-
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    // Track null-checked variables per block (variables known to be non-null)
-    var checked_per_block = try allocator.alloc(std.StringHashMapUnmanaged(void), num_blocks);
+    const checked = try allocator.alloc(
+        std.StringHashMapUnmanaged(void),
+        num_blocks,
+    );
     defer {
-        for (checked_per_block) |*map| map.deinit(allocator);
-        allocator.free(checked_per_block);
+        for (checked) |*map| map.deinit(allocator);
+        allocator.free(checked);
     }
-    for (checked_per_block) |*map| map.* = .{};
+    for (checked) |*map| map.* = .{};
 
-    // Phase 1: Identify null checks in each block
-    for (cfg.blocks.items, 0..) |block, bid| {
-        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+    try collectNullChecksPerBlock(
+        allocator, cfg, lines, func_line, checked,
+    );
 
-        for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < func_line) continue;
-            const idx = line_num - func_line;
-            if (idx >= lines.len) continue;
-            const t = mem.trim(u8, lines[idx], " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-
-            // Detect null check patterns and extract variable names
-            // Pattern: if (x != null) or if (x) |_|
-            if (mem.startsWith(u8, t, "if (") or mem.startsWith(u8, t, "} else if (") or
-                mem.startsWith(u8, t, "while ("))
-            {
-                if (extractNullCheckedVar(t)) |var_name| {
-                    try checked_per_block[bid].put(allocator, var_name, {});
-                }
-            }
-        }
-    }
-
-    // Phase 2: Propagate null-check state through CFG (forward dataflow)
-    // A variable is checked if it's checked on ALL predecessor paths
+    var iters: usize = 0;
     var changed = true;
-    var iterations: usize = 0;
-    while (changed and iterations < 100) {
+    while (changed and iters < 100) {
         changed = false;
-        iterations += 1;
-
-        for (cfg.blocks.items, 0..) |_, bid| {
-            // Get all predecessors of this block
-            var preds = std.ArrayListUnmanaged(usize){};
-            defer preds.deinit(allocator);
-            for (cfg.edges.items) |edge| {
-                if (edge.to == bid) {
-                    try preds.append(allocator, edge.from);
-                }
-            }
-
-            // Skip entry block (no predecessors)
-            if (preds.items.len == 0) continue;
-
-            // For each variable checked in all predecessors, it's checked here too
-            // (unless this block re-assigns it)
-            var first_pred = true;
-            var intersection: std.StringHashMapUnmanaged(void) = .{};
-            defer intersection.deinit(allocator);
-
-            for (preds.items) |pred| {
-                if (first_pred) {
-                    // Start with first predecessor's set
-                    var iter = checked_per_block[pred].iterator();
-                    while (iter.next()) |entry| {
-                        try intersection.put(allocator, entry.key_ptr.*, {});
-                    }
-                    first_pred = false;
-                } else {
-                    // Intersect with other predecessors
-                    var to_remove = std.ArrayListUnmanaged([]const u8){};
-                    defer to_remove.deinit(allocator);
-                    var iter = intersection.iterator();
-                    while (iter.next()) |entry| {
-                        if (!checked_per_block[pred].contains(entry.key_ptr.*)) {
-                            try to_remove.append(allocator, entry.key_ptr.*);
-                        }
-                    }
-                    for (to_remove.items) |key| {
-                        _ = intersection.remove(key);
-                    }
-                }
-            }
-
-            // Add intersection to this block's checked set
-            var iter = intersection.iterator();
-            while (iter.next()) |entry| {
-                const gop = try checked_per_block[bid].getOrPut(allocator, entry.key_ptr.*);
-                if (!gop.found_existing) changed = true;
-            }
+        iters += 1;
+        for (0..num_blocks) |bid| {
+            if (try intersectPredChecks(
+                allocator, cfg, bid, checked,
+            )) changed = true;
         }
     }
 
-    // Phase 3: Check for unsafe unwraps where variable isn't null-checked
     for (cfg.blocks.items, 0..) |block, bid| {
-        if (block.start_line == 0 or block.start_line > block.end_line) continue;
-
-        for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < func_line) continue;
-            const idx = line_num - func_line;
+        if (block.start_line == 0 or
+            block.start_line > block.end_line) continue;
+        for (block.start_line..block.end_line + 1) |ln| {
+            if (ln < func_line) continue;
+            const idx = ln - func_line;
             if (idx >= lines.len) continue;
             const t = mem.trim(u8, lines[idx], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
-
-            // Check for .? unwrap
-            if (mem.indexOf(u8, t, ".?")) |col| {
-                // Skip if in safe context on this line
-                if (isInSafeContext(t)) continue;
-                if (!isUnsafeUnwrapUsage(t, col)) continue;
-
-                // Extract variable being unwrapped
-                if (extractUnwrappedVar(t, col)) |var_name| {
-                    // Skip if variable is null-checked on all paths to this point
-                    if (checked_per_block[bid].contains(var_name)) continue;
-
-                    // Skip if early return null guard on prior lines
-                    // Zig idiom: if (x == null) { return; } guarantees x is non-null after
-                    if (hasEarlyReturnNullGuard(lines, idx, var_name)) continue;
-
-                    try issues.append(allocator, .{
-                        .file = file_path,
-                        .line = line_num,
-                        .col = col + 1,
-                        .severity = .warning,
-                        .rule = RULE_OPTIONAL_UNWRAP_UNSAFE,
-                        .message = "optional unwrap (.?) may panic if null",
-                        .help = "use 'orelse' for safe unwrap, or check for null with 'if'",
-                    });
-                }
-            }
-
-            // Check for unsafe deref of optional pointer (maybe_/opt_ prefix)
-            if (mem.indexOf(u8, t, ".*")) |col| {
-                const before = t[0..col];
-                const has_maybe = mem.indexOf(u8, before, "maybe_") != null;
-                const has_opt = mem.indexOf(u8, before, "opt_") != null;
-                if (!has_maybe and !has_opt) continue;
-                if (isInSafeContext(t)) continue;
-
-                // Extract the variable name
-                if (extractDerefVar(t, col)) |var_name| {
-                    if (checked_per_block[bid].contains(var_name)) continue;
-
-                    try issues.append(allocator, .{
-                        .file = file_path,
-                        .line = line_num,
-                        .col = col + 1,
-                        .severity = .warning,
-                        .rule = RULE_ORELSE_QUESTION_UNSAFE,
-                        .message = "dereferencing optional pointer may panic if null",
-                        .help = "check for null before dereferencing, or use 'orelse'",
-                    });
-                }
-            }
+            try checkLineForUnsafeUnwrap(
+                allocator,
+                t,
+                ln,
+                idx,
+                lines,
+                file_path,
+                &checked[bid],
+                &issues,
+            );
         }
     }
-
     return issues;
 }
 
@@ -7650,8 +7807,9 @@ fn analyzeCFGErrors(
     is_in_test_context: bool,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
+    const is_test_ctx = mem.startsWith(u8, func_name, "test ") or
+        is_in_test_context;
 
-    // Analyze each block
     for (cfg.blocks.items) |block| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
 
@@ -7662,68 +7820,70 @@ fn analyzeCFGErrors(
 
             const t = mem.trim(u8, lines[idx], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
+            if (is_test_ctx) continue;
 
-            // ZA201: Silent catch {} is handled by the line-based analyzer
-            // (checkSilentCatchWithContext in checkLineErrors) to avoid duplicates.
-            // The line-based analyzer already handles defer context, best-effort ops, etc.
-
-            // ZA202: catch unreachable - skip in test context (intentional fail-fast)
-            // In production code, catch unreachable is dangerous. In tests, it's common.
-            // Test context: func name starts with "test " OR function is nested inside a test block
-            const is_test_ctx = mem.startsWith(u8, func_name, "test ") or is_in_test_context;
-            if (!is_test_ctx) {
-                if (mem.indexOf(u8, t, "catch unreachable")) |col| {
-                    if (!isInsideString(t, col)) {
-                        try issues.append(allocator, .{
-                            .file = file_path,
-                            .line = line_num,
-                            .col = col + 1,
-                            .severity = .warning,
-                            .rule = RULE_CATCH_UNREACHABLE,
-                            .message = "catch unreachable will panic on error",
-                            .help = "use explicit error handling",
-                        });
-                    }
-                }
+            if (checkCatchUnreachable(t, file_path, line_num)) |issue| {
+                try issues.append(allocator, issue);
             }
-
-            // ZA203: orelse unreachable - skip in test context
-            // Also skip if variable was null-checked earlier in scope
-            if (!is_test_ctx) {
-                if (mem.indexOf(u8, t, "orelse unreachable")) |col| {
-                    if (!isInsideString(t, col)) {
-                        // Extract var name before "orelse unreachable"
-                        const guarded = blk: {
-                            const vn = extractOrelseVar(t, col);
-                            if (vn) |name| {
-                                // Scan backward for null guard
-                                if (hasNullGuard(
-                                    lines,
-                                    idx,
-                                    func_line,
-                                    name,
-                                )) break :blk true;
-                            }
-                            break :blk false;
-                        };
-                        if (!guarded) {
-                            try issues.append(allocator, .{
-                                .file = file_path,
-                                .line = line_num,
-                                .col = col + 1,
-                                .severity = .warning,
-                                .rule = RULE_ORELSE_UNREACHABLE,
-                                .message = "orelse unreachable will panic",
-                                .help = "use explicit null handling",
-                            });
-                        }
-                    }
-                }
+            if (checkOrelseUnreachable(
+                t,
+                file_path,
+                line_num,
+                lines,
+                idx,
+                func_line,
+            )) |issue| {
+                try issues.append(allocator, issue);
             }
         }
     }
 
     return issues;
+}
+
+/// ZA202: catch unreachable will panic on error
+fn checkCatchUnreachable(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+) ?Issue {
+    const col = mem.indexOf(u8, t, "catch unreachable") orelse return null;
+    if (isInsideString(t, col)) return null;
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_CATCH_UNREACHABLE,
+        .message = "catch unreachable will panic on error",
+        .help = "use explicit error handling",
+    };
+}
+
+/// ZA203: orelse unreachable will panic on null
+fn checkOrelseUnreachable(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+    lines: []const []const u8,
+    idx: usize,
+    func_line: usize,
+) ?Issue {
+    const col = mem.indexOf(u8, t, "orelse unreachable") orelse return null;
+    if (isInsideString(t, col)) return null;
+
+    if (extractOrelseVar(t, col)) |name| {
+        if (hasNullGuard(lines, idx, func_line, name)) return null;
+    }
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_ORELSE_UNREACHABLE,
+        .message = "orelse unreachable will panic",
+        .help = "use explicit null handling",
+    };
 }
 
 /// Extract variable name before "orelse unreachable"
@@ -7900,6 +8060,348 @@ fn extractDerefVar(t: []const u8, dot_star_pos: usize) ?[]const u8 {
     return null;
 }
 
+/// Phase 1: Identify guard patterns in each CFG block
+/// Scan a range of lines for guard patterns, adding to the given map
+fn scanLinesForGuards(
+    allocator: Allocator,
+    lines: []const []const u8,
+    func_line: usize,
+    start: usize,
+    end: usize,
+    guards: *std.StringHashMapUnmanaged(void),
+) !void {
+    for (start..end + 1) |line_num| {
+        if (line_num < func_line) continue;
+        const idx = line_num - func_line;
+        if (idx >= lines.len) continue;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (extractGuardedVar(t)) |var_name| {
+            try guards.put(allocator, var_name, {});
+        }
+    }
+}
+
+fn collectBlockGuards(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    guarded_per_block: []std.StringHashMapUnmanaged(void),
+) !void {
+    for (cfg.blocks.items, 0..) |block, bid| {
+        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+        try scanLinesForGuards(
+            allocator,
+            lines,
+            func_line,
+            block.start_line,
+            block.end_line,
+            &guarded_per_block[bid],
+        );
+    }
+}
+
+/// Check if predecessor block has both true and false branch edges
+fn hasBothBranches(cfg: *ControlFlowGraph, pred: usize) bool {
+    var has_true: bool = false;
+    var has_false: bool = false;
+    for (cfg.edges.items) |e| {
+        if (e.from == pred) {
+            if (e.kind == .branch_true) has_true = true;
+            if (e.kind == .branch_false) has_false = true;
+        }
+    }
+    return has_true and has_false;
+}
+
+const PredInfo = struct { block: usize, via_true_branch: bool };
+
+/// Intersect first predecessor's guards into the intersection set
+fn initIntersectionFromPred(
+    allocator: Allocator,
+    intersection: *std.StringHashMapUnmanaged(void),
+    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    pred_info: PredInfo,
+    pred_has_both: bool,
+) !void {
+    var iter = guarded_per_block[pred_info.block].iterator();
+    while (iter.next()) |entry| {
+        if (pred_has_both and !pred_info.via_true_branch) continue;
+        try intersection.put(allocator, entry.key_ptr.*, {});
+    }
+}
+
+/// Remove guards from intersection not in a subsequent predecessor
+fn narrowIntersection(
+    allocator: Allocator,
+    intersection: *std.StringHashMapUnmanaged(void),
+    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    pred_info: PredInfo,
+    pred_has_both: bool,
+) !void {
+    var to_remove = std.ArrayListUnmanaged([]const u8){};
+    defer to_remove.deinit(allocator);
+    var iter = intersection.iterator();
+    while (iter.next()) |entry| {
+        var has = guarded_per_block[pred_info.block].contains(entry.key_ptr.*);
+        if (pred_has_both and !pred_info.via_true_branch) has = false;
+        if (!has) try to_remove.append(allocator, entry.key_ptr.*);
+    }
+    for (to_remove.items) |key| _ = intersection.remove(key);
+}
+
+/// Collect predecessor block info for a given block ID
+fn collectPredecessors(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    bid: usize,
+) !std.ArrayListUnmanaged(PredInfo) {
+    var preds = std.ArrayListUnmanaged(PredInfo){};
+    for (cfg.edges.items) |edge| {
+        if (edge.to == bid) {
+            try preds.append(allocator, .{
+                .block = edge.from,
+                .via_true_branch = edge.kind == .branch_true,
+            });
+        }
+    }
+    return preds;
+}
+
+/// Compute guard intersection from all predecessors of a block
+fn computePredIntersection(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    preds: []const PredInfo,
+) !std.StringHashMapUnmanaged(void) {
+    var intersection: std.StringHashMapUnmanaged(void) = .{};
+    for (preds, 0..) |pi, i| {
+        const both = hasBothBranches(cfg, pi.block);
+        if (i == 0) {
+            try initIntersectionFromPred(
+                allocator,
+                &intersection,
+                guarded_per_block,
+                pi,
+                both,
+            );
+        } else {
+            try narrowIntersection(
+                allocator,
+                &intersection,
+                guarded_per_block,
+                pi,
+                both,
+            );
+        }
+    }
+    return intersection;
+}
+
+/// Merge intersection into a block's guard set, returning true if changed
+fn mergeIntoBlock(
+    allocator: Allocator,
+    intersection: *std.StringHashMapUnmanaged(void),
+    block_guards: *std.StringHashMapUnmanaged(void),
+) !bool {
+    var any_new = false;
+    var iter = intersection.iterator();
+    while (iter.next()) |entry| {
+        const gop = try block_guards.getOrPut(allocator, entry.key_ptr.*);
+        if (!gop.found_existing) any_new = true;
+    }
+    return any_new;
+}
+
+/// Phase 2: Propagate guard state through CFG (forward dataflow)
+fn propagateGuardsThroughCFG(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    guarded_per_block: []std.StringHashMapUnmanaged(void),
+) !void {
+    var changed = true;
+    var iterations: usize = 0;
+    while (changed and iterations < 100) {
+        changed = false;
+        iterations += 1;
+        for (cfg.blocks.items, 0..) |_, bid| {
+            var preds = try collectPredecessors(allocator, cfg, bid);
+            defer preds.deinit(allocator);
+            if (preds.items.len == 0) continue;
+
+            var intersection = try computePredIntersection(
+                allocator,
+                cfg,
+                guarded_per_block,
+                preds.items,
+            );
+            defer intersection.deinit(allocator);
+
+            if (try mergeIntoBlock(
+                allocator,
+                &intersection,
+                &guarded_per_block[bid],
+            )) changed = true;
+        }
+    }
+}
+
+/// Check if a decrement is guarded by various patterns
+fn isDecrementGuarded(
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    var_name: []const u8,
+    guarded: *const std.StringHashMapUnmanaged(void),
+) bool {
+    if (guarded.contains(var_name)) return true;
+    if (hasGuardOnLine(t, var_name)) return true;
+    if (hasBreakGuardOnPriorLines(lines, idx, var_name)) return true;
+    if (isSignedVarInContext(lines, idx, var_name)) return true;
+    if (hasPairedIncrementInLines(lines[0..idx], var_name)) return true;
+    if (isInComptimeBlock(lines, idx)) return true;
+    if (hasAssertGeGuard(lines, idx, var_name)) return true;
+    if (hasEnclosingVarGuard(lines, idx, var_name)) return true;
+    if (hasElseBranchGuard(lines, idx)) return true;
+    return false;
+}
+
+/// Check if array base.len is guarded via CFG
+fn isArrayLenCFGGuarded(
+    t: []const u8,
+    guarded: *const std.StringHashMapUnmanaged(void),
+) bool {
+    const base = extractArrayBaseFromIndexArithmetic(t) orelse return false;
+    var buf: [128]u8 = undefined;
+    if (base.len + 4 > buf.len) return false;
+    @memcpy(buf[0..base.len], base);
+    @memcpy(buf[base.len..][0..4], ".len");
+    return guarded.contains(buf[0 .. base.len + 4]);
+}
+
+/// Check if array index arithmetic is guarded by various patterns
+fn isArrayIndexGuarded(
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    guarded: *const std.StringHashMapUnmanaged(void),
+) bool {
+    if (mem.indexOf(u8, t, "-|") != null) return true;
+    if (hasIndexGuardOnLine(t)) return true;
+    if (hasShortCircuitGuardOnPriorLines(lines, idx)) return true;
+    if (isArrayLenCFGGuarded(t, guarded)) return true;
+    if (hasEndsWithStartsWithGuard(lines, idx)) return true;
+    if (hasElseBranchGuard(lines, idx)) return true;
+    if (isInComptimeBlock(lines, idx)) return true;
+    if (hasEarlyReturnLengthGuard(lines, idx, t)) return true;
+    if (hasLoopInitGuard(lines, idx, t)) return true;
+    if (hasEnclosingBlockGuard(lines, idx, t)) return true;
+    return false;
+}
+
+/// ZA901: Check for unguarded decrement on a single line
+fn checkDecrementOverflow(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    line_num: usize,
+    file_path: []const u8,
+    guarded: *const std.StringHashMapUnmanaged(void),
+    reported: *std.AutoHashMap(usize, void),
+) !void {
+    const col = mem.indexOf(u8, t, "-= 1") orelse return;
+    if (isInsideString(t, col)) return;
+    const var_name = extractDecrementVar(t, col) orelse return;
+    if (isDecrementGuarded(t, lines, idx, var_name, guarded)) return;
+    try issues.append(allocator, .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_DECREMENT_WITHOUT_CHECK,
+        .message = "decrement without overflow guard may panic",
+        .help = "add guard (if/while/assert x > 0) " ++
+            "or use saturating arithmetic (-|)",
+    });
+    try reported.put(line_num, {});
+}
+
+/// ZA903: Check for unguarded array index arithmetic
+fn checkArrayIndexOverflow(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    line_num: usize,
+    file_path: []const u8,
+    guarded: *const std.StringHashMapUnmanaged(void),
+    reported: *std.AutoHashMap(usize, void),
+) !void {
+    const col = hasArrayIndexSubtraction(t) orelse return;
+    if (isInsideString(t, col)) return;
+    if (isArrayIndexGuarded(t, lines, idx, guarded)) return;
+    try issues.append(allocator, .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_INDEX_ARITHMETIC,
+        .message = "arithmetic in array index may overflow",
+        .help = "ensure index arithmetic cannot underflow" ++
+            ", or use saturating subtraction -|",
+    });
+    try reported.put(line_num, {});
+}
+
+/// Phase 3: Check for unguarded panic patterns in a single block
+fn checkPanicPatternsInBlock(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    block_start: usize,
+    block_end: usize,
+    guarded: *const std.StringHashMapUnmanaged(void),
+    reported: *std.AutoHashMap(usize, void),
+) !void {
+    for (block_start..block_end + 1) |line_num| {
+        if (line_num < func_line or reported.contains(line_num)) continue;
+        const idx = line_num - func_line;
+        if (idx >= lines.len) continue;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (mem.indexOf(u8, t, "testing.expect") != null) continue;
+        try checkDecrementOverflow(
+            allocator,
+            issues,
+            t,
+            lines,
+            idx,
+            line_num,
+            file_path,
+            guarded,
+            reported,
+        );
+        try checkArrayIndexOverflow(
+            allocator,
+            issues,
+            t,
+            lines,
+            idx,
+            line_num,
+            file_path,
+            guarded,
+            reported,
+        );
+    }
+}
+
 /// CFG-based panic/overflow pattern analysis (ZA901/ZA902/ZA903)
 /// Uses control flow graph to track guards across paths
 fn analyzeCFGPanicPatterns(
@@ -7914,245 +8416,35 @@ fn analyzeCFGPanicPatterns(
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    // Track guarded variables per block (variables with overflow guard)
-    var guarded_per_block = try allocator.alloc(std.StringHashMapUnmanaged(void), num_blocks);
+    var guarded_per_block = try allocator.alloc(
+        std.StringHashMapUnmanaged(void),
+        num_blocks,
+    );
     defer {
-        for (guarded_per_block) |*map| map.deinit(allocator);
+        for (guarded_per_block) |*m| m.deinit(allocator);
         allocator.free(guarded_per_block);
     }
-    for (guarded_per_block) |*map| map.* = .{};
+    for (guarded_per_block) |*m| m.* = .{};
 
-    // Phase 1: Identify guards in each block
-    for (cfg.blocks.items, 0..) |block, bid| {
-        if (block.start_line == 0 or block.start_line > block.end_line) continue;
+    try collectBlockGuards(allocator, cfg, lines, func_line, guarded_per_block);
+    try propagateGuardsThroughCFG(allocator, cfg, guarded_per_block);
 
-        for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < func_line) continue;
-            const idx = line_num - func_line;
-            if (idx >= lines.len) continue;
-            const t = mem.trim(u8, lines[idx], " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-
-            // Detect guard patterns and extract variable names
-            if (extractGuardedVar(t)) |var_name| {
-                try guarded_per_block[bid].put(allocator, var_name, {});
-            }
-        }
-    }
-
-    // Phase 2: Propagate guard state through CFG (forward dataflow)
-    // Key insight: Guards in conditional blocks only apply to the `then` branch
-    var changed = true;
-    var iterations: usize = 0;
-    while (changed and iterations < 100) {
-        changed = false;
-        iterations += 1;
-
-        for (cfg.blocks.items, 0..) |_, bid| {
-            // Collect predecessors with their edge types
-            const PredInfo = struct { block: usize, via_true_branch: bool };
-            var preds = std.ArrayListUnmanaged(PredInfo){};
-            defer preds.deinit(allocator);
-            for (cfg.edges.items) |edge| {
-                if (edge.to == bid) {
-                    try preds.append(allocator, .{
-                        .block = edge.from,
-                        .via_true_branch = edge.kind == .branch_true,
-                    });
-                }
-            }
-
-            if (preds.items.len == 0) continue;
-
-            var first_pred = true;
-            var intersection: std.StringHashMapUnmanaged(void) = .{};
-            defer intersection.deinit(allocator);
-
-            for (preds.items) |pred_info| {
-                const pred = pred_info.block;
-
-                // Check if predecessor is a conditional (has both true and false edges)
-                const pred_has_both_branches = blk: {
-                    var has_true: bool = false;
-                    var has_false: bool = false;
-                    for (cfg.edges.items) |e| {
-                        if (e.from == pred) {
-                            if (e.kind == .branch_true) has_true = true;
-                            if (e.kind == .branch_false) has_false = true;
-                        }
-                    }
-                    break :blk has_true and has_false;
-                };
-
-                if (first_pred) {
-                    var iter = guarded_per_block[pred].iterator();
-                    while (iter.next()) |entry| {
-                        // If coming from conditional via false branch, don't inherit guards
-                        // because guards in conditions only apply to true branch
-                        if (pred_has_both_branches and !pred_info.via_true_branch) continue;
-                        try intersection.put(allocator, entry.key_ptr.*, {});
-                    }
-                    first_pred = false;
-                } else {
-                    var to_remove = std.ArrayListUnmanaged([]const u8){};
-                    defer to_remove.deinit(allocator);
-                    var iter = intersection.iterator();
-                    while (iter.next()) |entry| {
-                        // Check if this guard should come from this predecessor
-                        var should_have_guard = guarded_per_block[pred].contains(entry.key_ptr.*);
-                        // If coming via false branch from conditional, pred doesn't provide guard
-                        if (pred_has_both_branches and !pred_info.via_true_branch) {
-                            should_have_guard = false;
-                        }
-                        if (!should_have_guard) {
-                            try to_remove.append(allocator, entry.key_ptr.*);
-                        }
-                    }
-                    for (to_remove.items) |key| {
-                        _ = intersection.remove(key);
-                    }
-                }
-            }
-
-            var iter = intersection.iterator();
-            while (iter.next()) |entry| {
-                const gop = try guarded_per_block[bid].getOrPut(allocator, entry.key_ptr.*);
-                if (!gop.found_existing) changed = true;
-            }
-        }
-    }
-
-    // Phase 3: Check for unguarded decrements and subtractions
-    // Track reported lines to avoid duplicates from overlapping CFG blocks
     var reported_lines = std.AutoHashMap(usize, void).init(allocator);
     defer reported_lines.deinit();
 
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
-
-        for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < func_line) continue;
-            if (reported_lines.contains(line_num)) continue;
-            const idx = line_num - func_line;
-            if (idx >= lines.len) continue;
-            const t = mem.trim(u8, lines[idx], " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-
-            // Skip test blocks
-            if (mem.indexOf(u8, t, "testing.expect") != null) continue;
-
-            // Check for decrement (-= 1) without guard
-            if (mem.indexOf(u8, t, "-= 1")) |col| {
-                if (isInsideString(t, col)) continue;
-
-                if (extractDecrementVar(t, col)) |var_name| {
-                    // Skip if guarded on all paths
-                    if (guarded_per_block[bid].contains(var_name)) continue;
-
-                    // Skip if guard on same line
-                    if (hasGuardOnLine(t, var_name)) continue;
-
-                    // Skip if guard on prior lines (if (x == 0) break; pattern)
-                    if (hasBreakGuardOnPriorLines(lines, idx, var_name)) continue;
-
-                    // Skip signed types (can go negative)
-                    if (isSignedVarInContext(lines, idx, var_name)) continue;
-
-                    // Skip if there's a paired increment
-                    if (hasPairedIncrementInLines(lines[0..idx], var_name)) continue;
-
-                    // Skip if in comptime block
-                    if (isInComptimeBlock(lines, idx)) continue;
-
-                    // Skip if assert(var >= N) on prior lines
-                    if (hasAssertGeGuard(lines, idx, var_name)) continue;
-
-                    // Skip if inside enclosing if/while (var > 0) block
-                    if (hasEnclosingVarGuard(lines, idx, var_name)) continue;
-
-                    // Skip if in else branch of if (var == 0) / if (var < N)
-                    if (hasElseBranchGuard(lines, idx)) continue;
-
-                    try issues.append(allocator, .{
-                        .file = file_path,
-                        .line = line_num,
-                        .col = col + 1,
-                        .severity = .warning,
-                        .rule = RULE_DECREMENT_WITHOUT_CHECK,
-                        .message = "decrement without overflow guard may panic",
-                        .help = "add guard (if/while/assert x > 0) " ++
-                            "or use saturating arithmetic (-|)",
-                    });
-                    try reported_lines.put(line_num, {});
-                }
-            }
-
-            // Check for array index arithmetic
-            if (hasArrayIndexSubtraction(t)) |col| {
-                if (isInsideString(t, col)) continue;
-
-                // Skip if saturating subtraction
-                if (mem.indexOf(u8, t, "-|") != null) continue;
-
-                // Skip if guard pattern on same line
-                if (hasIndexGuardOnLine(t)) continue;
-
-                // Skip if short-circuit guard on prior lines (multi-line expressions)
-                if (hasShortCircuitGuardOnPriorLines(lines, idx)) continue;
-
-                // Skip if the array's .len is guarded via CFG
-                // Pattern: x[x.len - N] is safe if x.len is guarded
-                if (extractArrayBaseFromIndexArithmetic(t)) |base| {
-                    // Check if {base}.len is guarded
-                    var buf: [128]u8 = undefined;
-                    if (base.len + 4 <= buf.len) {
-                        @memcpy(buf[0..base.len], base);
-                        @memcpy(buf[base.len..][0..4], ".len");
-                        const len_var = buf[0 .. base.len + 4];
-                        if (guarded_per_block[bid].contains(len_var)) continue;
-                    }
-                }
-
-                // Skip if endsWith/startsWith guard on prior lines
-                // Zig semantics: mem.endsWith(s, suffix) implies s.len >= suffix.len
-                // Pattern: assert(mem.endsWith(var, "X")) then var.len - "X".len
-                if (hasEndsWithStartsWithGuard(lines, idx)) continue;
-
-                // Skip if in else/else-if branch with inverted guard
-                // Pattern: if (x.len < 4) { ... } else { x[x.len - x.len/4] } - safe
-                // Pattern: if (x <= 30) { ... } else if (x <= 120)
-                //   { arr[divFloor(x,10) - 1] } - safe
-                if (hasElseBranchGuard(lines, idx)) continue;
-
-                // Skip if in comptime block (compiler catches overflow at compile time)
-                if (isInComptimeBlock(lines, idx)) continue;
-
-                // Skip if early-return guard protects length
-                // Pattern: if (x.len < N) return; ... arr[x.len - M] where M < N
-                if (hasEarlyReturnLengthGuard(lines, idx, t)) continue;
-
-                // Skip if loop init guarantees minimum value
-                // Pattern: var i: T = N; while (...) { arr[i - K] } where N >= K
-                if (hasLoopInitGuard(lines, idx, t)) continue;
-
-                // Skip if inside an enclosing block guarded by if/while (var > 0)
-                // Pattern: if (x > 0) { ... arr[x - 1] ... }
-                // Pattern: while (cols_len > 0) { ... cells[cols_len - 1] ... }
-                if (hasEnclosingBlockGuard(lines, idx, t)) continue;
-
-                try issues.append(allocator, .{
-                    .file = file_path,
-                    .line = line_num,
-                    .col = col + 1,
-                    .severity = .warning,
-                    .rule = RULE_INDEX_ARITHMETIC,
-                    .message = "arithmetic in array index may overflow",
-                    .help = "ensure index arithmetic cannot underflow" ++
-                        ", or use saturating subtraction -|",
-                });
-                try reported_lines.put(line_num, {});
-            }
-        }
+        try checkPanicPatternsInBlock(
+            allocator,
+            &issues,
+            lines,
+            func_line,
+            file_path,
+            block.start_line,
+            block.end_line,
+            &guarded_per_block[bid],
+            &reported_lines,
+        );
     }
 
     return issues;

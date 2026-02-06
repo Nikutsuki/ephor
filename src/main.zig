@@ -3863,6 +3863,60 @@ fn isOwnershipTransferCall(t: []const u8, alloc_name: []const u8) bool {
     return false;
 }
 
+/// Detect function argument ownership transfer
+/// Catches: someFunc(alloc_name, ...) or someFunc(..., alloc_name) or someFunc(alloc_name)
+/// Excludes: alloc_name.method() and alloc_name[...] and simple comparisons
+fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
+    // Find alloc_name that appears inside parentheses as a function argument
+    var search_start: usize = 0;
+    while (mem.indexOf(u8, t[search_start..], alloc_name)) |rel_pos| {
+        const pos = search_start + rel_pos;
+        search_start = pos + alloc_name.len;
+
+        // Verify it's a whole word (not part of longer identifier)
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + alloc_name.len < t.len and isIdent(t[pos + alloc_name.len])) continue;
+
+        // Check if it's inside a function call's parentheses
+        // Walk backwards from pos to find a ( that has a function name before it
+        var depth: usize = 0;
+        var i = pos;
+        while (i > 0) {
+            i -= 1;
+            if (t[i] == ')') {
+                depth += 1;
+            } else if (t[i] == '(') {
+                if (depth > 0) {
+                    depth -= 1;
+                } else {
+                    // Found the opening paren - check if there's a function name before it
+                    if (i == 0) break;
+                    var name_end = i;
+                    // Skip whitespace
+                    while (name_end > 0 and t[name_end - 1] == ' ') name_end -= 1;
+                    if (name_end == 0) break;
+                    // Check for function/method name character
+                    if (isIdent(t[name_end - 1])) {
+                        // Skip: if the function IS the alloc_name itself (alloc_name.method() pattern)
+                        // or if this is the allocation itself (try allocator.alloc(T, size))
+                        var fname_start = name_end - 1;
+                        while (fname_start > 0 and isIdent(t[fname_start - 1])) fname_start -= 1;
+                        const fname = t[fname_start..name_end];
+                        // Don't count if function name IS the allocation
+                        if (mem.eql(u8, fname, "alloc") or mem.eql(u8, fname, "create") or
+                            mem.eql(u8, fname, "dupe") or mem.eql(u8, fname, "realloc"))
+                            break;
+                        // This is a function call with alloc_name as argument
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 /// Detect module-level variable assignment (singleton/global pattern)
 /// Pattern: identifier = alloc_name (no const/var keyword, no self./ctx. prefix)
 fn isModuleLevelAssignment(t: []const u8, alloc_name: []const u8) bool {
@@ -5912,6 +5966,7 @@ const CFGState = struct {
     brace_depth: usize = 0,
     in_func: bool = false,
     fn_returns_error: bool = false,
+    fn_is_noreturn: bool = false,
     // Test block context tracking
     in_test_block: bool = false,
     test_brace_depth: usize = 0,
@@ -5955,6 +6010,9 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
         mem.indexOf(u8, t, "!*") != null or
         mem.indexOf(u8, t, "![") != null;
 
+    // Detect noreturn functions - memory leaks don't matter in noreturn
+    state.fn_is_noreturn = mem.indexOf(u8, t, "noreturn") != null;
+
     return was_in_func; // True if we interrupted another function
 }
 
@@ -5979,14 +6037,18 @@ fn processFunction(
     func_lines_items: []const []const u8,
     fn_returns_error: bool,
     is_in_test_context: bool,
+    fn_is_noreturn: bool,
 ) !void {
-    // Run memory analysis
-    var func_issues = try analyzeFunction(
-        allocator,
-        file_path,
-        func_start,
-        func_lines_items,
-    );
+    // Run memory analysis (skip for noreturn functions - leaks don't matter)
+    var func_issues = if (fn_is_noreturn)
+        std.ArrayListUnmanaged(Issue){}
+    else
+        try analyzeFunction(
+            allocator,
+            file_path,
+            func_start,
+            func_lines_items,
+        );
     defer func_issues.deinit(allocator);
     try issues.appendSlice(allocator, func_issues.items);
 
@@ -6150,7 +6212,7 @@ fn analyzeCFGFile(
                     // Process the previous (outer) function before starting the nested one
                     // Skip if it's too short (likely just a type-returning stub)
                     if (func_lines.items.len >= 3) {
-                        try processFunction(allocator, issues, file_path, prev_func_name, prev_func_start, func_lines.items, false, prev_func_in_test);
+                        try processFunction(allocator, issues, file_path, prev_func_name, prev_func_start, func_lines.items, false, prev_func_in_test, false);
                     }
                     func_lines.clearRetainingCapacity();
                 }
@@ -6177,6 +6239,7 @@ fn analyzeCFGFile(
             func_lines.items,
             state.fn_returns_error,
             is_in_test,
+            state.fn_is_noreturn,
         );
 
         state.in_func = false;
@@ -6320,6 +6383,8 @@ fn detectAllocOnLine(
     allocator: Allocator,
 ) !void {
     const alloc_call = findAllocCall(t) orelse return;
+    // Skip alloc() catch null - makes result optional, cleanup handled differently
+    if (mem.indexOf(u8, t, "catch null") != null) return;
     const aname = extractAllocatorName(t) orelse "";
     const has_no_err = mem.indexOf(u8, t, "catch unreachable") != null or
         mem.indexOf(u8, t, "catch return") != null or
@@ -6428,6 +6493,7 @@ const ReturnStoreState = struct {
     in_return: bool = false,
     in_self_assign: bool = false,
     brace_depth: usize = 0,
+    paren_depth: usize = 0,
 };
 
 /// Track if line starts a multi-line return or self assignment
@@ -6436,6 +6502,7 @@ fn updateReturnStoreState(t: []const u8, state: *ReturnStoreState) void {
     if (mem.startsWith(u8, t, "return ")) {
         state.in_return = true;
         state.brace_depth = 0;
+        state.paren_depth = 0;
     }
 
     // Start tracking self.field = .{} assignments
@@ -6446,23 +6513,26 @@ fn updateReturnStoreState(t: []const u8, state: *ReturnStoreState) void {
         {
             state.in_self_assign = true;
             state.brace_depth = 0;
+            state.paren_depth = 0;
         }
     }
 
-    // Track brace depth for multi-line constructs
+    // Track brace and paren depth for multi-line constructs
     if (state.in_return or state.in_self_assign) {
         for (t) |c| {
             if (c == '{') state.brace_depth += 1;
+            if (c == '(') state.paren_depth += 1;
+            if (c == ')') {
+                if (state.paren_depth > 0) state.paren_depth -= 1;
+            }
             if (c == '}') {
                 if (state.brace_depth > 0) state.brace_depth -= 1;
-                if (state.brace_depth == 0) {
-                    state.in_return = false;
-                    state.in_self_assign = false;
-                }
             }
         }
-        // Single-line without braces
-        if (state.brace_depth == 0 and mem.indexOf(u8, t, ";") != null) {
+        // End multi-line construct when all delimiters are balanced and line ends with ;
+        if (state.brace_depth == 0 and state.paren_depth == 0 and
+            mem.indexOf(u8, t, ";") != null)
+        {
             state.in_return = false;
             state.in_self_assign = false;
         }
@@ -6884,15 +6954,24 @@ fn analyzeFunction(
 
                 // Ownership transfer via method call: .put(alias), .append(alias), etc.
                 const transfer_methods = [_][]const u8{
-                    ".put(",    ".putNoClobber(", ".append(",    ".appendSlice(",
-                    ".insert(", ".add(",          ".push(",      ".enqueue(",
-                    ".submit(", ".toJS(",         ".toValue(",   ".toSlice(",
-                    ".toOwnedSlice(",
+                    ".put(",          ".putNoClobber(", ".append(",       ".appendSlice(",
+                    ".insert(",       ".add(",          ".push(",         ".enqueue(",
+                    ".submit(",       ".toJS(",         ".toValue(",      ".toSlice(",
+                    ".toOwnedSlice(", ".dependOn(",     ".setText(",      ".clone(",
+                    ".addText(",      ".strHash(",
                 };
                 for (transfer_methods) |method| {
                     if (mem.indexOf(u8, t, method) != null) {
                         allocs.items[ai].ownership_transferred = true;
                         break;
+                    }
+                }
+
+                // Function argument ownership transfer: someFunc(alloc_name, ...) or someFunc(alloc_name)
+                // This catches cases where allocation is passed as argument to any function
+                if (!allocs.items[ai].ownership_transferred) {
+                    if (isFunctionArgTransfer(t, alias)) {
+                        allocs.items[ai].ownership_transferred = true;
                     }
                 }
             }

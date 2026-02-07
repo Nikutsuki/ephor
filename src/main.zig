@@ -1245,6 +1245,7 @@ fn collectUndefinedVars(
 
         const col = mem.indexOf(u8, t, "= undefined") orelse continue;
         if (!isCompleteUndefinedToken(t, col)) continue;
+        if (isInsideString(t, col)) continue;
         if (isStructFieldUndefined(t, col)) continue;
 
         const name = extractVarDeclName(t) orelse continue;
@@ -1449,9 +1450,431 @@ fn checkVarDefiniteAssignment(
         const bid = findBlockForLine(cfg, al) orelse continue;
         if (def_entry[bid] or gen[bid]) continue;
         if (!hasVarRead(t, var_name)) continue;
+        // Check if the read is inside a correlated guard: the same if-condition
+        // that gates the read also gates an earlier assignment of the variable.
+        if (isCorrelatedGuardRead(lines, idx, var_name)) continue;
+        // Check if the read is inside a null-guard on a variable that is only
+        // set non-null in blocks that also assign the flagged variable.
+        if (isNullGuardCorrelatedRead(lines, idx, var_name)) continue;
+        // Check if all paths that don't assign the variable have early returns.
+        // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
+        if (hasEarlyReturnOnUnassignedPaths(lines, var_name, idx)) continue;
         try issues.put(var_name, al);
         break;
     }
+}
+
+/// Check if a variable read at `read_idx` is inside an if-block whose condition
+/// also guards an earlier assignment to the same variable.
+/// Pattern: if (cond) { x = val; } ... if (cond) { use(x); }
+/// Also handles: for (...) { if (cond) { x = val; } } if (guard) |_| { use(x); }
+/// where `guard` is a correlated variable assigned together with `x`.
+fn isCorrelatedGuardRead(
+    lines: []const []const u8,
+    read_idx: usize,
+    var_name: []const u8,
+) bool {
+    const guard_cond = findEnclosingIfCondition(lines, read_idx) orelse return false;
+
+    for (0..read_idx) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!hasIfCondition(t, guard_cond)) continue;
+        if (blockContainsAssignment(lines, i + 1, read_idx, var_name)) return true;
+    }
+    return false;
+}
+
+/// Check if a brace-delimited block starting at `start` contains an assignment
+/// to `var_name`. Stops at `limit` or when the block closes.
+fn blockContainsAssignment(
+    lines: []const []const u8,
+    start: usize,
+    limit: usize,
+    var_name: []const u8,
+) bool {
+    var block_depth: usize = 1;
+    var j = start;
+    while (j < limit and block_depth > 0) : (j += 1) {
+        const inner = mem.trim(u8, lines[j], " \t\r");
+        block_depth = computeBraceDepth(inner, block_depth);
+        if (mem.indexOf(u8, inner, var_name)) |vpos| {
+            if (isAssignmentTarget(inner, var_name, vpos)) return true;
+        }
+    }
+    return false;
+}
+
+/// Compute brace depth for a line given initial depth, returning new depth.
+fn computeBraceDepth(t: []const u8, initial: usize) usize {
+    var depth = initial;
+    for (t) |c| {
+        if (c == '{') depth += 1;
+        if (c == '}' and depth > 0) depth -= 1;
+    }
+    return depth;
+}
+
+/// Check if a variable read is inside a null-guard block for a correlated variable.
+/// Pattern:
+///   var guard: ?T = null;
+///   var x = undefined;
+///   ... if (cond) { guard = val; x = val2; } ...
+///   if (guard) |_| { use(x); }
+///
+/// The variable `x` is safe to read because `guard` is only non-null when `x`
+/// was also assigned in the same block.
+fn isNullGuardCorrelatedRead(
+    lines: []const []const u8,
+    read_idx: usize,
+    var_name: []const u8,
+) bool {
+    const guard_cond = findEnclosingIfCondition(lines, read_idx) orelse return false;
+    if (!isNullInitializedVar(lines, guard_cond)) return false;
+    return allGuardAssignsCorrelate(lines, read_idx, guard_cond, var_name);
+}
+
+/// Check if a variable is declared as `var name ... = null` anywhere in the lines.
+fn isNullInitializedVar(lines: []const []const u8, name: []const u8) bool {
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!mem.startsWith(u8, t, "var ")) continue;
+        const after_var = t[4..];
+        if (!mem.startsWith(u8, after_var, name)) continue;
+        if (after_var.len > name.len and isIdent(after_var[name.len])) continue;
+        if (mem.indexOf(u8, t, "= null") != null) return true;
+    }
+    return false;
+}
+
+/// Check that every non-null assignment to the guard also assigns the variable.
+fn allGuardAssignsCorrelate(
+    lines: []const []const u8,
+    limit: usize,
+    guard: []const u8,
+    var_name: []const u8,
+) bool {
+    for (0..limit) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!isGuardAssignment(t, guard)) continue;
+        if (mem.indexOf(u8, t, "= null") != null) continue;
+        if (!isVarAssignedNearby(lines, i, var_name, 10)) return false;
+    }
+    return true;
+}
+
+/// Check if a line assigns to the guard variable (word-boundary aware).
+fn isGuardAssignment(t: []const u8, guard: []const u8) bool {
+    const gpos = mem.indexOf(u8, t, guard) orelse return false;
+    if (gpos > 0 and isIdent(t[gpos - 1])) return false;
+    if (gpos + guard.len < t.len and isIdent(t[gpos + guard.len])) return false;
+    if (gpos > 0 and t[gpos - 1] == '.') return false;
+    return isAssignmentTarget(t, guard, gpos);
+}
+
+/// Check if a variable is assigned within `radius` lines of `center_idx`.
+fn isVarAssignedNearby(
+    lines: []const []const u8,
+    center_idx: usize,
+    var_name: []const u8,
+    radius: usize,
+) bool {
+    const start = if (center_idx > radius) center_idx - radius else 0;
+    const end = @min(center_idx + radius, lines.len);
+    for (start..end) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (mem.indexOf(u8, t, var_name)) |vpos| {
+            if (vpos > 0 and isIdent(t[vpos - 1])) continue;
+            if (vpos + var_name.len < t.len and isIdent(t[vpos + var_name.len])) continue;
+            if (isAssignmentTarget(t, var_name, vpos)) return true;
+        }
+    }
+    return false;
+}
+
+/// Extract the condition from an enclosing if-statement by walking backwards.
+/// Returns the condition string (e.g., "big" from "if (big) {") or null.
+fn findEnclosingIfCondition(
+    lines: []const []const u8,
+    read_idx: usize,
+) ?[]const u8 {
+    // Walk backwards to find the nearest enclosing if
+    var depth: usize = 0;
+    var i = read_idx;
+    while (i > 0) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+
+        // Count braces backwards: } increases depth, { decreases
+        for (t) |c| {
+            if (c == '}') depth += 1;
+            if (c == '{' and depth > 0) depth -= 1;
+        }
+
+        // At depth 0, look for if-statement
+        if (depth == 0) {
+            if (extractIfCondition(t)) |cond| return cond;
+        }
+    }
+    return null;
+}
+
+/// Extract the condition text from an if-statement line.
+/// "if (big) {" -> "big", "if (minWindow) |other| {" -> "minWindow"
+fn extractIfCondition(t: []const u8) ?[]const u8 {
+    // Must start with "if " or "} else if " or "if("
+    var rest: []const u8 = undefined;
+    if (mem.startsWith(u8, t, "if ") or mem.startsWith(u8, t, "if(")) {
+        rest = t[2..];
+    } else if (mem.startsWith(u8, t, "} else if ") or mem.startsWith(u8, t, "} else if(")) {
+        rest = t[9..];
+    } else {
+        return null;
+    }
+    rest = mem.trimLeft(u8, rest, " \t");
+    if (rest.len == 0 or rest[0] != '(') return null;
+    // Find matching close paren
+    var paren_depth: usize = 0;
+    for (rest, 0..) |c, ci| {
+        if (c == '(') paren_depth += 1;
+        if (c == ')') {
+            paren_depth -= 1;
+            if (paren_depth == 0) {
+                return mem.trim(u8, rest[1..ci], " \t");
+            }
+        }
+    }
+    return null;
+}
+
+/// Check if a line contains an if-statement with the given condition.
+fn hasIfCondition(t: []const u8, cond: []const u8) bool {
+    const line_cond = extractIfCondition(t) orelse return false;
+    return mem.eql(u8, line_cond, cond);
+}
+
+/// Check if all code paths that don't assign `var_name` before `read_idx`
+/// contain an early return/break/continue, making the variable definitely assigned
+/// at the read point.
+///
+/// Scans forward through the function lines to find if/else-if/else chains.
+/// For each complete chain (must have else or else-if ending), checks whether
+/// every branch either assigns the variable or exits.
+///
+/// Pattern: if (A) { x = 1; } else if (B) { x = 2; } else { return; }
+fn hasEarlyReturnOnUnassignedPaths(
+    lines: []const []const u8,
+    var_name: []const u8,
+    read_idx: usize,
+) bool {
+    // Forward scan: find if/else chains and check branch properties
+    var i: usize = 0;
+    while (i < read_idx) {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) {
+            i += 1;
+            continue;
+        }
+
+        // Look for if-start at the current nesting level
+        if (!isIfStart(t)) {
+            i += 1;
+            continue;
+        }
+
+        // Found an if-start. Collect all branches of this if/else chain.
+        if (checkIfElseChainComplete(lines, i, read_idx, var_name))
+            return true;
+
+        // Skip past this if block to avoid re-processing
+        i = skipBracedBlock(lines, i, read_idx);
+        i += 1;
+    }
+    return false;
+}
+
+fn isIfStart(t: []const u8) bool {
+    return mem.startsWith(u8, t, "if ") or mem.startsWith(u8, t, "if(");
+}
+
+fn isElseIfLine(t: []const u8) bool {
+    return mem.startsWith(u8, t, "} else if") or
+        mem.startsWith(u8, t, "else if ") or
+        mem.startsWith(u8, t, "else if(");
+}
+
+fn isElseLine(t: []const u8) bool {
+    return mem.startsWith(u8, t, "} else {") or
+        mem.startsWith(u8, t, "} else{") or
+        mem.eql(u8, t, "else {") or
+        mem.eql(u8, t, "else{");
+}
+
+/// Skip past a braced block starting at `start_idx`, returning the index of
+/// the closing `}` (or `limit-1` if not found).
+fn skipBracedBlock(
+    lines: []const []const u8,
+    start_idx: usize,
+    limit: usize,
+) usize {
+    var depth: usize = 0;
+    var found_open = false;
+    for (start_idx..limit) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        const prev_depth = depth;
+        depth = computeBraceDepth(t, depth);
+        if (!found_open and depth > prev_depth) found_open = true;
+        if (found_open and depth == 0) return i;
+    }
+    return if (limit > 0) limit - 1 else 0;
+}
+
+/// Check a complete if/else-if/else chain starting at `if_start`.
+/// Returns true if the variable is definitely assigned after the chain
+/// (every branch either assigns it or exits).
+const BranchList = struct {
+    starts: [32]usize = undefined,
+    ends: [32]usize = undefined,
+    count: usize = 0,
+
+    fn add(self: *BranchList, start: usize, end: usize) bool {
+        if (self.count >= 32) return false;
+        self.starts[self.count] = start;
+        self.ends[self.count] = end;
+        self.count += 1;
+        return true;
+    }
+};
+
+fn checkIfElseChainComplete(
+    lines: []const []const u8,
+    if_start: usize,
+    limit: usize,
+    var_name: []const u8,
+) bool {
+    var branches = BranchList{};
+    var block_end = skipBracedBlock(lines, if_start, limit);
+    if (block_end >= limit) return false;
+    if (!branches.add(if_start, block_end)) return false;
+
+    const found_else = collectElseBranches(lines, &block_end, limit, &branches);
+    if (!found_else or branches.count < 2) return false;
+    return validateBranchCoverage(lines, &branches, var_name);
+}
+
+/// Collect else-if and else branches following an if block.
+/// Returns true if the chain ends with a final else.
+fn collectElseBranches(
+    lines: []const []const u8,
+    block_end: *usize,
+    limit: usize,
+    branches: *BranchList,
+) bool {
+    while (block_end.* + 1 < limit) {
+        const close_t = mem.trim(u8, lines[block_end.*], " \t\r");
+        const next_idx = skipCommentLines(lines, block_end.* + 1, limit);
+        if (next_idx >= limit) break;
+        const next_t = mem.trim(u8, lines[next_idx], " \t\r");
+
+        // "} else if" or "} else" on the closing line itself
+        if (isElseIfLine(close_t) or isElseLine(close_t)) {
+            const prev_end = branches.ends[branches.count - 1];
+            block_end.* = skipBracedBlock(lines, block_end.*, limit);
+            if (block_end.* >= limit) return false;
+            if (!branches.add(prev_end, block_end.*)) return false;
+            if (isElseLine(close_t)) return true;
+            continue;
+        }
+
+        // "else if" or "else" on the NEXT non-comment line (separated from })
+        if (isElseIfLine(next_t) or isElseLine(next_t)) {
+            block_end.* = skipBracedBlock(lines, next_idx, limit);
+            if (block_end.* >= limit) return false;
+            if (!branches.add(next_idx, block_end.*)) return false;
+            if (isElseLine(next_t)) return true;
+            continue;
+        }
+        break;
+    }
+    return false;
+}
+
+/// Skip comment and multiline-string lines starting at `start`.
+fn skipCommentLines(lines: []const []const u8, start: usize, limit: usize) usize {
+    var idx = start;
+    while (idx < limit) {
+        if (!isCommentOrMultilineString(mem.trim(u8, lines[idx], " \t\r"))) break;
+        idx += 1;
+    }
+    return idx;
+}
+
+/// Validate that every branch assigns the variable or exits.
+fn validateBranchCoverage(
+    lines: []const []const u8,
+    branches: *const BranchList,
+    var_name: []const u8,
+) bool {
+    var has_assignment = false;
+    for (0..branches.count) |bi| {
+        const assigns = branchAssignsVar(lines, branches.starts[bi], branches.ends[bi], var_name);
+        const exits = branchHasExit(lines, branches.starts[bi], branches.ends[bi]);
+        if (!assigns and !exits) return false;
+        if (assigns) has_assignment = true;
+    }
+    return has_assignment;
+}
+
+/// Check if a branch (lines[start..end]) assigns the variable.
+fn branchAssignsVar(
+    lines: []const []const u8,
+    start: usize,
+    end: usize,
+    var_name: []const u8,
+) bool {
+    const actual_end = @min(end, lines.len - 1);
+    for (start..actual_end + 1) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        // Check for assignment at any position in the line
+        if (mem.indexOf(u8, t, var_name)) |vpos| {
+            if (vpos > 0 and isIdent(t[vpos - 1])) continue;
+            if (vpos + var_name.len < t.len and isIdent(t[vpos + var_name.len])) continue;
+            if (isAssignmentTarget(t, var_name, vpos)) return true;
+        }
+    }
+    return false;
+}
+
+/// Check if a branch has an unconditional exit (return/break/continue/unreachable).
+fn branchHasExit(
+    lines: []const []const u8,
+    start: usize,
+    end: usize,
+) bool {
+    const actual_end = @min(end, lines.len - 1);
+    var depth: usize = 0;
+    for (start..actual_end + 1) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        depth = computeBraceDepth(t, depth);
+        if (depth <= 1 and isExitStatement(t)) return true;
+    }
+    return false;
+}
+
+fn isExitStatement(t: []const u8) bool {
+    return mem.startsWith(u8, t, "return ") or
+        mem.startsWith(u8, t, "return;") or
+        mem.eql(u8, t, "return") or
+        mem.startsWith(u8, t, "break;") or
+        mem.startsWith(u8, t, "continue;") or
+        mem.eql(u8, t, "unreachable;") or
+        mem.eql(u8, t, "unreachable,");
 }
 
 fn runDefiniteAssignmentWorklist(
@@ -1487,6 +1910,11 @@ fn computeBlockEntry(
     for (cfg.edges.items) |edge| {
         if (edge.to != bid) continue;
         if (edge.kind == .loop_back) continue;
+        // Skip return blocks - they never flow to the merge point,
+        // so they shouldn't affect definite assignment analysis.
+        // e.g., if (A) { x = 1; } else { return; } // x is definitely assigned here
+        if (edge.from < cfg.blocks.items.len and
+            cfg.blocks.items[edge.from].is_return) continue;
         has_pred = true;
         if (!def_exit[edge.from]) result = false;
     }
@@ -3358,7 +3786,7 @@ const ImportGraph = struct {
         return fs.cwd().realpath(dir, buf) catch null;
     }
 
-    /// Scan already-loaded content for b.path("...zig") refs, marking reachable.
+    /// Scan already-loaded content for b.path("...zig") and pathJoin refs, marking reachable.
     fn scanContentBuildPathRefs(
         self: *ImportGraph,
         content: []const u8,
@@ -3379,6 +3807,28 @@ const ImportGraph = struct {
                 );
             }
             pos = str_end + 1;
+        }
+        // Also scan for pathJoin(&.{ "dir", "file.zig" }) patterns
+        self.scanContentPathJoinRefs(content, build_root);
+    }
+
+    /// Scan content for pathJoin(&.{ ... }) patterns and mark .zig results reachable.
+    fn scanContentPathJoinRefs(
+        self: *ImportGraph,
+        content: []const u8,
+        build_root: []const u8,
+    ) void {
+        const tag = "pathJoin(&.{";
+        var pos: usize = 0;
+        while (pos + tag.len < content.len) {
+            const rest = content[pos..];
+            const rel = mem.indexOf(u8, rest, tag) orelse break;
+            const abs_pos = pos + rel + tag.len;
+            if (extractPathJoin(self.allocator, content, abs_pos - 1)) |joined| {
+                defer self.allocator.free(joined);
+                self.tryMarkBuildPath(joined, build_root);
+            }
+            pos = abs_pos;
         }
     }
 
@@ -3881,6 +4331,23 @@ fn isArenaAllocLine(t: []const u8) bool {
         ".temp.create(",
     };
     for (no_free_segments) |pat| {
+        if (mem.indexOf(u8, t, pat) != null) return true;
+    }
+    // Build arena allocator patterns: b.allocator and owner.allocator are
+    // *std.Build arena allocators that don't need explicit free
+    const build_alloc_patterns = [_][]const u8{
+        "b.allocator.alloc(",
+        "b.allocator.create(",
+        "b.allocator.dupe(",
+        "b.allocator.dupeZ(",
+        "b.allocator.realloc(",
+        "owner.allocator.alloc(",
+        "owner.allocator.create(",
+        "owner.allocator.dupe(",
+        "owner.allocator.dupeZ(",
+        "owner.allocator.realloc(",
+    };
+    for (build_alloc_patterns) |pat| {
         if (mem.indexOf(u8, t, pat) != null) return true;
     }
     return false;
@@ -10681,6 +11148,82 @@ fn extractQuotedPath(line: []const u8, start: usize) ?[]const u8 {
     return path;
 }
 
+/// Extract a joined path from a pathJoin(&.{ "seg1", "seg2", ... }) pattern.
+/// Returns the joined path (e.g. "seg1/seg2/file.zig") or null.
+/// Caller must free the returned slice.
+/// Find the brace-delimited inner content of a pathJoin(&.{ ... }) call.
+fn findPathJoinInner(line: []const u8, start: usize) ?[]const u8 {
+    if (start >= line.len) return null;
+    const rest = line[start..];
+    const brace = mem.indexOf(u8, rest, "{") orelse return null;
+    const after_brace = start + brace + 1;
+    if (after_brace >= line.len) return null;
+    const close_brace = mem.indexOf(u8, line[after_brace..], "}") orelse return null;
+    return line[after_brace .. after_brace + close_brace];
+}
+
+const PathJoinResult = struct { count: usize, total_len: usize };
+
+/// Parse quoted string segments from pathJoin inner content.
+fn parsePathJoinSegments(
+    inner: []const u8,
+    segments: *[16][]const u8,
+) PathJoinResult {
+    var count: usize = 0;
+    var total_len: usize = 0;
+    var pos: usize = 0;
+    while (pos < inner.len and count < 16) {
+        const q1 = mem.indexOf(u8, inner[pos..], "\"") orelse break;
+        const str_start = pos + q1 + 1;
+        if (str_start >= inner.len) break;
+        const q2 = mem.indexOf(u8, inner[str_start..], "\"") orelse break;
+        const seg = inner[str_start .. str_start + q2];
+        if (seg.len > 0) {
+            segments[count] = seg;
+            total_len += seg.len;
+            count += 1;
+        }
+        pos = str_start + q2 + 1;
+    }
+    return .{ .count = count, .total_len = total_len };
+}
+
+/// Join path segments with '/' separator into an allocated string.
+/// Returns null if not a .zig path. Caller must free result.
+fn joinPathSegments(
+    allocator: Allocator,
+    segments: []const []const u8,
+    total_len: usize,
+) ?[]const u8 {
+    const sep_count = segments.len - 1;
+    const joined = allocator.alloc(u8, total_len + sep_count) catch return null;
+    var offset: usize = 0;
+    for (segments, 0..) |seg, i| {
+        @memcpy(joined[offset .. offset + seg.len], seg);
+        offset += seg.len;
+        if (i < sep_count) {
+            joined[offset] = '/';
+            offset += 1;
+        }
+    }
+    if (!mem.endsWith(u8, joined, ".zig")) {
+        allocator.free(joined);
+        return null;
+    }
+    return joined;
+}
+
+/// Extract a joined path from a pathJoin(&.{ "seg1", "seg2", ... }) pattern.
+/// Returns the joined path (e.g. "seg1/seg2/file.zig") or null.
+/// Caller must free the returned slice.
+fn extractPathJoin(allocator: Allocator, line: []const u8, start: usize) ?[]const u8 {
+    const inner = findPathJoinInner(line, start) orelse return null;
+    var segments: [16][]const u8 = undefined;
+    const result = parsePathJoinSegments(inner, &segments);
+    if (result.count == 0) return null;
+    return joinPathSegments(allocator, segments[0..result.count], result.total_len);
+}
+
 /// Add entry if the file exists and isn't already added
 fn addEntryIfValid(
     allocator: Allocator,
@@ -10734,6 +11277,27 @@ fn extractPathTagEntries(
         const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
         if (extractQuotedPath(line, idx + pat.len)) |path|
             try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+    }
+}
+
+/// Extract pathJoin(&.{ "dir", "file.zig" }) entries from a build.zig line
+fn extractPathJoinEntries(
+    allocator: Allocator,
+    cfg: *Config,
+    line: []const u8,
+    prefix: []const u8,
+    added: *std.StringHashMap(void),
+) !void {
+    const tag = "pathJoin(&.{";
+    var pos: usize = 0;
+    while (pos < line.len) {
+        const idx = mem.indexOf(u8, line[pos..], tag) orelse break;
+        const abs_pos = pos + idx + tag.len;
+        if (extractPathJoin(allocator, line, abs_pos - 1)) |joined| {
+            defer allocator.free(joined);
+            try addEntryWithPrefix(allocator, cfg, joined, prefix, added);
+        }
+        pos = abs_pos;
     }
 }
 
@@ -10802,6 +11366,8 @@ fn extractBuildZigEntriesFromPath(
             if (extractQuotedPath(line, idx + 7)) |path|
                 try addEntryWithPrefix(allocator, cfg, path, prefix, added);
         }
+        // Handle b.pathJoin(&.{ "dir", "file.zig" }) patterns
+        try extractPathJoinEntries(allocator, cfg, line, prefix, added);
         try extractPathTagEntries(allocator, cfg, line, prefix, added);
         try followImportsInLine(allocator, cfg, line, build_path, prefix, added);
     }

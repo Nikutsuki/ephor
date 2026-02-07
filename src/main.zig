@@ -1368,6 +1368,7 @@ fn isIndirectlyInitialized(
     vn: []const u8,
 ) bool {
     var in_inline_for = false;
+    var in_for_loop: usize = 0;
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
@@ -1376,6 +1377,47 @@ fn isIndirectlyInitialized(
         if (hasComptimeFieldAssignment(t, vn)) return true;
         if (isInlineForAssignment(t, vn, &in_inline_for))
             return true;
+        // Track for-loop depth and detect array element assignment
+        // inside for loops: for (...) |...| { ... args[i] = ...; }
+        if (mem.startsWith(u8, t, "for ") or
+            mem.startsWith(u8, t, "for("))
+        {
+            for (t) |c| {
+                if (c == '{') in_for_loop += 1;
+            }
+        } else if (in_for_loop > 0) {
+            for (t) |c| {
+                if (c == '{') in_for_loop += 1;
+                if (c == '}' and in_for_loop > 0) in_for_loop -= 1;
+            }
+            if (in_for_loop > 0 and isArrayIndexAssignment(t, vn))
+                return true;
+        }
+    }
+    return false;
+}
+
+/// Check if a line assigns to a variable via array indexing: `var_name[...] = ...`
+fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
+        // Word boundary check
+        if (vpos > 0 and isIdent(t[vpos - 1])) {
+            pos = vpos + vn.len;
+            continue;
+        }
+        const end = vpos + vn.len;
+        if (end >= t.len) {
+            pos = end;
+            continue;
+        }
+        if (isIdent(t[end])) {
+            pos = end;
+            continue;
+        }
+        // Check for `var_name[`
+        if (t[end] == '[') return true;
+        pos = end;
     }
     return false;
 }
@@ -1459,6 +1501,12 @@ fn checkVarDefiniteAssignment(
         // Check if all paths that don't assign the variable have early returns.
         // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
         if (hasEarlyReturnOnUnassignedPaths(lines, var_name, idx)) continue;
+        // Check if the read is on the RHS of an `or` short-circuit in a
+        // condition where the LHS guards against the variable being
+        // uninitialized.
+        // e.g., if (param_group_t == null or i > param_group_end) {
+        //            param_group_end = ...; }
+        if (isOrShortCircuitSafe(lines, idx, var_name)) continue;
         try issues.put(var_name, al);
         break;
     }
@@ -1474,13 +1522,35 @@ fn isCorrelatedGuardRead(
     read_idx: usize,
     var_name: []const u8,
 ) bool {
-    const guard_cond = findEnclosingIfCondition(lines, read_idx) orelse return false;
+    // Check all enclosing if conditions, not just the nearest one.
+    // This handles nested ifs like:
+    //   if (cy.Trace and cond) {  // outer
+    //       if (x != tempRetainedStart) {  // inner - nearest
+    // We need to check the outer condition too.
+    var search_from = read_idx;
+    while (search_from > 0) {
+        const guard_cond = findEnclosingIfCondition(
+            lines,
+            search_from,
+        ) orelse break;
 
-    for (0..read_idx) |i| {
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        if (!hasIfCondition(t, guard_cond)) continue;
-        if (blockContainsAssignment(lines, i + 1, read_idx, var_name)) return true;
+        for (0..read_idx) |i| {
+            const t = mem.trim(u8, lines[i], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            if (!hasIfCondition(t, guard_cond)) continue;
+            if (blockContainsAssignment(
+                lines,
+                i + 1,
+                read_idx,
+                var_name,
+            )) return true;
+        }
+
+        // Walk back further past the if we just found to check
+        // outer enclosing ifs
+        const if_line = findEnclosingIfLine(lines, search_from) orelse break;
+        if (if_line == 0) break;
+        search_from = if_line;
     }
     return false;
 }
@@ -1623,6 +1693,31 @@ fn findEnclosingIfCondition(
     return null;
 }
 
+/// Find the line index of the nearest enclosing if-statement by walking
+/// backwards. Returns the line index or null if not found.
+fn findEnclosingIfLine(
+    lines: []const []const u8,
+    read_idx: usize,
+) ?usize {
+    var depth: usize = 0;
+    var i = read_idx;
+    while (i > 0) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+
+        for (t) |c| {
+            if (c == '}') depth += 1;
+            if (c == '{' and depth > 0) depth -= 1;
+        }
+
+        if (depth == 0) {
+            if (extractIfCondition(t) != null) return i;
+        }
+    }
+    return null;
+}
+
 /// Extract the condition text from an if-statement line.
 /// "if (big) {" -> "big", "if (minWindow) |other| {" -> "minWindow"
 fn extractIfCondition(t: []const u8) ?[]const u8 {
@@ -1750,20 +1845,140 @@ const BranchList = struct {
     }
 };
 
+/// Result of tracking braces through a line with zero-detection.
+const BraceZeroResult = struct {
+    depth: usize,
+    found_open: bool,
+    touched_zero: bool,
+};
+
+/// Track braces through a line, detecting if depth passes through 0.
+fn trackBracesWithZeroDetect(
+    t: []const u8,
+    initial_depth: usize,
+    initial_open: bool,
+) BraceZeroResult {
+    var depth = initial_depth;
+    var found_open = initial_open;
+    var touched_zero = false;
+    for (t) |c| {
+        if (c == '{') {
+            depth += 1;
+            if (!found_open) found_open = true;
+        }
+        if (c == '}' and depth > 0) {
+            depth -= 1;
+            if (found_open and depth == 0) touched_zero = true;
+        }
+    }
+    return .{
+        .depth = depth,
+        .found_open = found_open,
+        .touched_zero = touched_zero,
+    };
+}
+
+/// Try to continue an if/else chain from the next line after a block closes.
+/// Returns the index to continue from, or null if chain ends.
+fn tryChainContinuation(
+    lines: []const []const u8,
+    current: usize,
+    limit: usize,
+) ?usize {
+    const next_idx = skipCommentLines(lines, current + 1, limit);
+    if (next_idx >= limit) return null;
+    const next_t = mem.trim(u8, lines[next_idx], " \t\r");
+    if (isElseIfLine(next_t) or isElseLine(next_t)) return next_idx;
+    return null;
+}
+
+/// State for parsing an if/else chain into branches.
+const ChainParseState = struct {
+    branches: BranchList = BranchList{},
+    depth: usize = 0,
+    found_open: bool = false,
+    branch_start: usize = 0,
+    has_else: bool = false,
+    i: usize = 0,
+    done: bool = false,
+    overflow: bool = false,
+
+    /// Process a single line in the chain. Returns the next index to
+    /// use for the outer loop (may skip ahead for next-line continuations).
+    fn processLine(
+        self: *ChainParseState,
+        lines: []const []const u8,
+        limit: usize,
+    ) void {
+        const t = mem.trim(u8, lines[self.i], " \t\r");
+        if (isCommentOrMultilineString(t)) return;
+
+        const r = trackBracesWithZeroDetect(t, self.depth, self.found_open);
+        self.depth = r.depth;
+        self.found_open = r.found_open;
+        if (!r.touched_zero) return;
+
+        if (!self.branches.add(self.branch_start, self.i)) {
+            self.overflow = true;
+            self.done = true;
+            return;
+        }
+
+        if (self.depth > 0) {
+            if (isElseLine(t)) self.has_else = true;
+            self.branch_start = self.i;
+            return;
+        }
+
+        self.handleNextLineContinuation(lines, limit);
+    }
+
+    fn handleNextLineContinuation(
+        self: *ChainParseState,
+        lines: []const []const u8,
+        limit: usize,
+    ) void {
+        const next_idx = tryChainContinuation(
+            lines,
+            self.i,
+            limit,
+        ) orelse {
+            self.done = true;
+            return;
+        };
+        const next_t = mem.trim(u8, lines[next_idx], " \t\r");
+        if (isElseLine(next_t)) self.has_else = true;
+        self.branch_start = next_idx;
+        self.i = next_idx;
+        const nr = trackBracesWithZeroDetect(
+            next_t,
+            self.depth,
+            self.found_open,
+        );
+        self.depth = nr.depth;
+        self.found_open = nr.found_open;
+    }
+};
+
 fn checkIfElseChainComplete(
     lines: []const []const u8,
     if_start: usize,
     limit: usize,
     var_name: []const u8,
 ) bool {
-    var branches = BranchList{};
-    var block_end = skipBracedBlock(lines, if_start, limit);
-    if (block_end >= limit) return false;
-    if (!branches.add(if_start, block_end)) return false;
+    var state = ChainParseState{
+        .branch_start = if_start,
+        .i = if_start,
+    };
 
-    const found_else = collectElseBranches(lines, &block_end, limit, &branches);
-    if (!found_else or branches.count < 2) return false;
-    return validateBranchCoverage(lines, &branches, var_name);
+    while (state.i < limit) : (state.i += 1) {
+        state.processLine(lines, limit);
+        if (state.done) break;
+    }
+
+    if (state.overflow) return false;
+    if (!state.has_else or state.branches.count < 2) return false;
+    return validateBranchCoverage(lines, &state.branches, var_name);
 }
 
 /// Collect else-if and else branches following an if block.
@@ -1875,6 +2090,41 @@ fn isExitStatement(t: []const u8) bool {
         mem.startsWith(u8, t, "continue;") or
         mem.eql(u8, t, "unreachable;") or
         mem.eql(u8, t, "unreachable,");
+}
+
+/// Check if a variable read is safe due to `or` short-circuit evaluation.
+/// Pattern: `if (guard == null or i > var_name)` where the variable is
+/// assigned inside the if-block body. When `guard == null` is true, the
+/// RHS (`i > var_name`) is never evaluated, so the read is safe. When
+/// `guard != null`, the variable was assigned in a prior iteration.
+fn isOrShortCircuitSafe(
+    lines: []const []const u8,
+    read_idx: usize,
+    var_name: []const u8,
+) bool {
+    const t = mem.trim(u8, lines[read_idx], " \t\r");
+    // The read must be in an if-condition containing " or "
+    const or_pos = mem.indexOf(u8, t, " or ") orelse return false;
+    // The variable read must be on the RIGHT side of " or "
+    const vpos = mem.indexOf(u8, t, var_name) orelse return false;
+    if (vpos <= or_pos) return false;
+    // Word boundary check
+    if (vpos > 0 and isIdent(t[vpos - 1])) return false;
+    if (vpos + var_name.len < t.len and
+        isIdent(t[vpos + var_name.len])) return false;
+    // Must be in an if-condition
+    if (!mem.startsWith(u8, t, "if ") and
+        !mem.startsWith(u8, t, "if(")) return false;
+    // The variable must be assigned inside the if-block body
+    if (read_idx + 1 < lines.len) {
+        return blockContainsAssignment(
+            lines,
+            read_idx + 1,
+            @min(read_idx + 20, lines.len),
+            var_name,
+        );
+    }
+    return false;
 }
 
 fn runDefiniteAssignmentWorklist(
@@ -7333,14 +7583,34 @@ fn isSliceAlias(
     const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
     const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
     for (as.names.items) |existing_name| {
-        if (!mem.startsWith(u8, rhs, existing_name)) continue;
-        if (rhs.len <= existing_name.len) continue;
-        const next_ch = rhs[existing_name.len];
-        if (next_ch != '[' and next_ch != '.') continue;
         if (mem.eql(u8, alias_name, alloc_name)) continue;
-        return true;
+        // Direct slice/field access: x = buffer[...] or x = buffer.field
+        if (mem.startsWith(u8, rhs, existing_name) and rhs.len > existing_name.len) {
+            const next_ch = rhs[existing_name.len];
+            if (next_ch == '[' or next_ch == '.') return true;
+        }
+        // Direct assignment: x = buffer (exact match, possibly with semicolon/catch)
+        if (mem.startsWith(u8, rhs, existing_name)) {
+            if (rhs.len == existing_name.len) return true;
+            const next_ch = rhs[existing_name.len];
+            if (next_ch == ';' or next_ch == ' ') return true;
+        }
+        // bufPrint into alloc buffer: x = std.fmt.bufPrint(buffer, ...) or bufPrint(buffer, ...)
+        if (isBufPrintAlias(rhs, existing_name)) return true;
     }
     return false;
+}
+
+/// Check if RHS is a bufPrint call using existing_name as the destination buffer
+fn isBufPrintAlias(rhs: []const u8, existing_name: []const u8) bool {
+    const bp_pos = mem.indexOf(u8, rhs, "bufPrint(") orelse return false;
+    const arg_start = bp_pos + "bufPrint(".len;
+    if (arg_start + existing_name.len > rhs.len) return false;
+    // First arg should be the buffer name
+    if (!mem.startsWith(u8, rhs[arg_start..], existing_name)) return false;
+    if (arg_start + existing_name.len >= rhs.len) return true;
+    const after = rhs[arg_start + existing_name.len];
+    return after == ',' or after == ')' or after == ' ';
 }
 
 /// Check if an alias set contains a name
@@ -7351,6 +7621,40 @@ fn aliasSetContains(as: *const AliasSet, name: []const u8) bool {
     return false;
 }
 
+/// Extract the LHS variable name from a reassignment (not a var/const declaration)
+/// Pattern: `identifier = ...` where identifier is a simple name (no dots, no brackets)
+fn extractReassignTarget(t: []const u8) ?[]const u8 {
+    // Must not be a declaration
+    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return null;
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
+    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+    if (lhs.len == 0) return null;
+    // Must be a simple identifier (no dots, no brackets - those are field/index assigns)
+    for (lhs) |c| {
+        if (!isIdent(c)) return null;
+    }
+    return lhs;
+}
+
+/// Try to add alias_name to an alias set if it qualifies (single or multi-line)
+fn tryAddAlias(
+    allocator: Allocator,
+    as: *AliasSet,
+    t: []const u8,
+    alias_name: []const u8,
+    alloc_name: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+) !void {
+    if (aliasSetContains(as, alias_name)) return;
+    if (isSliceAlias(as, t, alias_name, alloc_name)) {
+        try as.names.append(allocator, alias_name);
+        return;
+    }
+    if (isMultiLineBufPrintAlias(lines, idx, as))
+        try as.names.append(allocator, alias_name);
+}
+
 /// Scan lines for slice aliasing and add to alias sets
 fn scanSliceAliases(
     allocator: Allocator,
@@ -7358,16 +7662,56 @@ fn scanSliceAliases(
     alias_sets: []AliasSet,
     allocs: []const AllocInfo,
 ) !void {
-    for (lines) |line| {
+    for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        const alias_name = extractVarDeclName(t) orelse continue;
+        const alias_name = extractVarDeclName(t) orelse extractReassignTarget(t) orelse continue;
         for (alias_sets, 0..) |*as, ai| {
-            if (!isSliceAlias(as, t, alias_name, allocs[ai].name)) continue;
-            if (aliasSetContains(as, alias_name)) continue;
-            try as.names.append(allocator, alias_name);
+            try tryAddAlias(allocator, as, t, alias_name, allocs[ai].name, lines, idx);
         }
     }
+}
+
+/// Check if a trimmed line is the first arg of a bufPrint call matching an alias set name
+fn isFirstArgMatch(nt: []const u8, as: *const AliasSet) bool {
+    for (as.names.items) |existing_name| {
+        if (!mem.startsWith(u8, nt, existing_name)) continue;
+        if (nt.len == existing_name.len) return true;
+        const after = nt[existing_name.len];
+        if (after == ',' or after == ')' or after == ' ') return true;
+    }
+    return false;
+}
+
+/// Check if a line starts a bufPrint call whose first argument (on the next line)
+/// is an existing alias in the set. Pattern:
+///   x = ...bufPrint(        (line idx)
+///       buffer,             (line idx+1..idx+3)
+fn isMultiLineBufPrintAlias(
+    lines: []const []const u8,
+    idx: usize,
+    as: *const AliasSet,
+) bool {
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    if (!hasPendingBufPrint(t)) return false;
+    // Look at next few lines for the first argument
+    const search_end = @min(idx + 4, lines.len);
+    for (lines[idx + 1 .. search_end]) |next_line| {
+        const nt = mem.trim(u8, next_line, " \t\r");
+        if (nt.len == 0) continue;
+        return isFirstArgMatch(nt, as);
+    }
+    return false;
+}
+
+/// Check if the line contains a bufPrint( call with no arguments on the same line
+fn hasPendingBufPrint(t: []const u8) bool {
+    const bp_pos = mem.indexOf(u8, t, "bufPrint(") orelse return false;
+    const after_bp = bp_pos + "bufPrint(".len;
+    if (after_bp >= t.len) return true;
+    const rest = t[after_bp..];
+    // If comma or ) present, args are on this line (handled by single-line check)
+    return mem.indexOf(u8, rest, ",") == null and mem.indexOf(u8, rest, ")") == null;
 }
 
 /// Track struct assignment data flow state

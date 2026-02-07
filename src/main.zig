@@ -1137,13 +1137,20 @@ fn hasAsmConstraintBefore(t: []const u8, abs_pos: usize) bool {
     if (abs_pos < 2) return false;
     const before = t[0..abs_pos];
     if (mem.lastIndexOf(u8, before, "\"") == null) return false;
+    // "=" is write-only output, "~" is clobber, "+" is read-write output
     return mem.indexOf(u8, before, "\"=") != null or
-        mem.indexOf(u8, before, "\"~") != null;
+        mem.indexOf(u8, before, "\"~") != null or
+        mem.indexOf(u8, before, "\"+") != null;
 }
 
 fn hasAsmOutputVar(t: []const u8, var_name: []const u8) bool {
-    if (mem.indexOf(u8, t, "asm") == null and
-        mem.indexOf(u8, t, "\"=") == null) return false;
+    // Check for asm output constraint on same line (single-line asm)
+    // or on a continuation line of multi-line asm (constraint line without "asm" keyword)
+    const has_asm = mem.indexOf(u8, t, "asm") != null;
+    const has_output_constraint = mem.indexOf(u8, t, "\"=") != null or
+        mem.indexOf(u8, t, "\"+") != null or
+        mem.indexOf(u8, t, "\"~") != null;
+    if (!has_asm and !has_output_constraint) return false;
     var search_start: usize = 0;
     while (search_start + 1 + var_name.len + 1 <= t.len) {
         const paren_pos = mem.indexOf(u8, t[search_start..], "(") orelse return false;
@@ -1375,6 +1382,7 @@ fn isIndirectlyInitialized(
         if (hasMethodCallOnVar(t, vn)) return true;
         if (hasAsmOutputVar(t, vn)) return true;
         if (hasComptimeFieldAssignment(t, vn)) return true;
+        if (hasSlicePassToFunction(t, vn)) return true;
         if (isInlineForAssignment(t, vn, &in_inline_for))
             return true;
         // Track for-loop depth and detect array element assignment
@@ -1417,6 +1425,61 @@ fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
         }
         // Check for `var_name[`
         if (t[end] == '[') return true;
+        pos = end;
+    }
+    return false;
+}
+
+/// Check if a mutable slice of the variable is passed to a function call.
+/// Pattern: func(var_name[0..]) or func(var_name[0..N])
+/// Passing a mutable slice allows the callee to write into the array,
+/// effectively initializing it (e.g., reader.readSliceShort(buf[0..])).
+fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
+        // Word boundary check before
+        if (vpos > 0 and isIdent(t[vpos - 1])) {
+            pos = vpos + vn.len;
+            continue;
+        }
+        const end = vpos + vn.len;
+        if (end >= t.len) {
+            pos = end;
+            continue;
+        }
+        // Word boundary check after
+        if (isIdent(t[end])) {
+            pos = end;
+            continue;
+        }
+        // Skip if inside string or comment
+        if (isInsideString(t, vpos)) {
+            pos = end;
+            continue;
+        }
+        if (mem.indexOf(u8, t[0..vpos], "//") != null) return false;
+        // Check for var_name[ pattern (slice creation)
+        if (t[end] != '[') {
+            pos = end;
+            continue;
+        }
+        // Must NOT be an assignment target (var_name[i] = ...),
+        // which is a write, not a read-via-slice-pass.
+        // We specifically want var_name[...] passed as a function argument.
+        // Check if the enclosing context is a function call argument.
+        // Look backwards for a '(' that indicates we're inside a function call.
+        if (vpos > 0) {
+            var depth: usize = 0;
+            var j = vpos;
+            while (j > 0) {
+                j -= 1;
+                if (t[j] == ')') depth += 1;
+                if (t[j] == '(') {
+                    if (depth == 0) return true;
+                    depth -= 1;
+                }
+            }
+        }
         pos = end;
     }
     return false;
@@ -2186,6 +2249,10 @@ fn hasVarRead(t: []const u8, var_name: []const u8) bool {
         // Skip struct field access - e.g., self.file_id is not the local file_id
         if (i > 0 and t[i - 1] == '.') continue;
 
+        // Skip if inside a string literal
+        // e.g., std.mem.eql(u8, field_name, "range") is not a read of var range
+        if (isInsideString(t, i)) continue;
+
         // Skip if inside a comment (after //)
         if (mem.indexOf(u8, t[0..i], "//")) |_| continue;
 
@@ -2275,22 +2342,67 @@ fn analyzeOneAllocSafety(
     num_blocks: usize,
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
-    var bstate = try initBlockFreeState(allocator, num_blocks);
-    defer bstate.deinit(allocator);
-    scanBlocksForFreeOps(
-        cfg, lines, func_line, alloc_info.name,
-        in_defer, in_errdefer, alloc_info, &bstate,
+    var bstate = try initAndScanFreeState(
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        alloc_info,
+        in_defer,
+        in_errdefer,
+        num_blocks,
     );
+    defer bstate.deinit(allocator);
     try detectUseAfterFree(
-        allocator, cfg, lines, func_line, file_path,
-        alloc_info.name, alloc_info, in_errdefer, in_defer,
-        &bstate, issues,
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        file_path,
+        alloc_info.name,
+        alloc_info,
+        in_errdefer,
+        in_defer,
+        &bstate,
+        issues,
     );
     try detectDoubleFree(
-        allocator, cfg, lines, func_line, file_path,
-        alloc_info.name, alloc_info, in_defer, in_errdefer,
-        &bstate, issues,
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        file_path,
+        alloc_info.name,
+        alloc_info,
+        in_defer,
+        in_errdefer,
+        &bstate,
+        issues,
     );
+}
+
+fn initAndScanFreeState(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    alloc_info: *CFGAllocation,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+    num_blocks: usize,
+) !BlockFreeState {
+    var bstate = try initBlockFreeState(allocator, num_blocks);
+    scanBlocksForFreeOps(
+        cfg,
+        lines,
+        func_line,
+        alloc_info.name,
+        in_defer,
+        in_errdefer,
+        alloc_info,
+        &bstate,
+    );
+    return bstate;
 }
 
 fn analyzeCFGMemorySafety(
@@ -2314,9 +2426,16 @@ fn analyzeCFGMemorySafety(
     var alloc_iter = allocs.iterator();
     while (alloc_iter.next()) |entry| {
         try analyzeOneAllocSafety(
-            allocator, cfg, lines, func_line, file_path,
-            entry.value_ptr, markers.in_defer, markers.in_errdefer,
-            num_blocks, &issues,
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            file_path,
+            entry.value_ptr,
+            markers.in_defer,
+            markers.in_errdefer,
+            num_blocks,
+            &issues,
         );
     }
     return issues;
@@ -2434,8 +2553,12 @@ fn scanBlocksForFreeOps(
         if (block.start_line == 0 or
             block.start_line > block.end_line) continue;
         const r = scanBlockForFreeOp(
-            block, lines, func_line,
-            var_name, in_defer, in_errdefer,
+            block,
+            lines,
+            func_line,
+            var_name,
+            in_defer,
+            in_errdefer,
         );
         bstate.freed_in_block[bid] = r.free_seen;
         bstate.freed_line_in_block[bid] = r.free_line;
@@ -2591,25 +2714,70 @@ fn checkLineForUAF(
     const bid = findBlockForLine(cfg, actual_line) orelse return;
     const bs = cfg.blocks.items[bid].start_line;
     if (bs == 0 or bs > actual_line) return;
+    if (try checkSameBlockUAF(
+        allocator,
+        lines,
+        func_line,
+        bs,
+        actual_line,
+        var_name,
+        alloc_info,
+        in_defer,
+        in_errdefer,
+        use_col,
+        file_path,
+        issues,
+    )) return;
+    const preds_freed = try checkPredecessorsFreed(allocator, cfg, bid, bstate);
+    if (preds_freed and alloc_info.freed_line > 0) {
+        try appendUAFIssue(
+            allocator,
+            issues,
+            file_path,
+            actual_line,
+            use_col,
+            var_name,
+            alloc_info.freed_line,
+        );
+    }
+}
+
+/// Check if a variable was freed in the same block; emit UAF if so.
+fn checkSameBlockUAF(
+    allocator: Allocator,
+    lines: []const []const u8,
+    func_line: usize,
+    block_start: usize,
+    actual_line: usize,
+    var_name: []const u8,
+    alloc_info: *CFGAllocation,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+    use_col: usize,
+    file_path: []const u8,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !bool {
     const sbf = checkSameBlockFree(
-        lines, func_line, bs, actual_line,
-        var_name, alloc_info, in_defer, in_errdefer,
+        lines,
+        func_line,
+        block_start,
+        actual_line,
+        var_name,
+        alloc_info,
+        in_defer,
+        in_errdefer,
     );
-    if (sbf.freed and !sbf.intervening_return) {
-        try appendUAFIssue(
-            allocator, issues, file_path,
-            actual_line, use_col, var_name, alloc_info.freed_line,
-        );
-        return;
-    }
-    if (try checkPredecessorsFreed(allocator, cfg, bid, bstate) and
-        alloc_info.freed_line > 0)
-    {
-        try appendUAFIssue(
-            allocator, issues, file_path,
-            actual_line, use_col, var_name, alloc_info.freed_line,
-        );
-    }
+    if (!sbf.freed or sbf.intervening_return) return false;
+    try appendUAFIssue(
+        allocator,
+        issues,
+        file_path,
+        actual_line,
+        use_col,
+        var_name,
+        alloc_info.freed_line,
+    );
+    return true;
 }
 
 fn detectUseAfterFree(
@@ -2630,9 +2798,19 @@ fn detectUseAfterFree(
         const t = mem.trim(u8, line, " \t\r");
         if (isUAFSkipLine(t)) continue;
         try checkLineForUAF(
-            allocator, cfg, lines, func_line, file_path,
-            var_name, alloc_info, in_defer, in_errdefer,
-            bstate, issues, t, func_line + idx,
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            file_path,
+            var_name,
+            alloc_info,
+            in_defer,
+            in_errdefer,
+            bstate,
+            issues,
+            t,
+            func_line + idx,
         );
     }
 }
@@ -2691,23 +2869,77 @@ fn checkLineForDoubleFree(
     const bid = findBlockForLine(cfg, actual_line) orelse return;
     const bs = cfg.blocks.items[bid].start_line;
     if (bs == 0 or bs > actual_line) return;
-    const sbf = checkSameBlockFree(
-        lines, func_line, bs, actual_line,
-        var_name, alloc_info, in_defer, in_errdefer,
+    if (try checkSameBlockDoubleFree(
+        allocator,
+        lines,
+        func_line,
+        bs,
+        actual_line,
+        var_name,
+        alloc_info,
+        in_defer,
+        in_errdefer,
+        file_path,
+        t,
+        issues,
+    )) return;
+    try detectCrossBlockDoubleFree(
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        file_path,
+        t,
+        actual_line,
+        bid,
+        var_name,
+        alloc_info,
+        bstate,
+        issues,
     );
-    if (sbf.freed) {
-        if (hasExclusiveBranchBetween(lines, alloc_info.freed_line, actual_line, func_line)) return;
+}
+
+/// Check same-block double free and emit issue if found; returns true if freed.
+fn checkSameBlockDoubleFree(
+    allocator: Allocator,
+    lines: []const []const u8,
+    func_line: usize,
+    block_start: usize,
+    actual_line: usize,
+    var_name: []const u8,
+    alloc_info: *CFGAllocation,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+    file_path: []const u8,
+    t: []const u8,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !bool {
+    const sbf = checkSameBlockFree(
+        lines,
+        func_line,
+        block_start,
+        actual_line,
+        var_name,
+        alloc_info,
+        in_defer,
+        in_errdefer,
+    );
+    if (!sbf.freed) return false;
+    const freed = alloc_info.freed_line;
+    if (!hasExclusiveBranchBetween(lines, freed, actual_line, func_line)) {
         try appendDoubleFreeIssue(
-            allocator, issues, file_path, t, actual_line,
-            var_name, alloc_info.freed_line, .err,
+            allocator,
+            issues,
+            file_path,
+            t,
+            actual_line,
+            var_name,
+            freed,
+            .err,
             "remove duplicate free",
         );
-        return;
     }
-    try detectCrossBlockDoubleFree(
-        allocator, cfg, lines, func_line, file_path,
-        t, actual_line, bid, var_name, alloc_info, bstate, issues,
-    );
+    return true;
 }
 
 fn detectDoubleFree(
@@ -2729,9 +2961,19 @@ fn detectDoubleFree(
         if (!hasRealFreePattern(t)) continue;
         if (!isDirectFreeOfVar(t, var_name)) continue;
         try checkLineForDoubleFree(
-            allocator, cfg, lines, func_line, file_path,
-            var_name, alloc_info, in_defer, in_errdefer,
-            bstate, issues, t, func_line + idx,
+            allocator,
+            cfg,
+            lines,
+            func_line,
+            file_path,
+            var_name,
+            alloc_info,
+            in_defer,
+            in_errdefer,
+            bstate,
+            issues,
+            t,
+            func_line + idx,
         );
     }
 }
@@ -2788,7 +3030,7 @@ fn detectCrossBlockDoubleFree(
     if (preds.items.len == 0) return;
 
     const pa = analyzePredFreeState(preds.items, bstate);
-    if (!pa.any_freed) return;
+    if (!pa.any_freed or !pa.any_normal) return;
 
     const ref = if (pa.freed_pred_line > 0)
         pa.freed_pred_line
@@ -2797,17 +3039,51 @@ fn detectCrossBlockDoubleFree(
     if (hasExclusiveBranchBetween(lines, ref, actual_line, func_line))
         return;
 
-    if (pa.any_normal and pa.def_freed) {
+    try emitCrossBlockDoubleFree(
+        allocator,
+        issues,
+        file_path,
+        t,
+        actual_line,
+        var_name,
+        ref,
+        pa,
+    );
+}
+
+fn emitCrossBlockDoubleFree(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+    t: []const u8,
+    actual_line: usize,
+    var_name: []const u8,
+    ref: usize,
+    pa: PredFreeAnalysis,
+) !void {
+    if (pa.def_freed) {
         try appendDoubleFreeIssue(
-            allocator, issues, file_path, t,
-            actual_line, var_name, ref,
-            .err, "remove duplicate free",
+            allocator,
+            issues,
+            file_path,
+            t,
+            actual_line,
+            var_name,
+            ref,
+            .err,
+            "remove duplicate free",
         );
-    } else if (pa.any_normal and pa.any_freed and !pa.def_freed) {
+    } else if (pa.any_freed) {
         try appendDoubleFreeIssue(
-            allocator, issues, file_path, t,
-            actual_line, var_name, ref,
-            .warning, "move free outside conditional",
+            allocator,
+            issues,
+            file_path,
+            t,
+            actual_line,
+            var_name,
+            ref,
+            .warning,
+            "move free outside conditional",
         );
     }
 }
@@ -3278,8 +3554,13 @@ fn checkDeferCoverageForAlloc(
     defer owner_vars.deinit(allocator);
 
     var state = try scanBlocksForPatterns(
-        allocator, cfg, lines, func_line,
-        alloc.name, owner_vars.items, num_blocks,
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        alloc.name,
+        owner_vars.items,
+        num_blocks,
     );
     defer state.deinit(allocator);
 
@@ -3571,17 +3852,27 @@ fn scanErrdeferLines(
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (try continueBlockCollection(
-            t, &state.bs, &state.errdefers, allocator,
+            t,
+            &state.bs,
+            &state.errdefers,
+            allocator,
         )) continue;
         const has_try = mem.indexOf(u8, t, "try ") != null;
         if (has_try and isTryAllocation(t)) {
             try collectTryAllocFromLine(
-                t, actual_line,
-                &state.try_allocs, &state.try_lines_list, allocator,
+                t,
+                actual_line,
+                &state.try_allocs,
+                &state.try_lines_list,
+                allocator,
             );
         }
         try collectDeferFromLine(
-            t, actual_line, &state.bs, &state.errdefers, allocator,
+            t,
+            actual_line,
+            &state.bs,
+            &state.errdefers,
+            allocator,
         );
         if (has_try) try state.try_lines_list.append(allocator, actual_line);
     }
@@ -3608,9 +3899,12 @@ fn analyzeCFGErrdeferCoverage(
         checkErrdeferOwnershipTransfer(alloc, lines, func_line);
     }
     try checkErrdeferGaps(
-        allocator, state.try_allocs.items,
-        state.errdefers.items, state.try_lines_list.items,
-        file_path, &issues,
+        allocator,
+        state.try_allocs.items,
+        state.errdefers.items,
+        state.try_lines_list.items,
+        file_path,
+        &issues,
     );
     return issues;
 }
@@ -4903,7 +5197,10 @@ fn isInsideFunctionCallArg(t: []const u8, pos: usize) bool {
         if (t[i] == ')') {
             depth += 1;
         } else if (t[i] == '(') {
-            if (depth > 0) { depth -= 1; continue; }
+            if (depth > 0) {
+                depth -= 1;
+                continue;
+            }
             return isNonAllocFnCallAt(t, i);
         }
     }
@@ -6950,7 +7247,13 @@ fn runCFGSafetyAnalyses(
     defer r2.deinit(a);
     try out.appendSlice(a, r2.items);
     var r3 = try analyzeCFGErrors(
-        a, cfg, fl, fstart, fp, fn_name, in_test,
+        a,
+        cfg,
+        fl,
+        fstart,
+        fp,
+        fn_name,
+        in_test,
     );
     defer r3.deinit(a);
     try out.appendSlice(a, r3.items);
@@ -6966,7 +7269,10 @@ fn runDefiniteAssignmentAnalysis(
     file_path: []const u8,
 ) !void {
     var def_issues = try analyzeDefiniteAssignment(
-        allocator, cfg, func_lines_items, func_start,
+        allocator,
+        cfg,
+        func_lines_items,
+        func_start,
     );
     defer def_issues.deinit();
     try emitDefiniteAssignmentIssues(allocator, issues, &def_issues, file_path);
@@ -6994,15 +7300,32 @@ fn processFunction(
     defer cfg.deinit();
 
     try runDefiniteAssignmentAnalysis(
-        allocator, issues, &cfg, func_lines_items, func_start, file_path,
+        allocator,
+        issues,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
     );
     try runCFGMemoryAnalyses(
-        allocator, issues, &cfg, func_lines_items,
-        func_start, file_path, fn_returns_error, is_in_test_context,
+        allocator,
+        issues,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+        fn_returns_error,
+        is_in_test_context,
     );
     try runCFGSafetyAnalyses(
-        allocator, issues, &cfg, func_lines_items,
-        func_start, file_path, func_name, is_in_test_context,
+        allocator,
+        issues,
+        &cfg,
+        func_lines_items,
+        func_start,
+        file_path,
+        func_name,
+        is_in_test_context,
     );
 }
 
@@ -7030,8 +7353,14 @@ fn analyzeCFGFile(
             state.in_test_block = ts.in_test;
             state.test_brace_depth = ts.depth;
             try handleCFGFuncDetection(
-                allocator, issues, file_path,
-                &state, &prev, &func_lines, t, line_num,
+                allocator,
+                issues,
+                file_path,
+                &state,
+                &prev,
+                &func_lines,
+                t,
+                line_num,
             );
         }
         if (!state.in_func) continue;
@@ -7040,15 +7369,37 @@ fn analyzeCFGFile(
         if (is_comment) continue;
         if (!trackCFGBraces(t, &state)) continue;
 
-        const is_in_test = state.func_in_test or isInTestContext(file_path, false);
-        try processFunction(
-            allocator, issues, file_path, state.func_name,
-            state.func_start, func_lines.items,
-            state.fn_returns_error, is_in_test, state.fn_is_noreturn,
+        try finishCFGFunction(
+            allocator,
+            issues,
+            file_path,
+            &state,
+            &func_lines,
         );
-        state.in_func = false;
-        func_lines.clearRetainingCapacity();
     }
+}
+
+fn finishCFGFunction(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+    state: *CFGState,
+    func_lines: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const in_test = state.func_in_test or isInTestContext(file_path, false);
+    try processFunction(
+        allocator,
+        issues,
+        file_path,
+        state.func_name,
+        state.func_start,
+        func_lines.items,
+        state.fn_returns_error,
+        in_test,
+        state.fn_is_noreturn,
+    );
+    state.in_func = false;
+    func_lines.clearRetainingCapacity();
 }
 
 /// Saved state for the previous function during CFG file analysis
@@ -7081,9 +7432,15 @@ fn handleCFGFuncDetection(
         state.func_in_test = state.in_test_block;
         if (func_lines.items.len >= 3) {
             try processFunction(
-                allocator, issues, file_path, prev.name,
-                prev.start, func_lines.items,
-                false, prev.in_test, false,
+                allocator,
+                issues,
+                file_path,
+                prev.name,
+                prev.start,
+                func_lines.items,
+                false,
+                prev.in_test,
+                false,
             );
         }
         if (func_lines.items.len > 0) func_lines.clearRetainingCapacity();
@@ -7973,8 +8330,13 @@ fn analyzeFunction(
     }
 
     try processAllocTracking(
-        allocator, lines, func_start,
-        &allocs, &events, alias_sets, in_defer_block,
+        allocator,
+        lines,
+        func_start,
+        &allocs,
+        &events,
+        alias_sets,
+        in_defer_block,
     );
     try reportLeaks(allocs.items, has_err_return, file_path, &issues, allocator);
     try reportMemEvents(events.items, file_path, &issues, allocator);
@@ -7999,10 +8361,10 @@ fn hasErrorHandling(t: []const u8) bool {
 /// Check if line contains builtin or optional method (safe to discard)
 /// Patterns that are safe to discard (builtins and value-returning methods)
 const safe_builtin_pats = [_][]const u8{
-    "@import",        "@intCast",        "@ptrCast",       "@as(",
-    ".pop()",         ".orderedRemove(", ".swapRemove(",   ".getLast()",
-    ".getLastOrNull()", ".get(",         ".count()",       ".len",
-    ".items",         ".next()",         ".peek()",
+    "@import",          "@intCast",        "@ptrCast",     "@as(",
+    ".pop()",           ".orderedRemove(", ".swapRemove(", ".getLast()",
+    ".getLastOrNull()", ".get(",           ".count()",     ".len",
+    ".items",           ".next()",         ".peek()",
 };
 
 fn isSafeBuiltin(t: []const u8) bool {
@@ -8222,8 +8584,12 @@ fn collectNullChecksPerBlock(
         if (block.start_line == 0 or
             block.start_line > block.end_line) continue;
         try collectNullChecksInBlock(
-            allocator, lines, func_line,
-            block.start_line, block.end_line, &checked[bid],
+            allocator,
+            lines,
+            func_line,
+            block.start_line,
+            block.end_line,
+            &checked[bid],
         );
     }
 }
@@ -8376,12 +8742,22 @@ fn checkLineForUnsafeUnwrap(
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
     try checkOptionalUnwrap(
-        allocator, t, line_num, idx, lines,
-        file_path, checked_set, issues,
+        allocator,
+        t,
+        line_num,
+        idx,
+        lines,
+        file_path,
+        checked_set,
+        issues,
     );
     try checkOptionalDeref(
-        allocator, t, line_num,
-        file_path, checked_set, issues,
+        allocator,
+        t,
+        line_num,
+        file_path,
+        checked_set,
+        issues,
     );
 }
 
@@ -8424,8 +8800,14 @@ fn scanBlocksForUnsafeUnwraps(
             const t = mem.trim(u8, lines[idx], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
             try checkLineForUnsafeUnwrap(
-                allocator, t, ln, idx, lines,
-                file_path, &checked[bid], issues,
+                allocator,
+                t,
+                ln,
+                idx,
+                lines,
+                file_path,
+                &checked[bid],
+                issues,
             );
         }
     }
@@ -8455,8 +8837,13 @@ fn analyzeCFGNullSafety(
     try collectNullChecksPerBlock(allocator, cfg, lines, func_line, checked);
     try propagateNullChecks(allocator, cfg, checked, num_blocks);
     try scanBlocksForUnsafeUnwraps(
-        allocator, cfg, lines, func_line,
-        file_path, checked, &issues,
+        allocator,
+        cfg,
+        lines,
+        func_line,
+        file_path,
+        checked,
+        &issues,
     );
     return issues;
 }
@@ -9471,7 +9858,9 @@ fn extractIndexSubtraction(line: []const u8) ?IdxSub {
     }
     if (sub_end == spos + 3) return null;
     const val = std.fmt.parseInt(
-        usize, line[spos + 3 .. sub_end], 10,
+        usize,
+        line[spos + 3 .. sub_end],
+        10,
     ) catch return null;
     return .{ .idx_var = idx_var, .subtrahend = val };
 }
@@ -9864,7 +10253,7 @@ fn isIncrementPattern(after_var: []const u8) bool {
         mem.startsWith(u8, after_var, "+=1") or
         mem.startsWith(u8, after_var, " += 1;") or
         (mem.startsWith(u8, after_var, " = ") and
-        mem.indexOf(u8, after_var, "+ 1") != null);
+            mem.indexOf(u8, after_var, "+ 1") != null);
 }
 
 /// Check if a var/const declaration has a positive initial value
@@ -10051,8 +10440,15 @@ fn checkSubtractionOverflow(
         if (t[i] != '[') continue;
         const end = findMatchingBracket(t, i) orelse continue;
         const found = try checkBracketSubtraction(
-            issues, allocator, path, t, line_num,
-            context_lines, current_idx, i, end,
+            issues,
+            allocator,
+            path,
+            t,
+            line_num,
+            context_lines,
+            current_idx,
+            i,
+            end,
         );
         if (found) return;
         i = end;
@@ -10308,7 +10704,8 @@ fn handleMemoryLeak(
         FileLocation{ .file = "unknown", .line = 0 };
     if (loc.line > 0) {
         msg = try std.fmt.allocPrint(
-            allocator, "memory leak at {s}:{d}",
+            allocator,
+            "memory leak at {s}:{d}",
             .{ loc.file, loc.line },
         );
         owned = true;
@@ -10411,8 +10808,12 @@ fn classifyGPALine(
         if (!matchesAnyPattern(t, cls.patterns)) continue;
         if (verbose) std.debug.print("GPA: {s}\n", .{t});
         if (cls.located) return emitLocatedIssue(
-            issues, allocator, t,
-            cls.rule, cls.message, cls.help,
+            issues,
+            allocator,
+            t,
+            cls.rule,
+            cls.message,
+            cls.help,
         );
         return emitRuntimeIssue(issues, allocator, cls.rule, cls.message, cls.help);
     }
@@ -10453,7 +10854,10 @@ fn handlePanicLine(
 ) !void {
     if (verbose) std.debug.print("PANIC: {s}\n", .{t});
     try emitTestIssue(
-        allocator, issues, t, RULE_RUNTIME_PANIC,
+        allocator,
+        issues,
+        t,
+        RULE_RUNTIME_PANIC,
         "panic detected during test execution",
         "runtime panic - check for integer overflow, null pointer, or unreachable",
     );
@@ -10467,7 +10871,10 @@ fn handleFailLine(
 ) !void {
     if (verbose) std.debug.print("TEST FAIL: {s}\n", .{t});
     try emitTestIssue(
-        allocator, issues, t, RULE_RUNTIME_TEST_FAILURE,
+        allocator,
+        issues,
+        t,
+        RULE_RUNTIME_TEST_FAILURE,
         "test failed",
         "check test assertions and expected values",
     );
@@ -10578,14 +10985,14 @@ fn isTypeFactory(line: []const u8) bool {
 
 /// Default orphan exclusion path patterns (contains-match)
 const orphan_exclude_dirs = [_][]const u8{
-    "/test/",      "/tests/",       "/testing/",
-    "localhost_testing/",
-    "/examples/",  "/example/",     "/bench/",
-    "/benchmarks/", "/demo/",       "/demos/",
-    "/samples/",   "/tools/",       "/mods/",
-    "/init/",      "/deps/",        "/vendor/",
-    "/.packages/", "/tool/",        "/user/",
-    "/apps/",      "/app/",         "/cmd/",
+    "/test/",             "/tests/",      "/testing/",
+    "localhost_testing/", "/examples/",   "/example/",
+    "/bench/",            "/benchmarks/", "/demo/",
+    "/demos/",            "/samples/",    "/tools/",
+    "/mods/",             "/init/",       "/deps/",
+    "/vendor/",           "/.packages/",  "/tool/",
+    "/user/",             "/apps/",       "/app/",
+    "/cmd/",
 };
 
 /// Check if a path matches any of the orphan exclusion directory patterns

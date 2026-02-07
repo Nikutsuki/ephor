@@ -94,7 +94,7 @@ ephor init
 Industry-standard format compatible with GCC, clang, ESLint, IntelliJ IDEA, and VS Code:
 
 ```
-src/main.zig:506:25: warning[ZA201]: silent catch {} discards error without handling
+src/main.zig:506:25: note[ZA201]: silent catch {} discards error without handling
   help: use 'catch |err| { log.err(...); return err; }' or propagate with 'try'
 ```
 
@@ -158,15 +158,16 @@ Example config:
 | **ZA105** | error | ON | Use-after-free: accessing memory after free |
 | **ZA106** | error | ON | Double-free: calling free twice on same pointer |
 
-### Error Handling (ZA2xx)
+### Error Handling Patterns (ZA2xx)
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA201** | warning | ON | Silent `catch {}` discards errors |
-| **ZA202** | error | ON | `catch unreachable` will panic |
-| **ZA203** | error | ON | `orelse unreachable` will panic |
-| **ZA204** | warning | ON | `= undefined` may leak sensitive data |
-| **ZA205** | warning | ON | Discarding error union result without try/catch |
+| **ZA201** | note | ON | Silent `catch {}` (informational) |
+| **ZA202** | note | ON | `catch unreachable` (informational) |
+| **ZA203** | note | ON | `orelse unreachable` (informational) |
+| **ZA204** | note | ON | `= undefined` may leak sensitive data (informational) |
+| **ZA205** | note | ON | Discarding error union result (informational) |
+| **ZA206** | warning | ON | `exit()` bypasses defers (memory leak!) |
 
 ### Complexity (ZA3xx)
 
@@ -482,7 +483,7 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 
 ```bash
 $ ephor check
-src/main.zig:506:25: warning[ZA201]: silent catch {} discards error without handling
+src/main.zig:506:25: note[ZA201]: silent catch {} discards error without handling
   help: use 'catch |err| { log.err(...); return err; }' or propagate with 'try'
 
 ephor summary

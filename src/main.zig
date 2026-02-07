@@ -814,11 +814,42 @@ fn hasAssignmentAfterBracket(text: []const u8) ?bool {
             if (depth > 0) depth -= 1;
             if (depth == 0) {
                 const after = mem.trimLeft(u8, text[i + 1 ..], " \t");
-                return isAssignmentOp(after);
+                if (isAssignmentOp(after)) return true;
+                // Continue through chained field.index access
+                // e.g., [col].v[row] = sum
+                if (after.len > 0 and (after[0] == '.' or after[0] == '['))
+                    return hasAssignmentAfterChain(after);
+                return false;
             }
         }
     }
     return null; // No closing bracket found
+}
+
+/// Follow chained .field and [index] access to find assignment
+fn hasAssignmentAfterChain(text: []const u8) ?bool {
+    var pos: usize = 0;
+    while (pos < text.len) {
+        if (text[pos] == '.') {
+            pos += 1;
+            while (pos < text.len and isIdent(text[pos])) pos += 1;
+        } else if (text[pos] == '[') {
+            var depth: usize = 0;
+            for (text[pos..], 0..) |c, i| {
+                if (c == '[') depth += 1 else if (c == ']') {
+                    if (depth > 0) depth -= 1;
+                    if (depth == 0) {
+                        pos += i + 1;
+                        break;
+                    }
+                }
+            } else return null;
+        } else {
+            const after = mem.trimLeft(u8, text[pos..], " \t");
+            return isAssignmentOp(after);
+        }
+    }
+    return null;
 }
 
 fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
@@ -997,7 +1028,15 @@ const ForLoopTracker = struct {
         if (!self.in_loop) return;
         const pos = mem.indexOf(u8, t, var_name) orelse return;
         const end_pos = pos + var_name.len;
-        if (end_pos < t.len and t[end_pos] == '[') {
+        if (end_pos >= t.len) return;
+        // Pattern: var_name[...] = (direct indexed assignment)
+        if (t[end_pos] == '[') {
+            if (self.start_bid) |bid| gen[bid] = true;
+            return;
+        }
+        // Pattern: var_name.field[...] = (field access + indexed)
+        // Handles: result.v[col].v[row] = sum
+        if (t[end_pos] == '.' and isAssignmentTarget(t, var_name, pos)) {
             if (self.start_bid) |bid| gen[bid] = true;
         }
     }
@@ -1327,12 +1366,42 @@ fn isIndirectlyInitialized(
     lines: []const []const u8,
     vn: []const u8,
 ) bool {
+    var in_inline_for = false;
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (hasMethodCallOnVar(t, vn)) return true;
         if (hasAsmOutputVar(t, vn)) return true;
         if (hasComptimeFieldAssignment(t, vn)) return true;
+        if (isInlineForAssignment(t, vn, &in_inline_for))
+            return true;
+    }
+    return false;
+}
+
+/// Check if variable is assigned inside an inline for loop
+/// Pattern: inline for (...) |...| { ... var_name.field = ... }
+fn isInlineForAssignment(
+    t: []const u8,
+    vn: []const u8,
+    in_inline_for: *bool,
+) bool {
+    if (mem.startsWith(u8, t, "inline for ") or
+        mem.startsWith(u8, t, "inline for("))
+    {
+        in_inline_for.* = true;
+    }
+    if (!in_inline_for.*) return false;
+    // Check if variable is being assigned via field/index access
+    if (mem.indexOf(u8, t, vn)) |pos| {
+        const end = pos + vn.len;
+        if (end < t.len and (t[end] == '.' or t[end] == '[')) {
+            if (isAssignmentTarget(t, vn, pos)) return true;
+        }
+    }
+    // Track when inline for ends (simplified: close brace at line start)
+    if (mem.eql(u8, t, "}") or mem.startsWith(u8, t, "} ")) {
+        in_inline_for.* = false;
     }
     return false;
 }
@@ -2435,7 +2504,7 @@ fn scanSingleBlock(
         if (idx >= lines.len) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
         const is_defer = mem.startsWith(u8, t, "defer ");
-        const has_free = hasRealFreePattern(t) and mem.indexOf(u8, t, alloc_name) != null;
+        const has_free = hasRealFreePattern(t) and containsIdentifier(t, alloc_name);
 
         if (is_defer and has_free) state.has_defer[bid] = true;
         if (!is_defer and !mem.startsWith(u8, t, "errdefer ") and has_free) freed = true;
@@ -4301,107 +4370,21 @@ fn trackTestBlock(
     return .{ .in_test = in_block, .depth = brace_depth };
 }
 
-/// Best-effort operations where silent catch {} is acceptable
-/// NOTE: This is HEURISTIC-BASED on common library patterns, not Zig language semantics.
-/// Categories: filesystem, cleanup, collection, writer, network, threading
-const best_effort_ops = [_][]const u8{
-    // Filesystem - might already exist/not exist
-    "makePath(",              "makeDir(",              "deleteFile(",            "deleteDir(",
-    "deleteTree(",            "unlink(",               "remove(",                "rename(",
-    "symLink(",
-    // Cleanup - best effort during teardown
-                  ".close(",               ".deinit(",               ".destroy(",
-    ".free(",                 ".flush(",               ".sync(",                 ".reset(",
-    ".clear(",
-    // Collection - partial success acceptable
-                   ".append(",              ".put(",                  ".appendSlice(",
-    ".appendAssumeCapacity(", ".ensureTotalCapacity(", ".ensureUnusedCapacity(",
-    // Writer - logging/debugging can fail
-    ".print(",
-    ".writeAll(",             ".writeByte(",           ".write(",                "std.debug.print(",
-    "writePositionalAll(",    "writeStreamingAll(",    "writeAllBuffer(",
-    // Network - transient failures expected
-           ".send(",
-    ".recv(",                 ".connect(",             ".bind(",                 ".stream.write(",
-    // Locking - best effort
-    ".lock(",                 ".unlock(",
-    // State changes - best effort (display links, services)
-                 ".start(",                ".stop(",
-    // Threading - community pattern from Zig std lib (std/Thread.zig, std/Thread/Condition.zig)
-    // Event loops: missed wakeups are self-correcting on next iteration
-    // Zig std lib uses catch {} for yield(), timedWait(); ghostty uses .notify() catch {}
-    ".setName(",              ".notify(",              ".wakeup(",               ".signal(",
-    ".yield(",                ".timedWait(",
-    // Reader/stream - partial reads are best-effort
-              ".fillMore(",             ".skipUntilDelimiter",
-    ".discardDelimiter",
-    // Display/format - rendering failures are non-fatal
-         ".formatDiagram(",       ".printString(",
-    // State changes - setting attributes/selection/callbacks best-effort
-             ".setSelection(",
-    ".setAttribute(",         ".preeditCallback(",
-    // Error logging - logging an error that already happened
-        ".fromShader(",           ".fromProgram(",
-    // System calls - OS tuning best-effort
-    "setrlimit(",
-};
-
-/// Check if catch {} is on a continuation line of a multi-line function call.
-/// When a line starts with ) before the catch, the actual function call is on
-/// previous lines. These are overwhelmingly best-effort patterns in practice.
-/// Examples:
-///   ) catch {},      // multi-line .print(...\n) catch {}
-///   }, .on) catch {}; // multi-line .line(.{...}, .on) catch {};
-fn isMultiLineCatchContinuation(t: []const u8) bool {
-    // The trimmed line must start with a closing delimiter, indicating it's
-    // a continuation of a multi-line expression
-    if (t.len == 0) return false;
-    if (t[0] != ')' and t[0] != '}' and t[0] != ']') return false;
-    // And must contain catch {} or catch |_| {}
-    if (mem.indexOf(u8, t, "catch {}") != null) return true;
-    if (mem.indexOf(u8, t, "catch |_| {}") != null) return true;
-    return false;
-}
-
-/// Check if a silent catch is for a best-effort operation
-fn isBestEffortOperation(t: []const u8) bool {
-    for (best_effort_ops) |op| {
-        if (mem.indexOf(u8, t, op) != null) return true;
-    }
-    return false;
-}
-
-/// Check if we're in a cleanup function (deinit, close, destroy, cleanup, shutdown)
-fn isCleanupFunctionContext(func_name: []const u8) bool {
-    const cleanup_patterns = [_][]const u8{
-        "deinit",
-        "close",
-        "destroy",
-        "cleanup",
-        "shutdown",
-        "teardown",
-        "dispose",
-        "release",
-    };
-    for (cleanup_patterns) |pattern| {
-        if (mem.indexOf(u8, func_name, pattern) != null) return true;
-    }
-    return false;
-}
-
 /// Check for silent catch patterns (ZA201)
-/// Skip warning in contexts where best-effort is intentional
+/// Skip note in defer/errdefer contexts (best-effort cleanup)
 fn checkSilentCatch(t: []const u8, path: []const u8, line: usize) ?Issue {
-    return checkSilentCatchWithContext(t, path, line, "");
-}
-
-/// Context-aware silent catch check
-fn isSilentCatchExempt(t: []const u8, func_name: []const u8) bool {
     if (mem.startsWith(u8, t, "defer ") or
-        mem.startsWith(u8, t, "errdefer ")) return true;
-    if (isBestEffortOperation(t)) return true;
-    if (isMultiLineCatchContinuation(t)) return true;
-    return isCleanupFunctionContext(func_name);
+        mem.startsWith(u8, t, "errdefer ")) return null;
+    const found = findSilentCatchCol(t) orelse return null;
+    return .{
+        .file = path,
+        .line = line,
+        .col = found.col + 1,
+        .severity = .note,
+        .rule = RULE_SILENT_CATCH,
+        .message = found.msg,
+        .help = "use catch |err| with logging, or propagate with try",
+    };
 }
 
 fn findSilentCatchCol(t: []const u8) ?struct { col: usize, msg: []const u8 } {
@@ -4413,25 +4396,6 @@ fn findSilentCatchCol(t: []const u8) ?struct { col: usize, msg: []const u8 } {
             return .{ .col = col, .msg = "silent catch |_| {} discards error" };
     }
     return null;
-}
-
-fn checkSilentCatchWithContext(
-    t: []const u8,
-    path: []const u8,
-    line: usize,
-    func_name: []const u8,
-) ?Issue {
-    if (isSilentCatchExempt(t, func_name)) return null;
-    const found = findSilentCatchCol(t) orelse return null;
-    return .{
-        .file = path,
-        .line = line,
-        .col = found.col + 1,
-        .severity = .warning,
-        .rule = RULE_SILENT_CATCH,
-        .message = found.msg,
-        .help = "use catch |err| with logging, or propagate with try",
-    };
 }
 
 /// Extract variable name from "var x" or "const x" declaration (for ZA204)
@@ -5176,15 +5140,14 @@ fn checkLineErrors(
     ln: usize,
     skip_undefined: bool,
     in_defer: bool,
-    func_name: []const u8,
     pending: *?PendingUndefined,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
 ) !void {
-    // ZA201 (silent catch) - only from line-based analyzer (not duplicated in CFG)
-    // ZA202/ZA203 are handled only in analyzeCFGErrors to support test context detection
+    // ZA201 (silent catch) - only from line-based analyzer
+    // ZA202/ZA203 are handled only in analyzeCFGErrors
     if (!in_defer) {
-        if (checkSilentCatchWithContext(t, path, ln, func_name)) |i| {
+        if (checkSilentCatch(t, path, ln)) |i| {
             try issues.append(allocator, i);
         }
     }
@@ -5307,7 +5270,6 @@ fn analyzeFileErrors(
             line_num,
             s.skip_undefined,
             state.in_defer_block,
-            state.current_func_name,
             &state.pending_undefined,
             issues,
             allocator,
@@ -7748,7 +7710,7 @@ fn checkCatchUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .warning,
+        .severity = .note,
         .rule = RULE_CATCH_UNREACHABLE,
         .message = "catch unreachable will panic on error",
         .help = "use explicit error handling",
@@ -7774,7 +7736,7 @@ fn checkOrelseUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .warning,
+        .severity = .note,
         .rule = RULE_ORELSE_UNREACHABLE,
         .message = "orelse unreachable will panic",
         .help = "use explicit null handling",
@@ -11220,9 +11182,9 @@ fn printHelp() void {
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
         \\                     ZA103: alloc-no-errdefer, ZA104: memory-leak,
         \\                     ZA105: use-after-free, ZA106: double-free)
-        \\  ZA2xx  Errors     (ZA201: silent-catch, ZA202: catch-unreachable,
-        \\                     ZA203: orelse-unreachable, ZA204: undefined-usage,
-        \\                     ZA205: ignored-error)
+        \\  ZA2xx  ErrHandle  (ZA201: silent-catch, ZA202: catch-unreachable,
+        \\                     ZA203: orelse-unreachable, ZA204: undefined,
+        \\                     ZA205: ignored-error, ZA206: exit-bypasses-defer)
         \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap, ZA802: unsafe-deref)
         \\  ZA9xx  Panic      (ZA901: decrement-no-guard, ZA902: subtraction-overflow,
         \\                     ZA903: index-arithmetic)

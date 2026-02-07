@@ -19,7 +19,7 @@ pub const RULE_MEMORY_LEAK = "ZA104";
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
 
-// ZA2xx - Error handling
+// ZA2xx - Error handling patterns (informational notes + ZA206 warning)
 pub const RULE_SILENT_CATCH = "ZA201";
 pub const RULE_CATCH_UNREACHABLE = "ZA202";
 pub const RULE_ORELSE_UNREACHABLE = "ZA203";

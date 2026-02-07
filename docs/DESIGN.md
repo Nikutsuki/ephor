@@ -123,7 +123,7 @@ No separate "deep" mode. All checks run together. Some use pattern matching (fas
 **Rule Categories**:
 ```
 ZA1xx  Memory      Allocation/deallocation checks
-ZA2xx  Errors      Error handling checks
+ZA2xx  ErrHandle   Error handling patterns (notes + ZA206 warning)
 ZA3xx  Complexity  Code complexity metrics
 ZA4xx  Unused      Dead code detection
 ZA5xx  Structure   Import graph analysis
@@ -159,24 +159,25 @@ All checks are fast enough for regular development. No need for separate modes.
 | ZA105 | ON | Use-after-free detected | Memory safety |
 | ZA106 | ON | Double-free detected | Memory safety |
 
-### ZA2xx Error Handling
+### ZA2xx Error Handling Patterns
 
-| Rule | Default | Description | Rationale |
-|------|---------|-------------|-----------|
-| ZA201 | ON | `catch {}` or `catch \|_\| {}` with empty body | Silent error swallowing is bad |
-| ZA202 | ON | `catch unreachable` | Will panic if error occurs |
-| ZA203 | ON | `orelse unreachable` | Will panic if null |
-| ZA204 | ON | `= undefined` initialization | May leak sensitive data |
-| ZA205 | ON | Error union result discarded without `try`/`catch` | Ignored errors cause bugs |
+| Rule | Default | Severity | Description | Rationale |
+|------|---------|----------|-------------|-----------|
+| ZA201 | ON | note | `catch {}` or `catch \|_\| {}` with empty body | Informational - often intentional in Zig |
+| ZA202 | ON | note | `catch unreachable` | Informational - assertion pattern |
+| ZA203 | ON | note | `orelse unreachable` | Informational - assertion pattern |
+| ZA204 | ON | note | `= undefined` initialization | May leak sensitive data |
+| ZA205 | ON | note | Error union result discarded without `try`/`catch` | Informational |
+| ZA206 | ON | warning | `std.process.exit()` bypasses defers | Causes resource leaks |
 
 ### ZA3xx Complexity
 
 | Rule | Default | Threshold | Description |
 |------|---------|-----------|-------------|
 | ZA301 | ON | 50 lines | Function exceeds max lines |
-| ZA302 | ON | 4 levels | Function exceeds max nesting |
-| ZA303 | ON | 5 params | Function has too many parameters |
-| ZA304 | ON | 10 | Function has too many branches |
+| ZA302 | ON | 3 levels | Function exceeds max nesting |
+| ZA303 | ON | 4 params | Function has too many parameters |
+| ZA304 | ON | 12 | Function has too many branches |
 
 **Threshold Rationale**:
 - 50 lines: Fits on one screen, comprehensible at a glance

@@ -12111,8 +12111,11 @@ fn patchBuildZig(allocator: Allocator) !?usize {
 /// If install_version is provided, upgrades to that specific version;
 /// otherwise defaults to the binary's own version (EPHOR_VERSION).
 fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
-    const ver = install_version orelse EPHOR_VERSION;
-    const package_url = try buildPackageUrl(allocator, install_version);
+    // If no explicit version, fetch the latest from Bitbucket tags API
+    const fetched_ver = if (install_version == null) fetchLatestVersion(allocator) else null;
+    defer if (fetched_ver) |fv| allocator.free(fv);
+    const ver = install_version orelse (fetched_ver orelse EPHOR_VERSION);
+    const package_url = try buildPackageUrl(allocator, ver);
     defer allocator.free(package_url);
 
     // Check if build.zig.zon exists and has ephor dependency
@@ -12243,7 +12246,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.9.3";
+const EPHOR_VERSION = "0.9.4";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -12266,7 +12269,7 @@ fn checkForUpdates(allocator: Allocator) void {
     if (!isNewerVersion(EPHOR_VERSION, latest)) return;
     update_notification = std.fmt.allocPrint(
         allocator,
-        "\nhint: ephor v{s} available (current: v{s}). Run: ephor upgrade\n",
+        "\nhint: ephor v{s} available (current: v{s}). Run: zig build ephor-upgrade\n",
         .{ latest, EPHOR_VERSION },
     ) catch null;
 }
@@ -12331,9 +12334,28 @@ fn writeCacheFile(path: []const u8, timestamp: i64, version: []const u8) void {
     file.writeAll("\n") catch return;
 }
 
-/// Fetch latest version from Bitbucket by running curl and parsing
-/// the .version field from build.zig.zon.
+/// Fetch latest version from the Bitbucket tags API (not cached raw files).
+/// Falls back to parsing build.zig.zon from main branch if tags API fails.
 fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
+    // Primary: use tags API (sorted by date, most recent first)
+    const api_url = "https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1";
+    const api_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "curl", "-sL", "--max-time", "5", api_url },
+    }) catch return fetchVersionFromZon(allocator);
+    defer allocator.free(api_result.stdout);
+    defer allocator.free(api_result.stderr);
+
+    if (api_result.stdout.len > 0) {
+        if (parseVersionFromTagsApi(allocator, api_result.stdout)) |ver| return ver;
+    }
+
+    // Fallback: parse build.zig.zon from main branch
+    return fetchVersionFromZon(allocator);
+}
+
+/// Fetch version by parsing build.zig.zon from the main branch (CDN-cached fallback).
+fn fetchVersionFromZon(allocator: Allocator) ?[]const u8 {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "curl", "-sL", "--max-time", "3", EPHOR_VERSION_URL },
@@ -12343,6 +12365,25 @@ fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
 
     if (result.stdout.len == 0) return null;
     return parseVersionFromZon(allocator, result.stdout);
+}
+
+/// Parse version from Bitbucket tags API JSON response.
+/// Looks for `"name": "vX.Y.Z"` pattern.
+fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
+    // Find "name": "vX.Y.Z" — the first match is the latest tag
+    const name_marker = "\"name\":";
+    const idx = mem.indexOf(u8, json, name_marker) orelse return null;
+    var pos = idx + name_marker.len;
+    // Skip whitespace
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t')) : (pos += 1) {}
+    if (pos >= json.len or json[pos] != '"') return null;
+    pos += 1; // skip opening quote
+    const end = mem.indexOfPos(u8, json, pos, "\"") orelse return null;
+    const tag_name = json[pos..end];
+    // Strip leading 'v' if present
+    const ver = if (tag_name.len > 0 and tag_name[0] == 'v') tag_name[1..] else tag_name;
+    if (ver.len == 0) return null;
+    return allocator.dupe(u8, ver) catch null;
 }
 
 /// Parse `.version = "X.Y.Z"` from build.zig.zon content.

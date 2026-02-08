@@ -5501,7 +5501,7 @@ fn checkSilentCatch(t: []const u8, path: []const u8, line: usize) ?Issue {
         .file = path,
         .line = line,
         .col = found.col + 1,
-        .severity = .note,
+        .severity = .warning,
         .rule = RULE_SILENT_CATCH,
         .message = found.msg,
         .help = "use catch |err| with logging, or propagate with try",
@@ -9015,7 +9015,7 @@ fn checkCatchUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .note,
+        .severity = .warning,
         .rule = RULE_CATCH_UNREACHABLE,
         .message = "catch unreachable will panic on error",
         .help = "use explicit error handling",
@@ -9041,7 +9041,7 @@ fn checkOrelseUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .note,
+        .severity = .warning,
         .rule = RULE_ORELSE_UNREACHABLE,
         .message = "orelse unreachable will panic",
         .help = "use explicit null handling",
@@ -12159,7 +12159,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.8.7";
+const EPHOR_VERSION = "0.8.8";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -12432,7 +12432,7 @@ fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
     var added = std.StringHashMap(void).init(allocator);
     defer added.deinit();
     for (cfg.entries.items) |e| {
-        added.put(e, {}) catch {};
+        try added.put(e, {});
     }
 
     var lines = mem.splitScalar(u8, content, '\n');
@@ -12811,7 +12811,7 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
 
     // Update added set with build.zig entries
     for (cfg.entries.items) |e| {
-        added.put(e, {}) catch {};
+        try added.put(e, {});
     }
 
     // Scan common multi-entry directories

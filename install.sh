@@ -21,16 +21,23 @@ if [ ! -f "build.zig" ]; then
 fi
 
 if [ ! -f "build.zig.zon" ]; then
-    echo "error: no build.zig.zon found in current directory"
-    echo ""
-    echo "  Ephor requires a Zig project with build.zig and build.zig.zon."
-    echo "  To initialize a Zig project, run:"
-    echo ""
-    echo "    zig init"
-    echo ""
-    echo "  Then re-run the install:"
-    echo "    curl -fsSL ${REPO}/raw/main/install.sh | sh"
-    exit 1
+    PROJECT_NAME=$(basename "$(pwd)" | tr '-' '_' | tr '[:upper:]' '[:lower:]')
+    echo "No build.zig.zon found, creating one..."
+    cat > build.zig.zon << ZONEOF
+.{
+    .name = .${PROJECT_NAME},
+    .version = "0.0.0",
+    .fingerprint = 0x0,
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+ZONEOF
+    # Zig computes the correct fingerprint - capture it
+    SUGGESTED=$(zig build 2>&1 | grep -o 'use this value: 0x[0-9a-f]*' | sed 's/use this value: //')
+    if [ -n "$SUGGESTED" ]; then
+        sed -i.bak "s/\.fingerprint = 0x0/.fingerprint = ${SUGGESTED}/" build.zig.zon
+        rm -f build.zig.zon.bak
+    fi
+    echo "Created build.zig.zon for project '${PROJECT_NAME}'"
 fi
 
 # Fetch latest tagged version from Bitbucket tags API (not cached raw files)

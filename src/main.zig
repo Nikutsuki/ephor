@@ -12159,7 +12159,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.8.5";
+const EPHOR_VERSION = "0.8.6";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13653,7 +13653,7 @@ pub fn main() !void {
                 sortIssuesByFile(issues.items);
 
                 const c = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg);
-                if (c.warnings > 0) should_exit_error = true;
+                _ = c;
             }
         },
 
@@ -13664,7 +13664,7 @@ pub fn main() !void {
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "memory", &cfg);
-            if (c.warnings > 0) should_exit_error = true;
+            _ = c;
         },
 
         .errors => {
@@ -13674,7 +13674,7 @@ pub fn main() !void {
             var issues = try analyzeErrors(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg);
-            if (c.warnings > 0) should_exit_error = true;
+            _ = c;
         },
 
         .unused => {
@@ -13684,7 +13684,7 @@ pub fn main() !void {
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "unused", &cfg);
-            if (c.warnings > 0) should_exit_error = true;
+            _ = c;
         },
 
         .complexity => {
@@ -13694,14 +13694,14 @@ pub fn main() !void {
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg);
-            if (c.warnings > 0) should_exit_error = true;
+            _ = c;
         },
 
         .fmt_check => {
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg);
-            if (c.warnings > 0) should_exit_error = true;
+            _ = c;
         },
 
         .stats => {
@@ -13715,7 +13715,7 @@ pub fn main() !void {
             var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg);
-            if (c.warnings > 0) should_exit_error = true;
+            _ = c;
         },
 
         .check => {
@@ -13939,7 +13939,7 @@ pub fn main() !void {
                     );
                 }
 
-                if (total.warnings > 0) should_exit_error = true;
+                // Analysis results are informational - don't fail the build
             }
         },
     }

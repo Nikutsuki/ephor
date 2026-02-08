@@ -4,17 +4,44 @@
 
 set -e
 
-EPHOR_URL="https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz"
+REPO="https://bitbucket.org/rhyoslabs/ephor"
 
 # Check we're in a Zig project
 if [ ! -f "build.zig" ]; then
-    echo "Error: build.zig not found. Run this from your Zig project root."
+    echo "error: no build.zig found in current directory"
+    echo ""
+    echo "  Ephor requires a Zig project with build.zig and build.zig.zon."
+    echo "  To initialize a Zig project, run:"
+    echo ""
+    echo "    zig init"
+    echo ""
+    echo "  Then re-run the install:"
+    echo "    curl -fsSL ${REPO}/raw/main/install.sh | sh"
     exit 1
 fi
 
 if [ ! -f "build.zig.zon" ]; then
-    echo "Error: build.zig.zon not found. Run this from your Zig project root."
+    echo "error: no build.zig.zon found in current directory"
+    echo ""
+    echo "  Ephor requires a Zig project with build.zig and build.zig.zon."
+    echo "  To initialize a Zig project, run:"
+    echo ""
+    echo "    zig init"
+    echo ""
+    echo "  Then re-run the install:"
+    echo "    curl -fsSL ${REPO}/raw/main/install.sh | sh"
     exit 1
+fi
+
+# Fetch latest tagged version from Bitbucket API
+LATEST_TAG=$(curl -sL "${REPO}/raw/main/build.zig.zon" | grep '\.version' | head -1 | sed 's/.*"\([0-9][0-9.]*\)".*/\1/')
+
+if [ -z "$LATEST_TAG" ]; then
+    echo "warning: could not detect latest version, using main branch"
+    EPHOR_URL="${REPO}/get/main.tar.gz"
+else
+    echo "Installing ephor v${LATEST_TAG}..."
+    EPHOR_URL="${REPO}/get/v${LATEST_TAG}.tar.gz"
 fi
 
 echo "Adding ephor dependency..."

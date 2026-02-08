@@ -12159,7 +12159,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.8.3";
+const EPHOR_VERSION = "0.8.4";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13322,20 +13322,31 @@ fn shouldPrintIssue(issue: Issue, cfg: *const Config) bool {
 
 /// Print issues and return count of actionable issues (warnings + errors only).
 /// Notes are printed but do NOT count toward the exit code.
+const PrintCounts = struct {
+    warnings: usize = 0,
+    notes: usize = 0,
+
+    fn add(self: PrintCounts, other: PrintCounts) PrintCounts {
+        return .{
+            .warnings = self.warnings + other.warnings,
+            .notes = self.notes + other.notes,
+        };
+    }
+};
+
 fn printIssues(
     issues: []const Issue,
     base_path: []const u8,
     format: OutputFormat,
     title: []const u8,
     cfg: *const Config,
-) usize {
+) PrintCounts {
     var total_printable: usize = 0;
-    var actionable_count: usize = 0;
+    var counts = PrintCounts{};
     for (issues) |issue| {
-        if (shouldPrintIssue(issue, cfg)) {
-            total_printable += 1;
-            if (issue.severity != .note) actionable_count += 1;
-        }
+        if (!shouldPrintIssue(issue, cfg)) continue;
+        total_printable += 1;
+        if (issue.severity == .note) counts.notes += 1 else counts.warnings += 1;
     }
     if (format == .json) {
         std.debug.print(
@@ -13355,7 +13366,26 @@ fn printIssues(
             issue.printText(base_path);
         }
     }
-    return actionable_count;
+    return counts;
+}
+
+fn printResultFooter(total: PrintCounts) void {
+    if (total.warnings == 0 and total.notes == 0) return;
+    std.debug.print("\nephor: ", .{});
+    if (total.warnings > 0) {
+        std.debug.print("{d} warning{s}", .{
+            total.warnings,
+            if (total.warnings == 1) "" else "s",
+        });
+        if (total.notes > 0) std.debug.print(", ", .{});
+    }
+    if (total.notes > 0) {
+        std.debug.print("{d} note{s}", .{
+            total.notes,
+            if (total.notes == 1) "" else "s",
+        });
+    }
+    std.debug.print(" found\n", .{});
 }
 
 fn printStats(s: ProjectStats, format: OutputFormat) void {
@@ -13622,8 +13652,8 @@ pub fn main() !void {
                 defer deinitIssues(&issues, alloc);
                 sortIssuesByFile(issues.items);
 
-                const count = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg);
-                if (count > 0) should_exit_error = true;
+                const c = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg);
+                if (c.warnings > 0) should_exit_error = true;
             }
         },
 
@@ -13633,8 +13663,8 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const count = printIssues(issues.items, base_path, cfg.format, "memory", &cfg);
-            if (count > 0) should_exit_error = true;
+            const c = printIssues(issues.items, base_path, cfg.format, "memory", &cfg);
+            if (c.warnings > 0) should_exit_error = true;
         },
 
         .errors => {
@@ -13643,8 +13673,8 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeErrors(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const count = printIssues(issues.items, base_path, cfg.format, "errors", &cfg);
-            if (count > 0) should_exit_error = true;
+            const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg);
+            if (c.warnings > 0) should_exit_error = true;
         },
 
         .unused => {
@@ -13653,8 +13683,8 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const count = printIssues(issues.items, base_path, cfg.format, "unused", &cfg);
-            if (count > 0) should_exit_error = true;
+            const c = printIssues(issues.items, base_path, cfg.format, "unused", &cfg);
+            if (c.warnings > 0) should_exit_error = true;
         },
 
         .complexity => {
@@ -13663,15 +13693,15 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
-            const count = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg);
-            if (count > 0) should_exit_error = true;
+            const c = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg);
+            if (c.warnings > 0) should_exit_error = true;
         },
 
         .fmt_check => {
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
-            const count = printIssues(issues.items, base_path, cfg.format, "format", &cfg);
-            if (count > 0) should_exit_error = true;
+            const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg);
+            if (c.warnings > 0) should_exit_error = true;
         },
 
         .stats => {
@@ -13684,8 +13714,8 @@ pub fn main() !void {
         .runtime => {
             var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
-            const count = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg);
-            if (count > 0) should_exit_error = true;
+            const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg);
+            if (c.warnings > 0) should_exit_error = true;
         },
 
         .check => {
@@ -13857,19 +13887,30 @@ pub fn main() !void {
                     &cfg,
                 );
 
+                // Accumulate totals
+                const total = orphan_count
+                    .add(mem_count).add(ignored_err_count)
+                    .add(err_count).add(null_safety_count)
+                    .add(panic_count).add(unused_count)
+                    .add(cx_count).add(fmt_count)
+                    .add(naming_count).add(style_count);
+
                 if (cfg.show_summary) {
                     printSummary(.{
-                        .orphan = orphan_count,
-                        .memory = mem_count,
-                        .err = err_count + ignored_err_count,
-                        .unused = unused_count,
-                        .complexity = cx_count,
-                        .fmt = fmt_count,
-                        .style = style_count + naming_count,
-                        .null_safety = null_safety_count,
-                        .panic = panic_count,
+                        .orphan = orphan_count.warnings,
+                        .memory = mem_count.warnings,
+                        .err = err_count.warnings + ignored_err_count.warnings,
+                        .unused = unused_count.warnings,
+                        .complexity = cx_count.warnings,
+                        .fmt = fmt_count.warnings,
+                        .style = style_count.warnings + naming_count.warnings,
+                        .null_safety = null_safety_count.warnings,
+                        .panic = panic_count.warnings,
                     }, stats, cfg.format);
                 }
+
+                // Print summary footer
+                printResultFooter(total);
 
                 // Export issues to file if requested
                 if (cfg.export_path) |export_path| {
@@ -13898,11 +13939,7 @@ pub fn main() !void {
                     );
                 }
 
-                const total = orphan_count + mem_count +
-                    err_count + ignored_err_count +
-                    unused_count + cx_count + fmt_count +
-                    style_count + naming_count + null_safety_count + panic_count;
-                if (total > 0) should_exit_error = true;
+                if (total.warnings > 0) should_exit_error = true;
             }
         },
     }

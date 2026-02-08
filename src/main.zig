@@ -6310,7 +6310,7 @@ fn reportEndOfFileIssues(
 /// ZA206: Check for std.process.exit() bypassing defers
 fn checkExitBypassesDefer(
     t: []const u8,
-    content: []const u8,
+    _: []const u8,
     path: []const u8,
     line_num: usize,
     has_defer: bool,
@@ -6323,7 +6323,6 @@ fn checkExitBypassesDefer(
 
     const exit_pos = mem.indexOf(u8, t, "exit(") orelse 0;
     if (isInsideString(t, exit_pos)) return null;
-    if (isInlineDisabled(content, line_num, RULE_EXIT_BYPASSES_DEFER)) return null;
 
     return .{
         .file = path,
@@ -11155,27 +11154,29 @@ fn isCImportFile(file_path: []const u8, content: []const u8) bool {
     return false;
 }
 
-/// Check if current line has disable directive for rule
-fn checkSameLineDisable(line: []const u8, rule: []const u8) bool {
-    if (mem.indexOf(u8, line, "// ephor:disable") == null) return false;
+/// Check if a line has an ignore/disable directive for rule
+/// Supports: // ephor:ignore ZA201, // ephor:disable ZA201
+fn checkLineIgnore(line: []const u8, rule: []const u8) bool {
+    // Check for ephor:ignore or ephor:disable on this line
+    const ignore_pos = mem.indexOf(u8, line, "// ephor:ignore");
+    const disable_pos = mem.indexOf(u8, line, "// ephor:disable");
+    const pos = ignore_pos orelse disable_pos orelse return false;
+    _ = pos;
+    // If the rule is mentioned, it's disabled
     if (mem.indexOf(u8, line, rule) != null) return true;
-    // Check for specific rule disable (with rule after directive)
-    const has_specific = mem.indexOf(u8, line, "ephor:disable ") != null;
+    // If no specific rule after directive, it disables all rules on this line
+    // But not if it's a variant like "disable-next-line"
+    const has_specific_ignore = mem.indexOf(u8, line, "ephor:ignore ") != null;
+    const has_specific_disable = mem.indexOf(u8, line, "ephor:disable ") != null;
     const has_variant = mem.indexOf(u8, line, "ephor:disable-") != null;
-    return !has_specific and !has_variant;
+    if (has_specific_ignore or has_specific_disable or has_variant) return false;
+    return true;
 }
 
-/// Check if previous line has disable-next-line directive for rule
-fn checkPrevLineDisable(pl: []const u8, rule: []const u8) bool {
-    if (mem.indexOf(u8, pl, "// ephor:disable-next-line") == null) return false;
-    if (mem.indexOf(u8, pl, rule) != null) return true;
-    const disable_idx = mem.indexOf(u8, pl, "disable-next-line") orelse return false;
-    const after = pl[disable_idx + 17 ..];
-    const trimmed = mem.trim(u8, after, " \t");
-    return trimmed.len == 0 or trimmed[0] == '/';
-}
-
-/// Check if a line has an inline disable directive for the given rule
+/// Check if a line has an inline ignore/disable directive for the given rule.
+/// Same-line: // ephor:ignore ZA201 (after code) suppresses that line only.
+/// Previous line: // ephor:ignore ZA201 (comment-only line) suppresses next line.
+/// Also supports: // ephor:disable-next-line ZA201 (explicit next-line form).
 fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool {
     var current_line: usize = 1;
     var lines = mem.splitScalar(u8, content, '\n');
@@ -11186,9 +11187,12 @@ fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool
             current_line += 1;
         }
         if (current_line != line_num) continue;
-        if (checkSameLineDisable(line, rule)) return true;
+        // Same line: // ephor:ignore ZA201 (works on any line with the directive)
+        if (checkLineIgnore(line, rule)) return true;
+        // Previous line: only if it's a comment-only line (no code before //)
         if (prev_line) |pl| {
-            if (checkPrevLineDisable(pl, rule)) return true;
+            const trimmed = mem.trimLeft(u8, pl, " \t");
+            if (mem.startsWith(u8, trimmed, "//") and checkLineIgnore(pl, rule)) return true;
         }
         break;
     }
@@ -12159,7 +12163,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.8.8";
+const EPHOR_VERSION = "0.8.9";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13122,10 +13126,9 @@ fn printHelp() void {
         \\    }
         \\  }
         \\
-        \\INLINE DISABLE (in source code):
-        \\  // ephor:disable ZA201           (disable rule on this line)
-        \\  // ephor:disable-next-line ZA201 (disable rule on next line)
-        \\  // ephor:disable                 (disable all rules on line)
+        \\INLINE IGNORE (in source code):
+        \\  // ephor:ignore ZA201  (suppress this rule on current or next line)
+        \\  // ephor:ignore        (suppress all rules on current or next line)
         \\
         \\RULE IDS:
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
@@ -13285,6 +13288,7 @@ fn exportIssues(
     export_path: []const u8,
     all_issues: []const Issue,
     cfg: *const Config,
+    graph: ?*const ImportGraph,
 ) !void {
     var file = try std.fs.cwd().createFile(export_path, .{});
     defer file.close();
@@ -13299,7 +13303,7 @@ fn exportIssues(
     try writer.print("# Total issues: {d}\n\n", .{all_issues.len});
 
     for (all_issues) |issue| {
-        if (!shouldPrintIssue(issue, cfg)) continue;
+        if (!shouldPrintIssue(issue, cfg, graph)) continue;
         try writeExportIssue(allocator, writer, issue);
     }
     try file.writeAll(output.items);
@@ -13310,13 +13314,19 @@ fn exportIssues(
 // ============================================================================
 
 /// Check if issue should be printed based on config filters
-fn shouldPrintIssue(issue: Issue, cfg: *const Config) bool {
+fn shouldPrintIssue(issue: Issue, cfg: *const Config, graph: ?*const ImportGraph) bool {
     // Runtime issues (ZR1xx) use absolute paths from stack traces - skip path filter
     const is_runtime_issue = std.mem.startsWith(u8, issue.rule, "ZR1");
     if (!is_runtime_issue and !std.mem.startsWith(u8, issue.file, cfg.path)) return false;
     if (cfg.isRuleDisabled(issue.rule)) return false;
     if (!is_runtime_issue and cfg.isPathExcluded(issue.file)) return false;
     if (isKnownIssue(issue, cfg)) return false;
+    // Check inline ignore/disable comments in source
+    if (graph) |g| {
+        if (g.files.get(issue.file)) |analysis| {
+            if (isInlineDisabled(analysis.content, issue.line, issue.rule)) return false;
+        }
+    }
     return true;
 }
 
@@ -13340,11 +13350,12 @@ fn printIssues(
     format: OutputFormat,
     title: []const u8,
     cfg: *const Config,
+    graph: ?*const ImportGraph,
 ) PrintCounts {
     var total_printable: usize = 0;
     var counts = PrintCounts{};
     for (issues) |issue| {
-        if (!shouldPrintIssue(issue, cfg)) continue;
+        if (!shouldPrintIssue(issue, cfg, graph)) continue;
         total_printable += 1;
         if (issue.severity == .note) counts.notes += 1 else counts.warnings += 1;
     }
@@ -13355,14 +13366,14 @@ fn printIssues(
         );
         var printed: usize = 0;
         for (issues) |issue| {
-            if (!shouldPrintIssue(issue, cfg)) continue;
+            if (!shouldPrintIssue(issue, cfg, graph)) continue;
             printed += 1;
             issue.printJson(base_path, printed == total_printable);
         }
         std.debug.print("  ]\n}}\n", .{});
     } else {
         for (issues) |issue| {
-            if (!shouldPrintIssue(issue, cfg)) continue;
+            if (!shouldPrintIssue(issue, cfg, graph)) continue;
             issue.printText(base_path);
         }
     }
@@ -13652,7 +13663,7 @@ pub fn main() !void {
                 defer deinitIssues(&issues, alloc);
                 sortIssuesByFile(issues.items);
 
-                const c = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg);
+                const c = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg, &g);
                 _ = c;
             }
         },
@@ -13663,7 +13674,7 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "memory", &cfg);
+            const c = printIssues(issues.items, base_path, cfg.format, "memory", &cfg, &g);
             _ = c;
         },
 
@@ -13673,7 +13684,7 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeErrors(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg);
+            const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg, &g);
             _ = c;
         },
 
@@ -13683,7 +13694,7 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "unused", &cfg);
+            const c = printIssues(issues.items, base_path, cfg.format, "unused", &cfg, &g);
             _ = c;
         },
 
@@ -13693,14 +13704,14 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg);
+            const c = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg, &g);
             _ = c;
         },
 
         .fmt_check => {
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg);
+            const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg, null);
             _ = c;
         },
 
@@ -13714,7 +13725,7 @@ pub fn main() !void {
         .runtime => {
             var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg);
+            const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg, null);
             _ = c;
         },
 
@@ -13797,6 +13808,7 @@ pub fn main() !void {
                     cfg.format,
                     "orphans",
                     &cfg,
+                    &g,
                 );
                 // Filter cfg_mem_issues by rule category
                 var mem_only_issues = std.ArrayListUnmanaged(Issue){};
@@ -13822,6 +13834,7 @@ pub fn main() !void {
                     cfg.format,
                     "memory",
                     &cfg,
+                    &g,
                 );
                 const ignored_err_count = printIssues(
                     ignored_err_issues.items,
@@ -13829,6 +13842,7 @@ pub fn main() !void {
                     cfg.format,
                     "errors",
                     &cfg,
+                    &g,
                 );
                 const err_count = printIssues(
                     err_issues.items,
@@ -13836,6 +13850,7 @@ pub fn main() !void {
                     cfg.format,
                     "errors",
                     &cfg,
+                    &g,
                 );
                 const null_safety_count = printIssues(
                     null_safety_issues.items,
@@ -13843,6 +13858,7 @@ pub fn main() !void {
                     cfg.format,
                     "null-safety",
                     &cfg,
+                    &g,
                 );
                 const panic_count = printIssues(
                     panic_issues.items,
@@ -13850,6 +13866,7 @@ pub fn main() !void {
                     cfg.format,
                     "panic",
                     &cfg,
+                    &g,
                 );
                 const unused_count = printIssues(
                     unused_issues.items,
@@ -13857,6 +13874,7 @@ pub fn main() !void {
                     cfg.format,
                     "unused",
                     &cfg,
+                    &g,
                 );
                 const cx_count = printIssues(
                     cx_issues.items,
@@ -13864,6 +13882,7 @@ pub fn main() !void {
                     cfg.format,
                     "complexity",
                     &cfg,
+                    &g,
                 );
                 const fmt_count = printIssues(
                     fmt_issues.items,
@@ -13871,6 +13890,7 @@ pub fn main() !void {
                     cfg.format,
                     "format",
                     &cfg,
+                    &g,
                 );
                 const naming_count = printIssues(
                     naming_issues.items,
@@ -13878,6 +13898,7 @@ pub fn main() !void {
                     cfg.format,
                     "naming",
                     &cfg,
+                    &g,
                 );
                 const style_count = printIssues(
                     style_issues.items,
@@ -13885,6 +13906,7 @@ pub fn main() !void {
                     cfg.format,
                     "style",
                     &cfg,
+                    &g,
                 );
 
                 // Accumulate totals
@@ -13930,7 +13952,7 @@ pub fn main() !void {
                     for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
                     for (panic_issues.items) |i| try all_issues.append(alloc, i);
 
-                    exportIssues(alloc, export_path, all_issues.items, &cfg) catch |err| {
+                    exportIssues(alloc, export_path, all_issues.items, &cfg, &g) catch |err| {
                         std.debug.print("error: failed to export issues: {}\n", .{err});
                     };
                     std.debug.print(
@@ -14699,6 +14721,61 @@ test "isInlineDisabled detects disable-next-line" {
     try std.testing.expect(isInlineDisabled(content, 3, "ZA201"));
     // Line 4 is not covered
     try std.testing.expect(!isInlineDisabled(content, 4, "ZA201"));
+}
+
+test "ephor:ignore suppresses same-line issue" {
+    const content =
+        \\const x = foo() catch {}; // ephor:ignore ZA201
+        \\const y = foo() catch {};
+    ;
+    // Line 1 ignored
+    try std.testing.expect(isInlineDisabled(content, 1, "ZA201"));
+    // Line 2 not ignored
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+}
+
+test "ephor:ignore on previous line suppresses next line" {
+    const content =
+        \\// ephor:ignore ZA203
+        \\const x = val orelse unreachable;
+        \\const y = val orelse unreachable;
+    ;
+    // Line 2 suppressed by comment on line 1
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA203"));
+    // Line 3 not covered
+    try std.testing.expect(!isInlineDisabled(content, 3, "ZA203"));
+}
+
+test "ephor:ignore without rule suppresses all rules on line" {
+    const content =
+        \\const x = foo() catch {}; // ephor:ignore
+    ;
+    try std.testing.expect(isInlineDisabled(content, 1, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 1, "ZA202"));
+    try std.testing.expect(isInlineDisabled(content, 1, "ZA101"));
+}
+
+test "ephor:ignore with specific rule only suppresses that rule" {
+    const content =
+        \\const x = foo() catch {}; // ephor:ignore ZA201
+    ;
+    try std.testing.expect(isInlineDisabled(content, 1, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(content, 1, "ZA202"));
+}
+
+test "ephor:ignore works for ZA202 catch unreachable" {
+    const content =
+        \\// ephor:ignore ZA202
+        \\const x = getData() catch unreachable;
+    ;
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA202"));
+}
+
+test "ephor:ignore works for ZA101 memory warning" {
+    const content =
+        \\const buf = try alloc.alloc(u8, 1024); // ephor:ignore ZA101
+    ;
+    try std.testing.expect(isInlineDisabled(content, 1, "ZA101"));
 }
 
 test "checkSilentCatch detects catch {}" {

@@ -70,7 +70,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.8.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.9.tar.gz",
     },
 },
 ```
@@ -147,7 +147,7 @@ Example config:
 
 ```json
 {
-  "version": "0.8.8",
+  "version": "0.8.9",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -286,6 +286,21 @@ ephor check --enable=ZA702
 **Priority**: `enable` takes precedence over `disable`. Use `enable` to:
 - Override a disabled rule
 - Turn on off-by-default rules (like ZA702)
+
+### Inline Ignores
+
+Suppress a specific warning on a single line:
+
+```zig
+const x = foo() catch {};  // ephor:ignore ZA201
+
+// ephor:ignore ZA203
+const val = table[idx] orelse unreachable;
+```
+
+- Same line: `// ephor:ignore ZA201` suppresses that line
+- Previous line: `// ephor:ignore ZA201` on a comment-only line suppresses the next line
+- Omit the rule to suppress all rules: `// ephor:ignore`
 
 ## CLI Options
 

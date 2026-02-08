@@ -319,16 +319,22 @@ fn legacy_handler() void {
 
 Omit the rule to suppress all rules: `// ephor:ignore`
 
+## Build Steps
+
+```bash
+zig build ephor           # Run all static checks
+zig build ephor-upgrade   # Upgrade ephor to latest version
+```
+
 ## CLI Options
+
+When running via the standalone binary, ephor accepts these commands and options:
 
 ```
 ephor [command] [path] [options]
 
 Commands:
-  init        Create ephor.json config file
-  install     Add ephor to project's build.zig (version-pinned)
-  upgrade     Upgrade ephor to a new version (alias: update)
-  check       Run all static checks (default when no command given)
+  check       Run all static checks (default)
   runtime     Run tests with memory diagnostics (dynamic analysis)
   orphans     Files not imported from entry points
   memory      Alloc without defer patterns
@@ -337,6 +343,9 @@ Commands:
   complexity  Function complexity metrics
   fmt-check   Files needing zig fmt
   stats       Project statistics
+  upgrade     Upgrade ephor to latest version (alias: update)
+  install     Add ephor to project's build.zig (version-pinned)
+  init        Create ephor.json config file
 
 Options:
   --entry=<file>       Entry point (default: src/main.zig)

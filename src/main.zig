@@ -11156,8 +11156,9 @@ fn isCImportFile(file_path: []const u8, content: []const u8) bool {
 
 /// Check if a line has an ignore/disable directive for rule
 /// Supports: // ephor:ignore ZA201, // ephor:disable ZA201
+/// Check if a single line contains an ephor:ignore or ephor:disable directive
+/// that matches the given rule.
 fn checkLineIgnore(line: []const u8, rule: []const u8) bool {
-    // Check for ephor:ignore or ephor:disable on this line
     const ignore_pos = mem.indexOf(u8, line, "// ephor:ignore");
     const disable_pos = mem.indexOf(u8, line, "// ephor:disable");
     const pos = ignore_pos orelse disable_pos orelse return false;
@@ -11165,34 +11166,113 @@ fn checkLineIgnore(line: []const u8, rule: []const u8) bool {
     // If the rule is mentioned, it's disabled
     if (mem.indexOf(u8, line, rule) != null) return true;
     // If no specific rule after directive, it disables all rules on this line
-    // But not if it's a variant like "disable-next-line"
+    // But not if it's a variant like "disable-next-line" or "ignore-file"
     const has_specific_ignore = mem.indexOf(u8, line, "ephor:ignore ") != null;
     const has_specific_disable = mem.indexOf(u8, line, "ephor:disable ") != null;
     const has_variant = mem.indexOf(u8, line, "ephor:disable-") != null;
+    const has_file_ignore = mem.indexOf(u8, line, "ephor:ignore-file") != null;
+    if (has_file_ignore) return false;
     if (has_specific_ignore or has_specific_disable or has_variant) return false;
     return true;
 }
 
-/// Check if a line has an inline ignore/disable directive for the given rule.
-/// Same-line: // ephor:ignore ZA201 (after code) suppresses that line only.
-/// Previous line: // ephor:ignore ZA201 (comment-only line) suppresses next line.
-/// Also supports: // ephor:disable-next-line ZA201 (explicit next-line form).
+/// Check if a file-level ignore directive matches a rule.
+fn checkFileIgnoreRule(line: []const u8, rule: []const u8) bool {
+    if (mem.indexOf(u8, line, rule) != null) return true;
+    if (mem.indexOf(u8, line, "ephor:ignore-file ")) |start_pos| {
+        const after = line[start_pos + "ephor:ignore-file ".len ..];
+        const trimmed = mem.trimLeft(u8, after, " \t");
+        if (trimmed.len > 0) return false;
+    }
+    return true;
+}
+
+/// Check if a line/block/file has an inline ignore directive for the given rule.
+///
+/// Supports three forms:
+///   1. Same-line:  `code(); // ephor:ignore ZA201` — suppresses that line only
+///   2. Scope-aware: `// ephor:ignore ZA201` on a comment-only line before a function
+///      or block — automatically suppresses the entire scope (tracks braces)
+///      If the next line doesn't open a scope, suppresses just the next line.
+///   3. File-level: `// ephor:ignore-file ZA201` — suppresses entire file
 fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool {
+    // First pass: check for file-level ignores (can appear anywhere in file)
+    var file_lines = mem.splitScalar(u8, content, '\n');
+    while (file_lines.next()) |line| {
+        if (mem.indexOf(u8, line, "ephor:ignore-file") != null) {
+            if (checkFileIgnoreRule(line, rule)) return true;
+        }
+    }
+
+    // Second pass: check same-line, previous-line, and scope-aware ignores
     var current_line: usize = 1;
     var lines = mem.splitScalar(u8, content, '\n');
     var prev_line: ?[]const u8 = null;
+    // Track scope-aware ignore blocks: when a comment-only ignore line precedes
+    // a line that opens a brace scope, we track depth until the scope closes.
+    var scope_ignore_depth: usize = 0;
+    var in_scope_ignore = false;
     while (lines.next()) |line| {
         defer {
             prev_line = line;
             current_line += 1;
         }
-        if (current_line != line_num) continue;
-        // Same line: // ephor:ignore ZA201 (works on any line with the directive)
-        if (checkLineIgnore(line, rule)) return true;
-        // Previous line: only if it's a comment-only line (no code before //)
+
+        // Track brace depth for scope-aware ignores
+        if (in_scope_ignore) {
+            for (line) |ch| {
+                if (ch == '{') scope_ignore_depth += 1;
+                if (ch == '}') {
+                    if (scope_ignore_depth > 0) {
+                        scope_ignore_depth -= 1;
+                        if (scope_ignore_depth == 0) {
+                            // Scope closed — this line is the last suppressed line
+                            if (current_line == line_num) return true;
+                            in_scope_ignore = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (in_scope_ignore and current_line == line_num) return true;
+            // Check if prev_line was a comment-only ignore that starts a new scope
+            // (don't re-check, the scope tracking handles it)
+            continue;
+        }
+
+        // Check if this is a comment-only ignore line that starts scope tracking
         if (prev_line) |pl| {
-            const trimmed = mem.trimLeft(u8, pl, " \t");
-            if (mem.startsWith(u8, trimmed, "//") and checkLineIgnore(pl, rule)) return true;
+            const prev_trimmed = mem.trimLeft(u8, pl, " \t");
+            if (mem.startsWith(u8, prev_trimmed, "//") and checkLineIgnore(pl, rule)) {
+                // Previous line has an ignore directive — check if THIS line opens a scope
+                if (mem.indexOf(u8, line, "{") != null) {
+                    // Count net brace depth on this line
+                    scope_ignore_depth = 0;
+                    for (line) |bch| {
+                        if (bch == '{') scope_ignore_depth += 1;
+                        if (bch == '}') {
+                            if (scope_ignore_depth > 0) scope_ignore_depth -= 1;
+                        }
+                    }
+                    if (scope_ignore_depth > 0) {
+                        in_scope_ignore = true;
+                    }
+                    // This line is suppressed (it's the first line of the ignored scope)
+                    if (current_line == line_num) return true;
+                    continue;
+                }
+            }
+        }
+
+        if (current_line != line_num) continue;
+
+        // Same-line: // ephor:ignore ZA201
+        if (checkLineIgnore(line, rule)) return true;
+
+        // Previous-line without scope: suppresses just this one line
+        if (prev_line) |pl| {
+            const prev_trimmed = mem.trimLeft(u8, pl, " \t");
+            if (mem.startsWith(u8, prev_trimmed, "//") and checkLineIgnore(pl, rule)) return true;
         }
         break;
     }
@@ -12163,7 +12243,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.8.9";
+const EPHOR_VERSION = "0.9.0";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13127,8 +13207,10 @@ fn printHelp() void {
         \\  }
         \\
         \\INLINE IGNORE (in source code):
-        \\  // ephor:ignore ZA201  (suppress this rule on current or next line)
-        \\  // ephor:ignore        (suppress all rules on current or next line)
+        \\  // ephor:ignore ZA201       (same line or next line)
+        \\  // ephor:ignore ZA201       (above fn/block: suppresses entire scope)
+        \\  // ephor:ignore-file ZA201  (suppresses rule for entire file)
+        \\  // ephor:ignore             (omit rule to suppress all)
         \\
         \\RULE IDS:
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
@@ -14776,6 +14858,124 @@ test "ephor:ignore works for ZA101 memory warning" {
         \\const buf = try alloc.alloc(u8, 1024); // ephor:ignore ZA101
     ;
     try std.testing.expect(isInlineDisabled(content, 1, "ZA101"));
+}
+
+test "ephor:ignore above function suppresses entire scope" {
+    const content =
+        \\const a = foo() catch {};
+        \\// ephor:ignore ZA201
+        \\fn bad_function() void {
+        \\    bar() catch {};
+        \\    baz() catch {};
+        \\}
+        \\const b = qux() catch {};
+    ;
+    // Line 1: before ignore — not suppressed
+    try std.testing.expect(!isInlineDisabled(content, 1, "ZA201"));
+    // Line 3: function declaration line — suppressed (scope starts here)
+    try std.testing.expect(isInlineDisabled(content, 3, "ZA201"));
+    // Line 4: inside function body — suppressed
+    try std.testing.expect(isInlineDisabled(content, 4, "ZA201"));
+    // Line 5: inside function body — suppressed
+    try std.testing.expect(isInlineDisabled(content, 5, "ZA201"));
+    // Line 6: closing brace — suppressed (last line of scope)
+    try std.testing.expect(isInlineDisabled(content, 6, "ZA201"));
+    // Line 7: after function — not suppressed
+    try std.testing.expect(!isInlineDisabled(content, 7, "ZA201"));
+}
+
+test "ephor:ignore above scope only suppresses matching rule" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\fn my_fn() void {
+        \\    foo() catch {};
+        \\    const x = val orelse unreachable;
+        \\}
+    ;
+    // ZA201 suppressed inside scope
+    try std.testing.expect(isInlineDisabled(content, 3, "ZA201"));
+    // ZA203 NOT suppressed — different rule
+    try std.testing.expect(!isInlineDisabled(content, 4, "ZA203"));
+}
+
+test "ephor:ignore above scope without rule suppresses all rules" {
+    const content =
+        \\// ephor:ignore
+        \\fn my_fn() void {
+        \\    foo() catch {};
+        \\    const x = val orelse unreachable;
+        \\}
+    ;
+    try std.testing.expect(isInlineDisabled(content, 3, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 4, "ZA203"));
+}
+
+test "ephor:ignore scope works with nested braces" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\fn outer() void {
+        \\    if (true) {
+        \\        foo() catch {};
+        \\    }
+        \\    bar() catch {};
+        \\}
+        \\const after = baz() catch {};
+    ;
+    // Lines 2-7: inside outer function scope — all suppressed
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 4, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 6, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 7, "ZA201"));
+    // Line 8: after scope — not suppressed
+    try std.testing.expect(!isInlineDisabled(content, 8, "ZA201"));
+}
+
+test "ephor:ignore-file suppresses entire file" {
+    const content =
+        \\// ephor:ignore-file ZA201
+        \\const a = foo() catch {};
+        \\fn something() void {
+        \\    baz() catch {};
+        \\}
+    ;
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 4, "ZA201"));
+    // Different rule NOT suppressed
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA202"));
+}
+
+test "ephor:ignore-file without rule suppresses all rules" {
+    const content =
+        \\// ephor:ignore-file
+        \\const a = foo() catch {};
+        \\const b = val orelse unreachable;
+    ;
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 3, "ZA203"));
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA101"));
+}
+
+test "ephor:ignore-file works from anywhere in file" {
+    const content =
+        \\const a = foo() catch {};
+        \\// ephor:ignore-file ZA201
+        \\const b = bar() catch {};
+    ;
+    // Even line 1 (before the directive) is suppressed
+    try std.testing.expect(isInlineDisabled(content, 1, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 3, "ZA201"));
+}
+
+test "ephor:ignore before non-scope line suppresses just next line" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\const a = foo() catch {};
+        \\const b = bar() catch {};
+    ;
+    // Line 2: next line after ignore (no scope opened) — suppressed
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    // Line 3: not covered
+    try std.testing.expect(!isInlineDisabled(content, 3, "ZA201"));
 }
 
 test "checkSilentCatch detects catch {}" {

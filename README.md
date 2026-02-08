@@ -70,7 +70,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.9.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.0.tar.gz",
     },
 },
 ```
@@ -147,7 +147,7 @@ Example config:
 
 ```json
 {
-  "version": "0.8.9",
+  "version": "0.9.0",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -289,18 +289,29 @@ ephor check --enable=ZA702
 
 ### Inline Ignores
 
-Suppress a specific warning on a single line:
+Suppress warnings with `// ephor:ignore` at three levels:
 
+**Same line** — suppresses just that line:
 ```zig
 const x = foo() catch {};  // ephor:ignore ZA201
-
-// ephor:ignore ZA203
-const val = table[idx] orelse unreachable;
 ```
 
-- Same line: `// ephor:ignore ZA201` suppresses that line
-- Previous line: `// ephor:ignore ZA201` on a comment-only line suppresses the next line
-- Omit the rule to suppress all rules: `// ephor:ignore`
+**Above a function or block** — automatically suppresses the entire scope:
+```zig
+// ephor:ignore ZA201
+fn legacy_handler() void {
+    foo() catch {};   // suppressed
+    bar() catch {};   // suppressed
+}
+// issues reported normally after the scope ends
+```
+
+**File level** — suppresses a rule for the entire file (place anywhere):
+```zig
+// ephor:ignore-file ZA201
+```
+
+Omit the rule to suppress all rules: `// ephor:ignore`
 
 ## CLI Options
 

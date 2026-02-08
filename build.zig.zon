@@ -5,7 +5,7 @@
 
 .{
     .name = .ephor,
-    .version = "0.8.2",
+    .version = "0.8.3",
     .fingerprint = 0xe665525c8b28e1a7,
     .minimum_zig_version = "0.15.0",
     .paths = .{

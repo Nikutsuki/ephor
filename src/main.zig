@@ -11841,29 +11841,20 @@ const EPHOR_BUILD_SNIPPET =
 ;
 
 /// Print instructions when build.zig.zon is missing during install.
-fn printNoZonHelp(package_url: []const u8) void {
+fn printMissingProjectFileHelp(file: []const u8) void {
     std.debug.print(
-        \\No build.zig.zon found in current directory.
-        \\
-        \\To add ephor to your project:
-        \\
-        \\1. Create build.zig.zon with:
-        \\
-        \\   .{{
-        \\       .name = .my_project,
-        \\       .version = "0.1.0",
-        \\       .dependencies = .{{
-        \\           .ephor = .{{
-        \\               .url = "{s}",
-        \\               // Run 'zig build' to get the hash
-        \\           }},
-        \\       }},
-        \\       .paths = .{{ "build.zig", "build.zig.zon", "src" }},
-        \\   }}
-        \\
-        \\2. Then run: ephor install
-        \\
-    , .{package_url});
+        "error: no {s} found in current directory\n" ++
+            "\n" ++
+            "  Ephor requires a Zig project with build.zig and build.zig.zon.\n" ++
+            "  To initialize a Zig project, run:\n" ++
+            "\n" ++
+            "    zig init\n" ++
+            "\n" ++
+            "  Then re-run the install:\n" ++
+            "    curl -fsSL {s}/raw/main/install.sh | sh\n" ++
+            "\n",
+        .{ file, EPHOR_REPO_BASE },
+    );
 }
 
 /// Print fallback instructions when zig fetch fails.
@@ -11884,19 +11875,35 @@ fn printFetchFailedHelp(package_url: []const u8) void {
 /// Run the install command: adds ephor to project's build system.
 /// If install_version is provided, installs that specific version;
 /// otherwise defaults to the binary's own version (EPHOR_VERSION).
-fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
-    const ver = install_version orelse EPHOR_VERSION;
-    const package_url = try buildPackageUrl(allocator, install_version);
-    defer allocator.free(package_url);
-
+/// Check that build.zig and build.zig.zon exist. Returns false
+/// and prints help if either is missing.
+fn checkProjectPrerequisites() bool {
+    const has_build_zig = blk: {
+        fs.cwd().access("build.zig", .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!has_build_zig) {
+        printMissingProjectFileHelp("build.zig");
+        return false;
+    }
     const has_zon = blk: {
         fs.cwd().access("build.zig.zon", .{}) catch break :blk false;
         break :blk true;
     };
     if (!has_zon) {
-        printNoZonHelp(package_url);
-        return;
+        printMissingProjectFileHelp("build.zig.zon");
+        return false;
     }
+    return true;
+}
+
+fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
+    const ver = install_version orelse EPHOR_VERSION;
+
+    if (!checkProjectPrerequisites()) return;
+
+    const package_url = try buildPackageUrl(allocator, install_version);
+    defer allocator.free(package_url);
 
     std.debug.print("Installing ephor v{s}...\n", .{ver});
 
@@ -12152,7 +12159,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.8.2";
+const EPHOR_VERSION = "0.8.3";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13020,7 +13027,12 @@ fn parseArgs(allocator: Allocator) !Config {
     }
 
     // If path wasn't set by config or CLI, auto-detect from build.zig
-    if (!cfg.path_owned) {
+    // (only for commands that analyze code, not install/upgrade/help/version)
+    const needs_path = switch (cfg.command) {
+        .install, .upgrade, .help, .version => false,
+        else => true,
+    };
+    if (needs_path and !cfg.path_owned) {
         const detected = detectPathDirFromBuildZig(allocator);
         cfg.path = detected;
         cfg.path_owned = true;

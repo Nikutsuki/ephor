@@ -18,6 +18,8 @@
 
 ## Installation
 
+**Requires**: A Zig project with `build.zig` and `build.zig.zon` (run `zig init` if you don't have these).
+
 **macOS / Linux:**
 ```bash
 cd /path/to/your-project
@@ -68,7 +70,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.2.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.3.tar.gz",
     },
 },
 ```

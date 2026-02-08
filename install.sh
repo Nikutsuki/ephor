@@ -33,8 +33,9 @@ if [ ! -f "build.zig.zon" ]; then
     exit 1
 fi
 
-# Fetch latest tagged version from Bitbucket API
-LATEST_TAG=$(curl -sL "${REPO}/raw/main/build.zig.zon" | grep '\.version' | head -1 | sed 's/.*"\([0-9][0-9.]*\)".*/\1/')
+# Fetch latest tagged version from Bitbucket tags API (not cached raw files)
+TAGS_API="https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1"
+LATEST_TAG=$(curl -sL "$TAGS_API" | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
 
 if [ -z "$LATEST_TAG" ]; then
     echo "warning: could not detect latest version, using main branch"

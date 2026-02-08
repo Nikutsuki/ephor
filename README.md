@@ -40,25 +40,22 @@ zig build ephor
 
 That's it.
 
-### Version Management
-
-Ephor pins the installed version in `ephor.json` so your team always runs the same version.
+### Upgrading
 
 ```bash
-# Install current version (auto-detects config)
-ephor install
+# Upgrade to latest version (via build system)
+zig build ephor-upgrade
 
-# Install a specific version
-ephor install --version=0.7.0
-
-# Upgrade to latest version
+# Or with standalone CLI
 ephor upgrade
 
 # Upgrade to a specific version
 ephor upgrade --version=0.9.2
 ```
 
-The pinned version is stored in `ephor.json` under the `"version"` key. When you run `ephor install`, it auto-detects your source directory, entry points from `build.zig`, and writes a config file.
+### Version Management
+
+Ephor pins the installed version in `ephor.json` so your team always runs the same version. The pinned version is stored under the `"version"` key. When you run `ephor install`, it auto-detects your source directory, entry points from `build.zig`, and writes a config file.
 
 ### Manual Installation
 
@@ -82,9 +79,15 @@ const ephor_dep = b.dependency("ephor", .{
     .target = target,
     .optimize = .ReleaseSafe,
 });
-const ephor_exe = ephor_dep.artifact("ephor");
+const ephor_artifact = ephor_dep.artifact("ephor");
 const ephor_step = b.step("ephor", "Run ephor static analysis");
-ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);
+ephor_step.dependOn(&b.addRunArtifact(ephor_artifact).step);
+
+// Ephor upgrade
+const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
+ephor_upgrade_cmd.addArgs(&.{"upgrade"});
+const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
+ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
 ```
 
 </details>
@@ -94,6 +97,9 @@ ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);
 ```bash
 # Run all static checks (via build system)
 zig build ephor
+
+# Upgrade to latest version
+zig build ephor-upgrade
 
 # Or with standalone CLI (defaults to 'check' on configured code directory)
 ephor

@@ -55,7 +55,7 @@ ephor install --version=0.7.0
 ephor upgrade
 
 # Upgrade to a specific version
-ephor upgrade --version=0.9.1
+ephor upgrade --version=0.9.2
 ```
 
 The pinned version is stored in `ephor.json` under the `"version"` key. When you run `ephor install`, it auto-detects your source directory, entry points from `build.zig`, and writes a config file.
@@ -70,7 +70,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.1.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.2.tar.gz",
     },
 },
 ```
@@ -147,7 +147,7 @@ Example config:
 
 ```json
 {
-  "version": "0.9.1",
+  "version": "0.9.2",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],

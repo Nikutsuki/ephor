@@ -80,8 +80,15 @@ else
 
     // Ephor static analysis
     const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
+    const ephor_artifact = ephor_dep.artifact("ephor");
     const ephor_step = b.step("ephor", "Run ephor static analysis");
-    ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);
+    ephor_step.dependOn(&b.addRunArtifact(ephor_artifact).step);
+
+    // Ephor upgrade
+    const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
+    ephor_upgrade_cmd.addArgs(&.{"upgrade"});
+    const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
+    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
 EPHOR_EOF
     tail -n +"$((LINE + 1))" build.zig >> build.zig.tmp
     mv build.zig.tmp build.zig
@@ -90,3 +97,4 @@ fi
 echo ""
 echo "Done! Run static analysis with:"
 echo "  zig build ephor"
+echo "  zig build ephor-upgrade  (upgrade to latest version)"

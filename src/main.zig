@@ -11641,21 +11641,38 @@ fn writeDefaultConfig() !void {
 }
 
 /// Detect the path_dir from build.zig by finding root_source_file patterns.
-/// Returns the directory portion (e.g., "src" from "src/main.zig") or "src" as fallback.
+/// Returns an allocator-owned string. Caller must free.
 fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
-    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return "src";
-    defer allocator.free(content);
-
-    // Look for .root_source_file = b.path("some/path/main.zig") or similar
-    const patterns = [_][]const u8{
-        "root_source_file",
-        ".root_src",
+    const content = fs.cwd().readFileAlloc(
+        allocator,
+        "build.zig",
+        1024 * 1024,
+    ) catch |err| {
+        std.debug.print(
+            "error: no build.zig found: {}\n" ++
+                "  hint: run from project root, or: ephor check <dir>\n",
+            .{err},
+        );
+        return allocator.dupe(u8, ".") catch ".";
     };
+
+    const result = findPathDirInContent(content);
+    const duped = allocator.dupe(u8, result) catch {
+        allocator.free(content);
+        return allocator.dupe(u8, ".") catch ".";
+    };
+    allocator.free(content);
+    return duped;
+}
+
+/// Scan build.zig content for root_source_file pattern, return dir portion.
+/// Returns a slice into `content` - caller must dupe before freeing content.
+fn findPathDirInContent(content: []const u8) []const u8 {
+    const patterns = [_][]const u8{ "root_source_file", ".root_src" };
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         for (patterns) |pattern| {
             const pat_idx = mem.indexOf(u8, line, pattern) orelse continue;
-            // Find a quoted .zig path after the pattern
             const rest = line[pat_idx..];
             const q1 = mem.indexOf(u8, rest, "\"") orelse continue;
             const after_q1 = q1 + 1;
@@ -11663,12 +11680,16 @@ fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
             const q2 = mem.indexOf(u8, rest[after_q1..], "\"") orelse continue;
             const path = rest[after_q1 .. after_q1 + q2];
             if (!mem.endsWith(u8, path, ".zig")) continue;
-            // Extract directory: "src/main.zig" -> "src", "main.zig" -> "."
             if (std.fs.path.dirname(path)) |dir| return dir;
             return ".";
         }
     }
-    return "src";
+    std.debug.print(
+        "warning: could not detect source directory from build.zig\n" ++
+            "  hint: specify a path: ephor check <dir>, or create ephor.json with 'ephor init'\n",
+        .{},
+    );
+    return ".";
 }
 
 /// Collect entry points from build.zig for the install config.
@@ -12996,6 +13017,13 @@ fn parseArgs(allocator: Allocator) !Config {
             allocator.free(cfg.path);
             cfg.path = trimmed;
         }
+    }
+
+    // If path wasn't set by config or CLI, auto-detect from build.zig
+    if (!cfg.path_owned) {
+        const detected = detectPathDirFromBuildZig(allocator);
+        cfg.path = detected;
+        cfg.path_owned = true;
     }
 
     if (cfg.path_owned and !mem.eql(u8, cfg.path, "src")) try detectTargetEntries(allocator, &cfg);

@@ -68,7 +68,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.0.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.1.tar.gz",
     },
 },
 ```

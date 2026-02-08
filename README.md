@@ -70,7 +70,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.4.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.5.tar.gz",
     },
 },
 ```
@@ -147,7 +147,7 @@ Example config:
 
 ```json
 {
-  "version": "0.8.0",
+  "version": "0.8.5",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],

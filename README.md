@@ -38,6 +38,26 @@ zig build ephor
 
 That's it.
 
+### Version Management
+
+Ephor pins the installed version in `ephor.json` so your team always runs the same version.
+
+```bash
+# Install current version (auto-detects config)
+ephor install
+
+# Install a specific version
+ephor install --version=0.7.0
+
+# Upgrade to latest version
+ephor upgrade
+
+# Upgrade to a specific version
+ephor upgrade --version=0.9.0
+```
+
+The pinned version is stored in `ephor.json` under the `"version"` key. When you run `ephor install`, it auto-detects your source directory, entry points from `build.zig`, and writes a config file.
+
 ### Manual Installation
 
 <details>
@@ -48,7 +68,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.8.0.tar.gz",
     },
 },
 ```
@@ -56,9 +76,13 @@ Add to `build.zig.zon`:
 Run `zig build` once to get the hash, add it, then add to `build.zig`:
 
 ```zig
-const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
+const ephor_dep = b.dependency("ephor", .{
+    .target = target,
+    .optimize = .ReleaseSafe,
+});
+const ephor_exe = ephor_dep.artifact("ephor");
 const ephor_step = b.step("ephor", "Run ephor static analysis");
-ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);
+ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);
 ```
 
 </details>
@@ -69,7 +93,10 @@ ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);
 # Run all static checks (via build system)
 zig build ephor
 
-# Or with standalone CLI
+# Or with standalone CLI (defaults to 'check' on configured code directory)
+ephor
+
+# Equivalent to:
 ephor check src/
 
 # Individual analyzers
@@ -88,6 +115,8 @@ ephor stats
 # Create config file
 ephor init
 ```
+
+Running `ephor` with no arguments defaults to `check` on the `path_dir` configured in `ephor.json` (default: `src`).
 
 ## Output Format
 
@@ -116,7 +145,8 @@ Example config:
 
 ```json
 {
-  "src": "src",
+  "version": "0.8.0",
+  "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
   "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
@@ -137,7 +167,8 @@ Example config:
 
 | Option | Description |
 |--------|-------------|
-| `src` | Source directory to scan |
+| `version` | Pinned ephor version (set by `install`/`upgrade`) |
+| `path_dir` | Directory to analyze (also accepts `code`, `src`, or `root` as aliases) |
 | `entries` | Entry points for orphan detection |
 | `exclude` | Paths to exclude from all checks (substring match) |
 | `orphan_exclude` | Patterns to exclude from orphan detection only |
@@ -204,7 +235,7 @@ Example config:
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA701** | warning | ON | Line exceeds max length (default: 80 columns) |
+| **ZA701** | warning | ON | Line exceeds max length (default: 100 columns) |
 | **ZA702** | warning | OFF | File exceeds max size (set `max_file_bytes` to enable) |
 | **ZA703** | warning | ON | Naming convention violation (types=TitleCase, funcs=camelCase, vars=snake_case) |
 
@@ -257,11 +288,13 @@ ephor check --enable=ZA702
 ## CLI Options
 
 ```
-ephor <command> [path] [options]
+ephor [command] [path] [options]
 
 Commands:
   init        Create ephor.json config file
-  check       Run all static checks (default)
+  install     Add ephor to project's build.zig (version-pinned)
+  upgrade     Upgrade ephor to a new version (alias: update)
+  check       Run all static checks (default when no command given)
   runtime     Run tests with memory diagnostics (dynamic analysis)
   orphans     Files not imported from entry points
   memory      Alloc without defer patterns
@@ -279,8 +312,10 @@ Options:
   --max-lines=N        Max function lines (default: 50)
   --max-nesting=N      Max nesting depth (default: 4)
   --max-params=N       Max parameters (default: 5)
-  --max-line-length=N  Max columns per line (default: 80)
+  --max-line-length=N  Max columns per line (default: 100)
   --max-file-bytes=N   Max file size in bytes (enables ZA702)
+  --version=<X.Y.Z>   For install/upgrade: pin a specific version
+  --command=<cmd>      For runtime: custom command instead of 'zig build test'
   -V, --verbose        Verbose output
   -s, --summary        Show summary at end (off by default)
 ```
@@ -474,8 +509,10 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 
 | Code | Meaning |
 |------|---------|
-| 0 | No issues found |
-| 1 | Issues found |
+| 0 | No warnings or errors found |
+| 1 | Warnings or errors found |
+
+Notes (informational issues like ZA201-ZA205) are printed but do **not** cause a non-zero exit code. Only warnings and errors affect the exit code.
 
 ## Examples
 

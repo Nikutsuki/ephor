@@ -508,6 +508,7 @@ const CFGBuildCtx = struct {
             .while_block, .for_block => {
                 try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
                 self.current_block = entry.merge_block;
+                self.setStartLine(line + 1);
             },
             .switch_block => {
                 if (!self.cfg.blocks.items[self.current_block].is_return)
@@ -3338,6 +3339,8 @@ fn checkOwnershipInLine(
             mem.startsWith(u8, t, "var ")) continue;
         const eq_pos = mem.indexOf(u8, t, " = ").?;
         const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+        // Skip discard patterns: _ = value (not ownership transfer)
+        if (mem.eql(u8, lhs, "_")) continue;
         if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null)
             return true;
     }
@@ -3411,6 +3414,13 @@ const BlockCoverageState = struct {
         }
         return false;
     }
+
+    fn anyOwnershipTransferred(self: BlockCoverageState) bool {
+        for (self.ownership_transferred) |transferred| {
+            if (transferred) return true;
+        }
+        return false;
+    }
 };
 
 /// Scan CFG blocks for defer, free, and ownership patterns
@@ -3451,6 +3461,7 @@ fn scanSingleBlock(
 ) void {
     var freed = false;
     var return_after = false;
+    var defer_depth: usize = 0;
 
     for (block.start_line..block.end_line + 1) |line_num| {
         if (line_num < func_line) continue;
@@ -3460,8 +3471,16 @@ fn scanSingleBlock(
         const is_defer = mem.startsWith(u8, t, "defer ");
         const has_free = hasRealFreePattern(t) and containsIdentifier(t, alloc_name);
 
-        if (is_defer and has_free) state.has_defer[bid] = true;
-        if (!is_defer and !mem.startsWith(u8, t, "errdefer ") and has_free) freed = true;
+        // Track multi-line defer blocks: defer { ... }
+        if (is_defer and (mem.indexOf(u8, t, "{") != null)) {
+            defer_depth = countBraceDepth(t, 0);
+        } else if (defer_depth > 0) {
+            defer_depth = countBraceDepth(t, defer_depth);
+        }
+        const in_defer_block = is_defer or defer_depth > 0;
+
+        if (in_defer_block and has_free) state.has_defer[bid] = true;
+        if (!in_defer_block and !mem.startsWith(u8, t, "errdefer ") and has_free) freed = true;
         if (freed and mem.startsWith(u8, t, "return")) return_after = true;
         if (checkOwnershipInLine(t, owner_vars)) state.ownership_transferred[bid] = true;
     }
@@ -3568,11 +3587,99 @@ fn checkDeferCoverageForAlloc(
     defer allocator.free(covered);
 
     const alloc_block_covered = covered[alloc.block];
-    const any_defer = state.anyDeferExists();
 
-    if (!alloc_block_covered and any_defer)
-        return buildPartialCoverageIssue(file_path, alloc);
-    return null;
+    // If ownership is transferred anywhere (e.g., allocation returned to caller),
+    // the caller is responsible for cleanup - not a missing defer.
+    if (alloc_block_covered or state.anyOwnershipTransferred())
+        return null;
+
+    // Fallback: linear scan for defer free anywhere in the function.
+    // The CFG block analysis can miss multi-line defers that span block boundaries.
+    if (hasDeferFreeInFunction(lines, alloc.name))
+        return null;
+
+    return buildPartialCoverageIssue(file_path, alloc);
+}
+
+/// Find the indent level of an allocation line by name
+fn findAllocIndent(lines: []const []const u8, alloc_name: []const u8) usize {
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (hasRealAllocPattern(t) and containsIdentifier(t, alloc_name))
+            return countIndent(line);
+    }
+    return 0;
+}
+
+/// Process a single line during defer-free scan, returns true if free found in valid defer
+fn checkDeferFreeLine(
+    line: []const u8,
+    t: []const u8,
+    alloc_name: []const u8,
+    alloc_indent: usize,
+    defer_depth: *usize,
+    skip_depth: *usize,
+) bool {
+    // Skip mode: inside a defer block at deeper scope than alloc
+    if (skip_depth.* > 0) {
+        skip_depth.* = countBraceDepth(t, skip_depth.*);
+        return false;
+    }
+
+    const is_defer_start = mem.startsWith(u8, t, "defer ") or
+        mem.startsWith(u8, t, "defer{");
+    if (is_defer_start)
+        return handleDeferStart(line, t, alloc_name, alloc_indent, defer_depth, skip_depth);
+
+    if (defer_depth.* > 0) {
+        if (hasRealFreePattern(t) and containsIdentifier(t, alloc_name))
+            return true;
+        defer_depth.* = countBraceDepth(t, defer_depth.*);
+    }
+    return false;
+}
+
+/// Handle a defer statement start during defer-free scan
+fn handleDeferStart(
+    line: []const u8,
+    t: []const u8,
+    alloc_name: []const u8,
+    alloc_indent: usize,
+    defer_depth: *usize,
+    skip_depth: *usize,
+) bool {
+    // Only consider defers at same or outer scope as the allocation
+    if (countIndent(line) > alloc_indent) {
+        if (mem.indexOf(u8, t, "{") != null)
+            skip_depth.* = countBraceDepth(t, 0);
+        return false;
+    }
+    // Single-line defer with free
+    if (hasRealFreePattern(t) and containsIdentifier(t, alloc_name))
+        return true;
+    // Multi-line defer block start at same/outer scope
+    if (mem.indexOf(u8, t, "{") != null)
+        defer_depth.* = countBraceDepth(t, 0);
+    return false;
+}
+
+/// Linear scan for a defer block containing .free(name) or .destroy(name) at the
+/// same or outer scope as the allocation. Handles multi-line defer { ... } blocks.
+fn hasDeferFreeInFunction(
+    lines: []const []const u8,
+    alloc_name: []const u8,
+) bool {
+    const alloc_indent = findAllocIndent(lines, alloc_name);
+    var defer_depth: usize = 0;
+    var skip_depth: usize = 0;
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (checkDeferFreeLine(line, t, alloc_name, alloc_indent, &defer_depth, &skip_depth))
+            return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -11127,6 +11234,7 @@ const Config = struct {
     known_issues_path: ?[]const u8, // --known-issues=<filepath> to filter known true positives
     known_issues: std.ArrayListUnmanaged([]const u8), // Loaded known issues (file:line format)
     runtime_command: ?[]const u8, // --command=<cmd> for runtime analysis
+    install_version: ?[]const u8, // --version=X.Y.Z for install/upgrade
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -11145,6 +11253,7 @@ const Config = struct {
         for (self.known_issues.items) |k| allocator.free(k);
         self.known_issues.deinit(allocator);
         if (self.runtime_command) |c| allocator.free(c);
+        if (self.install_version) |v| allocator.free(v);
     }
 
     /// Determine if a rule is enabled considering enable list and disable list
@@ -11248,7 +11357,7 @@ fn tryLoadConfigFromDir(
     return true;
 }
 
-/// Loads entries from config (CLI path takes priority over config "src")
+/// Loads entries from config (CLI path takes priority over config "path_dir")
 fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []const u8) !void {
     const saved_path = try allocator.dupe(u8, cfg.path);
     errdefer allocator.free(saved_path);
@@ -11350,7 +11459,7 @@ fn parseConfigArray(
 ) !usize {
     var i = start + 1;
     while (i < content.len and content[i] != ']') {
-        i = skipWhitespace(content, i, true);
+        i = skipWhitespaceAndComments(content, i);
         if (i >= content.len or content[i] == ']') break;
         if (content[i] != '"') {
             i += 1;
@@ -11377,11 +11486,11 @@ fn parseConfigArray(
 fn parseThresholdsObject(content: []const u8, start: usize, th: *Thresholds) usize {
     var i = start + 1;
     while (i < content.len and content[i] != '}') {
-        i = skipWhitespace(content, i, true);
-        if (content[i] == '}') break;
+        i = skipWhitespaceAndComments(content, i);
+        if (i >= content.len or content[i] == '}') break;
         i = parseThresholdPair(content, i, th);
     }
-    return i + 1;
+    return if (i < content.len) i + 1 else i;
 }
 
 /// Handle a single config key-value pair
@@ -11392,7 +11501,9 @@ fn handleConfigKey(
     key: []const u8,
     cfg: *Config,
 ) !usize {
-    if (mem.eql(u8, key, "src") and content[start] == '"') {
+    const is_path_dir_key = mem.eql(u8, key, "path_dir") or
+        mem.eql(u8, key, "code") or mem.eql(u8, key, "src") or mem.eql(u8, key, "root");
+    if (is_path_dir_key and content[start] == '"') {
         const result = parseJsonString(content, start);
         if (cfg.path_owned) allocator.free(cfg.path);
         cfg.path = try allocator.dupe(u8, result.val);
@@ -11408,13 +11519,36 @@ fn handleConfigKey(
     return skipJsonValue(content, start);
 }
 
+/// Skip a // line comment, returning the index after the newline (or content.len)
+fn skipLineComment(content: []const u8, start: usize) usize {
+    var i = start;
+    while (i < content.len and content[i] != '\n') i += 1;
+    return if (i < content.len) i + 1 else i;
+}
+
+/// Skip whitespace and // line comments (used during JSON config parsing)
+fn skipWhitespaceAndComments(content: []const u8, start: usize) usize {
+    var i = start;
+    while (i < content.len) {
+        const c = content[i];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == ',') {
+            i += 1;
+        } else if (i + 1 < content.len and content[i] == '/' and content[i + 1] == '/') {
+            i = skipLineComment(content, i + 2);
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
 fn parseConfigJson(allocator: Allocator, content: []const u8, cfg: *Config) !void {
     var i: usize = 0;
     while (i < content.len and content[i] != '{') i += 1;
     if (i >= content.len) return;
     i += 1;
     while (i < content.len) {
-        i = skipWhitespace(content, i, true);
+        i = skipWhitespaceAndComments(content, i);
         if (i >= content.len or content[i] == '}') break;
         if (content[i] != '"') {
             i += 1;
@@ -11448,12 +11582,45 @@ fn handleConfigCreateError(err: anyerror) !void {
 fn writeDefaultConfig() !void {
     const default_config =
         \\{
-        \\  "src": "src",
+        \\  // Directory to analyze - auto-detected from build.zig during install
+        \\  // (e.g., "src", "lib", "app", or "." for project root)
+        \\  "path_dir": "src",
+        \\
+        \\  // Entry points for import graph analysis (orphan detection)
+        \\  // Add your main files and build.zig here
         \\  "entries": ["src/main.zig", "build.zig"],
-        \\  "exclude": ["test", "vendor"],
+        \\
+        \\  // Directories to exclude from analysis
+        \\  "exclude": ["test", "vendor", "third_party"],
+        \\
+        \\  // Patterns to exclude from orphan detection only
         \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
+        \\
+        \\  // Rules to disable (by ID or category prefix)
+        \\  // Examples: "ZA301" (single rule), "ZA3" (all complexity), "ZA7" (all style)
+        \\  //
+        \\  // Available rules:
+        \\  //   ZA1xx Memory:     ZA101 alloc-no-defer, ZA102 create-no-defer,
+        \\  //                     ZA103 alloc-no-errdefer, ZA104 memory-leak,
+        \\  //                     ZA105 use-after-free, ZA106 double-free
+        \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (note), ZA202 catch-unreachable (note),
+        \\  //                     ZA203 orelse-unreachable (note), ZA204 undefined (note),
+        \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer
+        \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
+        \\  //                     ZA303 too-many-params, ZA304 too-many-branches
+        \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
+        \\  //   ZA5xx Structure:  ZA501 orphan-file
+        \\  //   ZA6xx Format:     ZA601 needs-format
+        \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long, ZA703 naming
+        \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
+        \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
+        \\  //                     ZA903 index-arithmetic
         \\  "disable": [],
+        \\
+        \\  // Rules to explicitly enable (overrides disable)
         \\  "enable": [],
+        \\
+        \\  // Configurable thresholds
         \\  "thresholds": {
         \\    "max_lines": 50,
         \\    "max_nesting": 4,
@@ -11473,8 +11640,170 @@ fn writeDefaultConfig() !void {
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
 }
 
-/// URL for ephor package (used by install command)
-const EPHOR_PACKAGE_URL = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz";
+/// Detect the path_dir from build.zig by finding root_source_file patterns.
+/// Returns the directory portion (e.g., "src" from "src/main.zig") or "src" as fallback.
+fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
+    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return "src";
+    defer allocator.free(content);
+
+    // Look for .root_source_file = b.path("some/path/main.zig") or similar
+    const patterns = [_][]const u8{
+        "root_source_file",
+        ".root_src",
+    };
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        for (patterns) |pattern| {
+            const pat_idx = mem.indexOf(u8, line, pattern) orelse continue;
+            // Find a quoted .zig path after the pattern
+            const rest = line[pat_idx..];
+            const q1 = mem.indexOf(u8, rest, "\"") orelse continue;
+            const after_q1 = q1 + 1;
+            if (after_q1 >= rest.len) continue;
+            const q2 = mem.indexOf(u8, rest[after_q1..], "\"") orelse continue;
+            const path = rest[after_q1 .. after_q1 + q2];
+            if (!mem.endsWith(u8, path, ".zig")) continue;
+            // Extract directory: "src/main.zig" -> "src", "main.zig" -> "."
+            if (std.fs.path.dirname(path)) |dir| return dir;
+            return ".";
+        }
+    }
+    return "src";
+}
+
+/// Collect entry points from build.zig for the install config.
+/// Returns entries as a list of strings (caller frees with allocator).
+fn collectInstallEntries(
+    allocator: Allocator,
+    root_dir: []const u8,
+) !std.ArrayListUnmanaged([]const u8) {
+    var entries: std.ArrayListUnmanaged([]const u8) = .{};
+    errdefer {
+        for (entries.items) |e| allocator.free(e);
+        entries.deinit(allocator);
+    }
+
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+
+    // Add standard entry from root_source_file detection
+    const main_path = if (mem.eql(u8, root_dir, "."))
+        try allocator.dupe(u8, "main.zig")
+    else
+        try std.fmt.allocPrint(allocator, "{s}/main.zig", .{root_dir});
+
+    const main_exists = blk: {
+        fs.cwd().access(main_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (main_exists) {
+        try added.put(main_path, {});
+        try entries.append(allocator, main_path);
+    } else {
+        allocator.free(main_path);
+    }
+
+    // Always add build.zig as entry
+    const build_zig = try allocator.dupe(u8, "build.zig");
+    if (!added.contains(build_zig)) {
+        try added.put(build_zig, {});
+        try entries.append(allocator, build_zig);
+    } else {
+        allocator.free(build_zig);
+    }
+
+    return entries;
+}
+
+/// Create ephor.json during install with auto-detected path_dir and entries.
+/// Returns the detected path_dir string (static, not owned) for display.
+fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
+    // Don't overwrite existing config
+    fs.cwd().access(CONFIG_FILENAME, .{}) catch {
+        // File doesn't exist - create it
+        const root_dir = detectPathDirFromBuildZig(allocator);
+        var entries = try collectInstallEntries(allocator, root_dir);
+        defer {
+            for (entries.items) |e| allocator.free(e);
+            entries.deinit(allocator);
+        }
+
+        // Build entries JSON array string
+        var entries_json: std.ArrayListUnmanaged(u8) = .{};
+        defer entries_json.deinit(allocator);
+        try entries_json.append(allocator, '[');
+        for (entries.items, 0..) |entry, i| {
+            if (i > 0) try entries_json.appendSlice(allocator, ", ");
+            try entries_json.append(allocator, '"');
+            try entries_json.appendSlice(allocator, entry);
+            try entries_json.append(allocator, '"');
+        }
+        try entries_json.append(allocator, ']');
+
+        // Write config with version field
+        const config_content = try std.fmt.allocPrint(allocator,
+            \\{{
+            \\  // Installed ephor version
+            \\  "version": "{s}",
+            \\
+            \\  // Directory to analyze - auto-detected from build.zig
+            \\  // (e.g., "src", "lib", "app", or "." for project root)
+            \\  "path_dir": "{s}",
+            \\
+            \\  // Entry points for import graph analysis (orphan detection)
+            \\  "entries": {s},
+            \\
+            \\  // Directories to exclude from analysis
+            \\  "exclude": ["test", "vendor", "third_party"],
+            \\
+            \\  // Patterns to exclude from orphan detection only
+            \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
+            \\
+            \\  // Rules to disable (by ID or category prefix)
+            \\  "disable": [],
+            \\
+            \\  // Rules to explicitly enable (overrides disable)
+            \\  "enable": [],
+            \\
+            \\  // Configurable thresholds
+            \\  "thresholds": {{
+            \\    "max_lines": 50,
+            \\    "max_nesting": 4,
+            \\    "max_params": 5,
+            \\    "max_branches": 10,
+            \\    "max_line_length": 100
+            \\  }}
+            \\}}
+            \\
+        , .{ ver, root_dir, entries_json.items });
+        defer allocator.free(config_content);
+
+        const file = try fs.cwd().createFile(CONFIG_FILENAME, .{});
+        defer file.close();
+        try file.writeAll(config_content);
+
+        std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
+            CONFIG_FILENAME, ver, root_dir,
+        });
+        return root_dir;
+    };
+    // Config already exists - update version if needed
+    updateConfigVersion(allocator, ver);
+    std.debug.print("{s} already exists (skipped)\n", .{CONFIG_FILENAME});
+    return "src";
+}
+
+/// Base URL for ephor repository (used to construct versioned package URLs)
+const EPHOR_REPO_BASE = "https://bitbucket.org/rhyoslabs/ephor";
+
+/// Build a versioned package URL for install/upgrade.
+/// If version is null, defaults to EPHOR_VERSION (the binary's own version).
+/// Returns an allocated string that the caller must free.
+fn buildPackageUrl(allocator: Allocator, ver: ?[]const u8) ![]const u8 {
+    const v = ver orelse EPHOR_VERSION;
+    return std.fmt.allocPrint(allocator, "{s}/get/v{s}.tar.gz", .{ EPHOR_REPO_BASE, v });
+}
 
 /// Code snippet to add to build.zig
 const EPHOR_BUILD_SNIPPET =
@@ -11485,75 +11814,86 @@ const EPHOR_BUILD_SNIPPET =
     \\        .optimize = .ReleaseSafe,
     \\    });
     \\    const ephor_exe = ephor_dep.artifact("ephor");
-    \\    const ephor_cmd = b.addRunArtifact(ephor_exe);
-    \\    ephor_cmd.addArgs(&.{ "check", "src/" });
     \\    const ephor_step = b.step("ephor", "Run ephor static analysis");
-    \\    ephor_step.dependOn(&ephor_cmd.step);
+    \\    ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);
     \\
 ;
 
-/// Run the install command: adds ephor to project's build system
-fn runInstallCommand(allocator: Allocator) !void {
-    // Check if build.zig.zon exists
+/// Print instructions when build.zig.zon is missing during install.
+fn printNoZonHelp(package_url: []const u8) void {
+    std.debug.print(
+        \\No build.zig.zon found in current directory.
+        \\
+        \\To add ephor to your project:
+        \\
+        \\1. Create build.zig.zon with:
+        \\
+        \\   .{{
+        \\       .name = .my_project,
+        \\       .version = "0.1.0",
+        \\       .dependencies = .{{
+        \\           .ephor = .{{
+        \\               .url = "{s}",
+        \\               // Run 'zig build' to get the hash
+        \\           }},
+        \\       }},
+        \\       .paths = .{{ "build.zig", "build.zig.zon", "src" }},
+        \\   }}
+        \\
+        \\2. Then run: ephor install
+        \\
+    , .{package_url});
+}
+
+/// Print fallback instructions when zig fetch fails.
+fn printFetchFailedHelp(package_url: []const u8) void {
+    std.debug.print(
+        \\
+        \\Failed to fetch ephor package. You can add it manually:
+        \\
+        \\1. Add to build.zig.zon dependencies:
+        \\   .ephor = .{{
+        \\       .url = "{s}",
+        \\       // Run 'zig build' to get the hash
+        \\   }},
+        \\
+    , .{package_url});
+}
+
+/// Run the install command: adds ephor to project's build system.
+/// If install_version is provided, installs that specific version;
+/// otherwise defaults to the binary's own version (EPHOR_VERSION).
+fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
+    const ver = install_version orelse EPHOR_VERSION;
+    const package_url = try buildPackageUrl(allocator, install_version);
+    defer allocator.free(package_url);
+
     const has_zon = blk: {
         fs.cwd().access("build.zig.zon", .{}) catch break :blk false;
         break :blk true;
     };
-
     if (!has_zon) {
-        std.debug.print(
-            \\No build.zig.zon found in current directory.
-            \\
-            \\To add ephor to your project:
-            \\
-            \\1. Create build.zig.zon with:
-            \\
-            \\   .{{
-            \\       .name = .my_project,
-            \\       .version = "0.1.0",
-            \\       .dependencies = .{{
-            \\           .ephor = .{{
-            \\               .url = "{s}",
-            \\               // Run 'zig build' to get the hash
-            \\           }},
-            \\       }},
-            \\       .paths = .{{ "build.zig", "build.zig.zon", "src" }},
-            \\   }}
-            \\
-            \\2. Then run: ephor install
-            \\
-        , .{EPHOR_PACKAGE_URL});
+        printNoZonHelp(package_url);
         return;
     }
 
-    // Run zig fetch --save to add the dependency
-    std.debug.print("Adding ephor dependency to build.zig.zon...\n", .{});
+    std.debug.print("Installing ephor v{s}...\n", .{ver});
+
+    const url_z = try allocator.dupeZ(u8, package_url);
+    defer allocator.free(url_z);
 
     var child = std.process.Child.init(
-        &.{ "zig", "fetch", "--save=ephor", EPHOR_PACKAGE_URL },
+        &.{ "zig", "fetch", "--save=ephor", url_z },
         allocator,
     );
-
     const term = try child.spawnAndWait();
-
     if (term.Exited != 0) {
-        std.debug.print(
-            \\
-            \\Failed to fetch ephor package. You can add it manually:
-            \\
-            \\1. Add to build.zig.zon dependencies:
-            \\   .ephor = .{{
-            \\       .url = "{s}",
-            \\       // Run 'zig build' to get the hash
-            \\   }},
-            \\
-        , .{EPHOR_PACKAGE_URL});
+        printFetchFailedHelp(package_url);
         return;
     }
 
-    std.debug.print("Done! Added ephor to build.zig.zon\n\n", .{});
+    std.debug.print("Added ephor v{s} to build.zig.zon\n\n", .{ver});
 
-    // Now try to patch build.zig
     const patched = patchBuildZig(allocator) catch |err| {
         std.debug.print("Could not auto-patch build.zig: {}\n", .{err});
         std.debug.print("\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_SNIPPET});
@@ -11562,12 +11902,16 @@ fn runInstallCommand(allocator: Allocator) !void {
     };
 
     if (patched) |line| {
-        std.debug.print("Added ephor step to build.zig at line {d}\n\n", .{line});
-        std.debug.print("Run: zig build ephor\n", .{});
+        std.debug.print("Added ephor step to build.zig at line {d}\n", .{line});
     } else {
-        std.debug.print("Ephor step already exists in build.zig\n\n", .{});
-        std.debug.print("Run: zig build ephor\n", .{});
+        std.debug.print("Ephor step already exists in build.zig\n", .{});
     }
+
+    _ = createInstallConfig(allocator, ver) catch |err| {
+        std.debug.print("Could not create {s}: {}\n", .{ CONFIG_FILENAME, err });
+    };
+
+    std.debug.print("Run: zig build ephor\n", .{});
 }
 
 /// Patch build.zig to add ephor step. Returns line number
@@ -11651,8 +11995,14 @@ fn patchBuildZig(allocator: Allocator) !?usize {
     return insert_after + 2;
 }
 
-/// Run the upgrade command: updates ephor dependency in build.zig.zon
-fn runUpgradeCommand(allocator: Allocator) !void {
+/// Run the upgrade command: updates ephor dependency in build.zig.zon.
+/// If install_version is provided, upgrades to that specific version;
+/// otherwise defaults to the binary's own version (EPHOR_VERSION).
+fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
+    const ver = install_version orelse EPHOR_VERSION;
+    const package_url = try buildPackageUrl(allocator, install_version);
+    defer allocator.free(package_url);
+
     // Check if build.zig.zon exists and has ephor dependency
     const has_ephor = blk: {
         const file = fs.cwd().openFile(
@@ -11675,46 +12025,261 @@ fn runUpgradeCommand(allocator: Allocator) !void {
         return;
     }
 
-    std.debug.print("Upgrading ephor to latest version...\n", .{});
+    std.debug.print("Upgrading ephor to v{s}...\n", .{ver});
 
-    // Run zig fetch --save to update the dependency (fetches latest and updates hash)
+    const url_z = try allocator.dupeZ(u8, package_url);
+    defer allocator.free(url_z);
+
+    // Run zig fetch --save to update the dependency
     var child = std.process.Child.init(
-        &.{ "zig", "fetch", "--save=ephor", EPHOR_PACKAGE_URL },
+        &.{ "zig", "fetch", "--save=ephor", url_z },
         allocator,
     );
 
     const term = try child.spawnAndWait();
 
     if (term.Exited != 0) {
-        std.debug.print("Failed to upgrade ephor.\n", .{});
+        std.debug.print("Failed to upgrade ephor to v{s}.\n", .{ver});
         return;
     }
 
+    // Update version in ephor.json if it exists
+    updateConfigVersion(allocator, ver);
+
     std.debug.print(
-        \\Done! Ephor updated to latest version.
+        \\Done! Ephor updated to v{s}.
         \\
         \\Run 'zig build ephor' to verify.
         \\
-    , .{});
+    , .{ver});
+}
+
+/// Update the "version" field in ephor.json if the file exists.
+/// Best-effort: silently does nothing if file is missing or cannot be updated.
+fn updateConfigVersion(allocator: Allocator, ver: []const u8) void {
+    const content = fs.cwd().readFileAlloc(
+        allocator,
+        CONFIG_FILENAME,
+        64 * 1024,
+    ) catch return;
+    defer allocator.free(content);
+
+    const new_content = buildVersionUpdatedConfig(allocator, content, ver) orelse return;
+    defer allocator.free(new_content);
+
+    writeConfigFile(new_content) catch return;
+    std.debug.print("Updated {s} (version: {s})\n", .{ CONFIG_FILENAME, ver });
+}
+
+/// Build config content with the version field replaced or inserted.
+/// Returns allocated string on success, null if content cannot be processed.
+fn buildVersionUpdatedConfig(
+    allocator: Allocator,
+    content: []const u8,
+    ver: []const u8,
+) ?[]const u8 {
+    const key = "\"version\"";
+    if (mem.indexOf(u8, content, key)) |key_pos| {
+        return replaceVersionValue(allocator, content, key_pos + key.len, ver);
+    }
+    return insertVersionField(allocator, content, ver);
+}
+
+/// Replace the value of an existing "version" key at the given offset.
+fn replaceVersionValue(
+    allocator: Allocator,
+    content: []const u8,
+    after_key: usize,
+    ver: []const u8,
+) ?[]const u8 {
+    // Find opening quote of value
+    var i = after_key;
+    while (i < content.len and content[i] != '"') i += 1;
+    if (i >= content.len) return null;
+    const val_start = i + 1;
+    // Find closing quote
+    var j = val_start;
+    while (j < content.len and content[j] != '"') j += 1;
+    if (j >= content.len) return null;
+
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        content[0..val_start],
+        ver,
+        content[j..],
+    }) catch null;
+}
+
+/// Insert a "version" field after the opening brace when none exists.
+fn insertVersionField(
+    allocator: Allocator,
+    content: []const u8,
+    ver: []const u8,
+) ?[]const u8 {
+    const brace_pos = mem.indexOf(u8, content, "{") orelse return null;
+    return std.fmt.allocPrint(allocator, "{s}\n  \"version\": \"{s}\",{s}", .{
+        content[0 .. brace_pos + 1],
+        ver,
+        content[brace_pos + 1 ..],
+    }) catch null;
+}
+
+/// Write content to the config file (ephor.json).
+fn writeConfigFile(content: []const u8) !void {
+    const out = try fs.cwd().createFile(CONFIG_FILENAME, .{});
+    defer out.close();
+    try out.writeAll(content);
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.7.4";
+const EPHOR_VERSION = "0.8.1";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
 
-/// Check for new version at startup (non-blocking, best effort)
-/// NOTE: Version check requires the repo to be public. Once published,
-/// this will fetch build.zig.zon from EPHOR_VERSION_URL to compare versions.
+/// Cache file name in home directory
+const UPDATE_CACHE_FILE = ".ephor_update_check";
+
+/// Check frequency: once per day (seconds)
+const UPDATE_CHECK_INTERVAL: i64 = 86400;
+
+/// Stored update notification (printed after analysis output)
+var update_notification: ?[]const u8 = null;
+
+/// Check for new version (best effort, never blocks on failure).
+/// Reads/writes ~/.ephor_update_check cache (timestamp + version).
+/// Fetches latest version via curl if cache is stale or missing.
 fn checkForUpdates(allocator: Allocator) void {
-    _ = allocator;
-    // TODO: Enable once repo is public
-    // Version checking is disabled until the repo is published to Bitbucket.
-    // Once public, this will:
-    // 1. Check ~/.ephor_update_check for cached version (once per day)
-    // 2. Fetch latest build.zig.zon from repo
-    // 3. Compare versions and show update notice if newer
+    const latest = getCachedOrFetchVersion(allocator) orelse return;
+    defer allocator.free(latest);
+    if (!isNewerVersion(EPHOR_VERSION, latest)) return;
+    update_notification = std.fmt.allocPrint(
+        allocator,
+        "\nhint: ephor v{s} available (current: v{s}). Run: ephor upgrade\n",
+        .{ latest, EPHOR_VERSION },
+    ) catch null;
+}
+
+/// Return the latest known version string, using cache or fetching.
+fn getCachedOrFetchVersion(allocator: Allocator) ?[]const u8 {
+    const cache_path = buildCachePath(allocator) orelse return null;
+    defer allocator.free(cache_path);
+
+    const now = std.time.timestamp();
+
+    // Try reading cache file
+    if (readCacheFile(allocator, cache_path, now)) |ver| return ver;
+
+    // Cache stale or missing: fetch from remote
+    const fetched = fetchLatestVersion(allocator) orelse return null;
+    writeCacheFile(cache_path, now, fetched);
+    return fetched;
+}
+
+/// Build the absolute path to ~/.ephor_update_check
+fn buildCachePath(allocator: Allocator) ?[]u8 {
+    const home = std.posix.getenv("HOME") orelse return null;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ home, UPDATE_CACHE_FILE },
+    ) catch null;
+}
+
+/// Read cache file and return version if still fresh (< 1 day old).
+fn readCacheFile(
+    allocator: Allocator,
+    path: []const u8,
+    now: i64,
+) ?[]const u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 256) catch return null;
+    defer allocator.free(content);
+
+    var lines = mem.splitScalar(u8, content, '\n');
+    const ts_str = lines.next() orelse return null;
+    const ver_str = lines.next() orelse return null;
+
+    const cached_ts = std.fmt.parseInt(i64, ts_str, 10) catch return null;
+    if (now - cached_ts >= UPDATE_CHECK_INTERVAL) return null;
+
+    const trimmed = mem.trim(u8, ver_str, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
+/// Write timestamp and version to cache file (best effort).
+fn writeCacheFile(path: []const u8, timestamp: i64, version: []const u8) void {
+    const file = std.fs.createFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    var buf: [64]u8 = undefined;
+    const line1 = std.fmt.bufPrint(&buf, "{d}\n", .{timestamp}) catch return;
+    file.writeAll(line1) catch return;
+    file.writeAll(version) catch return;
+    file.writeAll("\n") catch return;
+}
+
+/// Fetch latest version from Bitbucket by running curl and parsing
+/// the .version field from build.zig.zon.
+fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "curl", "-sL", "--max-time", "3", EPHOR_VERSION_URL },
+    }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.stdout.len == 0) return null;
+    return parseVersionFromZon(allocator, result.stdout);
+}
+
+/// Parse `.version = "X.Y.Z"` from build.zig.zon content.
+fn parseVersionFromZon(allocator: Allocator, content: []const u8) ?[]const u8 {
+    const marker = ".version";
+    var pos: usize = 0;
+    while (pos < content.len) {
+        const idx = mem.indexOfPos(u8, content, pos, marker) orelse return null;
+        pos = idx + marker.len;
+        // Skip whitespace and '='
+        while (pos < content.len and (content[pos] == ' ' or
+            content[pos] == '=' or content[pos] == '\t')) : (pos += 1)
+        {}
+        if (pos >= content.len or content[pos] != '"') continue;
+        pos += 1; // skip opening quote
+        const end = mem.indexOfPos(u8, content, pos, "\"") orelse return null;
+        const ver = content[pos..end];
+        if (ver.len == 0) return null;
+        return allocator.dupe(u8, ver) catch null;
+    }
+    return null;
+}
+
+/// Compare two semver strings. Returns true if remote > local.
+fn isNewerVersion(local: []const u8, remote: []const u8) bool {
+    const l = parseSemver(local) orelse return false;
+    const r = parseSemver(remote) orelse return false;
+    if (r[0] != l[0]) return r[0] > l[0];
+    if (r[1] != l[1]) return r[1] > l[1];
+    return r[2] > l[2];
+}
+
+/// Parse "X.Y.Z" into [3]u32. Returns null on failure.
+fn parseSemver(ver: []const u8) ?[3]u32 {
+    var parts: [3]u32 = .{ 0, 0, 0 };
+    var it = mem.splitScalar(u8, ver, '.');
+    var i: usize = 0;
+    while (it.next()) |part| {
+        if (i >= 3) return null;
+        // Strip any suffix like "-dev" from the last part
+        const clean = if (mem.indexOfScalar(u8, part, '-')) |dash|
+            part[0..dash]
+        else
+            part;
+        parts[i] = std.fmt.parseInt(u32, clean, 10) catch return null;
+        i += 1;
+    }
+    if (i < 3) return null;
+    return parts;
 }
 
 // ============================================================================
@@ -11736,6 +12301,7 @@ fn parseCommand(cmd: []const u8) ?Command {
         .{ .name = "install", .cmd = .install },
         .{ .name = "upgrade", .cmd = .upgrade },
         .{ .name = "update", .cmd = .upgrade }, // Alias
+        .{ .name = "help", .cmd = .help },
         .{ .name = "--help", .cmd = .help },
         .{ .name = "-h", .cmd = .help },
         .{ .name = "--version", .cmd = .version },
@@ -12356,6 +12922,8 @@ fn handleOptionalPathArg(
         return setOptionalPath(allocator, &cfg.known_issues_path, arg[15..]);
     if (mem.startsWith(u8, arg, "--command="))
         return setOptionalPath(allocator, &cfg.runtime_command, arg[10..]);
+    if (mem.startsWith(u8, arg, "--version="))
+        return setOptionalPath(allocator, &cfg.install_version, arg[10..]);
     return false;
 }
 
@@ -12383,7 +12951,7 @@ fn parseArgs(allocator: Allocator) !Config {
     defer args.deinit();
     _ = args.next();
     var cfg = Config{
-        .command = .help,
+        .command = .check,
         .path = "src",
         .path_owned = false,
         .entries = .{},
@@ -12400,6 +12968,7 @@ fn parseArgs(allocator: Allocator) !Config {
         .known_issues_path = null,
         .known_issues = .{},
         .runtime_command = null,
+        .install_version = null,
     };
     try loadConfigFile(allocator, &cfg);
     var cli_entries = false;
@@ -12414,6 +12983,21 @@ fn parseArgs(allocator: Allocator) !Config {
         }
     }
     while (args.next()) |arg| try parseCliArg(allocator, arg, &cfg, &cli_entries);
+
+    // Strip trailing slashes from path to prevent double-slash in output
+    // (e.g., "src/" + "/main.zig" would produce "src//main.zig")
+    if (cfg.path_owned) {
+        var path = cfg.path;
+        while (path.len > 1 and path[path.len - 1] == '/') {
+            path = path[0 .. path.len - 1];
+        }
+        if (path.len != cfg.path.len) {
+            const trimmed = try allocator.dupe(u8, path);
+            allocator.free(cfg.path);
+            cfg.path = trimmed;
+        }
+    }
+
     if (cfg.path_owned and !mem.eql(u8, cfg.path, "src")) try detectTargetEntries(allocator, &cfg);
     if (cfg.entries.items.len == 0) try detectStandardEntries(allocator, &cfg);
     return cfg;
@@ -12433,8 +13017,8 @@ fn printHelp() void {
         \\
         \\COMMANDS:
         \\  init        Create ephor.json config file
-        \\  install     Add ephor to project's build.zig (runs zig fetch)
-        \\  upgrade     Update ephor to latest version (alias: update)
+        \\  install     Add ephor to project's build.zig (version-pinned)
+        \\  upgrade     Upgrade ephor to a new version (alias: update)
         \\  check       Run all static checks (default)
         \\  runtime     Run tests with memory diagnostics (dynamic analysis)
         \\  orphans     Files not imported from entry points
@@ -12461,6 +13045,13 @@ fn printHelp() void {
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
         \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
+        \\  --version=<X.Y.Z>   For 'install'/'upgrade': pin a specific version
+        \\
+        \\INSTALL/UPGRADE EXAMPLES:
+        \\  ephor install                    # Install current version (v0.7.4)
+        \\  ephor install --version=0.7.0    # Install specific version
+        \\  ephor upgrade                    # Upgrade to current binary version
+        \\  ephor upgrade --version=0.9.0    # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -12475,7 +13066,8 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "src": "src",
+        \\    "version": "0.7.4",
+        \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
         \\    "disable": ["ZA301"],
@@ -12688,6 +13280,8 @@ fn shouldPrintIssue(issue: Issue, cfg: *const Config) bool {
     return true;
 }
 
+/// Print issues and return count of actionable issues (warnings + errors only).
+/// Notes are printed but do NOT count toward the exit code.
 fn printIssues(
     issues: []const Issue,
     base_path: []const u8,
@@ -12695,20 +13289,24 @@ fn printIssues(
     title: []const u8,
     cfg: *const Config,
 ) usize {
-    var count: usize = 0;
+    var total_printable: usize = 0;
+    var actionable_count: usize = 0;
     for (issues) |issue| {
-        if (shouldPrintIssue(issue, cfg)) count += 1;
+        if (shouldPrintIssue(issue, cfg)) {
+            total_printable += 1;
+            if (issue.severity != .note) actionable_count += 1;
+        }
     }
     if (format == .json) {
         std.debug.print(
             "{{\n  \"analyzer\": \"{s}\",\n  \"count\": {d},\n  \"issues\": [\n",
-            .{ title, count },
+            .{ title, total_printable },
         );
         var printed: usize = 0;
         for (issues) |issue| {
             if (!shouldPrintIssue(issue, cfg)) continue;
             printed += 1;
-            issue.printJson(base_path, printed == count);
+            issue.printJson(base_path, printed == total_printable);
         }
         std.debug.print("  ]\n}}\n", .{});
     } else {
@@ -12717,7 +13315,7 @@ fn printIssues(
             issue.printText(base_path);
         }
     }
-    return count;
+    return actionable_count;
 }
 
 fn printStats(s: ProjectStats, format: OutputFormat) void {
@@ -12947,19 +13545,19 @@ pub fn main() !void {
             };
             // If --build flag, also print build integration info
             if (cfg.init_build and !should_exit_error) {
-                runInstallCommand(alloc) catch |err| {
+                runInstallCommand(alloc, cfg.install_version) catch |err| {
                     std.debug.print("error: failed to run install: {}\n", .{err});
                     should_exit_error = true;
                 };
             }
         },
 
-        .install => runInstallCommand(alloc) catch |err| {
+        .install => runInstallCommand(alloc, cfg.install_version) catch |err| {
             std.debug.print("error: failed to install: {}\n", .{err});
             should_exit_error = true;
         },
 
-        .upgrade => runUpgradeCommand(alloc) catch |err| {
+        .upgrade => runUpgradeCommand(alloc, cfg.install_version) catch |err| {
             std.debug.print("error: failed to upgrade: {}\n", .{err});
             should_exit_error = true;
         },
@@ -13267,6 +13865,13 @@ pub fn main() !void {
                 if (total > 0) should_exit_error = true;
             }
         },
+    }
+
+    // Print update notification after all analysis output
+    if (update_notification) |msg| {
+        std.debug.print("{s}", .{msg});
+        alloc.free(msg);
+        update_notification = null;
     }
 
     // Exit with error code AFTER all defers have run (cfg.deinit, gpa.deinit)
@@ -13900,6 +14505,7 @@ test "Config.isRuleEnabled respects explicit enable" {
         .known_issues_path = null,
         .known_issues = .{},
         .runtime_command = null,
+        .install_version = null,
     };
     defer cfg.deinit(allocator);
 
@@ -13933,6 +14539,7 @@ test "Config.isRuleEnabled respects disable prefix" {
         .known_issues_path = null,
         .known_issues = .{},
         .runtime_command = null,
+        .install_version = null,
     };
     defer cfg.deinit(allocator);
 
@@ -13973,6 +14580,7 @@ test "Config.isRuleEnabled enable overrides disable" {
         .known_issues_path = null,
         .known_issues = .{},
         .runtime_command = null,
+        .install_version = null,
     };
     defer cfg.deinit(allocator);
 
@@ -14151,6 +14759,50 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
     }
 }
 
+test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Test content: allocation with no defer, no free, no ownership transfer
+    const test_content =
+        \\fn leaky(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    _ = data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg_graph = try buildCFG(allocator, "leaky", 1, lines_list.items);
+    defer cfg_graph.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg_graph,
+        lines_list.items,
+        1,
+        "test_no_defer.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    // Should detect that allocation has no defer at all
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
 // ============================================================================
 // Integration Test: Bad Code Patterns (CFG-based)
 // ============================================================================
@@ -14303,4 +14955,63 @@ test "integration: no false positive for valid catch-free-return" {
             try std.testing.expect(false); // Fail if we find UAF in valid code
         }
     }
+}
+
+// ============================================================================
+// Update Check Tests
+// ============================================================================
+
+test "isNewerVersion detects newer versions" {
+    try std.testing.expect(isNewerVersion("0.7.4", "0.8.0"));
+    try std.testing.expect(isNewerVersion("0.7.4", "0.7.5"));
+    try std.testing.expect(isNewerVersion("0.7.4", "1.0.0"));
+    try std.testing.expect(!isNewerVersion("0.7.4", "0.7.4"));
+    try std.testing.expect(!isNewerVersion("0.7.4", "0.7.3"));
+    try std.testing.expect(!isNewerVersion("0.7.4", "0.6.9"));
+    try std.testing.expect(!isNewerVersion("1.0.0", "0.99.99"));
+}
+
+test "isNewerVersion handles dev suffix" {
+    try std.testing.expect(isNewerVersion("0.7.4", "0.8.0-dev"));
+    try std.testing.expect(!isNewerVersion("0.8.0", "0.8.0-dev"));
+}
+
+test "parseSemver parses valid versions" {
+    const v = parseSemver("1.2.3").?;
+    try std.testing.expectEqual(@as(u32, 1), v[0]);
+    try std.testing.expectEqual(@as(u32, 2), v[1]);
+    try std.testing.expectEqual(@as(u32, 3), v[2]);
+}
+
+test "parseSemver rejects invalid versions" {
+    try std.testing.expect(parseSemver("abc") == null);
+    try std.testing.expect(parseSemver("1.2") == null);
+    try std.testing.expect(parseSemver("") == null);
+}
+
+test "parseVersionFromZon extracts version" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const zon_content =
+        \\.{
+        \\    .name = .ephor,
+        \\    .version = "0.9.0",
+        \\    .fingerprint = 0x12345,
+        \\}
+    ;
+
+    const ver = parseVersionFromZon(allocator, zon_content).?;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.9.0", ver);
+}
+
+test "parseVersionFromZon returns null for missing version" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const bad_content = ".{ .name = .ephor }";
+    try std.testing.expect(parseVersionFromZon(allocator, bad_content) == null);
 }

@@ -43,15 +43,10 @@ That's it.
 ### Upgrading
 
 ```bash
-# Upgrade to latest version (via build system)
 zig build ephor-upgrade
-
-# Or with standalone CLI
-ephor upgrade
-
-# Upgrade to a specific version
-ephor upgrade --version=0.9.2
 ```
+
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.9.3`
 
 ### Version Management
 
@@ -67,7 +62,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.2.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.3.tar.gz",
     },
 },
 ```
@@ -94,37 +89,33 @@ ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
 
 ## Usage
 
+### Via Build System (Recommended)
+
+Most users interact with ephor through their project's build system:
+
 ```bash
-# Run all static checks (via build system)
-zig build ephor
+zig build ephor           # Run all static checks
+zig build ephor-upgrade   # Upgrade to latest version
+```
 
-# Upgrade to latest version
-zig build ephor-upgrade
+No standalone binary needed — the install script adds these build steps automatically.
 
-# Or with standalone CLI (defaults to 'check' on configured code directory)
-ephor
+### Standalone CLI
 
-# Equivalent to:
-ephor check src/
+If you have the `ephor` binary installed directly, it accepts commands and options:
 
-# Individual analyzers
+```bash
+ephor                     # Defaults to 'check' on configured src directory
+ephor check src/          # Explicit path
 ephor memory              # Alloc without defer patterns
 ephor errors              # Silent catch {} discards
 ephor orphans             # Files not imported
 ephor complexity          # Function complexity
 ephor fmt-check           # Files needing zig fmt
-
-# Dynamic analysis (runs tests with memory diagnostics)
-ephor runtime
-
-# Project statistics
-ephor stats
-
-# Create config file
-ephor init
+ephor runtime             # Dynamic analysis (runs tests with memory diagnostics)
+ephor stats               # Project statistics
+ephor init                # Create ephor.json config file
 ```
-
-Running `ephor` with no arguments defaults to `check` on the `path_dir` configured in `ephor.json` (default: `src`).
 
 ## Output Format
 
@@ -153,7 +144,7 @@ Example config:
 
 ```json
 {
-  "version": "0.9.2",
+  "version": "0.9.3",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -319,16 +310,9 @@ fn legacy_handler() void {
 
 Omit the rule to suppress all rules: `// ephor:ignore`
 
-## Build Steps
+## CLI Reference
 
-```bash
-zig build ephor           # Run all static checks
-zig build ephor-upgrade   # Upgrade ephor to latest version
-```
-
-## CLI Options
-
-When running via the standalone binary, ephor accepts these commands and options:
+Full command reference for the standalone `ephor` binary:
 
 ```
 ephor [command] [path] [options]

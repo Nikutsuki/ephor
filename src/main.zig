@@ -12243,7 +12243,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.9.0";
+const EPHOR_VERSION = "0.9.1";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13335,7 +13335,7 @@ fn writeCodeSnippet(
 
     var line_iter = mem.splitScalar(u8, content, '\n');
     var line_num: usize = 1;
-    try writer.print("\n```zig\n", .{});
+    try writer.print("```zig\n", .{});
 
     const start_line = if (issue_line > 2) issue_line - 2 else 1;
     const end_line = issue_line + 2;
@@ -13351,9 +13351,10 @@ fn writeCodeSnippet(
 }
 
 /// Write a single issue entry to the export writer
-fn writeExportIssue(allocator: Allocator, writer: anytype, issue: Issue) !void {
+fn writeExportIssue(allocator: Allocator, writer: anytype, issue: Issue, base_path: []const u8) !void {
+    const rel_path = types.relativePath(issue.file, base_path);
     try writer.print("## {s}:{d}:{d} [{s}]\n", .{
-        issue.file, issue.line, issue.col, issue.rule,
+        rel_path, issue.line, issue.col, issue.rule,
     });
     try writer.print("**{s}**: {s}\n", .{
         @tagName(issue.severity), issue.message,
@@ -13379,14 +13380,26 @@ fn exportIssues(
     defer output.deinit(allocator);
     var writer = output.writer(allocator);
 
+    const ts: u64 = @intCast(std.time.timestamp());
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = ts };
+    const day_secs = epoch_secs.getDaySeconds();
+    const year_day = epoch_secs.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
     try writer.print("# Ephor Issues Export\n", .{});
-    try writer.print("# Generated: {d}\n", .{std.time.timestamp()});
+    try writer.print("# Generated: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC\n", .{
+        year_day.year,
+        @intFromEnum(month_day.month),
+        month_day.day_index + 1,
+        day_secs.getHoursIntoDay(),
+        day_secs.getMinutesIntoHour(),
+        day_secs.getSecondsIntoMinute(),
+    });
     try writer.print("# Path: {s}\n", .{cfg.path});
     try writer.print("# Total issues: {d}\n\n", .{all_issues.len});
 
     for (all_issues) |issue| {
         if (!shouldPrintIssue(issue, cfg, graph)) continue;
-        try writeExportIssue(allocator, writer, issue);
+        try writeExportIssue(allocator, writer, issue, cfg.path);
     }
     try file.writeAll(output.items);
 }

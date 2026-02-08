@@ -12246,7 +12246,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.9.4";
+const EPHOR_VERSION = "0.9.5";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13435,7 +13435,6 @@ fn exportIssues(
         day_secs.getMinutesIntoHour(),
         day_secs.getSecondsIntoMinute(),
     });
-    try writer.print("# Path: {s}\n", .{cfg.path});
     try writer.print("# Total issues: {d}\n\n", .{all_issues.len});
 
     for (all_issues) |issue| {

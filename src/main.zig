@@ -3190,7 +3190,7 @@ fn hasNearbyDefer(
         if (scan_line.len == 0) continue;
         const check_indent = countIndent(raw_line);
         if (check_indent < alloc_indent) break;
-        if (!mem.startsWith(u8, scan_line, "defer ")) continue;
+        if (!isDeferOrErrdefer(scan_line)) continue;
         if (check_indent != alloc_indent) continue;
         if (hasRealCleanupPattern(scan_line) and
             mem.indexOf(u8, scan_line, name) != null) return true;
@@ -3198,12 +3198,18 @@ fn hasNearbyDefer(
     return false;
 }
 
-/// Scan for a defer at an OUTER scope that frees this variable
+/// Check if a trimmed line starts with defer or errdefer
+fn isDeferOrErrdefer(t: []const u8) bool {
+    return mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ") or
+        mem.startsWith(u8, t, "errdefer{") or mem.startsWith(u8, t, "defer{");
+}
+
+/// Scan for a defer/errdefer at an OUTER scope that frees this variable
 fn hasOuterScopeDefer(lines: []const []const u8, alloc_indent: usize, name: []const u8) bool {
     for (0..lines.len) |check_idx| {
         const raw_line = lines[check_idx];
         const scan_line = mem.trim(u8, raw_line, " \t\r");
-        if (!mem.startsWith(u8, scan_line, "defer ")) continue;
+        if (!isDeferOrErrdefer(scan_line)) continue;
         if (countIndent(raw_line) >= alloc_indent) continue;
         if (hasRealCleanupPattern(scan_line) and
             mem.indexOf(u8, scan_line, name) != null) return true;
@@ -3468,10 +3474,10 @@ fn scanSingleBlock(
         const idx = line_num - func_line;
         if (idx >= lines.len) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
-        const is_defer = mem.startsWith(u8, t, "defer ");
+        const is_defer = isDeferOrErrdefer(t);
         const has_free = hasRealFreePattern(t) and containsIdentifier(t, alloc_name);
 
-        // Track multi-line defer blocks: defer { ... }
+        // Track multi-line defer/errdefer blocks: defer { ... } / errdefer { ... }
         if (is_defer and (mem.indexOf(u8, t, "{") != null)) {
             defer_depth = countBraceDepth(t, 0);
         } else if (defer_depth > 0) {
@@ -3626,8 +3632,7 @@ fn checkDeferFreeLine(
         return false;
     }
 
-    const is_defer_start = mem.startsWith(u8, t, "defer ") or
-        mem.startsWith(u8, t, "defer{");
+    const is_defer_start = isDeferOrErrdefer(t);
     if (is_defer_start)
         return handleDeferStart(line, t, alloc_name, alloc_indent, defer_depth, skip_depth);
 

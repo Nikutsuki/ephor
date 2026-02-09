@@ -69,8 +69,10 @@ else
         echo "Please add manually after your exe/lib setup:"
         echo ""
         echo '    const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });'
+        echo '    const ephor_cmd = b.addRunArtifact(ephor_dep.artifact("ephor"));'
+        echo '    if (b.args) |args| { ephor_cmd.addArgs(args); }'
         echo '    const ephor_step = b.step("ephor", "Run ephor static analysis");'
-        echo '    ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);'
+        echo '    ephor_step.dependOn(&ephor_cmd.step);'
         exit 0
     fi
 
@@ -81,8 +83,12 @@ else
     // Ephor static analysis
     const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
     const ephor_artifact = ephor_dep.artifact("ephor");
+    const ephor_cmd = b.addRunArtifact(ephor_artifact);
+    if (b.args) |args| {
+        ephor_cmd.addArgs(args);
+    }
     const ephor_step = b.step("ephor", "Run ephor static analysis");
-    ephor_step.dependOn(&b.addRunArtifact(ephor_artifact).step);
+    ephor_step.dependOn(&ephor_cmd.step);
 
     // Ephor upgrade
     const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);

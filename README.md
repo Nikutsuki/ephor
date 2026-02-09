@@ -46,7 +46,7 @@ That's it.
 zig build ephor-upgrade
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.10.0`
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.10.1`
 
 ### Version Management
 
@@ -62,7 +62,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.10.0.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.10.1.tar.gz",
     },
 },
 ```
@@ -75,8 +75,12 @@ const ephor_dep = b.dependency("ephor", .{
     .optimize = .ReleaseSafe,
 });
 const ephor_artifact = ephor_dep.artifact("ephor");
+const ephor_cmd = b.addRunArtifact(ephor_artifact);
+if (b.args) |args| {
+    ephor_cmd.addArgs(args);
+}
 const ephor_step = b.step("ephor", "Run ephor static analysis");
-ephor_step.dependOn(&b.addRunArtifact(ephor_artifact).step);
+ephor_step.dependOn(&ephor_cmd.step);
 
 // Ephor upgrade
 const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
@@ -94,11 +98,13 @@ ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
 Most users interact with ephor through their project's build system:
 
 ```bash
-zig build ephor           # Run all static checks
-zig build ephor-upgrade   # Upgrade to latest version
+zig build ephor              # Run all static checks
+zig build ephor -- init      # Create ephor.json config file
+zig build ephor -- stats     # Show project statistics
+zig build ephor-upgrade      # Upgrade to latest version
 ```
 
-No standalone binary needed — the install script adds these build steps automatically.
+Arguments after `--` are forwarded to ephor, so any CLI command works through the build system. No standalone binary needed — the install script adds these build steps automatically.
 
 ### Standalone CLI
 
@@ -137,14 +143,15 @@ ephor check --format=json
 Create `ephor.json` in your project root:
 
 ```bash
-ephor init
+zig build ephor -- init   # Via build system
+ephor init                # Standalone CLI
 ```
 
 Example config:
 
 ```json
 {
-  "version": "0.10.0",
+  "version": "0.10.1",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],

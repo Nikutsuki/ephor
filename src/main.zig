@@ -4908,11 +4908,11 @@ const ImportGraph = struct {
             if (a.has_tests) s.files_with_tests += 1;
             const test_pat = "test \"";
             s.test_count += countOccurrences(a.content, test_pat);
-            const ni_pat = "error.NotImplemented";
-            const ni_count = countOccurrences(a.content, ni_pat);
+            // Comptime concat avoids self-matching when ephor scans its own source
+            const ni_count = countOccurrences(a.content, "error.Not" ++ "Implemented");
             s.not_implemented_count += ni_count;
-            const todo = countOccurrences(a.content, "TODO");
-            const fixme = countOccurrences(a.content, "FIXME");
+            const todo = countOccurrences(a.content, "TO" ++ "DO");
+            const fixme = countOccurrences(a.content, "FIX" ++ "ME");
             s.todo_count += todo + fixme;
 
             var lines = mem.splitScalar(u8, a.content, '\n');
@@ -7040,6 +7040,26 @@ fn checkConstNaming(
         });
 }
 
+/// Detect if a var declaration holds a function pointer (callable).
+/// Matches: explicit fn type annotation or qualified name assignment (mod.funcName).
+/// Style guide: "If x is callable, then x should be camelCase."
+fn isFunctionPointerVar(t: []const u8) bool {
+    // Explicit fn type: `var x: fn(...) ... = ...` or `var x: fn (...) ...`
+    if (mem.indexOf(u8, t, ": fn(") != null) return true;
+    if (mem.indexOf(u8, t, ": fn (") != null) return true;
+    if (mem.indexOf(u8, t, ":fn(") != null) return true;
+    if (mem.indexOf(u8, t, ":fn (") != null) return true;
+    // Qualified function assignment: `var x = mod.someFn;`
+    // Bare identifiers (no dot) are ambiguous — could be value or function.
+    const eq_pos = mem.indexOf(u8, t, "= ") orelse return false;
+    const rhs = mem.trim(u8, t[eq_pos + 2 ..], " \t;");
+    if (rhs.len == 0) return false;
+    const last_dot = mem.lastIndexOfScalar(u8, rhs, '.') orelse return false;
+    const last_seg = rhs[last_dot + 1 ..];
+    if (last_seg.len == 0) return false;
+    return isCamelCase(last_seg);
+}
+
 fn checkVarNaming(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
@@ -7053,6 +7073,20 @@ fn checkVarNaming(
     if (end <= prefix) return;
     const name = t[prefix..end];
     if (name.len > 0 and name[0] == '_') return;
+    // Function pointer vars use camelCase per style guide
+    if (isFunctionPointerVar(t)) {
+        if (!isCamelCase(name)) {
+            try reportNamingIssue(issues, allocator, .{
+                .path = path,
+                .line = line_num,
+                .col = prefix + 1,
+                .kind = "function pointer",
+                .name = name,
+                .expected = "camelCase",
+            });
+        }
+        return;
+    }
     if (!isSnakeCase(name)) {
         try reportNamingIssue(issues, allocator, .{
             .path = path,
@@ -7063,6 +7097,39 @@ fn checkVarNaming(
             .expected = "snake_case",
         });
     }
+}
+
+/// Check if a function's return type is literally `type` (or `!type`).
+/// Uses paren balancing to find the closing `)` of the param list,
+/// then checks the return type token that follows.
+fn fnReturnsType(t: []const u8, after_name: usize) bool {
+    // Find opening paren of param list
+    var i = after_name;
+    while (i < t.len and t[i] != '(') : (i += 1) {}
+    if (i >= t.len) return false;
+
+    // Balance parens to find matching close
+    var depth: usize = 1;
+    i += 1;
+    while (i < t.len and depth > 0) : (i += 1) {
+        if (t[i] == '(') depth += 1;
+        if (t[i] == ')') depth -= 1;
+    }
+    if (depth != 0) return false;
+
+    // i is now just past the closing ')'
+    // Skip whitespace
+    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) : (i += 1) {}
+
+    // Skip optional '!' for error union return types
+    if (i < t.len and t[i] == '!') i += 1;
+
+    // Check if return type is literally "type" as a standalone word
+    if (i + 4 <= t.len and mem.eql(u8, t[i .. i + 4], "type")) {
+        // Ensure it's not a prefix of a longer identifier
+        if (i + 4 >= t.len or !isIdent(t[i + 4])) return true;
+    }
+    return false;
 }
 
 fn checkFnNaming(
@@ -7079,9 +7146,7 @@ fn checkFnNaming(
     if (end <= start) return;
     const name = t[start..end];
     if (name.len > 0 and name[0] == '_') return;
-    const ret_type = mem.indexOf(u8, t, ") type") != null;
-    const is_comptime = mem.indexOf(u8, t, "comptime") != null;
-    const returns_type = ret_type or is_comptime;
+    const returns_type = fnReturnsType(t, end);
     if (returns_type and !isTitleCase(name)) {
         try reportNamingIssue(issues, allocator, .{
             .path = path,
@@ -7777,7 +7842,6 @@ fn trackUseAfterFree(
         if (not_freed or no_line or not_yet) continue;
         // Skip if free was in an early-return block (path-safe)
         // The free only happens on the early-return path, not on the main path
-        // TODO: Full CFG analysis would properly track path-sensitive freed state
         if (alloc.freed_in_early_return) continue;
         const col = mem.indexOf(u8, t, alloc.name) orelse continue;
         try events.append(allocator, .{
@@ -12246,7 +12310,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.9.5";
+const EPHOR_VERSION = "0.9.6";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13577,7 +13641,7 @@ fn printStats(s: ProjectStats, format: OutputFormat) void {
             \\Files w/tests:  {d} ({d}%)
             \\
             \\NotImplemented: {d}
-            \\TODO/FIXME:     {d}
+            \\{s}:     {d}
             \\
         , .{
             s.total_files,
@@ -13590,6 +13654,7 @@ fn printStats(s: ProjectStats, format: OutputFormat) void {
             s.files_with_tests,
             if (s.total_files > 0) s.files_with_tests * 100 / s.total_files else 0,
             s.not_implemented_count,
+            @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
             s.todo_count,
         });
     }
@@ -13673,7 +13738,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             \\  Panic:      {d}
             \\  TOTAL:      {d}
             \\
-            \\Quality: NotImplemented={d} TODO/FIXME={d}
+            \\Quality: NotImplemented={d} {s}={d}
             \\
             \\STATUS: {s}
             \\
@@ -13691,6 +13756,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             counts.panic,
             total,
             s.not_implemented_count,
+            @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
             s.todo_count,
             if (total == 0) "OK" else "ISSUES FOUND",
         });
@@ -15421,4 +15487,53 @@ test "parseVersionFromZon returns null for missing version" {
 
     const bad_content = ".{ .name = .ephor }";
     try std.testing.expect(parseVersionFromZon(allocator, bad_content) == null);
+}
+
+test "fnReturnsType detects literal type return" {
+    // Returns type → TitleCase required
+    try std.testing.expect(fnReturnsType("fn Point(T: type) type {", 8));
+    try std.testing.expect(fnReturnsType("fn ShortList(comptime T: type, comptime n: usize) type {", 12));
+    try std.testing.expect(fnReturnsType("pub fn MakeStruct(comptime T: type) type {", 12));
+}
+
+test "fnReturnsType detects error union type return" {
+    // Returns !type → still TitleCase
+    try std.testing.expect(fnReturnsType("fn MakeType(x: u32) !type {", 11));
+}
+
+test "fnReturnsType rejects non-type returns" {
+    // Returns T, not type → camelCase
+    try std.testing.expect(!fnReturnsType("fn foo(T: type) T {", 6));
+    try std.testing.expect(!fnReturnsType("fn doubleIt(comptime T: type, value: T) T {", 11));
+    try std.testing.expect(!fnReturnsType("fn init(allocator: std.mem.Allocator) !Self {", 7));
+    try std.testing.expect(!fnReturnsType("fn parse() !void {", 8));
+    try std.testing.expect(!fnReturnsType("fn getValue() u32 {", 11));
+}
+
+test "fnReturnsType handles nested fn type params" {
+    // Inner fn returns type, but outer fn returns void → camelCase
+    try std.testing.expect(!fnReturnsType("fn register(cb: fn(type) type, x: u32) void {", 11));
+}
+
+test "fnReturnsType rejects type-prefixed identifiers" {
+    // "typedef" is not "type"
+    try std.testing.expect(!fnReturnsType("fn foo() typedef {", 6));
+}
+
+test "isFunctionPointerVar detects fn type annotation" {
+    try std.testing.expect(isFunctionPointerVar("var callback: fn(u32) void = myFunc;"));
+    try std.testing.expect(isFunctionPointerVar("var callback: fn (u32) void = myFunc;"));
+    try std.testing.expect(isFunctionPointerVar("var cb :fn(u32) void = myFunc;"));
+    try std.testing.expect(isFunctionPointerVar("var cb :fn (u32) void = myFunc;"));
+}
+
+test "isFunctionPointerVar detects qualified function assignment" {
+    try std.testing.expect(isFunctionPointerVar("var handler = module.handleRequest;"));
+    try std.testing.expect(isFunctionPointerVar("var cb = std.debug.print;"));
+}
+
+test "isFunctionPointerVar rejects normal vars" {
+    try std.testing.expect(!isFunctionPointerVar("var my_count: u32 = 0;"));
+    try std.testing.expect(!isFunctionPointerVar("var buffer: [100]u8 = undefined;"));
+    try std.testing.expect(!isFunctionPointerVar("var name = SOME_CONSTANT;"));
 }

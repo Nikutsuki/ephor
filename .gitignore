@@ -27,3 +27,7 @@ ephor.json
 *.a
 *.so
 *.dylib
+
+# Compiled example binaries (source .zig files are tracked)
+examples/all_issues_demo
+examples/leak_demo

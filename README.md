@@ -46,7 +46,7 @@ That's it.
 zig build ephor-upgrade
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.9.5`
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.9.6`
 
 ### Version Management
 
@@ -62,7 +62,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.5.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.6.tar.gz",
     },
 },
 ```
@@ -144,7 +144,7 @@ Example config:
 
 ```json
 {
-  "version": "0.9.5",
+  "version": "0.9.6",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -236,7 +236,24 @@ Example config:
 |------|----------|---------|-------------|
 | **ZA701** | warning | ON | Line exceeds max length (default: 100 columns) |
 | **ZA702** | warning | OFF | File exceeds max size (set `max_file_bytes` to enable) |
-| **ZA703** | warning | ON | Naming convention violation (types=TitleCase, funcs=camelCase, vars=snake_case) |
+| **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
+
+#### ZA703 Naming Rules
+
+Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
+
+| Declaration | Expected | Example |
+|---|---|---|
+| Type definitions (`struct`, `enum`, `union`, `opaque`) | `TitleCase` | `const MyStruct = struct {};` |
+| Functions returning `type` | `TitleCase` | `fn ArrayList(comptime T: type) type {}` |
+| All other functions | `camelCase` | `fn getValue() u32 {}` |
+| Generic functions returning `T` (not `type`) | `camelCase` | `fn maxInt(comptime T: type) T {}` |
+| Variables (`var`) | `snake_case` | `var my_count: u32 = 0;` |
+| Constants (`const`) | `snake_case` | `const max_size = 1024;` |
+| Type aliases (`const`) | `TitleCase` | `const Allocator = std.mem.Allocator;` |
+| Function aliases (`const`) | `camelCase` | `const eql = std.mem.eql;` |
+| Imports | (not checked) | `const std = @import("std");` |
+| Names starting with `_` | (exempt) | `fn _helper() void {}` |
 
 ### Null Safety (ZA8xx)
 

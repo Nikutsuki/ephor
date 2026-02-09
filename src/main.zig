@@ -3124,6 +3124,12 @@ fn collectCFGAllocations(
 ) !std.ArrayListUnmanaged(CFGAlloc) {
     var allocs = std.ArrayListUnmanaged(CFGAlloc){};
 
+    // Pre-scan: build set of no-free allocator names by tracking type-based
+    // initialization (ArenaAllocator, FixedBufferAllocator, etc.) and
+    // .allocator() aliases on tracked variables.
+    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
+    defer no_free_names.deinit(allocator);
+
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
@@ -3136,6 +3142,10 @@ fn collectCFGAllocations(
         if (isArenaAllocLine(t)) continue;
         const aname = extractAllocatorName(t) orelse "";
         if (isNoFreeAllocatorName(aname)) continue;
+
+        // Skip allocations from type-tracked no-free allocators
+        if (aname.len > 0 and no_free_names.contains(aname)) continue;
+        if (isNoFreeCallChain(t, &no_free_names)) continue;
 
         const name = extractVarDeclName(t) orelse continue;
         const col = getRealAllocPos(t) orelse 0;
@@ -3808,6 +3818,7 @@ fn collectTryAllocFromLine(
     try_allocs: *std.ArrayListUnmanaged(TryAlloc),
     try_lines: *std.ArrayListUnmanaged(usize),
     allocator: Allocator,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
 ) !void {
     if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t)) {
         try try_lines.append(allocator, actual_line);
@@ -3815,6 +3826,15 @@ fn collectTryAllocFromLine(
     }
     const aname_e = extractAllocatorName(t) orelse "";
     if (isNoFreeAllocatorName(aname_e)) {
+        try try_lines.append(allocator, actual_line);
+        return;
+    }
+    // Skip allocations from type-tracked no-free allocators
+    if (aname_e.len > 0 and no_free_names.contains(aname_e)) {
+        try try_lines.append(allocator, actual_line);
+        return;
+    }
+    if (isNoFreeCallChain(t, no_free_names)) {
         try try_lines.append(allocator, actual_line);
         return;
     }
@@ -3959,6 +3979,12 @@ fn scanErrdeferLines(
         .try_lines_list = .{},
         .bs = .{},
     };
+
+    // Pre-scan: build set of no-free allocator names by tracking type-based
+    // initialization and .allocator() aliases
+    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
+    defer no_free_names.deinit(allocator);
+
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
@@ -3977,6 +4003,7 @@ fn scanErrdeferLines(
                 &state.try_allocs,
                 &state.try_lines_list,
                 allocator,
+                &no_free_names,
             );
         }
         try collectDeferFromLine(
@@ -5017,6 +5044,84 @@ fn hasNoFreeAllocatorPattern(t: []const u8) bool {
         if (mem.indexOf(u8, t, p) != null) return true;
     }
     return false;
+}
+
+/// Build a set of variable names that hold no-free allocators by tracking
+/// type-based initialization patterns in the function body.
+/// Tracks Zig stdlib types (not project-specific variable names):
+/// - FixedBufferAllocator.init, ArenaAllocator.init, StackFallbackAllocator
+/// - .allocator() aliases from tracked variables (Zig allocator interface)
+fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
+    var names = std.StringHashMapUnmanaged(void){};
+
+    // Known no-free allocator types from Zig stdlib
+    const no_free_inits = [_][]const u8{
+        "FixedBufferAllocator.init(",
+        "FixedBufferAllocator{",
+        "ArenaAllocator.init(",
+        "StackFallbackAllocator(",
+    };
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
+        const name = extractVarDeclName(t) orelse continue;
+
+        // Track variables initialized with known no-free allocator types
+        for (no_free_inits) |init_pat| {
+            if (mem.indexOf(u8, t, init_pat) != null) {
+                try names.put(a, name, {});
+                break;
+            }
+        }
+
+        // Track .allocator() aliases: const X = Y.allocator()
+        // where Y is a tracked no-free allocator variable
+        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
+        var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+        if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
+        const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse continue;
+        const source = rhs[0..dot_alloc];
+        if (source.len == 0) continue;
+        // Source must be a simple identifier
+        var all_ident = true;
+        for (source) |c| {
+            if (!isIdent(c)) {
+                all_ident = false;
+                break;
+            }
+        }
+        if (!all_ident) continue;
+        if (names.contains(source)) {
+            try names.put(a, name, {});
+        }
+    }
+
+    return names;
+}
+
+/// Check if line uses .allocator().{alloc_method}() chain from a tracked no-free source.
+/// Detects patterns like: fba_var.allocator().alloc(...), arena_var.allocator().create(...)
+fn isNoFreeCallChain(t: []const u8, no_free_names: *const std.StringHashMapUnmanaged(void)) bool {
+    const chain_marker = ".allocator().";
+    const pos = mem.indexOf(u8, t, chain_marker) orelse return false;
+
+    // Verify what follows is an allocator method
+    const after = t[pos + chain_marker.len ..];
+    const is_alloc_method = mem.startsWith(u8, after, "alloc(") or
+        mem.startsWith(u8, after, "create(") or
+        mem.startsWith(u8, after, "dupe(") or
+        mem.startsWith(u8, after, "dupeZ(") or
+        mem.startsWith(u8, after, "realloc(");
+    if (!is_alloc_method) return false;
+
+    // Extract source variable name before .allocator()
+    var start = pos;
+    while (start > 0 and isIdent(t[start - 1])) start -= 1;
+    if (start >= pos) return false;
+    const source = t[start..pos];
+    return no_free_names.contains(source);
 }
 
 /// Patterns indicating ownership transfer (casts, out-params, container methods)

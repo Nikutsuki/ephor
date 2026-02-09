@@ -12327,10 +12327,21 @@ fn checkForUpdates(allocator: Allocator) void {
     };
     defer allocator.free(latest);
     if (!isNewerVersion(EPHOR_VERSION, latest)) return;
+    const msg = std.fmt.allocPrint(
+        allocator,
+        "  ephor v{s} available (current: v{s}). Run: zig build ephor-upgrade  ",
+        .{ latest, EPHOR_VERSION },
+    ) catch return;
+    defer allocator.free(msg);
+
+    const border = allocator.alloc(u8, msg.len) catch return;
+    defer allocator.free(border);
+    @memset(border, '#');
+
     update_notification = std.fmt.allocPrint(
         allocator,
-        "\nhint: ephor v{s} available (current: v{s}). Run: zig build ephor-upgrade\n",
-        .{ latest, EPHOR_VERSION },
+        "\n{s}\n{s}\n{s}\n",
+        .{ border, msg, border },
     ) catch null;
 }
 

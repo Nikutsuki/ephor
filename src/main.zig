@@ -12225,6 +12225,9 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
     // Update version in ephor.json if it exists
     updateConfigVersion(allocator, ver);
 
+    // Update build.zig integration to match current canonical block
+    updateBuildZigIntegration(allocator);
+
     std.debug.print(
         \\Done! Ephor updated to v{s}.
         \\
@@ -12309,8 +12312,64 @@ fn writeConfigFile(content: []const u8) !void {
     try out.writeAll(content);
 }
 
+/// Canonical ephor build.zig integration block.
+/// This is the source of truth — upgrade replaces the entire ephor section with this.
+/// When the integration needs to change, update this block and bump the version.
+const EPHOR_BUILD_BLOCK =
+    \\    // Ephor static analysis
+    \\    const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
+    \\    const ephor_artifact = ephor_dep.artifact("ephor");
+    \\    const ephor_cmd = b.addRunArtifact(ephor_artifact);
+    \\    if (b.args) |args| {
+    \\        ephor_cmd.addArgs(args);
+    \\    }
+    \\    const ephor_step = b.step("ephor", "Run ephor static analysis");
+    \\    ephor_step.dependOn(&ephor_cmd.step);
+    \\
+    \\    // Ephor upgrade
+    \\    const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
+    \\    ephor_upgrade_cmd.addArgs(&.{"upgrade"});
+    \\    const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
+    \\    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
+;
+
+/// Update the ephor build steps in build.zig to match the current canonical block.
+/// Finds the ephor section by its start/end markers and replaces it entirely.
+/// Best-effort: silently does nothing if build.zig is missing or has no ephor section.
+fn updateBuildZigIntegration(allocator: Allocator) void {
+    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
+    defer allocator.free(content);
+
+    // Find the ephor section boundaries
+    const start_marker = "    // Ephor static analysis";
+    const end_marker = "ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);";
+
+    const start_pos = mem.indexOf(u8, content, start_marker) orelse return;
+    const end_search_start = start_pos + start_marker.len;
+    const end_pos = mem.indexOf(u8, content[end_search_start..], end_marker) orelse return;
+    const block_end = end_search_start + end_pos + end_marker.len;
+
+    // Extract current block and compare
+    const current_block = content[start_pos..block_end];
+    if (mem.eql(u8, current_block, EPHOR_BUILD_BLOCK)) return;
+
+    // Replace the block
+    const new_content = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        content[0..start_pos],
+        EPHOR_BUILD_BLOCK,
+        content[block_end..],
+    }) catch return;
+    defer allocator.free(new_content);
+
+    const out = fs.cwd().createFile("build.zig", .{}) catch return;
+    defer out.close();
+    out.writeAll(new_content) catch return;
+
+    std.debug.print("Updated build.zig (ephor build steps)\n", .{});
+}
+
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.10.1";
+const EPHOR_VERSION = "0.10.2";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";

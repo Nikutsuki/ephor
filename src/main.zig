@@ -12310,25 +12310,21 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.9.6";
+const EPHOR_VERSION = "0.9.7";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
-
-/// Cache file name in home directory
-const UPDATE_CACHE_FILE = ".ephor_update_check";
-
-/// Check frequency: once per day (seconds)
-const UPDATE_CHECK_INTERVAL: i64 = 86400;
 
 /// Stored update notification (printed after analysis output)
 var update_notification: ?[]const u8 = null;
 
 /// Check for new version (best effort, never blocks on failure).
-/// Reads/writes ~/.ephor_update_check cache (timestamp + version).
-/// Fetches latest version via curl if cache is stale or missing.
+/// Always fetches latest version from remote — no local cache.
 fn checkForUpdates(allocator: Allocator) void {
-    const latest = getCachedOrFetchVersion(allocator) orelse return;
+    const latest = fetchLatestVersion(allocator) orelse {
+        std.debug.print("warning: could not fetch latest ephor version, continuing with v{s}\n", .{EPHOR_VERSION});
+        return;
+    };
     defer allocator.free(latest);
     if (!isNewerVersion(EPHOR_VERSION, latest)) return;
     update_notification = std.fmt.allocPrint(
@@ -12336,66 +12332,6 @@ fn checkForUpdates(allocator: Allocator) void {
         "\nhint: ephor v{s} available (current: v{s}). Run: zig build ephor-upgrade\n",
         .{ latest, EPHOR_VERSION },
     ) catch null;
-}
-
-/// Return the latest known version string, using cache or fetching.
-fn getCachedOrFetchVersion(allocator: Allocator) ?[]const u8 {
-    const cache_path = buildCachePath(allocator) orelse return null;
-    defer allocator.free(cache_path);
-
-    const now = std.time.timestamp();
-
-    // Try reading cache file
-    if (readCacheFile(allocator, cache_path, now)) |ver| return ver;
-
-    // Cache stale or missing: fetch from remote
-    const fetched = fetchLatestVersion(allocator) orelse return null;
-    writeCacheFile(cache_path, now, fetched);
-    return fetched;
-}
-
-/// Build the absolute path to ~/.ephor_update_check
-fn buildCachePath(allocator: Allocator) ?[]u8 {
-    const home = std.posix.getenv("HOME") orelse return null;
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}",
-        .{ home, UPDATE_CACHE_FILE },
-    ) catch null;
-}
-
-/// Read cache file and return version if still fresh (< 1 day old).
-fn readCacheFile(
-    allocator: Allocator,
-    path: []const u8,
-    now: i64,
-) ?[]const u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const content = file.readToEndAlloc(allocator, 256) catch return null;
-    defer allocator.free(content);
-
-    var lines = mem.splitScalar(u8, content, '\n');
-    const ts_str = lines.next() orelse return null;
-    const ver_str = lines.next() orelse return null;
-
-    const cached_ts = std.fmt.parseInt(i64, ts_str, 10) catch return null;
-    if (now - cached_ts >= UPDATE_CHECK_INTERVAL) return null;
-
-    const trimmed = mem.trim(u8, ver_str, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    return allocator.dupe(u8, trimmed) catch null;
-}
-
-/// Write timestamp and version to cache file (best effort).
-fn writeCacheFile(path: []const u8, timestamp: i64, version: []const u8) void {
-    const file = std.fs.createFileAbsolute(path, .{}) catch return;
-    defer file.close();
-    var buf: [64]u8 = undefined;
-    const line1 = std.fmt.bufPrint(&buf, "{d}\n", .{timestamp}) catch return;
-    file.writeAll(line1) catch return;
-    file.writeAll(version) catch return;
-    file.writeAll("\n") catch return;
 }
 
 /// Fetch latest version from the Bitbucket tags API (not cached raw files).

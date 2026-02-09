@@ -46,7 +46,7 @@ That's it.
 zig build ephor-upgrade
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.9.6`
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.9.7`
 
 ### Version Management
 
@@ -62,7 +62,7 @@ Add to `build.zig.zon`:
 ```zig
 .dependencies = .{
     .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.6.tar.gz",
+        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.9.7.tar.gz",
     },
 },
 ```
@@ -144,7 +144,7 @@ Example config:
 
 ```json
 {
-  "version": "0.9.6",
+  "version": "0.9.7",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],

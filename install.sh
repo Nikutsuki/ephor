@@ -55,31 +55,8 @@ fi
 echo "Adding ephor dependency..."
 zig fetch --save=ephor "$EPHOR_URL"
 
-# Check if ephor step already exists
-if grep -q 'dependency("ephor"' build.zig; then
-    echo "ephor step already exists in build.zig"
-else
-    echo "Patching build.zig..."
-
-    # Find the line number of the last installArtifact call
-    LINE=$(grep -n "installArtifact" build.zig | tail -1 | cut -d: -f1)
-
-    if [ -z "$LINE" ]; then
-        echo "Warning: Could not find installArtifact in build.zig"
-        echo "Please add manually after your exe/lib setup:"
-        echo ""
-        echo '    const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });'
-        echo '    const ephor_cmd = b.addRunArtifact(ephor_dep.artifact("ephor"));'
-        echo '    if (b.args) |args| { ephor_cmd.addArgs(args); }'
-        echo '    const ephor_step = b.step("ephor", "Run ephor static analysis");'
-        echo '    ephor_step.dependOn(&ephor_cmd.step);'
-        exit 0
-    fi
-
-    # Create patched file using head/tail (portable)
-    head -n "$LINE" build.zig > build.zig.tmp
-    cat >> build.zig.tmp << 'EPHOR_EOF'
-
+# Canonical ephor block for build.zig (single source of truth)
+EPHOR_BLOCK='
     // Ephor static analysis
     const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
     const ephor_artifact = ephor_dep.artifact("ephor");
@@ -94,13 +71,44 @@ else
     const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
     ephor_upgrade_cmd.addArgs(&.{"upgrade"});
     const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
-    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
-EPHOR_EOF
+    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);'
+
+if grep -q '// Ephor static analysis' build.zig; then
+    # Ephor block exists - replace it with the canonical version
+    START_LINE=$(grep -n '// Ephor static analysis' build.zig | head -1 | cut -d: -f1)
+    END_LINE=$(grep -n 'ephor_upgrade_step\.dependOn' build.zig | head -1 | cut -d: -f1)
+
+    if [ -n "$START_LINE" ] && [ -n "$END_LINE" ]; then
+        head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
+        echo "$EPHOR_BLOCK" >> build.zig.tmp
+        tail -n +"$((END_LINE + 1))" build.zig >> build.zig.tmp
+        mv build.zig.tmp build.zig
+        echo "Updated ephor build steps in build.zig"
+    fi
+elif grep -q 'dependency("ephor"' build.zig; then
+    # Has dependency but non-standard block layout - leave it, warn user
+    echo "warning: ephor dependency found but build steps have non-standard layout"
+    echo "Please update your ephor build steps manually (see README)"
+else
+    # Fresh install - add the block after the last installArtifact
+    echo "Adding ephor build steps to build.zig..."
+
+    LINE=$(grep -n "installArtifact" build.zig | tail -1 | cut -d: -f1)
+
+    if [ -z "$LINE" ]; then
+        echo "Warning: Could not find installArtifact in build.zig"
+        echo "Please add the ephor build steps manually (see README)"
+        exit 0
+    fi
+
+    head -n "$LINE" build.zig > build.zig.tmp
+    echo "$EPHOR_BLOCK" >> build.zig.tmp
     tail -n +"$((LINE + 1))" build.zig >> build.zig.tmp
     mv build.zig.tmp build.zig
 fi
 
 echo ""
 echo "Done! Run static analysis with:"
-echo "  zig build ephor"
-echo "  zig build ephor-upgrade  (upgrade to latest version)"
+echo "  zig build ephor              (run all checks)"
+echo "  zig build ephor -- init      (create ephor.json config)"
+echo "  zig build ephor-upgrade      (upgrade to latest version)"

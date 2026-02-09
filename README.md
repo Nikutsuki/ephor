@@ -46,7 +46,15 @@ That's it.
 zig build ephor-upgrade
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.10.2`
+This updates the dependency, `ephor.json`, and `build.zig` integration in one step.
+
+Alternatively, re-run the install script to update everything:
+
+```bash
+curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
+```
+
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.10.3`
 
 ### Version Management
 
@@ -57,17 +65,13 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 <details>
 <summary>Click to expand manual steps</summary>
 
-Add to `build.zig.zon`:
+Add the dependency:
 
-```zig
-.dependencies = .{
-    .ephor = .{
-        .url = "https://bitbucket.org/rhyoslabs/ephor/get/v0.10.2.tar.gz",
-    },
-},
+```bash
+zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.10.3.tar.gz
 ```
 
-Run `zig build` once to get the hash, add it, then add to `build.zig`:
+Then add to `build.zig`:
 
 ```zig
 const ephor_dep = b.dependency("ephor", .{
@@ -151,7 +155,7 @@ Example config:
 
 ```json
 {
-  "version": "0.10.2",
+  "version": "0.10.3",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],

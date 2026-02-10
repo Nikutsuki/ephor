@@ -195,7 +195,6 @@ Example config:
 | **ZA101** | warning | ON | Stdlib allocation without `defer free()` (alloc, allocPrint, toOwnedSlice, readFileAlloc, mem.concat, etc.) |
 | **ZA102** | warning | ON | `create()` without `defer destroy()` |
 | **ZA103** | warning | ON | Stdlib allocation without `errdefer` in error-returning function |
-| **ZA104** | warning | ON | Memory leak: allocation not freed on all paths |
 | **ZA105** | error | ON | Use-after-free: accessing memory after free |
 | **ZA106** | error | ON | Double-free: calling free twice on same pointer |
 

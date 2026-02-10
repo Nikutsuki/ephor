@@ -1,6 +1,6 @@
 // Test case: C FFI out-parameter ownership transfer
 // This pattern is common in C API wrappers (e.g., ghostty)
-// Expected: NO warning for ZA102/ZA104 - ownership transferred to out-param
+// Expected: NO warning for ZA102 - ownership transferred to out-param
 const std = @import("std");
 
 pub const Parser = struct {

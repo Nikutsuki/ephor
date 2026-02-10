@@ -78,7 +78,6 @@ No separate modes. All checks available. Configure what you want via `ephor.json
 | **ZA101** alloc no defer | Memory Safety | - | Memory leak prevention |
 | **ZA102** create no defer | Memory Safety | - | Memory leak prevention |
 | **ZA103** alloc no errdefer | Memory Safety | - | Leak on error path |
-| **ZA104** memory leak | Memory Safety | - | Allocated but not freed |
 | **ZA105** use-after-free | Memory Safety | - | Access after free |
 | **ZA106** double-free | Memory Safety | - | Free called twice |
 | **ZA201** silent catch {} | Error Handling | - | Error swallowing is universally bad |
@@ -155,7 +154,6 @@ All checks are fast enough for regular development. No need for separate modes.
 | ZA101 | ON | `.alloc()` without `defer free()` in same scope | Memory leak prevention |
 | ZA102 | ON | `.create()` without `defer destroy()` in same scope | Memory leak prevention |
 | ZA103 | ON | Allocation in error-returning function without `errdefer` | Leak on error path |
-| ZA104 | ON | Memory leak detected (allocated but not freed) | Memory safety |
 | ZA105 | ON | Use-after-free detected | Memory safety |
 | ZA106 | ON | Double-free detected | Memory safety |
 
@@ -469,7 +467,6 @@ fn veryLongFunction() void {  // No warning on this line
 
 ### Phase 4: CFG Infrastructure (v0.8) ✓
 - [x] Build control flow graph (CFG) infrastructure
-- [x] Add ZA104 (memory leak detection)
 - [x] Add ZA105 (use-after-free)
 - [x] Add ZA106 (double-free)
 - [ ] Improve ZA103 accuracy with CFG (optional refinement)
@@ -495,7 +492,7 @@ fn veryLongFunction() void {  // No warning on this line
 
 ## Technical Details: CFG/DFA Infrastructure
 
-This section explains what CFG/DFA infrastructure means and how it enables advanced checks (ZA104-106, ZA205, ZA801-802, ZA901-903).
+This section explains what CFG/DFA infrastructure means and how it enables advanced checks (ZA105-106, ZA205, ZA801-802, ZA901-903).
 
 ### Why Pattern Matching Isn't Enough
 
@@ -595,7 +592,7 @@ ALLOCATED FREED WILL_BE_FREED
 ```
 
 **What DFA enables**:
-- ZA104: Leak detection - ptr is ALLOCATED at function exit without FREED or WILL_BE_FREED
+- ZA101/ZA102: Leak detection - ptr is ALLOCATED at function exit without FREED or WILL_BE_FREED
 - ZA105: Use-after-free - ptr is FREED but then accessed
 - ZA801: Null safety - optional is UNCHECKED but then dereferenced
 

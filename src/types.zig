@@ -15,7 +15,6 @@ const Allocator = mem.Allocator;
 pub const RULE_ALLOC_NO_DEFER = "ZA101";
 pub const RULE_CREATE_NO_DEFER = "ZA102";
 pub const RULE_ALLOC_NO_ERRDEFER = "ZA103";
-pub const RULE_MEMORY_LEAK = "ZA104";
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
 

@@ -68,18 +68,35 @@ fn store_in_field(self: *Node, allocator: std.mem.Allocator) !void {
 
 // ============================================================================
 // Collection Transfer
-// NOTE: Collection ownership transfer via .append()/.put() is a known
-// detection gap in CFG analysis. These patterns are recognized in the
-// line-based analyzer but not yet fully tracked in CFG defer coverage.
-// Uncomment when CFG collection transfer detection is implemented.
 // ============================================================================
 
-// fn append_to_list(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
-//     const data = try allocator.dupe(u8, "hello");
-//     try list.append(data);
-// }
+fn append_to_list(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
+    const data = try allocator.dupe(u8, "hello");
+    try list.append(data);
+}
 
-// fn put_in_map(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8)) !void {
-//     const data = try allocator.dupe(u8, "value");
-//     try map.put("key", data);
-// }
+fn put_in_map(allocator: std.mem.Allocator, map: *std.StringHashMap([]const u8)) !void {
+    const data = try allocator.dupe(u8, "value");
+    try map.put("key", data);
+}
+
+// ============================================================================
+// Labeled Break Transfer
+// ============================================================================
+
+fn labeled_break_transfer(allocator: std.mem.Allocator) ![]u8 {
+    const result = blk: {
+        const data = try allocator.alloc(u8, 100);
+        break :blk data;
+    };
+    return result;
+}
+
+// ============================================================================
+// Pointer Deref Assignment (ownership transfer to pointed-to location)
+// ============================================================================
+
+fn deref_assignment(allocator: std.mem.Allocator, out: *[]u8) !void {
+    const data = try allocator.alloc(u8, 100);
+    out.* = data;
+}

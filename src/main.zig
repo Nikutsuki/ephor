@@ -3326,6 +3326,46 @@ fn checkOwnershipInLine(
         // Direct return of owner variable
         if (mem.startsWith(u8, t, "return ")) return true;
 
+        // Labeled break transfers ownership out of a block
+        if (mem.startsWith(u8, t, "break :")) return true;
+
+        // Container ownership transfer: .append(data), .put(key, data)
+        // Owner var must appear as an ARGUMENT (after the method pattern),
+        // not as the LHS of a declaration receiving the return value.
+        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) {
+            for (compat.getContainerOwnershipMethods()) |pattern| {
+                if (mem.indexOf(u8, t, pattern)) |pat_pos| {
+                    // Check that owner var appears after the method call opening paren
+                    const after_method = pat_pos + pattern.len;
+                    if (after_method < t.len) {
+                        if (mem.indexOf(u8, t[after_method..], ov.name) != null) return true;
+                    }
+                }
+            }
+        }
+
+        // Realloc consumes the old pointer: .realloc(old, new_size)
+        // Owner var must be an argument to realloc, not the result
+        if (mem.indexOf(u8, t, ".realloc(")) |realloc_pos| {
+            const after_paren = realloc_pos + ".realloc(".len;
+            if (after_paren < t.len and
+                mem.indexOf(u8, t[after_paren..], ov.name) != null)
+                return true;
+        }
+
+        // Pointer deref assignment: out.* = data (transfers to caller)
+        if (mem.indexOf(u8, t, ".* = ") != null) {
+            if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+                const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+                // Only if the owner var is on the RHS (being transferred)
+                if (!mem.startsWith(u8, lhs, "const ") and
+                    !mem.startsWith(u8, lhs, "var ") and
+                    mem.endsWith(u8, lhs, ".*") and
+                    !containsIdentifier(lhs, ov.name))
+                    return true;
+            }
+        }
+
         // Stored in any struct field (identifier.field = value)
         if (mem.indexOf(u8, t, " = ")) |eq_pos| {
             const lhs = mem.trim(u8, t[0..eq_pos], " \t");
@@ -3395,15 +3435,18 @@ const BlockCoverageState = struct {
     has_defer: []bool,
     ownership_transferred: []bool,
     free_and_return: []bool,
+    has_direct_free: []bool,
 
     fn deinit(self: *BlockCoverageState, allocator: Allocator) void {
         allocator.free(self.has_defer);
         allocator.free(self.ownership_transferred);
         allocator.free(self.free_and_return);
+        allocator.free(self.has_direct_free);
     }
 
     fn isBlockCovered(self: BlockCoverageState, bid: usize) bool {
-        return self.has_defer[bid] or self.ownership_transferred[bid] or self.free_and_return[bid];
+        return self.has_defer[bid] or self.ownership_transferred[bid] or
+            self.free_and_return[bid] or self.has_direct_free[bid];
     }
 
     fn anyDeferExists(self: BlockCoverageState) bool {
@@ -3435,10 +3478,12 @@ fn scanBlocksForPatterns(
         .has_defer = try allocator.alloc(bool, num_blocks),
         .ownership_transferred = try allocator.alloc(bool, num_blocks),
         .free_and_return = try allocator.alloc(bool, num_blocks),
+        .has_direct_free = try allocator.alloc(bool, num_blocks),
     };
     @memset(state.has_defer, false);
     @memset(state.ownership_transferred, false);
     @memset(state.free_and_return, false);
+    @memset(state.has_direct_free, false);
 
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
@@ -3478,7 +3523,10 @@ fn scanSingleBlock(
         const in_defer_block = is_defer or defer_depth > 0;
 
         if (in_defer_block and has_free) state.has_defer[bid] = true;
-        if (!in_defer_block and !mem.startsWith(u8, t, "errdefer ") and has_free) freed = true;
+        if (!in_defer_block and !mem.startsWith(u8, t, "errdefer ") and has_free) {
+            freed = true;
+            state.has_direct_free[bid] = true;
+        }
         if (freed and mem.startsWith(u8, t, "return")) return_after = true;
         if (checkOwnershipInLine(t, owner_vars)) state.ownership_transferred[bid] = true;
     }
@@ -5627,6 +5675,7 @@ const ownership_lang_patterns = [_][]const u8{
     "@ptrCast", // Pointer cast
     "@alignCast", // Alignment cast
     ".ptr", // Slice reassignment
+    ".realloc(", // Realloc consumes old pointer
 };
 
 /// Check if ownership is transferred via cast, reassignment, or container method
@@ -16886,4 +16935,448 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)
         }
     }
     try std.testing.expect(found_za103);
+}
+
+// ============================================================================
+// ZA101 additional unit tests: qualified functions, container methods, transfers
+// ============================================================================
+
+test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_concat(alloc: std.mem.Allocator) !void {
+        \\    const data = try std.mem.concat(alloc, u8, &.{"a", "b"});
+        \\    _ = data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_concat", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_concat_no_defer.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_owned(alloc: std.mem.Allocator) !void {
+        \\    var list = std.ArrayList(u8).init(alloc);
+        \\    defer list.deinit();
+        \\    try list.appendSlice("hello");
+        \\    const data = try list.toOwnedSlice();
+        \\    _ = data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_owned", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_owned_no_defer.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn arena_usage() !void {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    defer arena.deinit();
+        \\    const alloc = arena.allocator();
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    _ = data;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_skip.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_skip.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_skip.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for ownership transfer via return (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn factory(alloc: std.mem.Allocator) ![]u8 {
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    return data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "factory", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_return_transfer.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_return_transfer.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// ZA102 unit tests: create() without destroy
+// ============================================================================
+
+test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn leaky_create(allocator: std.mem.Allocator) !void {
+        \\    const node = try allocator.create(Node);
+        \\    _ = node;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_create_no_destroy.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_create_no_destroy.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za102 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER)) {
+            found_za102 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za102);
+}
+
+test "analyzeCFGDeferCoverage no false positive for create with defer destroy (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn good_create(allocator: std.mem.Allocator) !void {
+        \\    const node = try allocator.create(Node);
+        \\    defer allocator.destroy(node);
+        \\    node.* = .{ .value = 42, .next = null };
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_create_good.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_create_good.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_create_good.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for create with ownership transfer (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn create_factory(allocator: std.mem.Allocator) !*Node {
+        \\    const node = try allocator.create(Node);
+        \\    node.* = .{ .value = 1, .next = null };
+        \\    return node;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "create_factory", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_create_return.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_create_return.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for create on arena allocator (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn arena_create() !void {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    defer arena.deinit();
+        \\    const alloc = arena.allocator();
+        \\    const node = try alloc.create(Node);
+        \\    _ = node;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_create.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_create.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_create.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// ZA103 additional tests: qualified functions, arena skip
+// ============================================================================
+
+test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn bad_errdefer_concat(alloc: std.mem.Allocator) !void {
+        \\    const data = try std.mem.concat(alloc, u8, &.{"a", "b"});
+        \\    const more = try alloc.alloc(u8, 50);
+        \\    defer alloc.free(data);
+        \\    defer alloc.free(more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_concat_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_concat_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za103 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER)) {
+            found_za103 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za103);
+}
+
+test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn arena_no_errdefer() !void {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    defer arena.deinit();
+        \\    const alloc = arena.allocator();
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    const more = try alloc.alloc(u8, 200);
+        \\    _ = data;
+        \\    _ = more;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_errdefer.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// ZA105/ZA106 additional tests: alias UAF, defer safety
+// ============================================================================
+
+test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
+    // Tests direct UAF: free(data) then data[idx] = val
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn uaf_subscript(allocator: std.mem.Allocator) void {
+        \\    const data = allocator.alloc(u8, 100) catch return;
+        \\    allocator.free(data);
+        \\    data[0] = 42; // UAF: accessing freed memory
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_subscript_uaf.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_subscript_uaf.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za105 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_subscript_uaf.zig") and
+            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+        {
+            found_za105 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za105);
+}
+
+test "analyzeCFGMemory no false positive for defer free (ZA105)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn proper_defer(allocator: std.mem.Allocator) void {
+        \\    const data = allocator.alloc(u8, 100) catch return;
+        \\    defer allocator.free(data);
+        \\    data[0] = 42; // Valid: data is alive, defer runs AFTER function exits
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_defer_safe.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_defer_safe.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_defer_safe.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
+        }
+    }
 }

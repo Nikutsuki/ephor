@@ -149,3 +149,65 @@ fn leak_getAppDataDir(allocator: std.mem.Allocator) !void {
     const data = try std.fs.getAppDataDir(allocator, "myapp");
     _ = data;
 }
+
+// ============================================================================
+// Container Methods (Owned Memory)
+// ============================================================================
+
+fn leak_toOwnedSliceSentinel(allocator: std.mem.Allocator) !void {
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
+    try list.appendSlice("hello");
+    const data = try list.toOwnedSliceSentinel(0);
+    _ = data;
+}
+
+fn leak_cloneWithAllocator(allocator: std.mem.Allocator) !void {
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
+    try list.appendSlice("hello");
+    const data = try list.cloneWithAllocator(allocator);
+    _ = data;
+}
+
+fn leak_concatWithSentinel(allocator: std.mem.Allocator) !void {
+    const data = try allocator.concatWithSentinel(u8, &.{ "hello", " ", "world" }, 0);
+    _ = data;
+}
+
+// ============================================================================
+// File I/O (Allocating Reads - Additional)
+// ============================================================================
+
+fn leak_readFileAlloc(allocator: std.mem.Allocator) !void {
+    const dir = std.fs.cwd();
+    const data = try dir.readFileAlloc(allocator, "test.txt", 1024);
+    _ = data;
+}
+
+fn leak_readFileAllocOptions(allocator: std.mem.Allocator) !void {
+    const dir = std.fs.cwd();
+    const data = try dir.readFileAllocOptions(allocator, "test.txt", 1024, null, .{});
+    _ = data;
+}
+
+fn leak_readToEndAllocOptions(allocator: std.mem.Allocator) !void {
+    const file = try std.fs.cwd().openFile("test.txt", .{});
+    defer file.close();
+    const data = try file.reader().readToEndAllocOptions(allocator, 1024, null, .{});
+    _ = data;
+}
+
+// ============================================================================
+// Path Operations (Additional)
+// ============================================================================
+
+fn leak_selfExePathAlloc(allocator: std.mem.Allocator) !void {
+    const data = try std.fs.selfExePathAlloc(allocator);
+    _ = data;
+}
+
+fn leak_selfExeDirPathAlloc(allocator: std.mem.Allocator) !void {
+    const data = try std.fs.selfExeDirPathAlloc(allocator);
+    _ = data;
+}

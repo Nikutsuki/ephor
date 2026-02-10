@@ -95,3 +95,47 @@ fn missing_errdefer_getAppDataDir(allocator: std.mem.Allocator) !void {
     defer allocator.free(data);
     defer allocator.free(more);
 }
+
+fn missing_errdefer_toOwnedSliceSentinel(allocator: std.mem.Allocator) !void {
+    var list = std.ArrayList(u8).init(allocator);
+    defer list.deinit();
+    try list.appendSlice("hello");
+    const data = try list.toOwnedSliceSentinel(0);
+    // Missing errdefer here!
+    const more = try allocator.alloc(u8, 100);
+    defer allocator.free(data);
+    defer allocator.free(more);
+}
+
+fn missing_errdefer_concatWithSentinel(allocator: std.mem.Allocator) !void {
+    const data = try allocator.concatWithSentinel(u8, &.{ "hello", " " }, 0);
+    // Missing errdefer here!
+    const more = try allocator.alloc(u8, 50);
+    defer allocator.free(data);
+    defer allocator.free(more);
+}
+
+fn missing_errdefer_readFileAlloc(allocator: std.mem.Allocator) !void {
+    const dir = std.fs.cwd();
+    const data = try dir.readFileAlloc(allocator, "test.txt", 1024);
+    // Missing errdefer here!
+    const more = try allocator.alloc(u8, 100);
+    defer allocator.free(data);
+    defer allocator.free(more);
+}
+
+fn missing_errdefer_selfExePathAlloc(allocator: std.mem.Allocator) !void {
+    const data = try std.fs.selfExePathAlloc(allocator);
+    // Missing errdefer here!
+    const more = try allocator.alloc(u8, 100);
+    defer allocator.free(data);
+    defer allocator.free(more);
+}
+
+fn missing_errdefer_selfExeDirPathAlloc(allocator: std.mem.Allocator) !void {
+    const data = try std.fs.selfExeDirPathAlloc(allocator);
+    // Missing errdefer here!
+    const more = try allocator.alloc(u8, 100);
+    defer allocator.free(data);
+    defer allocator.free(more);
+}

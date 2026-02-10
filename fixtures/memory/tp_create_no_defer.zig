@@ -18,3 +18,19 @@ fn leak_create_with_init(allocator: std.mem.Allocator) !void {
     node.* = .{ .value = 42, .next = null };
     _ = node;
 }
+
+fn leak_create_in_loop(allocator: std.mem.Allocator) !void {
+    for (0..5) |i| {
+        const node = try allocator.create(Node);
+        node.* = .{ .value = @intCast(i), .next = null };
+        _ = node;
+    }
+}
+
+fn leak_multiple_creates(allocator: std.mem.Allocator) !void {
+    const a = try allocator.create(Node);
+    const b = try allocator.create(Node);
+    a.* = .{ .value = 1, .next = null };
+    b.* = .{ .value = 2, .next = a };
+    _ = b;
+}

@@ -9,7 +9,7 @@
 | **check** | Run all static checks |
 | **runtime** | Dynamic analysis via test execution (memory leaks, panics) |
 | **orphans** | Files not imported from entry points |
-| **memory** | `alloc()` without matching `defer free()` |
+| **memory** | Stdlib allocation without matching `defer free()` (50+ patterns) |
 | **errors** | Silent `catch {}`, `catch unreachable`, `= undefined` |
 | **unused** | Unused imports, const, and var declarations |
 | **complexity** | Long functions, deep nesting, too many params/branches |
@@ -192,9 +192,9 @@ Example config:
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA101** | warning | ON | `alloc()` without `defer free()` |
+| **ZA101** | warning | ON | Stdlib allocation without `defer free()` (alloc, allocPrint, toOwnedSlice, readFileAlloc, mem.concat, etc.) |
 | **ZA102** | warning | ON | `create()` without `defer destroy()` |
-| **ZA103** | warning | ON | Allocation in error-returning function without `errdefer` |
+| **ZA103** | warning | ON | Stdlib allocation without `errdefer` in error-returning function |
 | **ZA104** | warning | ON | Memory leak: allocation not freed on all paths |
 | **ZA105** | error | ON | Use-after-free: accessing memory after free |
 | **ZA106** | error | ON | Double-free: calling free twice on same pointer |
@@ -349,7 +349,7 @@ Commands:
   check       Run all static checks (default)
   runtime     Run tests with memory diagnostics (dynamic analysis)
   orphans     Files not imported from entry points
-  memory      Alloc without defer patterns
+  memory      Stdlib allocation without defer patterns (50+ patterns)
   errors      Silent catch {} discards
   unused      Unused imports/const/var declarations
   complexity  Function complexity metrics
@@ -648,6 +648,230 @@ src/compat/
 4. Register in `version_registry`
 
 Each version module exports consistent wrapper functions that handle API differences between Zig versions (e.g., HashMap.put signature changes).
+
+## Technical: How Detection Works
+
+This section documents the internal detection architecture. Understanding these internals helps identify gaps and validate correctness.
+
+### Architecture Overview
+
+Ephor has three analysis entry points, each building a `TypeContext` for type-aware detection:
+
+| Entry Point | Scope | Rules | TypeContext Source |
+|-------------|-------|-------|-------------------|
+| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA206 (in `checkLineErrors`) | `parseFileTypeContext(content)` |
+| `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `parseFileTypeContext(content)` |
+| `analyzeFunction` | Single function body | ZA101-ZA106 (memory tracking) | `parseFileTypeContextFromLines(lines)` |
+
+All three build a `TypeContext` and pass it through to the detection functions that need type information.
+
+### TypeContext: The Core Data Structure
+
+```
+TypeContext = {
+    struct_methods:   Map<TypeName, Map<MethodName, ReturnKind>>
+    function_returns: Map<FunctionName, ReturnKind>
+    var_types:        Map<VariableName, TypeName>
+    stdlib_vars:      Map<VariableName, void>
+}
+```
+
+| Field | Purpose | Example |
+|-------|---------|---------|
+| `struct_methods` | Maps type names to their method return types | `"MyLogger" -> {"clear" -> void_type, "flush" -> error_union}` |
+| `function_returns` | Maps top-level function names to return types | `"helper" -> void_type, "riskyOp" -> error_union` |
+| `var_types` | Maps variable names to their declared type | `"logger" -> "MyLogger", "state" -> "State"` |
+| `stdlib_vars` | Tracks variables initialized from stdlib containers/allocators | `"list" -> void, "map" -> void` |
+
+### ReturnKind Classification
+
+The `classifyReturnType` function converts return type text to an enum:
+
+| Return Type Text | ReturnKind | Safe to Discard? |
+|-----------------|------------|------------------|
+| `void` | `.void_type` | Yes |
+| `noreturn` | `.noreturn_type` | Yes |
+| `!void`, `!T`, `ErrorSet!T` | `.error_union` | **No** (ZA205) |
+| `?T`, `?*T` | `.optional` | Yes |
+| `u32`, `[]u8`, `*T`, etc. | `.value` | Yes |
+| (empty/unparseable) | `.unknown` | Falls through to vocab |
+
+### Type Parsing: What Gets Registered
+
+`parseFileTypeContext` scans the file line-by-line and builds TypeContext:
+
+**1. Type definitions** (struct, enum, union — all can have methods in Zig):
+
+```zig
+const MyStruct = struct { ... };       // Tracked
+const State = enum { ... };            // Tracked
+const Result = union(enum) { ... };    // Tracked
+const Flags = packed struct { ... };   // Tracked
+const CHandle = extern struct { ... }; // Tracked
+```
+
+Detection pattern: `= struct {`, `= enum {`, `= enum(`, `= union(`, `= union {`, `= packed struct {`, `= extern struct {`, `= packed union {`, `= extern union {`
+
+**2. Method signatures** (inside a type scope):
+
+```zig
+pub fn method(self: *MyStruct) void { ... }       // struct_methods["MyStruct"]["method"] = .void_type
+pub fn method(self: *MyStruct) !void { ... }       // struct_methods["MyStruct"]["method"] = .error_union
+pub fn method(self: MyEnum) u32 { ... }            // struct_methods["MyEnum"]["method"] = .value
+fn method(self: *const MyStruct, arg: u32) ?T { }  // struct_methods["MyStruct"]["method"] = .optional
+```
+
+Self parameter extraction: strips `*` and `*const` prefixes to get bare type name.
+
+**3. Variable declarations**:
+
+```zig
+var x: MyStruct = .{};                // var_types["x"] = "MyStruct" (explicit annotation)
+var x = MyStruct.init(allocator);     // var_types["x"] = "MyStruct" (RHS inference: TypeName.init)
+var x = MyStruct{};                   // var_types["x"] = "MyStruct" (RHS inference: TypeName{})
+var x = MyStruct{ .field = 5 };       // var_types["x"] = "MyStruct" (RHS inference: TypeName{ .field)
+```
+
+RHS inference requires the type name to start with uppercase (PascalCase).
+
+**4. Stdlib variable tracking** (for vocab fallback):
+
+```zig
+var list = std.ArrayList(u32).init(allocator);     // stdlib_vars["list"] = void
+var map = std.StringHashMap(u32).init(allocator);  // stdlib_vars["map"] = void
+var arena = std.heap.ArenaAllocator.init(...);     // stdlib_vars["arena"] = void
+```
+
+Matched via `compat.getStdlibContainerInitPatterns()` and `compat.getAllInitPatterns()`.
+
+**5. Top-level functions** (outside any type scope):
+
+```zig
+fn helper() void { }          // function_returns["helper"] = .void_type
+fn riskyOp() !void { }        // function_returns["riskyOp"] = .error_union
+pub fn getValue() u32 { }     // function_returns["getValue"] = .value
+```
+
+### Resolution Chain
+
+When ephor encounters `_ = expr`, it resolves whether the discard is safe through a tiered chain. Different detection functions use slightly different tiers, but the core pattern is:
+
+**Tier 1 — Cleanup patterns (always safe):**
+Hardcoded patterns like `.free(`, `.destroy(`, `.deinit(` — these are void by Zig convention and always safe to discard.
+
+**Tier 2 — TypeContext resolution (definitive when available):**
+
+For `_ = receiver.method(...)`:
+1. Look up `receiver` in `var_types` → get type name (e.g., `"MyLogger"`)
+2. Look up type name in `struct_methods` → get method map
+3. Look up method name in method map → get `ReturnKind`
+
+For `_ = funcName(...)`:
+1. Extract function name (must be simple identifier, no dots)
+2. Look up in `function_returns` → get `ReturnKind`
+
+Decision:
+- `.void_type`, `.value`, `.optional`, `.noreturn_type` → **safe** (suppress)
+- `.error_union` → **not safe** (report ZA205)
+- `.unknown` → fall through to next tier
+
+**Tier 3 — Stdlib vocab (trusted for known containers):**
+If the receiver variable is tracked in `stdlib_vars`, check against vocabulary patterns from the compat layer (`getSafeMethodPatterns()`, `getVoidMethodPatterns()`). Method patterns (starting with `.`) only match when the receiver is a confirmed stdlib type.
+
+**Tier 4 — Legacy patterns (backwards compat):**
+Substring matching for non-stdlib patterns (C FFI uppercase functions, parser internals). Universal patterns (not starting with `.`) always match regardless of receiver type.
+
+**Tier 5 — Unknown → report:**
+If no tier resolved the call, the discard is reported (conservative: better to flag than miss).
+
+### Detection Functions and Their Tiers
+
+| Function | Used By | Tiers Used |
+|----------|---------|------------|
+| `isSafeToDiscard` | `checkDiscardedResult` (ZA205 in `analyzeFileErrors`) | 1→2→3→4 |
+| `isSafeBuiltin` | `checkIgnoredError` (ZA205 in `analyzeIgnoredErrorsInFile`) | builtins→2→3→fields→optionals |
+| `isKnownVoidFunction` | Error analysis (confirms void return) | 1→2→3→log patterns |
+| `checkMethodTransfer` | `processAllocTracking` (ZA101-106 memory) | stdlib_vars only (no Tier 2) |
+
+### Memory Analysis Path (ZA101-ZA106)
+
+Memory analysis runs per-function via `analyzeFunction`:
+
+1. **Pass 1**: Detect allocations (27 method patterns + 3 qualified patterns covering all stdlib allocating functions)
+2. **Pass 2**: Build alias sets (track which variables alias the allocation)
+3. **Pass 3** (`processAllocTracking`): Track ownership transfers via `checkMethodTransfer`
+
+`checkMethodTransfer` uses `type_ctx.stdlib_vars` to determine if a method call transfers ownership to a stdlib container (e.g., `list.append(ptr)` transfers ownership of `ptr` to `list`).
+
+**Note**: `parseFileTypeContextFromLines` (used for function-scope analysis) only builds `var_types` and `stdlib_vars`. It does NOT build `struct_methods` — method return type resolution is not available in the memory analysis path. This is acceptable because memory analysis doesn't need return types; it needs ownership transfer detection, which uses vocab patterns.
+
+### Known Limitations
+
+#### What Is NOT Parsed
+
+| Pattern | Why | Fallback |
+|---------|-----|----------|
+| Multi-line function signatures | Line-by-line parser can't join lines | Falls through to `.unknown` → vocab |
+| Cross-file type resolution | Types defined in imported files | Falls through to `.unknown` → vocab |
+| Generic type parameters | `ArrayList(u8)` stored as full text, lookup mismatch | Falls through to `.unknown` → vocab |
+| Type aliases | `const MyList = ArrayList;` not tracked | Falls through to `.unknown` → vocab |
+| Variable reassignment | `x = NewType.init()` doesn't update type | Uses original declaration type |
+| Method chaining | `a.b().c()` — only sees last receiver | May resolve wrong receiver |
+| Nested function definitions | Functions inside functions | Registered as top-level |
+| Comptime-generated types | Types from `comptime` blocks | Falls through to `.unknown` → vocab |
+| Pointer chain stripping | `**MyStruct` keeps one `*` | May cause lookup mismatch |
+
+All limitations fall through to `.unknown`, which triggers vocab-based detection (Tier 3/4). This means: **no false negatives from parsing limitations** — the worst case is falling back to the same behavior as before TypeContext existed.
+
+#### Known False Positive Patterns
+
+| Pattern | Rule | Root Cause | Status |
+|---------|------|------------|--------|
+| Arena allocator via `std.mem.Allocator` interface | ZA101/ZA103 | Type erasure — arena loses no-free semantics when passed as generic Allocator | Open |
+| Allocation immediately returned to caller | ZA103 | Missing return-path analysis — `return ptr` transfers ownership | Open |
+
+These patterns are documented in `fixtures/good_code_patterns_false_positive.zig` and validated against the community project corpus.
+
+### Vocabulary System (Compat Layer)
+
+The compat layer (`src/compat/`) provides version-specific pattern vocabularies:
+
+| Vocabulary | Purpose | Example Patterns |
+|-----------|---------|-----------------|
+| `getCleanupPatterns()` | Methods that are always void | `.free(`, `.destroy(`, `.deinit(` |
+| `getSafeMethodPatterns()` | Stdlib methods safe to discard | `.clear(`, `.next(`, `.pop(` |
+| `getVoidMethodPatterns()` | Stdlib methods returning void | `.resize(`, `.shrinkRetainingCapacity(` |
+| `getContainerOwnershipMethods()` | Methods that transfer allocation ownership | `.append(`, `.put(`, `.insert(` |
+| `getStdlibContainerInitPatterns()` | Init patterns for stdlib containers | `ArrayList(`, `StringHashMap(` |
+| `getAllInitPatterns()` | Init patterns for all stdlib types including allocators | `ArenaAllocator.init(`, `FixedBufferAllocator.init(` |
+
+Vocabularies are defined per Zig version (`v0_15.zig`, `v0_16.zig`) and selected at build time via `compat.zig`.
+
+### Testing Strategy
+
+Ephor uses three testing layers:
+
+**1. Unit tests** (in `src/main.zig`): Test individual parsing and classification functions:
+- `classifyReturnType`, `extractFnReturnType`, `extractSelfTypeName`, `extractFnName`, `extractVarTypeName`
+- `extractMethodCall`, `resolveReturnKind`
+- `parseFileTypeContext` (struct, enum, union, packed/extern, top-level functions)
+
+**2. Integration tests** (in `src/main.zig`): Test full detection pipeline using `createTestFileAnalysis` + `ImportGraph`:
+- User-defined struct/enum/union void methods → NOT flagged
+- User-defined error-returning methods → flagged
+- Stdlib methods via vocab fallback → NOT flagged
+- Vocab override (user `.clear()` returning `!void` → flagged despite vocab)
+- Mixed types in same file resolved independently
+- Unknown receiver falls through to legacy
+
+**3. Fixture files** (in `fixtures/`):
+- `bad_code_patterns.zig` — Code that MUST be flagged (true positives)
+- `good_code_patterns_false_positive.zig` — Code that MUST NOT be flagged (false positive regression tests)
+- `naming_conventions.zig` — Naming rule test patterns
+
+**4. Corpus validation** (3000+ community Zig projects):
+- Dogfood: `ephor check src/` → zero issues
+- Community baseline regression testing against key projects
 
 ## License
 

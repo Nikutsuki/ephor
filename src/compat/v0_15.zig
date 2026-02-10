@@ -11,6 +11,7 @@
 //   - zig-cache renamed to .zig-cache
 
 const std = @import("std");
+pub const vocab = @import("vocab.zig");
 
 /// Version identifier
 pub const version = "0.15";
@@ -77,6 +78,7 @@ pub const builtins = [_][]const u8{
     "@truncate",
     "@errorCast",
     "@memcpy",
+    "@memmove",
     "@memset",
 
     // Math operations
@@ -137,6 +139,7 @@ pub const builtins = [_][]const u8{
     "@frameAddress",
     "@errorReturnTrace",
     "@call",
+    "@branchHint",
 
     // C interop
     "@cImport",
@@ -198,7 +201,6 @@ pub const optional_methods = [_][]const u8{
     // ArrayList optional methods
     ".popOrNull()",
     ".getLastOrNull(",
-    ".getLast()",
 
     // BoundedArray
     ".popOrNull()",
@@ -575,15 +577,421 @@ pub const std_modules = [_][]const u8{
     "std.ArrayListUnmanaged",
     "std.AutoArrayHashMap",
     "std.AutoHashMap",
-    "std.BoundedArray",
     "std.MultiArrayList",
     "std.PriorityQueue",
     "std.SegmentedList",
     "std.SinglyLinkedList",
-    "std.TailQueue",
     "std.StaticStringMap",
     "std.StringHashMap",
     "std.StringArrayHashMap",
+};
+
+// ============================================================================
+// Stdlib Vocabulary - Allocator Types, Methods, and Patterns
+// Single source of truth for Zig 0.15.x stdlib knowledge
+// ============================================================================
+
+pub const allocator_types = [_]vocab.AllocatorType{
+    .{
+        .name = "ArenaAllocator",
+        .full_path = "std.heap.ArenaAllocator",
+        .init_pattern = "ArenaAllocator.init(",
+        .needs_free = false,
+        .cleanup_method = ".deinit(",
+    },
+    .{
+        .name = "FixedBufferAllocator",
+        .full_path = "std.heap.FixedBufferAllocator",
+        .init_pattern = "FixedBufferAllocator.init(",
+        .needs_free = false,
+        .cleanup_method = "",
+    },
+    .{
+        .name = "StackFallbackAllocator",
+        .full_path = "std.heap.StackFallbackAllocator",
+        .init_pattern = "StackFallbackAllocator(",
+        .needs_free = false,
+        .cleanup_method = ".deinit(",
+    },
+    .{
+        .name = "GeneralPurposeAllocator",
+        .full_path = "std.heap.GeneralPurposeAllocator",
+        .init_pattern = "GeneralPurposeAllocator(",
+        .needs_free = true,
+        .cleanup_method = ".deinit(",
+    },
+    .{
+        .name = "DebugAllocator",
+        .full_path = "std.heap.DebugAllocator",
+        .init_pattern = "DebugAllocator(",
+        .needs_free = true,
+        .cleanup_method = ".deinit(",
+    },
+    .{
+        .name = "ThreadSafeAllocator",
+        .full_path = "std.heap.ThreadSafeAllocator",
+        .init_pattern = "ThreadSafeAllocator.init(",
+        .needs_free = true,
+        .cleanup_method = ".deinit(",
+    },
+    .{
+        .name = "MemoryPool",
+        .full_path = "std.heap.MemoryPool",
+        .init_pattern = "MemoryPool(",
+        .needs_free = true,
+        .cleanup_method = ".deinit(",
+    },
+    .{
+        .name = "MemoryPoolAligned",
+        .full_path = "std.heap.MemoryPoolAligned",
+        .init_pattern = "MemoryPoolAligned(",
+        .needs_free = true,
+        .cleanup_method = ".deinit(",
+    },
+};
+
+pub const global_allocators = [_]vocab.GlobalAllocator{
+    .{ .name = "page_allocator", .full_path = "std.heap.page_allocator", .needs_free = true },
+    .{ .name = "c_allocator", .full_path = "std.heap.c_allocator", .needs_free = true },
+    .{ .name = "raw_c_allocator", .full_path = "std.heap.raw_c_allocator", .needs_free = true },
+    .{ .name = "wasm_allocator", .full_path = "std.heap.wasm_allocator", .needs_free = true },
+    .{ .name = "smp_allocator", .full_path = "std.heap.smp_allocator", .needs_free = true },
+    .{ .name = "testing.allocator", .full_path = "std.testing.allocator", .needs_free = true },
+};
+
+pub const alloc_methods = [_]vocab.AllocMethod{
+    .{
+        .pattern = ".alloc(",
+        .short_name = "alloc",
+        .returns_slice = true,
+        .cleanup = ".free(",
+    },
+    .{
+        .pattern = ".alignedAlloc(",
+        .short_name = "alignedAlloc",
+        .returns_slice = true,
+        .cleanup = ".free(",
+    },
+    .{
+        .pattern = ".allocSentinel(",
+        .short_name = "allocSentinel",
+        .returns_slice = true,
+        .cleanup = ".free(",
+    },
+    .{
+        .pattern = ".realloc(",
+        .short_name = "realloc",
+        .returns_slice = true,
+        .cleanup = ".free(",
+    },
+    .{
+        .pattern = ".create(",
+        .short_name = "create",
+        .returns_slice = false,
+        .cleanup = ".destroy(",
+    },
+    .{
+        .pattern = ".dupe(",
+        .short_name = "dupe",
+        .returns_slice = true,
+        .cleanup = ".free(",
+    },
+    .{
+        .pattern = ".dupeZ(",
+        .short_name = "dupeZ",
+        .returns_slice = true,
+        .cleanup = ".free(",
+    },
+    .{
+        .pattern = ".allocWithOptions(",
+        .short_name = "allocWithOptions",
+        .returns_slice = true,
+        .cleanup = ".free(",
+    },
+};
+
+pub const cleanup_methods = [_]vocab.CleanupMethod{
+    .{ .pattern = ".free(", .is_void = true },
+    .{ .pattern = ".destroy(", .is_void = true },
+    .{ .pattern = ".deinit(", .is_void = true },
+};
+
+pub const container_methods = [_]vocab.ContainerMethod{
+    .{ .pattern = ".put(", .takes_ownership = true, .is_void = false },
+    .{ .pattern = ".putNoClobber(", .takes_ownership = true, .is_void = false },
+    .{ .pattern = ".append(", .takes_ownership = true, .is_void = false },
+    .{ .pattern = ".appendSlice(", .takes_ownership = true, .is_void = false },
+    .{ .pattern = ".insert(", .takes_ownership = true, .is_void = false },
+    .{ .pattern = ".toOwnedSlice(", .takes_ownership = true, .is_void = false },
+    .{ .pattern = ".clone(", .takes_ownership = true, .is_void = false },
+};
+
+/// Stdlib methods safe to discard (void or value-returning, not error-returning).
+/// Used by isSafeToDiscard, isSafeBuiltin, isKnownVoidFunction in main.zig.
+pub const safe_methods = [_]vocab.SafeMethod{
+    // Void methods (container lifecycle)
+    .{ .pattern = ".clear(", .is_void = true },
+    .{ .pattern = ".clearAndFree(", .is_void = true },
+    .{ .pattern = ".clearRetainingCapacity(", .is_void = true },
+    .{ .pattern = ".reset(", .is_void = true },
+    .{ .pattern = ".close(", .is_void = true },
+    .{ .pattern = ".skip(", .is_void = true },
+    // Value-returning methods (T or ?T, not !T)
+    .{ .pattern = ".pop(", .is_void = false },
+    .{ .pattern = ".remove(", .is_void = false },
+    .{ .pattern = ".swapRemove(", .is_void = false },
+    .{ .pattern = ".orderedRemove(", .is_void = false },
+    .{ .pattern = ".get(", .is_void = false },
+    .{ .pattern = ".getLastOrNull()", .is_void = false },
+    .{ .pattern = ".count()", .is_void = false },
+    .{ .pattern = ".next()", .is_void = false },
+    .{ .pattern = ".peek()", .is_void = false },
+    // IO methods (return usize or !void, but commonly discarded)
+    .{ .pattern = ".write(", .is_void = false },
+    .{ .pattern = ".print(", .is_void = false },
+    // Validation/check (returns diagnostic info)
+    .{ .pattern = ".check(", .is_void = false },
+    // std.debug and std.testing (always void or noreturn)
+    .{ .pattern = "debug.print", .is_void = true },
+    .{ .pattern = "assert(", .is_void = true },
+    .{ .pattern = "expect(", .is_void = false },
+};
+
+// ============================================================================
+// Comptime Flat Arrays - for fast substring matching in main.zig
+// Derived from structured data above
+// ============================================================================
+
+/// Init patterns for allocator types that don't need per-allocation free
+/// (ArenaAllocator, FixedBufferAllocator, StackFallbackAllocator)
+pub const no_free_init_patterns: []const []const u8 = &.{
+    "ArenaAllocator.init(",
+    "ArenaAllocator.State",
+    "FixedBufferAllocator.init(",
+    "FixedBufferAllocator{",
+    "StackFallbackAllocator(",
+    "stackFallback(",
+};
+
+/// Init patterns for ALL allocator types (no-free + needs-free)
+pub const all_init_patterns: []const []const u8 = &.{
+    // No-free types
+    "ArenaAllocator.init(",
+    "FixedBufferAllocator.init(",
+    "FixedBufferAllocator{",
+    "StackFallbackAllocator(",
+    "stackFallback(",
+    // Needs-free types
+    "GeneralPurposeAllocator(",
+    "DebugAllocator(",
+    "ThreadSafeAllocator.init(",
+    "MemoryPool(",
+    "MemoryPoolAligned(",
+};
+
+/// Names of global singleton allocators
+pub const global_alloc_names: []const []const u8 = &.{
+    "page_allocator",
+    "c_allocator",
+    "raw_c_allocator",
+    "wasm_allocator",
+    "smp_allocator",
+    "testing.allocator",
+};
+
+/// Allocation method patterns for line matching (e.g. ".alloc(")
+pub const alloc_method_patterns: []const []const u8 = &.{
+    // std.mem.Allocator interface
+    ".alloc(",
+    ".alignedAlloc(",
+    ".allocSentinel(",
+    ".realloc(",
+    ".create(",
+    ".dupe(",
+    ".dupeZ(",
+    ".allocWithOptions(",
+    // std.fmt (allocator as first arg)
+    ".allocPrint(",
+    ".allocPrintSentinel(",
+    // Container methods that produce owned memory
+    ".toOwnedSlice(",
+    ".toOwnedSliceSentinel(",
+    ".cloneWithAllocator(",
+    // File I/O (allocating reads)
+    ".readFileAlloc(",
+    ".readFileAllocOptions(",
+    ".readToEndAlloc(",
+    ".readToEndAllocOptions(",
+    ".readAllAlloc(",
+    // Path operations
+    ".selfExePathAlloc(",
+    ".selfExeDirPathAlloc(",
+    ".realpathAlloc(",
+    // String operations
+    ".replaceOwned(",
+    ".concatWithSentinel(",
+    // JSON/serialization
+    ".stringifyAlloc(",
+};
+
+/// Short names for allocation methods (identifier matching, e.g. "alloc")
+pub const alloc_method_short_names: []const []const u8 = &.{
+    "alloc",
+    "alignedAlloc",
+    "allocSentinel",
+    "realloc",
+    "create",
+    "dupe",
+    "dupeZ",
+    "allocWithOptions",
+    "allocPrint",
+    "allocPrintSentinel",
+    "toOwnedSlice",
+    "toOwnedSliceSentinel",
+    "cloneWithAllocator",
+    "readFileAlloc",
+    "readFileAllocOptions",
+    "readToEndAlloc",
+    "readToEndAllocOptions",
+    "readAllAlloc",
+    "selfExePathAlloc",
+    "selfExeDirPathAlloc",
+    "realpathAlloc",
+    "replaceOwned",
+    "concatWithSentinel",
+    "stringifyAlloc",
+};
+
+/// Fully-qualified stdlib function patterns that allocate memory.
+/// These have generic names (concat, join) that would false-positive
+/// as bare `.method(` patterns, so we match with module prefix.
+pub const qualified_alloc_fn_patterns: []const []const u8 = &.{
+    "mem.concat(",
+    "mem.join(",
+    "mem.joinZ(",
+};
+
+/// Cleanup/deallocation patterns
+pub const cleanup_pattern_strs: []const []const u8 = &.{
+    ".free(",
+    ".destroy(",
+    ".deinit(",
+};
+
+/// Container methods that transfer ownership (store/consume passed values)
+pub const container_ownership_methods: []const []const u8 = &.{
+    ".put(",
+    ".putNoClobber(",
+    ".putAssumeCapacity(",
+    ".append(",
+    ".appendSlice(",
+    ".insert(",
+    ".addOne(",
+    ".toOwnedSlice(",
+    ".fromOwnedSlice(",
+    ".clone(",
+};
+
+/// Stdlib methods safe to discard (all patterns from safe_methods)
+pub const safe_method_patterns: []const []const u8 = &.{
+    ".clear(",
+    ".clearAndFree(",
+    ".clearRetainingCapacity(",
+    ".reset(",
+    ".close(",
+    ".skip(",
+    ".pop(",
+    ".remove(",
+    ".swapRemove(",
+    ".orderedRemove(",
+    ".get(",
+    ".getLastOrNull()",
+    ".count()",
+    ".next()",
+    ".peek()",
+    ".write(",
+    ".print(",
+    ".check(",
+    "debug.print",
+    "assert(",
+    "expect(",
+};
+
+/// Stdlib void methods (subset of safe_methods where is_void == true)
+pub const void_method_patterns: []const []const u8 = &.{
+    ".clear(",
+    ".clearAndFree(",
+    ".clearRetainingCapacity(",
+    ".reset(",
+    ".close(",
+    ".skip(",
+    "debug.print",
+    "assert(",
+};
+
+/// Pointer type patterns for no-free allocator parameter detection
+/// Used to check if a function parameter is typed as a no-free allocator pointer
+pub const no_free_type_ptrs: []const []const u8 = &.{
+    "*ArenaAllocator",
+    "*std.heap.ArenaAllocator",
+    "*FixedBufferAllocator",
+    "*std.heap.FixedBufferAllocator",
+    "*StackFallbackAllocator",
+    "*std.heap.StackFallbackAllocator",
+};
+
+/// Stdlib container mutation methods that fill/modify a variable
+/// Used by isFillPattern() to detect "var x = undefined; x.method()" patterns
+/// These are methods defined on stdlib containers (ArrayList, HashMap, etc.)
+pub const modifying_method_patterns: []const []const u8 = &.{
+    ".update(",
+    ".set(",
+    ".reinit(",
+    ".reset(",
+    ".fill(",
+    ".clear(",
+    ".put(",
+    ".append(",
+    ".resize(",
+    ".ensureCapacity(",
+    ".replaceRange(",
+    ".insertSlice(",
+};
+
+/// Stdlib container type init patterns (for type-based detection)
+/// Used by collectStdlibVarNames() to track which variables hold stdlib types.
+/// Only types from std whose methods (.clear, .append, etc.) are known void.
+pub const stdlib_container_init_patterns: []const []const u8 = &.{
+    // Collections
+    "ArrayList(",
+    "ArrayListUnmanaged(",
+    "ArrayListAligned(",
+    "MultiArrayList(",
+    "SegmentedList(",
+    "PriorityQueue(",
+    "PriorityDequeue(",
+    "SinglyLinkedList(",
+    "DoublyLinkedList(",
+    // Maps
+    "StringHashMap(",
+    "StringHashMapUnmanaged(",
+    "AutoHashMap(",
+    "AutoHashMapUnmanaged(",
+    "AutoArrayHashMap(",
+    "AutoArrayHashMapUnmanaged(",
+    "StringArrayHashMap(",
+    "StringArrayHashMapUnmanaged(",
+    "StaticStringMap(",
+    "EnumArray(",
+    "EnumMap(",
+    "EnumSet(",
+    "BufSet.init(",
+    "BufMap.init(",
+    // IO
+    "std.fs.File",
+    "fs.File",
+    "BufferedReader(",
+    "BufferedWriter(",
 };
 
 // ============================================================================
@@ -736,4 +1144,45 @@ test "ArrayListAppend works with ArrayListUnmanaged" {
     try arrayListAppend(u32, &list, allocator, 42);
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
     try std.testing.expectEqual(@as(u32, 42), list.items[0]);
+}
+
+test "vocabulary allocator_types has expected count" {
+    try std.testing.expectEqual(@as(usize, 8), allocator_types.len);
+}
+
+test "vocabulary global_allocators includes testing.allocator" {
+    var found = false;
+    for (global_allocators) |g| {
+        if (std.mem.eql(u8, g.name, "testing.allocator")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "vocabulary alloc_methods includes dupe and dupeZ" {
+    var found_dupe = false;
+    var found_dupez = false;
+    for (alloc_methods) |m| {
+        if (std.mem.eql(u8, m.short_name, "dupe")) found_dupe = true;
+        if (std.mem.eql(u8, m.short_name, "dupeZ")) found_dupez = true;
+    }
+    try std.testing.expect(found_dupe);
+    try std.testing.expect(found_dupez);
+}
+
+test "vocabulary no_free_init_patterns is non-empty" {
+    try std.testing.expect(no_free_init_patterns.len > 0);
+}
+
+test "vocabulary all_init_patterns includes MemoryPool" {
+    var found = false;
+    for (all_init_patterns) |p| {
+        if (std.mem.eql(u8, p, "MemoryPool(")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }

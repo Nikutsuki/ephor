@@ -773,6 +773,25 @@ pub const no_free_init_patterns: []const []const u8 = &.{
     "stackFallback(",
 };
 
+/// Struct field type patterns for no-free allocators.
+/// Used to detect fields like `arena: std.heap.ArenaAllocator,` so that
+/// allocations through field chains (e.g. self.arena.alloc()) are suppressed.
+/// Type-based only — never matches on field names, only on declared types.
+pub const no_free_field_type_patterns: []const []const u8 = &.{
+    "std.heap.ArenaAllocator",
+    "heap.ArenaAllocator",
+    "ArenaAllocator",
+    "std.heap.FixedBufferAllocator",
+    "heap.FixedBufferAllocator",
+    "FixedBufferAllocator",
+    "*std.heap.ArenaAllocator",
+    "*heap.ArenaAllocator",
+    "*ArenaAllocator",
+    "*std.heap.FixedBufferAllocator",
+    "*heap.FixedBufferAllocator",
+    "*FixedBufferAllocator",
+};
+
 /// Init patterns for ALL allocator types (no-free + needs-free)
 pub const all_init_patterns: []const []const u8 = &.{
     // No-free types
@@ -1176,6 +1195,18 @@ test "vocabulary alloc_methods includes dupe and dupeZ" {
 
 test "vocabulary no_free_init_patterns is non-empty" {
     try std.testing.expect(no_free_init_patterns.len > 0);
+}
+
+test "vocabulary no_free_field_type_patterns covers ArenaAllocator and FixedBufferAllocator" {
+    try std.testing.expect(no_free_field_type_patterns.len > 0);
+    var found_arena = false;
+    var found_fba = false;
+    for (no_free_field_type_patterns) |p| {
+        if (std.mem.eql(u8, p, "std.heap.ArenaAllocator")) found_arena = true;
+        if (std.mem.eql(u8, p, "std.heap.FixedBufferAllocator")) found_fba = true;
+    }
+    try std.testing.expect(found_arena);
+    try std.testing.expect(found_fba);
 }
 
 test "vocabulary all_init_patterns includes MemoryPool" {

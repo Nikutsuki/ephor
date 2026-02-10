@@ -2309,6 +2309,7 @@ fn analyzeOneAllocSafety(
     in_errdefer: []const bool,
     num_blocks: usize,
     issues: *std.ArrayListUnmanaged(Issue),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
     var bstate = try initAndScanFreeState(
         allocator,
@@ -2333,6 +2334,7 @@ fn analyzeOneAllocSafety(
         in_defer,
         &bstate,
         issues,
+        aliases,
     );
     try detectDoubleFree(
         allocator,
@@ -2379,13 +2381,19 @@ fn analyzeCFGMemorySafety(
     lines: []const []const u8,
     func_line: usize,
     file_path: []const u8,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
-    var allocs = try collectMemSafetyAllocs(allocator, lines, func_line);
+    var allocs = try collectMemSafetyAllocs(allocator, lines, func_line, file_no_free_fields);
     defer allocs.deinit();
     if (allocs.count() == 0) return issues;
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
+
+    // Build alias map: alias_name -> original_alloc_name
+    // Tracks patterns like `const alias = data;` where `data` is a tracked allocation
+    var aliases = try collectAliases(allocator, lines, &allocs);
+    defer aliases.deinit(allocator);
 
     const markers = try markDeferAndErrdeferBlocks(allocator, lines);
     defer allocator.free(markers.in_defer);
@@ -2404,9 +2412,58 @@ fn analyzeCFGMemorySafety(
             markers.in_errdefer,
             num_blocks,
             &issues,
+            &aliases,
         );
     }
     return issues;
+}
+
+/// Collect variable aliases for tracked allocations.
+/// Scans for `const alias = original;` or `var alias = original;` patterns
+/// where `original` is a tracked allocation name. Returns alias_name -> original_name map.
+fn collectAliases(
+    a: Allocator,
+    lines: []const []const u8,
+    allocs: *const std.StringHashMap(CFGAllocation),
+) !std.StringHashMapUnmanaged([]const u8) {
+    var aliases = std.StringHashMapUnmanaged([]const u8){};
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+
+        // Match: const X = Y; or var X = Y;
+        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
+        const name = extractVarDeclName(t) orelse continue;
+
+        // Don't track if this name is itself an allocation (not an alias)
+        if (allocs.contains(name)) continue;
+
+        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
+        var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+
+        // Strip trailing semicolon
+        if (rhs.len > 0 and rhs[rhs.len - 1] == ';') rhs = rhs[0 .. rhs.len - 1];
+        rhs = mem.trim(u8, rhs, " \t");
+
+        // RHS must be a simple identifier (the original variable name)
+        if (rhs.len == 0) continue;
+        var all_ident = true;
+        for (rhs) |c| {
+            if (!isIdent(c)) {
+                all_ident = false;
+                break;
+            }
+        }
+        if (!all_ident) continue;
+
+        // Check if RHS is a tracked allocation
+        if (allocs.contains(rhs)) {
+            try aliases.put(a, name, rhs);
+        }
+    }
+
+    return aliases;
 }
 
 /// Per-block free tracking state for memory safety analysis.
@@ -2440,10 +2497,13 @@ fn collectMemSafetyAllocs(
     allocator: Allocator,
     lines: []const []const u8,
     func_line: usize,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.StringHashMap(CFGAllocation) {
     // Build type-tracked allocator sets (stdlib types only)
     var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
     defer no_free_names.deinit(allocator);
+    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
+    defer local_no_free_fields.deinit(allocator);
     var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
     defer all_alloc_names.deinit(allocator);
 
@@ -2456,7 +2516,13 @@ fn collectMemSafetyAllocs(
         // Skip allocations from type-tracked no-free allocators (stdlib types only)
         const alloc_name = extractAllocatorName(t) orelse "";
         if (alloc_name.len > 0 and no_free_names.contains(alloc_name)) continue;
-        if (isNoFreeCallChain(t, &no_free_names)) continue;
+        if (isNoFreeCallChainFull(t, &no_free_names, &local_no_free_fields)) continue;
+        if (isNoFreeFieldChain(t, &local_no_free_fields)) continue;
+        // Check file-level no-free fields (struct definitions outside this function)
+        if (file_no_free_fields) |fields| {
+            if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
+            if (isNoFreeFieldChain(t, fields)) continue;
+        }
         const name = extractVarDeclName(t) orelse continue;
         try allocs.put(name, .{
             .name = name,
@@ -2766,7 +2832,9 @@ fn detectUseAfterFree(
     in_defer: []const bool,
     bstate: *const BlockFreeState,
     issues: *std.ArrayListUnmanaged(Issue),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
+    // Check direct uses of the freed variable
     for (lines, 0..) |line, idx| {
         if (in_errdefer[idx]) continue;
         const t = mem.trim(u8, line, " \t\r");
@@ -2786,6 +2854,46 @@ fn detectUseAfterFree(
             t,
             func_line + idx,
         );
+    }
+
+    // Check uses of aliases after the original is freed.
+    // The free was on the ORIGINAL variable, not the alias. So we can't reuse
+    // checkLineForUAF (which scans for free of the passed var_name).
+    // Instead: if original was freed, any use of an alias after the free line is UAF.
+    if (alloc_info.freed_line == 0) return; // Original not freed, no alias UAF possible
+    var alias_iter = aliases.iterator();
+    while (alias_iter.next()) |entry| {
+        const alias_name = entry.key_ptr.*;
+        const original = entry.value_ptr.*;
+        if (!mem.eql(u8, original, var_name)) continue;
+
+        for (lines, 0..) |line, idx| {
+            const actual_line = func_line + idx;
+            if (actual_line <= alloc_info.freed_line) continue;
+            if (in_errdefer[idx]) continue;
+            if (in_defer[idx]) continue;
+            const t = mem.trim(u8, line, " \t\r");
+            if (isUAFSkipLine(t)) continue;
+
+            // Skip the alias definition line itself
+            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) {
+                if (extractVarDeclName(t)) |decl_name| {
+                    if (mem.eql(u8, decl_name, alias_name)) continue;
+                }
+            }
+
+            const use_col = findVarUseOnLine(t, alias_name) orelse continue;
+            try appendUAFIssue(
+                allocator,
+                issues,
+                file_path,
+                actual_line,
+                use_col,
+                alias_name,
+                alloc_info.freed_line,
+            );
+            break; // One UAF per alias is sufficient
+        }
     }
 }
 
@@ -3106,12 +3214,15 @@ fn collectCFGAllocations(
     cfg: *ControlFlowGraph,
     lines: []const []const u8,
     func_line: usize,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(CFGAlloc) {
     var allocs = std.ArrayListUnmanaged(CFGAlloc){};
 
     // Pre-scan: build type-tracked allocator sets
     var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
     defer no_free_names.deinit(allocator);
+    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
+    defer local_no_free_fields.deinit(allocator);
     var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
     defer all_alloc_names.deinit(allocator);
 
@@ -3125,7 +3236,13 @@ fn collectCFGAllocations(
         // Skip allocations from type-tracked no-free allocators (stdlib types only)
         const aname = extractAllocatorName(t) orelse "";
         if (aname.len > 0 and no_free_names.contains(aname)) continue;
-        if (isNoFreeCallChain(t, &no_free_names)) continue;
+        if (isNoFreeCallChainFull(t, &no_free_names, &local_no_free_fields)) continue;
+        if (isNoFreeFieldChain(t, &local_no_free_fields)) continue;
+        // Check file-level no-free fields (struct definitions outside this function)
+        if (file_no_free_fields) |fields| {
+            if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
+            if (isNoFreeFieldChain(t, fields)) continue;
+        }
         // For standalone/method-style calls where allocator is an argument (not receiver),
         // check the first-arg allocator for no-free suppression
         if (extractStandaloneAllocator(t)) |standalone_alloc| {
@@ -3393,6 +3510,7 @@ fn analyzeCFGDeferCoverage(
     lines: []const []const u8,
     func_line: usize,
     file_path: []const u8,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
@@ -3400,7 +3518,7 @@ fn analyzeCFGDeferCoverage(
     if (hasNoFreeAllocatorParameter(lines)) return issues;
 
     // Phase 1: Collect allocations
-    var allocs = try collectCFGAllocations(allocator, cfg, lines, func_line);
+    var allocs = try collectCFGAllocations(allocator, cfg, lines, func_line, file_no_free_fields);
     defer allocs.deinit(allocator);
     if (allocs.items.len == 0) return issues;
 
@@ -3849,6 +3967,7 @@ fn collectTryAllocFromLine(
     try_lines: *std.ArrayListUnmanaged(usize),
     allocator: Allocator,
     no_free_names: *const std.StringHashMapUnmanaged(void),
+    no_free_fields: *const std.StringHashMapUnmanaged(void),
 ) !void {
     // Skip allocations from type-tracked no-free allocators (stdlib types only)
     const aname_e = extractAllocatorName(t) orelse "";
@@ -3856,7 +3975,11 @@ fn collectTryAllocFromLine(
         try try_lines.append(allocator, actual_line);
         return;
     }
-    if (isNoFreeCallChain(t, no_free_names)) {
+    if (isNoFreeCallChainFull(t, no_free_names, no_free_fields)) {
+        try try_lines.append(allocator, actual_line);
+        return;
+    }
+    if (isNoFreeFieldChain(t, no_free_fields)) {
         try try_lines.append(allocator, actual_line);
         return;
     }
@@ -3995,6 +4118,7 @@ fn scanErrdeferLines(
     allocator: Allocator,
     lines: []const []const u8,
     func_line: usize,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !ErrdeferScanState {
     var state = ErrdeferScanState{
         .try_allocs = .{},
@@ -4007,6 +4131,10 @@ fn scanErrdeferLines(
     // initialization and .allocator() aliases
     var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
     defer no_free_names.deinit(allocator);
+    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
+    defer local_no_free_fields.deinit(allocator);
+    // Merge file-level fields: use file-level if available, else local only
+    const effective_fields = file_no_free_fields orelse &local_no_free_fields;
 
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
@@ -4027,6 +4155,7 @@ fn scanErrdeferLines(
                 &state.try_lines_list,
                 allocator,
                 &no_free_names,
+                effective_fields,
             );
         }
         try collectDeferFromLine(
@@ -4048,12 +4177,13 @@ fn analyzeCFGErrdeferCoverage(
     func_line: usize,
     file_path: []const u8,
     fn_returns_error: bool,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
     if (!fn_returns_error) return issues;
     if (hasNoFreeAllocatorType(lines)) return issues;
 
-    var state = try scanErrdeferLines(allocator, lines, func_line);
+    var state = try scanErrdeferLines(allocator, lines, func_line, file_no_free_fields);
     defer state.deinit(allocator);
 
     if (state.try_allocs.items.len == 0) return issues;
@@ -5015,6 +5145,116 @@ fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.Str
     return names;
 }
 
+/// Collect struct field names whose declared type is a no-free allocator.
+/// Scans the entire file for struct field declarations matching stdlib no-free
+/// allocator types (e.g. `arena: std.heap.ArenaAllocator,`).
+/// Type-based only — matches on declared types, never on field names.
+fn collectNoFreeFieldNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
+    var names = std.StringHashMapUnmanaged(void){};
+    const field_type_patterns = compat.getNoFreeFieldTypePatterns();
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+
+        // Match struct field declarations: `field_name: TypePattern`
+        // Must contain `: ` (field declaration syntax) but NOT `const ` or `var `
+        // (those are variable declarations handled by collectNoFreeAllocatorNames)
+        if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) continue;
+        if (mem.startsWith(u8, t, "pub const ") or mem.startsWith(u8, t, "pub var ")) continue;
+
+        // Look for `identifier: type_pattern` pattern
+        const colon_pos = mem.indexOf(u8, t, ": ") orelse continue;
+        if (colon_pos == 0) continue;
+
+        // Extract field name (everything before the colon must be a valid identifier)
+        const field_name = t[0..colon_pos];
+        var valid_field = true;
+        for (field_name) |c| {
+            if (!isIdent(c)) {
+                valid_field = false;
+                break;
+            }
+        }
+        if (!valid_field or field_name.len == 0) continue;
+
+        // Check if the type after `: ` matches a no-free allocator type
+        const type_part = mem.trim(u8, t[colon_pos + 2 ..], " \t");
+        for (field_type_patterns) |pat| {
+            if (mem.startsWith(u8, type_part, pat)) {
+                // Verify the match is a complete type (followed by , or = or end)
+                if (type_part.len == pat.len or
+                    type_part[pat.len] == ',' or
+                    type_part[pat.len] == ' ' or
+                    type_part[pat.len] == '=')
+                {
+                    try names.put(a, field_name, {});
+                    break;
+                }
+            }
+        }
+    }
+
+    return names;
+}
+
+/// Content-based version of collectNoFreeFieldNames for file-level scanning.
+/// Splits content by newlines and delegates to the line-based version.
+fn collectNoFreeFieldNamesFromContent(
+    a: Allocator,
+    content: []const u8,
+) !std.StringHashMapUnmanaged(void) {
+    // Split content into lines
+    var file_lines = std.ArrayListUnmanaged([]const u8){};
+    defer file_lines.deinit(a);
+    var line_iter = mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        try file_lines.append(a, line);
+    }
+    return collectNoFreeFieldNames(a, file_lines.items);
+}
+
+/// Check if an allocation call is through a struct field chain where one
+/// segment is a known no-free allocator field (type-based detection).
+/// Matches patterns like: self.arena.alloc(...), ctx.fba.dupe(...)
+/// where `arena`/`fba` were declared as no-free allocator types in a struct.
+fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnmanaged(void)) bool {
+    if (no_free_fields.count() == 0) return false;
+
+    // Find the allocation method position
+    var method_pos: ?usize = null;
+    for (compat.getAllocMethodPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (method_pos == null or pos < method_pos.?)
+                method_pos = pos;
+        }
+    }
+    const end = method_pos orelse return false;
+    if (end == 0) return false;
+
+    // Walk backwards to extract the full receiver chain (e.g. "self.arena")
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+        start -= 1;
+    }
+    if (start >= end) return false;
+    const chain = t[start..end];
+
+    // Check each segment of the chain against known no-free field names
+    var iter_start: usize = 0;
+    while (iter_start < chain.len) {
+        // Find next dot or end of chain
+        const dot_pos = mem.indexOf(u8, chain[iter_start..], ".") orelse (chain.len - iter_start);
+        const segment = chain[iter_start .. iter_start + dot_pos];
+        if (segment.len > 0 and no_free_fields.contains(segment)) {
+            return true;
+        }
+        iter_start += dot_pos + 1;
+    }
+
+    return false;
+}
+
 /// Build set of ALL allocator variable names (both no-free and need-free).
 /// Used to determine if `.create()` receiver is an allocator.
 /// Tracks stdlib type initializations + .allocator() calls + global singletons.
@@ -5641,7 +5881,20 @@ fn isMethodOnStdlibVar(
 
 /// Check if line uses .allocator().{alloc_method}() chain from a tracked no-free source.
 /// Detects patterns like: fba_var.allocator().alloc(...), arena_var.allocator().create(...)
-fn isNoFreeCallChain(t: []const u8, no_free_names: *const std.StringHashMapUnmanaged(void)) bool {
+fn isNoFreeCallChain(
+    t: []const u8,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+) bool {
+    return isNoFreeCallChainFull(t, no_free_names, null);
+}
+
+/// Check if allocation is through a no-free allocator call chain:
+/// X.allocator().method() where X is a tracked no-free variable or field.
+fn isNoFreeCallChainFull(
+    t: []const u8,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+) bool {
     const chain_marker = ".allocator().";
     const pos = mem.indexOf(u8, t, chain_marker) orelse return false;
 
@@ -5660,12 +5913,22 @@ fn isNoFreeCallChain(t: []const u8, no_free_names: *const std.StringHashMapUnman
     }
     if (!is_alloc_method) return false;
 
-    // Extract source variable name before .allocator()
+    // Extract source variable/field name before .allocator()
     var start = pos;
     while (start > 0 and isIdent(t[start - 1])) start -= 1;
     if (start >= pos) return false;
     const source = t[start..pos];
-    return no_free_names.contains(source);
+
+    // Check local variable names (e.g. arena.allocator().alloc())
+    if (no_free_names.contains(source)) return true;
+
+    // Check struct field names (e.g. self.arena.allocator().alloc())
+    // The source before .allocator() is a field name in a dotted chain
+    if (no_free_fields) |fields| {
+        if (fields.contains(source)) return true;
+    }
+
+    return false;
 }
 
 /// Zig language construct patterns indicating ownership transfer (not stdlib-specific)
@@ -7890,6 +8153,8 @@ const CFGState = struct {
     func_in_test: bool = false,
     // File-level: functions that receive no-free allocators at call sites
     no_free_param_fns: ?*const std.StringHashMapUnmanaged(void) = null,
+    // File-level: struct field names declared with no-free allocator types
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void) = null,
 };
 
 /// Detect function start and initialize state
@@ -7986,20 +8251,21 @@ fn runCFGMemoryAnalyses(
     fn_ret_err: bool,
     in_test: bool,
     is_no_free_recipient: bool,
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !void {
-    var r1 = try analyzeCFGMemorySafety(a, cfg, fl, fstart, fp);
+    var r1 = try analyzeCFGMemorySafety(a, cfg, fl, fstart, fp, no_free_fields);
     defer r1.deinit(a);
     try out.appendSlice(a, r1.items);
     var r2 = if (is_no_free_recipient)
         std.ArrayListUnmanaged(Issue){}
     else
-        try analyzeCFGDeferCoverage(a, cfg, fl, fstart, fp);
+        try analyzeCFGDeferCoverage(a, cfg, fl, fstart, fp, no_free_fields);
     defer r2.deinit(a);
     try out.appendSlice(a, r2.items);
     var r3 = if (in_test or is_no_free_recipient)
         std.ArrayListUnmanaged(Issue){}
     else
-        try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err);
+        try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err, no_free_fields);
     defer r3.deinit(a);
     try out.appendSlice(a, r3.items);
 }
@@ -8063,6 +8329,7 @@ fn processFunction(
     fn_returns_error: bool,
     is_in_test_context: bool,
     no_free_param_fns: ?*const std.StringHashMapUnmanaged(void),
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !void {
     // Check if this function receives a no-free allocator via call-site propagation
     const is_no_free_recipient = if (no_free_param_fns) |fns| fns.contains(func_name) else false;
@@ -8088,6 +8355,7 @@ fn processFunction(
         fn_returns_error,
         is_in_test_context,
         is_no_free_recipient,
+        no_free_fields,
     );
     try runCFGSafetyAnalyses(
         allocator,
@@ -8112,8 +8380,14 @@ fn analyzeCFGFile(
     var no_free_fns = try buildNoFreeParamFunctions(allocator, content);
     defer no_free_fns.deinit(allocator);
 
+    // Pre-scan: collect struct field names declared with no-free allocator types
+    // (e.g. `arena: std.heap.ArenaAllocator,`) for field-chain suppression
+    var no_free_fields = try collectNoFreeFieldNamesFromContent(allocator, content);
+    defer no_free_fields.deinit(allocator);
+
     var state = CFGState{
         .no_free_param_fns = &no_free_fns,
+        .no_free_fields = &no_free_fields,
     };
     var line_num: usize = 1;
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -8175,6 +8449,7 @@ fn finishCFGFunction(
         state.fn_returns_error,
         in_test,
         state.no_free_param_fns,
+        state.no_free_fields,
     );
     state.in_func = false;
     func_lines.clearRetainingCapacity();
@@ -8219,6 +8494,7 @@ fn handleCFGFuncDetection(
                 false,
                 prev.in_test,
                 state.no_free_param_fns,
+                state.no_free_fields,
             );
         }
         if (func_lines.items.len > 0) func_lines.clearRetainingCapacity();
@@ -15793,6 +16069,7 @@ test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
         lines_list.items,
         1,
         "test_conditional.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -15838,6 +16115,7 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
         lines_list.items,
         1,
         "test_good.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -15879,6 +16157,7 @@ test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
         lines_list.items,
         1,
         "test_no_defer.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -16698,6 +16977,7 @@ test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
         lines_list.items,
         1,
         "test_dupe_no_defer.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -16740,6 +17020,7 @@ test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
         lines_list.items,
         1,
         "test_allocPrint_no_defer.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -16783,6 +17064,7 @@ test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
         lines_list.items,
         1,
         "test_dupe_good.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -16823,6 +17105,7 @@ test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101
         lines_list.items,
         1,
         "test_allocPrint_good.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -16970,6 +17253,7 @@ test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
         lines_list.items,
         1,
         "test_concat_no_defer.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -17015,6 +17299,7 @@ test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
         lines_list.items,
         1,
         "test_owned_no_defer.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -17089,6 +17374,7 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
         lines_list.items,
         1,
         "test_return_transfer.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -17195,6 +17481,7 @@ test "analyzeCFGDeferCoverage no false positive for create with ownership transf
         lines_list.items,
         1,
         "test_create_return.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -17377,6 +17664,119 @@ test "analyzeCFGMemory no false positive for defer free (ZA105)" {
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.file, "test_defer_safe.zig")) {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
+        }
+    }
+}
+
+test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
+    // Tests alias UAF: const alias = data; free(data); use(alias);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn alias_uaf(allocator: std.mem.Allocator) !void {
+        \\    const data = try allocator.alloc(u8, 100);
+        \\    const alias = data;
+        \\    allocator.free(data);
+        \\    process(alias);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_alias_uaf.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_alias_uaf.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za105 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_alias_uaf.zig") and
+            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+        {
+            found_za105 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za105);
+}
+
+test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
+    // Arena accessed through struct field: self.arena.allocator().alloc()
+    // Type-based detection: field declared as std.heap.ArenaAllocator
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Analyser = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    data: []const u8,
+        \\};
+        \\fn arena_field_alloc(self: *Analyser) !void {
+        \\    const data = try self.arena.allocator().alloc(u8, 100);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_field.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_field.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // No ZA101/ZA102/ZA103 should fire for arena field chain allocations
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_field.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
+    // FixedBufferAllocator accessed through struct field
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Parser = struct {
+        \\    fba: std.heap.FixedBufferAllocator,
+        \\    input: []const u8,
+        \\};
+        \\fn fba_field_alloc(parser: *Parser) !void {
+        \\    const data = try parser.fba.allocator().alloc(u8, 64);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_fba_field.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_fba_field.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_fba_field.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
         }
     }
 }

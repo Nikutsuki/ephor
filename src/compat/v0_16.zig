@@ -775,6 +775,25 @@ pub const no_free_init_patterns: []const []const u8 = &.{
     "stackFallback(",
 };
 
+/// Struct field type patterns for no-free allocators.
+/// Used to detect fields like `arena: std.heap.ArenaAllocator,` so that
+/// allocations through field chains (e.g. self.arena.alloc()) are suppressed.
+/// Type-based only — never matches on field names, only on declared types.
+pub const no_free_field_type_patterns: []const []const u8 = &.{
+    "std.heap.ArenaAllocator",
+    "heap.ArenaAllocator",
+    "ArenaAllocator",
+    "std.heap.FixedBufferAllocator",
+    "heap.FixedBufferAllocator",
+    "FixedBufferAllocator",
+    "*std.heap.ArenaAllocator",
+    "*heap.ArenaAllocator",
+    "*ArenaAllocator",
+    "*std.heap.FixedBufferAllocator",
+    "*heap.FixedBufferAllocator",
+    "*FixedBufferAllocator",
+};
+
 pub const all_init_patterns: []const []const u8 = &.{
     "ArenaAllocator.init(",
     "FixedBufferAllocator.init(",

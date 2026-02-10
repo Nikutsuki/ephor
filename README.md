@@ -654,15 +654,15 @@ This section documents the internal detection architecture. Understanding these 
 
 ### Architecture Overview
 
-Ephor has three analysis entry points, each building a `TypeContext` for type-aware detection:
+Ephor has three analysis entry points:
 
-| Entry Point | Scope | Rules | TypeContext Source |
-|-------------|-------|-------|-------------------|
-| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA206 (in `checkLineErrors`) | `parseFileTypeContext(content)` |
-| `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `parseFileTypeContext(content)` |
-| `analyzeFunction` | Single function body | ZA101-ZA106 (memory tracking) | `parseFileTypeContextFromLines(lines)` |
+| Entry Point | Scope | Rules | Context |
+|-------------|-------|-------|---------|
+| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA206 (in `checkLineErrors`) | `TypeContext` via `parseFileTypeContext(content)` |
+| `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
+| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106 (memory) | `CFGState` with file-level `no_free_fields` |
 
-All three build a `TypeContext` and pass it through to the detection functions that need type information.
+Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression.
 
 ### TypeContext: The Core Data Structure
 
@@ -794,15 +794,39 @@ If no tier resolved the call, the discard is reported (conservative: better to f
 
 ### Memory Analysis Path (ZA101-ZA106)
 
-Memory analysis runs per-function via `analyzeFunction`:
+Memory analysis uses a **CFG-based approach** through three specialized analyzers:
 
-1. **Pass 1**: Detect allocations (27 method patterns + 3 qualified patterns covering all stdlib allocating functions)
-2. **Pass 2**: Build alias sets (track which variables alias the allocation)
-3. **Pass 3** (`processAllocTracking`): Track ownership transfers via `checkMethodTransfer`
+| Analyzer | Rules | Purpose |
+|----------|-------|---------|
+| `analyzeCFGDeferCoverage` | ZA101, ZA102 | Allocation without matching `defer free()`/`defer destroy()` |
+| `analyzeCFGErrdeferCoverage` | ZA103 | Allocation without `errdefer` before next `try` |
+| `analyzeCFGMemorySafety` | ZA104, ZA105, ZA106 | Memory not freed on all paths, use-after-free, double-free |
 
-`checkMethodTransfer` uses `type_ctx.stdlib_vars` to determine if a method call transfers ownership to a stdlib container (e.g., `list.append(ptr)` transfers ownership of `ptr` to `list`).
+**Analysis pipeline per file** (`analyzeCFGFile`):
 
-**Note**: `parseFileTypeContextFromLines` (used for function-scope analysis) only builds `var_types` and `stdlib_vars`. It does NOT build `struct_methods` — method return type resolution is not available in the memory analysis path. This is acceptable because memory analysis doesn't need return types; it needs ownership transfer detection, which uses vocab patterns.
+1. **File-level setup**: Compute `no_free_fields` by scanning struct field declarations for no-free allocator types (e.g., `arena: std.heap.ArenaAllocator`)
+2. **Function extraction**: Split file into individual functions
+3. **Per-function analysis** (`processFunction` → `runCFGMemoryAnalyses`): Run all three analyzers with shared state
+
+**No-free allocator suppression** — allocations that don't need per-allocation free:
+
+| Detection Method | What It Catches | Example |
+|-----------------|-----------------|---------|
+| Local variable init | Variables initialized with `ArenaAllocator.init(...)` | `var arena = std.heap.ArenaAllocator.init(...)` |
+| `.allocator()` call chain | Allocations via `.allocator()` on tracked no-free variables | `arena.allocator().alloc(u8, 100)` |
+| Struct field type (file-level) | Fields declared as no-free allocator types in struct definitions | `arena: std.heap.ArenaAllocator` |
+| Field access chain | Allocations through struct fields of no-free types | `self.arena.allocator().alloc(u8, 100)` |
+| Data flow tracking | No-free allocator types propagated through assignments | `const alloc = arena.allocator();` |
+
+**IMPORTANT**: All suppression is **type-based, not name-based**. Ephor tracks `std.heap.ArenaAllocator`, `std.heap.FixedBufferAllocator`, and `std.heap.StackFallbackAllocator` via stdlib type patterns. Variable/field names like "arena" or "fba" are never used for detection — only the declared type matters.
+
+**Alias tracking for ZA105** (use-after-free):
+
+The UAF detector tracks variable aliases — `const alias = data;` where `data` is a tracked allocation. If `data` is freed and `alias` is used afterwards, ZA105 fires on the alias usage.
+
+**Ownership transfer detection**:
+
+Allocations transferred to stdlib containers (e.g., `list.append(ptr)`) or returned from the function (`return ptr`) are suppressed. The `checkMethodTransfer` function uses `type_ctx.stdlib_vars` to identify stdlib container ownership methods.
 
 ### Known Limitations
 
@@ -826,10 +850,11 @@ All limitations fall through to `.unknown`, which triggers vocab-based detection
 
 | Pattern | Rule | Root Cause | Status |
 |---------|------|------------|--------|
-| Arena allocator via `std.mem.Allocator` interface | ZA101/ZA103 | Type erasure — arena loses no-free semantics when passed as generic Allocator | Open |
-| Allocation immediately returned to caller | ZA103 | Missing return-path analysis — `return ptr` transfers ownership | Open |
+| Arena allocator via `std.mem.Allocator` interface | ZA101/ZA103 | Type erasure — arena loses no-free semantics when passed as generic `Allocator` | Open (by design: type-based detection cannot resolve erased types) |
 
-These patterns are documented in `fixtures/good_code_patterns_false_positive.zig` and validated against the community project corpus.
+Note: Arena allocations through **struct field chains** (e.g., `self.arena.allocator().alloc(...)`) are correctly suppressed when the field is declared with a no-free allocator type like `std.heap.ArenaAllocator`. Only type-erased fields (declared as `std.mem.Allocator`) remain as known false positives.
+
+These patterns are validated against the community project corpus (3000+ projects, top 100 by size audited with zero false positives).
 
 ### Vocabulary System (Compat Layer)
 
@@ -843,6 +868,7 @@ The compat layer (`src/compat/`) provides version-specific pattern vocabularies:
 | `getContainerOwnershipMethods()` | Methods that transfer allocation ownership | `.append(`, `.put(`, `.insert(` |
 | `getStdlibContainerInitPatterns()` | Init patterns for stdlib containers | `ArrayList(`, `StringHashMap(` |
 | `getAllInitPatterns()` | Init patterns for all stdlib types including allocators | `ArenaAllocator.init(`, `FixedBufferAllocator.init(` |
+| `getNoFreeFieldTypePatterns()` | Struct field types that are no-free allocators | `std.heap.ArenaAllocator`, `std.heap.FixedBufferAllocator` |
 
 Vocabularies are defined per Zig version (`v0_15.zig`, `v0_16.zig`) and selected at build time via `compat.zig`.
 
@@ -867,6 +893,8 @@ Ephor uses three testing layers:
 - `bad_code_patterns.zig` — Code that MUST be flagged (true positives)
 - `good_code_patterns_false_positive.zig` — Code that MUST NOT be flagged (false positive regression tests)
 - `naming_conventions.zig` — Naming rule test patterns
+- `fixtures/memory/tp_*.zig` — True positive memory fixtures (ZA101-ZA106)
+- `fixtures/memory/fp_*.zig` — False positive memory fixtures (arena field chains, ownership transfer, deferred alloc)
 
 **4. Corpus validation** (3000+ community Zig projects):
 - Dogfood: `ephor check src/` → zero issues

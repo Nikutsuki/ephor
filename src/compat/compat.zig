@@ -336,6 +336,16 @@ pub fn getNoFreeInitPatterns() []const []const u8 {
     return v0_15.no_free_init_patterns;
 }
 
+/// Struct field type patterns for no-free allocators.
+/// Used to detect fields like `arena: std.heap.ArenaAllocator,` so that
+/// allocations through field chains (e.g. self.arena.alloc()) are suppressed.
+/// Type-based only — never matches on field names, only on declared types.
+pub fn getNoFreeFieldTypePatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.no_free_field_type_patterns;
+    return v0_15.no_free_field_type_patterns;
+}
+
 /// Init patterns for ALL allocator types (no-free + needs-free)
 pub fn getAllInitPatterns() []const []const u8 {
     const version = getCurrentVersion();
@@ -483,6 +493,20 @@ test "getBuiltins returns non-empty list" {
 test "getNoFreeInitPatterns returns non-empty list" {
     const patterns = getNoFreeInitPatterns();
     try std.testing.expect(patterns.len > 0);
+}
+
+test "getNoFreeFieldTypePatterns returns non-empty list" {
+    const patterns = getNoFreeFieldTypePatterns();
+    try std.testing.expect(patterns.len > 0);
+    // Must include ArenaAllocator patterns
+    var found_arena = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, "std.heap.ArenaAllocator")) {
+            found_arena = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_arena);
 }
 
 test "getAllInitPatterns returns non-empty list" {

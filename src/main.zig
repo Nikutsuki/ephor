@@ -3332,6 +3332,8 @@ fn checkOwnershipInLine(
             const lhs = mem.trim(u8, t[0..eq_pos], " \t");
             // Skip const/var declarations (those are local)
             if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) {
+                // Pointer dereference init: name.* = .{...} writes TO allocated memory
+                if (mem.endsWith(u8, lhs, ".*") and containsIdentifier(lhs, ov.name)) continue;
                 // LHS with a dot = struct field storage (e.g., self.x, ctx.y, result.z, node.data)
                 if (mem.indexOf(u8, lhs, ".") != null) return true;
                 // Skip discard patterns: _ = value
@@ -3734,7 +3736,12 @@ fn checkErrdeferOwnershipTransfer(
     const alloc_idx = alloc.line - func_line;
     if (alloc_idx >= lines.len) return;
 
-    for (lines[alloc_idx..]) |line| {
+    // Start from line AFTER the allocation — the allocation line itself
+    // can't be an ownership transfer of its own result (e.g., toOwnedSlice
+    // on the alloc line would falsely match container_ownership_methods)
+    const start = alloc_idx + 1;
+    if (start >= lines.len) return;
+    for (lines[start..]) |line| {
         const lt = mem.trim(u8, line, " \t\r");
         // Check for break :label ownership transfer
         if (mem.indexOf(u8, lt, "break :") != null and containsIdentifier(lt, alloc.name)) {
@@ -5664,7 +5671,18 @@ fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
     if (mem.indexOf(u8, t, alloc_name) == null) return false;
     // Check Zig language construct patterns
     for (ownership_lang_patterns) |pattern| {
-        if (mem.indexOf(u8, t, pattern) != null) return true;
+        if (mem.indexOf(u8, t, pattern) == null) continue;
+        // ".* = " is only an ownership transfer when alloc_name is on the RHS.
+        // When alloc_name is on the LHS (e.g., node.* = .{...}), it's
+        // initialization of allocated memory, not a transfer.
+        if (mem.eql(u8, pattern, ".* = ")) {
+            if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+                const rhs = t[eq_pos + 3 ..];
+                if (mem.indexOf(u8, rhs, alloc_name) != null) return true;
+            }
+            continue;
+        }
+        return true;
     }
     // Check stdlib container methods (compat layer)
     for (compat.getContainerOwnershipMethods()) |pattern| {
@@ -8967,6 +8985,8 @@ fn checkAssignmentOwnership(
     const eq_pos = mem.indexOf(u8, t, " = ").?;
     const lhs = mem.trim(u8, t[0..eq_pos], " \t");
     if (lhs.len == 0) return;
+    // Skip discard patterns: _ = value (not storage)
+    if (mem.eql(u8, lhs, "_")) return;
     if (mem.indexOf(u8, lhs, ".") == null and
         !mem.eql(u8, lhs, alias))
     {
@@ -17407,4 +17427,386 @@ test "buildNoFreeParamFunctions skips function definitions" {
 
     // "doStuff" should NOT be detected — it's a definition, not a call
     try std.testing.expect(!result.contains("doStuff"));
+}
+
+// ============================================================================
+// findAllocCall pattern detection tests
+// ============================================================================
+
+test "findAllocCall detects .dupe(" {
+    const result = findAllocCall("    const copy = try allocator.dupe(u8, original);", null);
+    try std.testing.expect(result != null);
+    try std.testing.expect(!result.?.is_create);
+}
+
+test "findAllocCall detects .dupeZ(" {
+    const result = findAllocCall("    const copy = try allocator.dupeZ(u8, original);", null);
+    try std.testing.expect(result != null);
+    try std.testing.expect(!result.?.is_create);
+}
+
+test "findAllocCall detects .allocPrint(" {
+    const result = findAllocCall("    const msg = try std.fmt.allocPrint(allocator, \"{d}\", .{42});", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .toOwnedSlice(" {
+    const result = findAllocCall("    const slice = try list.toOwnedSlice();", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .readFileAlloc(" {
+    const result = findAllocCall("    const data = try dir.readFileAlloc(allocator, \"file.txt\", 1024);", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .realpathAlloc(" {
+    const result = findAllocCall("    const path = try std.fs.cwd().realpathAlloc(allocator, \".\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .stringifyAlloc(" {
+    const result = findAllocCall("    const json = try std.json.stringifyAlloc(allocator, value, .{});", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .replaceOwned(" {
+    const result = findAllocCall("    const out = try std.mem.replaceOwned(u8, allocator, input, \"a\", \"b\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .concatWithSentinel(" {
+    const result = findAllocCall("    const out = try allocator.concatWithSentinel(u8, slices, 0);", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects mem.concat(" {
+    const result = findAllocCall("    const merged = try std.mem.concat(allocator, u8, &.{a, b});", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects mem.join(" {
+    const result = findAllocCall("    const joined = try std.mem.join(allocator, \", \", parts);", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects process.getEnvVarOwned(" {
+    const result = findAllocCall("    const home = try std.process.getEnvVarOwned(allocator, \"HOME\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects fs.getAppDataDir(" {
+    const result = findAllocCall("    const dir = try std.fs.getAppDataDir(allocator, \"myapp\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall does NOT detect .clone(" {
+    const result = findAllocCall("    const copy = try list.clone();", null);
+    try std.testing.expect(result == null);
+}
+
+test "findAllocCall does NOT detect .append(" {
+    const result = findAllocCall("    try list.append(allocator, item);", null);
+    try std.testing.expect(result == null);
+}
+
+// ============================================================================
+// analyzeCFGDeferCoverage tests for non-basic alloc patterns (ZA101/ZA102)
+// ============================================================================
+
+test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    _ = data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_dupe", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_dupe_no_defer.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_print(alloc: std.mem.Allocator) !void {
+        \\    const msg = try std.fmt.allocPrint(alloc, "hi {d}", .{42});
+        \\    _ = msg;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_print", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_allocPrint_no_defer.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn good_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    defer alloc.free(data);
+        \\    process(data);
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "good_dupe", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_dupe_good.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_dupe_good.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn good_print(alloc: std.mem.Allocator) !void {
+        \\    const msg = try std.fmt.allocPrint(alloc, "hi {d}", .{42});
+        \\    defer alloc.free(msg);
+        \\    process(msg);
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "good_print", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_allocPrint_good.zig",
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_allocPrint_good.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// analyzeCFGErrdeferCoverage tests for non-basic patterns (ZA103)
+// ============================================================================
+
+test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn bad_errdefer_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    const more = try alloc.dupe(u8, "world");
+        \\    defer alloc.free(data);
+        \\    defer alloc.free(more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dupe_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za103 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER)) {
+            found_za103 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za103);
+}
+
+test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn good_errdefer_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    errdefer alloc.free(data);
+        \\    const more = try alloc.dupe(u8, "world");
+        \\    errdefer alloc.free(more);
+        \\    process(data, more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dupe_good_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_good_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_dupe_good_errdefer.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn bad_errdefer_print(alloc: std.mem.Allocator) !void {
+        \\    const msg = try std.fmt.allocPrint(alloc, "val={d}", .{42});
+        \\    const more = try alloc.alloc(u8, 50);
+        \\    defer alloc.free(msg);
+        \\    defer alloc.free(more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_print_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_print_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za103 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER)) {
+            found_za103 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za103);
+}
+
+// ============================================================================
+// ZA104 (Memory Leak) Unit Tests
+// ============================================================================
+
+test "analyzeFunction emits ZA104 for alloc with zero cleanup" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn leak(allocator: std.mem.Allocator) !void {",
+        "    const data = try allocator.alloc(u8, 100);",
+        "    _ = data;",
+        "}",
+    };
+
+    var issues = try analyzeFunction(allocator, "test.zig", 1, &lines, false);
+    defer issues.deinit(allocator);
+
+    var found_za104 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_MEMORY_LEAK)) {
+            found_za104 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za104);
 }

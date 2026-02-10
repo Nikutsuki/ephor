@@ -809,7 +809,7 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".allocWithOptions(",
     // std.fmt (allocator as first arg)
     ".allocPrint(",
-    ".allocPrintSentinel(",
+    ".allocPrintZ(",
     // Container methods that produce owned memory
     ".toOwnedSlice(",
     ".toOwnedSliceSentinel(",
@@ -841,7 +841,7 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "dupeZ",
     "allocWithOptions",
     "allocPrint",
-    "allocPrintSentinel",
+    "allocPrintZ",
     "toOwnedSlice",
     "toOwnedSliceSentinel",
     "cloneWithAllocator",
@@ -865,6 +865,8 @@ pub const qualified_alloc_fn_patterns: []const []const u8 = &.{
     "mem.concat(",
     "mem.join(",
     "mem.joinZ(",
+    "process.getEnvVarOwned(",
+    "fs.getAppDataDir(",
 };
 
 pub const cleanup_pattern_strs: []const []const u8 = &.{

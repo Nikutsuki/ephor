@@ -118,7 +118,7 @@ If you have the `ephor` binary installed directly, it accepts commands and optio
 ephor                     # Defaults to 'check' on configured src directory
 ephor check src/          # Explicit path
 ephor memory              # Alloc without defer patterns
-ephor errors              # Silent catch {} discards
+ephor errors              # Error handling patterns (ZA201-ZA208)
 ephor orphans             # Files not imported
 ephor complexity          # Function complexity
 ephor fmt-check           # Files needing zig fmt
@@ -164,9 +164,9 @@ Example config:
   "enable": ["ZA702"],
   "thresholds": {
     "max_lines": 50,
-    "max_nesting": 4,
-    "max_params": 5,
-    "max_branches": 10,
+    "max_nesting": 3,
+    "max_params": 4,
+    "max_branches": 12,
     "max_line_length": 100,
     "max_file_bytes": 25000
   }
@@ -208,15 +208,17 @@ Example config:
 | **ZA204** | note | ON | `= undefined` may leak sensitive data (informational) |
 | **ZA205** | note | ON | Discarding error union result (informational) |
 | **ZA206** | warning | ON | `exit()` bypasses defers (memory leak!) |
+| **ZA207** | warning | ON | `catch undefined` (dangerous — converts errors to UB) |
+| **ZA208** | note | ON | `@panic()` crash point (informational) |
 
 ### Complexity (ZA3xx)
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA301** | warning | ON | Function exceeds max lines (default: 50; type factories get 3x) |
-| **ZA302** | warning | ON | Function exceeds max nesting depth (default: 4; type factories get 2x) |
-| **ZA303** | warning | ON | Function has too many parameters (default: 5) |
-| **ZA304** | warning | ON | Function has too many branches (default: 10; type factories get 3x) |
+| **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
+| **ZA303** | warning | ON | Function has too many parameters (default: 4) |
+| **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
 
 **Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they're metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they're compile-time unrolled.
 
@@ -349,7 +351,7 @@ Commands:
   runtime     Run tests with memory diagnostics (dynamic analysis)
   orphans     Files not imported from entry points
   memory      Stdlib allocation without defer patterns (50+ patterns)
-  errors      Silent catch {} discards
+  errors      Error handling patterns (ZA201-ZA208)
   unused      Unused imports/const/var declarations
   complexity  Function complexity metrics
   fmt-check   Files needing zig fmt
@@ -364,8 +366,9 @@ Options:
   --disable=<rule>     Disable rule (e.g., ZA301, ZA3 for all ZA3xx)
   --enable=<rule>      Enable rule (overrides disable)
   --max-lines=N        Max function lines (default: 50)
-  --max-nesting=N      Max nesting depth (default: 4)
-  --max-params=N       Max parameters (default: 5)
+  --max-nesting=N      Max nesting depth (default: 3)
+  --max-params=N       Max parameters (default: 4)
+  --max-branches=N     Max branches per function (default: 12)
   --max-line-length=N  Max columns per line (default: 100)
   --max-file-bytes=N   Max file size in bytes (enables ZA702)
   --version=<X.Y.Z>   For install/upgrade: pin a specific version

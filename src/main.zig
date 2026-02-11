@@ -44,6 +44,8 @@ const RULE_ORELSE_UNREACHABLE = types.RULE_ORELSE_UNREACHABLE;
 const RULE_UNDEFINED_USAGE = types.RULE_UNDEFINED_USAGE;
 const RULE_IGNORED_ERROR = types.RULE_IGNORED_ERROR;
 const RULE_EXIT_BYPASSES_DEFER = types.RULE_EXIT_BYPASSES_DEFER;
+const RULE_CATCH_UNDEFINED = types.RULE_CATCH_UNDEFINED;
+const RULE_PANIC = types.RULE_PANIC;
 const RULE_FUNC_TOO_LONG = types.RULE_FUNC_TOO_LONG;
 const RULE_NESTING_TOO_DEEP = types.RULE_NESTING_TOO_DEEP;
 const RULE_TOO_MANY_PARAMS = types.RULE_TOO_MANY_PARAMS;
@@ -7122,19 +7124,46 @@ fn checkLineErrors(
     type_ctx: ?*const TypeContext,
 ) !void {
     // ZA201 (silent catch) - only from line-based analyzer
-    // ZA202/ZA203 are handled only in analyzeCFGErrors
     if (!in_defer) {
         if (checkSilentCatch(t, path, ln)) |i| {
             try issues.append(allocator, i);
         }
     }
-    // Skip undefined checks in test/module-level context
-    if (!skip_undefined) {
+    // ZA202: catch unreachable
+    if (checkCatchUnreachable(t, path, ln)) |i| {
+        try issues.append(allocator, i);
+    }
+    // ZA203: orelse unreachable (simple line-based check, no null guard analysis)
+    if (checkLineOrelseUnreachable(t, path, ln)) |i| {
+        try issues.append(allocator, i);
+    }
+    // ZA207: catch undefined (dangerous — converts errors to UB)
+    if (checkCatchUndefined(t, path, ln)) |i| {
+        try issues.append(allocator, i);
+    }
+    // Always resolve pending undefineds (even at module boundary) to avoid
+    // losing ZA204 issues when skip_undefined transitions from false→true.
+    // handlePendingUndefined checks fill patterns and scope boundaries.
+    if (pending.* != null) {
+        if (handlePendingUndefined(t, path, ln, pending)) |i| {
+            try issues.append(allocator, i);
+        }
+    }
+    // Only track NEW undefineds when not in test/module-level context
+    // and when no pending is active (handlePendingUndefined already ran above)
+    if (!skip_undefined and pending.* == null) {
+        // checkUndefinedUsage: only detects new "= undefined" when pending is null
         if (checkUndefinedUsage(t, path, ln, pending)) |i| {
             try issues.append(allocator, i);
         }
     }
     if (checkDiscardedResult(t, path, ln, type_ctx)) |i| try issues.append(allocator, i);
+    // ZA208: @panic() detection (skip test files only, not module-level code)
+    if (!isTestFilePath(path)) {
+        if (checkPanic(t, path, ln)) |i| {
+            try issues.append(allocator, i);
+        }
+    }
 }
 
 /// Report remaining pending issues at end of file
@@ -7174,7 +7203,9 @@ fn checkExitBypassesDefer(
 ) ?Issue {
     if (!has_defer or func_name.len == 0) return null;
     const has_exit = mem.indexOf(u8, t, "std.process.exit(") != null or
-        mem.indexOf(u8, t, "process.exit(") != null;
+        mem.indexOf(u8, t, "process.exit(") != null or
+        mem.indexOf(u8, t, "std.posix.exit(") != null or
+        mem.indexOf(u8, t, "posix.exit(") != null;
     if (!has_exit) return null;
 
     const exit_pos = mem.indexOf(u8, t, "exit(") orelse 0;
@@ -7186,7 +7217,7 @@ fn checkExitBypassesDefer(
         .col = exit_pos + 1,
         .severity = .warning,
         .rule = RULE_EXIT_BYPASSES_DEFER,
-        .message = "std.process.exit() bypasses all defers in current scope",
+        .message = "exit() bypasses all defers in current scope",
         .help = "set a flag and exit at end of function, or " ++
             "return error to let defers run",
     };
@@ -9208,6 +9239,69 @@ fn checkOrelseUnreachable(
         .rule = RULE_ORELSE_UNREACHABLE,
         .message = "orelse unreachable will panic",
         .help = "use explicit null handling",
+    };
+}
+
+/// ZA203 (line-based): orelse unreachable without null guard analysis
+/// Used by checkLineErrors for the `errors` subcommand path.
+fn checkLineOrelseUnreachable(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+) ?Issue {
+    const col = mem.indexOf(u8, t, "orelse unreachable") orelse return null;
+    if (isInsideString(t, col)) return null;
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_ORELSE_UNREACHABLE,
+        .message = "orelse unreachable will panic",
+        .help = "use explicit null handling",
+    };
+}
+
+/// ZA207: catch undefined converts errors to undefined behavior
+fn checkCatchUndefined(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+) ?Issue {
+    // Match "catch undefined" but not "catch |_| undefined" or "catch |err| undefined"
+    const col = mem.indexOf(u8, t, "catch undefined") orelse return null;
+    if (isInsideString(t, col)) return null;
+    // Ensure it's "catch undefined" not "catch |...| undefined"
+    const after_catch = t[col + 5 ..]; // skip "catch"
+    const trimmed = mem.trimLeft(u8, after_catch, " \t");
+    if (trimmed.len > 0 and trimmed[0] == '|') return null;
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_CATCH_UNDEFINED,
+        .message = "catch undefined converts errors to undefined behavior",
+        .help = "handle the error explicitly or use catch |err| { ... }",
+    };
+}
+
+/// ZA208: @panic() will crash the program
+fn checkPanic(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+) ?Issue {
+    const col = mem.indexOf(u8, t, "@panic(") orelse return null;
+    if (isInsideString(t, col)) return null;
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .note,
+        .rule = RULE_PANIC,
+        .message = "@panic() will crash the program",
+        .help = "consider returning an error instead, or document why panic is necessary",
     };
 }
 
@@ -11852,7 +11946,8 @@ fn writeDefaultConfig() !void {
         \\  //                     ZA105 use-after-free, ZA106 double-free
         \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (note), ZA202 catch-unreachable (note),
         \\  //                     ZA203 orelse-unreachable (note), ZA204 undefined (note),
-        \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer
+        \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer,
+        \\  //                     ZA207 catch-undefined, ZA208 panic (note)
         \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
         \\  //                     ZA303 too-many-params, ZA304 too-many-branches
         \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
@@ -11870,9 +11965,9 @@ fn writeDefaultConfig() !void {
         \\  // Configurable thresholds
         \\  "thresholds": {
         \\    "max_lines": 50,
-        \\    "max_nesting": 4,
-        \\    "max_params": 5,
-        \\    "max_branches": 10,
+        \\    "max_nesting": 3,
+        \\    "max_params": 4,
+        \\    "max_branches": 12,
         \\    "max_line_length": 100
         \\  }
         \\}
@@ -12037,9 +12132,9 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
             \\  // Configurable thresholds
             \\  "thresholds": {{
             \\    "max_lines": 50,
-            \\    "max_nesting": 4,
-            \\    "max_params": 5,
-            \\    "max_branches": 10,
+            \\    "max_nesting": 3,
+            \\    "max_params": 4,
+            \\    "max_branches": 12,
             \\    "max_line_length": 100
             \\  }}
             \\}}
@@ -13169,12 +13264,16 @@ fn parseThresholdArg(arg: []const u8, th: *Thresholds) bool {
         th.max_function_lines = v;
         return true;
     }
-    if (parseThreshold(arg, "--max-nesting=", 4)) |v| {
+    if (parseThreshold(arg, "--max-nesting=", 3)) |v| {
         th.max_nesting_depth = v;
         return true;
     }
-    if (parseThreshold(arg, "--max-params=", 5)) |v| {
+    if (parseThreshold(arg, "--max-params=", 4)) |v| {
         th.max_params = v;
+        return true;
+    }
+    if (parseThreshold(arg, "--max-branches=", 12)) |v| {
+        th.max_branches = v;
         return true;
     }
     if (parseThreshold(arg, "--max-line-length=", 100)) |v| {
@@ -13357,7 +13456,7 @@ fn printHelp() void {
         \\  runtime     Run tests with memory diagnostics (dynamic analysis)
         \\  orphans     Files not imported from entry points
         \\  memory      Alloc without defer patterns
-        \\  errors      Silent catch {} discards
+        \\  errors      Error handling patterns (ZA201-ZA208)
         \\  unused      Unused imports/declarations
         \\  complexity  Function complexity metrics
         \\  fmt-check   Files needing zig fmt (runs zig fmt --check)
@@ -13369,8 +13468,9 @@ fn printHelp() void {
         \\  --disable=<rule>     Disable rule (e.g., ZA301, ZA1)
         \\  --enable=<rule>      Enable rule (overrides disable)
         \\  --max-lines=N        Max function lines (default: 50)
-        \\  --max-nesting=N      Max nesting depth (default: 4)
-        \\  --max-params=N       Max parameters (default: 5)
+        \\  --max-nesting=N      Max nesting depth (default: 3)
+        \\  --max-params=N       Max parameters (default: 4)
+        \\  --max-branches=N     Max branches per function (default: 12)
         \\  --max-line-length=N  Max columns per line (default: 100)
         \\  --max-file-bytes=N   Max file size in bytes (optional)
         \\  -V, --verbose        Verbose output
@@ -13408,9 +13508,9 @@ fn printHelp() void {
         \\    "enable": ["ZA702"],
         \\    "thresholds": {
         \\      "max_lines": 50,
-        \\      "max_nesting": 4,
-        \\      "max_params": 5,
-        \\      "max_branches": 10,
+        \\      "max_nesting": 3,
+        \\      "max_params": 4,
+        \\      "max_branches": 12,
         \\      "max_line_length": 100,
         \\      "max_file_bytes": 25000
         \\    }
@@ -13990,6 +14090,15 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeErrors(alloc, &g);
             defer deinitIssues(&issues, alloc);
+            // ZA205: discarded error union results
+            var ignored = try analyzeIgnoredErrors(alloc, &g);
+            defer deinitIssues(&ignored, alloc);
+            // Merge ignored errors into issues for unified output
+            for (ignored.items) |item| {
+                try issues.append(alloc, item);
+            }
+            // Clear ignored without deiniting items (now owned by issues)
+            ignored.items.len = 0;
             const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg, &g);
             _ = c;
         },
@@ -14129,6 +14238,9 @@ pub fn main() !void {
                         try null_safety_issues.append(alloc, issue);
                     } else if (mem.startsWith(u8, issue.rule, "ZA9")) {
                         try panic_issues.append(alloc, issue);
+                    } else if (mem.startsWith(u8, issue.rule, "ZA2")) {
+                        // ZA2xx covered by analyzeErrors — skip to avoid duplicates
+                        continue;
                     } else {
                         try mem_only_issues.append(alloc, issue);
                     }
@@ -17779,4 +17891,315 @@ test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
         }
     }
+}
+
+// ============================================================================
+// ZA204 Tests — `= undefined` detection
+// ============================================================================
+
+test "ZA204 fires for unfilled var undefined" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    var x: u32 = undefined;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
+            mem.eql(u8, issue.file, "test_za204.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA204 no FP for memset after undefined" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    var buf: [256]u8 = undefined;
+        \\    @memset(&buf, 0);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_fill.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_fill.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_za204_fill.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
+        }
+    }
+}
+
+// ============================================================================
+// ZA202/ZA203 Tests — catch/orelse unreachable via errors path
+// ============================================================================
+
+test "ZA202 catch unreachable fires via analyzeErrors" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE) and
+            mem.eql(u8, issue.file, "test_za202.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA203 orelse unreachable fires via analyzeErrors" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo(opt: ?u32) void {
+        \\    const x = opt orelse unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za203.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za203.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE) and
+            mem.eql(u8, issue.file, "test_za203.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+// ============================================================================
+// ZA207 Tests — catch undefined
+// ============================================================================
+
+test "ZA207 catch undefined fires" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch undefined;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za207.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za207.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED) and
+            mem.eql(u8, issue.file, "test_za207.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA207 catch |_| undefined does NOT fire" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch |_| undefined;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za207_no_fp.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za207_no_fp.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_za207_no_fp.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED));
+        }
+    }
+}
+
+// ============================================================================
+// ZA208 Tests — @panic detection
+// ============================================================================
+
+test "ZA208 @panic fires in non-test context" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    @panic("something went wrong");
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za208.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za208.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_PANIC) and
+            mem.eql(u8, issue.file, "test_za208.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA208 @panic does NOT fire in test block" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\test "my test" {
+        \\    @panic("expected in test");
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za208_test.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za208_test.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_za208_test.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_PANIC));
+        }
+    }
+}
+
+// ============================================================================
+// ZA206 Tests — exit() bypasses defers (expanded for posix.exit)
+// ============================================================================
+
+test "ZA206 std.posix.exit fires" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn cleanup() void {
+        \\    defer allocator.free(data);
+        \\    std.posix.exit(1);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za206_posix.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za206_posix.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
+            mem.eql(u8, issue.file, "test_za206_posix.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }

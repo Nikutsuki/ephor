@@ -36,7 +36,6 @@ const analyzers = @import("analyzers/analyzers.zig");
 const RULE_ALLOC_NO_DEFER = types.RULE_ALLOC_NO_DEFER;
 const RULE_CREATE_NO_DEFER = types.RULE_CREATE_NO_DEFER;
 const RULE_ALLOC_NO_ERRDEFER = types.RULE_ALLOC_NO_ERRDEFER;
-const RULE_MEMORY_LEAK = types.RULE_MEMORY_LEAK;
 const RULE_USE_AFTER_FREE = types.RULE_USE_AFTER_FREE;
 const RULE_DOUBLE_FREE = types.RULE_DOUBLE_FREE;
 const RULE_SILENT_CATCH = types.RULE_SILENT_CATCH;
@@ -45,6 +44,8 @@ const RULE_ORELSE_UNREACHABLE = types.RULE_ORELSE_UNREACHABLE;
 const RULE_UNDEFINED_USAGE = types.RULE_UNDEFINED_USAGE;
 const RULE_IGNORED_ERROR = types.RULE_IGNORED_ERROR;
 const RULE_EXIT_BYPASSES_DEFER = types.RULE_EXIT_BYPASSES_DEFER;
+const RULE_CATCH_UNDEFINED = types.RULE_CATCH_UNDEFINED;
+const RULE_PANIC = types.RULE_PANIC;
 const RULE_FUNC_TOO_LONG = types.RULE_FUNC_TOO_LONG;
 const RULE_NESTING_TOO_DEEP = types.RULE_NESTING_TOO_DEEP;
 const RULE_TOO_MANY_PARAMS = types.RULE_TOO_MANY_PARAMS;
@@ -84,6 +85,7 @@ const isIdent = types.isIdent;
 const isInsideString = types.isInsideString;
 const skipWhitespace = types.skipWhitespace;
 
+const ReturnKind = types.ReturnKind;
 const FileAnalysis = types.FileAnalysis;
 const Thresholds = types.Thresholds;
 
@@ -607,21 +609,20 @@ fn isCommentOrMultilineString(t: []const u8) bool {
 
 /// Check if line has a free/destroy pattern that's NOT inside a string
 fn hasRealFreePattern(t: []const u8) bool {
-    // Check for .free(
-    if (mem.indexOf(u8, t, ".free(")) |pos| {
-        if (!isPatternInString(t, pos)) return true;
-    }
-    // Check for .destroy(
-    if (mem.indexOf(u8, t, ".destroy(")) |pos| {
-        if (!isPatternInString(t, pos)) return true;
+    // Check cleanup patterns from compat layer (excludes .deinit which is bulk cleanup)
+    for (compat.getCleanupPatterns()) |pat| {
+        // Only check .free( and .destroy( — not .deinit( (bulk cleanup, not per-alloc)
+        if (mem.eql(u8, pat, ".deinit(")) continue;
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (!isPatternInString(t, pos)) return true;
+        }
     }
     return false;
 }
 
 /// Check if line has any cleanup pattern (.free, .destroy, .deinit) NOT inside a string
 fn hasRealCleanupPattern(t: []const u8) bool {
-    const patterns = [_][]const u8{ ".free(", ".destroy(", ".deinit(" };
-    for (patterns) |pat| {
+    for (compat.getCleanupPatterns()) |pat| {
         if (mem.indexOf(u8, t, pat)) |pos| {
             if (!isPatternInString(t, pos)) return true;
         }
@@ -672,38 +673,6 @@ fn isTypeAllocFactory(t: []const u8, alloc_pos: usize) bool {
     // Check if this identifier starts with uppercase (Type name)
     const first_char = t[id_start];
     return first_char >= 'A' and first_char <= 'Z';
-}
-
-/// Check if line has an allocation pattern (.alloc or .create) NOT inside a string
-/// Skips Type.alloc() factory methods (uppercase first letter)
-fn hasRealAllocPattern(t: []const u8) bool {
-    if (mem.indexOf(u8, t, ".alloc(")) |pos| {
-        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return true;
-    }
-    if (mem.indexOf(u8, t, ".create(")) |pos| {
-        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return true;
-    }
-    return false;
-}
-
-/// Get position of real allocation pattern
-/// (not in string, not Type.alloc()), returns null if not found
-fn getRealAllocPos(t: []const u8) ?usize {
-    if (mem.indexOf(u8, t, ".alloc(")) |pos| {
-        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return pos;
-    }
-    if (mem.indexOf(u8, t, ".create(")) |pos| {
-        if (!isPatternInString(t, pos) and !isTypeAllocFactory(t, pos)) return pos;
-    }
-    return null;
-}
-
-/// Check if this is a real .create( call (not in string)
-fn hasRealCreatePattern(t: []const u8) bool {
-    if (mem.indexOf(u8, t, ".create(")) |pos| {
-        return !isPatternInString(t, pos);
-    }
-    return false;
 }
 
 /// Check if a variable name appears as a LOCAL variable (not a struct field)
@@ -2342,6 +2311,7 @@ fn analyzeOneAllocSafety(
     in_errdefer: []const bool,
     num_blocks: usize,
     issues: *std.ArrayListUnmanaged(Issue),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
     var bstate = try initAndScanFreeState(
         allocator,
@@ -2366,6 +2336,7 @@ fn analyzeOneAllocSafety(
         in_defer,
         &bstate,
         issues,
+        aliases,
     );
     try detectDoubleFree(
         allocator,
@@ -2412,13 +2383,19 @@ fn analyzeCFGMemorySafety(
     lines: []const []const u8,
     func_line: usize,
     file_path: []const u8,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
-    var allocs = try collectMemSafetyAllocs(allocator, lines, func_line);
+    var allocs = try collectMemSafetyAllocs(allocator, lines, func_line, file_no_free_fields);
     defer allocs.deinit();
     if (allocs.count() == 0) return issues;
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
+
+    // Build alias map: alias_name -> original_alloc_name
+    // Tracks patterns like `const alias = data;` where `data` is a tracked allocation
+    var aliases = try collectAliases(allocator, lines, &allocs);
+    defer aliases.deinit(allocator);
 
     const markers = try markDeferAndErrdeferBlocks(allocator, lines);
     defer allocator.free(markers.in_defer);
@@ -2437,9 +2414,58 @@ fn analyzeCFGMemorySafety(
             markers.in_errdefer,
             num_blocks,
             &issues,
+            &aliases,
         );
     }
     return issues;
+}
+
+/// Collect variable aliases for tracked allocations.
+/// Scans for `const alias = original;` or `var alias = original;` patterns
+/// where `original` is a tracked allocation name. Returns alias_name -> original_name map.
+fn collectAliases(
+    a: Allocator,
+    lines: []const []const u8,
+    allocs: *const std.StringHashMap(CFGAllocation),
+) !std.StringHashMapUnmanaged([]const u8) {
+    var aliases = std.StringHashMapUnmanaged([]const u8){};
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+
+        // Match: const X = Y; or var X = Y;
+        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
+        const name = extractVarDeclName(t) orelse continue;
+
+        // Don't track if this name is itself an allocation (not an alias)
+        if (allocs.contains(name)) continue;
+
+        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
+        var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+
+        // Strip trailing semicolon
+        if (rhs.len > 0 and rhs[rhs.len - 1] == ';') rhs = rhs[0 .. rhs.len - 1];
+        rhs = mem.trim(u8, rhs, " \t");
+
+        // RHS must be a simple identifier (the original variable name)
+        if (rhs.len == 0) continue;
+        var all_ident = true;
+        for (rhs) |c| {
+            if (!isIdent(c)) {
+                all_ident = false;
+                break;
+            }
+        }
+        if (!all_ident) continue;
+
+        // Check if RHS is a tracked allocation
+        if (allocs.contains(rhs)) {
+            try aliases.put(a, name, rhs);
+        }
+    }
+
+    return aliases;
 }
 
 /// Per-block free tracking state for memory safety analysis.
@@ -2473,24 +2499,39 @@ fn collectMemSafetyAllocs(
     allocator: Allocator,
     lines: []const []const u8,
     func_line: usize,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.StringHashMap(CFGAllocation) {
+    // Build type-tracked allocator sets (stdlib types only)
+    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
+    defer no_free_names.deinit(allocator);
+    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
+    defer local_no_free_fields.deinit(allocator);
+    var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
+    defer all_alloc_names.deinit(allocator);
+
     var allocs = std.StringHashMap(CFGAllocation).init(allocator);
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
-        if (!hasRealAllocPattern(t)) continue;
-        if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t))
-            continue;
+        // Type-based allocation detection: .alloc() or .create() on tracked allocators
+        const alloc_call = findAllocCall(t, &all_alloc_names) orelse continue;
+        // Skip allocations from type-tracked no-free allocators (stdlib types only)
         const alloc_name = extractAllocatorName(t) orelse "";
-        if (isNoFreeAllocatorName(alloc_name)) continue;
+        if (alloc_name.len > 0 and no_free_names.contains(alloc_name)) continue;
+        if (isNoFreeCallChainFull(t, &no_free_names, &local_no_free_fields)) continue;
+        if (isNoFreeFieldChain(t, &local_no_free_fields)) continue;
+        // Check file-level no-free fields (struct definitions outside this function)
+        if (file_no_free_fields) |fields| {
+            if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
+            if (isNoFreeFieldChain(t, fields)) continue;
+        }
         const name = extractVarDeclName(t) orelse continue;
-        const col = getRealAllocPos(t) orelse 0;
         try allocs.put(name, .{
             .name = name,
             .alloc_line = actual_line,
-            .alloc_col = col + 1,
+            .alloc_col = alloc_call.col + 1,
             .state = .allocated,
-            .is_create = hasRealCreatePattern(t),
+            .is_create = alloc_call.is_create,
         });
     }
     return allocs;
@@ -2793,7 +2834,9 @@ fn detectUseAfterFree(
     in_defer: []const bool,
     bstate: *const BlockFreeState,
     issues: *std.ArrayListUnmanaged(Issue),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
+    // Check direct uses of the freed variable
     for (lines, 0..) |line, idx| {
         if (in_errdefer[idx]) continue;
         const t = mem.trim(u8, line, " \t\r");
@@ -2814,6 +2857,46 @@ fn detectUseAfterFree(
             func_line + idx,
         );
     }
+
+    // Check uses of aliases after the original is freed.
+    // The free was on the ORIGINAL variable, not the alias. So we can't reuse
+    // checkLineForUAF (which scans for free of the passed var_name).
+    // Instead: if original was freed, any use of an alias after the free line is UAF.
+    if (alloc_info.freed_line == 0) return; // Original not freed, no alias UAF possible
+    var alias_iter = aliases.iterator();
+    while (alias_iter.next()) |entry| {
+        const alias_name = entry.key_ptr.*;
+        const original = entry.value_ptr.*;
+        if (!mem.eql(u8, original, var_name)) continue;
+
+        for (lines, 0..) |line, idx| {
+            const actual_line = func_line + idx;
+            if (actual_line <= alloc_info.freed_line) continue;
+            if (in_errdefer[idx]) continue;
+            if (in_defer[idx]) continue;
+            const t = mem.trim(u8, line, " \t\r");
+            if (isUAFSkipLine(t)) continue;
+
+            // Skip the alias definition line itself
+            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) {
+                if (extractVarDeclName(t)) |decl_name| {
+                    if (mem.eql(u8, decl_name, alias_name)) continue;
+                }
+            }
+
+            const use_col = findVarUseOnLine(t, alias_name) orelse continue;
+            try appendUAFIssue(
+                allocator,
+                issues,
+                file_path,
+                actual_line,
+                use_col,
+                alias_name,
+                alloc_info.freed_line,
+            );
+            break; // One UAF per alias is sufficient
+        }
+    }
 }
 
 fn appendDoubleFreeIssue(
@@ -2827,8 +2910,14 @@ fn appendDoubleFreeIssue(
     severity: Severity,
     help: []const u8,
 ) !void {
-    const col = mem.indexOf(u8, t, ".free(") orelse
-        mem.indexOf(u8, t, ".destroy(") orelse 0;
+    var col: usize = 0;
+    for (compat.getCleanupPatterns()) |pat| {
+        if (mem.eql(u8, pat, ".deinit(")) continue;
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            col = pos;
+            break;
+        }
+    }
     const pfx = if (severity == .warning) "conditional " else "";
     const msg = try std.fmt.allocPrint(
         allocator,
@@ -3103,14 +3192,20 @@ const CFGAlloc = struct {
 };
 
 /// Check if function has arena parameter (first few lines)
-fn hasArenaParameter(lines: []const []const u8) bool {
-    for (lines[0..@min(5, lines.len)]) |line| {
+/// Check if function has a parameter with a no-free allocator TYPE annotation.
+/// Checks parameter TYPE (e.g., `: *ArenaAllocator`, `: std.mem.Allocator` backed by arena),
+/// not parameter NAME (which is developer-chosen and unreliable).
+fn hasNoFreeAllocatorParameter(lines: []const []const u8) bool {
+    // Check first 10 lines (function signature may span multiple lines)
+    const no_free_ptrs = compat.getNoFreeTypePtrs();
+    for (lines[0..@min(10, lines.len)]) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.indexOf(u8, t, "arena:") != null or
-            mem.indexOf(u8, t, "arena :") != null)
-        {
-            return true;
+        // Parameter typed as no-free allocator pointer (compat layer)
+        for (no_free_ptrs) |ptr_pat| {
+            if (mem.indexOf(u8, t, ptr_pat) != null) return true;
         }
+        // Stop scanning at function body start
+        if (mem.indexOf(u8, t, ") ") != null and mem.indexOf(u8, t, "{") != null) break;
     }
     return false;
 }
@@ -3121,42 +3216,50 @@ fn collectCFGAllocations(
     cfg: *ControlFlowGraph,
     lines: []const []const u8,
     func_line: usize,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(CFGAlloc) {
     var allocs = std.ArrayListUnmanaged(CFGAlloc){};
 
-    // Pre-scan: build set of no-free allocator names by tracking type-based
-    // initialization (ArenaAllocator, FixedBufferAllocator, etc.) and
-    // .allocator() aliases on tracked variables.
+    // Pre-scan: build type-tracked allocator sets
     var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
     defer no_free_names.deinit(allocator);
+    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
+    defer local_no_free_fields.deinit(allocator);
+    var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
+    defer all_alloc_names.deinit(allocator);
 
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
 
-        // Detect allocations (skip patterns inside string literals)
-        if (!hasRealAllocPattern(t)) continue;
+        // Detect allocations using type-based detection for .create()
+        const alloc_info = findAllocCall(t, &all_alloc_names) orelse continue;
 
-        // Skip no-free allocators (arena, scratch, temp, frame, fba, recycle)
-        if (hasNoFreeAllocatorPattern(t)) continue;
-        if (isArenaAllocLine(t)) continue;
+        // Skip allocations from type-tracked no-free allocators (stdlib types only)
         const aname = extractAllocatorName(t) orelse "";
-        if (isNoFreeAllocatorName(aname)) continue;
-
-        // Skip allocations from type-tracked no-free allocators
         if (aname.len > 0 and no_free_names.contains(aname)) continue;
-        if (isNoFreeCallChain(t, &no_free_names)) continue;
+        if (isNoFreeCallChainFull(t, &no_free_names, &local_no_free_fields)) continue;
+        if (isNoFreeFieldChain(t, &local_no_free_fields)) continue;
+        // Check file-level no-free fields (struct definitions outside this function)
+        if (file_no_free_fields) |fields| {
+            if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
+            if (isNoFreeFieldChain(t, fields)) continue;
+        }
+        // For standalone/method-style calls where allocator is an argument (not receiver),
+        // check the first-arg allocator for no-free suppression
+        if (extractStandaloneAllocator(t)) |standalone_alloc| {
+            if (no_free_names.contains(standalone_alloc)) continue;
+        }
 
         const name = extractVarDeclName(t) orelse continue;
-        const col = getRealAllocPos(t) orelse 0;
         const block = findBlockForLine(cfg, actual_line) orelse continue;
 
         try allocs.append(allocator, .{
             .name = name,
             .line = actual_line,
-            .col = col + 1,
+            .col = alloc_info.col + 1,
             .block = block,
-            .is_create = hasRealCreatePattern(t),
+            .is_create = alloc_info.is_create,
         });
     }
 
@@ -3342,23 +3445,61 @@ fn checkOwnershipInLine(
         // Direct return of owner variable
         if (mem.startsWith(u8, t, "return ")) return true;
 
-        // Stored in self or ctx field
-        if (mem.indexOf(u8, t, "self.") != null or
-            mem.indexOf(u8, t, "ctx.") != null)
-        {
-            return true;
+        // Labeled break transfers ownership out of a block
+        if (mem.startsWith(u8, t, "break :")) return true;
+
+        // Container ownership transfer: .append(data), .put(key, data)
+        // Owner var must appear as an ARGUMENT (after the method pattern),
+        // not as the LHS of a declaration receiving the return value.
+        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) {
+            for (compat.getContainerOwnershipMethods()) |pattern| {
+                if (mem.indexOf(u8, t, pattern)) |pat_pos| {
+                    // Check that owner var appears after the method call opening paren
+                    const after_method = pat_pos + pattern.len;
+                    if (after_method < t.len) {
+                        if (mem.indexOf(u8, t[after_method..], ov.name) != null) return true;
+                    }
+                }
+            }
         }
 
-        // Module-level variable assignment
-        if (mem.indexOf(u8, t, " = ") == null) continue;
-        if (mem.startsWith(u8, t, "const ") or
-            mem.startsWith(u8, t, "var ")) continue;
-        const eq_pos = mem.indexOf(u8, t, " = ").?;
-        const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-        // Skip discard patterns: _ = value (not ownership transfer)
-        if (mem.eql(u8, lhs, "_")) continue;
-        if (lhs.len > 0 and mem.indexOf(u8, lhs, ".") == null)
-            return true;
+        // Realloc consumes the old pointer: .realloc(old, new_size)
+        // Owner var must be an argument to realloc, not the result
+        if (mem.indexOf(u8, t, ".realloc(")) |realloc_pos| {
+            const after_paren = realloc_pos + ".realloc(".len;
+            if (after_paren < t.len and
+                mem.indexOf(u8, t[after_paren..], ov.name) != null)
+                return true;
+        }
+
+        // Pointer deref assignment: out.* = data (transfers to caller)
+        if (mem.indexOf(u8, t, ".* = ") != null) {
+            if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+                const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+                // Only if the owner var is on the RHS (being transferred)
+                if (!mem.startsWith(u8, lhs, "const ") and
+                    !mem.startsWith(u8, lhs, "var ") and
+                    mem.endsWith(u8, lhs, ".*") and
+                    !containsIdentifier(lhs, ov.name))
+                    return true;
+            }
+        }
+
+        // Stored in any struct field (identifier.field = value)
+        if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+            const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+            // Skip const/var declarations (those are local)
+            if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) {
+                // Pointer dereference init: name.* = .{...} writes TO allocated memory
+                if (mem.endsWith(u8, lhs, ".*") and containsIdentifier(lhs, ov.name)) continue;
+                // LHS with a dot = struct field storage (e.g., self.x, ctx.y, result.z, node.data)
+                if (mem.indexOf(u8, lhs, ".") != null) return true;
+                // Skip discard patterns: _ = value
+                if (mem.eql(u8, lhs, "_")) continue;
+                // Simple identifier = module-level variable assignment
+                if (lhs.len > 0) return true;
+            }
+        }
     }
     return false;
 }
@@ -3371,14 +3512,15 @@ fn analyzeCFGDeferCoverage(
     lines: []const []const u8,
     func_line: usize,
     file_path: []const u8,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
 
-    // Skip arena-based functions (no defer needed)
-    if (hasArenaParameter(lines)) return issues;
+    // Skip functions that take a no-free allocator by TYPE (e.g., *ArenaAllocator parameter)
+    if (hasNoFreeAllocatorParameter(lines)) return issues;
 
     // Phase 1: Collect allocations
-    var allocs = try collectCFGAllocations(allocator, cfg, lines, func_line);
+    var allocs = try collectCFGAllocations(allocator, cfg, lines, func_line, file_no_free_fields);
     defer allocs.deinit(allocator);
     if (allocs.items.len == 0) return issues;
 
@@ -3413,15 +3555,18 @@ const BlockCoverageState = struct {
     has_defer: []bool,
     ownership_transferred: []bool,
     free_and_return: []bool,
+    has_direct_free: []bool,
 
     fn deinit(self: *BlockCoverageState, allocator: Allocator) void {
         allocator.free(self.has_defer);
         allocator.free(self.ownership_transferred);
         allocator.free(self.free_and_return);
+        allocator.free(self.has_direct_free);
     }
 
     fn isBlockCovered(self: BlockCoverageState, bid: usize) bool {
-        return self.has_defer[bid] or self.ownership_transferred[bid] or self.free_and_return[bid];
+        return self.has_defer[bid] or self.ownership_transferred[bid] or
+            self.free_and_return[bid] or self.has_direct_free[bid];
     }
 
     fn anyDeferExists(self: BlockCoverageState) bool {
@@ -3453,10 +3598,12 @@ fn scanBlocksForPatterns(
         .has_defer = try allocator.alloc(bool, num_blocks),
         .ownership_transferred = try allocator.alloc(bool, num_blocks),
         .free_and_return = try allocator.alloc(bool, num_blocks),
+        .has_direct_free = try allocator.alloc(bool, num_blocks),
     };
     @memset(state.has_defer, false);
     @memset(state.ownership_transferred, false);
     @memset(state.free_and_return, false);
+    @memset(state.has_direct_free, false);
 
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
@@ -3496,7 +3643,10 @@ fn scanSingleBlock(
         const in_defer_block = is_defer or defer_depth > 0;
 
         if (in_defer_block and has_free) state.has_defer[bid] = true;
-        if (!in_defer_block and !mem.startsWith(u8, t, "errdefer ") and has_free) freed = true;
+        if (!in_defer_block and !mem.startsWith(u8, t, "errdefer ") and has_free) {
+            freed = true;
+            state.has_direct_free[bid] = true;
+        }
         if (freed and mem.startsWith(u8, t, "return")) return_after = true;
         if (checkOwnershipInLine(t, owner_vars)) state.ownership_transferred[bid] = true;
     }
@@ -3621,7 +3771,8 @@ fn checkDeferCoverageForAlloc(
 fn findAllocIndent(lines: []const []const u8, alloc_name: []const u8) usize {
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (hasRealAllocPattern(t) and containsIdentifier(t, alloc_name))
+        // Check for .alloc( or .create( (not in string, not Type factory)
+        if (findAllocCall(t, null) != null and containsIdentifier(t, alloc_name))
             return countIndent(line);
     }
     return 0;
@@ -3716,37 +3867,31 @@ const ErrdeferInfo = struct {
     content: []const u8,
 };
 
-/// Check if function uses arena allocator (skip errdefer analysis)
-fn usesArenaAllocator(lines: []const []const u8) bool {
-    for (lines, 0..) |line, idx| {
+/// Check if function uses any no-free allocator type (type-based detection).
+/// Scans for stdlib type initialization patterns — not variable names.
+fn hasNoFreeAllocatorType(lines: []const []const u8) bool {
+    // Check for no-free allocator TYPE initialization patterns (compat layer)
+    const no_free_pats = compat.getNoFreeInitPatterns();
+    for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.indexOf(u8, t, "ArenaAllocator.init") != null) return true;
-        if (mem.indexOf(u8, t, "arena.deinit()") != null) return true;
-        if (mem.indexOf(u8, t, "arena.allocator()") != null) return true;
-        // Function signature with arena parameter (first few lines only)
-        if (idx < 5) {
-            if (mem.indexOf(u8, t, "arena:") != null or
-                mem.indexOf(u8, t, "arena_allocator:") != null or
-                mem.indexOf(u8, t, "_arena:") != null)
-                return true;
+        if (isCommentOrMultilineString(t)) continue;
+        for (no_free_pats) |pat| {
+            if (mem.indexOf(u8, t, pat) != null) return true;
         }
     }
-    return false;
+    // Also check for no-free allocator TYPE in parameter annotations
+    return hasNoFreeAllocatorParameter(lines);
 }
 
 /// Check if line contains a try allocation (not in no-free allocator)
 fn isTryAllocation(t: []const u8) bool {
     const has_try = mem.indexOf(u8, t, "try ") != null;
-    const has_alloc = hasPatternNotInString(t, ".alloc(");
-    const has_create = hasPatternNotInString(t, ".create(") and isAllocatorCreate(t);
+    if (!has_try) return false;
+    if (!mem.startsWith(u8, t, "const ") and
+        !mem.startsWith(u8, t, "var ")) return false;
 
-    if (!has_try or !(has_alloc or has_create)) return false;
-    if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return false;
-
-    // Skip no-free allocators
-    if (hasNoFreeAllocatorPattern(t)) return false;
-
-    return true;
+    // Check all allocation method patterns from compat layer
+    return findAllocCall(t, null) != null;
 }
 
 /// Check ownership transfer for errdefer analysis
@@ -3758,7 +3903,12 @@ fn checkErrdeferOwnershipTransfer(
     const alloc_idx = alloc.line - func_line;
     if (alloc_idx >= lines.len) return;
 
-    for (lines[alloc_idx..]) |line| {
+    // Start from line AFTER the allocation — the allocation line itself
+    // can't be an ownership transfer of its own result (e.g., toOwnedSlice
+    // on the alloc line would falsely match container_ownership_methods)
+    const start = alloc_idx + 1;
+    if (start >= lines.len) return;
+    for (lines[start..]) |line| {
         const lt = mem.trim(u8, line, " \t\r");
         // Check for break :label ownership transfer
         if (mem.indexOf(u8, lt, "break :") != null and containsIdentifier(lt, alloc.name)) {
@@ -3819,31 +3969,29 @@ fn collectTryAllocFromLine(
     try_lines: *std.ArrayListUnmanaged(usize),
     allocator: Allocator,
     no_free_names: *const std.StringHashMapUnmanaged(void),
+    no_free_fields: *const std.StringHashMapUnmanaged(void),
 ) !void {
-    if (isArenaAllocLine(t) or hasNoFreeAllocatorPattern(t)) {
-        try try_lines.append(allocator, actual_line);
-        return;
-    }
+    // Skip allocations from type-tracked no-free allocators (stdlib types only)
     const aname_e = extractAllocatorName(t) orelse "";
-    if (isNoFreeAllocatorName(aname_e)) {
-        try try_lines.append(allocator, actual_line);
-        return;
-    }
-    // Skip allocations from type-tracked no-free allocators
     if (aname_e.len > 0 and no_free_names.contains(aname_e)) {
         try try_lines.append(allocator, actual_line);
         return;
     }
-    if (isNoFreeCallChain(t, no_free_names)) {
+    if (isNoFreeCallChainFull(t, no_free_names, no_free_fields)) {
+        try try_lines.append(allocator, actual_line);
+        return;
+    }
+    if (isNoFreeFieldChain(t, no_free_fields)) {
         try try_lines.append(allocator, actual_line);
         return;
     }
     if (extractVarDeclName(t)) |name| {
+        const alloc_info = findAllocCall(t, null) orelse return;
         try try_allocs.append(allocator, .{
             .name = name,
             .line = actual_line,
-            .col = (getRealAllocPos(t) orelse 0) + 1,
-            .is_create = hasRealCreatePattern(t),
+            .col = alloc_info.col + 1,
+            .is_create = alloc_info.is_create,
         });
     }
 }
@@ -3972,6 +4120,7 @@ fn scanErrdeferLines(
     allocator: Allocator,
     lines: []const []const u8,
     func_line: usize,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !ErrdeferScanState {
     var state = ErrdeferScanState{
         .try_allocs = .{},
@@ -3984,6 +4133,10 @@ fn scanErrdeferLines(
     // initialization and .allocator() aliases
     var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
     defer no_free_names.deinit(allocator);
+    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
+    defer local_no_free_fields.deinit(allocator);
+    // Merge file-level fields: use file-level if available, else local only
+    const effective_fields = file_no_free_fields orelse &local_no_free_fields;
 
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
@@ -4004,6 +4157,7 @@ fn scanErrdeferLines(
                 &state.try_lines_list,
                 allocator,
                 &no_free_names,
+                effective_fields,
             );
         }
         try collectDeferFromLine(
@@ -4025,12 +4179,13 @@ fn analyzeCFGErrdeferCoverage(
     func_line: usize,
     file_path: []const u8,
     fn_returns_error: bool,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .{};
     if (!fn_returns_error) return issues;
-    if (usesArenaAllocator(lines)) return issues;
+    if (hasNoFreeAllocatorType(lines)) return issues;
 
-    var state = try scanErrdeferLines(allocator, lines, func_line);
+    var state = try scanErrdeferLines(allocator, lines, func_line, file_no_free_fields);
     defer state.deinit(allocator);
 
     if (state.try_allocs.items.len == 0) return issues;
@@ -4047,42 +4202,6 @@ fn analyzeCFGErrdeferCoverage(
     );
     return issues;
 }
-
-// ============================================================================
-// Function Analysis Types (for analyzeFunction)
-// ============================================================================
-
-/// Track allocations in function analysis
-const AllocInfo = struct {
-    name: []const u8,
-    allocator_name: []const u8,
-    line: usize,
-    col: usize,
-    is_create: bool,
-    has_defer: bool = false,
-    has_errdefer: bool = false,
-    freed_explicitly: bool = false,
-    freed_line: usize = 0,
-    freed_in_early_return: bool = false, // Free is in catch/if block with return (path-safe)
-    returned: bool = false,
-    stored: bool = false,
-    ownership_transferred: bool = false,
-    is_arena_alloc: bool = false,
-    no_error_path: bool = false, // alloc uses non-try error handling (no error path)
-};
-
-/// Memory event types for use-after-free and double-free
-const MemoryEventKind = enum { use_after_free, double_free };
-
-/// Track memory events
-const MemoryEvent = struct {
-    kind: MemoryEventKind,
-    alloc_name: []const u8,
-    alloc_line: usize,
-    freed_line: usize,
-    event_line: usize,
-    event_col: usize,
-};
 
 // ============================================================================
 // Import Graph
@@ -4966,101 +5085,17 @@ const ImportGraph = struct {
 // Memory Analysis Helpers
 // ============================================================================
 
-/// Check if line indicates arena/fixed-buffer allocator
-fn isNoFreeAllocator(lines: []const []const u8) bool {
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
-        // Arena allocators
-        if (mem.indexOf(u8, t, "ArenaAllocator") != null) return true;
-        if (mem.indexOf(u8, t, "arena.allocator()") != null) return true;
-        if (mem.indexOf(u8, t, "arena_allocator") != null) return true;
-        // Fixed buffer allocators
-        const fba = "FixedBufferAllocator";
-        if (mem.indexOf(u8, t, fba) != null) return true;
-        const fba2 = "fixedBufferAllocator";
-        if (mem.indexOf(u8, t, fba2) != null) return true;
-        if (mem.indexOf(u8, t, "fba.allocator()") != null) return true;
-        // Stack fallback
-        if (mem.indexOf(u8, t, "stackFallback") != null) return true;
-    }
-    return false;
-}
-
-/// Check if allocator name suggests no-free allocator
-fn isNoFreeAllocatorName(name: []const u8) bool {
-    // Arena/scratch allocator naming patterns
-    if (mem.indexOf(u8, name, "arena") != null) return true;
-    if (mem.indexOf(u8, name, "scratch") != null) return true;
-    if (mem.indexOf(u8, name, "temp") != null) return true;
-    if (mem.indexOf(u8, name, "frame") != null) return true;
-    if (mem.indexOf(u8, name, "recycle") != null) return true;
-    if (mem.eql(u8, name, "fba")) return true;
-    return false;
-}
-
-/// Check if the allocation line uses an arena allocator via dotted path
-/// Handles patterns like sema.arena.alloc(), comp.arena.alloc(), tc.driver.comp.arena.alloc()
-/// where extractAllocatorName only returns the first segment (e.g., "sema")
-fn isArenaAllocLine(t: []const u8) bool {
-    const no_free_segments = [_][]const u8{
-        ".arena.alloc(",
-        ".arena.create(",
-        ".arena.dupe(",
-        ".arena.dupeZ(",
-        ".arena.realloc(",
-        ".scratch.alloc(",
-        ".scratch.create(",
-        ".temp.alloc(",
-        ".temp.create(",
-    };
-    for (no_free_segments) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) return true;
-    }
-    // Build arena allocator patterns: b.allocator and owner.allocator are
-    // *std.Build arena allocators that don't need explicit free
-    const build_alloc_patterns = [_][]const u8{
-        "b.allocator.alloc(",
-        "b.allocator.create(",
-        "b.allocator.dupe(",
-        "b.allocator.dupeZ(",
-        "b.allocator.realloc(",
-        "owner.allocator.alloc(",
-        "owner.allocator.create(",
-        "owner.allocator.dupe(",
-        "owner.allocator.dupeZ(",
-        "owner.allocator.realloc(",
-    };
-    for (build_alloc_patterns) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) return true;
-    }
-    return false;
-}
-
-/// Check if a line contains no-free allocator patterns (arena, scratch, temp, frame, fba, recycle)
-/// Used to skip allocations that don't need defer cleanup
-fn hasNoFreeAllocatorPattern(t: []const u8) bool {
-    const patterns = [_][]const u8{ "arena", "scratch", "temp", "frame", ".fba.", "recycle" };
-    for (patterns) |p| {
-        if (mem.indexOf(u8, t, p) != null) return true;
-    }
-    return false;
-}
-
 /// Build a set of variable names that hold no-free allocators by tracking
 /// type-based initialization patterns in the function body.
-/// Tracks Zig stdlib types (not project-specific variable names):
-/// - FixedBufferAllocator.init, ArenaAllocator.init, StackFallbackAllocator
-/// - .allocator() aliases from tracked variables (Zig allocator interface)
+/// Build set of variable names holding no-free allocators by tracking
+/// TYPE-BASED initialization patterns (Zig stdlib types only).
+/// Tracks: FixedBufferAllocator, ArenaAllocator, StackFallbackAllocator
+/// Also tracks .allocator() aliases and struct field aliases.
 fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
     var names = std.StringHashMapUnmanaged(void){};
 
-    // Known no-free allocator types from Zig stdlib
-    const no_free_inits = [_][]const u8{
-        "FixedBufferAllocator.init(",
-        "FixedBufferAllocator{",
-        "ArenaAllocator.init(",
-        "StackFallbackAllocator(",
-    };
+    // No-free allocator type init patterns from stdlib vocabulary (compat layer)
+    const no_free_inits = compat.getNoFreeInitPatterns();
 
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
@@ -5077,14 +5112,15 @@ fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.Str
         }
 
         // Track .allocator() aliases: const X = Y.allocator()
-        // where Y is a tracked no-free allocator variable
+        // where Y is a tracked no-free allocator variable (or Y.field is)
         const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
         var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
         if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
         const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse continue;
         const source = rhs[0..dot_alloc];
         if (source.len == 0) continue;
-        // Source must be a simple identifier
+
+        // Check if source is a tracked no-free variable (simple identifier)
         var all_ident = true;
         for (source) |c| {
             if (!isIdent(c)) {
@@ -5092,68 +5128,841 @@ fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.Str
                 break;
             }
         }
-        if (!all_ident) continue;
-        if (names.contains(source)) {
+        if (all_ident and names.contains(source)) {
             try names.put(a, name, {});
+            continue;
+        }
+
+        // Check dotted sources: self.arena.allocator(), x.fba.allocator()
+        // The last segment before .allocator() might be a tracked no-free var
+        if (mem.lastIndexOf(u8, source, ".")) |last_dot| {
+            const field = source[last_dot + 1 ..];
+            if (field.len > 0 and names.contains(field)) {
+                try names.put(a, name, {});
+                continue;
+            }
         }
     }
 
     return names;
 }
 
+/// Collect struct field names whose declared type is a no-free allocator.
+/// Scans the entire file for struct field declarations matching stdlib no-free
+/// allocator types (e.g. `arena: std.heap.ArenaAllocator,`).
+/// Type-based only — matches on declared types, never on field names.
+fn collectNoFreeFieldNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
+    var names = std.StringHashMapUnmanaged(void){};
+    const field_type_patterns = compat.getNoFreeFieldTypePatterns();
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+
+        // Match struct field declarations: `field_name: TypePattern`
+        // Must contain `: ` (field declaration syntax) but NOT `const ` or `var `
+        // (those are variable declarations handled by collectNoFreeAllocatorNames)
+        if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) continue;
+        if (mem.startsWith(u8, t, "pub const ") or mem.startsWith(u8, t, "pub var ")) continue;
+
+        // Look for `identifier: type_pattern` pattern
+        const colon_pos = mem.indexOf(u8, t, ": ") orelse continue;
+        if (colon_pos == 0) continue;
+
+        // Extract field name (everything before the colon must be a valid identifier)
+        const field_name = t[0..colon_pos];
+        var valid_field = true;
+        for (field_name) |c| {
+            if (!isIdent(c)) {
+                valid_field = false;
+                break;
+            }
+        }
+        if (!valid_field or field_name.len == 0) continue;
+
+        // Check if the type after `: ` matches a no-free allocator type
+        const type_part = mem.trim(u8, t[colon_pos + 2 ..], " \t");
+        for (field_type_patterns) |pat| {
+            if (mem.startsWith(u8, type_part, pat)) {
+                // Verify the match is a complete type (followed by , or = or end)
+                if (type_part.len == pat.len or
+                    type_part[pat.len] == ',' or
+                    type_part[pat.len] == ' ' or
+                    type_part[pat.len] == '=')
+                {
+                    try names.put(a, field_name, {});
+                    break;
+                }
+            }
+        }
+    }
+
+    return names;
+}
+
+/// Content-based version of collectNoFreeFieldNames for file-level scanning.
+/// Splits content by newlines and delegates to the line-based version.
+fn collectNoFreeFieldNamesFromContent(
+    a: Allocator,
+    content: []const u8,
+) !std.StringHashMapUnmanaged(void) {
+    // Split content into lines
+    var file_lines = std.ArrayListUnmanaged([]const u8){};
+    defer file_lines.deinit(a);
+    var line_iter = mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        try file_lines.append(a, line);
+    }
+    return collectNoFreeFieldNames(a, file_lines.items);
+}
+
+/// Check if an allocation call is through a struct field chain where one
+/// segment is a known no-free allocator field (type-based detection).
+/// Matches patterns like: self.arena.alloc(...), ctx.fba.dupe(...)
+/// where `arena`/`fba` were declared as no-free allocator types in a struct.
+fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnmanaged(void)) bool {
+    if (no_free_fields.count() == 0) return false;
+
+    // Find the allocation method position
+    var method_pos: ?usize = null;
+    for (compat.getAllocMethodPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (method_pos == null or pos < method_pos.?)
+                method_pos = pos;
+        }
+    }
+    const end = method_pos orelse return false;
+    if (end == 0) return false;
+
+    // Walk backwards to extract the full receiver chain (e.g. "self.arena")
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+        start -= 1;
+    }
+    if (start >= end) return false;
+    const chain = t[start..end];
+
+    // Check each segment of the chain against known no-free field names
+    var iter_start: usize = 0;
+    while (iter_start < chain.len) {
+        // Find next dot or end of chain
+        const dot_pos = mem.indexOf(u8, chain[iter_start..], ".") orelse (chain.len - iter_start);
+        const segment = chain[iter_start .. iter_start + dot_pos];
+        if (segment.len > 0 and no_free_fields.contains(segment)) {
+            return true;
+        }
+        iter_start += dot_pos + 1;
+    }
+
+    return false;
+}
+
+/// Build set of ALL allocator variable names (both no-free and need-free).
+/// Used to determine if `.create()` receiver is an allocator.
+/// Tracks stdlib type initializations + .allocator() calls + global singletons.
+fn collectAllAllocatorNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
+    var names = std.StringHashMapUnmanaged(void){};
+
+    // All allocator type init patterns from stdlib vocabulary (compat layer)
+    const alloc_inits = compat.getAllInitPatterns();
+
+    // Global singleton allocators from stdlib vocabulary (compat layer)
+    const global_allocs = compat.getGlobalAllocNames();
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
+        const name = extractVarDeclName(t) orelse continue;
+
+        // Track variables initialized with known allocator types
+        for (alloc_inits) |init_pat| {
+            if (mem.indexOf(u8, t, init_pat) != null) {
+                try names.put(a, name, {});
+                break;
+            }
+        }
+
+        // Track variables assigned global singleton allocators
+        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
+        const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t;");
+        for (global_allocs) |g| {
+            if (mem.endsWith(u8, rhs, g)) {
+                try names.put(a, name, {});
+                break;
+            }
+        }
+
+        // Track .allocator() aliases: const X = Y.allocator()
+        // where Y is any tracked allocator variable
+        if (mem.indexOf(u8, rhs, ".allocator()") != null) {
+            const dot_pos = mem.indexOf(u8, rhs, ".allocator()").?;
+            const source = rhs[0..dot_pos];
+            if (source.len > 0) {
+                var all_ident = true;
+                for (source) |c| {
+                    if (!isIdent(c)) {
+                        all_ident = false;
+                        break;
+                    }
+                }
+                if (all_ident and names.contains(source)) {
+                    try names.put(a, name, {});
+                }
+            }
+        }
+    }
+
+    // Also track function parameters typed as Allocator
+    for (lines[0..@min(10, lines.len)]) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        // Parameter with Allocator type: "name: Allocator" or "name: std.mem.Allocator"
+        if (mem.indexOf(u8, t, ": Allocator") != null or
+            mem.indexOf(u8, t, ": std.mem.Allocator") != null or
+            mem.indexOf(u8, t, ": *Allocator") != null or
+            mem.indexOf(u8, t, ":Allocator") != null)
+        {
+            // Extract parameter name (word before the colon)
+            if (mem.indexOf(u8, t, ": Allocator") orelse
+                mem.indexOf(u8, t, ": std.mem.Allocator") orelse
+                mem.indexOf(u8, t, ": *Allocator") orelse
+                mem.indexOf(u8, t, ":Allocator")) |colon_pos|
+            {
+                var start = colon_pos;
+                while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '_')) start -= 1;
+                if (start < colon_pos) {
+                    const param_name = t[start..colon_pos];
+                    if (param_name.len > 0) try names.put(a, param_name, {});
+                }
+            }
+        }
+        // Stop at function body
+        if (mem.indexOf(u8, t, ") ") != null and mem.indexOf(u8, t, "{") != null) break;
+    }
+
+    return names;
+}
+
+/// Scan file content to find functions called with no-free allocator arguments.
+/// Enables cross-function propagation: if `foo(arena_var)` where arena_var is
+/// tracked as no-free, then `foo` receives a no-free allocator parameter.
+/// This fixes false positives where arena is passed as std.mem.Allocator interface.
+fn buildNoFreeParamFunctions(a: Allocator, content: []const u8) !std.StringHashMapUnmanaged(void) {
+    var result = std.StringHashMapUnmanaged(void){};
+
+    // Step 1: Collect all no-free allocator variable names at file scope
+    var no_free_vars = std.StringHashMapUnmanaged(void){};
+    defer no_free_vars.deinit(a);
+
+    const no_free_inits = compat.getNoFreeInitPatterns();
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
+        const name = extractVarDeclName(t) orelse continue;
+
+        for (no_free_inits) |pat| {
+            if (mem.indexOf(u8, t, pat) != null) {
+                try no_free_vars.put(a, name, {});
+                break;
+            }
+        }
+
+        // Track .allocator() aliases of tracked no-free vars
+        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
+        var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+        if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
+        const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse continue;
+        const source = rhs[0..dot_alloc];
+        if (source.len == 0) continue;
+        var all_ident = true;
+        for (source) |c| {
+            if (!isIdent(c)) {
+                all_ident = false;
+                break;
+            }
+        }
+        if (all_ident and no_free_vars.contains(source)) {
+            try no_free_vars.put(a, name, {});
+        }
+    }
+
+    if (no_free_vars.count() == 0) return result;
+
+    // Step 2: Content-based scan for function calls with no-free var arguments
+    // Handles multi-line function calls (common in Zig code)
+    var cpos: usize = 0;
+    while (cpos < content.len) {
+        const paren_pos = mem.indexOfScalarPos(u8, content, cpos, '(') orelse break;
+        cpos = paren_pos + 1;
+
+        // Extract function name before the paren
+        if (paren_pos == 0) continue;
+        var fn_start: usize = paren_pos;
+        while (fn_start > 0 and isIdent(content[fn_start - 1])) fn_start -= 1;
+        if (fn_start == paren_pos) continue;
+
+        const func_name = content[fn_start..paren_pos];
+        // Skip method calls (preceded by dot)
+        if (fn_start > 0 and content[fn_start - 1] == '.') continue;
+        // Skip type constructors (uppercase first letter)
+        if (func_name[0] >= 'A' and func_name[0] <= 'Z') continue;
+        // Skip keywords
+        if (mem.eql(u8, func_name, "try") or mem.eql(u8, func_name, "if") or
+            mem.eql(u8, func_name, "while") or mem.eql(u8, func_name, "for") or
+            mem.eql(u8, func_name, "catch") or mem.eql(u8, func_name, "switch") or
+            mem.eql(u8, func_name, "return") or mem.eql(u8, func_name, "fn") or
+            mem.eql(u8, func_name, "test")) continue;
+        // Skip function definitions: check for "fn " or "pub fn " before name
+        if (fn_start >= 3 and mem.eql(u8, content[fn_start - 3 .. fn_start], "fn ")) continue;
+        if (fn_start >= 7 and mem.eql(u8, content[fn_start - 7 .. fn_start], "pub fn ")) continue;
+
+        // Find matching closing paren (handles multi-line calls)
+        var close: usize = paren_pos + 1;
+        var depth: usize = 0;
+        const max_scan = @min(content.len, paren_pos + 2000); // Limit scan range
+        while (close < max_scan) : (close += 1) {
+            if (content[close] == '(') {
+                depth += 1;
+            } else if (content[close] == ')') {
+                if (depth == 0) break;
+                depth -= 1;
+            }
+        }
+        if (close >= max_scan) continue;
+
+        const args = content[paren_pos + 1 .. close];
+
+        // Check if any no-free var is referenced in the arguments
+        var nfi = no_free_vars.iterator();
+        while (nfi.next()) |nf_entry| {
+            const nf_name = nf_entry.key_ptr.*;
+            var search_pos: usize = 0;
+            while (search_pos < args.len) {
+                const found = mem.indexOfPos(u8, args, search_pos, nf_name) orelse break;
+                const end = found + nf_name.len;
+                const before_ok = found == 0 or !isIdent(args[found - 1]);
+                const after_ok = end >= args.len or
+                    !isIdent(args[end]);
+                if (before_ok and after_ok) {
+                    try result.put(a, func_name, {});
+                    break;
+                }
+                search_pos = end;
+            }
+            if (result.contains(func_name)) break;
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// TypeContext: Return-type-aware detection infrastructure
+// ============================================================================
+
+/// Classify a return type string (text after closing `)` in a fn signature).
+fn classifyReturnType(ret: []const u8) ReturnKind {
+    const t = mem.trim(u8, ret, " \t\r");
+    if (t.len == 0) return .unknown;
+    if (mem.eql(u8, t, "void")) return .void_type;
+    if (mem.eql(u8, t, "noreturn")) return .noreturn_type;
+    // Error union: starts with '!' or contains '!' before the type
+    if (t[0] == '!') return .error_union;
+    // "ErrorSet!T" or "anyerror!T" patterns
+    if (mem.indexOf(u8, t, "!") != null) return .error_union;
+    if (t[0] == '?') return .optional;
+    return .value;
+}
+
+/// Type-aware context for resolving return types of method calls and functions.
+/// Replaces the flat `StringHashMapUnmanaged(void)` stdlib_vars with richer info.
+const TypeContext = struct {
+    /// "StructName" -> ("methodName" -> ReturnKind)
+    struct_methods: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(ReturnKind)),
+    /// "functionName" -> ReturnKind (top-level/file-scope functions)
+    function_returns: std.StringHashMapUnmanaged(ReturnKind),
+    /// "varName" -> "TypeName" (from declarations)
+    var_types: std.StringHashMapUnmanaged([]const u8),
+    /// "varName" -> void (known stdlib vars, for vocab fallback)
+    stdlib_vars: std.StringHashMapUnmanaged(void),
+
+    fn init() TypeContext {
+        return .{
+            .struct_methods = .{},
+            .function_returns = .{},
+            .var_types = .{},
+            .stdlib_vars = .{},
+        };
+    }
+
+    fn deinit(self: *TypeContext, a: Allocator) void {
+        var it = self.struct_methods.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(a);
+        }
+        self.struct_methods.deinit(a);
+        self.function_returns.deinit(a);
+        self.var_types.deinit(a);
+        self.stdlib_vars.deinit(a);
+    }
+};
+
+/// Result of extracting a method call from a line
+const MethodCall = struct { receiver: []const u8, method: []const u8 };
+
+/// Extract receiver.method from a line containing a method call.
+/// Scans for "identifier.identifier(" patterns. Returns the last such match.
+fn extractMethodCall(t: []const u8) ?MethodCall {
+    var result: ?MethodCall = null;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '.') continue;
+        // Extract method name after dot
+        const method_start = i + 1;
+        var method_end = method_start;
+        while (method_end < t.len and isIdent(t[method_end])) method_end += 1;
+        if (method_end == method_start) continue;
+        if (method_end >= t.len or t[method_end] != '(') continue;
+        // Extract receiver before dot
+        const target = extractMethodTarget(t, i) orelse continue;
+        result = .{ .receiver = target, .method = t[method_start..method_end] };
+    }
+    return result;
+}
+
+/// Resolve the return kind for a call expression on a trimmed line.
+/// Checks TypeContext in order: parsed struct methods, parsed functions, then unknown.
+fn resolveReturnKind(ctx: *const TypeContext, t: []const u8) ReturnKind {
+    // Try method call resolution: receiver.method(
+    if (extractMethodCall(t)) |call| {
+        if (ctx.var_types.get(call.receiver)) |type_name| {
+            if (ctx.struct_methods.get(type_name)) |methods| {
+                if (methods.get(call.method)) |rk| return rk;
+            }
+        }
+    }
+    // Try standalone function call: _ = funcName(
+    if (mem.startsWith(u8, t, "_ = ")) {
+        const after = t[4..];
+        const paren = mem.indexOf(u8, after, "(") orelse return .unknown;
+        const name = after[0..paren];
+        // Must be a simple identifier (no dots = not a method call)
+        if (mem.indexOf(u8, name, ".") != null) return .unknown;
+        if (name.len == 0) return .unknown;
+        var all_ident = true;
+        for (name) |c| {
+            if (!isIdent(c)) {
+                all_ident = false;
+                break;
+            }
+        }
+        if (all_ident) {
+            if (ctx.function_returns.get(name)) |rk| return rk;
+        }
+    }
+    return .unknown;
+}
+
+/// Extract return type text from a function signature line.
+/// Given a line like "pub fn foo(self: *T, x: u32) !void {", returns "!void".
+/// Returns null if no valid return type can be extracted.
+fn extractFnReturnType(t: []const u8) ?[]const u8 {
+    // Find the fn keyword to ensure we're looking at a function
+    const fn_pos = mem.indexOf(u8, t, "fn ") orelse return null;
+    // Find the opening paren of params
+    const open_paren = mem.indexOfScalarPos(u8, t, fn_pos, '(') orelse return null;
+    // Walk to find the matching closing paren (handle nested parens)
+    var depth: usize = 0;
+    var close_paren: ?usize = null;
+    for (t[open_paren..], 0..) |c, offset| {
+        if (c == '(') depth += 1;
+        if (c == ')') {
+            depth -= 1;
+            if (depth == 0) {
+                close_paren = open_paren + offset;
+                break;
+            }
+        }
+    }
+    const cp = close_paren orelse return null;
+    // Text between close paren and opening brace is the return type
+    const after_close = t[cp + 1 ..];
+    // Find the opening brace (or end of line for declarations without body)
+    const brace = mem.indexOfScalar(u8, after_close, '{') orelse after_close.len;
+    const ret_text = mem.trim(u8, after_close[0..brace], " \t\r");
+    if (ret_text.len == 0) return null;
+    return ret_text;
+}
+
+/// Extract the self-parameter type name from a method signature.
+/// For "fn foo(self: *MyStruct, ...)" returns "MyStruct".
+/// For "fn foo(self: *const MyStruct)" returns "MyStruct".
+/// For "fn foo(self: MyStruct)" returns "MyStruct".
+fn extractSelfTypeName(t: []const u8) ?[]const u8 {
+    // Find the parameter list opening
+    const open_paren = mem.indexOfScalar(u8, t, '(') orelse return null;
+    // Find self parameter
+    const after_paren = t[open_paren + 1 ..];
+    const trimmed = mem.trim(u8, after_paren, " \t");
+    if (!mem.startsWith(u8, trimmed, "self")) return null;
+    // Must be followed by : or , or )
+    if (trimmed.len <= 4) return null;
+    if (trimmed[4] != ':' and trimmed[4] != ' ') return null;
+    // Find the colon after self
+    const colon_pos = mem.indexOfScalar(u8, trimmed, ':') orelse return null;
+    const type_text = mem.trim(u8, trimmed[colon_pos + 1 ..], " \t");
+    // Strip pointer markers: *Type, *const Type
+    var name_start: usize = 0;
+    if (type_text.len > 0 and type_text[0] == '*') {
+        name_start = 1;
+        const remaining = type_text[1..];
+        if (mem.startsWith(u8, remaining, "const ")) {
+            name_start = 7; // past "*const "
+        }
+    }
+    // Extract the type name (identifier chars until comma, paren, or space)
+    var name_end = name_start;
+    while (name_end < type_text.len and isIdent(type_text[name_end])) name_end += 1;
+    if (name_end <= name_start) return null;
+    return type_text[name_start..name_end];
+}
+
+/// Extract the function name from a fn declaration line.
+/// "pub fn foo(...)" -> "foo", "fn bar(...)" -> "bar"
+fn extractFnName(t: []const u8) ?[]const u8 {
+    const fn_pos = mem.indexOf(u8, t, "fn ") orelse return null;
+    const after_fn = t[fn_pos + 3 ..];
+    var end: usize = 0;
+    while (end < after_fn.len and isIdent(after_fn[end])) end += 1;
+    if (end == 0) return null;
+    return after_fn[0..end];
+}
+
+/// Extract the type name from a variable declaration's right-hand side.
+/// Handles: `var x: TypeName = ...`, `var x = TypeName.init(...)`, `var x = TypeName{...}`
+fn extractVarTypeName(t: []const u8) ?[]const u8 {
+    // Must be a var/const declaration
+    const is_var = mem.startsWith(u8, t, "var ");
+    const is_const = mem.startsWith(u8, t, "const ");
+    if (!is_var and !is_const) return null;
+
+    // Check for explicit type annotation: var x: TypeName = ...
+    const prefix_len: usize = if (is_var) 4 else 6;
+    var name_end = prefix_len;
+    while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
+    if (name_end <= prefix_len) return null;
+    const after_name = mem.trim(u8, t[name_end..], " \t");
+    if (after_name.len > 0 and after_name[0] == ':') {
+        // Explicit type annotation
+        const type_start_raw = after_name[1..];
+        const type_start = mem.trim(u8, type_start_raw, " \t");
+        // Skip pointer/optional markers for the type name
+        var ts: usize = 0;
+        if (ts < type_start.len and type_start[ts] == '*') ts += 1;
+        if (ts < type_start.len and type_start[ts] == '?') ts += 1;
+        var te: usize = ts;
+        while (te < type_start.len and isIdent(type_start[te])) te += 1;
+        if (te > ts) return type_start[ts..te];
+    }
+
+    // Check for TypeName.init( or TypeName{ patterns
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
+    const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+    if (rhs.len == 0) return null;
+    // Must start with uppercase (type names are PascalCase in Zig)
+    if (rhs[0] < 'A' or rhs[0] > 'Z') return null;
+    // Extract the type identifier
+    var rhs_end: usize = 0;
+    while (rhs_end < rhs.len and isIdent(rhs[rhs_end])) rhs_end += 1;
+    if (rhs_end == 0) return null;
+    // Must be followed by .init(, {, or ( (generic type)
+    if (rhs_end >= rhs.len) return null;
+    const next_char = rhs[rhs_end];
+    if (next_char == '{' or next_char == '(') return rhs[0..rhs_end];
+    if (next_char == '.') {
+        // TypeName.init( or TypeName.method(
+        return rhs[0..rhs_end];
+    }
+    return null;
+}
+
+/// Build TypeContext from file content. Parses struct method signatures,
+/// variable type declarations, and top-level function signatures.
+/// Also builds stdlib_vars (same as collectStdlibVarNames).
+fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
+    var ctx = TypeContext.init();
+
+    const container_inits = compat.getStdlibContainerInitPatterns();
+    const allocator_inits = compat.getAllInitPatterns();
+
+    // Track type scope (struct/enum/union) via brace depth
+    var current_type: ?[]const u8 = null;
+    var type_brace_depth: usize = 0;
+    var brace_depth: usize = 0;
+
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) {
+            // Still track braces in comments? No — skip entirely
+            continue;
+        }
+
+        // Track brace depth
+        for (t) |c| {
+            if (c == '{') brace_depth += 1;
+            if (c == '}') {
+                if (brace_depth > 0) brace_depth -= 1;
+            }
+        }
+
+        // Detect type scope: struct, enum, union — all can have methods in Zig
+        if (mem.indexOf(u8, t, "= struct {") != null or
+            mem.indexOf(u8, t, "= struct{") != null or
+            mem.indexOf(u8, t, "= packed struct {") != null or
+            mem.indexOf(u8, t, "= extern struct {") != null or
+            mem.indexOf(u8, t, "= enum {") != null or
+            mem.indexOf(u8, t, "= enum(") != null or
+            mem.indexOf(u8, t, "= union(") != null or
+            mem.indexOf(u8, t, "= union {") != null or
+            mem.indexOf(u8, t, "= packed union {") != null or
+            mem.indexOf(u8, t, "= extern union {") != null)
+        {
+            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const ")) {
+                const name_start = if (mem.startsWith(u8, t, "pub const ")) @as(usize, 10) else 6;
+                var name_end = name_start;
+                while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
+                if (name_end > name_start) {
+                    current_type = t[name_start..name_end];
+                    type_brace_depth = brace_depth;
+                }
+            }
+        }
+
+        // Exit type scope when braces close
+        if (current_type != null and brace_depth < type_brace_depth) {
+            current_type = null;
+        }
+
+        // Parse function/method signatures
+        if (mem.indexOf(u8, t, "fn ") != null and mem.indexOf(u8, t, "(") != null) {
+            const ret_text = extractFnReturnType(t) orelse continue;
+            const rk = classifyReturnType(ret_text);
+            const fn_name = extractFnName(t) orelse continue;
+
+            if (current_type) |type_name| {
+                // Check if this is a method (has self parameter)
+                if (extractSelfTypeName(t) != null) {
+                    // Register as type method
+                    const gop = try ctx.struct_methods.getOrPut(a, type_name);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .{};
+                    }
+                    try gop.value_ptr.put(a, fn_name, rk);
+                }
+            } else {
+                // Top-level function
+                try ctx.function_returns.put(a, fn_name, rk);
+            }
+            // Don't try to also parse as a var decl
+            continue;
+        }
+
+        // Parse variable declarations for type info
+        if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "const ")) {
+            const var_name = extractVarDeclName(t) orelse continue;
+
+            // Check for type name
+            if (extractVarTypeName(t)) |type_name| {
+                try ctx.var_types.put(a, var_name, type_name);
+            }
+
+            // Also build stdlib_vars (same logic as checkStdlibVarLine)
+            for (container_inits) |init_pat| {
+                if (mem.indexOf(u8, t, init_pat) != null) {
+                    try ctx.stdlib_vars.put(a, var_name, {});
+                    break;
+                }
+            } else {
+                for (allocator_inits) |init_pat| {
+                    if (mem.indexOf(u8, t, init_pat) != null) {
+                        try ctx.stdlib_vars.put(a, var_name, {});
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return ctx;
+}
+
+/// Line-based variant for function-scoped analysis (memory path).
+fn parseFileTypeContextFromLines(a: Allocator, lines: []const []const u8) !TypeContext {
+    var ctx = TypeContext.init();
+
+    const container_inits = compat.getStdlibContainerInitPatterns();
+    const allocator_inits = compat.getAllInitPatterns();
+
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+
+        // Parse variable declarations
+        if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "const ")) {
+            const var_name = extractVarDeclName(t) orelse continue;
+
+            if (extractVarTypeName(t)) |type_name| {
+                try ctx.var_types.put(a, var_name, type_name);
+            }
+
+            // Build stdlib_vars
+            for (container_inits) |init_pat| {
+                if (mem.indexOf(u8, t, init_pat) != null) {
+                    try ctx.stdlib_vars.put(a, var_name, {});
+                    break;
+                }
+            } else {
+                for (allocator_inits) |init_pat| {
+                    if (mem.indexOf(u8, t, init_pat) != null) {
+                        try ctx.stdlib_vars.put(a, var_name, {});
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return ctx;
+}
+
+/// Extract the variable name a method is called on by walking backwards
+/// from the dot position. For "list.clear(" with dot_pos pointing at the '.',
+/// walks back through identifier chars to find "list".
+/// For "self.list.clear(" returns "list" (stops at the previous dot).
+fn extractMethodTarget(t: []const u8, dot_pos: usize) ?[]const u8 {
+    if (dot_pos == 0) return null;
+    const end = dot_pos;
+    var start = dot_pos;
+    while (start > 0 and isIdent(t[start - 1])) start -= 1;
+    if (start >= end) return null;
+    return t[start..end];
+}
+
+/// Type-aware method pattern matching.
+/// - Universal patterns (don't start with '.') always apply: "debug.print", "assert("
+/// - Method patterns (start with '.') only match when the receiver variable is a
+///   confirmed stdlib type tracked in stdlib_vars.
+/// When stdlib_vars is null, falls back to legacy substring matching (current behavior).
+fn isMethodOnStdlibVar(
+    t: []const u8,
+    stdlib_vars: ?*const std.StringHashMapUnmanaged(void),
+    patterns: []const []const u8,
+) bool {
+    const vars = stdlib_vars orelse {
+        // Legacy fallback: no type info, use substring matching
+        for (patterns) |pat| {
+            if (mem.indexOf(u8, t, pat) != null) return true;
+        }
+        return false;
+    };
+
+    for (patterns) |pat| {
+        if (!mem.startsWith(u8, pat, ".")) {
+            // Universal pattern (debug.print, assert, etc.) — always apply
+            if (mem.indexOf(u8, t, pat) != null) return true;
+            continue;
+        }
+        // Method pattern — verify target is a tracked stdlib variable
+        const pos = mem.indexOf(u8, t, pat) orelse continue;
+        const target = extractMethodTarget(t, pos) orelse continue;
+        if (vars.contains(target)) return true;
+    }
+    return false;
+}
+
 /// Check if line uses .allocator().{alloc_method}() chain from a tracked no-free source.
 /// Detects patterns like: fba_var.allocator().alloc(...), arena_var.allocator().create(...)
-fn isNoFreeCallChain(t: []const u8, no_free_names: *const std.StringHashMapUnmanaged(void)) bool {
+fn isNoFreeCallChain(
+    t: []const u8,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+) bool {
+    return isNoFreeCallChainFull(t, no_free_names, null);
+}
+
+/// Check if allocation is through a no-free allocator call chain:
+/// X.allocator().method() where X is a tracked no-free variable or field.
+fn isNoFreeCallChainFull(
+    t: []const u8,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+) bool {
     const chain_marker = ".allocator().";
     const pos = mem.indexOf(u8, t, chain_marker) orelse return false;
 
-    // Verify what follows is an allocator method
+    // Verify what follows is an allocator method (short names from compat layer)
     const after = t[pos + chain_marker.len ..];
-    const is_alloc_method = mem.startsWith(u8, after, "alloc(") or
-        mem.startsWith(u8, after, "create(") or
-        mem.startsWith(u8, after, "dupe(") or
-        mem.startsWith(u8, after, "dupeZ(") or
-        mem.startsWith(u8, after, "realloc(");
+    var is_alloc_method = false;
+    for (compat.getAllocMethodShortNames()) |short_name| {
+        // Check "methodName(" pattern after the chain marker
+        if (after.len > short_name.len and
+            mem.startsWith(u8, after, short_name) and
+            after[short_name.len] == '(')
+        {
+            is_alloc_method = true;
+            break;
+        }
+    }
     if (!is_alloc_method) return false;
 
-    // Extract source variable name before .allocator()
+    // Extract source variable/field name before .allocator()
     var start = pos;
     while (start > 0 and isIdent(t[start - 1])) start -= 1;
     if (start >= pos) return false;
     const source = t[start..pos];
-    return no_free_names.contains(source);
+
+    // Check local variable names (e.g. arena.allocator().alloc())
+    if (no_free_names.contains(source)) return true;
+
+    // Check struct field names (e.g. self.arena.allocator().alloc())
+    // The source before .allocator() is a field name in a dotted chain
+    if (no_free_fields) |fields| {
+        if (fields.contains(source)) return true;
+    }
+
+    return false;
 }
 
-/// Patterns indicating ownership transfer (casts, out-params, container methods)
-const ownership_transfer_patterns = [_][]const u8{
+/// Zig language construct patterns indicating ownership transfer (not stdlib-specific)
+const ownership_lang_patterns = [_][]const u8{
     "break :", // Labeled block break - ownership to block result
     ".* = ", // Out-parameter assignment (C FFI)
     "@ptrCast", // Pointer cast
     "@alignCast", // Alignment cast
     ".ptr", // Slice reassignment
-    // Container methods
-    ".append(",
-    ".put(",
-    ".putNoClobber(",
-    // Async/queue methods
-    ".submit(",
-    ".enqueue(",
-    ".push(",
-    ".send(",
-    ".emit(",
-    ".dispatch(",
-    ".transfer(",
-    ".deliver(",
-    ".publish(",
-    ".broadcast(",
-    ".post(",
-    ".write(",
+    ".realloc(", // Realloc consumes old pointer
 };
 
-/// Check if ownership is transferred via cast or reassignment
+/// Check if ownership is transferred via cast, reassignment, or container method
 fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
     if (mem.indexOf(u8, t, alloc_name) == null) return false;
-    for (ownership_transfer_patterns) |pattern| {
+    // Check Zig language construct patterns
+    for (ownership_lang_patterns) |pattern| {
+        if (mem.indexOf(u8, t, pattern) == null) continue;
+        // ".* = " is only an ownership transfer when alloc_name is on the RHS.
+        // When alloc_name is on the LHS (e.g., node.* = .{...}), it's
+        // initialization of allocated memory, not a transfer.
+        if (mem.eql(u8, pattern, ".* = ")) {
+            if (mem.indexOf(u8, t, " = ")) |eq_pos| {
+                const rhs = t[eq_pos + 3 ..];
+                if (mem.indexOf(u8, rhs, alloc_name) != null) return true;
+            }
+            continue;
+        }
+        return true;
+    }
+    // Check stdlib container methods (compat layer)
+    for (compat.getContainerOwnershipMethods()) |pattern| {
         if (mem.indexOf(u8, t, pattern) != null) return true;
     }
     return false;
@@ -5178,16 +5987,6 @@ fn isStructFieldStorage(t: []const u8, alloc_name: []const u8) bool {
     return false;
 }
 
-/// Check if this is a pool allocator pattern
-fn isPoolAllocator(t: []const u8) bool {
-    // Memory pool patterns
-    if (mem.indexOf(u8, t, "MemoryPool") != null) return true;
-    if (mem.indexOf(u8, t, "pool.create(") != null) return true;
-    if (mem.indexOf(u8, t, "pool.alloc(") != null) return true;
-    if (mem.indexOf(u8, t, "ObjectPool") != null) return true;
-    return false;
-}
-
 /// Extract identifier before .create( position
 fn extractCreateCaller(t: []const u8, create_pos: usize) ?[]const u8 {
     if (create_pos == 0) return null;
@@ -5197,81 +5996,19 @@ fn extractCreateCaller(t: []const u8, create_pos: usize) ?[]const u8 {
     return t[start..create_pos];
 }
 
-/// Check if name is a known allocator name
-fn isKnownAllocatorName(name: []const u8) bool {
-    const names = [_][]const u8{
-        "allocator",
-        "alloc",
-        "gpa",
-        "arena",
-        "fba",
-        "page_allocator",
-        "testing_allocator",
-        "self",
-    };
-    for (names) |n| {
-        if (mem.eql(u8, name, n)) return true;
-    }
-    return false;
-}
-
-/// Check if name is known NON-allocator that calls .create()
-fn isKnownNonAllocatorCreate(name: []const u8) bool {
-    // Common non-allocator methods named .create() in Zig ecosystem
-    const non_allocator_creates = [_][]const u8{
-        "cgroup", // Linux cgroup management (ghostty)
-        "os", // OS file operations
-        "file", // File system operations
-        "dir", // Directory operations
-        "socket", // Network socket creation
-        "thread", // Thread spawning
-        "process", // Process spawning
-        "pipe", // Pipe creation
-        "event", // Event creation
-        "signal", // Signal handlers
-        "timer", // Timer creation
-        "mutex", // Mutex creation
-        "semaphore", // Semaphore creation
-        "condvar", // Condition variable creation
-        "internal_os", // Internal OS wrappers (ghostty)
-    };
-    for (non_allocator_creates) |known| {
-        if (mem.eql(u8, name, known)) return true;
-        // Also check dotted prefixes like internal_os.cgroup
-        if (mem.indexOf(u8, name, known) != null) return true;
-    }
-    return false;
-}
-
-/// Check if .create() is allocator.create() vs static method or non-allocator
-fn isAllocatorCreate(t: []const u8) bool {
-    const pos = mem.indexOf(u8, t, ".create(") orelse return false;
-    const name = extractCreateCaller(t, pos) orelse return false;
-    // Uppercase = Type.create() static method (e.g., Parser.create())
-    const is_upper = name.len > 0 and name[0] >= 'A' and name[0] <= 'Z';
-    if (is_upper) return false;
-    // Check known non-allocator .create() patterns first
-    if (isKnownNonAllocatorCreate(name)) return false;
-    // Known allocator names
-    if (isKnownAllocatorName(name)) return true;
-    // Name contains allocator/alloc - likely an allocator
-    if (mem.indexOf(u8, name, "allocator") != null) return true;
-    if (mem.indexOf(u8, name, "alloc") != null) return true;
-    // Default to false - be conservative about flagging .create()
-    // Only flag when we're confident it's an allocator
-    return false;
-}
-
 /// Extract the allocator name from an allocation line
 fn extractAllocatorName(t: []const u8) ?[]const u8 {
-    // Pattern: name.alloc( or name.create(
-    const alloc_pat = ".alloc(";
-    const create_pat = ".create(";
-    const alloc_pos = mem.indexOf(u8, t, alloc_pat) orelse
-        mem.indexOf(u8, t, create_pat) orelse return null;
+    // Find first allocation method position using compat layer patterns
+    var first_pos: ?usize = null;
+    for (compat.getAllocMethodPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (first_pos == null or pos < first_pos.?)
+                first_pos = pos;
+        }
+    }
 
     // Walk backwards to find the allocator name
-    const end = alloc_pos;
+    const end = first_pos orelse return null;
     var start = end;
     while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
         start -= 1;
@@ -5290,6 +6027,62 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Patterns where allocator is the first function argument (not the receiver).
+/// Used to extract the allocator name for no-free suppression on stdlib functions
+/// like `std.fmt.allocPrint(allocator, ...)` or `list.toOwnedSlice(allocator)`.
+const first_arg_alloc_patterns = [_][]const u8{
+    ".allocPrint(",
+    ".allocPrintSentinel(",
+    ".toOwnedSlice(",
+    ".toOwnedSliceSentinel(",
+    ".cloneWithAllocator(",
+    ".readFileAlloc(",
+    ".readFileAllocOptions(",
+    ".readToEndAlloc(",
+    ".readToEndAllocOptions(",
+    ".readAllAlloc(",
+    ".selfExePathAlloc(",
+    ".selfExeDirPathAlloc(",
+    ".realpathAlloc(",
+    ".replaceOwned(",
+    ".concatWithSentinel(",
+    ".stringifyAlloc(",
+};
+
+/// Extract the allocator name from the first argument of a standalone or
+/// method-style allocating function call where the allocator is an argument,
+/// not the receiver. Handles patterns like:
+///   std.fmt.allocPrint(allocator, ...)
+///   list.toOwnedSlice(allocator)
+///   std.mem.concat(allocator, u8, ...)
+///   mem.join(allocator, ...)
+fn extractStandaloneAllocator(t: []const u8) ?[]const u8 {
+    // Check qualified patterns (allocator is the first arg for all)
+    for (compat.getQualifiedAllocFnPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            return extractFirstArgIdent(t, pos + pat.len);
+        }
+    }
+    // Check method patterns where allocator is the first arg
+    for (first_arg_alloc_patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            return extractFirstArgIdent(t, pos + pat.len);
+        }
+    }
+    return null;
+}
+
+/// Extract a simple identifier starting at `start` (first arg before comma/paren).
+fn extractFirstArgIdent(t: []const u8, start: usize) ?[]const u8 {
+    var s = start;
+    while (s < t.len and (t[s] == ' ' or t[s] == '\t')) s += 1;
+    if (s >= t.len) return null;
+    const ident_start = s;
+    while (s < t.len and isIdent(t[s])) s += 1;
+    if (s == ident_start) return null;
+    return t[ident_start..s];
+}
+
 // ============================================================================
 // Analysis Functions
 // ============================================================================
@@ -5304,14 +6097,6 @@ fn isReturnPattern(t: []const u8, alloc_name: []const u8) bool {
     return mem.indexOf(u8, t, alloc_name) != null;
 }
 
-/// Detect if allocation is stored in self (builder pattern)
-fn isSelfStoragePattern(t: []const u8, alloc_name: []const u8) bool {
-    const has_self = mem.indexOf(u8, t, "self.") != null;
-    const has_name = mem.indexOf(u8, t, alloc_name) != null;
-    const has_assign = mem.indexOf(u8, t, " = ") != null;
-    return has_self and has_name and has_assign;
-}
-
 /// Detect direct field assignment: var.field = try allocator.alloc(...)
 /// This handles patterns like ctx.editing_buffer = try self.allocator.alloc(...)
 fn isDirectFieldAssignment(t: []const u8, alloc_name: []const u8) bool {
@@ -5323,9 +6108,22 @@ fn isDirectFieldAssignment(t: []const u8, alloc_name: []const u8) bool {
     // LHS should be identifier.field (e.g., ctx.editing_buffer, self.buffer)
     if (mem.indexOf(u8, lhs, ".") == null) return false;
 
-    // RHS should contain alloc/create pattern (skip patterns in strings)
-    const has_alloc = hasPatternNotInString(rhs, ".alloc(") or
-        hasPatternNotInString(rhs, ".create(");
+    // RHS should contain an allocation method pattern (skip patterns in strings)
+    var has_alloc = false;
+    for (compat.getAllocMethodPatterns()) |pat| {
+        if (hasPatternNotInString(rhs, pat)) {
+            has_alloc = true;
+            break;
+        }
+    }
+    if (!has_alloc) {
+        for (compat.getQualifiedAllocFnPatterns()) |pat| {
+            if (hasPatternNotInString(rhs, pat)) {
+                has_alloc = true;
+                break;
+            }
+        }
+    }
     if (!has_alloc) return false;
 
     // Check if lhs field name matches alloc_name (e.g., ctx.editing_buffer with editing_buffer)
@@ -5334,64 +6132,19 @@ fn isDirectFieldAssignment(t: []const u8, alloc_name: []const u8) bool {
     return false;
 }
 
-fn detectsArenaAllocator(t: []const u8) bool {
-    const patterns = [_][]const u8{
-        "ArenaAllocator",
-        "arena.allocator()",
-        "FixedBufferAllocator",
-        "fba.allocator()",
-        "stackFallback",
-    };
-    for (patterns) |p| {
-        if (mem.indexOf(u8, t, p) != null) return true;
-    }
-    // Check for function parameter named "arena" (common pattern)
-    // Pattern: fn foo(arena: std.mem.Allocator) or fn foo(arena: Allocator)
-    if (mem.indexOf(u8, t, "fn ") != null) {
-        if (mem.indexOf(u8, t, "arena:") != null) return true;
-        if (mem.indexOf(u8, t, "arena :") != null) return true;
-    }
-    return false;
-}
-
-/// Detect ownership transfer via function call
-/// Pattern: foo.submit(alloc_name), queue.enqueue(alloc_name), etc.
+/// Detect ownership transfer via function call argument
+/// Uses general approach: if alloc_name appears as argument to any function call,
+/// ownership may have been transferred. This is project-agnostic.
 fn isOwnershipTransferCall(t: []const u8, alloc_name: []const u8) bool {
-    // Must contain alloc_name
-    const alloc_pos = mem.indexOf(u8, t, alloc_name) orelse return false;
-
-    // alloc_name must be followed by ) (argument to function)
-    if (alloc_pos + alloc_name.len >= t.len) return false;
-
-    // Check characters after alloc_name
-    var after_pos = alloc_pos + alloc_name.len;
-    while (after_pos < t.len and t[after_pos] == ' ') after_pos += 1;
-    if (after_pos >= t.len) return false;
-
-    // Must end with ) or , (part of argument list)
-    if (t[after_pos] != ')' and t[after_pos] != ',') return false;
-
-    // Check for ownership-transferring method names before (
-    const ownership_methods = [_][]const u8{
-        ".submit(",  ".enqueue(",   ".push(",     ".send(",
-        ".emit(",    ".dispatch(",  ".transfer(", ".deliver(",
-        ".publish(", ".broadcast(", ".post(",     ".write(",
-    };
-    for (ownership_methods) |method| {
-        if (mem.indexOf(u8, t, method) != null) return true;
-    }
-
-    return false;
+    return isFunctionArgTransfer(t, alloc_name);
 }
 
 /// Detect function argument ownership transfer
 /// Catches: someFunc(alloc_name, ...) or someFunc(..., alloc_name) or someFunc(alloc_name)
 /// Excludes: alloc_name.method() and alloc_name[...] and simple comparisons
-/// Allocation function names that don't count as ownership transfer
-const alloc_fn_names = [_][]const u8{ "alloc", "create", "dupe", "realloc" };
-
 /// Walk backward from a position to find the enclosing function call name.
 /// Returns true if it's a non-allocation function call (ownership transfer).
+/// Allocation function names (from compat layer) don't count as ownership transfer.
 fn isNonAllocFnCallAt(t: []const u8, paren_pos: usize) bool {
     if (paren_pos == 0) return false;
     var name_end = paren_pos;
@@ -5400,7 +6153,7 @@ fn isNonAllocFnCallAt(t: []const u8, paren_pos: usize) bool {
     var fname_start = name_end - 1;
     while (fname_start > 0 and isIdent(t[fname_start - 1])) fname_start -= 1;
     const fname = t[fname_start..name_end];
-    for (alloc_fn_names) |afn| {
+    for (compat.getAllocMethodShortNames()) |afn| {
         if (mem.eql(u8, fname, afn)) return false;
     }
     return true;
@@ -5437,7 +6190,7 @@ fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
 }
 
 /// Detect module-level variable assignment (singleton/global pattern)
-/// Pattern: identifier = alloc_name (no const/var keyword, no self./ctx. prefix)
+/// Pattern: identifier = alloc_name (no const/var keyword, not field assignment)
 fn isModuleLevelAssignment(t: []const u8, alloc_name: []const u8) bool {
     // Must contain alloc_name
     if (mem.indexOf(u8, t, alloc_name) == null) return false;
@@ -5452,18 +6205,13 @@ fn isModuleLevelAssignment(t: []const u8, alloc_name: []const u8) bool {
     const lhs = mem.trim(u8, t[0..eq_pos], " \t");
     if (lhs.len == 0) return false;
 
-    // LHS must be a simple identifier OR have a dot for field access
-    // Skip if it's self.x or ctx.x (handled by other checks)
-    if (mem.startsWith(u8, lhs, "self.") or mem.startsWith(u8, lhs, "ctx.")) return false;
+    // Skip field assignments (any identifier.field pattern — ownership transfer, not module-level)
+    if (mem.indexOf(u8, lhs, ".") != null) return false;
 
-    // If LHS is a simple identifier (no dots), it might be a module-level variable
-    if (mem.indexOf(u8, lhs, ".") == null) {
-        // Ensure alloc_name appears on RHS
-        const rhs = t[eq_pos + 3 ..];
-        return mem.indexOf(u8, rhs, alloc_name) != null;
-    }
-
-    return false;
+    // LHS is a simple identifier = module-level variable assignment
+    // Ensure alloc_name appears on RHS
+    const rhs = t[eq_pos + 3 ..];
+    return mem.indexOf(u8, rhs, alloc_name) != null;
 }
 
 /// Detect direct module-level allocation (not a local var, not a field)
@@ -5472,17 +6220,14 @@ fn isDirectModuleLevelAlloc(t: []const u8) bool {
     // Must have an assignment
     const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
 
+    // Must not be a const/var declaration (those are local)
+    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return false;
+
     // Extract lhs (the assigned-to variable)
     const lhs = mem.trim(u8, t[0..eq_pos], " \t");
     if (lhs.len == 0) return false;
 
-    // Must not be a const/var declaration (those are local)
-    if (mem.startsWith(u8, lhs, "const ") or mem.startsWith(u8, lhs, "var ")) return false;
-
-    // Skip if it's self.x or ctx.x (handled by other checks as field assignment)
-    if (mem.startsWith(u8, lhs, "self.") or mem.startsWith(u8, lhs, "ctx.")) return false;
-
-    // Skip if lhs contains a dot (field access like x.y)
+    // Skip any field assignment (identifier.field — ownership transfer, not module-level)
     if (mem.indexOf(u8, lhs, ".") != null) return false;
 
     // LHS must be a valid identifier (letters, numbers, underscores)
@@ -5490,9 +6235,15 @@ fn isDirectModuleLevelAlloc(t: []const u8) bool {
         if (!isIdent(c)) return false;
     }
 
-    // RHS must contain .alloc( or .create( (skip patterns in strings)
+    // RHS must contain an allocation method pattern (skip patterns in strings)
     const rhs = t[eq_pos + 3 ..];
-    return hasPatternNotInString(rhs, ".alloc(") or hasPatternNotInString(rhs, ".create(");
+    for (compat.getAllocMethodPatterns()) |pat| {
+        if (hasPatternNotInString(rhs, pat)) return true;
+    }
+    for (compat.getQualifiedAllocFnPatterns()) |pat| {
+        if (hasPatternNotInString(rhs, pat)) return true;
+    }
+    return false;
 }
 
 /// Check if allocation is directly assigned to a struct field (x.field = alloc)
@@ -5535,29 +6286,30 @@ fn isInTestContext(path: []const u8, in_test_block: bool) bool {
 }
 
 /// Check if a discarded result is safe (void/non-error return type)
-fn isSafeToDiscard(t: []const u8) bool {
-    const skip_patterns = [_][]const u8{
-        ".destroy(", // Allocator destroy - returns void
-        ".free(", // Allocator free - returns void
-        ".pop(", // Returns popped T, not error - ok to discard
-        ".clear(", // Returns void
-        ".clearAndFree(", // Returns void
-        ".clearRetainingCapacity(", // Returns void
-        ".reset(", // Usually returns void
-        ".skip(", // Iterator skip - returns bool, not error
-        ".remove(", // HashMap/list remove - returns ?T
-        ".ordered_remove(", // OrderedHashMap remove - returns ?T
-        ".swapRemove(", // List swapRemove - returns T
-        ".orderedRemove(", // List orderedRemove - returns T
-        ".deinit(", // Deinit - returns void or diagnostic info
-        ".close(", // Close - returns void
-        ".check(", // Check/validate - returns diagnostic info
-        ".write(", // Write operations - return usize
-        ".print(", // Print operations - return !void
+fn isSafeToDiscard(t: []const u8, type_ctx: ?*const TypeContext) bool {
+    // Stdlib cleanup patterns (void methods: .free, .destroy, .deinit) — always safe
+    for (compat.getCleanupPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat) != null) return true;
+    }
+    // Return-type resolution (definitive when available)
+    if (type_ctx) |ctx| {
+        const rk = resolveReturnKind(ctx, t);
+        switch (rk) {
+            .void_type, .value, .optional, .noreturn_type => return true,
+            .error_union => return false,
+            .unknown => {}, // fall through to vocab
+        }
+    }
+    // Stdlib safe methods — type-aware: method patterns (.clear, .next, etc.)
+    // only match when receiver is a tracked stdlib variable
+    const stdlib_vars_ptr = if (type_ctx) |ctx| &ctx.stdlib_vars else null;
+    if (isMethodOnStdlibVar(t, stdlib_vars_ptr, compat.getSafeMethodPatterns())) return true;
+    // Non-stdlib patterns (parser internals, C FFI)
+    const non_stdlib_safe = [_][]const u8{
         ".parseEscapeSequence(", // Parser returning parsed value
-        "A(", // C FFI / Windows API (uppercase = external)
+        "A(", // C FFI / Windows API (uppercase)
     };
-    for (skip_patterns) |pattern| {
+    for (non_stdlib_safe) |pattern| {
         if (mem.indexOf(u8, t, pattern) != null) return true;
     }
     // C FFI: _ = ExternalFunction(...) - uppercase function name after _ =
@@ -5751,13 +6503,8 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
         return true;
 
     // Pattern 9: Method calls on var that may modify receiver (self parameter)
-    // Covers: var_name.update(...), var_name.set(...), var_name.reinit(...), etc.
-    const modifying_methods = [_][]const u8{
-        ".update(",      ".set(",    ".reinit(",         ".reset(",
-        ".assign(",      ".fill(",   ".clear(",          ".put(",
-        ".append(",      ".resize(", ".ensureCapacity(", ".replaceRange(",
-        ".insertSlice(",
-    };
+    // Stdlib container mutation methods from compat vocab
+    const modifying_methods = compat.getModifyingMethodPatterns();
     for (modifying_methods) |method| {
         if (mem.indexOf(u8, t, var_name)) |var_pos| {
             const after_var = var_pos + var_name.len;
@@ -6072,12 +6819,13 @@ fn checkDiscardedResult(
     t: []const u8,
     path: []const u8,
     line: usize,
+    type_ctx: ?*const TypeContext,
 ) ?Issue {
     const starts_discard = mem.startsWith(u8, t, "_ = ");
     const has_call = mem.indexOf(u8, t, "()") != null;
     if (!starts_discard or !has_call) return null;
     if (compat.containsOptionalMethod(t)) return null;
-    if (isSafeToDiscard(t)) return null;
+    if (isSafeToDiscard(t, type_ctx)) return null;
     // _ = try func() propagates errors - only discards success value
     if (mem.indexOf(u8, t, "try ") != null) return null;
     const has_catch = mem.indexOf(u8, t, " catch ") != null;
@@ -6339,8 +7087,7 @@ fn removePendingField(state: *ErrorAnalysisState, i: usize) void {
 fn isTestFilePath(path: []const u8) bool {
     return mem.indexOf(u8, path, "_test.zig") != null or
         mem.indexOf(u8, path, "/test/") != null or
-        mem.indexOf(u8, path, "/tests/") != null or
-        mem.indexOf(u8, path, "localhost_testing") != null;
+        mem.indexOf(u8, path, "/tests/") != null;
 }
 
 /// Report unfilled struct field
@@ -6374,21 +7121,49 @@ fn checkLineErrors(
     pending: *?PendingUndefined,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
+    type_ctx: ?*const TypeContext,
 ) !void {
     // ZA201 (silent catch) - only from line-based analyzer
-    // ZA202/ZA203 are handled only in analyzeCFGErrors
     if (!in_defer) {
         if (checkSilentCatch(t, path, ln)) |i| {
             try issues.append(allocator, i);
         }
     }
-    // Skip undefined checks in test/module-level context
-    if (!skip_undefined) {
+    // ZA202: catch unreachable
+    if (checkCatchUnreachable(t, path, ln)) |i| {
+        try issues.append(allocator, i);
+    }
+    // ZA203: orelse unreachable (simple line-based check, no null guard analysis)
+    if (checkLineOrelseUnreachable(t, path, ln)) |i| {
+        try issues.append(allocator, i);
+    }
+    // ZA207: catch undefined (dangerous — converts errors to UB)
+    if (checkCatchUndefined(t, path, ln)) |i| {
+        try issues.append(allocator, i);
+    }
+    // Always resolve pending undefineds (even at module boundary) to avoid
+    // losing ZA204 issues when skip_undefined transitions from false→true.
+    // handlePendingUndefined checks fill patterns and scope boundaries.
+    if (pending.* != null) {
+        if (handlePendingUndefined(t, path, ln, pending)) |i| {
+            try issues.append(allocator, i);
+        }
+    }
+    // Only track NEW undefineds when not in test/module-level context
+    // and when no pending is active (handlePendingUndefined already ran above)
+    if (!skip_undefined and pending.* == null) {
+        // checkUndefinedUsage: only detects new "= undefined" when pending is null
         if (checkUndefinedUsage(t, path, ln, pending)) |i| {
             try issues.append(allocator, i);
         }
     }
-    if (checkDiscardedResult(t, path, ln)) |i| try issues.append(allocator, i);
+    if (checkDiscardedResult(t, path, ln, type_ctx)) |i| try issues.append(allocator, i);
+    // ZA208: @panic() detection (skip test files only, not module-level code)
+    if (!isTestFilePath(path)) {
+        if (checkPanic(t, path, ln)) |i| {
+            try issues.append(allocator, i);
+        }
+    }
 }
 
 /// Report remaining pending issues at end of file
@@ -6428,7 +7203,9 @@ fn checkExitBypassesDefer(
 ) ?Issue {
     if (!has_defer or func_name.len == 0) return null;
     const has_exit = mem.indexOf(u8, t, "std.process.exit(") != null or
-        mem.indexOf(u8, t, "process.exit(") != null;
+        mem.indexOf(u8, t, "process.exit(") != null or
+        mem.indexOf(u8, t, "std.posix.exit(") != null or
+        mem.indexOf(u8, t, "posix.exit(") != null;
     if (!has_exit) return null;
 
     const exit_pos = mem.indexOf(u8, t, "exit(") orelse 0;
@@ -6440,7 +7217,7 @@ fn checkExitBypassesDefer(
         .col = exit_pos + 1,
         .severity = .warning,
         .rule = RULE_EXIT_BYPASSES_DEFER,
-        .message = "std.process.exit() bypasses all defers in current scope",
+        .message = "exit() bypasses all defers in current scope",
         .help = "set a flag and exit at end of function, or " ++
             "return error to let defers run",
     };
@@ -6478,6 +7255,10 @@ fn analyzeFileErrors(
     issues: *std.ArrayListUnmanaged(Issue),
     a: FileAnalysis,
 ) !void {
+    // Build type-aware context for this file (struct methods, var types, stdlib vars)
+    var type_ctx = try parseFileTypeContext(allocator, a.content);
+    defer type_ctx.deinit(allocator);
+
     var state = ErrorAnalysisState{};
     var line_num: usize = 1;
     var lines = mem.splitScalar(u8, a.content, '\n');
@@ -6503,6 +7284,7 @@ fn analyzeFileErrors(
             &state.pending_undefined,
             issues,
             allocator,
+            &type_ctx,
         );
 
         if (checkExitBypassesDefer(
@@ -7400,6 +8182,10 @@ const CFGState = struct {
     test_brace_depth: usize = 0,
     // Whether current function started inside a test block
     func_in_test: bool = false,
+    // File-level: functions that receive no-free allocators at call sites
+    no_free_param_fns: ?*const std.StringHashMapUnmanaged(void) = null,
+    // File-level: struct field names declared with no-free allocator types
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void) = null,
 };
 
 /// Detect function start and initialize state
@@ -7495,17 +8281,22 @@ fn runCFGMemoryAnalyses(
     fp: []const u8,
     fn_ret_err: bool,
     in_test: bool,
+    is_no_free_recipient: bool,
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !void {
-    var r1 = try analyzeCFGMemorySafety(a, cfg, fl, fstart, fp);
+    var r1 = try analyzeCFGMemorySafety(a, cfg, fl, fstart, fp, no_free_fields);
     defer r1.deinit(a);
     try out.appendSlice(a, r1.items);
-    var r2 = try analyzeCFGDeferCoverage(a, cfg, fl, fstart, fp);
-    defer r2.deinit(a);
-    try out.appendSlice(a, r2.items);
-    var r3 = if (in_test)
+    var r2 = if (is_no_free_recipient)
         std.ArrayListUnmanaged(Issue){}
     else
-        try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err);
+        try analyzeCFGDeferCoverage(a, cfg, fl, fstart, fp, no_free_fields);
+    defer r2.deinit(a);
+    try out.appendSlice(a, r2.items);
+    var r3 = if (in_test or is_no_free_recipient)
+        std.ArrayListUnmanaged(Issue){}
+    else
+        try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err, no_free_fields);
     defer r3.deinit(a);
     try out.appendSlice(a, r3.items);
 }
@@ -7568,14 +8359,11 @@ fn processFunction(
     func_lines_items: []const []const u8,
     fn_returns_error: bool,
     is_in_test_context: bool,
-    fn_is_noreturn: bool,
+    no_free_param_fns: ?*const std.StringHashMapUnmanaged(void),
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !void {
-    var func_issues = if (fn_is_noreturn)
-        std.ArrayListUnmanaged(Issue){}
-    else
-        try analyzeFunction(allocator, file_path, func_start, func_lines_items);
-    defer func_issues.deinit(allocator);
-    try issues.appendSlice(allocator, func_issues.items);
+    // Check if this function receives a no-free allocator via call-site propagation
+    const is_no_free_recipient = if (no_free_param_fns) |fns| fns.contains(func_name) else false;
 
     var cfg = try buildCFG(allocator, func_name, func_start, func_lines_items);
     defer cfg.deinit();
@@ -7597,6 +8385,8 @@ fn processFunction(
         file_path,
         fn_returns_error,
         is_in_test_context,
+        is_no_free_recipient,
+        no_free_fields,
     );
     try runCFGSafetyAnalyses(
         allocator,
@@ -7617,7 +8407,19 @@ fn analyzeCFGFile(
     content: []const u8,
     file_path: []const u8,
 ) !void {
-    var state = CFGState{};
+    // Pre-scan: find functions called with no-free allocator args (arena propagation)
+    var no_free_fns = try buildNoFreeParamFunctions(allocator, content);
+    defer no_free_fns.deinit(allocator);
+
+    // Pre-scan: collect struct field names declared with no-free allocator types
+    // (e.g. `arena: std.heap.ArenaAllocator,`) for field-chain suppression
+    var no_free_fields = try collectNoFreeFieldNamesFromContent(allocator, content);
+    defer no_free_fields.deinit(allocator);
+
+    var state = CFGState{
+        .no_free_param_fns = &no_free_fns,
+        .no_free_fields = &no_free_fields,
+    };
     var line_num: usize = 1;
     var line_iter = mem.splitScalar(u8, content, '\n');
     var func_lines = std.ArrayListUnmanaged([]const u8){};
@@ -7677,7 +8479,8 @@ fn finishCFGFunction(
         func_lines.items,
         state.fn_returns_error,
         in_test,
-        state.fn_is_noreturn,
+        state.no_free_param_fns,
+        state.no_free_fields,
     );
     state.in_func = false;
     func_lines.clearRetainingCapacity();
@@ -7721,7 +8524,8 @@ fn handleCFGFuncDetection(
                 func_lines.items,
                 false,
                 prev.in_test,
-                false,
+                state.no_free_param_fns,
+                state.no_free_fields,
             );
         }
         if (func_lines.items.len > 0) func_lines.clearRetainingCapacity();
@@ -7742,8 +8546,17 @@ fn analyzeCFGMemory(
 }
 
 // ============================================================================
-// analyzeFunction Helpers
+// Memory Analysis Helpers
 // ============================================================================
+
+fn countBraceDepth(t: []const u8, depth: usize) usize {
+    var d = depth;
+    for (t) |c| {
+        if (c == '{') d += 1;
+        if (c == '}' and d > 0) d -= 1;
+    }
+    return d;
+}
 
 /// Detect if function can return errors
 fn detectErrorReturns(lines: []const []const u8) bool {
@@ -7757,870 +8570,53 @@ fn detectErrorReturns(lines: []const []const u8) bool {
     return false;
 }
 
-/// Check if line contains allocation call
-fn findAllocCall(t: []const u8) ?struct { col: usize, is_create: bool } {
-    if (isPoolAllocator(t)) return null;
-    // Check for .alloc( (includes allocator.alloc( as suffix match)
-    // Skip Type.alloc() factory patterns (Type starts uppercase)
-    if (mem.indexOf(u8, t, ".alloc(")) |col| {
-        if (!isPatternInString(t, col) and !isTypeAllocFactory(t, col))
-            return .{ .col = col, .is_create = false };
+/// Check if line contains allocation call using vocab from compat layer.
+/// For .create(), uses tracked allocator set to verify receiver is an allocator
+/// (common method name on non-allocator types). All other alloc methods are
+/// allocator-specific enough to detect without type-based verification.
+fn findAllocCall(
+    t: []const u8,
+    alloc_names: ?*const std.StringHashMapUnmanaged(void),
+) ?struct { col: usize, is_create: bool } {
+    for (compat.getAllocMethodPatterns()) |pattern| {
+        const col = mem.indexOf(u8, t, pattern) orelse continue;
+        if (isPatternInString(t, col)) continue;
+        if (isTypeAllocFactory(t, col)) continue;
+
+        const is_create = mem.eql(u8, pattern, ".create(");
+        if (is_create) {
+            // .create() needs type-based check — too common on non-allocators
+            if (!isAllocatorCreateTypeBased(t, col, alloc_names))
+                continue;
+        }
+        return .{ .col = col, .is_create = is_create };
     }
-    // Check for .create( (includes allocator.create( as suffix match)
-    // Skip Type.create() factory patterns (Type starts uppercase)
-    if (mem.indexOf(u8, t, ".create(")) |col| {
-        if (!isPatternInString(t, col) and !isTypeAllocFactory(t, col) and isAllocatorCreate(t))
-            return .{ .col = col, .is_create = true };
+
+    // Check qualified function patterns (e.g. "mem.concat(", "mem.join(")
+    for (compat.getQualifiedAllocFnPatterns()) |pattern| {
+        const col = mem.indexOf(u8, t, pattern) orelse continue;
+        if (isPatternInString(t, col)) continue;
+        return .{ .col = col, .is_create = false };
     }
+
     return null;
 }
 
-/// Try to extract allocation from a line
-fn tryExtractAllocation(t: []const u8, actual_line: usize, uses_arena: bool) ?AllocInfo {
-    const name = extractVarDeclName(t) orelse return null;
-    const alloc_call = findAllocCall(t) orelse return null;
-    const alloc_name = extractAllocatorName(t) orelse "";
-    // Detect catch unreachable/return/panic: no error path, errdefer unneeded
-    const has_no_err_path = mem.indexOf(u8, t, "catch unreachable") != null or
-        mem.indexOf(u8, t, "catch return") != null or
-        mem.indexOf(u8, t, "catch @panic") != null;
-    return AllocInfo{
-        .name = name,
-        .allocator_name = alloc_name,
-        .line = actual_line,
-        .col = alloc_call.col + 1,
-        .is_create = alloc_call.is_create,
-        .is_arena_alloc = uses_arena or isNoFreeAllocatorName(alloc_name) or isArenaAllocLine(t),
-        .no_error_path = has_no_err_path,
-    };
-}
-
-/// Update allocations based on defer patterns in a line
-fn updateDefers(t: []const u8, allocs: []AllocInfo) void {
-    if (mem.indexOf(u8, t, "defer ") == null) return;
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name) == null) continue;
-        // Check for cleanup patterns (skip if inside string literals)
-        if (hasRealCleanupPattern(t)) {
-            alloc.has_defer = true;
-        }
+/// Determine if .create() at the given position is called on an allocator.
+/// Type-based: checks if receiver is in tracked allocator variable set or is uppercase (factory).
+fn isAllocatorCreateTypeBased(t: []const u8, create_pos: usize, alloc_names: ?*const std.StringHashMapUnmanaged(void)) bool {
+    const name = extractCreateCaller(t, create_pos) orelse return false;
+    // Uppercase first letter = Type.create() factory method, NOT an allocator
+    if (name.len > 0 and name[0] >= 'A' and name[0] <= 'Z') return false;
+    // Check tracked allocator variable set (type-based)
+    if (alloc_names) |names| {
+        return names.contains(name);
     }
-}
-
-/// Update allocations based on errdefer patterns
-fn updateErrdefers(t: []const u8, allocs: []AllocInfo) void {
-    if (mem.indexOf(u8, t, "errdefer ") == null) return;
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name) == null) continue;
-        // Check for cleanup patterns (skip if inside string literals)
-        if (hasRealCleanupPattern(t)) {
-            alloc.has_errdefer = true;
-        }
-    }
-}
-
-/// Report memory leak issue
-fn reportMemoryLeak(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    file_path: []const u8,
-    alloc: AllocInfo,
-) !void {
-    const msg = if (alloc.is_create)
-        "memory leak: create() result not freed on all paths"
-    else
-        "memory leak: alloc() result not freed on all paths";
-
-    const help = if (alloc.is_create)
-        "add 'defer allocator.destroy(ptr);' or return/store the pointer"
-    else
-        "add 'defer allocator.free(slice);' or return/store the pointer";
-
-    try issues.append(allocator, .{
-        .file = file_path,
-        .line = alloc.line,
-        .col = alloc.col,
-        .severity = .warning,
-        .rule = RULE_MEMORY_LEAK,
-        .message = msg,
-        .help = help,
-    });
-}
-
-// ============================================================================
-// CFG Function Analysis Helpers
-// ============================================================================
-
-const AllocLineContext = struct {
-    var_name: []const u8,
-    actual_line: usize,
-    uses_arena: bool,
-};
-
-fn detectAllocOnLine(
-    t: []const u8,
-    ctx: AllocLineContext,
-    allocs: *std.ArrayListUnmanaged(AllocInfo),
-    allocator: Allocator,
-) !void {
-    const alloc_call = findAllocCall(t) orelse return;
-    // Skip alloc() catch null - makes result optional, cleanup handled differently
-    if (mem.indexOf(u8, t, "catch null") != null) return;
-    const aname = extractAllocatorName(t) orelse "";
-    const has_no_err = mem.indexOf(u8, t, "catch unreachable") != null or
-        mem.indexOf(u8, t, "catch return") != null or
-        mem.indexOf(u8, t, "catch @panic") != null;
-    try allocs.append(allocator, .{
-        .name = ctx.var_name,
-        .allocator_name = aname,
-        .line = ctx.actual_line,
-        .col = alloc_call.col + 1,
-        .is_create = alloc_call.is_create,
-        .is_arena_alloc = ctx.uses_arena or isNoFreeAllocatorName(aname) or isArenaAllocLine(t),
-        .no_error_path = has_no_err,
-    });
-}
-
-fn trackDeferFrees(
-    t: []const u8,
-    allocs: []AllocInfo,
-    is_errdefer: bool,
-) void {
-    const keyword = if (is_errdefer) "errdefer " else "defer ";
-    if (mem.indexOf(u8, t, keyword) == null) return;
-    // Check for cleanup patterns (skip if inside string literals)
-    // Use hasRealCleanupPattern which includes .free, .destroy, AND .deinit
-    const has_cleanup = hasRealCleanupPattern(t);
-    if (!has_cleanup) return;
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name) == null) continue;
-        if (is_errdefer)
-            alloc.has_errdefer = true
-        else
-            alloc.has_defer = true;
-    }
-}
-
-fn trackExplicitFrees(
-    t: []const u8,
-    actual_line: usize,
-    allocs: []AllocInfo,
-    _: *std.ArrayListUnmanaged(MemoryEvent), // unused - double-free now in CFG analysis
-    _: Allocator, // unused - double-free now in CFG analysis
-) !void {
-    const has_defer = mem.indexOf(u8, t, "defer ") != null;
-    const has_errdefer = mem.indexOf(u8, t, "errdefer ") != null;
-    if (has_defer or has_errdefer) return;
-    // Use hasRealFreePattern to skip patterns inside string literals
-    if (!hasRealFreePattern(t)) return;
-
-    // Check if this free is in a catch/if block that also has a return
-    // Pattern: catch { ... .free(...) ... return ...; }
-    const is_catch_with_return = mem.indexOf(u8, t, "catch") != null and
-        mem.indexOf(u8, t, "return") != null;
-    const is_if_with_return = mem.startsWith(u8, t, "if ") and
-        mem.indexOf(u8, t, "return") != null;
-    const is_early_return_free = is_catch_with_return or is_if_with_return;
-
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name) == null) continue;
-        // Note: double-free/use-after-free detection now handled by CFG-based
-        // analyzeCFGMemorySafety which provides path-sensitive analysis
-        alloc.freed_explicitly = true;
-        alloc.freed_line = actual_line;
-        alloc.freed_in_early_return = is_early_return_free;
-    }
-}
-
-fn trackUseAfterFree(
-    t: []const u8,
-    actual_line: usize,
-    allocs: []const AllocInfo,
-    events: *std.ArrayListUnmanaged(MemoryEvent),
-    allocator: Allocator,
-) !void {
-    const has_defer = mem.indexOf(u8, t, "defer ") != null;
-    // Use hasRealFreePattern to skip patterns inside string literals
-    if (has_defer or hasRealFreePattern(t)) return;
-    const is_decl = mem.startsWith(u8, t, "const ");
-    const is_var = mem.startsWith(u8, t, "var ");
-    if (is_decl or is_var) return;
-    for (allocs) |alloc| {
-        const not_freed = !alloc.freed_explicitly;
-        const no_line = alloc.freed_line == 0;
-        const not_yet = alloc.freed_line >= actual_line;
-        if (not_freed or no_line or not_yet) continue;
-        // Skip if free was in an early-return block (path-safe)
-        // The free only happens on the early-return path, not on the main path
-        if (alloc.freed_in_early_return) continue;
-        const col = mem.indexOf(u8, t, alloc.name) orelse continue;
-        try events.append(allocator, .{
-            .kind = .use_after_free,
-            .alloc_name = alloc.name,
-            .alloc_line = alloc.line,
-            .freed_line = alloc.freed_line,
-            .event_line = actual_line,
-            .event_col = col + 1,
-        });
-    }
-}
-
-/// Track multi-line return/store state
-const ReturnStoreState = struct {
-    in_return: bool = false,
-    in_self_assign: bool = false,
-    brace_depth: usize = 0,
-    paren_depth: usize = 0,
-};
-
-/// Track if line starts a multi-line return or self assignment
-fn isSelfAssignStart(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "= .{") == null) return false;
-    return mem.indexOf(u8, t, "self.") != null or
-        mem.indexOf(u8, t, "result.") != null;
-}
-
-fn trackDelimiterDepth(t: []const u8, state: *ReturnStoreState) void {
-    for (t) |c| {
-        if (c == '{') state.brace_depth += 1;
-        if (c == '(') state.paren_depth += 1;
-        if (c == ')' and state.paren_depth > 0) state.paren_depth -= 1;
-        if (c == '}' and state.brace_depth > 0) state.brace_depth -= 1;
-    }
-    if (state.brace_depth == 0 and state.paren_depth == 0 and
-        mem.indexOf(u8, t, ";") != null)
-    {
-        state.in_return = false;
-        state.in_self_assign = false;
-    }
-}
-
-fn updateReturnStoreState(t: []const u8, state: *ReturnStoreState) void {
-    if (mem.startsWith(u8, t, "return ")) {
-        state.in_return = true;
-        state.brace_depth = 0;
-        state.paren_depth = 0;
-    }
-    if (!state.in_self_assign and isSelfAssignStart(t)) {
-        state.in_self_assign = true;
-        state.brace_depth = 0;
-        state.paren_depth = 0;
-    }
-    if (state.in_return or state.in_self_assign)
-        trackDelimiterDepth(t, state);
-}
-
-fn trackReturnAndStore(
-    t: []const u8,
-    allocs: []AllocInfo,
-    state: *ReturnStoreState,
-    debug_line: usize, // Added for debugging
-) void {
-    _ = debug_line;
-    const was_in_return = state.in_return;
-    const was_in_self = state.in_self_assign;
-    updateReturnStoreState(t, state);
-
-    if (was_in_return or mem.startsWith(u8, t, "return ")) {
-        markAllocsReturned(t, allocs);
-    }
-    if (was_in_self or state.in_self_assign) {
-        markAllocsStored(t, allocs);
-    }
-    markSelfResultStored(t, allocs);
-    markStructFieldStored(t, allocs);
-}
-
-/// Mark allocations as returned when their name appears in a return statement
-fn markAllocsReturned(t: []const u8, allocs: []AllocInfo) void {
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name) != null) alloc.returned = true;
-    }
-}
-
-/// Mark allocations as stored when their name appears in a self/result assignment context
-fn markAllocsStored(t: []const u8, allocs: []AllocInfo) void {
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name) != null) alloc.stored = true;
-    }
-}
-
-/// Handle single-line self.x = alloc or result.x = alloc patterns
-fn markSelfResultStored(t: []const u8, allocs: []AllocInfo) void {
-    const has_self = mem.indexOf(u8, t, "self.") != null;
-    const has_result = mem.indexOf(u8, t, "result.") != null;
-    if (!has_self and !has_result) return;
-    const eq_pos = mem.indexOf(u8, t, "=") orelse return;
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name)) |pos| {
-            if (pos > eq_pos) alloc.stored = true;
-        }
-    }
-}
-
-/// Handle general struct.field = alloc patterns (ownership transfer to struct field)
-fn markStructFieldStored(t: []const u8, allocs: []AllocInfo) void {
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return;
-    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-    if (mem.indexOf(u8, lhs, ".") == null) return;
-    for (allocs) |*alloc| {
-        if (mem.indexOf(u8, t, alloc.name)) |pos| {
-            if (pos > eq_pos) alloc.stored = true;
-        }
-    }
-}
-
-/// Report a single leaked allocation and optional errdefer warning
-fn reportOneAllocLeak(
-    alloc: AllocInfo,
-    has_err_return: bool,
-    file_path: []const u8,
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-) !void {
-    try issues.append(allocator, .{
-        .file = file_path,
-        .line = alloc.line,
-        .col = alloc.col,
-        .severity = .warning,
-        .rule = RULE_MEMORY_LEAK,
-        .message = if (alloc.is_create)
-            "memory leak: create() not freed"
-        else
-            "memory leak: alloc() not freed",
-        .help = if (alloc.is_create)
-            "add 'defer allocator.destroy(ptr);'"
-        else
-            "add 'defer allocator.free(slice);'",
-    });
-    const needs_errdefer = has_err_return and !alloc.no_error_path and
-        !alloc.has_errdefer and !alloc.returned and
-        !alloc.stored and !alloc.ownership_transferred;
-    if (needs_errdefer) {
-        try issues.append(allocator, .{
-            .file = file_path,
-            .line = alloc.line,
-            .col = alloc.col,
-            .severity = .warning,
-            .rule = RULE_ALLOC_NO_ERRDEFER,
-            .message = "alloc without errdefer",
-            .help = "add errdefer to prevent leak",
-        });
-    }
-}
-
-fn reportLeaks(
-    allocs: []const AllocInfo,
-    has_err_return: bool,
-    file_path: []const u8,
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-) !void {
-    for (allocs) |alloc| {
-        const skip = alloc.is_arena_alloc or alloc.returned or
-            alloc.stored or alloc.ownership_transferred or
-            alloc.has_defer or alloc.freed_explicitly;
-        if (!skip)
-            try reportOneAllocLeak(alloc, has_err_return, file_path, issues, allocator);
-    }
-}
-
-fn reportMemEvents(
-    events: []const MemoryEvent,
-    file_path: []const u8,
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-) !void {
-    for (events) |event| {
-        const args = .{ event.alloc_name, event.freed_line };
-        const is_uaf = event.kind == .use_after_free;
-        const msg = if (is_uaf)
-            try std.fmt.allocPrint(
-                allocator,
-                "use-after-free: '{s}' freed on {d}",
-                args,
-            )
-        else
-            try std.fmt.allocPrint(
-                allocator,
-                "double-free: '{s}' freed on {d}",
-                args,
-            );
-        const rule = if (is_uaf) RULE_USE_AFTER_FREE else RULE_DOUBLE_FREE;
-        const help = if (is_uaf)
-            "don't access freed memory"
-        else
-            "remove duplicate free";
-        try issues.append(allocator, .{
-            .file = file_path,
-            .line = event.event_line,
-            .col = event.event_col,
-            .severity = .err,
-            .rule = rule,
-            .message = msg,
-            .message_owned = true,
-            .help = help,
-        });
-    }
-}
-
-/// Mark which lines are inside defer blocks (for use-after-free detection)
-/// Frees inside defer blocks execute at scope exit, not at the literal line number
-/// Count brace depth by scanning a line for { and } characters (returns new depth)
-fn countBraceDepth(t: []const u8, depth: usize) usize {
-    var d = depth;
-    for (t) |c| {
-        if (c == '{') d += 1;
-        if (c == '}' and d > 0) d -= 1;
-    }
-    return d;
-}
-
-fn markDeferBlockLines(
-    allocator: Allocator,
-    lines: []const []const u8,
-) ![]bool {
-    var in_defer = try allocator.alloc(bool, lines.len);
-    @memset(in_defer, false);
-
-    var defer_depth: usize = 0;
-    for (lines, 0..) |line, idx| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (mem.startsWith(u8, t, "defer {") or mem.startsWith(u8, t, "defer{")) {
-            in_defer[idx] = true;
-            defer_depth = countBraceDepth(t, defer_depth);
-            continue;
-        }
-        if (defer_depth > 0) {
-            in_defer[idx] = true;
-            defer_depth = countBraceDepth(t, defer_depth);
-        }
-    }
-    return in_defer;
-}
-
-/// Alias set for tracking data flow through variables
-const AliasSet = struct {
-    names: std.ArrayListUnmanaged([]const u8),
-
-    fn deinit(self: *AliasSet, allocator: Allocator) void {
-        self.names.deinit(allocator);
-    }
-};
-
-/// Build alias sets by tracking data flow through struct assignments
-/// Pattern: const x = Type{ ... alloc_name ... } makes x an alias
-/// Check if alias_name derives from any existing name in an alias set via RHS
-fn isSliceAlias(
-    as: *const AliasSet,
-    t: []const u8,
-    alias_name: []const u8,
-    alloc_name: []const u8,
-) bool {
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
-    const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
-    for (as.names.items) |existing_name| {
-        if (mem.eql(u8, alias_name, alloc_name)) continue;
-        // Direct slice/field access: x = buffer[...] or x = buffer.field
-        if (mem.startsWith(u8, rhs, existing_name) and rhs.len > existing_name.len) {
-            const next_ch = rhs[existing_name.len];
-            if (next_ch == '[' or next_ch == '.') return true;
-        }
-        // Direct assignment: x = buffer (exact match, possibly with semicolon/catch)
-        if (mem.startsWith(u8, rhs, existing_name)) {
-            if (rhs.len == existing_name.len) return true;
-            const next_ch = rhs[existing_name.len];
-            if (next_ch == ';' or next_ch == ' ') return true;
-        }
-        // bufPrint into alloc buffer: x = std.fmt.bufPrint(buffer, ...) or bufPrint(buffer, ...)
-        if (isBufPrintAlias(rhs, existing_name)) return true;
+    // Fallback when no tracked set available: check known stdlib globals (compat layer)
+    for (compat.getGlobalAllocNames()) |g| {
+        if (mem.eql(u8, name, g)) return true;
     }
     return false;
-}
-
-/// Check if RHS is a bufPrint call using existing_name as the destination buffer
-fn isBufPrintAlias(rhs: []const u8, existing_name: []const u8) bool {
-    const bp_pos = mem.indexOf(u8, rhs, "bufPrint(") orelse return false;
-    const arg_start = bp_pos + "bufPrint(".len;
-    if (arg_start + existing_name.len > rhs.len) return false;
-    // First arg should be the buffer name
-    if (!mem.startsWith(u8, rhs[arg_start..], existing_name)) return false;
-    if (arg_start + existing_name.len >= rhs.len) return true;
-    const after = rhs[arg_start + existing_name.len];
-    return after == ',' or after == ')' or after == ' ';
-}
-
-/// Check if an alias set contains a name
-fn aliasSetContains(as: *const AliasSet, name: []const u8) bool {
-    for (as.names.items) |n| {
-        if (mem.eql(u8, n, name)) return true;
-    }
-    return false;
-}
-
-/// Extract the LHS variable name from a reassignment (not a var/const declaration)
-/// Pattern: `identifier = ...` where identifier is a simple name (no dots, no brackets)
-fn extractReassignTarget(t: []const u8) ?[]const u8 {
-    // Must not be a declaration
-    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return null;
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
-    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-    if (lhs.len == 0) return null;
-    // Must be a simple identifier (no dots, no brackets - those are field/index assigns)
-    for (lhs) |c| {
-        if (!isIdent(c)) return null;
-    }
-    return lhs;
-}
-
-/// Try to add alias_name to an alias set if it qualifies (single or multi-line)
-fn tryAddAlias(
-    allocator: Allocator,
-    as: *AliasSet,
-    t: []const u8,
-    alias_name: []const u8,
-    alloc_name: []const u8,
-    lines: []const []const u8,
-    idx: usize,
-) !void {
-    if (aliasSetContains(as, alias_name)) return;
-    if (isSliceAlias(as, t, alias_name, alloc_name)) {
-        try as.names.append(allocator, alias_name);
-        return;
-    }
-    if (isMultiLineBufPrintAlias(lines, idx, as))
-        try as.names.append(allocator, alias_name);
-}
-
-/// Scan lines for slice aliasing and add to alias sets
-fn scanSliceAliases(
-    allocator: Allocator,
-    lines: []const []const u8,
-    alias_sets: []AliasSet,
-    allocs: []const AllocInfo,
-) !void {
-    for (lines, 0..) |line, idx| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const alias_name = extractVarDeclName(t) orelse extractReassignTarget(t) orelse continue;
-        for (alias_sets, 0..) |*as, ai| {
-            try tryAddAlias(allocator, as, t, alias_name, allocs[ai].name, lines, idx);
-        }
-    }
-}
-
-/// Check if a trimmed line is the first arg of a bufPrint call matching an alias set name
-fn isFirstArgMatch(nt: []const u8, as: *const AliasSet) bool {
-    for (as.names.items) |existing_name| {
-        if (!mem.startsWith(u8, nt, existing_name)) continue;
-        if (nt.len == existing_name.len) return true;
-        const after = nt[existing_name.len];
-        if (after == ',' or after == ')' or after == ' ') return true;
-    }
-    return false;
-}
-
-/// Check if a line starts a bufPrint call whose first argument (on the next line)
-/// is an existing alias in the set. Pattern:
-///   x = ...bufPrint(        (line idx)
-///       buffer,             (line idx+1..idx+3)
-fn isMultiLineBufPrintAlias(
-    lines: []const []const u8,
-    idx: usize,
-    as: *const AliasSet,
-) bool {
-    const t = mem.trim(u8, lines[idx], " \t\r");
-    if (!hasPendingBufPrint(t)) return false;
-    // Look at next few lines for the first argument
-    const search_end = @min(idx + 4, lines.len);
-    for (lines[idx + 1 .. search_end]) |next_line| {
-        const nt = mem.trim(u8, next_line, " \t\r");
-        if (nt.len == 0) continue;
-        return isFirstArgMatch(nt, as);
-    }
-    return false;
-}
-
-/// Check if the line contains a bufPrint( call with no arguments on the same line
-fn hasPendingBufPrint(t: []const u8) bool {
-    const bp_pos = mem.indexOf(u8, t, "bufPrint(") orelse return false;
-    const after_bp = bp_pos + "bufPrint(".len;
-    if (after_bp >= t.len) return true;
-    const rest = t[after_bp..];
-    // If comma or ) present, args are on this line (handled by single-line check)
-    return mem.indexOf(u8, rest, ",") == null and mem.indexOf(u8, rest, ")") == null;
-}
-
-/// Track struct assignment data flow state
-const StructFlowState = struct {
-    in_struct: bool = false,
-    brace_depth: i32 = 0,
-    struct_var: []const u8 = "",
-
-    fn detectStart(self: *StructFlowState, t: []const u8) void {
-        if (self.in_struct) return;
-        if (mem.indexOf(u8, t, "{") == null or mem.indexOf(u8, t, "= ") == null) return;
-        if (extractVarDeclName(t)) |name| {
-            self.struct_var = name;
-            self.in_struct = true;
-            self.brace_depth = 0;
-        } else if (mem.indexOf(u8, t, ".* = ") != null) {
-            var end: usize = 0;
-            while (end < t.len and isIdent(t[end])) end += 1;
-            if (end > 0) {
-                self.struct_var = t[0..end];
-                self.in_struct = true;
-                self.brace_depth = 0;
-            }
-        }
-    }
-
-    fn trackBraces(self: *StructFlowState, t: []const u8) void {
-        for (t) |c| {
-            if (c == '{') self.brace_depth += 1;
-            if (c == '}') self.brace_depth -= 1;
-        }
-    }
-
-    fn checkEnd(self: *StructFlowState, t: []const u8) void {
-        if (self.brace_depth <= 0 and mem.indexOf(u8, t, ";") != null) {
-            self.in_struct = false;
-            self.struct_var = "";
-        }
-    }
-};
-
-/// Scan struct data flow and add struct vars as aliases
-/// Check if an alias set references a line and should adopt the struct var
-fn shouldAdoptStructVar(
-    as: *const AliasSet,
-    t: []const u8,
-    struct_var: []const u8,
-    alloc_name: []const u8,
-) bool {
-    if (struct_var.len == 0) return false;
-    if (mem.eql(u8, struct_var, alloc_name)) return false;
-    if (aliasSetContains(as, struct_var)) return false;
-    for (as.names.items) |alias| {
-        if (mem.indexOf(u8, t, alias) != null) return true;
-    }
-    return false;
-}
-
-fn scanStructDataFlow(
-    allocator: Allocator,
-    lines: []const []const u8,
-    alias_sets: []AliasSet,
-    allocs: []const AllocInfo,
-) !void {
-    var sfs = StructFlowState{};
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        sfs.detectStart(t);
-        if (!sfs.in_struct) continue;
-        sfs.trackBraces(t);
-        var to_update: [64]usize = undefined;
-        var count: usize = 0;
-        for (alias_sets, 0..) |*as, ai| {
-            if (count >= 64) break;
-            if (!shouldAdoptStructVar(as, t, sfs.struct_var, allocs[ai].name))
-                continue;
-            to_update[count] = ai;
-            count += 1;
-        }
-        for (to_update[0..count]) |idx| {
-            try alias_sets[idx].names.append(allocator, sfs.struct_var);
-        }
-        sfs.checkEnd(t);
-    }
-}
-
-fn buildAliasSets(
-    allocator: Allocator,
-    lines: []const []const u8,
-    allocs: []const AllocInfo,
-) ![]AliasSet {
-    const alias_sets = try allocator.alloc(AliasSet, allocs.len);
-    for (alias_sets, 0..) |*as, i| {
-        as.names = .{};
-        try as.names.append(allocator, allocs[i].name);
-    }
-    try scanSliceAliases(allocator, lines, alias_sets, allocs);
-    try scanStructDataFlow(allocator, lines, alias_sets, allocs);
-    return alias_sets;
-}
-
-/// Check if line has assignment pattern for ownership
-fn checkAssignmentOwnership(
-    t: []const u8,
-    alias: []const u8,
-    alloc: *AllocInfo,
-) void {
-    if (mem.indexOf(u8, t, " = ") == null) return;
-    if (mem.startsWith(u8, t, "const ")) return;
-    if (mem.startsWith(u8, t, "var ")) return;
-    const eq_pos = mem.indexOf(u8, t, " = ").?;
-    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-    if (lhs.len == 0) return;
-    if (mem.indexOf(u8, lhs, ".") == null and
-        !mem.eql(u8, lhs, alias))
-    {
-        alloc.stored = true;
-    }
-    if (mem.indexOf(u8, lhs, ".") != null) {
-        const rhs = t[eq_pos + 3 ..];
-        if (mem.indexOf(u8, rhs, alias) != null) {
-            alloc.stored = true;
-        }
-    }
-}
-
-/// Check method-call ownership transfer patterns
-fn checkMethodTransfer(t: []const u8, alloc: *AllocInfo) void {
-    const methods = [_][]const u8{
-        ".put(",          ".putNoClobber(",
-        ".append(",       ".appendSlice(",
-        ".insert(",       ".add(",
-        ".push(",         ".enqueue(",
-        ".submit(",       ".toJS(",
-        ".toValue(",      ".toSlice(",
-        ".toOwnedSlice(", ".dependOn(",
-        ".setText(",      ".clone(",
-        ".addText(",      ".strHash(",
-    };
-    for (methods) |m| {
-        if (mem.indexOf(u8, t, m) != null) {
-            alloc.ownership_transferred = true;
-            return;
-        }
-    }
-}
-
-/// Track alias-based ownership transfers for a line
-/// Apply ownership tracking for a single alias match against an alloc
-fn applyAliasOwnership(
-    t: []const u8,
-    alias: []const u8,
-    alloc: *AllocInfo,
-    in_ret: bool,
-    in_self: bool,
-) void {
-    if (in_ret) alloc.returned = true;
-    if (in_self) alloc.stored = true;
-    checkAssignmentOwnership(t, alias, alloc);
-    checkMethodTransfer(t, alloc);
-    if (!alloc.ownership_transferred and isFunctionArgTransfer(t, alias)) {
-        alloc.ownership_transferred = true;
-    }
-}
-
-fn trackAliasOwnership(
-    t: []const u8,
-    rss: *const ReturnStoreState,
-    alias_sets: []const AliasSet,
-    allocs: []AllocInfo,
-) void {
-    const in_ret = rss.in_return or
-        mem.startsWith(u8, t, "return ");
-    const in_self = rss.in_self_assign or
-        mem.indexOf(u8, t, "self.") != null or
-        mem.indexOf(u8, t, "ctx.") != null;
-
-    for (alias_sets, 0..) |as, ai| {
-        for (as.names.items) |alias| {
-            if (mem.indexOf(u8, t, alias) == null) continue;
-            applyAliasOwnership(t, alias, &allocs[ai], in_ret, in_self);
-        }
-    }
-}
-
-/// Collect allocations from function lines (Pass 1)
-fn collectFuncAllocations(
-    allocator: Allocator,
-    lines: []const []const u8,
-    func_start: usize,
-    uses_arena: bool,
-) !std.ArrayListUnmanaged(AllocInfo) {
-    var allocs = std.ArrayListUnmanaged(AllocInfo){};
-    for (lines, 0..) |line, idx| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const var_name = extractVarDeclName(t) orelse continue;
-        const ctx: AllocLineContext = .{
-            .var_name = var_name,
-            .actual_line = func_start + idx,
-            .uses_arena = uses_arena,
-        };
-        try detectAllocOnLine(t, ctx, &allocs, allocator);
-    }
-    return allocs;
-}
-
-/// Process lines for defer/free/ownership tracking (Pass 3)
-fn processAllocTracking(
-    allocator: Allocator,
-    lines: []const []const u8,
-    func_start: usize,
-    allocs: *std.ArrayListUnmanaged(AllocInfo),
-    events: *std.ArrayListUnmanaged(MemoryEvent),
-    alias_sets: []const AliasSet,
-    in_defer_block: []const bool,
-) !void {
-    var rss = ReturnStoreState{};
-    for (lines, 0..) |line, idx| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        for (allocs.items) |*a| {
-            if (isOwnershipTransfer(t, a.name)) a.ownership_transferred = true;
-        }
-        trackDeferFrees(t, allocs.items, false);
-        trackDeferFrees(t, allocs.items, true);
-        if (!in_defer_block[idx])
-            try trackExplicitFrees(t, func_start + idx, allocs.items, events, allocator);
-        updateReturnStoreState(t, &rss);
-        trackAliasOwnership(t, &rss, alias_sets, allocs.items);
-    }
-}
-
-/// Analyze a single function for memory issues
-fn analyzeFunction(
-    allocator: Allocator,
-    file_path: []const u8,
-    func_start: usize,
-    lines: []const []const u8,
-) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
-    const has_err_return = detectErrorReturns(lines);
-    const uses_arena = isNoFreeAllocator(lines);
-
-    const in_defer_block = try markDeferBlockLines(allocator, lines);
-    defer allocator.free(in_defer_block);
-
-    var allocs = try collectFuncAllocations(allocator, lines, func_start, uses_arena);
-    defer allocs.deinit(allocator);
-
-    var events = std.ArrayListUnmanaged(MemoryEvent){};
-    defer events.deinit(allocator);
-
-    const alias_sets = try buildAliasSets(allocator, lines, allocs.items);
-    defer {
-        for (alias_sets) |*as| as.deinit(allocator);
-        allocator.free(alias_sets);
-    }
-
-    try processAllocTracking(
-        allocator,
-        lines,
-        func_start,
-        &allocs,
-        &events,
-        alias_sets,
-        in_defer_block,
-    );
-    try reportLeaks(allocs.items, has_err_return, file_path, &issues, allocator);
-    try reportMemEvents(events.items, file_path, &issues, allocator);
-    return issues;
 }
 
 // ============================================================================
@@ -8639,18 +8635,24 @@ fn hasErrorHandling(t: []const u8) bool {
 }
 
 /// Check if line contains builtin or optional method (safe to discard)
-/// Patterns that are safe to discard (builtins and value-returning methods)
-const safe_builtin_pats = [_][]const u8{
-    "@import",          "@intCast",        "@ptrCast",     "@as(",
-    ".pop()",           ".orderedRemove(", ".swapRemove(", ".getLast()",
-    ".getLastOrNull()", ".get(",           ".count()",     ".len",
-    ".items",           ".next()",         ".peek()",
-};
-
-fn isSafeBuiltin(t: []const u8) bool {
-    for (safe_builtin_pats) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) return true;
+fn isSafeBuiltin(t: []const u8, type_ctx: ?*const TypeContext) bool {
+    // Zig builtins (version-aware via compat layer)
+    if (compat.containsBuiltin(t)) return true;
+    // Return-type resolution (definitive when available)
+    if (type_ctx) |ctx| {
+        const rk = resolveReturnKind(ctx, t);
+        switch (rk) {
+            .void_type, .value, .optional, .noreturn_type => return true,
+            .error_union => return false,
+            .unknown => {}, // fall through to vocab
+        }
     }
+    // Stdlib safe methods — type-aware
+    const stdlib_vars_ptr = if (type_ctx) |ctx| &ctx.stdlib_vars else null;
+    if (isMethodOnStdlibVar(t, stdlib_vars_ptr, compat.getSafeMethodPatterns())) return true;
+    // Non-stdlib safe patterns (struct field access)
+    if (mem.indexOf(u8, t, ".len") != null) return true;
+    if (mem.indexOf(u8, t, ".items") != null) return true;
     return compat.containsOptionalMethod(t);
 }
 
@@ -8669,13 +8671,27 @@ fn isStatementPattern(t: []const u8) bool {
 }
 
 /// Check if it's a known void function (safe to not capture result)
-fn isKnownVoidFunction(t: []const u8) bool {
-    const void_fns = [_][]const u8{
-        "print(",   "debug.print", "log.",   "assert(",   "expect(",
-        ".deinit(", ".close(",     ".free(", ".destroy(",
-    };
-    for (void_fns) |fn_name| {
-        if (mem.indexOf(u8, t, fn_name) != null) return true;
+fn isKnownVoidFunction(t: []const u8, type_ctx: ?*const TypeContext) bool {
+    // Stdlib cleanup patterns (.free, .destroy, .deinit) — always void
+    for (compat.getCleanupPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat) != null) return true;
+    }
+    // Return-type resolution (definitive when available)
+    if (type_ctx) |ctx| {
+        const rk = resolveReturnKind(ctx, t);
+        switch (rk) {
+            .void_type, .noreturn_type => return true,
+            .error_union, .value, .optional => return false,
+            .unknown => {}, // fall through to vocab
+        }
+    }
+    // Stdlib void methods — type-aware: .clear, .close, .reset only on stdlib vars;
+    // debug.print, assert always apply (universal patterns)
+    const stdlib_vars_ptr = if (type_ctx) |ctx| &ctx.stdlib_vars else null;
+    if (isMethodOnStdlibVar(t, stdlib_vars_ptr, compat.getVoidMethodPatterns())) return true;
+    // log.* with word boundary (std.log.info, std.log.warn, etc.)
+    if (mem.indexOf(u8, t, "log.")) |pos| {
+        if (pos == 0 or !isIdent(t[pos - 1])) return true;
     }
     return false;
 }
@@ -8687,9 +8703,10 @@ fn checkIgnoredError(
     file_path: []const u8,
     t: []const u8,
     line_num: usize,
+    type_ctx: ?*const TypeContext,
 ) !void {
     const is_discard = mem.startsWith(u8, t, "_ = ") and mem.indexOf(u8, t, "(") != null;
-    if (!is_discard or hasErrorHandling(t) or isSafeBuiltin(t)) return;
+    if (!is_discard or hasErrorHandling(t) or isSafeBuiltin(t, type_ctx)) return;
     try issues.append(allocator, .{
         .file = file_path,
         .line = line_num,
@@ -8749,6 +8766,10 @@ fn analyzeIgnoredErrorsInFile(
     file_path: []const u8,
     content: []const u8,
 ) !void {
+    // Build type-aware context for this file (struct methods, var types, stdlib vars)
+    var type_ctx = try parseFileTypeContext(allocator, content);
+    defer type_ctx.deinit(allocator);
+
     var line_num: usize = 1;
     var defer_depth: usize = 0;
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -8766,7 +8787,7 @@ fn analyzeIgnoredErrorsInFile(
             defer_depth = updateDeferBraceDepth(t, defer_depth);
             continue;
         }
-        try checkIgnoredError(allocator, issues, file_path, t, line_num);
+        try checkIgnoredError(allocator, issues, file_path, t, line_num, &type_ctx);
     }
 }
 
@@ -9218,6 +9239,69 @@ fn checkOrelseUnreachable(
         .rule = RULE_ORELSE_UNREACHABLE,
         .message = "orelse unreachable will panic",
         .help = "use explicit null handling",
+    };
+}
+
+/// ZA203 (line-based): orelse unreachable without null guard analysis
+/// Used by checkLineErrors for the `errors` subcommand path.
+fn checkLineOrelseUnreachable(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+) ?Issue {
+    const col = mem.indexOf(u8, t, "orelse unreachable") orelse return null;
+    if (isInsideString(t, col)) return null;
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_ORELSE_UNREACHABLE,
+        .message = "orelse unreachable will panic",
+        .help = "use explicit null handling",
+    };
+}
+
+/// ZA207: catch undefined converts errors to undefined behavior
+fn checkCatchUndefined(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+) ?Issue {
+    // Match "catch undefined" but not "catch |_| undefined" or "catch |err| undefined"
+    const col = mem.indexOf(u8, t, "catch undefined") orelse return null;
+    if (isInsideString(t, col)) return null;
+    // Ensure it's "catch undefined" not "catch |...| undefined"
+    const after_catch = t[col + 5 ..]; // skip "catch"
+    const trimmed = mem.trimLeft(u8, after_catch, " \t");
+    if (trimmed.len > 0 and trimmed[0] == '|') return null;
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_CATCH_UNDEFINED,
+        .message = "catch undefined converts errors to undefined behavior",
+        .help = "handle the error explicitly or use catch |err| { ... }",
+    };
+}
+
+/// ZA208: @panic() will crash the program
+fn checkPanic(
+    t: []const u8,
+    file_path: []const u8,
+    line_num: usize,
+) ?Issue {
+    const col = mem.indexOf(u8, t, "@panic(") orelse return null;
+    if (isInsideString(t, col)) return null;
+    return .{
+        .file = file_path,
+        .line = line_num,
+        .col = col + 1,
+        .severity = .note,
+        .rule = RULE_PANIC,
+        .message = "@panic() will crash the program",
+        .help = "consider returning an error instead, or document why panic is necessary",
     };
 }
 
@@ -11265,14 +11349,13 @@ fn isTypeFactory(line: []const u8) bool {
 
 /// Default orphan exclusion path patterns (contains-match)
 const orphan_exclude_dirs = [_][]const u8{
-    "/test/",             "/tests/",      "/testing/",
-    "localhost_testing/", "/examples/",   "/example/",
-    "/bench/",            "/benchmarks/", "/demo/",
-    "/demos/",            "/samples/",    "/tools/",
-    "/mods/",             "/init/",       "/deps/",
-    "/vendor/",           "/.packages/",  "/tool/",
-    "/user/",             "/apps/",       "/app/",
-    "/cmd/",
+    "/test/",       "/tests/",   "/testing/",
+    "/examples/",   "/example/", "/bench/",
+    "/benchmarks/", "/demo/",    "/demos/",
+    "/samples/",    "/tools/",   "/mods/",
+    "/init/",       "/deps/",    "/vendor/",
+    "/.packages/",  "/tool/",    "/user/",
+    "/apps/",       "/app/",     "/cmd/",
 };
 
 /// Check if a path matches any of the orphan exclusion directory patterns
@@ -11859,11 +11942,12 @@ fn writeDefaultConfig() !void {
         \\  //
         \\  // Available rules:
         \\  //   ZA1xx Memory:     ZA101 alloc-no-defer, ZA102 create-no-defer,
-        \\  //                     ZA103 alloc-no-errdefer, ZA104 memory-leak,
+        \\  //                     ZA103 alloc-no-errdefer,
         \\  //                     ZA105 use-after-free, ZA106 double-free
         \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (note), ZA202 catch-unreachable (note),
         \\  //                     ZA203 orelse-unreachable (note), ZA204 undefined (note),
-        \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer
+        \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer,
+        \\  //                     ZA207 catch-undefined, ZA208 panic (note)
         \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
         \\  //                     ZA303 too-many-params, ZA304 too-many-branches
         \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
@@ -11881,9 +11965,9 @@ fn writeDefaultConfig() !void {
         \\  // Configurable thresholds
         \\  "thresholds": {
         \\    "max_lines": 50,
-        \\    "max_nesting": 4,
-        \\    "max_params": 5,
-        \\    "max_branches": 10,
+        \\    "max_nesting": 3,
+        \\    "max_params": 4,
+        \\    "max_branches": 12,
         \\    "max_line_length": 100
         \\  }
         \\}
@@ -12048,9 +12132,9 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
             \\  // Configurable thresholds
             \\  "thresholds": {{
             \\    "max_lines": 50,
-            \\    "max_nesting": 4,
-            \\    "max_params": 5,
-            \\    "max_branches": 10,
+            \\    "max_nesting": 3,
+            \\    "max_params": 4,
+            \\    "max_branches": 12,
             \\    "max_line_length": 100
             \\  }}
             \\}}
@@ -12479,7 +12563,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.10.3";
+const EPHOR_VERSION = "0.11.0";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -12690,12 +12774,12 @@ fn scanBuildZigEntries(
 ) !void {
     const build_zig_path = try buildPathWithPrefix(allocator, cfg.path, "build.zig");
     defer allocator.free(build_zig_path);
-    try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, added);
+    try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, added, 0);
 
     const parent = std.fs.path.dirname(mem.trimRight(u8, cfg.path, "/")) orelse ".";
     const parent_build = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{parent});
     defer allocator.free(parent_build);
-    try extractBuildZigEntriesFromPath(allocator, cfg, parent_build, parent, added);
+    try extractBuildZigEntriesFromPath(allocator, cfg, parent_build, parent, added, 0);
 }
 
 fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
@@ -12724,7 +12808,7 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
     for (multi_entry_dirs) |dir| {
         const dir_path = try buildPathWithPrefix(allocator, cfg.path, dir);
         defer allocator.free(dir_path);
-        try scanDirForEntriesWithPrefix(allocator, cfg, dir_path, cfg.path, &added);
+        try scanDirForEntriesWithPrefix(allocator, cfg, dir_path, cfg.path, &added, 0);
     }
 }
 
@@ -12967,6 +13051,7 @@ fn followImportsInLine(
     build_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
     var imp_pos: usize = 0;
     while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
@@ -12975,7 +13060,7 @@ fn followImportsInLine(
         const imp_path = extractQuotedPath(line, istart) orelse continue;
         if (!isValidZigImport(imp_path)) continue;
         try addEntryWithPrefix(allocator, cfg, imp_path, prefix, added);
-        try recurseNestedBuildModule(allocator, cfg, build_path, imp_path, prefix, added);
+        try recurseNestedBuildModule(allocator, cfg, build_path, imp_path, prefix, added, depth);
     }
 }
 
@@ -12987,11 +13072,12 @@ fn recurseNestedBuildModule(
     imp_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) Allocator.Error!void {
     const cur_dir = std.fs.path.dirname(build_path) orelse ".";
     const nested = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cur_dir, imp_path });
     defer allocator.free(nested);
-    extractBuildZigEntriesFromPath(allocator, cfg, nested, prefix, added) catch {
+    extractBuildZigEntriesFromPath(allocator, cfg, nested, prefix, added, depth + 1) catch {
         if (cfg.verbose) std.debug.print(
             "note: could not parse nested build module {s}\n",
             .{nested},
@@ -13006,7 +13092,11 @@ fn extractBuildZigEntriesFromPath(
     build_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
+    // Prevent stack overflow from circular @import chains (e.g., A imports B imports A)
+    if (depth > 4) return;
+
     const content = fs.cwd().readFileAlloc(allocator, build_path, 1024 * 1024) catch return;
     defer allocator.free(content);
 
@@ -13019,7 +13109,7 @@ fn extractBuildZigEntriesFromPath(
         // Handle b.pathJoin(&.{ "dir", "file.zig" }) patterns
         try extractPathJoinEntries(allocator, cfg, line, prefix, added);
         try extractPathTagEntries(allocator, cfg, line, prefix, added);
-        try followImportsInLine(allocator, cfg, line, build_path, prefix, added);
+        try followImportsInLine(allocator, cfg, line, build_path, prefix, added, depth);
     }
 }
 
@@ -13062,7 +13152,9 @@ fn scanDirForEntriesWithPrefix(
     dir_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
+    if (depth > 16) return;
     var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     var iter = dir.iterate();
@@ -13073,7 +13165,7 @@ fn scanDirForEntriesWithPrefix(
         if (entry.kind != .directory) continue;
         const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
         defer allocator.free(subdir);
-        try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added);
+        try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added, depth + 1);
     }
 }
 
@@ -13083,7 +13175,9 @@ fn scanDirForEntries(
     cfg: *Config,
     dir_path: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
+    if (depth > 16) return;
     var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     var iter = dir.iterate();
@@ -13094,7 +13188,7 @@ fn scanDirForEntries(
         if (entry.kind != .directory) continue;
         const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
         defer allocator.free(subdir);
-        try scanDirForEntries(allocator, cfg, subdir, added);
+        try scanDirForEntries(allocator, cfg, subdir, added, depth + 1);
     }
 }
 
@@ -13129,7 +13223,7 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
         "bin",       "ci",      "user",
     };
     for (multi_entry_dirs) |dir| {
-        try scanDirForEntries(allocator, cfg, dir, &added);
+        try scanDirForEntries(allocator, cfg, dir, &added, 0);
     }
 
     // Auto-discover test files in src/
@@ -13180,12 +13274,16 @@ fn parseThresholdArg(arg: []const u8, th: *Thresholds) bool {
         th.max_function_lines = v;
         return true;
     }
-    if (parseThreshold(arg, "--max-nesting=", 4)) |v| {
+    if (parseThreshold(arg, "--max-nesting=", 3)) |v| {
         th.max_nesting_depth = v;
         return true;
     }
-    if (parseThreshold(arg, "--max-params=", 5)) |v| {
+    if (parseThreshold(arg, "--max-params=", 4)) |v| {
         th.max_params = v;
+        return true;
+    }
+    if (parseThreshold(arg, "--max-branches=", 12)) |v| {
+        th.max_branches = v;
         return true;
     }
     if (parseThreshold(arg, "--max-line-length=", 100)) |v| {
@@ -13368,7 +13466,7 @@ fn printHelp() void {
         \\  runtime     Run tests with memory diagnostics (dynamic analysis)
         \\  orphans     Files not imported from entry points
         \\  memory      Alloc without defer patterns
-        \\  errors      Silent catch {} discards
+        \\  errors      Error handling patterns (ZA201-ZA208)
         \\  unused      Unused imports/declarations
         \\  complexity  Function complexity metrics
         \\  fmt-check   Files needing zig fmt (runs zig fmt --check)
@@ -13380,8 +13478,9 @@ fn printHelp() void {
         \\  --disable=<rule>     Disable rule (e.g., ZA301, ZA1)
         \\  --enable=<rule>      Enable rule (overrides disable)
         \\  --max-lines=N        Max function lines (default: 50)
-        \\  --max-nesting=N      Max nesting depth (default: 4)
-        \\  --max-params=N       Max parameters (default: 5)
+        \\  --max-nesting=N      Max nesting depth (default: 3)
+        \\  --max-params=N       Max parameters (default: 4)
+        \\  --max-branches=N     Max branches per function (default: 12)
         \\  --max-line-length=N  Max columns per line (default: 100)
         \\  --max-file-bytes=N   Max file size in bytes (optional)
         \\  -V, --verbose        Verbose output
@@ -13419,9 +13518,9 @@ fn printHelp() void {
         \\    "enable": ["ZA702"],
         \\    "thresholds": {
         \\      "max_lines": 50,
-        \\      "max_nesting": 4,
-        \\      "max_params": 5,
-        \\      "max_branches": 10,
+        \\      "max_nesting": 3,
+        \\      "max_params": 4,
+        \\      "max_branches": 12,
         \\      "max_line_length": 100,
         \\      "max_file_bytes": 25000
         \\    }
@@ -13435,7 +13534,7 @@ fn printHelp() void {
         \\
         \\RULE IDS:
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
-        \\                     ZA103: alloc-no-errdefer, ZA104: memory-leak,
+        \\                     ZA103: alloc-no-errdefer,
         \\                     ZA105: use-after-free, ZA106: double-free)
         \\  ZA2xx  ErrHandle  (ZA201: silent-catch, ZA202: catch-unreachable,
         \\                     ZA203: orelse-unreachable, ZA204: undefined,
@@ -14001,6 +14100,15 @@ pub fn main() !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeErrors(alloc, &g);
             defer deinitIssues(&issues, alloc);
+            // ZA205: discarded error union results
+            var ignored = try analyzeIgnoredErrors(alloc, &g);
+            defer deinitIssues(&ignored, alloc);
+            // Merge ignored errors into issues for unified output
+            for (ignored.items) |item| {
+                try issues.append(alloc, item);
+            }
+            // Clear ignored without deiniting items (now owned by issues)
+            ignored.items.len = 0;
             const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg, &g);
             _ = c;
         },
@@ -14140,6 +14248,9 @@ pub fn main() !void {
                         try null_safety_issues.append(alloc, issue);
                     } else if (mem.startsWith(u8, issue.rule, "ZA9")) {
                         try panic_issues.append(alloc, issue);
+                    } else if (mem.startsWith(u8, issue.rule, "ZA2")) {
+                        // ZA2xx covered by analyzeErrors — skip to avoid duplicates
+                        continue;
                     } else {
                         try mem_only_issues.append(alloc, issue);
                     }
@@ -14330,7 +14441,7 @@ test "relativePath" {
 }
 
 // ============================================================================
-// Phase 4: CFG Memory Analysis Tests (ZA104, ZA105, ZA106)
+// Phase 4: CFG Memory Analysis Tests (ZA105, ZA106)
 // ============================================================================
 
 /// Helper to create test FileAnalysis with content
@@ -14759,6 +14870,794 @@ test "analyzeIgnoredErrors no false positive for catch" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_IGNORED_ERROR));
         }
     }
+}
+
+// ============================================================================
+// TypeContext / Return-Type-Aware Detection Integration Tests (ZA205)
+// Tests that the TypeContext parsing correctly suppresses or flags discarded
+// results based on the actual return type of user-defined methods/functions.
+// ============================================================================
+
+test "ZA205 type-aware: user-defined void method NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const MyLogger = struct {
+        \\    data: u32,
+        \\    pub fn clear(self: *MyLogger) void {
+        \\        self.data = 0;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var logger = MyLogger{ .data = 42 };
+        \\    _ = logger.clear();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_void_method.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_void_method.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // _ = logger.clear() should NOT be flagged (parsed void return)
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: user-defined error method IS flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const FlushableLogger = struct {
+        \\    data: u32,
+        \\    pub fn flush(self: *FlushableLogger) !void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var flogger = FlushableLogger{ .data = 0 };
+        \\    _ = flogger.flush();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_error_method.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_error_method.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // _ = flogger.flush() SHOULD be flagged (parsed !void return)
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA205 type-aware: standalone void function NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\fn helper() void {}
+        \\fn use() void {
+        \\    _ = helper();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_void_fn.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_void_fn.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: standalone error function IS flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\fn riskyOp() !void {
+        \\    return;
+        \\}
+        \\fn use() void {
+        \\    _ = riskyOp();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_error_fn.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_error_fn.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA205 type-aware: value-returning method NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Counter = struct {
+        \\    val: u32,
+        \\    pub fn count(self: *const Counter) u32 {
+        \\        return self.val;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var c = Counter{ .val = 5 };
+        \\    _ = c.count();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_value_method.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_value_method.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: optional-returning method NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Cache = struct {
+        \\    val: u32,
+        \\    pub fn lookup(self: *const Cache) ?u32 {
+        \\        _ = self;
+        \\        return null;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var cache = Cache{ .val = 0 };
+        \\    _ = cache.lookup();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_optional_method.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_optional_method.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const std = @import("std");
+        \\fn use() void {
+        \\    var list: std.ArrayListUnmanaged(u32) = .{};
+        \\    _ = list.pop();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_stdlib_method.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_stdlib_method.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: mixed struct void and error methods" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Struct has both void and error-returning methods
+    // Only the error-returning one should be flagged
+    const content =
+        \\const Service = struct {
+        \\    state: u32,
+        \\    pub fn reset(self: *Service) void {
+        \\        self.state = 0;
+        \\    }
+        \\    pub fn connect(self: *Service) !void {
+        \\        _ = self;
+        \\    }
+        \\    pub fn getStatus(self: *const Service) u32 {
+        \\        return self.state;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var svc = Service{ .state = 0 };
+        \\    _ = svc.reset();
+        \\    _ = svc.connect();
+        \\    _ = svc.getStatus();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_mixed_methods.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_mixed_methods.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // Should have exactly 1 ZA205: for svc.connect() (!void)
+    // reset() is void, getStatus() is u32 — both safe
+    var za205_count: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            za205_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), za205_count);
+}
+
+test "ZA205 type-aware: user .clear() returning !void IS flagged (overrides vocab)" {
+    // CRITICAL: This is the key test for TypeContext. The old code would NOT flag
+    // this because .clear( matches safe_method_patterns vocab. The new code MUST
+    // flag it because TypeContext resolves .clear() to error_union for this struct.
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const ErrorCleaner = struct {
+        \\    data: u32,
+        \\    pub fn clear(self: *ErrorCleaner) !void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var cleaner = ErrorCleaner{ .data = 0 };
+        \\    _ = cleaner.clear();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_error_clear.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_error_clear.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // _ = cleaner.clear() MUST be flagged — clear() returns !void on this type
+    // This is the scenario where TypeContext overrides the vocab safe_method_patterns
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
+    // Verify that stdlib containers' .clear() is still suppressed via vocab
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const std = @import("std");
+        \\fn use() void {
+        \\    var list: std.ArrayListUnmanaged(u32) = .{};
+        \\    _ = list.clear();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_stdlib_clear.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_stdlib_clear.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: unknown receiver falls through to legacy" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Variable type can't be determined (comes from function param)
+    // Should fall through to legacy pattern matching
+    const content =
+        \\fn use(x: anytype) void {
+        \\    _ = x.next();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_unknown_type.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_unknown_type.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // .next() is in the optional_methods vocab, so should NOT be flagged
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: enum void method NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const State = enum {
+        \\    active,
+        \\    inactive,
+        \\    pub fn reset(self: *State) void {
+        \\        self.* = .inactive;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var s: State = .active;
+        \\    _ = s.reset();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_enum_void.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_enum_void.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: enum error method IS flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const State = enum {
+        \\    active,
+        \\    inactive,
+        \\    pub fn tryTransition(self: *State) !void {
+        \\        _ = self;
+        \\        return;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var s: State = .active;
+        \\    _ = s.tryTransition();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_enum_error.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_enum_error.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za205 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            found_za205 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za205);
+}
+
+test "ZA205 type-aware: union void method NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Result = union(enum) {
+        \\    ok: u32,
+        \\    fail: void,
+        \\    pub fn discard(self: *Result) void {
+        \\        self.* = .{ .fail = {} };
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var r: Result = .{ .ok = 42 };
+        \\    _ = r.discard();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_union_void.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_union_void.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: union error method IS flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Result = union(enum) {
+        \\    ok: u32,
+        \\    fail: void,
+        \\    pub fn tryUnwrap(self: Result) !u32 {
+        \\        return switch (self) {
+        \\            .ok => |v| v,
+        \\            .fail => error.Failed,
+        \\        };
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    const r: Result = .{ .ok = 42 };
+        \\    _ = r.tryUnwrap();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_union_error.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_union_error.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za205 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            found_za205 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za205);
+}
+
+test "ZA205 type-aware: enum value method NOT flagged" {
+    // Enum method that returns a value (not error union) — safe to discard
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Color = enum {
+        \\    red,
+        \\    green,
+        \\    blue,
+        \\    pub fn toInt(self: Color) u8 {
+        \\        return switch (self) {
+        \\            .red => 0,
+        \\            .green => 1,
+        \\            .blue => 2,
+        \\        };
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    const c: Color = .red;
+        \\    _ = c.toInt();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_enum_value.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_enum_value.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: packed struct method works" {
+    // Packed structs are used in real code (hardware registers, protocol headers)
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Flags = packed struct {
+        \\    readable: bool,
+        \\    writable: bool,
+        \\    _padding: u6 = 0,
+        \\    pub fn clear(self: *Flags) void {
+        \\        self.readable = false;
+        \\        self.writable = false;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var f = Flags{ .readable = true, .writable = true };
+        \\    _ = f.clear();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_packed_struct.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_packed_struct.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: extern struct method works" {
+    // Extern structs used for C FFI
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const CHandle = extern struct {
+        \\    fd: i32,
+        \\    pub fn close(self: *CHandle) void {
+        \\        self.fd = -1;
+        \\    }
+        \\    pub fn read(self: *CHandle) !u32 {
+        \\        _ = self;
+        \\        return 0;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var h = CHandle{ .fd = 3 };
+        \\    _ = h.close();
+        \\    _ = h.read();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_extern_struct.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_extern_struct.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // close() returns void — NOT flagged
+    // read() returns !u32 — SHOULD be flagged
+    var za205_count: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            za205_count += 1;
+        }
+    }
+    // Only read() should trigger ZA205
+    try std.testing.expectEqual(@as(usize, 1), za205_count);
+}
+
+test "ZA205 type-aware: noreturn function NOT flagged" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Processor = struct {
+        \\    data: u32,
+        \\    pub fn halt(self: *Processor) noreturn {
+        \\        _ = self;
+        \\        while (true) {}
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var p = Processor{ .data = 0 };
+        \\    _ = p.halt();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_noreturn.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_noreturn.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            std.debug.print("UNEXPECTED ZA205 at line {d}: {s}\n", .{ issue.line, issue.message });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA205 type-aware: multiple user types in same file resolved independently" {
+    // Real Zig files define multiple types. Each type's methods must resolve independently.
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const Logger = struct {
+        \\    level: u8,
+        \\    pub fn clear(self: *Logger) void {
+        \\        self.level = 0;
+        \\    }
+        \\};
+        \\const Connection = enum {
+        \\    open,
+        \\    closed,
+        \\    pub fn close(self: *Connection) void {
+        \\        self.* = .closed;
+        \\    }
+        \\};
+        \\const Parser = union(enum) {
+        \\    idle: void,
+        \\    parsing: u32,
+        \\    pub fn parse(self: *Parser) !u32 {
+        \\        _ = self;
+        \\        return 42;
+        \\    }
+        \\};
+        \\fn use() void {
+        \\    var log: Logger = .{ .level = 5 };
+        \\    _ = log.clear();
+        \\    var conn: Connection = .open;
+        \\    _ = conn.close();
+        \\    var parser: Parser = .{ .idle = {} };
+        \\    _ = parser.parse();
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_multi_types.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multi_types.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // Logger.clear() -> void: NOT flagged
+    // Connection.close() -> void: NOT flagged
+    // Parser.parse() -> !u32: FLAGGED
+    var za205_count: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            za205_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), za205_count);
 }
 
 // ============================================================================
@@ -15292,6 +16191,7 @@ test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
         lines_list.items,
         1,
         "test_conditional.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -15337,6 +16237,7 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
         lines_list.items,
         1,
         "test_good.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -15378,6 +16279,7 @@ test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
         lines_list.items,
         1,
         "test_no_defer.zig",
+        null,
     );
     defer deinitIssues(&issues, allocator);
 
@@ -15652,4 +16554,1662 @@ test "isFunctionPointerVar rejects normal vars" {
     try std.testing.expect(!isFunctionPointerVar("var my_count: u32 = 0;"));
     try std.testing.expect(!isFunctionPointerVar("var buffer: [100]u8 = undefined;"));
     try std.testing.expect(!isFunctionPointerVar("var name = SOME_CONSTANT;"));
+}
+
+// ============================================================================
+// TypeContext / Return-Type-Aware Detection Tests
+// ============================================================================
+
+test "classifyReturnType identifies void" {
+    try std.testing.expectEqual(ReturnKind.void_type, classifyReturnType("void"));
+    try std.testing.expectEqual(ReturnKind.void_type, classifyReturnType("  void  "));
+}
+
+test "classifyReturnType identifies error unions" {
+    try std.testing.expectEqual(ReturnKind.error_union, classifyReturnType("!void"));
+    try std.testing.expectEqual(ReturnKind.error_union, classifyReturnType("!u32"));
+    try std.testing.expectEqual(ReturnKind.error_union, classifyReturnType("anyerror!T"));
+    try std.testing.expectEqual(ReturnKind.error_union, classifyReturnType("Error!void"));
+}
+
+test "classifyReturnType identifies optionals" {
+    try std.testing.expectEqual(ReturnKind.optional, classifyReturnType("?u32"));
+    try std.testing.expectEqual(ReturnKind.optional, classifyReturnType("?T"));
+}
+
+test "classifyReturnType identifies noreturn" {
+    try std.testing.expectEqual(ReturnKind.noreturn_type, classifyReturnType("noreturn"));
+}
+
+test "classifyReturnType identifies values" {
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("u32"));
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("Response"));
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("bool"));
+}
+
+test "classifyReturnType returns unknown for empty" {
+    try std.testing.expectEqual(ReturnKind.unknown, classifyReturnType(""));
+    try std.testing.expectEqual(ReturnKind.unknown, classifyReturnType("   "));
+}
+
+test "extractFnReturnType parses simple signatures" {
+    const r1 = extractFnReturnType("fn foo() void {");
+    try std.testing.expect(r1 != null);
+    try std.testing.expectEqualStrings("void", r1.?);
+
+    const r2 = extractFnReturnType("pub fn bar(x: u32) !void {");
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("!void", r2.?);
+
+    const r3 = extractFnReturnType("fn baz(self: *Self) u32 {");
+    try std.testing.expect(r3 != null);
+    try std.testing.expectEqualStrings("u32", r3.?);
+}
+
+test "extractFnReturnType handles nested parens" {
+    const r = extractFnReturnType("fn foo(cb: fn(u32) void, x: u32) !void {");
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("!void", r.?);
+}
+
+test "extractSelfTypeName extracts pointer self types" {
+    const t1 = extractSelfTypeName("fn foo(self: *MyStruct) void {");
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("MyStruct", t1.?);
+
+    const t2 = extractSelfTypeName("fn foo(self: *const MyStruct) void {");
+    try std.testing.expect(t2 != null);
+    try std.testing.expectEqualStrings("MyStruct", t2.?);
+
+    const t3 = extractSelfTypeName("fn foo(x: u32) void {");
+    try std.testing.expect(t3 == null);
+}
+
+test "extractFnName extracts function names" {
+    try std.testing.expectEqualStrings("foo", extractFnName("fn foo() void {").?);
+    try std.testing.expectEqualStrings("bar", extractFnName("pub fn bar(x: u32) !void {").?);
+    try std.testing.expect(extractFnName("const x = 42;") == null);
+}
+
+test "extractVarTypeName extracts explicit type annotations" {
+    const t1 = extractVarTypeName("var x: MyStruct = .{};");
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("MyStruct", t1.?);
+}
+
+test "extractVarTypeName extracts TypeName.init patterns" {
+    const t1 = extractVarTypeName("var list = ArrayList(u8).init(allocator);");
+    // ArrayList starts with uppercase, followed by (, so type is "ArrayList"
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("ArrayList", t1.?);
+}
+
+test "extractVarTypeName extracts struct literal patterns" {
+    const t1 = extractVarTypeName("var state = ErrorAnalysisState{};");
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("ErrorAnalysisState", t1.?);
+}
+
+test "extractVarTypeName returns null for non-type RHS" {
+    try std.testing.expect(extractVarTypeName("var x = some_func();") == null);
+    try std.testing.expect(extractVarTypeName("var x = 42;") == null);
+}
+
+test "extractMethodCall extracts receiver and method" {
+    const r1 = extractMethodCall("_ = list.clear()");
+    try std.testing.expect(r1 != null);
+    try std.testing.expectEqualStrings("list", r1.?.receiver);
+    try std.testing.expectEqualStrings("clear", r1.?.method);
+
+    const r2 = extractMethodCall("_ = logger.reset()");
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqualStrings("logger", r2.?.receiver);
+    try std.testing.expectEqualStrings("reset", r2.?.method);
+}
+
+test "extractMethodCall returns null for non-method calls" {
+    try std.testing.expect(extractMethodCall("_ = someFunction()") == null);
+    try std.testing.expect(extractMethodCall("const x = 42;") == null);
+}
+
+test "resolveReturnKind resolves struct method returns" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var ctx = TypeContext.init();
+    defer ctx.deinit(a);
+
+    // Register a struct method: MyLogger.clear -> void
+    var methods = std.StringHashMapUnmanaged(ReturnKind){};
+    try methods.put(a, "clear", .void_type);
+    try methods.put(a, "flush", .error_union);
+    try ctx.struct_methods.put(a, "MyLogger", methods);
+
+    // Register var type: logger -> MyLogger
+    try ctx.var_types.put(a, "logger", "MyLogger");
+
+    // _ = logger.clear() should resolve to void
+    const rk1 = resolveReturnKind(&ctx, "_ = logger.clear()");
+    try std.testing.expectEqual(ReturnKind.void_type, rk1);
+
+    // _ = logger.flush() should resolve to error_union
+    const rk2 = resolveReturnKind(&ctx, "_ = logger.flush()");
+    try std.testing.expectEqual(ReturnKind.error_union, rk2);
+
+    // _ = unknown.clear() should resolve to unknown (receiver not tracked)
+    const rk3 = resolveReturnKind(&ctx, "_ = unknown.clear()");
+    try std.testing.expectEqual(ReturnKind.unknown, rk3);
+}
+
+test "resolveReturnKind resolves standalone functions" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var ctx = TypeContext.init();
+    defer ctx.deinit(a);
+
+    try ctx.function_returns.put(a, "helper", .void_type);
+    try ctx.function_returns.put(a, "riskyOp", .error_union);
+
+    const rk1 = resolveReturnKind(&ctx, "_ = helper()");
+    try std.testing.expectEqual(ReturnKind.void_type, rk1);
+
+    const rk2 = resolveReturnKind(&ctx, "_ = riskyOp()");
+    try std.testing.expectEqual(ReturnKind.error_union, rk2);
+
+    const rk3 = resolveReturnKind(&ctx, "_ = unknownFunc()");
+    try std.testing.expectEqual(ReturnKind.unknown, rk3);
+}
+
+test "parseFileTypeContext builds struct methods" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\const MyStruct = struct {
+        \\    pub fn clear(self: *MyStruct) void {
+        \\    }
+        \\    pub fn process(self: *MyStruct) !void {
+        \\    }
+        \\    pub fn count(self: *const MyStruct) u32 {
+        \\    }
+        \\};
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    const methods = ctx.struct_methods.get("MyStruct");
+    try std.testing.expect(methods != null);
+    try std.testing.expectEqual(ReturnKind.void_type, methods.?.get("clear").?);
+    try std.testing.expectEqual(ReturnKind.error_union, methods.?.get("process").?);
+    try std.testing.expectEqual(ReturnKind.value, methods.?.get("count").?);
+}
+
+test "parseFileTypeContext builds var types" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\var logger: MyLogger = .{};
+        \\var state = ErrorState{};
+        \\const config = Config.init();
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    try std.testing.expectEqualStrings("MyLogger", ctx.var_types.get("logger").?);
+    try std.testing.expectEqualStrings("ErrorState", ctx.var_types.get("state").?);
+    try std.testing.expectEqualStrings("Config", ctx.var_types.get("config").?);
+}
+
+test "parseFileTypeContext builds stdlib vars" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\var list: std.ArrayListUnmanaged(u32) = .{};
+        \\var map = StringHashMap(u32).init(a);
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    try std.testing.expect(ctx.stdlib_vars.contains("list"));
+    try std.testing.expect(ctx.stdlib_vars.contains("map"));
+}
+
+test "parseFileTypeContext builds top-level functions" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\fn helper() void {
+        \\}
+        \\fn riskyOp() !u32 {
+        \\}
+        \\pub fn getValue() u32 {
+        \\}
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    try std.testing.expectEqual(ReturnKind.void_type, ctx.function_returns.get("helper").?);
+    try std.testing.expectEqual(ReturnKind.error_union, ctx.function_returns.get("riskyOp").?);
+    try std.testing.expectEqual(ReturnKind.value, ctx.function_returns.get("getValue").?);
+}
+
+test "parseFileTypeContext parses enum methods" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\const State = enum {
+        \\    active,
+        \\    inactive,
+        \\    pub fn reset(self: *State) void {
+        \\        self.* = .inactive;
+        \\    }
+        \\    pub fn tryTransition(self: *State) !void {
+        \\        _ = self;
+        \\        return;
+        \\    }
+        \\};
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    const methods = ctx.struct_methods.get("State").?;
+    try std.testing.expectEqual(ReturnKind.void_type, methods.get("reset").?);
+    try std.testing.expectEqual(ReturnKind.error_union, methods.get("tryTransition").?);
+}
+
+test "parseFileTypeContext parses union methods" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\const Result = union(enum) {
+        \\    ok: u32,
+        \\    fail: void,
+        \\    pub fn unwrap(self: Result) u32 {
+        \\        return switch (self) {
+        \\            .ok => |v| v,
+        \\            .fail => 0,
+        \\        };
+        \\    }
+        \\    pub fn tryUnwrap(self: Result) !u32 {
+        \\        _ = self;
+        \\        return 42;
+        \\    }
+        \\};
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    const methods = ctx.struct_methods.get("Result").?;
+    try std.testing.expectEqual(ReturnKind.value, methods.get("unwrap").?);
+    try std.testing.expectEqual(ReturnKind.error_union, methods.get("tryUnwrap").?);
+}
+
+test "parseFileTypeContext parses packed and extern types" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\const Flags = packed struct {
+        \\    a: bool,
+        \\    pub fn clear(self: *Flags) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\const CHandle = extern struct {
+        \\    fd: i32,
+        \\    pub fn read(self: *CHandle) !u32 {
+        \\        _ = self;
+        \\        return 0;
+        \\    }
+        \\};
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    const flag_methods = ctx.struct_methods.get("Flags").?;
+    try std.testing.expectEqual(ReturnKind.void_type, flag_methods.get("clear").?);
+
+    const handle_methods = ctx.struct_methods.get("CHandle").?;
+    try std.testing.expectEqual(ReturnKind.error_union, handle_methods.get("read").?);
+}
+
+test "isSafeToDiscard uses TypeContext for user-defined void methods" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var ctx = TypeContext.init();
+    defer ctx.deinit(a);
+
+    // Register: MyLogger.clear returns void
+    var methods = std.StringHashMapUnmanaged(ReturnKind){};
+    try methods.put(a, "clear", .void_type);
+    try ctx.struct_methods.put(a, "MyLogger", methods);
+    try ctx.var_types.put(a, "logger", "MyLogger");
+
+    // _ = logger.clear() should be safe (parsed void)
+    try std.testing.expect(isSafeToDiscard("_ = logger.clear()", &ctx));
+}
+
+test "isSafeToDiscard rejects user-defined error methods" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var ctx = TypeContext.init();
+    defer ctx.deinit(a);
+
+    // Register: MyLogger.clear returns !void
+    var methods = std.StringHashMapUnmanaged(ReturnKind){};
+    try methods.put(a, "clear", .error_union);
+    try ctx.struct_methods.put(a, "MyLogger", methods);
+    try ctx.var_types.put(a, "logger", "MyLogger");
+
+    // _ = logger.clear() should NOT be safe (error_union)
+    try std.testing.expect(!isSafeToDiscard("_ = logger.clear()", &ctx));
+}
+
+test "buildNoFreeParamFunctions detects single-line call" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\const alloc = arena.allocator();
+        \\try doStuff(alloc, 42);
+    ;
+    var result = try buildNoFreeParamFunctions(a, content);
+    defer result.deinit(a);
+
+    try std.testing.expect(result.contains("doStuff"));
+}
+
+test "buildNoFreeParamFunctions detects multi-line call" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\checksum +%= try run_benchmark(
+        \\    &bench,
+        \\    scenario.name,
+        \\    searches,
+        \\    arena.allocator(),
+        \\    &prng,
+        \\);
+    ;
+    var result = try buildNoFreeParamFunctions(a, content);
+    defer result.deinit(a);
+
+    try std.testing.expect(result.contains("run_benchmark"));
+}
+
+test "buildNoFreeParamFunctions skips function definitions" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\fn doStuff(arena: std.mem.Allocator) !void {
+        \\}
+    ;
+    var result = try buildNoFreeParamFunctions(a, content);
+    defer result.deinit(a);
+
+    // "doStuff" should NOT be detected — it's a definition, not a call
+    try std.testing.expect(!result.contains("doStuff"));
+}
+
+// ============================================================================
+// findAllocCall pattern detection tests
+// ============================================================================
+
+test "findAllocCall detects .dupe(" {
+    const result = findAllocCall("    const copy = try allocator.dupe(u8, original);", null);
+    try std.testing.expect(result != null);
+    try std.testing.expect(!result.?.is_create);
+}
+
+test "findAllocCall detects .dupeZ(" {
+    const result = findAllocCall("    const copy = try allocator.dupeZ(u8, original);", null);
+    try std.testing.expect(result != null);
+    try std.testing.expect(!result.?.is_create);
+}
+
+test "findAllocCall detects .allocPrint(" {
+    const result = findAllocCall("    const msg = try std.fmt.allocPrint(allocator, \"{d}\", .{42});", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .toOwnedSlice(" {
+    const result = findAllocCall("    const slice = try list.toOwnedSlice();", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .readFileAlloc(" {
+    const result = findAllocCall("    const data = try dir.readFileAlloc(allocator, \"file.txt\", 1024);", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .realpathAlloc(" {
+    const result = findAllocCall("    const path = try std.fs.cwd().realpathAlloc(allocator, \".\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .stringifyAlloc(" {
+    const result = findAllocCall("    const json = try std.json.stringifyAlloc(allocator, value, .{});", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .replaceOwned(" {
+    const result = findAllocCall("    const out = try std.mem.replaceOwned(u8, allocator, input, \"a\", \"b\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects .concatWithSentinel(" {
+    const result = findAllocCall("    const out = try allocator.concatWithSentinel(u8, slices, 0);", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects mem.concat(" {
+    const result = findAllocCall("    const merged = try std.mem.concat(allocator, u8, &.{a, b});", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects mem.join(" {
+    const result = findAllocCall("    const joined = try std.mem.join(allocator, \", \", parts);", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects process.getEnvVarOwned(" {
+    const result = findAllocCall("    const home = try std.process.getEnvVarOwned(allocator, \"HOME\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects fs.getAppDataDir(" {
+    const result = findAllocCall("    const dir = try std.fs.getAppDataDir(allocator, \"myapp\");", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall does NOT detect .clone(" {
+    const result = findAllocCall("    const copy = try list.clone();", null);
+    try std.testing.expect(result == null);
+}
+
+test "findAllocCall does NOT detect .append(" {
+    const result = findAllocCall("    try list.append(allocator, item);", null);
+    try std.testing.expect(result == null);
+}
+
+// ============================================================================
+// analyzeCFGDeferCoverage tests for non-basic alloc patterns (ZA101/ZA102)
+// ============================================================================
+
+test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    _ = data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_dupe", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_dupe_no_defer.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_print(alloc: std.mem.Allocator) !void {
+        \\    const msg = try std.fmt.allocPrint(alloc, "hi {d}", .{42});
+        \\    _ = msg;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_print", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_allocPrint_no_defer.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn good_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    defer alloc.free(data);
+        \\    process(data);
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "good_dupe", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_dupe_good.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_dupe_good.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn good_print(alloc: std.mem.Allocator) !void {
+        \\    const msg = try std.fmt.allocPrint(alloc, "hi {d}", .{42});
+        \\    defer alloc.free(msg);
+        \\    process(msg);
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "good_print", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_allocPrint_good.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_allocPrint_good.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// analyzeCFGErrdeferCoverage tests for non-basic patterns (ZA103)
+// ============================================================================
+
+test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn bad_errdefer_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    const more = try alloc.dupe(u8, "world");
+        \\    defer alloc.free(data);
+        \\    defer alloc.free(more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dupe_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za103 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER)) {
+            found_za103 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za103);
+}
+
+test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn good_errdefer_dupe(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.dupe(u8, "hello");
+        \\    errdefer alloc.free(data);
+        \\    const more = try alloc.dupe(u8, "world");
+        \\    errdefer alloc.free(more);
+        \\    process(data, more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dupe_good_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_good_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_dupe_good_errdefer.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn bad_errdefer_print(alloc: std.mem.Allocator) !void {
+        \\    const msg = try std.fmt.allocPrint(alloc, "val={d}", .{42});
+        \\    const more = try alloc.alloc(u8, 50);
+        \\    defer alloc.free(msg);
+        \\    defer alloc.free(more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_print_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_print_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za103 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER)) {
+            found_za103 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za103);
+}
+
+// ============================================================================
+// ZA101 additional unit tests: qualified functions, container methods, transfers
+// ============================================================================
+
+test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_concat(alloc: std.mem.Allocator) !void {
+        \\    const data = try std.mem.concat(alloc, u8, &.{"a", "b"});
+        \\    _ = data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_concat", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_concat_no_defer.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn leaky_owned(alloc: std.mem.Allocator) !void {
+        \\    var list = std.ArrayList(u8).init(alloc);
+        \\    defer list.deinit();
+        \\    try list.appendSlice("hello");
+        \\    const data = try list.toOwnedSlice();
+        \\    _ = data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "leaky_owned", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_owned_no_defer.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    var found_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
+            found_issue = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_issue);
+}
+
+test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn arena_usage() !void {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    defer arena.deinit();
+        \\    const alloc = arena.allocator();
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    _ = data;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_skip.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_skip.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_skip.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for ownership transfer via return (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn factory(alloc: std.mem.Allocator) ![]u8 {
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    return data;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "factory", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_return_transfer.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_return_transfer.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// ZA102 unit tests: create() without destroy
+// ============================================================================
+
+test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn leaky_create(allocator: std.mem.Allocator) !void {
+        \\    const node = try allocator.create(Node);
+        \\    _ = node;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_create_no_destroy.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_create_no_destroy.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za102 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER)) {
+            found_za102 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za102);
+}
+
+test "analyzeCFGDeferCoverage no false positive for create with defer destroy (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn good_create(allocator: std.mem.Allocator) !void {
+        \\    const node = try allocator.create(Node);
+        \\    defer allocator.destroy(node);
+        \\    node.* = .{ .value = 42, .next = null };
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_create_good.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_create_good.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_create_good.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for create with ownership transfer (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const test_content =
+        \\fn create_factory(allocator: std.mem.Allocator) !*Node {
+        \\    const node = try allocator.create(Node);
+        \\    node.* = .{ .value = 1, .next = null };
+        \\    return node;
+        \\}
+    ;
+
+    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    defer lines_list.deinit(allocator);
+
+    var line_iter = mem.splitScalar(u8, test_content, '\n');
+    while (line_iter.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    var cfg = try buildCFG(allocator, "create_factory", 1, lines_list.items);
+    defer cfg.deinit();
+
+    var issues = try analyzeCFGDeferCoverage(
+        allocator,
+        &cfg,
+        lines_list.items,
+        1,
+        "test_create_return.zig",
+        null,
+    );
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_create_return.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for create on arena allocator (ZA102)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn arena_create() !void {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    defer arena.deinit();
+        \\    const alloc = arena.allocator();
+        \\    const node = try alloc.create(Node);
+        \\    _ = node;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_create.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_create.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_create.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// ZA103 additional tests: qualified functions, arena skip
+// ============================================================================
+
+test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn bad_errdefer_concat(alloc: std.mem.Allocator) !void {
+        \\    const data = try std.mem.concat(alloc, u8, &.{"a", "b"});
+        \\    const more = try alloc.alloc(u8, 50);
+        \\    defer alloc.free(data);
+        \\    defer alloc.free(more);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_concat_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_concat_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za103 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER)) {
+            found_za103 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za103);
+}
+
+test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn arena_no_errdefer() !void {
+        \\    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\    defer arena.deinit();
+        \\    const alloc = arena.allocator();
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    const more = try alloc.alloc(u8, 200);
+        \\    _ = data;
+        \\    _ = more;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_errdefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_errdefer.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_errdefer.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+// ============================================================================
+// ZA105/ZA106 additional tests: alias UAF, defer safety
+// ============================================================================
+
+test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
+    // Tests direct UAF: free(data) then data[idx] = val
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn uaf_subscript(allocator: std.mem.Allocator) void {
+        \\    const data = allocator.alloc(u8, 100) catch return;
+        \\    allocator.free(data);
+        \\    data[0] = 42; // UAF: accessing freed memory
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_subscript_uaf.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_subscript_uaf.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za105 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_subscript_uaf.zig") and
+            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+        {
+            found_za105 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za105);
+}
+
+test "analyzeCFGMemory no false positive for defer free (ZA105)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn proper_defer(allocator: std.mem.Allocator) void {
+        \\    const data = allocator.alloc(u8, 100) catch return;
+        \\    defer allocator.free(data);
+        \\    data[0] = 42; // Valid: data is alive, defer runs AFTER function exits
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_defer_safe.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_defer_safe.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_defer_safe.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
+        }
+    }
+}
+
+test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
+    // Tests alias UAF: const alias = data; free(data); use(alias);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn alias_uaf(allocator: std.mem.Allocator) !void {
+        \\    const data = try allocator.alloc(u8, 100);
+        \\    const alias = data;
+        \\    allocator.free(data);
+        \\    process(alias);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_alias_uaf.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_alias_uaf.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za105 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_alias_uaf.zig") and
+            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+        {
+            found_za105 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za105);
+}
+
+test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
+    // Arena accessed through struct field: self.arena.allocator().alloc()
+    // Type-based detection: field declared as std.heap.ArenaAllocator
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Analyser = struct {
+        \\    arena: std.heap.ArenaAllocator,
+        \\    data: []const u8,
+        \\};
+        \\fn arena_field_alloc(self: *Analyser) !void {
+        \\    const data = try self.arena.allocator().alloc(u8, 100);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_field.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_field.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // No ZA101/ZA102/ZA103 should fire for arena field chain allocations
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_field.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
+    // FixedBufferAllocator accessed through struct field
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Parser = struct {
+        \\    fba: std.heap.FixedBufferAllocator,
+        \\    input: []const u8,
+        \\};
+        \\fn fba_field_alloc(parser: *Parser) !void {
+        \\    const data = try parser.fba.allocator().alloc(u8, 64);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_fba_field.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_fba_field.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_fba_field.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+// ============================================================================
+// ZA204 Tests — `= undefined` detection
+// ============================================================================
+
+test "ZA204 fires for unfilled var undefined" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    var x: u32 = undefined;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
+            mem.eql(u8, issue.file, "test_za204.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA204 no FP for memset after undefined" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    var buf: [256]u8 = undefined;
+        \\    @memset(&buf, 0);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_fill.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_fill.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_za204_fill.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
+        }
+    }
+}
+
+// ============================================================================
+// ZA202/ZA203 Tests — catch/orelse unreachable via errors path
+// ============================================================================
+
+test "ZA202 catch unreachable fires via analyzeErrors" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE) and
+            mem.eql(u8, issue.file, "test_za202.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA203 orelse unreachable fires via analyzeErrors" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo(opt: ?u32) void {
+        \\    const x = opt orelse unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za203.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za203.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE) and
+            mem.eql(u8, issue.file, "test_za203.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+// ============================================================================
+// ZA207 Tests — catch undefined
+// ============================================================================
+
+test "ZA207 catch undefined fires" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch undefined;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za207.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za207.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED) and
+            mem.eql(u8, issue.file, "test_za207.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA207 catch |_| undefined does NOT fire" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch |_| undefined;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za207_no_fp.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za207_no_fp.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_za207_no_fp.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED));
+        }
+    }
+}
+
+// ============================================================================
+// ZA208 Tests — @panic detection
+// ============================================================================
+
+test "ZA208 @panic fires in non-test context" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    @panic("something went wrong");
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za208.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za208.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_PANIC) and
+            mem.eql(u8, issue.file, "test_za208.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA208 @panic does NOT fire in test block" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\test "my test" {
+        \\    @panic("expected in test");
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za208_test.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za208_test.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_za208_test.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_PANIC));
+        }
+    }
+}
+
+// ============================================================================
+// ZA206 Tests — exit() bypasses defers (expanded for posix.exit)
+// ============================================================================
+
+test "ZA206 std.posix.exit fires" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn cleanup() void {
+        \\    defer allocator.free(data);
+        \\    std.posix.exit(1);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za206_posix.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za206_posix.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
+            mem.eql(u8, issue.file, "test_za206_posix.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }

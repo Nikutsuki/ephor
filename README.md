@@ -9,8 +9,8 @@
 | **check** | Run all static checks |
 | **runtime** | Dynamic analysis via test execution (memory leaks, panics) |
 | **orphans** | Files not imported from entry points |
-| **memory** | `alloc()` without matching `defer free()` |
-| **errors** | Silent `catch {}`, `catch unreachable`, `= undefined` |
+| **memory** | Allocation without `defer free/destroy`, missing `errdefer`, use-after-free, double-free |
+| **errors** | Silent `catch {}`, `catch unreachable`, `orelse unreachable`, `catch undefined`, `exit()` bypassing defers, `@panic()`, discarded errors |
 | **unused** | Unused imports, const, and var declarations |
 | **complexity** | Long functions, deep nesting, too many params/branches |
 | **style** | Lines too long, files too large |
@@ -54,7 +54,7 @@ Alternatively, re-run the install script to update everything:
 curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.10.3`
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.11.0`
 
 ### Version Management
 
@@ -68,7 +68,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.10.3.tar.gz
+zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.11.0.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -118,7 +118,7 @@ If you have the `ephor` binary installed directly, it accepts commands and optio
 ephor                     # Defaults to 'check' on configured src directory
 ephor check src/          # Explicit path
 ephor memory              # Alloc without defer patterns
-ephor errors              # Silent catch {} discards
+ephor errors              # Error handling patterns (ZA201-ZA208)
 ephor orphans             # Files not imported
 ephor complexity          # Function complexity
 ephor fmt-check           # Files needing zig fmt
@@ -155,7 +155,7 @@ Example config:
 
 ```json
 {
-  "version": "0.10.3",
+  "version": "0.11.0",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -164,9 +164,9 @@ Example config:
   "enable": ["ZA702"],
   "thresholds": {
     "max_lines": 50,
-    "max_nesting": 4,
-    "max_params": 5,
-    "max_branches": 10,
+    "max_nesting": 3,
+    "max_params": 4,
+    "max_branches": 12,
     "max_line_length": 100,
     "max_file_bytes": 25000
   }
@@ -192,10 +192,9 @@ Example config:
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA101** | warning | ON | `alloc()` without `defer free()` |
+| **ZA101** | warning | ON | Stdlib allocation without `defer free()` (alloc, allocPrint, toOwnedSlice, readFileAlloc, mem.concat, etc.) |
 | **ZA102** | warning | ON | `create()` without `defer destroy()` |
-| **ZA103** | warning | ON | Allocation in error-returning function without `errdefer` |
-| **ZA104** | warning | ON | Memory leak: allocation not freed on all paths |
+| **ZA103** | warning | ON | Stdlib allocation without `errdefer` in error-returning function |
 | **ZA105** | error | ON | Use-after-free: accessing memory after free |
 | **ZA106** | error | ON | Double-free: calling free twice on same pointer |
 
@@ -203,21 +202,23 @@ Example config:
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA201** | note | ON | Silent `catch {}` (informational) |
-| **ZA202** | note | ON | `catch unreachable` (informational) |
-| **ZA203** | note | ON | `orelse unreachable` (informational) |
-| **ZA204** | note | ON | `= undefined` may leak sensitive data (informational) |
-| **ZA205** | note | ON | Discarding error union result (informational) |
+| **ZA201** | warning | ON | Silent `catch {}` discards error |
+| **ZA202** | warning | ON | `catch unreachable` will panic on error |
+| **ZA203** | warning | ON | `orelse unreachable` will panic on null |
+| **ZA204** | warning | OFF | `= undefined` may leak sensitive data (use `--enable=ZA204`) |
+| **ZA205** | note | OFF | Discarding error union result (use `--enable=ZA205`) |
 | **ZA206** | warning | ON | `exit()` bypasses defers (memory leak!) |
+| **ZA207** | warning | ON | `catch undefined` (dangerous — converts errors to UB) |
+| **ZA208** | note | ON | `@panic()` crash point (informational) |
 
 ### Complexity (ZA3xx)
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA301** | warning | ON | Function exceeds max lines (default: 50; type factories get 3x) |
-| **ZA302** | warning | ON | Function exceeds max nesting depth (default: 4; type factories get 2x) |
-| **ZA303** | warning | ON | Function has too many parameters (default: 5) |
-| **ZA304** | warning | ON | Function has too many branches (default: 10; type factories get 3x) |
+| **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
+| **ZA303** | warning | ON | Function has too many parameters (default: 4) |
+| **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
 
 **Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they're metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they're compile-time unrolled.
 
@@ -270,16 +271,20 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA801** | warning | ON | Optional unwrap (.?) may panic if null |
-| **ZA802** | warning | ON | Dereferencing optional pointer may panic if null |
+| **ZA801** | warning | OFF | Optional unwrap (.?) may panic if null (use `--enable=ZA8`) |
+| **ZA802** | warning | OFF | Dereferencing optional pointer may panic if null (use `--enable=ZA8`) |
+
+**When to enable ZA8xx:** Pre-release audits for safety-critical code (servers, databases) where a null panic means downtime. Off by default because `.?` is extremely common in Zig and usually intentionally guarded.
 
 ### Panic Detection (ZA9xx)
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA901** | warning | ON | Decrement without overflow guard may panic |
-| **ZA902** | warning | ON | Subtraction in range may cause overflow |
-| **ZA903** | warning | ON | Arithmetic in array index may overflow |
+| **ZA901** | warning | OFF | Decrement without overflow guard may panic (use `--enable=ZA9`) |
+| **ZA902** | warning | OFF | Subtraction in range may cause overflow (use `--enable=ZA9`) |
+| **ZA903** | warning | OFF | Arithmetic in array index may overflow (use `--enable=ZA9`) |
+
+**When to enable ZA9xx:** Before switching from `Debug` to `ReleaseFast` builds — in debug mode, integer overflow panics helpfully; in `ReleaseFast` it becomes undefined behavior. Also useful for security-sensitive or financial code where overflow = vulnerability.
 
 ### Runtime Analysis (ZR1xx)
 
@@ -349,8 +354,8 @@ Commands:
   check       Run all static checks (default)
   runtime     Run tests with memory diagnostics (dynamic analysis)
   orphans     Files not imported from entry points
-  memory      Alloc without defer patterns
-  errors      Silent catch {} discards
+  memory      Stdlib allocation without defer patterns (50+ patterns)
+  errors      Error handling patterns (ZA201-ZA208)
   unused      Unused imports/const/var declarations
   complexity  Function complexity metrics
   fmt-check   Files needing zig fmt
@@ -365,8 +370,9 @@ Options:
   --disable=<rule>     Disable rule (e.g., ZA301, ZA3 for all ZA3xx)
   --enable=<rule>      Enable rule (overrides disable)
   --max-lines=N        Max function lines (default: 50)
-  --max-nesting=N      Max nesting depth (default: 4)
-  --max-params=N       Max parameters (default: 5)
+  --max-nesting=N      Max nesting depth (default: 3)
+  --max-params=N       Max parameters (default: 4)
+  --max-branches=N     Max branches per function (default: 12)
   --max-line-length=N  Max columns per line (default: 100)
   --max-file-bytes=N   Max file size in bytes (enables ZA702)
   --version=<X.Y.Z>   For install/upgrade: pin a specific version
@@ -567,7 +573,7 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 | 0 | No warnings or errors found |
 | 1 | Warnings or errors found |
 
-Notes (informational issues like ZA201-ZA205) are printed but do **not** cause a non-zero exit code. Only warnings and errors affect the exit code.
+Notes (informational issues like ZA205 and ZA208) are printed but do **not** cause a non-zero exit code. Only warnings and errors affect the exit code.
 
 ## Examples
 
@@ -648,6 +654,259 @@ src/compat/
 4. Register in `version_registry`
 
 Each version module exports consistent wrapper functions that handle API differences between Zig versions (e.g., HashMap.put signature changes).
+
+## Technical: How Detection Works
+
+This section documents the internal detection architecture. Understanding these internals helps identify gaps and validate correctness.
+
+### Architecture Overview
+
+Ephor has three analysis entry points:
+
+| Entry Point | Scope | Rules | Context |
+|-------------|-------|-------|---------|
+| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA208 (in `checkLineErrors`) | `TypeContext` via `parseFileTypeContext(content)` |
+| `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
+| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA8xx, ZA9xx | `CFGState` with file-level `no_free_fields` |
+
+Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression.
+
+### TypeContext: The Core Data Structure
+
+```
+TypeContext = {
+    struct_methods:   Map<TypeName, Map<MethodName, ReturnKind>>
+    function_returns: Map<FunctionName, ReturnKind>
+    var_types:        Map<VariableName, TypeName>
+    stdlib_vars:      Map<VariableName, void>
+}
+```
+
+| Field | Purpose | Example |
+|-------|---------|---------|
+| `struct_methods` | Maps type names to their method return types | `"MyLogger" -> {"clear" -> void_type, "flush" -> error_union}` |
+| `function_returns` | Maps top-level function names to return types | `"helper" -> void_type, "riskyOp" -> error_union` |
+| `var_types` | Maps variable names to their declared type | `"logger" -> "MyLogger", "state" -> "State"` |
+| `stdlib_vars` | Tracks variables initialized from stdlib containers/allocators | `"list" -> void, "map" -> void` |
+
+### ReturnKind Classification
+
+The `classifyReturnType` function converts return type text to an enum:
+
+| Return Type Text | ReturnKind | Safe to Discard? |
+|-----------------|------------|------------------|
+| `void` | `.void_type` | Yes |
+| `noreturn` | `.noreturn_type` | Yes |
+| `!void`, `!T`, `ErrorSet!T` | `.error_union` | **No** (ZA205) |
+| `?T`, `?*T` | `.optional` | Yes |
+| `u32`, `[]u8`, `*T`, etc. | `.value` | Yes |
+| (empty/unparseable) | `.unknown` | Falls through to vocab |
+
+### Type Parsing: What Gets Registered
+
+`parseFileTypeContext` scans the file line-by-line and builds TypeContext:
+
+**1. Type definitions** (struct, enum, union — all can have methods in Zig):
+
+```zig
+const MyStruct = struct { ... };       // Tracked
+const State = enum { ... };            // Tracked
+const Result = union(enum) { ... };    // Tracked
+const Flags = packed struct { ... };   // Tracked
+const CHandle = extern struct { ... }; // Tracked
+```
+
+Detection pattern: `= struct {`, `= enum {`, `= enum(`, `= union(`, `= union {`, `= packed struct {`, `= extern struct {`, `= packed union {`, `= extern union {`
+
+**2. Method signatures** (inside a type scope):
+
+```zig
+pub fn method(self: *MyStruct) void { ... }       // struct_methods["MyStruct"]["method"] = .void_type
+pub fn method(self: *MyStruct) !void { ... }       // struct_methods["MyStruct"]["method"] = .error_union
+pub fn method(self: MyEnum) u32 { ... }            // struct_methods["MyEnum"]["method"] = .value
+fn method(self: *const MyStruct, arg: u32) ?T { }  // struct_methods["MyStruct"]["method"] = .optional
+```
+
+Self parameter extraction: strips `*` and `*const` prefixes to get bare type name.
+
+**3. Variable declarations**:
+
+```zig
+var x: MyStruct = .{};                // var_types["x"] = "MyStruct" (explicit annotation)
+var x = MyStruct.init(allocator);     // var_types["x"] = "MyStruct" (RHS inference: TypeName.init)
+var x = MyStruct{};                   // var_types["x"] = "MyStruct" (RHS inference: TypeName{})
+var x = MyStruct{ .field = 5 };       // var_types["x"] = "MyStruct" (RHS inference: TypeName{ .field)
+```
+
+RHS inference requires the type name to start with uppercase (PascalCase).
+
+**4. Stdlib variable tracking** (for vocab fallback):
+
+```zig
+var list = std.ArrayList(u32).init(allocator);     // stdlib_vars["list"] = void
+var map = std.StringHashMap(u32).init(allocator);  // stdlib_vars["map"] = void
+var arena = std.heap.ArenaAllocator.init(...);     // stdlib_vars["arena"] = void
+```
+
+Matched via `compat.getStdlibContainerInitPatterns()` and `compat.getAllInitPatterns()`.
+
+**5. Top-level functions** (outside any type scope):
+
+```zig
+fn helper() void { }          // function_returns["helper"] = .void_type
+fn riskyOp() !void { }        // function_returns["riskyOp"] = .error_union
+pub fn getValue() u32 { }     // function_returns["getValue"] = .value
+```
+
+### Resolution Chain
+
+When ephor encounters `_ = expr`, it resolves whether the discard is safe through a tiered chain. Different detection functions use slightly different tiers, but the core pattern is:
+
+**Tier 1 — Cleanup patterns (always safe):**
+Hardcoded patterns like `.free(`, `.destroy(`, `.deinit(` — these are void by Zig convention and always safe to discard.
+
+**Tier 2 — TypeContext resolution (definitive when available):**
+
+For `_ = receiver.method(...)`:
+1. Look up `receiver` in `var_types` → get type name (e.g., `"MyLogger"`)
+2. Look up type name in `struct_methods` → get method map
+3. Look up method name in method map → get `ReturnKind`
+
+For `_ = funcName(...)`:
+1. Extract function name (must be simple identifier, no dots)
+2. Look up in `function_returns` → get `ReturnKind`
+
+Decision:
+- `.void_type`, `.value`, `.optional`, `.noreturn_type` → **safe** (suppress)
+- `.error_union` → **not safe** (report ZA205)
+- `.unknown` → fall through to next tier
+
+**Tier 3 — Stdlib vocab (trusted for known containers):**
+If the receiver variable is tracked in `stdlib_vars`, check against vocabulary patterns from the compat layer (`getSafeMethodPatterns()`, `getVoidMethodPatterns()`). Method patterns (starting with `.`) only match when the receiver is a confirmed stdlib type.
+
+**Tier 4 — Legacy patterns (backwards compat):**
+Substring matching for non-stdlib patterns (C FFI uppercase functions, parser internals). Universal patterns (not starting with `.`) always match regardless of receiver type.
+
+**Tier 5 — Unknown → report:**
+If no tier resolved the call, the discard is reported (conservative: better to flag than miss).
+
+### Detection Functions and Their Tiers
+
+| Function | Used By | Tiers Used |
+|----------|---------|------------|
+| `isSafeToDiscard` | `checkDiscardedResult` (ZA205 in `analyzeFileErrors`) | 1→2→3→4 |
+| `isSafeBuiltin` | `checkIgnoredError` (ZA205 in `analyzeIgnoredErrorsInFile`) | builtins→2→3→fields→optionals |
+| `isKnownVoidFunction` | Error analysis (confirms void return) | 1→2→3→log patterns |
+| `checkMethodTransfer` | `processAllocTracking` (ZA101-106 memory) | stdlib_vars only (no Tier 2) |
+
+### Memory Analysis Path (ZA101-ZA106)
+
+Memory analysis uses a **CFG-based approach** through three specialized analyzers:
+
+| Analyzer | Rules | Purpose |
+|----------|-------|---------|
+| `analyzeCFGDeferCoverage` | ZA101, ZA102 | Allocation without matching `defer free()`/`defer destroy()` |
+| `analyzeCFGErrdeferCoverage` | ZA103 | Allocation without `errdefer` before next `try` |
+| `analyzeCFGMemorySafety` | ZA105, ZA106 | Use-after-free, double-free |
+
+**Analysis pipeline per file** (`analyzeCFGFile`):
+
+1. **File-level setup**: Compute `no_free_fields` by scanning struct field declarations for no-free allocator types (e.g., `arena: std.heap.ArenaAllocator`)
+2. **Function extraction**: Split file into individual functions
+3. **Per-function analysis** (`processFunction`): Run `runCFGMemoryAnalyses` (ZA101-ZA106), `runCFGSafetyAnalyses` (ZA8xx, ZA9xx), and `runDefiniteAssignmentAnalysis`
+
+**No-free allocator suppression** — allocations that don't need per-allocation free:
+
+| Detection Method | What It Catches | Example |
+|-----------------|-----------------|---------|
+| Local variable init | Variables initialized with `ArenaAllocator.init(...)` | `var arena = std.heap.ArenaAllocator.init(...)` |
+| `.allocator()` call chain | Allocations via `.allocator()` on tracked no-free variables | `arena.allocator().alloc(u8, 100)` |
+| Struct field type (file-level) | Fields declared as no-free allocator types in struct definitions | `arena: std.heap.ArenaAllocator` |
+| Field access chain | Allocations through struct fields of no-free types | `self.arena.allocator().alloc(u8, 100)` |
+| Data flow tracking | No-free allocator types propagated through assignments | `const alloc = arena.allocator();` |
+
+**IMPORTANT**: All suppression is **type-based, not name-based**. Ephor tracks `std.heap.ArenaAllocator`, `std.heap.FixedBufferAllocator`, and `std.heap.StackFallbackAllocator` via stdlib type patterns. Variable/field names like "arena" or "fba" are never used for detection — only the declared type matters.
+
+**Alias tracking for ZA105** (use-after-free):
+
+The UAF detector tracks variable aliases — `const alias = data;` where `data` is a tracked allocation. If `data` is freed and `alias` is used afterwards, ZA105 fires on the alias usage.
+
+**Ownership transfer detection**:
+
+Allocations transferred to stdlib containers (e.g., `list.append(ptr)`) or returned from the function (`return ptr`) are suppressed. The `checkMethodTransfer` function uses `type_ctx.stdlib_vars` to identify stdlib container ownership methods.
+
+### Known Limitations
+
+#### What Is NOT Parsed
+
+| Pattern | Why | Fallback |
+|---------|-----|----------|
+| Multi-line function signatures | Line-by-line parser can't join lines | Falls through to `.unknown` → vocab |
+| Cross-file type resolution | Types defined in imported files | Falls through to `.unknown` → vocab |
+| Generic type parameters | `ArrayList(u8)` stored as full text, lookup mismatch | Falls through to `.unknown` → vocab |
+| Type aliases | `const MyList = ArrayList;` not tracked | Falls through to `.unknown` → vocab |
+| Variable reassignment | `x = NewType.init()` doesn't update type | Uses original declaration type |
+| Method chaining | `a.b().c()` — only sees last receiver | May resolve wrong receiver |
+| Nested function definitions | Functions inside functions | Registered as top-level |
+| Comptime-generated types | Types from `comptime` blocks | Falls through to `.unknown` → vocab |
+| Pointer chain stripping | `**MyStruct` keeps one `*` | May cause lookup mismatch |
+
+All limitations fall through to `.unknown`, which triggers vocab-based detection (Tier 3/4). This means: **no false negatives from parsing limitations** — the worst case is falling back to the same behavior as before TypeContext existed.
+
+#### Known False Positive Patterns
+
+| Pattern | Rule | Root Cause | Status |
+|---------|------|------------|--------|
+| Arena allocator via `std.mem.Allocator` interface | ZA101/ZA103 | Type erasure — arena loses no-free semantics when passed as generic `Allocator` | Open (by design: type-based detection cannot resolve erased types) |
+
+Note: Arena allocations through **struct field chains** (e.g., `self.arena.allocator().alloc(...)`) are correctly suppressed when the field is declared with a no-free allocator type like `std.heap.ArenaAllocator`. Only type-erased fields (declared as `std.mem.Allocator`) remain as known false positives.
+
+These patterns are validated against the community project corpus (3000+ projects, top 100 by size audited with zero false positives).
+
+### Vocabulary System (Compat Layer)
+
+The compat layer (`src/compat/`) provides version-specific pattern vocabularies:
+
+| Vocabulary | Purpose | Example Patterns |
+|-----------|---------|-----------------|
+| `getCleanupPatterns()` | Methods that are always void | `.free(`, `.destroy(`, `.deinit(` |
+| `getSafeMethodPatterns()` | Stdlib methods safe to discard | `.clear(`, `.next(`, `.pop(` |
+| `getVoidMethodPatterns()` | Stdlib methods returning void | `.resize(`, `.shrinkRetainingCapacity(` |
+| `getContainerOwnershipMethods()` | Methods that transfer allocation ownership | `.append(`, `.put(`, `.insert(` |
+| `getStdlibContainerInitPatterns()` | Init patterns for stdlib containers | `ArrayList(`, `StringHashMap(` |
+| `getAllInitPatterns()` | Init patterns for all stdlib types including allocators | `ArenaAllocator.init(`, `FixedBufferAllocator.init(` |
+| `getNoFreeFieldTypePatterns()` | Struct field types that are no-free allocators | `std.heap.ArenaAllocator`, `std.heap.FixedBufferAllocator` |
+
+Vocabularies are defined per Zig version (`v0_15.zig`, `v0_16.zig`) and selected at build time via `compat.zig`.
+
+### Testing Strategy
+
+Ephor uses three testing layers:
+
+**1. Unit tests** (in `src/main.zig`): Test individual parsing and classification functions:
+- `classifyReturnType`, `extractFnReturnType`, `extractSelfTypeName`, `extractFnName`, `extractVarTypeName`
+- `extractMethodCall`, `resolveReturnKind`
+- `parseFileTypeContext` (struct, enum, union, packed/extern, top-level functions)
+
+**2. Integration tests** (in `src/main.zig`): Test full detection pipeline using `createTestFileAnalysis` + `ImportGraph`:
+- User-defined struct/enum/union void methods → NOT flagged
+- User-defined error-returning methods → flagged
+- Stdlib methods via vocab fallback → NOT flagged
+- Vocab override (user `.clear()` returning `!void` → flagged despite vocab)
+- Mixed types in same file resolved independently
+- Unknown receiver falls through to legacy
+
+**3. Fixture files** (in `fixtures/`):
+- `bad_code_patterns.zig` — Code that MUST be flagged (true positives)
+- `good_code_patterns_false_positive.zig` — Code that MUST NOT be flagged (false positive regression tests)
+- `naming_conventions.zig` — Naming rule test patterns
+- `fixtures/memory/tp_*.zig` — True positive memory fixtures (ZA101-ZA106)
+- `fixtures/memory/fp_*.zig` — False positive memory fixtures (arena field chains, ownership transfer, deferred alloc)
+- `examples/error_handling_demo.zig` — Error handling patterns (ZA201-ZA208)
+
+**4. Corpus validation** (3000+ community Zig projects):
+- Dogfood: `ephor check src/` → zero issues
+- Community baseline regression testing against key projects
 
 ## License
 

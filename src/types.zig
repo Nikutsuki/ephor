@@ -15,7 +15,6 @@ const Allocator = mem.Allocator;
 pub const RULE_ALLOC_NO_DEFER = "ZA101";
 pub const RULE_CREATE_NO_DEFER = "ZA102";
 pub const RULE_ALLOC_NO_ERRDEFER = "ZA103";
-pub const RULE_MEMORY_LEAK = "ZA104";
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
 
@@ -26,6 +25,8 @@ pub const RULE_ORELSE_UNREACHABLE = "ZA203";
 pub const RULE_UNDEFINED_USAGE = "ZA204";
 pub const RULE_IGNORED_ERROR = "ZA205";
 pub const RULE_EXIT_BYPASSES_DEFER = "ZA206";
+pub const RULE_CATCH_UNDEFINED = "ZA207";
+pub const RULE_PANIC = "ZA208";
 
 // ZA3xx - Complexity
 pub const RULE_FUNC_TOO_LONG = "ZA301";
@@ -64,6 +65,19 @@ pub const RULE_RUNTIME_DOUBLE_FREE = "ZR102";
 pub const RULE_RUNTIME_USE_AFTER_FREE = "ZR103";
 pub const RULE_RUNTIME_TEST_FAILURE = "ZR104";
 pub const RULE_RUNTIME_PANIC = "ZR105";
+
+// ============================================================================
+// Return Type Classification (for type-based detection)
+// ============================================================================
+
+pub const ReturnKind = enum {
+    void_type, // void — safe to discard
+    error_union, // !void, !T — NOT safe (ZA205)
+    value, // u32, []u8 — safe to discard
+    optional, // ?T — safe to discard
+    noreturn_type, // noreturn — safe
+    unknown, // can't determine — fall through to legacy
+};
 
 // ============================================================================
 // Severity Levels
@@ -370,4 +384,14 @@ test "countLines counts newlines" {
 test "isInsideString detects strings" {
     try std.testing.expect(isInsideString("const x = \"hello", 14));
     try std.testing.expect(!isInsideString("const x = 42", 8));
+}
+
+test "ReturnKind has all expected variants" {
+    const rk: ReturnKind = .void_type;
+    try std.testing.expect(rk == .void_type);
+    try std.testing.expect(ReturnKind.error_union != .void_type);
+    try std.testing.expect(ReturnKind.value != .error_union);
+    try std.testing.expect(ReturnKind.optional != .value);
+    try std.testing.expect(ReturnKind.noreturn_type != .optional);
+    try std.testing.expect(ReturnKind.unknown != .noreturn_type);
 }

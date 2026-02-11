@@ -325,6 +325,113 @@ pub fn getStdModules() []const []const u8 {
 }
 
 // ============================================================================
+// Vocabulary access - Stdlib allocator types, methods, and patterns
+// Single source of truth routed through version-specific modules
+// ============================================================================
+
+/// Init patterns for allocator types that don't need per-allocation free
+pub fn getNoFreeInitPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.no_free_init_patterns;
+    return v0_15.no_free_init_patterns;
+}
+
+/// Struct field type patterns for no-free allocators.
+/// Used to detect fields like `arena: std.heap.ArenaAllocator,` so that
+/// allocations through field chains (e.g. self.arena.alloc()) are suppressed.
+/// Type-based only — never matches on field names, only on declared types.
+pub fn getNoFreeFieldTypePatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.no_free_field_type_patterns;
+    return v0_15.no_free_field_type_patterns;
+}
+
+/// Init patterns for ALL allocator types (no-free + needs-free)
+pub fn getAllInitPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.all_init_patterns;
+    return v0_15.all_init_patterns;
+}
+
+/// Names of global singleton allocators
+pub fn getGlobalAllocNames() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.global_alloc_names;
+    return v0_15.global_alloc_names;
+}
+
+/// Allocation method patterns for line matching (e.g. ".alloc(")
+pub fn getAllocMethodPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.alloc_method_patterns;
+    return v0_15.alloc_method_patterns;
+}
+
+/// Short names for allocation methods (identifier matching, e.g. "alloc")
+pub fn getAllocMethodShortNames() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.alloc_method_short_names;
+    return v0_15.alloc_method_short_names;
+}
+
+/// Qualified stdlib function patterns that allocate (e.g. "mem.concat(")
+/// These have generic names that need module prefix to avoid false positives.
+pub fn getQualifiedAllocFnPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.qualified_alloc_fn_patterns;
+    return v0_15.qualified_alloc_fn_patterns;
+}
+
+/// Cleanup/deallocation patterns (.free, .destroy, .deinit)
+pub fn getCleanupPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.cleanup_pattern_strs;
+    return v0_15.cleanup_pattern_strs;
+}
+
+/// Container methods that transfer ownership (store/consume passed values)
+pub fn getContainerOwnershipMethods() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.container_ownership_methods;
+    return v0_15.container_ownership_methods;
+}
+
+/// Pointer type patterns for no-free allocator parameter detection
+pub fn getNoFreeTypePtrs() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.no_free_type_ptrs;
+    return v0_15.no_free_type_ptrs;
+}
+
+/// Stdlib methods safe to discard (void or value-returning, not !T)
+pub fn getSafeMethodPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.safe_method_patterns;
+    return v0_15.safe_method_patterns;
+}
+
+/// Stdlib void methods (subset of safe methods)
+pub fn getVoidMethodPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.void_method_patterns;
+    return v0_15.void_method_patterns;
+}
+
+/// Stdlib container mutation methods (fill/modify receiver)
+pub fn getModifyingMethodPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.modifying_method_patterns;
+    return v0_15.modifying_method_patterns;
+}
+
+/// Stdlib container type init patterns (for type-based detection)
+pub fn getStdlibContainerInitPatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.stdlib_container_init_patterns;
+    return v0_15.stdlib_container_init_patterns;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -381,4 +488,105 @@ test "getOptionalMethods returns non-empty list" {
 test "getBuiltins returns non-empty list" {
     const builtins_list = getBuiltins();
     try std.testing.expect(builtins_list.len > 0);
+}
+
+test "getNoFreeInitPatterns returns non-empty list" {
+    const patterns = getNoFreeInitPatterns();
+    try std.testing.expect(patterns.len > 0);
+}
+
+test "getNoFreeFieldTypePatterns returns non-empty list" {
+    const patterns = getNoFreeFieldTypePatterns();
+    try std.testing.expect(patterns.len > 0);
+    // Must include ArenaAllocator patterns
+    var found_arena = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, "std.heap.ArenaAllocator")) {
+            found_arena = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_arena);
+}
+
+test "getAllInitPatterns returns non-empty list" {
+    const patterns = getAllInitPatterns();
+    try std.testing.expect(patterns.len > 0);
+    // Should include both no-free and needs-free types
+    try std.testing.expect(patterns.len > getNoFreeInitPatterns().len);
+}
+
+test "getGlobalAllocNames includes testing.allocator" {
+    const names = getGlobalAllocNames();
+    var found = false;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, "testing.allocator")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "getAllocMethodPatterns includes dupe" {
+    const patterns = getAllocMethodPatterns();
+    var found = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, ".dupe(")) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "getCleanupPatterns returns non-empty list" {
+    const patterns = getCleanupPatterns();
+    try std.testing.expect(patterns.len > 0);
+}
+
+test "getContainerOwnershipMethods returns non-empty list" {
+    const methods = getContainerOwnershipMethods();
+    try std.testing.expect(methods.len > 0);
+}
+
+test "getNoFreeTypePtrs returns non-empty list" {
+    const ptrs = getNoFreeTypePtrs();
+    try std.testing.expect(ptrs.len > 0);
+}
+
+test "getSafeMethodPatterns returns non-empty list" {
+    const patterns = getSafeMethodPatterns();
+    try std.testing.expect(patterns.len > 0);
+}
+
+test "getVoidMethodPatterns returns non-empty list" {
+    const patterns = getVoidMethodPatterns();
+    try std.testing.expect(patterns.len > 0);
+    // Void patterns should be a subset of safe patterns
+    try std.testing.expect(patterns.len < getSafeMethodPatterns().len);
+}
+
+test "getModifyingMethodPatterns returns non-empty list" {
+    const patterns = getModifyingMethodPatterns();
+    try std.testing.expect(patterns.len > 0);
+    // Should include common container methods
+    var found_append = false;
+    var found_put = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, ".append(")) found_append = true;
+        if (std.mem.eql(u8, p, ".put(")) found_put = true;
+    }
+    try std.testing.expect(found_append);
+    try std.testing.expect(found_put);
+}
+
+test "getStdlibContainerInitPatterns returns non-empty list" {
+    const patterns = getStdlibContainerInitPatterns();
+    try std.testing.expect(patterns.len > 0);
+    var found_arraylist = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, "ArrayList(")) found_arraylist = true;
+    }
+    try std.testing.expect(found_arraylist);
 }

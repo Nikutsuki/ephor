@@ -1,6 +1,6 @@
 // Test case: Ownership transfer to collections
 // When allocation is added to a collection, the collection owns it
-// Expected: NO warning for ZA102/ZA104
+// Expected: NO warning for ZA102
 const std = @import("std");
 
 const Endpoint = struct {

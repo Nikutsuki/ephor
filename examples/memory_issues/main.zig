@@ -54,7 +54,7 @@ fn riskyOperation() !u32 {
 }
 
 // =============================================================================
-// ZA104: Memory leak - not freed on all paths
+// ZA101: Memory leak - alloc without defer free
 // =============================================================================
 
 /// BAD: Memory not freed on error path
@@ -66,7 +66,7 @@ pub fn conditionalLeak(allocator: Allocator, condition: bool) !void {
         return;
     }
 
-    // Oops! data not freed when condition is false - ZA104 should fire
+    // Oops! data not freed when condition is false - ZA101 should fire
 }
 
 // =============================================================================

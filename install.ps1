@@ -3,28 +3,118 @@
 
 $ErrorActionPreference = "Stop"
 
-$EPHOR_URL = "https://bitbucket.org/rhyoslabs/ephor/get/main.tar.gz"
+$REPO = "https://bitbucket.org/rhyoslabs/ephor"
 
 # Check we're in a Zig project
 if (-not (Test-Path "build.zig")) {
-    Write-Error "Error: build.zig not found. Run this from your Zig project root."
+    Write-Error @"
+error: no build.zig found in current directory
+
+  Ephor requires a Zig project with build.zig and build.zig.zon.
+  To initialize a Zig project, run:
+
+    zig init
+
+  Then re-run the install:
+    irm $REPO/raw/main/install.ps1 | iex
+"@
     exit 1
 }
 
 if (-not (Test-Path "build.zig.zon")) {
-    Write-Error "Error: build.zig.zon not found. Run this from your Zig project root."
-    exit 1
+    $projectName = (Split-Path -Leaf (Get-Location)) -replace '-', '_'
+    $projectName = $projectName.ToLower()
+    Write-Host "No build.zig.zon found, creating one..."
+    @"
+.{
+    .name = .$projectName,
+    .version = "0.0.0",
+    .fingerprint = 0x0,
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+"@ | Set-Content "build.zig.zon"
+
+    # Zig computes the correct fingerprint - capture it
+    $output = zig build 2>&1 | Out-String
+    if ($output -match 'use this value: (0x[0-9a-f]+)') {
+        $fingerprint = $Matches[1]
+        (Get-Content "build.zig.zon" -Raw) -replace '\.fingerprint = 0x0', ".fingerprint = $fingerprint" | Set-Content "build.zig.zon"
+    }
+    Write-Host "Created build.zig.zon for project '$projectName'"
+}
+
+# Fetch latest tagged version from Bitbucket tags API (not cached raw files)
+$TAGS_API = "https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1"
+try {
+    $tagsJson = Invoke-RestMethod -Uri $TAGS_API -TimeoutSec 10
+    $LATEST_TAG = $tagsJson.values[0].name -replace '^v', ''
+} catch {
+    $LATEST_TAG = $null
+}
+
+if (-not $LATEST_TAG) {
+    Write-Host "warning: could not detect latest version, using main branch"
+    $EPHOR_URL = "$REPO/get/main.tar.gz"
+} else {
+    Write-Host "Installing ephor v$LATEST_TAG..."
+    $EPHOR_URL = "$REPO/get/v$LATEST_TAG.tar.gz"
 }
 
 Write-Host "Adding ephor dependency..."
 zig fetch --save=ephor $EPHOR_URL
 
-# Check if ephor step already exists
+# Canonical ephor block for build.zig
+$EPHOR_BLOCK = @"
+
+    // Ephor static analysis
+    const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
+    const ephor_artifact = ephor_dep.artifact("ephor");
+    const ephor_cmd = b.addRunArtifact(ephor_artifact);
+    if (b.args) |args| {
+        ephor_cmd.addArgs(args);
+    }
+    const ephor_step = b.step("ephor", "Run ephor static analysis");
+    ephor_step.dependOn(&ephor_cmd.step);
+
+    // Ephor upgrade
+    const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
+    ephor_upgrade_cmd.addArgs(&.{"upgrade"});
+    const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
+    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
+"@
+
 $buildContent = Get-Content "build.zig" -Raw
-if ($buildContent -match 'dependency\("ephor"') {
-    Write-Host "ephor step already exists in build.zig"
+
+if ($buildContent -match '// Ephor static analysis') {
+    # Ephor block exists - replace it with the canonical version
+    $lines = Get-Content "build.zig"
+    $startLine = -1
+    $endLine = -1
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '// Ephor static analysis' -and $startLine -eq -1) {
+            $startLine = $i
+        }
+        if ($lines[$i] -match 'ephor_upgrade_step\.dependOn') {
+            $endLine = $i
+        }
+    }
+
+    if ($startLine -ge 0 -and $endLine -ge 0) {
+        $newLines = @()
+        $newLines += $lines[0..($startLine - 1)]
+        $newLines += $EPHOR_BLOCK
+        if ($endLine + 1 -lt $lines.Count) {
+            $newLines += $lines[($endLine + 1)..($lines.Count - 1)]
+        }
+        $newLines | Set-Content "build.zig"
+        Write-Host "Updated ephor build steps in build.zig"
+    }
+} elseif ($buildContent -match 'dependency\("ephor"') {
+    Write-Host "warning: ephor dependency found but build steps have non-standard layout"
+    Write-Host "Please update your ephor build steps manually (see README)"
 } else {
-    Write-Host "Patching build.zig..."
+    Write-Host "Adding ephor build steps to build.zig..."
 
     $lines = Get-Content "build.zig"
     $lastInstallLine = -1
@@ -37,33 +127,21 @@ if ($buildContent -match 'dependency\("ephor"') {
 
     if ($lastInstallLine -eq -1) {
         Write-Host "Warning: Could not find installArtifact in build.zig"
-        Write-Host "Please add manually after your exe/lib setup:"
-        Write-Host ""
-        Write-Host '    const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });'
-        Write-Host '    const ephor_step = b.step("ephor", "Run ephor static analysis");'
-        Write-Host '    ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);'
+        Write-Host "Please add the ephor build steps manually (see README)"
         exit 0
     }
 
-    $ephorCode = @"
-
-    // Ephor static analysis
-    const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
-    const ephor_step = b.step("ephor", "Run ephor static analysis");
-    ephor_step.dependOn(&b.addRunArtifact(ephor_dep.artifact("ephor")).step);
-"@
-
     $newLines = @()
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $newLines += $lines[$i]
-        if ($i -eq $lastInstallLine) {
-            $newLines += $ephorCode
-        }
+    $newLines += $lines[0..$lastInstallLine]
+    $newLines += $EPHOR_BLOCK
+    if ($lastInstallLine + 1 -lt $lines.Count) {
+        $newLines += $lines[($lastInstallLine + 1)..($lines.Count - 1)]
     }
-
     $newLines | Set-Content "build.zig"
 }
 
 Write-Host ""
 Write-Host "Done! Run static analysis with:"
-Write-Host "  zig build ephor"
+Write-Host "  zig build ephor              (run all checks)"
+Write-Host "  zig build ephor -- init      (create ephor.json config)"
+Write-Host "  zig build ephor-upgrade      (upgrade to latest version)"

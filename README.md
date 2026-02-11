@@ -54,7 +54,7 @@ Alternatively, re-run the install script to update everything:
 curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.10.3`
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.11.0`
 
 ### Version Management
 
@@ -68,7 +68,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.10.3.tar.gz
+zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.11.0.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -155,7 +155,7 @@ Example config:
 
 ```json
 {
-  "version": "0.10.3",
+  "version": "0.11.0",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -271,16 +271,20 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA801** | warning | ON | Optional unwrap (.?) may panic if null |
-| **ZA802** | warning | ON | Dereferencing optional pointer may panic if null |
+| **ZA801** | warning | OFF | Optional unwrap (.?) may panic if null (use `--enable=ZA8`) |
+| **ZA802** | warning | OFF | Dereferencing optional pointer may panic if null (use `--enable=ZA8`) |
+
+**When to enable ZA8xx:** Pre-release audits for safety-critical code (servers, databases) where a null panic means downtime. Off by default because `.?` is extremely common in Zig and usually intentionally guarded.
 
 ### Panic Detection (ZA9xx)
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA901** | warning | ON | Decrement without overflow guard may panic |
-| **ZA902** | warning | ON | Subtraction in range may cause overflow |
-| **ZA903** | warning | ON | Arithmetic in array index may overflow |
+| **ZA901** | warning | OFF | Decrement without overflow guard may panic (use `--enable=ZA9`) |
+| **ZA902** | warning | OFF | Subtraction in range may cause overflow (use `--enable=ZA9`) |
+| **ZA903** | warning | OFF | Arithmetic in array index may overflow (use `--enable=ZA9`) |
+
+**When to enable ZA9xx:** Before switching from `Debug` to `ReleaseFast` builds — in debug mode, integer overflow panics helpfully; in `ReleaseFast` it becomes undefined behavior. Also useful for security-sensitive or financial code where overflow = vulnerability.
 
 ### Runtime Analysis (ZR1xx)
 
@@ -803,7 +807,7 @@ Memory analysis uses a **CFG-based approach** through three specialized analyzer
 |----------|-------|---------|
 | `analyzeCFGDeferCoverage` | ZA101, ZA102 | Allocation without matching `defer free()`/`defer destroy()` |
 | `analyzeCFGErrdeferCoverage` | ZA103 | Allocation without `errdefer` before next `try` |
-| `analyzeCFGMemorySafety` | ZA104, ZA105, ZA106 | Memory not freed on all paths, use-after-free, double-free |
+| `analyzeCFGMemorySafety` | ZA105, ZA106 | Use-after-free, double-free |
 
 **Analysis pipeline per file** (`analyzeCFGFile`):
 

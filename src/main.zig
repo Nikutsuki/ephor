@@ -12563,7 +12563,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.10.3";
+const EPHOR_VERSION = "0.11.0";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -12774,12 +12774,12 @@ fn scanBuildZigEntries(
 ) !void {
     const build_zig_path = try buildPathWithPrefix(allocator, cfg.path, "build.zig");
     defer allocator.free(build_zig_path);
-    try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, added);
+    try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, added, 0);
 
     const parent = std.fs.path.dirname(mem.trimRight(u8, cfg.path, "/")) orelse ".";
     const parent_build = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{parent});
     defer allocator.free(parent_build);
-    try extractBuildZigEntriesFromPath(allocator, cfg, parent_build, parent, added);
+    try extractBuildZigEntriesFromPath(allocator, cfg, parent_build, parent, added, 0);
 }
 
 fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
@@ -12808,7 +12808,7 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
     for (multi_entry_dirs) |dir| {
         const dir_path = try buildPathWithPrefix(allocator, cfg.path, dir);
         defer allocator.free(dir_path);
-        try scanDirForEntriesWithPrefix(allocator, cfg, dir_path, cfg.path, &added);
+        try scanDirForEntriesWithPrefix(allocator, cfg, dir_path, cfg.path, &added, 0);
     }
 }
 
@@ -13051,6 +13051,7 @@ fn followImportsInLine(
     build_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
     var imp_pos: usize = 0;
     while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
@@ -13059,7 +13060,7 @@ fn followImportsInLine(
         const imp_path = extractQuotedPath(line, istart) orelse continue;
         if (!isValidZigImport(imp_path)) continue;
         try addEntryWithPrefix(allocator, cfg, imp_path, prefix, added);
-        try recurseNestedBuildModule(allocator, cfg, build_path, imp_path, prefix, added);
+        try recurseNestedBuildModule(allocator, cfg, build_path, imp_path, prefix, added, depth);
     }
 }
 
@@ -13071,11 +13072,12 @@ fn recurseNestedBuildModule(
     imp_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) Allocator.Error!void {
     const cur_dir = std.fs.path.dirname(build_path) orelse ".";
     const nested = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cur_dir, imp_path });
     defer allocator.free(nested);
-    extractBuildZigEntriesFromPath(allocator, cfg, nested, prefix, added) catch {
+    extractBuildZigEntriesFromPath(allocator, cfg, nested, prefix, added, depth + 1) catch {
         if (cfg.verbose) std.debug.print(
             "note: could not parse nested build module {s}\n",
             .{nested},
@@ -13090,7 +13092,11 @@ fn extractBuildZigEntriesFromPath(
     build_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
+    // Prevent stack overflow from circular @import chains (e.g., A imports B imports A)
+    if (depth > 4) return;
+
     const content = fs.cwd().readFileAlloc(allocator, build_path, 1024 * 1024) catch return;
     defer allocator.free(content);
 
@@ -13103,7 +13109,7 @@ fn extractBuildZigEntriesFromPath(
         // Handle b.pathJoin(&.{ "dir", "file.zig" }) patterns
         try extractPathJoinEntries(allocator, cfg, line, prefix, added);
         try extractPathTagEntries(allocator, cfg, line, prefix, added);
-        try followImportsInLine(allocator, cfg, line, build_path, prefix, added);
+        try followImportsInLine(allocator, cfg, line, build_path, prefix, added, depth);
     }
 }
 
@@ -13146,7 +13152,9 @@ fn scanDirForEntriesWithPrefix(
     dir_path: []const u8,
     prefix: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
+    if (depth > 16) return;
     var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     var iter = dir.iterate();
@@ -13157,7 +13165,7 @@ fn scanDirForEntriesWithPrefix(
         if (entry.kind != .directory) continue;
         const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
         defer allocator.free(subdir);
-        try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added);
+        try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added, depth + 1);
     }
 }
 
@@ -13167,7 +13175,9 @@ fn scanDirForEntries(
     cfg: *Config,
     dir_path: []const u8,
     added: *std.StringHashMap(void),
+    depth: u8,
 ) !void {
+    if (depth > 16) return;
     var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
     var iter = dir.iterate();
@@ -13178,7 +13188,7 @@ fn scanDirForEntries(
         if (entry.kind != .directory) continue;
         const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
         defer allocator.free(subdir);
-        try scanDirForEntries(allocator, cfg, subdir, added);
+        try scanDirForEntries(allocator, cfg, subdir, added, depth + 1);
     }
 }
 
@@ -13213,7 +13223,7 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
         "bin",       "ci",      "user",
     };
     for (multi_entry_dirs) |dir| {
-        try scanDirForEntries(allocator, cfg, dir, &added);
+        try scanDirForEntries(allocator, cfg, dir, &added, 0);
     }
 
     // Auto-discover test files in src/

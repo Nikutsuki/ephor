@@ -9,8 +9,8 @@
 | **check** | Run all static checks |
 | **runtime** | Dynamic analysis via test execution (memory leaks, panics) |
 | **orphans** | Files not imported from entry points |
-| **memory** | Stdlib allocation without matching `defer free()` (50+ patterns) |
-| **errors** | Silent `catch {}`, `catch unreachable`, `= undefined` |
+| **memory** | Allocation without `defer free/destroy`, missing `errdefer`, use-after-free, double-free |
+| **errors** | Silent `catch {}`, `catch unreachable`, `orelse unreachable`, `catch undefined`, `exit()` bypassing defers, `@panic()`, discarded errors |
 | **unused** | Unused imports, const, and var declarations |
 | **complexity** | Long functions, deep nesting, too many params/branches |
 | **style** | Lines too long, files too large |
@@ -202,11 +202,11 @@ Example config:
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA201** | note | ON | Silent `catch {}` (informational) |
-| **ZA202** | note | ON | `catch unreachable` (informational) |
-| **ZA203** | note | ON | `orelse unreachable` (informational) |
-| **ZA204** | note | ON | `= undefined` may leak sensitive data (informational) |
-| **ZA205** | note | ON | Discarding error union result (informational) |
+| **ZA201** | warning | ON | Silent `catch {}` discards error |
+| **ZA202** | warning | ON | `catch unreachable` will panic on error |
+| **ZA203** | warning | ON | `orelse unreachable` will panic on null |
+| **ZA204** | warning | OFF | `= undefined` may leak sensitive data (use `--enable=ZA204`) |
+| **ZA205** | note | OFF | Discarding error union result (use `--enable=ZA205`) |
 | **ZA206** | warning | ON | `exit()` bypasses defers (memory leak!) |
 | **ZA207** | warning | ON | `catch undefined` (dangerous — converts errors to UB) |
 | **ZA208** | note | ON | `@panic()` crash point (informational) |
@@ -569,7 +569,7 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 | 0 | No warnings or errors found |
 | 1 | Warnings or errors found |
 
-Notes (informational issues like ZA201-ZA205) are printed but do **not** cause a non-zero exit code. Only warnings and errors affect the exit code.
+Notes (informational issues like ZA205 and ZA208) are printed but do **not** cause a non-zero exit code. Only warnings and errors affect the exit code.
 
 ## Examples
 
@@ -661,9 +661,9 @@ Ephor has three analysis entry points:
 
 | Entry Point | Scope | Rules | Context |
 |-------------|-------|-------|---------|
-| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA206 (in `checkLineErrors`) | `TypeContext` via `parseFileTypeContext(content)` |
+| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA208 (in `checkLineErrors`) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
-| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106 (memory) | `CFGState` with file-level `no_free_fields` |
+| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA8xx, ZA9xx | `CFGState` with file-level `no_free_fields` |
 
 Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression.
 
@@ -809,7 +809,7 @@ Memory analysis uses a **CFG-based approach** through three specialized analyzer
 
 1. **File-level setup**: Compute `no_free_fields` by scanning struct field declarations for no-free allocator types (e.g., `arena: std.heap.ArenaAllocator`)
 2. **Function extraction**: Split file into individual functions
-3. **Per-function analysis** (`processFunction` → `runCFGMemoryAnalyses`): Run all three analyzers with shared state
+3. **Per-function analysis** (`processFunction`): Run `runCFGMemoryAnalyses` (ZA101-ZA106), `runCFGSafetyAnalyses` (ZA8xx, ZA9xx), and `runDefiniteAssignmentAnalysis`
 
 **No-free allocator suppression** — allocations that don't need per-allocation free:
 
@@ -898,6 +898,7 @@ Ephor uses three testing layers:
 - `naming_conventions.zig` — Naming rule test patterns
 - `fixtures/memory/tp_*.zig` — True positive memory fixtures (ZA101-ZA106)
 - `fixtures/memory/fp_*.zig` — False positive memory fixtures (arena field chains, ownership transfer, deferred alloc)
+- `examples/error_handling_demo.zig` — Error handling patterns (ZA201-ZA208)
 
 **4. Corpus validation** (3000+ community Zig projects):
 - Dogfood: `ephor check src/` → zero issues

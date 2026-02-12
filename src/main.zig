@@ -4211,13 +4211,21 @@ const ImportGraph = struct {
     allocator: Allocator,
     files: std.StringHashMap(FileAnalysis),
     reachable: std.StringHashMap(void),
+    scan_root: ?[]const u8,
 
     fn init(allocator: Allocator) ImportGraph {
         return .{
             .allocator = allocator,
             .files = std.StringHashMap(FileAnalysis).init(allocator),
             .reachable = std.StringHashMap(void).init(allocator),
+            .scan_root = null,
         };
+    }
+
+    /// Returns true if resolved path is within the scan root (or no root set).
+    fn isWithinScanRoot(self: *const ImportGraph, resolved: []const u8) bool {
+        const root = self.scan_root orelse return true;
+        return mem.startsWith(u8, resolved, root);
     }
 
     fn deinit(self: *ImportGraph) void {
@@ -4248,7 +4256,7 @@ const ImportGraph = struct {
             return err;
         };
         defer dir.close();
-        try self.scanRecursive(dir, dir_path);
+        try self.scanRecursive(dir, dir_path, 0);
     }
 
     fn scanSingleFile(self: *ImportGraph, file_path: []const u8) !void {
@@ -4259,7 +4267,8 @@ const ImportGraph = struct {
         }
     }
 
-    fn scanRecursive(self: *ImportGraph, dir: fs.Dir, base: []const u8) !void {
+    fn scanRecursive(self: *ImportGraph, dir: fs.Dir, base: []const u8, depth: u16) !void {
+        if (depth > 32) return;
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             const path = try std.fmt.allocPrint(
@@ -4282,7 +4291,7 @@ const ImportGraph = struct {
                         .{ .iterate = true },
                     ) catch continue;
                     defer subdir.close();
-                    try self.scanRecursive(subdir, path);
+                    try self.scanRecursive(subdir, path, depth + 1);
                 },
                 else => self.allocator.free(path),
             }
@@ -4527,6 +4536,7 @@ const ImportGraph = struct {
         // Always resolve to absolute path for consistent comparison
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const resolved = std.fs.cwd().realpath(full, &buf) catch return null;
+        if (!self.isWithinScanRoot(resolved)) return null;
         return try self.allocator.dupe(u8, resolved);
     }
 
@@ -4649,6 +4659,7 @@ const ImportGraph = struct {
         defer self.allocator.free(full);
         var rbuf: [fs.max_path_bytes]u8 = undefined;
         const resolved = fs.cwd().realpath(full, &rbuf) catch return;
+        if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved)) {
             self.markReachableRecursive(resolved) catch return;
         }
@@ -4926,6 +4937,7 @@ const ImportGraph = struct {
         defer self.allocator.free(full);
         var rbuf: [fs.max_path_bytes]u8 = undefined;
         const resolved = fs.cwd().realpath(full, &rbuf) catch return;
+        if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved))
             self.markReachableRecursive(resolved) catch return;
     }
@@ -6363,7 +6375,7 @@ fn checkSilentCatch(t: []const u8, path: []const u8, line: usize) ?Issue {
         .file = path,
         .line = line,
         .col = found.col + 1,
-        .severity = .warning,
+        .severity = .note,
         .rule = RULE_SILENT_CATCH,
         .message = found.msg,
         .help = "use catch |err| with logging, or propagate with try",
@@ -9209,7 +9221,7 @@ fn checkCatchUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .warning,
+        .severity = .note,
         .rule = RULE_CATCH_UNREACHABLE,
         .message = "catch unreachable will panic on error",
         .help = "use explicit error handling",
@@ -9235,7 +9247,7 @@ fn checkOrelseUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .warning,
+        .severity = .note,
         .rule = RULE_ORELSE_UNREACHABLE,
         .message = "orelse unreachable will panic",
         .help = "use explicit null handling",
@@ -9255,7 +9267,7 @@ fn checkLineOrelseUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .warning,
+        .severity = .note,
         .rule = RULE_ORELSE_UNREACHABLE,
         .message = "orelse unreachable will panic",
         .help = "use explicit null handling",
@@ -11574,6 +11586,9 @@ const Config = struct {
     export_path: ?[]const u8, // --export=<filepath> to save issues to file
     known_issues_path: ?[]const u8, // --known-issues=<filepath> to filter known true positives
     known_issues: std.ArrayListUnmanaged([]const u8), // Loaded known issues (file:line format)
+    skip_fmt: bool, // --no-fmt: skip zig fmt subprocess
+    sandbox: bool, // --sandbox: no subprocesses, no runtime (untrusted project scanning)
+    auto_approve: bool, // --yes: skip interactive confirmation prompts
     runtime_command: ?[]const u8, // --command=<cmd> for runtime analysis
     install_version: ?[]const u8, // --version=X.Y.Z for install/upgrade
 
@@ -12563,7 +12578,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.0";
+const EPHOR_VERSION = "0.11.1";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13265,6 +13280,19 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         cfg.init_build = true;
         return true;
     }
+    if (mem.eql(u8, arg, "--no-fmt")) {
+        cfg.skip_fmt = true;
+        return true;
+    }
+    if (mem.eql(u8, arg, "--sandbox")) {
+        cfg.sandbox = true;
+        cfg.skip_fmt = true;
+        return true;
+    }
+    if (mem.eql(u8, arg, "--yes") or mem.eql(u8, arg, "-y")) {
+        cfg.auto_approve = true;
+        return true;
+    }
     return false;
 }
 
@@ -13398,6 +13426,9 @@ fn parseArgs(allocator: Allocator) !Config {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
+        .skip_fmt = false,
+        .sandbox = false,
+        .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
     };
@@ -13489,6 +13520,9 @@ fn printHelp() void {
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
         \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
+        \\  --no-fmt             Skip format checking (no zig fmt subprocess)
+        \\  --sandbox            Safe mode for untrusted code (no subprocesses, blocks runtime)
+        \\  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
         \\  --version=<X.Y.Z>   For 'install'/'upgrade': pin a specific version
         \\
         \\INSTALL/UPGRADE EXAMPLES:
@@ -13692,7 +13726,7 @@ fn exportIssues(
     all_issues: []const Issue,
     cfg: *const Config,
     graph: ?*const ImportGraph,
-) !void {
+) !usize {
     var file = try std.fs.cwd().createFile(export_path, .{});
     defer file.close();
 
@@ -13714,13 +13748,18 @@ fn exportIssues(
         day_secs.getMinutesIntoHour(),
         day_secs.getSecondsIntoMinute(),
     });
-    try writer.print("# Total issues: {d}\n\n", .{all_issues.len});
+    var filtered_count: usize = 0;
+    for (all_issues) |issue| {
+        if (shouldPrintIssue(issue, cfg, graph)) filtered_count += 1;
+    }
+    try writer.print("# Total issues: {d}\n\n", .{filtered_count});
 
     for (all_issues) |issue| {
         if (!shouldPrintIssue(issue, cfg, graph)) continue;
         try writeExportIssue(allocator, writer, issue, cfg.path);
     }
     try file.writeAll(output.items);
+    return filtered_count;
 }
 
 // ============================================================================
@@ -14072,6 +14111,7 @@ pub fn main() !void {
                 }
                 var g = ImportGraph.init(alloc);
                 defer g.deinit();
+                g.scan_root = base_path;
                 try scanPath(&g, cfg.path);
                 for (cfg.entries.items) |e| try g.markReachable(e);
                 try g.markBuildPathReferences(&cfg);
@@ -14087,6 +14127,7 @@ pub fn main() !void {
         .memory => {
             var g = ImportGraph.init(alloc);
             defer g.deinit();
+            g.scan_root = base_path;
             try scanPath(&g, cfg.path);
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
@@ -14097,6 +14138,7 @@ pub fn main() !void {
         .errors => {
             var g = ImportGraph.init(alloc);
             defer g.deinit();
+            g.scan_root = base_path;
             try scanPath(&g, cfg.path);
             var issues = try analyzeErrors(alloc, &g);
             defer deinitIssues(&issues, alloc);
@@ -14116,6 +14158,7 @@ pub fn main() !void {
         .unused => {
             var g = ImportGraph.init(alloc);
             defer g.deinit();
+            g.scan_root = base_path;
             try scanPath(&g, cfg.path);
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
@@ -14126,6 +14169,7 @@ pub fn main() !void {
         .complexity => {
             var g = ImportGraph.init(alloc);
             defer g.deinit();
+            g.scan_root = base_path;
             try scanPath(&g, cfg.path);
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
@@ -14134,24 +14178,60 @@ pub fn main() !void {
         },
 
         .fmt_check => {
-            var issues = try runFmtCheck(alloc, cfg.path);
-            defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg, null);
-            _ = c;
+            if (cfg.sandbox) {
+                std.debug.print("error: fmt-check is disabled in --sandbox mode\n", .{});
+                std.debug.print("  fmt-check spawns a zig fmt subprocess\n", .{});
+                std.debug.print("  remove --sandbox or use --no-fmt with check\n", .{});
+                should_exit_error = true;
+            } else {
+                var issues = try runFmtCheck(alloc, cfg.path);
+                defer deinitIssues(&issues, alloc);
+                const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg, null);
+                _ = c;
+            }
         },
 
         .stats => {
             var g = ImportGraph.init(alloc);
             defer g.deinit();
+            g.scan_root = base_path;
             try scanPath(&g, cfg.path);
             printStats(g.getStats(), cfg.format);
         },
 
         .runtime => {
-            var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
-            defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg, null);
-            _ = c;
+            if (cfg.sandbox) {
+                std.debug.print("error: runtime command is disabled in --sandbox mode\n", .{});
+                std.debug.print("  runtime compiles and executes project code\n", .{});
+                std.debug.print("  remove --sandbox to allow execution\n", .{});
+                should_exit_error = true;
+            } else {
+                if (!cfg.auto_approve) {
+                    const cmd_str = cfg.runtime_command orelse "zig build test";
+                    std.debug.print(
+                        \\
+                        \\WARNING: Runtime analysis will COMPILE AND EXECUTE code in:
+                        \\  {s}
+                        \\
+                        \\Command: {s}
+                        \\
+                        \\This runs untrusted code with your user privileges.
+                        \\Only run this on projects you trust.
+                        \\
+                        \\Proceed? [y/N]
+                    , .{ base_path, cmd_str });
+                    var read_buf: [16]u8 = undefined;
+                    const n = std.fs.File.stdin().read(&read_buf) catch 0;
+                    if (n == 0 or (read_buf[0] != 'y' and read_buf[0] != 'Y')) {
+                        std.debug.print("Aborted.\n", .{});
+                        return;
+                    }
+                }
+                var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
+                defer deinitIssues(&issues, alloc);
+                const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg, null);
+                _ = c;
+            }
         },
 
         .check => {
@@ -14168,6 +14248,7 @@ pub fn main() !void {
 
                 var g = ImportGraph.init(alloc);
                 defer g.deinit();
+                g.scan_root = base_path;
 
                 try scanPath(&g, cfg.path);
 
@@ -14208,7 +14289,10 @@ pub fn main() !void {
                 var cx_issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
                 defer deinitIssues(&cx_issues, alloc);
 
-                var fmt_issues = try runFmtCheck(alloc, cfg.path);
+                var fmt_issues: std.ArrayListUnmanaged(Issue) = if (!cfg.skip_fmt)
+                    try runFmtCheck(alloc, cfg.path)
+                else
+                    .{};
                 defer deinitIssues(&fmt_issues, alloc);
 
                 var style_issues = try analyzeStyle(alloc, &g, cfg.thresholds);
@@ -14380,13 +14464,14 @@ pub fn main() !void {
                     for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
                     for (panic_issues.items) |i| try all_issues.append(alloc, i);
 
-                    exportIssues(alloc, export_path, all_issues.items, &cfg, &g) catch |err| {
+                    if (exportIssues(alloc, export_path, all_issues.items, &cfg, &g)) |exported_count| {
+                        std.debug.print(
+                            "exported {d} issues to {s}\n",
+                            .{ exported_count, export_path },
+                        );
+                    } else |err| {
                         std.debug.print("error: failed to export issues: {}\n", .{err});
-                    };
-                    std.debug.print(
-                        "exported {d} issues to {s}\n",
-                        .{ all_issues.items.len, export_path },
-                    );
+                    }
                 }
 
                 // Analysis results are informational - don't fail the build
@@ -15819,6 +15904,9 @@ test "Config.isRuleEnabled respects explicit enable" {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
+        .skip_fmt = false,
+        .sandbox = false,
+        .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
     };
@@ -15853,6 +15941,9 @@ test "Config.isRuleEnabled respects disable prefix" {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
+        .skip_fmt = false,
+        .sandbox = false,
+        .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
     };
@@ -15894,6 +15985,9 @@ test "Config.isRuleEnabled enable overrides disable" {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
+        .skip_fmt = false,
+        .sandbox = false,
+        .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
     };

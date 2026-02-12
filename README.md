@@ -54,7 +54,7 @@ Alternatively, re-run the install script to update everything:
 curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.11.0`
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.11.1`
 
 ### Version Management
 
@@ -68,7 +68,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.11.0.tar.gz
+zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.11.1.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -155,7 +155,7 @@ Example config:
 
 ```json
 {
-  "version": "0.11.0",
+  "version": "0.11.1",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -375,6 +375,9 @@ Options:
   --max-branches=N     Max branches per function (default: 12)
   --max-line-length=N  Max columns per line (default: 100)
   --max-file-bytes=N   Max file size in bytes (enables ZA702)
+  --no-fmt             Skip format checking (no zig fmt subprocess)
+  --sandbox            Safe mode for untrusted code (no subprocesses, blocks runtime)
+  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
   --version=<X.Y.Z>   For install/upgrade: pin a specific version
   --command=<cmd>      For runtime: custom command instead of 'zig build test'
   -V, --verbose        Verbose output

@@ -675,6 +675,82 @@ fn isTypeAllocFactory(t: []const u8, alloc_pos: usize) bool {
     return first_char >= 'A' and first_char <= 'Z';
 }
 
+/// Check if the first argument after an opening paren looks like a Zig type.
+/// `std.mem.Allocator.alloc(comptime T: type, n: usize)` always has a type
+/// as its first argument. Non-memory `.alloc()` methods (e.g. SPIR-V register
+/// allocation) take runtime values instead.
+///
+/// Zig types look like:
+///   - Primitive: u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, bool, void, f16, f32, f64
+///   - User-defined: starts with uppercase (MyStruct, Allocator, Id)
+///   - Pointer/slice: [], [*], *
+///   - Optional: ?Type
+///   - Array: [N]Type
+///   - @import or @Type builtins
+///
+/// Non-types (runtime values) look like:
+///   - Lowercase identifiers that aren't primitives (object_ty_id, result, count)
+///   - Null, numeric literals
+fn hasTypeFirstArg(t: []const u8, open_paren_end: usize) bool {
+    if (open_paren_end >= t.len) return false;
+
+    // Skip whitespace after the opening paren
+    var pos = open_paren_end;
+    while (pos < t.len and (t[pos] == ' ' or t[pos] == '\t')) pos += 1;
+    if (pos >= t.len) return false;
+
+    const c = t[pos];
+
+    // Pointer/slice/array type constructors: [], [*], *
+    if (c == '[' or c == '*') return true;
+
+    // Optional type: ?Type
+    if (c == '?') return true;
+
+    // Builtin type: @import, @Type, @Vector, etc.
+    if (c == '@') return true;
+
+    // Close paren = no args = not std.mem.Allocator.alloc
+    if (c == ')') return false;
+
+    // Numeric literal or null = runtime value, not a type
+    if (c >= '0' and c <= '9') return false;
+    if (mem.startsWith(u8, t[pos..], "null")) return false;
+
+    // Extract the identifier
+    var id_end = pos;
+    while (id_end < t.len and (isIdent(t[id_end]) or t[id_end] == '.')) id_end += 1;
+    if (id_end == pos) return false;
+    const first_arg = t[pos..id_end];
+
+    // Uppercase first char = user-defined type (MyStruct, Allocator, etc.)
+    if (c >= 'A' and c <= 'Z') return true;
+
+    // Primitive numeric types: u8, u16, u32, u64, usize, i8, i16, i32, i64, isize
+    if ((c == 'u' or c == 'i') and first_arg.len >= 2) {
+        if (mem.eql(u8, first_arg, "usize") or mem.eql(u8, first_arg, "isize")) return true;
+        // u8, u16, u32, u64, u128, i8, i16, i32, i64, i128
+        if (first_arg.len >= 2 and first_arg[1] >= '0' and first_arg[1] <= '9') return true;
+    }
+
+    // Other primitive types
+    if (mem.eql(u8, first_arg, "bool") or
+        mem.eql(u8, first_arg, "void") or
+        mem.eql(u8, first_arg, "anyopaque") or
+        mem.eql(u8, first_arg, "comptime_int") or
+        mem.eql(u8, first_arg, "comptime_float"))
+    {
+        return true;
+    }
+
+    // Float types: f16, f32, f64, f80, f128
+    if (c == 'f' and first_arg.len >= 2 and first_arg[1] >= '0' and first_arg[1] <= '9') return true;
+
+    // If we got here with a lowercase identifier that's not a primitive,
+    // it's likely a runtime variable (e.g. object_ty_id, result, count)
+    return false;
+}
+
 /// Check if a variable name appears as a LOCAL variable (not a struct field)
 /// Returns true if the name appears NOT preceded by '.' (which would be field access)
 fn isLocalVarOccurrence(t: []const u8, name: []const u8) bool {
@@ -2502,10 +2578,10 @@ fn collectMemSafetyAllocs(
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.StringHashMap(CFGAllocation) {
     // Build type-tracked allocator sets (stdlib types only)
-    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
-    defer no_free_names.deinit(allocator);
     var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
     defer local_no_free_fields.deinit(allocator);
+    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines, file_no_free_fields);
+    defer no_free_names.deinit(allocator);
     var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
     defer all_alloc_names.deinit(allocator);
 
@@ -2525,6 +2601,17 @@ fn collectMemSafetyAllocs(
             if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
             if (isNoFreeFieldChain(t, fields)) continue;
         }
+        // For standalone/method-style calls where allocator is an argument (not receiver),
+        // check the first-arg allocator for no-free suppression
+        if (extractStandaloneAllocator(t)) |standalone_alloc| {
+            if (no_free_names.contains(standalone_alloc)) continue;
+            if (isArenaName(standalone_alloc)) continue;
+        } else if (extractMultilineFirstArg(t, lines, idx)) |ml_alloc| {
+            if (no_free_names.contains(ml_alloc)) continue;
+            if (isArenaName(ml_alloc)) continue;
+        }
+        // Dotted first-arg arena heuristic: allocPrint(cg.module.arena, ...)
+        if (isFirstArgArena(t)) continue;
         const name = extractVarDeclName(t) orelse continue;
         try allocs.put(name, .{
             .name = name,
@@ -3221,10 +3308,10 @@ fn collectCFGAllocations(
     var allocs = std.ArrayListUnmanaged(CFGAlloc){};
 
     // Pre-scan: build type-tracked allocator sets
-    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
-    defer no_free_names.deinit(allocator);
     var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
     defer local_no_free_fields.deinit(allocator);
+    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines, file_no_free_fields);
+    defer no_free_names.deinit(allocator);
     var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
     defer all_alloc_names.deinit(allocator);
 
@@ -3249,7 +3336,14 @@ fn collectCFGAllocations(
         // check the first-arg allocator for no-free suppression
         if (extractStandaloneAllocator(t)) |standalone_alloc| {
             if (no_free_names.contains(standalone_alloc)) continue;
+            if (isArenaName(standalone_alloc)) continue;
+        } else if (extractMultilineFirstArg(t, lines, idx)) |ml_alloc| {
+            // Multiline: allocPrint(\n    arena, ...) — first arg on next line
+            if (no_free_names.contains(ml_alloc)) continue;
+            if (isArenaName(ml_alloc)) continue;
         }
+        // Dotted first-arg arena heuristic: allocPrint(cg.module.arena, ...)
+        if (isFirstArgArena(t)) continue;
 
         const name = extractVarDeclName(t) orelse continue;
         const block = findBlockForLine(cfg, actual_line) orelse continue;
@@ -4131,10 +4225,10 @@ fn scanErrdeferLines(
 
     // Pre-scan: build set of no-free allocator names by tracking type-based
     // initialization and .allocator() aliases
-    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines);
-    defer no_free_names.deinit(allocator);
     var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
     defer local_no_free_fields.deinit(allocator);
+    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines, file_no_free_fields);
+    defer no_free_names.deinit(allocator);
     // Merge file-level fields: use file-level if available, else local only
     const effective_fields = file_no_free_fields orelse &local_no_free_fields;
 
@@ -4150,15 +4244,32 @@ fn scanErrdeferLines(
         )) continue;
         const has_try = mem.indexOf(u8, t, "try ") != null;
         if (has_try and isTryAllocation(t)) {
-            try collectTryAllocFromLine(
-                t,
-                actual_line,
-                &state.try_allocs,
-                &state.try_lines_list,
-                allocator,
-                &no_free_names,
-                effective_fields,
-            );
+            // Check standalone first-arg allocator (single-line and multiline)
+            const standalone_skip = blk: {
+                if (extractStandaloneAllocator(t)) |sa| {
+                    if (no_free_names.contains(sa)) break :blk true;
+                    if (isArenaName(sa)) break :blk true;
+                } else if (extractMultilineFirstArg(t, lines, idx)) |ml| {
+                    if (no_free_names.contains(ml)) break :blk true;
+                    if (isArenaName(ml)) break :blk true;
+                }
+                // Dotted first-arg arena heuristic
+                if (isFirstArgArena(t)) break :blk true;
+                break :blk false;
+            };
+            if (!standalone_skip) {
+                try collectTryAllocFromLine(
+                    t,
+                    actual_line,
+                    &state.try_allocs,
+                    &state.try_lines_list,
+                    allocator,
+                    &no_free_names,
+                    effective_fields,
+                );
+            } else {
+                try state.try_lines_list.append(allocator, actual_line);
+            }
         }
         try collectDeferFromLine(
             t,
@@ -5103,8 +5214,44 @@ const ImportGraph = struct {
 /// TYPE-BASED initialization patterns (Zig stdlib types only).
 /// Tracks: FixedBufferAllocator, ArenaAllocator, StackFallbackAllocator
 /// Also tracks .allocator() aliases and struct field aliases.
-fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
+fn collectNoFreeAllocatorNames(
+    a: Allocator,
+    lines: []const []const u8,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+) !std.StringHashMapUnmanaged(void) {
     var names = std.StringHashMapUnmanaged(void){};
+
+    // Scan function signature for arena-named Allocator parameters.
+    // Check first ~10 lines for parameter declarations like `arena: Allocator`
+    // or `arena: std.mem.Allocator` in the function signature.
+    const sig_limit = @min(lines.len, 10);
+    for (lines[0..sig_limit]) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        // Stop scanning once we hit the function body (lines starting with real code)
+        if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ") or
+            mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "if ") or
+            mem.startsWith(u8, t, "return ") or mem.startsWith(u8, t, "try "))
+            break;
+        // Look for ALL `arena: Allocator` or `arena: std.mem.Allocator` patterns on the line.
+        // A function signature may have multiple params: fn foo(gpa: Allocator, arena: Allocator)
+        {
+            var search_start: usize = 0;
+            while (mem.indexOf(u8, t[search_start..], ": ")) |rel_pos| {
+                const colon_pos = search_start + rel_pos;
+                // Extract parameter name (ident chars before the colon)
+                var pname_start = colon_pos;
+                while (pname_start > 0 and isIdent(t[pname_start - 1])) pname_start -= 1;
+                const pname = t[pname_start..colon_pos];
+                if (pname.len > 0 and isArenaName(pname)) {
+                    const type_str = mem.trim(u8, t[colon_pos + 2 ..], " \t,)");
+                    if (isAllocatorType(type_str)) {
+                        try names.put(a, pname, {});
+                    }
+                }
+                search_start = colon_pos + 2;
+            }
+        }
+    }
 
     // No-free allocator type init patterns from stdlib vocabulary (compat layer)
     const no_free_inits = compat.getNoFreeInitPatterns();
@@ -5123,11 +5270,43 @@ fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.Str
             }
         }
 
-        // Track .allocator() aliases: const X = Y.allocator()
-        // where Y is a tracked no-free allocator variable (or Y.field is)
+        // Anonymous init syntax (Zig 0.15+): `var fba: std.heap.FixedBufferAllocator = .init(`
+        // The type annotation declares the no-free type but `.init(` doesn't match
+        // the normal `FixedBufferAllocator.init(` pattern.
+        if (!names.contains(name)) {
+            if (mem.indexOf(u8, t, "= .init(") != null or mem.indexOf(u8, t, "= .{") != null) {
+                // Check if the type annotation is a no-free allocator type
+                if (mem.indexOf(u8, t, ": ")) |colon_pos| {
+                    const after_colon = mem.trim(u8, t[colon_pos + 2 ..], " \t");
+                    const field_type_patterns = compat.getNoFreeFieldTypePatterns();
+                    for (field_type_patterns) |pat| {
+                        if (mem.startsWith(u8, after_colon, pat)) {
+                            try names.put(a, name, {});
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Track local variables named "arena" as no-free allocators:
+        // `const arena = session.arena;`, `const arena = s.owner.allocator;`,
+        // `const arena = b.allocator;` etc.
+        // Naming a variable "arena" is a strong convention signal in Zig that
+        // it's backed by an arena allocator. False negative risk is near-zero.
         const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
         var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
         if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
+
+        if (!names.contains(name)) {
+            if (isArenaName(name)) {
+                try names.put(a, name, {});
+                continue;
+            }
+        }
+
+        // Track .allocator() aliases: const X = Y.allocator()
+        // where Y is a tracked no-free allocator variable (or Y.field is)
         const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse continue;
         const source = rhs[0..dot_alloc];
         if (source.len == 0) continue;
@@ -5147,11 +5326,21 @@ fn collectNoFreeAllocatorNames(a: Allocator, lines: []const []const u8) !std.Str
 
         // Check dotted sources: self.arena.allocator(), x.fba.allocator()
         // The last segment before .allocator() might be a tracked no-free var
+        // or a file-level no-free field (e.g. arena declared as ArenaAllocator or
+        // as Allocator with arena name in a struct definition).
         if (mem.lastIndexOf(u8, source, ".")) |last_dot| {
             const field = source[last_dot + 1 ..];
-            if (field.len > 0 and names.contains(field)) {
-                try names.put(a, name, {});
-                continue;
+            if (field.len > 0) {
+                if (names.contains(field)) {
+                    try names.put(a, name, {});
+                    continue;
+                }
+                if (file_no_free_fields) |fields| {
+                    if (fields.contains(field)) {
+                        try names.put(a, name, {});
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -5207,9 +5396,51 @@ fn collectNoFreeFieldNames(a: Allocator, lines: []const []const u8) !std.StringH
                 }
             }
         }
+
+        // Name-based heuristic: fields named "arena" (or containing "arena")
+        // with type Allocator/std.mem.Allocator/mem.Allocator are treated as no-free.
+        // In the Zig ecosystem, arena-named Allocator fields are always backed by
+        // ArenaAllocator — naming a GPA-backed allocator "arena" would be a severe
+        // convention violation.
+        if (!names.contains(field_name) and isArenaName(field_name)) {
+            if (isAllocatorType(type_part)) {
+                try names.put(a, field_name, {});
+            }
+        }
     }
 
     return names;
+}
+
+/// Check if a field/param name indicates an arena allocator.
+/// Matches "arena" exactly or names containing "arena" (e.g. "child_arena").
+fn isArenaName(name: []const u8) bool {
+    if (mem.eql(u8, name, "arena")) return true;
+    if (mem.indexOf(u8, name, "arena") != null) return true;
+    return false;
+}
+
+/// Check if a type string is an Allocator type (not ArenaAllocator/FixedBufferAllocator).
+/// Matches: Allocator, std.mem.Allocator, mem.Allocator
+fn isAllocatorType(type_part: []const u8) bool {
+    const allocator_types = [_][]const u8{
+        "Allocator",
+        "std.mem.Allocator",
+        "mem.Allocator",
+    };
+    for (allocator_types) |at| {
+        if (mem.startsWith(u8, type_part, at)) {
+            // Verify complete type (followed by terminator char or end of string)
+            if (type_part.len == at.len) return true;
+            const next = type_part[at.len];
+            if (next == ',' or next == ' ' or next == '=' or
+                next == ')' or next == '}' or next == ';')
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Content-based version of collectNoFreeFieldNames for file-level scanning.
@@ -5229,12 +5460,11 @@ fn collectNoFreeFieldNamesFromContent(
 }
 
 /// Check if an allocation call is through a struct field chain where one
-/// segment is a known no-free allocator field (type-based detection).
+/// segment is a known no-free allocator field (type-based or name-based detection).
 /// Matches patterns like: self.arena.alloc(...), ctx.fba.dupe(...)
-/// where `arena`/`fba` were declared as no-free allocator types in a struct.
+/// where `arena`/`fba` were declared as no-free allocator types in a struct,
+/// OR where the segment is named "arena" (name-based cross-file heuristic).
 fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnmanaged(void)) bool {
-    if (no_free_fields.count() == 0) return false;
-
     // Find the allocation method position
     var method_pos: ?usize = null;
     for (compat.getAllocMethodPatterns()) |pat| {
@@ -5254,14 +5484,27 @@ fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnm
     if (start >= end) return false;
     const chain = t[start..end];
 
+    // Must be a dotted chain (not just a bare identifier)
+    if (mem.indexOf(u8, chain, ".") == null) return false;
+
     // Check each segment of the chain against known no-free field names
+    // AND against the arena name heuristic (cross-file support)
     var iter_start: usize = 0;
     while (iter_start < chain.len) {
         // Find next dot or end of chain
         const dot_pos = mem.indexOf(u8, chain[iter_start..], ".") orelse (chain.len - iter_start);
         const segment = chain[iter_start .. iter_start + dot_pos];
-        if (segment.len > 0 and no_free_fields.contains(segment)) {
-            return true;
+        if (segment.len > 0) {
+            // Type-based: field declared as no-free allocator type
+            if (no_free_fields.count() > 0 and no_free_fields.contains(segment)) {
+                return true;
+            }
+            // Name-based: field named "arena" — cross-file heuristic.
+            // The struct definition may be in another file (e.g., Sema.zig defines
+            // `arena: Allocator` but Sema/arith.zig uses `sema.arena.alloc()`).
+            if (isArenaName(segment)) {
+                return true;
+            }
         }
         iter_start += dot_pos + 1;
     }
@@ -5942,6 +6185,10 @@ fn isNoFreeCallChainFull(
         if (fields.contains(source)) return true;
     }
 
+    // Name-based heuristic: if the immediate source before .allocator() is named
+    // "arena" (or contains "arena"), treat as no-free (cross-file support).
+    if (isArenaName(source)) return true;
+
     return false;
 }
 
@@ -6093,6 +6340,88 @@ fn extractFirstArgIdent(t: []const u8, start: usize) ?[]const u8 {
     while (s < t.len and isIdent(t[s])) s += 1;
     if (s == ident_start) return null;
     return t[ident_start..s];
+}
+
+/// Extract the full dotted expression starting at `start` (e.g., `cg.module.arena`).
+/// Returns everything up to the first non-ident, non-dot character.
+fn extractFirstArgDotted(t: []const u8, start: usize) ?[]const u8 {
+    var s = start;
+    while (s < t.len and (t[s] == ' ' or t[s] == '\t')) s += 1;
+    if (s >= t.len) return null;
+    const ident_start = s;
+    while (s < t.len and (isIdent(t[s]) or t[s] == '.')) s += 1;
+    if (s == ident_start) return null;
+    // Don't end with a dot
+    if (t[s - 1] == '.') s -= 1;
+    if (s == ident_start) return null;
+    return t[ident_start..s];
+}
+
+/// Check if a dotted first-arg expression contains an arena-named segment.
+/// Handles patterns like `std.fmt.allocPrint(cg.module.arena, ...)`
+fn isFirstArgArena(t: []const u8) bool {
+    // Try all standalone allocator extraction patterns
+    var arg_start: ?usize = null;
+    for (compat.getQualifiedAllocFnPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            arg_start = pos + pat.len;
+            break;
+        }
+    }
+    if (arg_start == null) {
+        for (first_arg_alloc_patterns) |pat| {
+            if (mem.indexOf(u8, t, pat)) |pos| {
+                arg_start = pos + pat.len;
+                break;
+            }
+        }
+    }
+    const start = arg_start orelse return false;
+    const dotted = extractFirstArgDotted(t, start) orelse return false;
+
+    // Check if any segment of the dotted expression is arena-named
+    var iter_pos: usize = 0;
+    while (iter_pos < dotted.len) {
+        const dot = mem.indexOf(u8, dotted[iter_pos..], ".") orelse (dotted.len - iter_pos);
+        const segment = dotted[iter_pos .. iter_pos + dot];
+        if (segment.len > 0 and isArenaName(segment)) return true;
+        iter_pos += dot + 1;
+    }
+    return false;
+}
+
+/// Extract the first argument of a multiline allocating call.
+/// When a line ends with an allocating pattern like `allocPrint(` and the first
+/// argument is on the next line, extract that identifier from the next line.
+/// Handles: `std.fmt.allocPrint(\n    arena,` and similar patterns.
+fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize) ?[]const u8 {
+    // Check if the line contains an allocating pattern that ends at the line boundary
+    // (i.e., extractStandaloneAllocator returned null because the arg is on the next line)
+    var has_alloc_pattern = false;
+    for (compat.getQualifiedAllocFnPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat) != null) {
+            has_alloc_pattern = true;
+            break;
+        }
+    }
+    if (!has_alloc_pattern) {
+        for (first_arg_alloc_patterns) |pat| {
+            if (mem.indexOf(u8, t, pat) != null) {
+                has_alloc_pattern = true;
+                break;
+            }
+        }
+    }
+    if (!has_alloc_pattern) return null;
+
+    // Check that the line ends with an open paren (possibly with trailing whitespace)
+    const trimmed = mem.trimRight(u8, t, " \t\r");
+    if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '(') return null;
+
+    // Look at the next line for the first argument
+    if (idx + 1 >= lines.len) return null;
+    const next_line = mem.trim(u8, lines[idx + 1], " \t\r");
+    return extractFirstArgIdent(next_line, 0);
 }
 
 // ============================================================================
@@ -8599,6 +8928,12 @@ fn findAllocCall(
         if (is_create) {
             // .create() needs type-based check — too common on non-allocators
             if (!isAllocatorCreateTypeBased(t, col, alloc_names))
+                continue;
+        }
+        // .alloc() first arg must look like a Zig type — non-allocator structs
+        // can have .alloc() methods (e.g. SPIR-V CodeGen register allocation).
+        if (mem.eql(u8, pattern, ".alloc(")) {
+            if (!hasTypeFirstArg(t, col + pattern.len))
                 continue;
         }
         return .{ .col = col, .is_create = is_create };
@@ -12576,7 +12911,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.2";
+const EPHOR_VERSION = "0.11.3";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -17957,6 +18292,523 @@ test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
         }
     }
+}
+
+// ============================================================================
+// Arena Allocator Name-Based Heuristic Tests
+// ============================================================================
+
+test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
+    // Field named "arena" with type Allocator (not ArenaAllocator) should be
+    // treated as no-free. This is the Zig compiler's pervasive pattern:
+    // const Sema = struct { arena: Allocator, ... };
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\const Sema = struct {
+        \\    arena: Allocator,
+        \\    gpa: Allocator,
+        \\};
+        \\fn analyze(sema: *Sema) !void {
+        \\    const data = try sema.arena.alloc(u8, 100);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_name_field.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_name_field.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_name_field.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for function parameter arena: Allocator (ZA101)" {
+    // Function parameter named "arena" with type Allocator should be no-free.
+    // Pattern: fn foo(arena: Allocator) !void { arena.alloc(...) }
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn processData(arena: std.mem.Allocator) !void {
+        \\    const data = try arena.alloc(u8, 256);
+        \\    compute(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_param.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_param.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_param.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
+    // Deep chain: self.ctx.arena.alloc() where arena field is Allocator type
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\const Ctx = struct {
+        \\    arena: Allocator,
+        \\};
+        \\const Worker = struct {
+        \\    ctx: *Ctx,
+        \\};
+        \\fn doWork(self: *Worker) !void {
+        \\    const buf = try self.ctx.arena.alloc(u8, 64);
+        \\    process(buf);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_deep_chain.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_deep_chain.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_deep_chain.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for allocPrint with arena param (ZA101)" {
+    // std.fmt.allocPrint(arena, ...) where arena is a function parameter
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn formatName(arena: std.mem.Allocator, name: []const u8) ![]u8 {
+        \\    const result = try std.fmt.allocPrint(arena, "Hello {s}", .{name});
+        \\    return result;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_allocprint.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_allocprint.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_allocprint.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
+    // A parameter named "allocator" (not "arena") should still trigger warnings.
+    // This verifies the heuristic is name-specific, not over-broad.
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn processData(alloc: std.mem.Allocator) !void {
+        \\    const data = try alloc.alloc(u8, 256);
+        \\    compute(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_non_arena_param.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_non_arena_param.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // Should find at least one ZA101 or ZA103 for the non-arena allocator
+    var found_memory_issue = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_non_arena_param.zig")) {
+            if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER) or
+                mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER))
+            {
+                found_memory_issue = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_memory_issue);
+}
+
+test "arena param no FP for ZA103 errdefer (name-based)" {
+    // Arena-named parameter should not trigger ZA103 either
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn buildNode(arena: std.mem.Allocator) !*Node {
+        \\    const node = try arena.create(Node);
+        \\    return node;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_za103.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_za103.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_za103.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        }
+    }
+}
+
+test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
+    // var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    // Zig 0.15+ anonymous init syntax
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn useFixedBuffer() !void {
+        \\    var buf: [4096]u8 = undefined;
+        \\    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+        \\    const alloc = fba.allocator();
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_anon_init_fba.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_anon_init_fba.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_anon_init_fba.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+test "no FP for arena param used as receiver and first-arg (ZA103)" {
+    // Reproduces git.zig pattern: fn init(arena: Allocator, ...) with arena.dupe() and allocPrint(arena, ...)
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\fn init(arena: Allocator, name: []const u8) ![]u8 {
+        \\    const scheme = try arena.dupe(u8, name);
+        \\    const user = try std.fmt.allocPrint(arena, "{s}", .{name});
+        \\    _ = scheme;
+        \\    return user;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_param_mixed.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_param_mixed.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_param_mixed.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for arena as non-first parameter (ZA103)" {
+    // Reproduces Value.zig pattern: fn sqrt(val, float_type, arena: Allocator, pt)
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\pub fn sqrt(val: u32, float_type: u32, arena: Allocator, pt: u32) ![]u8 {
+        \\    const result_data = try arena.alloc(u8, float_type);
+        \\    _ = val;
+        \\    _ = pt;
+        \\    return result_data;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_third_param.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_third_param.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_third_param.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for multiline allocPrint with arena (ZA101)" {
+    // Reproduces glibc.zig pattern: allocPrint(\n    arena,\n    fmt, ...)
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn buildStubs(gpa: std.mem.Allocator) !void {
+        \\    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
+        \\    defer arena_allocator.deinit();
+        \\    const arena = arena_allocator.allocator();
+        \\    const msg = try std.fmt.allocPrint(
+        \\        arena,
+        \\        "hello {s}",
+        \\        .{"world"},
+        \\    );
+        \\    process(msg);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_multiline_allocprint.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multiline_allocprint.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_multiline_allocprint.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
+    // Reproduces glibc.zig pattern: arena_allocator.allocator() alias used in allocPrint
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn buildStubs(gpa: std.mem.Allocator) !void {
+        \\    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
+        \\    defer arena_allocator.deinit();
+        \\    const arena = arena_allocator.allocator();
+        \\    const msg = try std.fmt.allocPrint(arena, "hello {s}", .{"world"});
+        \\    process(msg);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_arena_alias_allocprint.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_arena_alias_allocprint.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_arena_alias_allocprint.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for local arena alias from struct field access (ZA101)" {
+    // Reproduces git.zig pattern: const arena = session.arena; arena.alloc(...)
+    // where Session has arena: Allocator field
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\const Session = struct {
+        \\    arena: Allocator,
+        \\    data: []u8,
+        \\};
+        \\fn processSession(session: *Session) !void {
+        \\    const arena = session.arena;
+        \\    const buf = try arena.alloc(u8, 1024);
+        \\    process(buf);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_local_arena_alias.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_local_arena_alias.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_local_arena_alias.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        }
+    }
+}
+
+test "no FP for non-memory alloc method (ZA103)" {
+    // Non-allocator structs can have .alloc() methods (e.g. SPIR-V register allocation).
+    // These should NOT trigger ZA101/ZA103 since they don't allocate heap memory.
+    // std.mem.Allocator.alloc() always takes a type as first arg (u8, MyStruct, etc.).
+    // Non-memory .alloc() takes runtime values (ids, counts, etc.).
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const CodeGen = struct {
+        \\    data: []u8,
+        \\    pub fn alloc(self: *CodeGen, ty_id: u32, init: ?u32) !u32 {
+        \\        _ = self; _ = ty_id; _ = init;
+        \\        return 42;
+        \\    }
+        \\};
+        \\fn emitCode(cg: *CodeGen) !void {
+        \\    const tmp_id = try cg.alloc(object_ty_id, null);
+        \\    const result_id = try cg.alloc(child_ty_id, null);
+        \\    process(tmp_id, result_id);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_nonmem_alloc.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_nonmem_alloc.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_nonmem_alloc.zig")) {
+            // Non-memory .alloc() should NOT trigger memory warnings
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "real alloc with type arg still triggers (ZA101)" {
+    // Ensure that real allocator.alloc(u8, 100) still triggers warnings
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn leaky(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 1024);
+        \\    process(buf);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_real_alloc.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_real_alloc.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_memory_warning = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_real_alloc.zig") and
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+        {
+            found_memory_warning = true;
+        }
+    }
+    try std.testing.expect(found_memory_warning);
 }
 
 // ============================================================================

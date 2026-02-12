@@ -11586,8 +11586,6 @@ const Config = struct {
     export_path: ?[]const u8, // --export=<filepath> to save issues to file
     known_issues_path: ?[]const u8, // --known-issues=<filepath> to filter known true positives
     known_issues: std.ArrayListUnmanaged([]const u8), // Loaded known issues (file:line format)
-    skip_fmt: bool, // --no-fmt: skip zig fmt subprocess
-    sandbox: bool, // --sandbox: no subprocesses, no runtime (untrusted project scanning)
     auto_approve: bool, // --yes: skip interactive confirmation prompts
     runtime_command: ?[]const u8, // --command=<cmd> for runtime analysis
     install_version: ?[]const u8, // --version=X.Y.Z for install/upgrade
@@ -12578,7 +12576,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.1";
+const EPHOR_VERSION = "0.11.2";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13280,15 +13278,6 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         cfg.init_build = true;
         return true;
     }
-    if (mem.eql(u8, arg, "--no-fmt")) {
-        cfg.skip_fmt = true;
-        return true;
-    }
-    if (mem.eql(u8, arg, "--sandbox")) {
-        cfg.sandbox = true;
-        cfg.skip_fmt = true;
-        return true;
-    }
     if (mem.eql(u8, arg, "--yes") or mem.eql(u8, arg, "-y")) {
         cfg.auto_approve = true;
         return true;
@@ -13426,8 +13415,6 @@ fn parseArgs(allocator: Allocator) !Config {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
-        .skip_fmt = false,
-        .sandbox = false,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
@@ -13520,8 +13507,6 @@ fn printHelp() void {
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
         \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
-        \\  --no-fmt             Skip format checking (no zig fmt subprocess)
-        \\  --sandbox            Safe mode for untrusted code (no subprocesses, blocks runtime)
         \\  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
         \\  --version=<X.Y.Z>   For 'install'/'upgrade': pin a specific version
         \\
@@ -14178,17 +14163,10 @@ pub fn main() !void {
         },
 
         .fmt_check => {
-            if (cfg.sandbox) {
-                std.debug.print("error: fmt-check is disabled in --sandbox mode\n", .{});
-                std.debug.print("  fmt-check spawns a zig fmt subprocess\n", .{});
-                std.debug.print("  remove --sandbox or use --no-fmt with check\n", .{});
-                should_exit_error = true;
-            } else {
-                var issues = try runFmtCheck(alloc, cfg.path);
-                defer deinitIssues(&issues, alloc);
-                const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg, null);
-                _ = c;
-            }
+            var issues = try runFmtCheck(alloc, cfg.path);
+            defer deinitIssues(&issues, alloc);
+            const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg, null);
+            _ = c;
         },
 
         .stats => {
@@ -14200,38 +14178,31 @@ pub fn main() !void {
         },
 
         .runtime => {
-            if (cfg.sandbox) {
-                std.debug.print("error: runtime command is disabled in --sandbox mode\n", .{});
-                std.debug.print("  runtime compiles and executes project code\n", .{});
-                std.debug.print("  remove --sandbox to allow execution\n", .{});
-                should_exit_error = true;
-            } else {
-                if (!cfg.auto_approve) {
-                    const cmd_str = cfg.runtime_command orelse "zig build test";
-                    std.debug.print(
-                        \\
-                        \\WARNING: Runtime analysis will COMPILE AND EXECUTE code in:
-                        \\  {s}
-                        \\
-                        \\Command: {s}
-                        \\
-                        \\This runs untrusted code with your user privileges.
-                        \\Only run this on projects you trust.
-                        \\
-                        \\Proceed? [y/N]
-                    , .{ base_path, cmd_str });
-                    var read_buf: [16]u8 = undefined;
-                    const n = std.fs.File.stdin().read(&read_buf) catch 0;
-                    if (n == 0 or (read_buf[0] != 'y' and read_buf[0] != 'Y')) {
-                        std.debug.print("Aborted.\n", .{});
-                        return;
-                    }
+            if (!cfg.auto_approve) {
+                const cmd_str = cfg.runtime_command orelse "zig build test";
+                std.debug.print(
+                    \\
+                    \\WARNING: Runtime analysis will COMPILE AND EXECUTE code in:
+                    \\  {s}
+                    \\
+                    \\Command: {s}
+                    \\
+                    \\This runs untrusted code with your user privileges.
+                    \\Only run this on projects you trust.
+                    \\
+                    \\Proceed? [y/N]
+                , .{ base_path, cmd_str });
+                var read_buf: [16]u8 = undefined;
+                const n = std.fs.File.stdin().read(&read_buf) catch 0;
+                if (n == 0 or (read_buf[0] != 'y' and read_buf[0] != 'Y')) {
+                    std.debug.print("Aborted.\n", .{});
+                    return;
                 }
-                var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
-                defer deinitIssues(&issues, alloc);
-                const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg, null);
-                _ = c;
             }
+            var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
+            defer deinitIssues(&issues, alloc);
+            const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg, null);
+            _ = c;
         },
 
         .check => {
@@ -14289,10 +14260,7 @@ pub fn main() !void {
                 var cx_issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
                 defer deinitIssues(&cx_issues, alloc);
 
-                var fmt_issues: std.ArrayListUnmanaged(Issue) = if (!cfg.skip_fmt)
-                    try runFmtCheck(alloc, cfg.path)
-                else
-                    .{};
+                var fmt_issues = try runFmtCheck(alloc, cfg.path);
                 defer deinitIssues(&fmt_issues, alloc);
 
                 var style_issues = try analyzeStyle(alloc, &g, cfg.thresholds);
@@ -15904,8 +15872,6 @@ test "Config.isRuleEnabled respects explicit enable" {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
-        .skip_fmt = false,
-        .sandbox = false,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
@@ -15941,8 +15907,6 @@ test "Config.isRuleEnabled respects disable prefix" {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
-        .skip_fmt = false,
-        .sandbox = false,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
@@ -15985,8 +15949,6 @@ test "Config.isRuleEnabled enable overrides disable" {
         .export_path = null,
         .known_issues_path = null,
         .known_issues = .{},
-        .skip_fmt = false,
-        .sandbox = false,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,

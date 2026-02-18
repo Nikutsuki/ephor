@@ -845,6 +845,46 @@ fn isDirectAssignment(t: []const u8, name: []const u8, pos: usize) bool {
     return mem.startsWith(u8, trimmed, "=");
 }
 
+/// Check if a line contains a direct reassignment of var_name: `var_name = ...`
+/// Used to detect when a freed variable is reassigned to new memory.
+/// Skips `==` (comparison), `[` (subscript), string literals, and field access.
+fn hasDirectReassignment(t: []const u8, var_name: []const u8) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        // Word boundary checks
+        if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) continue;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos > 0 and t[pos - 1] == '.') continue; // field access
+        if (isInsideString(t, pos)) continue;
+        // Check for direct assignment (not ==, not subscript)
+        if (isDirectAssignment(t, var_name, pos)) return true;
+    }
+    return false;
+}
+
+/// Check if var_name is reassigned on any line between from_line and to_line (exclusive).
+/// Used by cross-block UAF detection to suppress false positives when a freed variable
+/// is reassigned to new memory before the next use.
+fn hasReassignmentBetween(
+    lines: []const []const u8,
+    func_line: usize,
+    from_line: usize,
+    to_line: usize,
+    var_name: []const u8,
+) bool {
+    if (from_line == 0 or from_line >= to_line) return false;
+    for (from_line + 1..to_line) |ln| {
+        if (ln < func_line) continue;
+        const idx = ln - func_line;
+        if (idx >= lines.len) continue;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (hasDirectReassignment(t, var_name)) return true;
+    }
+    return false;
+}
+
 /// Check if position is an assignment target (not a read) - includes subscript
 /// Check if text starts with `=` but not `==`
 fn isAssignmentOp(text: []const u8) bool {
@@ -2732,6 +2772,8 @@ fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
             continue;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos > 0 and t[pos - 1] == '.') continue;
+        // Capture binding: |var| in for/while/switch/catch creates a new binding
+        if (pos > 0 and t[pos - 1] == '|') continue;
         if (isInsideString(t, pos)) continue;
         if (isDirectAssignment(t, vn, pos)) continue;
         return pos;
@@ -2766,6 +2808,11 @@ fn checkSameBlockFree(
         if (hasRealFreePattern(ct) and isDirectFreeOfVar(ct, var_name)) {
             freed = true;
             alloc_info.freed_line = cl;
+        }
+        // Reassignment after free: `var_name = ...` resets freed state
+        // (the variable now points to new memory, not the freed allocation)
+        if (freed and hasDirectReassignment(ct, var_name)) {
+            freed = false;
         }
         if (freed and mem.startsWith(u8, ct, "return")) ret = true;
     }
@@ -2859,6 +2906,9 @@ fn checkLineForUAF(
     )) return;
     const preds_freed = try checkPredecessorsFreed(allocator, cfg, bid, bstate);
     if (preds_freed and alloc_info.freed_line > 0) {
+        // Check for reassignment between the free and this use
+        if (hasReassignmentBetween(lines, func_line, alloc_info.freed_line, actual_line, var_name))
+            return;
         try appendUAFIssue(
             allocator,
             issues,
@@ -8150,17 +8200,15 @@ fn analyzeStyle(
     while (iter.next()) |entry| {
         const a = entry.value_ptr.*;
 
-        // ZA702: File too long
-        if (th.max_file_bytes) |max_bytes| {
-            if (a.content.len > max_bytes)
-                try reportFileTooLong(
-                    &issues,
-                    allocator,
-                    a.path,
-                    a.content.len,
-                    max_bytes,
-                );
-        }
+        // ZA702: File too long (off by default, enable with --enable=ZA702)
+        if (a.content.len > th.max_file_bytes)
+            try reportFileTooLong(
+                &issues,
+                allocator,
+                a.path,
+                a.content.len,
+                th.max_file_bytes,
+            );
 
         // ZA701: Line too long
         var line_num: usize = 1;
@@ -11965,8 +12013,9 @@ const Config = struct {
 
     /// Check if a rule is off by default (prefix or exact match)
     fn isOffByDefault(self: *const Config, rule: []const u8) bool {
+        _ = self;
         if (mem.eql(u8, rule, RULE_FILE_TOO_LONG))
-            return self.thresholds.max_file_bytes == null;
+            return true;
         for (off_by_default_prefixes) |prefix| {
             if (mem.startsWith(u8, rule, prefix)) return true;
         }
@@ -12911,7 +12960,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.3";
+const EPHOR_VERSION = "0.11.5";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13642,8 +13691,8 @@ fn parseThresholdArg(arg: []const u8, th: *Thresholds) bool {
         th.max_line_length = v;
         return true;
     }
-    if (parseThreshold(arg, "--max-file-bytes=", 0)) |v| {
-        th.max_file_bytes = if (v > 0) v else null;
+    if (parseThreshold(arg, "--max-file-bytes=", 50_000)) |v| {
+        th.max_file_bytes = v;
         return true;
     }
     return false;
@@ -13876,7 +13925,7 @@ fn printHelp() void {
         \\      "max_params": 4,
         \\      "max_branches": 12,
         \\      "max_line_length": 100,
-        \\      "max_file_bytes": 25000
+        \\      "max_file_bytes": 50000
         \\    }
         \\  }
         \\
@@ -17898,6 +17947,81 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
     }
 }
 
+test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Pattern: return list.toOwnedSlice(allocator) — ownership transferred to caller
+    const code =
+        \\const std = @import("std");
+        \\
+        \\fn getItems(alloc: std.mem.Allocator) ![]u8 {
+        \\    var list = std.ArrayList(u8).init(alloc);
+        \\    errdefer list.deinit();
+        \\    try list.append(alloc, 42);
+        \\    return list.toOwnedSlice(alloc);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_owned_return.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_owned_return.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_owned_return.zig") and
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+        {
+            std.debug.print("unexpected ZA101: {s} line {d}\n", .{ issue.message, issue.line });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice (ZA101)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Pattern: const data = list.toOwnedSlice(alloc); return data
+    const code =
+        \\const std = @import("std");
+        \\
+        \\fn getFiltered(alloc: std.mem.Allocator) ![]u8 {
+        \\    var list = std.ArrayList(u8).init(alloc);
+        \\    errdefer list.deinit();
+        \\    try list.append(alloc, 1);
+        \\    const data = try list.toOwnedSlice(alloc);
+        \\    return data;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_owned_const.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_owned_const.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_owned_const.zig") and
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+        {
+            std.debug.print("unexpected ZA101: {s} line {d}\n", .{ issue.message, issue.line });
+            try std.testing.expect(false);
+        }
+    }
+}
+
 // ============================================================================
 // ZA102 unit tests: create() without destroy
 // ============================================================================
@@ -19120,4 +19244,149 @@ test "ZA206 std.posix.exit fires" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "ZA105: no false positive on variable reassignment after free" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Pattern: free(x); x = try alloc(); use(x) — NOT use-after-free
+    const code =
+        \\const std = @import("std");
+        \\
+        \\fn processLoop(alloc: std.mem.Allocator) !void {
+        \\    var buf = try alloc.alloc(u8, 64);
+        \\    alloc.free(buf);
+        \\    buf = try alloc.alloc(u8, 128);
+        \\    process(buf);
+        \\    alloc.free(buf);
+        \\}
+        \\fn process(d: []u8) void { _ = d; }
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_reassign.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_reassign.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
+            mem.eql(u8, issue.file, "test_reassign.zig"))
+        {
+            std.debug.print("unexpected ZA105: {s} line {d}\n", .{ issue.message, issue.line });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA105: no false positive on for-loop capture variable" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Pattern: for (items) |item| { alloc.free(item); } — NOT use-after-free
+    // The capture |item| creates a new binding, not a use of a prior "item"
+    const code =
+        \\const std = @import("std");
+        \\
+        \\fn cleanup(alloc: std.mem.Allocator) !void {
+        \\    const item = try alloc.alloc(u8, 32);
+        \\    alloc.free(item);
+        \\    const items = try alloc.alloc([]u8, 4);
+        \\    for (items) |item| {
+        \\        alloc.free(item);
+        \\    }
+        \\    alloc.free(items);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_capture.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_capture.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
+            mem.eql(u8, issue.file, "test_capture.zig"))
+        {
+            std.debug.print("unexpected ZA105: {s} line {d}\n", .{ issue.message, issue.line });
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "ZA105: still detects real use-after-free with reassignment check" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Real UAF: free(x); use(x) — no reassignment between
+    const code =
+        \\const std = @import("std");
+        \\
+        \\fn realUAF(alloc: std.mem.Allocator) void {
+        \\    const data = alloc.alloc(u8, 100) catch return;
+        \\    alloc.free(data);
+        \\    process(data);
+        \\}
+        \\fn process(d: []u8) void { _ = d; }
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_real_uaf.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_real_uaf.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var uaf_found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
+            mem.eql(u8, issue.file, "test_real_uaf.zig"))
+        {
+            uaf_found = true;
+            break;
+        }
+    }
+    try std.testing.expect(uaf_found);
+}
+
+test "findVarUseOnLine skips capture bindings" {
+    // |item| capture — not a use
+    try std.testing.expect(findVarUseOnLine("for (items) |item| {", "item") == null);
+    // |key, value| multi-capture
+    try std.testing.expect(findVarUseOnLine("switch (x) { |val| => {},", "val") == null);
+    // catch |err| capture
+    try std.testing.expect(findVarUseOnLine("} catch |err| {", "err") == null);
+    // Normal use — should still be detected
+    try std.testing.expect(findVarUseOnLine("process(item);", "item") != null);
+    // Use in free — findVarUseOnLine still finds it (filtered by isUAFSkipLine)
+    try std.testing.expect(findVarUseOnLine("alloc.free(item);", "item") != null);
+}
+
+test "hasDirectReassignment detects variable reassignment" {
+    try std.testing.expect(hasDirectReassignment("buf = try alloc.alloc(u8, 128);", "buf"));
+    try std.testing.expect(hasDirectReassignment("x = newValue();", "x"));
+    // Not a reassignment: comparison
+    try std.testing.expect(!hasDirectReassignment("if (buf == null) return;", "buf"));
+    // Not a reassignment: subscript access
+    try std.testing.expect(!hasDirectReassignment("buf[0] = 42;", "buf"));
+    // Not a reassignment: field access
+    try std.testing.expect(!hasDirectReassignment("self.buf = data;", "buf"));
+    // Not present at all
+    try std.testing.expect(!hasDirectReassignment("other = 5;", "buf"));
 }

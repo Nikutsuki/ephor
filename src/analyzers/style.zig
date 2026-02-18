@@ -88,9 +88,7 @@ pub fn analyze(
         const a = entry.value_ptr.*;
 
         // Check file size
-        if (thresholds.max_file_bytes) |max_bytes| {
-            try checkFileSize(allocator, &issues, a.path, a.content, max_bytes);
-        }
+        try checkFileSize(allocator, &issues, a.path, a.content, thresholds.max_file_bytes);
 
         // Check line lengths
         var line_num: usize = 1;

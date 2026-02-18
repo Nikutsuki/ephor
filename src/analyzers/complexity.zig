@@ -81,19 +81,43 @@ fn countBranchesInLine(t: []const u8) usize {
 // Function Metrics
 // ============================================================================
 
-/// Count parameters in function signature
+/// Count parameters in function signature (excludes self/method receiver)
 fn countParams(line: []const u8) usize {
     const open = mem.indexOf(u8, line, "(") orelse return 0;
-    const close = mem.indexOf(u8, line, ")") orelse return 0;
-    if (close <= open + 1) return 0;
 
-    const params = line[open + 1 .. close];
-    if (params.len == 0) return 0;
-
-    var count: usize = 1;
-    for (params) |c| {
-        if (c == ',') count += 1;
+    // Find matching close paren using depth tracking
+    var depth: usize = 1;
+    var pos = open + 1;
+    while (pos < line.len) : (pos += 1) {
+        if (line[pos] == '(') depth += 1;
+        if (line[pos] == ')') {
+            depth -= 1;
+            if (depth == 0) break;
+        }
     }
+    if (depth > 0) return 0;
+    if (pos <= open + 1) return 0;
+
+    const params = line[open + 1 .. pos];
+    if (mem.trim(u8, params, " \t\r").len == 0) return 0;
+
+    // Count commas at paren depth 0 only
+    var count: usize = 1;
+    var inner_depth: usize = 0;
+    for (params) |c| {
+        if (c == '(') inner_depth += 1;
+        if (c == ')' and inner_depth > 0) inner_depth -= 1;
+        if (c == ',' and inner_depth == 0) count += 1;
+    }
+
+    // Skip 'self' method receiver — not a user parameter
+    const tp = mem.trimLeft(u8, params, " \t");
+    if (mem.startsWith(u8, tp, "self")) {
+        if (tp.len == 4 or !types.isIdent(tp[4])) {
+            if (count > 0) count -= 1;
+        }
+    }
+
     return count;
 }
 
@@ -424,4 +448,28 @@ test "countParams counts correctly" {
     try std.testing.expectEqual(@as(usize, 0), countParams("fn foo() void"));
     try std.testing.expectEqual(@as(usize, 1), countParams("fn foo(x: i32) void"));
     try std.testing.expectEqual(@as(usize, 2), countParams("fn foo(x: i32, y: i32) void"));
+}
+
+test "countParams excludes self method receiver" {
+    // self alone = 0 user params
+    try std.testing.expectEqual(@as(usize, 0), countParams("fn foo(self) void"));
+    try std.testing.expectEqual(@as(usize, 0), countParams("fn foo(self: *Self) void"));
+    try std.testing.expectEqual(@as(usize, 0), countParams("fn foo(self: *@This()) void"));
+    // self + real params
+    const self_one = "fn exec(self: *Pool, sql: []const u8) void";
+    try std.testing.expectEqual(@as(usize, 1), countParams(self_one));
+    const self_two = "fn exec(self: *Pool, sql: []const u8, p: anytype) void";
+    try std.testing.expectEqual(@as(usize, 2), countParams(self_two));
+    // self_thing is NOT self — should count normally
+    try std.testing.expectEqual(@as(usize, 2), countParams("fn foo(self_thing: i32, x: i32) void"));
+}
+
+test "countParams handles nested parens in types" {
+    // Nested parens should not cause miscounting
+    try std.testing.expectEqual(@as(usize, 2), countParams(
+        "fn exec(self: *Self, sql: []const u8, args: std.meta.ArgsTuple(@TypeOf(sql))) void",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), countParams(
+        "fn foo(callback: @TypeOf(some_fn)) void",
+    ));
 }

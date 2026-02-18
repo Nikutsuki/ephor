@@ -195,7 +195,7 @@ pub const Thresholds = struct {
     max_params: usize = 4,
     max_branches: usize = 12,
     max_line_length: usize = 100,
-    max_file_bytes: ?usize = null,
+    max_file_bytes: usize = 50_000,
 };
 
 pub const ProjectStats = struct {

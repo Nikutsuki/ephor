@@ -9795,20 +9795,40 @@ fn findCallSiteLine(t: []const u8, preceding_lines: ?[]const []const u8) ?[]cons
 }
 
 /// Check if `catch unreachable` is inside a @TypeOf() expression (compile-time only).
-/// Uses paren-balanced lookback to find the call site across multiple lines.
+/// Walks backwards through preceding lines accumulating paren depth. If a line
+/// contains `@TypeOf(` while cumulative depth shows we're still inside its parens,
+/// the catch unreachable is compile-time only and safe to suppress.
 fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) bool {
-    // Check current line first (fast path)
+    // Check current line first (fast path) — scan left of `catch unreachable`
     var i = pos;
     while (i > 0) {
         i -= 1;
         if (i + 8 <= t.len and mem.eql(u8, t[i .. i + 8], "@TypeOf(")) return true;
         if (i + 7 <= t.len and mem.eql(u8, t[i .. i + 7], "@typeOf(")) return true;
     }
-    // Multi-line: find the call-site line via paren balance
-    const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
-    if (call_line.ptr == t.ptr) return false; // Already checked current line
-    return mem.indexOf(u8, call_line, "@TypeOf(") != null or
-        mem.indexOf(u8, call_line, "@typeOf(") != null;
+    // Multi-line: accumulate paren depth from current line backwards.
+    // If we find @TypeOf( on a line where depth > 0, we're nested inside it.
+    const prev = preceding_lines orelse return false;
+    var depth: isize = 0;
+    for (t) |c| {
+        if (c == '(') depth += 1;
+        if (c == ')') depth -= 1;
+    }
+    var idx = prev.len;
+    while (idx > 0) {
+        idx -= 1;
+        const pl = mem.trim(u8, prev[idx], " \t\r");
+        if (isCommentOrMultilineString(pl)) continue;
+        for (pl) |c| {
+            if (c == '(') depth += 1;
+            if (c == ')') depth -= 1;
+        }
+        if (depth > 0 and (mem.indexOf(u8, pl, "@TypeOf(") != null or
+            mem.indexOf(u8, pl, "@typeOf(") != null)) return true;
+        // Stop at statement boundaries (no paren nesting left to resolve)
+        if (depth <= 0 and (mem.endsWith(u8, pl, ";") or mem.endsWith(u8, pl, "{"))) break;
+    }
+    return false;
 }
 
 /// Check if `catch unreachable` comes from a bufPrint/bufPrintZ call.
@@ -19887,15 +19907,32 @@ test "isInsideTypeOf detects @TypeOf context" {
     try std.testing.expect(!isInsideTypeOf("const x = foo() catch unreachable;", 22, null));
 }
 
-test "isInsideTypeOf detects multi-line @TypeOf" {
+test "isInsideTypeOf detects multi-line @TypeOf with inner call spanning lines" {
+    // Inner function call spans multiple lines, catch unreachable on the last
     const prev = [_][]const u8{
         "const ReceiptsHolder = @TypeOf(",
-        "    block_fetcher.fetchBlockReceipts(undefined, 0)",
+        "    block_fetcher.fetchBlockReceipts(",
     };
-    // catch unreachable is on the current line, @TypeOf is 2 lines back
-    try std.testing.expect(isInsideTypeOf(") catch unreachable,", 2, &prev));
-    // No preceding @TypeOf
-    try std.testing.expect(!isInsideTypeOf(") catch unreachable,", 2, null));
+    const line = "        undefined, 0) catch unreachable,";
+    const col = mem.indexOf(u8, line, "catch unreachable").?;
+    try std.testing.expect(isInsideTypeOf(line, col, &prev));
+    // No preceding context
+    try std.testing.expect(!isInsideTypeOf(line, col, null));
+}
+
+test "isInsideTypeOf detects balanced-paren line inside @TypeOf" {
+    // pipeline.zig pattern: current line has balanced parens but is inside @TypeOf
+    const prev2 = [_][]const u8{
+        "const ReceiptsHolder = @TypeOf(",
+    };
+    const line = "block_fetcher.fetchBlockReceipts(undefined, 0) catch unreachable,";
+    const col = mem.indexOf(u8, line, "catch unreachable").?;
+    try std.testing.expect(isInsideTypeOf(line, col, &prev2));
+    // Same line but no @TypeOf wrapper — should NOT suppress
+    const prev3 = [_][]const u8{
+        "const result = someFunction(",
+    };
+    try std.testing.expect(!isInsideTypeOf(line, col, &prev3));
 }
 
 test "isBufPrintCatchUnreachable detects same-line pattern" {

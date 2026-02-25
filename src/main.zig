@@ -6751,6 +6751,8 @@ fn checkSilentCatch(t: []const u8, path: []const u8, line: usize, func_name: []c
         mem.startsWith(u8, t, "errdefer ")) return null;
     // Suppress in cleanup/shutdown functions — catch {} is intentional best-effort
     if (isCleanupFunction(func_name)) return null;
+    // Suppress when the called method is a cleanup/best-effort operation
+    if (isCleanupMethodCall(t)) return null;
     // Suppress writer/stream catch {} — client disconnect, no recovery action
     if (isStreamWriteCatch(t)) return null;
     const found = findSilentCatchCol(t) orelse return null;
@@ -6784,12 +6786,56 @@ fn isCleanupFunction(name: []const u8) bool {
     return false;
 }
 
+/// Check if the called method on the line is a cleanup/best-effort operation.
+/// Matches `.leaseRevoke(`, `.close(`, `.cleanup(`, `.shutdown(`, etc.
+/// Case-insensitive substring match (camelCase: `leaseRevoke` matches "revoke").
+fn isCleanupMethodCall(t: []const u8) bool {
+    const cleanup_keywords = [_][]const u8{
+        "revoke",  "close",   "cleanup",  "shutdown",   "deinit",
+        "release", "destroy", "teardown", "disconnect",
+    };
+    // Find method calls: look for .methodName( patterns
+    var pos: usize = 0;
+    while (mem.indexOfScalarPos(u8, t, pos, '.')) |dot| {
+        pos = dot + 1;
+        if (pos >= t.len) break;
+        // Extract method name after the dot
+        var end = pos;
+        while (end < t.len and isIdent(t[end])) end += 1;
+        if (end == pos) continue;
+        if (end >= t.len or t[end] != '(') continue;
+        const method = t[pos..end];
+        // Check if method name contains any cleanup keyword (case-insensitive)
+        if (containsCleanupKeyword(method, &cleanup_keywords)) {
+            if (!isInsideString(t, dot)) return true;
+        }
+    }
+    return false;
+}
+
+/// Case-insensitive substring check: does `name` contain any of the keywords?
+/// Handles camelCase (e.g., "leaseRevoke" contains "revoke" via "Revoke").
+fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
+    // Convert to lowercase buffer for comparison
+    var lower_buf: [128]u8 = undefined;
+    if (name.len > lower_buf.len) return false;
+    for (name, 0..) |c, i| {
+        lower_buf[i] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..name.len];
+    for (keywords) |kw| {
+        if (mem.indexOf(u8, lower, kw) != null) return true;
+    }
+    return false;
+}
+
 /// Check if line is a writer/stream write with catch {} — best-effort during streaming.
 /// Pattern: `writer.print(...)`, `writer.writeAll(...)`, `writer.writeByte(...)` etc.
 fn isStreamWriteCatch(t: []const u8) bool {
     const write_patterns = [_][]const u8{
-        ".print(",    ".writeAll(",         ".writeByte(",
-        ".writeInt(", ".writeBytesNTimes(",
+        ".print(",           ".writeAll(",         ".writeByte(",
+        ".writeInt(",        ".writeBytesNTimes(", ".writeSep(",
+        ".writeByteNTimes(",
     };
     for (write_patterns) |pat| {
         if (mem.indexOf(u8, t, pat)) |pos| {
@@ -7552,6 +7598,7 @@ fn checkLineErrors(
     allocator: Allocator,
     type_ctx: ?*const TypeContext,
     func_name: []const u8,
+    preceding_lines: ?[]const []const u8,
 ) !void {
     // ZA201 (silent catch) - only from line-based analyzer
     if (!in_defer) {
@@ -7560,7 +7607,7 @@ fn checkLineErrors(
         }
     }
     // ZA202: catch unreachable
-    if (checkCatchUnreachable(t, path, ln)) |i| {
+    if (checkCatchUnreachable(t, path, ln, preceding_lines)) |i| {
         try issues.append(allocator, i);
     }
     // ZA203: orelse unreachable (simple line-based check, no null guard analysis)
@@ -7689,12 +7736,19 @@ fn analyzeFileErrors(
     var type_ctx = try parseFileTypeContext(allocator, a.content);
     defer type_ctx.deinit(allocator);
 
-    var state = ErrorAnalysisState{};
-    var line_num: usize = 1;
-    var lines = mem.splitScalar(u8, a.content, '\n');
+    // Collect all lines for preceding-line lookback (ZA202 multi-line suppression)
+    var all_lines_list: std.ArrayListUnmanaged([]const u8) = .{};
+    defer all_lines_list.deinit(allocator);
+    var line_iter = mem.splitScalar(u8, a.content, '\n');
+    while (line_iter.next()) |l| {
+        try all_lines_list.append(allocator, l);
+    }
+    const all_lines = all_lines_list.items;
 
-    while (lines.next()) |line| {
-        defer line_num += 1;
+    var state = ErrorAnalysisState{};
+
+    for (all_lines, 0..) |line, line_idx| {
+        const line_num = line_idx + 1;
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
 
@@ -7705,6 +7759,7 @@ fn analyzeFileErrors(
             activatePendingFields(&state);
             try checkPendingFields(t, a.path, &state, issues, allocator);
         }
+        const preceding: ?[]const []const u8 = if (line_idx > 0) all_lines[0..line_idx] else null;
         try checkLineErrors(
             t,
             a.path,
@@ -7716,6 +7771,7 @@ fn analyzeFileErrors(
             allocator,
             &type_ctx,
             state.current_func_name,
+            preceding,
         );
 
         if (checkExitBypassesDefer(
@@ -7934,19 +7990,21 @@ fn calcLimit(base: usize, is_factory: bool, mult: usize) usize {
     return if (is_factory) base * mult else base;
 }
 
-/// Calculate branch limit with type factory (3x) and data dispatch (4x) multipliers.
+/// Calculate branch limit with type factory (3x) and data dispatch (8x) multipliers.
 /// Data dispatch functions (JSON deserialization, config loading) naturally have
 /// one branch per field — this is inherent, not a complexity smell.
 fn branchLimit(base: usize, is_type_factory: bool, is_data_dispatch: bool) usize {
     if (is_type_factory) return base * 3;
-    if (is_data_dispatch) return base * 4;
+    if (is_data_dispatch) return base * 8;
     return base;
 }
 
 /// Check if function name indicates a data-dispatch pattern where high branch counts
 /// are inherent (JSON deserialization, env var mapping, config loading).
+/// These functions have 1 branch per field/variable — linear, not complex.
 fn isDataDispatchFunction(name: []const u8) bool {
     if (name.len == 0) return false;
+    // Exact matches
     const dispatch_names = [_][]const u8{
         "fromJson",   "fromJsonObject", "parseJson",    "deserialize",
         "toJson",     "serialize",      "applyEnvVar",  "parseEnv",
@@ -7954,6 +8012,13 @@ fn isDataDispatchFunction(name: []const u8) bool {
     };
     for (dispatch_names) |dn| {
         if (mem.eql(u8, name, dn)) return true;
+    }
+    // Prefix matches — parse*, apply*, decode*, encode*
+    const dispatch_prefixes = [_][]const u8{
+        "parse", "apply", "decode", "encode",
+    };
+    for (dispatch_prefixes) |prefix| {
+        if (mem.startsWith(u8, name, prefix) and name.len > prefix.len) return true;
     }
     // Substring matches for common patterns
     const dispatch_substrings = [_][]const u8{
@@ -7979,7 +8044,7 @@ fn reportSingleComplexity(
     help: []const u8,
 ) !void {
     if (actual <= limit) return;
-    const suffix: []const u8 = if (state.is_type_factory) " [tf]" else "";
+    const suffix: []const u8 = if (state.is_type_factory) " [tf]" else if (state.is_data_dispatch) " [dd]" else "";
     const fmt = "function '{s}' has {d} {s} (max {d}){s}";
     const msg = try std.fmt.allocPrint(
         allocator,
@@ -9665,7 +9730,8 @@ fn analyzeCFGErrors(
             if (isCommentOrMultilineString(t)) continue;
             if (is_test_ctx) continue;
 
-            if (checkCatchUnreachable(t, file_path, line_num)) |issue|
+            const preceding: ?[]const []const u8 = if (idx > 0) lines[0..idx] else null;
+            if (checkCatchUnreachable(t, file_path, line_num, preceding)) |issue|
                 try issues.append(allocator, issue);
             if (checkOrelseUnreachable(
                 t,
@@ -9683,17 +9749,19 @@ fn analyzeCFGErrors(
 }
 
 /// ZA202: catch unreachable will panic on error
+/// Accepts preceding lines context for multi-line expression lookback.
 fn checkCatchUnreachable(
     t: []const u8,
     file_path: []const u8,
     line_num: usize,
+    preceding_lines: ?[]const []const u8,
 ) ?Issue {
     const col = mem.indexOf(u8, t, "catch unreachable") orelse return null;
     if (isInsideString(t, col)) return null;
     // Suppress inside @TypeOf() — compile-time only, never executed at runtime
-    if (isInsideTypeOf(t, col)) return null;
-    // Suppress bufPrint/bufPrintZ with fixed-size buffer — provably safe
-    if (isBufPrintWithFixedBuffer(t)) return null;
+    if (isInsideTypeOf(t, col, preceding_lines)) return null;
+    // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe
+    if (isBufPrintCatchUnreachable(t, preceding_lines)) return null;
     return .{
         .file = file_path,
         .line = line_num,
@@ -9705,31 +9773,53 @@ fn checkCatchUnreachable(
     };
 }
 
-/// Check if position is inside a @TypeOf(...) expression (compile-time only)
-fn isInsideTypeOf(t: []const u8, pos: usize) bool {
-    // Look backwards from pos for @TypeOf( — must appear before the position
+/// Check if `catch unreachable` is inside a @TypeOf() expression (compile-time only).
+/// Checks current line and optionally preceding lines for multi-line @TypeOf.
+fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) bool {
+    // Check current line
     var i = pos;
     while (i > 0) {
         i -= 1;
         if (i + 8 <= t.len and mem.eql(u8, t[i .. i + 8], "@TypeOf(")) return true;
         if (i + 7 <= t.len and mem.eql(u8, t[i .. i + 7], "@typeOf(")) return true;
     }
+    // Check preceding lines (for multi-line @TypeOf expressions)
+    const prev = preceding_lines orelse return false;
+    const lookback = @min(prev.len, 10);
+    for (0..lookback) |back| {
+        const pl = mem.trim(u8, prev[prev.len - 1 - back], " \t\r");
+        if (mem.indexOf(u8, pl, "@TypeOf(") != null) return true;
+        if (mem.indexOf(u8, pl, "@typeOf(") != null) return true;
+    }
     return false;
 }
 
-/// Check if line is a bufPrint/bufPrintZ call into a fixed-size buffer.
-/// Pattern: `bufPrint(&buf, ...) catch unreachable` where buf is a stack array.
-/// These are provably safe when the buffer is sized to hold max formatted output.
-fn isBufPrintWithFixedBuffer(t: []const u8) bool {
-    const bp = mem.indexOf(u8, t, "bufPrint(") orelse
-        mem.indexOf(u8, t, "bufPrintZ(") orelse return false;
-    if (isInsideString(t, bp)) return false;
-    // Find the opening paren after bufPrint/bufPrintZ
-    const paren_pos = mem.indexOfScalarPos(u8, t, bp, '(') orelse return false;
-    if (paren_pos + 1 >= t.len) return false;
-    const rest = mem.trim(u8, t[paren_pos + 1 ..], " \t");
-    // First arg starts with & — address-of fixed buffer
-    return mem.startsWith(u8, rest, "&");
+/// Check if `catch unreachable` comes from a bufPrint/bufPrintZ call.
+/// These functions only return error.NoSpaceLeft — programmers size the buffer
+/// to fit max output, making catch unreachable provably correct.
+/// Checks same line first, then preceding lines for multi-line calls.
+fn isBufPrintCatchUnreachable(t: []const u8, preceding_lines: ?[]const []const u8) bool {
+    // Same-line check
+    if (hasBufPrintCall(t)) return true;
+    // Multi-line: look back up to 10 lines for the bufPrint( opening
+    const prev = preceding_lines orelse return false;
+    const lookback = @min(prev.len, 10);
+    for (0..lookback) |back| {
+        const pl = mem.trim(u8, prev[prev.len - 1 - back], " \t\r");
+        if (hasBufPrintCall(pl)) return true;
+    }
+    return false;
+}
+
+/// Check if a line contains a bufPrint or bufPrintZ call (not inside a string).
+fn hasBufPrintCall(t: []const u8) bool {
+    if (mem.indexOf(u8, t, "bufPrint(")) |pos| {
+        if (!isInsideString(t, pos)) return true;
+    }
+    if (mem.indexOf(u8, t, "bufPrintZ(")) |pos| {
+        if (!isInsideString(t, pos)) return true;
+    }
+    return false;
 }
 
 /// ZA203: orelse unreachable will panic on null
@@ -13081,7 +13171,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.6";
+const EPHOR_VERSION = "0.11.7";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -19522,25 +19612,45 @@ test "ZA202 suppressed inside @TypeOf" {
         "const T = @TypeOf(pool.query(\"\", &.{}) catch unreachable);",
         "test.zig",
         1,
+        null,
     );
     try std.testing.expect(issue == null);
 }
 
-test "ZA202 suppressed for bufPrint with fixed buffer" {
-    // bufPrint(&buf, ...) catch unreachable is provably safe with sized buffers
+test "ZA202 suppressed for bufPrint same-line" {
+    // bufPrint(...) catch unreachable — only error is NoSpaceLeft
     const issue = checkCatchUnreachable(
         "const s = std.fmt.bufPrint(&buf, \"{d}\", .{val}) catch unreachable;",
         "test.zig",
         1,
+        null,
     );
     try std.testing.expect(issue == null);
 }
 
-test "ZA202 suppressed for bufPrintZ with fixed buffer" {
+test "ZA202 suppressed for bufPrintZ same-line" {
     const issue = checkCatchUnreachable(
         "const s = std.fmt.bufPrintZ(&buf, \"{d}\", .{val}) catch unreachable;",
         "test.zig",
         1,
+        null,
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA202 suppressed for bufPrint multi-line" {
+    // Multi-line: bufPrint( is on a preceding line, catch unreachable on current
+    const prev = [_][]const u8{
+        "return std.fmt.bufPrint(",
+        "    &buf,",
+        "    \"0x{x}\",",
+        "    .{block_num},",
+    };
+    const issue = checkCatchUnreachable(
+        ") catch unreachable;",
+        "test.zig",
+        5,
+        &prev,
     );
     try std.testing.expect(issue == null);
 }
@@ -19551,16 +19661,22 @@ test "ZA202 NOT suppressed for regular catch unreachable" {
         "const x = bar() catch unreachable;",
         "test.zig",
         1,
+        null,
     );
     try std.testing.expect(issue != null);
 }
 
-test "ZA202 NOT suppressed for bufPrint without address-of" {
-    // bufPrint(slice, ...) — not a fixed buffer, should still fire
+test "ZA202 NOT suppressed for non-bufPrint multi-line" {
+    // Some other multi-line call — should still fire
+    const prev = [_][]const u8{
+        "const result = someOtherFunction(",
+        "    arg1,",
+    };
     const issue = checkCatchUnreachable(
-        "const s = std.fmt.bufPrint(slice, \"{d}\", .{val}) catch unreachable;",
+        ") catch unreachable;",
         "test.zig",
-        1,
+        3,
+        &prev,
     );
     try std.testing.expect(issue != null);
 }
@@ -19620,6 +19736,14 @@ test "isDataDispatchFunction recognizes fromJson" {
     try std.testing.expect(isDataDispatchFunction("deserialize"));
     try std.testing.expect(isDataDispatchFunction("loadConfig"));
     try std.testing.expect(isDataDispatchFunction("applyEnvVar"));
+    // Prefix matches
+    try std.testing.expect(isDataDispatchFunction("parseBlock"));
+    try std.testing.expect(isDataDispatchFunction("parseTransaction"));
+    try std.testing.expect(isDataDispatchFunction("parseReceipt"));
+    try std.testing.expect(isDataDispatchFunction("parseLog"));
+    try std.testing.expect(isDataDispatchFunction("decodeHeader"));
+    try std.testing.expect(isDataDispatchFunction("encodeResponse"));
+    try std.testing.expect(isDataDispatchFunction("applyConfig"));
 }
 
 test "isDataDispatchFunction rejects regular names" {
@@ -19629,8 +19753,8 @@ test "isDataDispatchFunction rejects regular names" {
     try std.testing.expect(!isDataDispatchFunction(""));
 }
 
-test "branchLimit applies 4x for data dispatch" {
-    try std.testing.expectEqual(@as(usize, 48), branchLimit(12, false, true));
+test "branchLimit applies 8x for data dispatch" {
+    try std.testing.expectEqual(@as(usize, 96), branchLimit(12, false, true));
     try std.testing.expectEqual(@as(usize, 36), branchLimit(12, true, false));
     try std.testing.expectEqual(@as(usize, 12), branchLimit(12, false, false));
 }
@@ -19703,14 +19827,42 @@ test "countFnParams excludes self parameter" {
 }
 
 test "isInsideTypeOf detects @TypeOf context" {
-    try std.testing.expect(isInsideTypeOf("const T = @TypeOf(foo() catch unreachable);", 30));
-    try std.testing.expect(!isInsideTypeOf("const x = foo() catch unreachable;", 22));
+    try std.testing.expect(isInsideTypeOf("const T = @TypeOf(foo() catch unreachable);", 30, null));
+    try std.testing.expect(!isInsideTypeOf("const x = foo() catch unreachable;", 22, null));
 }
 
-test "isBufPrintWithFixedBuffer detects fixed buffer pattern" {
-    try std.testing.expect(isBufPrintWithFixedBuffer("std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable"));
-    try std.testing.expect(isBufPrintWithFixedBuffer("std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable"));
-    try std.testing.expect(!isBufPrintWithFixedBuffer("std.fmt.bufPrint(slice, \"{d}\", .{x}) catch unreachable"));
+test "isInsideTypeOf detects multi-line @TypeOf" {
+    const prev = [_][]const u8{
+        "const ReceiptsHolder = @TypeOf(",
+        "    block_fetcher.fetchBlockReceipts(undefined, 0)",
+    };
+    // catch unreachable is on the current line, @TypeOf is 2 lines back
+    try std.testing.expect(isInsideTypeOf(") catch unreachable,", 2, &prev));
+    // No preceding @TypeOf
+    try std.testing.expect(!isInsideTypeOf(") catch unreachable,", 2, null));
+}
+
+test "isBufPrintCatchUnreachable detects same-line pattern" {
+    try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable", null));
+    try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable", null));
+    try std.testing.expect(!isBufPrintCatchUnreachable(") catch unreachable;", null));
+}
+
+test "isBufPrintCatchUnreachable detects multi-line pattern" {
+    const prev = [_][]const u8{
+        "return std.fmt.bufPrint(",
+        "    &buf,",
+        "    \"0x{x}\",",
+        "    .{block_num},",
+    };
+    // catch unreachable is on the closing line, bufPrint( is 4 lines back
+    try std.testing.expect(isBufPrintCatchUnreachable(") catch unreachable;", &prev));
+}
+
+test "hasBufPrintCall detects bufPrint patterns" {
+    try std.testing.expect(hasBufPrintCall("return std.fmt.bufPrint(&buf, fmt, args)"));
+    try std.testing.expect(hasBufPrintCall("const s = bufPrintZ(&buf, \"{d}\", .{x})"));
+    try std.testing.expect(!hasBufPrintCall(") catch unreachable;"));
 }
 
 test "isCleanupFunction matches cleanup names" {
@@ -19738,4 +19890,18 @@ test "hasSelfParam detects self parameter" {
     try std.testing.expect(hasSelfParam("fn query(self: *Pool, sql: []const u8)", 8));
     try std.testing.expect(hasSelfParam("fn deinit(self: *Self)", 9));
     try std.testing.expect(!hasSelfParam("fn process(a: u32, b: u32)", 10));
+}
+
+test "isCleanupMethodCall matches cleanup method names" {
+    try std.testing.expect(isCleanupMethodCall("self.client.leaseRevoke(lid) catch {}"));
+    try std.testing.expect(isCleanupMethodCall("conn.close() catch {}"));
+    try std.testing.expect(isCleanupMethodCall("resource.cleanup() catch {}"));
+    try std.testing.expect(isCleanupMethodCall("pool.destroy() catch {}"));
+    try std.testing.expect(isCleanupMethodCall("session.disconnect() catch {}"));
+    try std.testing.expect(!isCleanupMethodCall("db.query() catch {}"));
+    try std.testing.expect(!isCleanupMethodCall("api.fetch() catch {}"));
+}
+
+test "isStreamWriteCatch matches writeSep pattern" {
+    try std.testing.expect(isStreamWriteCatch("ctr.writeSep(writer) catch {}"));
 }

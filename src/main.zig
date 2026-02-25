@@ -6746,9 +6746,13 @@ fn trackTestBlock(
 
 /// Check for silent catch patterns (ZA201)
 /// Skip note in defer/errdefer contexts (best-effort cleanup)
-fn checkSilentCatch(t: []const u8, path: []const u8, line: usize) ?Issue {
+fn checkSilentCatch(t: []const u8, path: []const u8, line: usize, func_name: []const u8) ?Issue {
     if (mem.startsWith(u8, t, "defer ") or
         mem.startsWith(u8, t, "errdefer ")) return null;
+    // Suppress in cleanup/shutdown functions — catch {} is intentional best-effort
+    if (isCleanupFunction(func_name)) return null;
+    // Suppress writer/stream catch {} — client disconnect, no recovery action
+    if (isStreamWriteCatch(t)) return null;
     const found = findSilentCatchCol(t) orelse return null;
     return .{
         .file = path,
@@ -6759,6 +6763,40 @@ fn checkSilentCatch(t: []const u8, path: []const u8, line: usize) ?Issue {
         .message = found.msg,
         .help = "use catch |err| with logging, or propagate with try",
     };
+}
+
+/// Check if function name indicates a cleanup/shutdown context where catch {} is expected.
+fn isCleanupFunction(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const cleanup_names = [_][]const u8{
+        "deinit", "cleanup", "shutdown", "close", "destroy", "teardown",
+    };
+    for (cleanup_names) |cn| {
+        if (mem.eql(u8, name, cn)) return true;
+    }
+    // Also match names containing these substrings (e.g., "shutdownLeader", "cleanupResources")
+    const cleanup_substrings = [_][]const u8{
+        "deinit", "cleanup", "shutdown",
+    };
+    for (cleanup_substrings) |sub| {
+        if (mem.indexOf(u8, name, sub) != null) return true;
+    }
+    return false;
+}
+
+/// Check if line is a writer/stream write with catch {} — best-effort during streaming.
+/// Pattern: `writer.print(...)`, `writer.writeAll(...)`, `writer.writeByte(...)` etc.
+fn isStreamWriteCatch(t: []const u8) bool {
+    const write_patterns = [_][]const u8{
+        ".print(",    ".writeAll(",         ".writeByte(",
+        ".writeInt(", ".writeBytesNTimes(",
+    };
+    for (write_patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (!isInsideString(t, pos)) return true;
+        }
+    }
+    return false;
 }
 
 fn findSilentCatchCol(t: []const u8) ?struct { col: usize, msg: []const u8 } {
@@ -7513,10 +7551,11 @@ fn checkLineErrors(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
     type_ctx: ?*const TypeContext,
+    func_name: []const u8,
 ) !void {
     // ZA201 (silent catch) - only from line-based analyzer
     if (!in_defer) {
-        if (checkSilentCatch(t, path, ln)) |i| {
+        if (checkSilentCatch(t, path, ln, func_name)) |i| {
             try issues.append(allocator, i);
         }
     }
@@ -7676,6 +7715,7 @@ fn analyzeFileErrors(
             issues,
             allocator,
             &type_ctx,
+            state.current_func_name,
         );
 
         if (checkExitBypassesDefer(
@@ -7840,9 +7880,12 @@ const ComplexityState = struct {
     branches: usize = 0,
     params: usize = 0,
     is_type_factory: bool = false,
+    is_data_dispatch: bool = false,
 };
 
-/// Count function parameters by counting colons at depth 1
+/// Count function parameters by counting colons at depth 1.
+/// Excludes `self` parameter — it's implicit in method call syntax and not
+/// a semantic parameter chosen by the caller.
 fn countFnParams(t: []const u8) usize {
     const p = mem.indexOf(u8, t, "(") orelse return 0;
     var params: usize = 0;
@@ -7853,7 +7896,20 @@ fn countFnParams(t: []const u8) usize {
         if (t[i] == ')') d -= 1;
         if (t[i] == ':' and d == 1) params += 1;
     }
+    // Subtract self parameter if present — `fn foo(self: *T, ...)` counts self as 1
+    if (hasSelfParam(t, p)) {
+        if (params > 0) params -= 1;
+    }
     return params;
+}
+
+/// Check if function signature has a `self` parameter (first param after open paren).
+fn hasSelfParam(t: []const u8, paren_pos: usize) bool {
+    if (paren_pos + 1 >= t.len) return false;
+    const after = mem.trim(u8, t[paren_pos + 1 ..], " \t");
+    return mem.startsWith(u8, after, "self:") or
+        mem.startsWith(u8, after, "self,") or
+        mem.startsWith(u8, after, "self)");
 }
 
 /// Check if keyword exists but not with inline prefix
@@ -7876,6 +7932,38 @@ fn countLineBranches(t: []const u8) usize {
 /// Calculate limit with type factory multiplier
 fn calcLimit(base: usize, is_factory: bool, mult: usize) usize {
     return if (is_factory) base * mult else base;
+}
+
+/// Calculate branch limit with type factory (3x) and data dispatch (4x) multipliers.
+/// Data dispatch functions (JSON deserialization, config loading) naturally have
+/// one branch per field — this is inherent, not a complexity smell.
+fn branchLimit(base: usize, is_type_factory: bool, is_data_dispatch: bool) usize {
+    if (is_type_factory) return base * 3;
+    if (is_data_dispatch) return base * 4;
+    return base;
+}
+
+/// Check if function name indicates a data-dispatch pattern where high branch counts
+/// are inherent (JSON deserialization, env var mapping, config loading).
+fn isDataDispatchFunction(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const dispatch_names = [_][]const u8{
+        "fromJson",   "fromJsonObject", "parseJson",    "deserialize",
+        "toJson",     "serialize",      "applyEnvVar",  "parseEnv",
+        "loadConfig", "parseConfig",    "handleConfig",
+    };
+    for (dispatch_names) |dn| {
+        if (mem.eql(u8, name, dn)) return true;
+    }
+    // Substring matches for common patterns
+    const dispatch_substrings = [_][]const u8{
+        "fromJson",    "FromJson",    "parseJson", "ParseJson",
+        "deserialize", "Deserialize", "serialize", "Serialize",
+    };
+    for (dispatch_substrings) |sub| {
+        if (mem.indexOf(u8, name, sub) != null) return true;
+    }
+    return false;
 }
 
 /// Report a single complexity issue
@@ -7950,7 +8038,7 @@ fn buildComplexityChecks(
         .{
             .rule = RULE_TOO_MANY_BRANCHES,
             .actual = state.branches,
-            .limit = calcLimit(th.max_branches, is_tf, 3),
+            .limit = branchLimit(th.max_branches, is_tf, state.is_data_dispatch),
             .metric = "branches",
             .help = "simplify logic",
         },
@@ -8010,16 +8098,18 @@ fn detectFnStart(t: []const u8, state: *ComplexityState, line_num: usize) void {
     }
     if (state.in_fn) return;
 
+    var end = pos + 3;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    const name = t[pos + 3 .. end];
     state.* = .{
         .in_fn = true,
         .fn_start = line_num,
         .fn_col = pos + 1,
         .is_type_factory = isTypeFactory(t),
+        .is_data_dispatch = isDataDispatchFunction(name),
         .params = countFnParams(t),
+        .fn_name = name,
     };
-    var end = pos + 3;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    state.fn_name = t[pos + 3 .. end];
 }
 
 /// State for tracking string/char literals while parsing
@@ -9600,6 +9690,10 @@ fn checkCatchUnreachable(
 ) ?Issue {
     const col = mem.indexOf(u8, t, "catch unreachable") orelse return null;
     if (isInsideString(t, col)) return null;
+    // Suppress inside @TypeOf() — compile-time only, never executed at runtime
+    if (isInsideTypeOf(t, col)) return null;
+    // Suppress bufPrint/bufPrintZ with fixed-size buffer — provably safe
+    if (isBufPrintWithFixedBuffer(t)) return null;
     return .{
         .file = file_path,
         .line = line_num,
@@ -9609,6 +9703,33 @@ fn checkCatchUnreachable(
         .message = "catch unreachable will panic on error",
         .help = "use explicit error handling",
     };
+}
+
+/// Check if position is inside a @TypeOf(...) expression (compile-time only)
+fn isInsideTypeOf(t: []const u8, pos: usize) bool {
+    // Look backwards from pos for @TypeOf( — must appear before the position
+    var i = pos;
+    while (i > 0) {
+        i -= 1;
+        if (i + 8 <= t.len and mem.eql(u8, t[i .. i + 8], "@TypeOf(")) return true;
+        if (i + 7 <= t.len and mem.eql(u8, t[i .. i + 7], "@typeOf(")) return true;
+    }
+    return false;
+}
+
+/// Check if line is a bufPrint/bufPrintZ call into a fixed-size buffer.
+/// Pattern: `bufPrint(&buf, ...) catch unreachable` where buf is a stack array.
+/// These are provably safe when the buffer is sized to hold max formatted output.
+fn isBufPrintWithFixedBuffer(t: []const u8) bool {
+    const bp = mem.indexOf(u8, t, "bufPrint(") orelse
+        mem.indexOf(u8, t, "bufPrintZ(") orelse return false;
+    if (isInsideString(t, bp)) return false;
+    // Find the opening paren after bufPrint/bufPrintZ
+    const paren_pos = mem.indexOfScalarPos(u8, t, bp, '(') orelse return false;
+    if (paren_pos + 1 >= t.len) return false;
+    const rest = mem.trim(u8, t[paren_pos + 1 ..], " \t");
+    // First arg starts with & — address-of fixed buffer
+    return mem.startsWith(u8, rest, "&");
 }
 
 /// ZA203: orelse unreachable will panic on null
@@ -12960,7 +13081,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.5";
+const EPHOR_VERSION = "0.11.6";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -16554,14 +16675,14 @@ test "ephor:ignore before non-scope line suppresses just next line" {
 
 test "checkSilentCatch detects catch {}" {
     // Basic catch {} should be detected
-    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1);
+    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData");
     try std.testing.expect(issue != null);
     try std.testing.expectEqualStrings("ZA201", issue.?.rule);
 }
 
 test "checkSilentCatch skips defer context" {
     // Same-line defer should not be detected
-    const issue = checkSilentCatch("defer foo() catch {}", "test.zig", 1);
+    const issue = checkSilentCatch("defer foo() catch {}", "test.zig", 1, "init");
     try std.testing.expect(issue == null);
 }
 
@@ -19389,4 +19510,232 @@ test "hasDirectReassignment detects variable reassignment" {
     try std.testing.expect(!hasDirectReassignment("self.buf = data;", "buf"));
     // Not present at all
     try std.testing.expect(!hasDirectReassignment("other = 5;", "buf"));
+}
+
+// ============================================================================
+// ZA202 Suppression Tests — @TypeOf and bufPrint
+// ============================================================================
+
+test "ZA202 suppressed inside @TypeOf" {
+    // @TypeOf(expr catch unreachable) is compile-time only, never executed
+    const issue = checkCatchUnreachable(
+        "const T = @TypeOf(pool.query(\"\", &.{}) catch unreachable);",
+        "test.zig",
+        1,
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA202 suppressed for bufPrint with fixed buffer" {
+    // bufPrint(&buf, ...) catch unreachable is provably safe with sized buffers
+    const issue = checkCatchUnreachable(
+        "const s = std.fmt.bufPrint(&buf, \"{d}\", .{val}) catch unreachable;",
+        "test.zig",
+        1,
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA202 suppressed for bufPrintZ with fixed buffer" {
+    const issue = checkCatchUnreachable(
+        "const s = std.fmt.bufPrintZ(&buf, \"{d}\", .{val}) catch unreachable;",
+        "test.zig",
+        1,
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA202 NOT suppressed for regular catch unreachable" {
+    // Normal catch unreachable should still fire
+    const issue = checkCatchUnreachable(
+        "const x = bar() catch unreachable;",
+        "test.zig",
+        1,
+    );
+    try std.testing.expect(issue != null);
+}
+
+test "ZA202 NOT suppressed for bufPrint without address-of" {
+    // bufPrint(slice, ...) — not a fixed buffer, should still fire
+    const issue = checkCatchUnreachable(
+        "const s = std.fmt.bufPrint(slice, \"{d}\", .{val}) catch unreachable;",
+        "test.zig",
+        1,
+    );
+    try std.testing.expect(issue != null);
+}
+
+// ============================================================================
+// ZA201 Suppression Tests — cleanup functions and writer catch {}
+// ============================================================================
+
+test "ZA201 suppressed in deinit function" {
+    const issue = checkSilentCatch("resource.revoke() catch {}", "test.zig", 1, "deinit");
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 suppressed in shutdown function" {
+    const issue = checkSilentCatch("lease.revoke() catch {}", "test.zig", 1, "shutdown");
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 suppressed in cleanup function" {
+    const issue = checkSilentCatch("conn.close() catch {}", "test.zig", 1, "cleanup");
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 suppressed for writer.print catch {}" {
+    const issue = checkSilentCatch(
+        "writer.print(\"{{\\\"key\\\":\\\"{s}\\\"}}\", .{val}) catch {}",
+        "test.zig",
+        1,
+        "handleRequest",
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 suppressed for writer.writeAll catch {}" {
+    const issue = checkSilentCatch(
+        "writer.writeAll(data) catch {}",
+        "test.zig",
+        1,
+        "streamResponse",
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 NOT suppressed in regular function" {
+    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData");
+    try std.testing.expect(issue != null);
+}
+
+// ============================================================================
+// ZA304 Suppression Tests — data dispatch functions
+// ============================================================================
+
+test "isDataDispatchFunction recognizes fromJson" {
+    try std.testing.expect(isDataDispatchFunction("fromJson"));
+    try std.testing.expect(isDataDispatchFunction("fromJsonObject"));
+    try std.testing.expect(isDataDispatchFunction("parseJson"));
+    try std.testing.expect(isDataDispatchFunction("deserialize"));
+    try std.testing.expect(isDataDispatchFunction("loadConfig"));
+    try std.testing.expect(isDataDispatchFunction("applyEnvVar"));
+}
+
+test "isDataDispatchFunction rejects regular names" {
+    try std.testing.expect(!isDataDispatchFunction("processBlock"));
+    try std.testing.expect(!isDataDispatchFunction("handleRequest"));
+    try std.testing.expect(!isDataDispatchFunction("init"));
+    try std.testing.expect(!isDataDispatchFunction(""));
+}
+
+test "branchLimit applies 4x for data dispatch" {
+    try std.testing.expectEqual(@as(usize, 48), branchLimit(12, false, true));
+    try std.testing.expectEqual(@as(usize, 36), branchLimit(12, true, false));
+    try std.testing.expectEqual(@as(usize, 12), branchLimit(12, false, false));
+}
+
+test "ZA304 suppressed for fromJson with many branches" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // fromJson with 20 branches (20 > 12 default, but 20 < 48 dispatch limit)
+    const code =
+        \\fn fromJson(obj: anytype) @This() {
+        \\    if (obj.get("f1")) |v| { _ = v; }
+        \\    if (obj.get("f2")) |v| { _ = v; }
+        \\    if (obj.get("f3")) |v| { _ = v; }
+        \\    if (obj.get("f4")) |v| { _ = v; }
+        \\    if (obj.get("f5")) |v| { _ = v; }
+        \\    if (obj.get("f6")) |v| { _ = v; }
+        \\    if (obj.get("f7")) |v| { _ = v; }
+        \\    if (obj.get("f8")) |v| { _ = v; }
+        \\    if (obj.get("f9")) |v| { _ = v; }
+        \\    if (obj.get("f10")) |v| { _ = v; }
+        \\    if (obj.get("f11")) |v| { _ = v; }
+        \\    if (obj.get("f12")) |v| { _ = v; }
+        \\    if (obj.get("f13")) |v| { _ = v; }
+        \\    if (obj.get("f14")) |v| { _ = v; }
+        \\    if (obj.get("f15")) |v| { _ = v; }
+        \\    if (obj.get("f16")) |v| { _ = v; }
+        \\    if (obj.get("f17")) |v| { _ = v; }
+        \\    if (obj.get("f18")) |v| { _ = v; }
+        \\    if (obj.get("f19")) |v| { _ = v; }
+        \\    if (obj.get("f20")) |v| { _ = v; }
+        \\    return .{};
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dispatch.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dispatch.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_BRANCHES) and
+            mem.eql(u8, issue.file, "test_dispatch.zig"))
+        {
+            std.debug.print("unexpected ZA304 for fromJson: {s}\n", .{issue.message});
+            try std.testing.expect(false);
+        }
+    }
+}
+
+// ============================================================================
+// ZA303 Tests — self parameter exclusion
+// ============================================================================
+
+test "countFnParams excludes self parameter" {
+    // Method with self + 3 params = 3 semantic params (not 4)
+    try std.testing.expectEqual(@as(usize, 3), countFnParams("fn query(self: *Pool, sql: []const u8, params: anytype, opts: Options) !Result"));
+    // Method with self + 2 params = 2 semantic params
+    try std.testing.expectEqual(@as(usize, 2), countFnParams("fn exec(self: *Pool, sql: []const u8, params: anytype) !void"));
+    // Free function with 3 params = 3 (no self to exclude)
+    try std.testing.expectEqual(@as(usize, 3), countFnParams("fn process(a: u32, b: u32, c: u32) void"));
+    // Method with just self = 0 semantic params
+    try std.testing.expectEqual(@as(usize, 0), countFnParams("fn deinit(self: *Self) void"));
+}
+
+test "isInsideTypeOf detects @TypeOf context" {
+    try std.testing.expect(isInsideTypeOf("const T = @TypeOf(foo() catch unreachable);", 30));
+    try std.testing.expect(!isInsideTypeOf("const x = foo() catch unreachable;", 22));
+}
+
+test "isBufPrintWithFixedBuffer detects fixed buffer pattern" {
+    try std.testing.expect(isBufPrintWithFixedBuffer("std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable"));
+    try std.testing.expect(isBufPrintWithFixedBuffer("std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable"));
+    try std.testing.expect(!isBufPrintWithFixedBuffer("std.fmt.bufPrint(slice, \"{d}\", .{x}) catch unreachable"));
+}
+
+test "isCleanupFunction matches cleanup names" {
+    try std.testing.expect(isCleanupFunction("deinit"));
+    try std.testing.expect(isCleanupFunction("cleanup"));
+    try std.testing.expect(isCleanupFunction("shutdown"));
+    try std.testing.expect(isCleanupFunction("close"));
+    try std.testing.expect(isCleanupFunction("destroy"));
+    try std.testing.expect(isCleanupFunction("shutdownLeader"));
+    try std.testing.expect(isCleanupFunction("cleanupResources"));
+    try std.testing.expect(!isCleanupFunction("processData"));
+    try std.testing.expect(!isCleanupFunction("init"));
+    try std.testing.expect(!isCleanupFunction(""));
+}
+
+test "isStreamWriteCatch matches writer patterns" {
+    try std.testing.expect(isStreamWriteCatch("writer.print(\"data\") catch {}"));
+    try std.testing.expect(isStreamWriteCatch("writer.writeAll(buf) catch {}"));
+    try std.testing.expect(isStreamWriteCatch("writer.writeByte(0x0a) catch {}"));
+    try std.testing.expect(!isStreamWriteCatch("foo() catch {}"));
+    try std.testing.expect(!isStreamWriteCatch("db.query() catch {}"));
+}
+
+test "hasSelfParam detects self parameter" {
+    try std.testing.expect(hasSelfParam("fn query(self: *Pool, sql: []const u8)", 8));
+    try std.testing.expect(hasSelfParam("fn deinit(self: *Self)", 9));
+    try std.testing.expect(!hasSelfParam("fn process(a: u32, b: u32)", 10));
 }

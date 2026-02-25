@@ -54,7 +54,7 @@ Alternatively, re-run the install script to update everything:
 curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.11.5`
+With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.11.6`
 
 ### Version Management
 
@@ -68,7 +68,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.11.5.tar.gz
+zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.11.6.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -155,7 +155,7 @@ Example config:
 
 ```json
 {
-  "version": "0.11.5",
+  "version": "0.11.6",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],

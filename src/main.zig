@@ -6746,15 +6746,21 @@ fn trackTestBlock(
 
 /// Check for silent catch patterns (ZA201)
 /// Skip note in defer/errdefer contexts (best-effort cleanup)
-fn checkSilentCatch(t: []const u8, path: []const u8, line: usize, func_name: []const u8) ?Issue {
+fn checkSilentCatch(
+    t: []const u8,
+    path: []const u8,
+    line: usize,
+    func_name: []const u8,
+    preceding_lines: ?[]const []const u8,
+) ?Issue {
     if (mem.startsWith(u8, t, "defer ") or
         mem.startsWith(u8, t, "errdefer ")) return null;
     // Suppress in cleanup/shutdown functions — catch {} is intentional best-effort
     if (isCleanupFunction(func_name)) return null;
     // Suppress when the called method is a cleanup/best-effort operation
     if (isCleanupMethodCall(t)) return null;
-    // Suppress writer/stream catch {} — client disconnect, no recovery action
-    if (isStreamWriteCatch(t)) return null;
+    // Suppress writer/stream catch {} — uses paren-balanced lookback for multi-line
+    if (isStreamWriteCatchMultiline(t, preceding_lines)) return null;
     const found = findSilentCatchCol(t) orelse return null;
     return .{
         .file = path,
@@ -6825,22 +6831,6 @@ fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
     const lower = lower_buf[0..name.len];
     for (keywords) |kw| {
         if (mem.indexOf(u8, lower, kw) != null) return true;
-    }
-    return false;
-}
-
-/// Check if line is a writer/stream write with catch {} — best-effort during streaming.
-/// Pattern: `writer.print(...)`, `writer.writeAll(...)`, `writer.writeByte(...)` etc.
-fn isStreamWriteCatch(t: []const u8) bool {
-    const write_patterns = [_][]const u8{
-        ".print(",           ".writeAll(",         ".writeByte(",
-        ".writeInt(",        ".writeBytesNTimes(", ".writeSep(",
-        ".writeByteNTimes(",
-    };
-    for (write_patterns) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            if (!isInsideString(t, pos)) return true;
-        }
     }
     return false;
 }
@@ -7602,7 +7592,7 @@ fn checkLineErrors(
 ) !void {
     // ZA201 (silent catch) - only from line-based analyzer
     if (!in_defer) {
-        if (checkSilentCatch(t, path, ln, func_name)) |i| {
+        if (checkSilentCatch(t, path, ln, func_name, preceding_lines)) |i| {
             try issues.append(allocator, i);
         }
     }
@@ -9762,6 +9752,8 @@ fn checkCatchUnreachable(
     if (isInsideTypeOf(t, col, preceding_lines)) return null;
     // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe
     if (isBufPrintCatchUnreachable(t, preceding_lines)) return null;
+    // Suppress stdlib functions called with string literals (parseIp("0.0.0.0", ...))
+    if (isSafeStdlibLiteralCall(t, preceding_lines)) return null;
     return .{
         .file = file_path,
         .line = line_num,
@@ -9773,40 +9765,79 @@ fn checkCatchUnreachable(
     };
 }
 
+/// Find the call-site line for a `) catch ...` by paren-balanced lookback.
+/// Starting from the current line, counts unmatched `)` backwards through
+/// preceding lines until the opening `(` is found. Returns the line containing
+/// the function call, or null if no match within the expression.
+fn findCallSiteLine(t: []const u8, preceding_lines: ?[]const []const u8) ?[]const u8 {
+    // Count unmatched parens on current line (left of "catch")
+    var depth: isize = 0;
+    for (t) |c| {
+        if (c == '(') depth += 1;
+        if (c == ')') depth -= 1;
+    }
+    // If balanced or more opens than closes, call site is this line
+    if (depth >= 0) return t;
+    // Unmatched closes → call started on a preceding line. Walk back.
+    const prev = preceding_lines orelse return null;
+    var idx = prev.len;
+    while (idx > 0) {
+        idx -= 1;
+        const pl = mem.trim(u8, prev[idx], " \t\r");
+        if (isCommentOrMultilineString(pl)) continue;
+        for (pl) |c| {
+            if (c == '(') depth += 1;
+            if (c == ')') depth -= 1;
+        }
+        if (depth >= 0) return pl;
+    }
+    return null;
+}
+
 /// Check if `catch unreachable` is inside a @TypeOf() expression (compile-time only).
-/// Checks current line and optionally preceding lines for multi-line @TypeOf.
+/// Uses paren-balanced lookback to find the call site across multiple lines.
 fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) bool {
-    // Check current line
+    // Check current line first (fast path)
     var i = pos;
     while (i > 0) {
         i -= 1;
         if (i + 8 <= t.len and mem.eql(u8, t[i .. i + 8], "@TypeOf(")) return true;
         if (i + 7 <= t.len and mem.eql(u8, t[i .. i + 7], "@typeOf(")) return true;
     }
-    // Check preceding lines (for multi-line @TypeOf expressions)
-    const prev = preceding_lines orelse return false;
-    const lookback = @min(prev.len, 10);
-    for (0..lookback) |back| {
-        const pl = mem.trim(u8, prev[prev.len - 1 - back], " \t\r");
-        if (mem.indexOf(u8, pl, "@TypeOf(") != null) return true;
-        if (mem.indexOf(u8, pl, "@typeOf(") != null) return true;
-    }
-    return false;
+    // Multi-line: find the call-site line via paren balance
+    const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
+    if (call_line.ptr == t.ptr) return false; // Already checked current line
+    return mem.indexOf(u8, call_line, "@TypeOf(") != null or
+        mem.indexOf(u8, call_line, "@typeOf(") != null;
 }
 
 /// Check if `catch unreachable` comes from a bufPrint/bufPrintZ call.
 /// These functions only return error.NoSpaceLeft — programmers size the buffer
 /// to fit max output, making catch unreachable provably correct.
-/// Checks same line first, then preceding lines for multi-line calls.
+/// Uses paren-balanced lookback for multi-line calls.
 fn isBufPrintCatchUnreachable(t: []const u8, preceding_lines: ?[]const []const u8) bool {
-    // Same-line check
     if (hasBufPrintCall(t)) return true;
-    // Multi-line: look back up to 10 lines for the bufPrint( opening
-    const prev = preceding_lines orelse return false;
-    const lookback = @min(prev.len, 10);
-    for (0..lookback) |back| {
-        const pl = mem.trim(u8, prev[prev.len - 1 - back], " \t\r");
-        if (hasBufPrintCall(pl)) return true;
+    const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
+    return hasBufPrintCall(call_line);
+}
+
+/// Check if `catch unreachable` comes from a stdlib function that is provably
+/// safe when called with a string literal argument (e.g., parseIp("0.0.0.0", port)).
+fn isSafeStdlibLiteralCall(t: []const u8, preceding_lines: ?[]const []const u8) bool {
+    const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
+    const safe_fns = [_][]const u8{
+        "parseIp(",  "parseIp4(",      "parseIp6(",
+        "parseInt(", "parseUnsigned(",
+    };
+    for (safe_fns) |fn_name| {
+        if (mem.indexOf(u8, call_line, fn_name)) |pos| {
+            if (!isInsideString(call_line, pos)) {
+                // Verify first argument is a string literal
+                const after = call_line[pos + fn_name.len ..];
+                const trimmed = mem.trim(u8, after, " \t");
+                if (mem.startsWith(u8, trimmed, "\"")) return true;
+            }
+        }
     }
     return false;
 }
@@ -9818,6 +9849,29 @@ fn hasBufPrintCall(t: []const u8) bool {
     }
     if (mem.indexOf(u8, t, "bufPrintZ(")) |pos| {
         if (!isInsideString(t, pos)) return true;
+    }
+    return false;
+}
+
+/// Check if a catch {} follows a writer/stream method call, looking back
+/// through preceding lines via paren-balanced lookback for multi-line calls.
+fn isStreamWriteCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bool {
+    if (isStreamWriteCall(t)) return true;
+    const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
+    return isStreamWriteCall(call_line);
+}
+
+/// Check if a line contains a writer/stream write method call (not inside a string).
+fn isStreamWriteCall(t: []const u8) bool {
+    const write_patterns = [_][]const u8{
+        ".print(",           ".writeAll(",         ".writeByte(",
+        ".writeInt(",        ".writeBytesNTimes(", ".writeSep(",
+        ".writeByteNTimes(",
+    };
+    for (write_patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (!isInsideString(t, pos)) return true;
+        }
     }
     return false;
 }
@@ -13171,7 +13225,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.7";
+const EPHOR_VERSION = "0.11.8";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -16765,14 +16819,14 @@ test "ephor:ignore before non-scope line suppresses just next line" {
 
 test "checkSilentCatch detects catch {}" {
     // Basic catch {} should be detected
-    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData");
+    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null);
     try std.testing.expect(issue != null);
     try std.testing.expectEqualStrings("ZA201", issue.?.rule);
 }
 
 test "checkSilentCatch skips defer context" {
     // Same-line defer should not be detected
-    const issue = checkSilentCatch("defer foo() catch {}", "test.zig", 1, "init");
+    const issue = checkSilentCatch("defer foo() catch {}", "test.zig", 1, "init", null);
     try std.testing.expect(issue == null);
 }
 
@@ -19686,17 +19740,17 @@ test "ZA202 NOT suppressed for non-bufPrint multi-line" {
 // ============================================================================
 
 test "ZA201 suppressed in deinit function" {
-    const issue = checkSilentCatch("resource.revoke() catch {}", "test.zig", 1, "deinit");
+    const issue = checkSilentCatch("resource.revoke() catch {}", "test.zig", 1, "deinit", null);
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed in shutdown function" {
-    const issue = checkSilentCatch("lease.revoke() catch {}", "test.zig", 1, "shutdown");
+    const issue = checkSilentCatch("lease.revoke() catch {}", "test.zig", 1, "shutdown", null);
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed in cleanup function" {
-    const issue = checkSilentCatch("conn.close() catch {}", "test.zig", 1, "cleanup");
+    const issue = checkSilentCatch("conn.close() catch {}", "test.zig", 1, "cleanup", null);
     try std.testing.expect(issue == null);
 }
 
@@ -19706,6 +19760,7 @@ test "ZA201 suppressed for writer.print catch {}" {
         "test.zig",
         1,
         "handleRequest",
+        null,
     );
     try std.testing.expect(issue == null);
 }
@@ -19716,12 +19771,13 @@ test "ZA201 suppressed for writer.writeAll catch {}" {
         "test.zig",
         1,
         "streamResponse",
+        null,
     );
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 NOT suppressed in regular function" {
-    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData");
+    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null);
     try std.testing.expect(issue != null);
 }
 
@@ -19878,12 +19934,12 @@ test "isCleanupFunction matches cleanup names" {
     try std.testing.expect(!isCleanupFunction(""));
 }
 
-test "isStreamWriteCatch matches writer patterns" {
-    try std.testing.expect(isStreamWriteCatch("writer.print(\"data\") catch {}"));
-    try std.testing.expect(isStreamWriteCatch("writer.writeAll(buf) catch {}"));
-    try std.testing.expect(isStreamWriteCatch("writer.writeByte(0x0a) catch {}"));
-    try std.testing.expect(!isStreamWriteCatch("foo() catch {}"));
-    try std.testing.expect(!isStreamWriteCatch("db.query() catch {}"));
+test "isStreamWriteCall matches writer patterns" {
+    try std.testing.expect(isStreamWriteCall("writer.print(\"data\") catch {}"));
+    try std.testing.expect(isStreamWriteCall("writer.writeAll(buf) catch {}"));
+    try std.testing.expect(isStreamWriteCall("writer.writeByte(0x0a) catch {}"));
+    try std.testing.expect(!isStreamWriteCall("foo() catch {}"));
+    try std.testing.expect(!isStreamWriteCall("db.query() catch {}"));
 }
 
 test "hasSelfParam detects self parameter" {
@@ -19902,6 +19958,6 @@ test "isCleanupMethodCall matches cleanup method names" {
     try std.testing.expect(!isCleanupMethodCall("api.fetch() catch {}"));
 }
 
-test "isStreamWriteCatch matches writeSep pattern" {
-    try std.testing.expect(isStreamWriteCatch("ctr.writeSep(writer) catch {}"));
+test "isStreamWriteCall matches writeSep pattern" {
+    try std.testing.expect(isStreamWriteCall("ctr.writeSep(writer) catch {}"));
 }

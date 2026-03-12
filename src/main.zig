@@ -3584,7 +3584,7 @@ fn checkOwnershipInLine(
     owner_vars: []const OwnerVar,
 ) bool {
     for (owner_vars) |ov| {
-        if (mem.indexOf(u8, t, ov.name) == null) continue;
+        if (!containsIdentifier(t, ov.name)) continue;
 
         // Direct return of owner variable
         if (mem.startsWith(u8, t, "return ")) return true;
@@ -3601,7 +3601,7 @@ fn checkOwnershipInLine(
                     // Check that owner var appears after the method call opening paren
                     const after_method = pat_pos + pattern.len;
                     if (after_method < t.len) {
-                        if (mem.indexOf(u8, t[after_method..], ov.name) != null) return true;
+                        if (containsIdentifier(t[after_method..], ov.name)) return true;
                     }
                 }
             }
@@ -3612,7 +3612,7 @@ fn checkOwnershipInLine(
         if (mem.indexOf(u8, t, ".realloc(")) |realloc_pos| {
             const after_paren = realloc_pos + ".realloc(".len;
             if (after_paren < t.len and
-                mem.indexOf(u8, t[after_paren..], ov.name) != null)
+                containsIdentifier(t[after_paren..], ov.name))
                 return true;
         }
 
@@ -6759,6 +6759,10 @@ fn checkSilentCatch(
     if (isCleanupFunction(func_name)) return null;
     // Suppress when the called method is a cleanup/best-effort operation
     if (isCleanupMethodCall(t)) return null;
+    // Suppress explicit discard: `_ = expr catch {}` — caller intentionally ignores both value and error
+    if (isDiscardedCatch(t)) return null;
+    // Suppress catch {} on continuation lines of multi-line defer expressions
+    if (isDeferCatchMultiline(t, preceding_lines)) return null;
     // Suppress writer/stream catch {} — uses paren-balanced lookback for multi-line
     if (isStreamWriteCatchMultiline(t, preceding_lines)) return null;
     const found = findSilentCatchCol(t) orelse return null;
@@ -6837,13 +6841,32 @@ fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
 
 fn findSilentCatchCol(t: []const u8) ?struct { col: usize, msg: []const u8 } {
     if (mem.indexOf(u8, t, "catch {}")) |col| {
-        if (!isInsideString(t, col))
+        if (!isInsideString(t, col) and !isInsideWhileCondition(t, col))
             return .{ .col = col, .msg = "silent catch {} discards error" };
     } else if (mem.indexOf(u8, t, "catch |_| {}")) |col| {
-        if (!isInsideString(t, col))
+        if (!isInsideString(t, col) and !isInsideWhileCondition(t, col))
             return .{ .col = col, .msg = "silent catch |_| {} discards error" };
     }
     return null;
+}
+
+/// Check if `catch {}` at `pos` is inside a while/if/for condition (paren-balanced).
+/// Suppresses ZA201 for patterns like `while (iter.next() catch {}) |val|`
+/// where catch converts error union to optional for the while loop.
+fn isInsideWhileCondition(t: []const u8, pos: usize) bool {
+    // Must have a control-flow keyword before the catch
+    const has_while = mem.indexOf(u8, t, "while (") != null;
+    const has_if = mem.indexOf(u8, t, "if (") != null;
+    const has_for = mem.indexOf(u8, t, "for (") != null;
+    if (!has_while and !has_if and !has_for) return false;
+
+    // Count paren depth at the catch position — if depth > 0, catch is inside condition parens
+    var depth: isize = 0;
+    for (t[0..pos]) |c| {
+        if (c == '(') depth += 1;
+        if (c == ')') depth -= 1;
+    }
+    return depth > 0;
 }
 
 /// Extract variable name from "var x" or "const x" declaration (for ZA204)
@@ -7583,6 +7606,7 @@ fn checkLineErrors(
     ln: usize,
     skip_undefined: bool,
     in_defer: bool,
+    in_test: bool,
     pending: *?PendingUndefined,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
@@ -7596,13 +7620,17 @@ fn checkLineErrors(
             try issues.append(allocator, i);
         }
     }
-    // ZA202: catch unreachable
-    if (checkCatchUnreachable(t, path, ln, preceding_lines)) |i| {
-        try issues.append(allocator, i);
+    // ZA202: catch unreachable — suppress in test blocks (intentional assertions)
+    if (!in_test) {
+        if (checkCatchUnreachable(t, path, ln, preceding_lines)) |i| {
+            try issues.append(allocator, i);
+        }
     }
-    // ZA203: orelse unreachable (simple line-based check, no null guard analysis)
-    if (checkLineOrelseUnreachable(t, path, ln)) |i| {
-        try issues.append(allocator, i);
+    // ZA203: orelse unreachable — suppress in test blocks (intentional assertions)
+    if (!in_test) {
+        if (checkLineOrelseUnreachable(t, path, ln)) |i| {
+            try issues.append(allocator, i);
+        }
     }
     // ZA207: catch undefined (dangerous — converts errors to UB)
     if (checkCatchUndefined(t, path, ln)) |i| {
@@ -7625,8 +7653,8 @@ fn checkLineErrors(
         }
     }
     if (checkDiscardedResult(t, path, ln, type_ctx)) |i| try issues.append(allocator, i);
-    // ZA208: @panic() detection (skip test files only, not module-level code)
-    if (!isTestFilePath(path)) {
+    // ZA208: @panic() detection — suppress in test blocks and test files
+    if (!in_test and !isTestFilePath(path)) {
         if (checkPanic(t, path, ln)) |i| {
             try issues.append(allocator, i);
         }
@@ -7750,12 +7778,14 @@ fn analyzeFileErrors(
             try checkPendingFields(t, a.path, &state, issues, allocator);
         }
         const preceding: ?[]const []const u8 = if (line_idx > 0) all_lines[0..line_idx] else null;
+        const in_test = isInTestContext(a.path, state.in_test_block);
         try checkLineErrors(
             t,
             a.path,
             line_num,
             s.skip_undefined,
             state.in_defer_block,
+            in_test,
             &state.pending_undefined,
             issues,
             allocator,
@@ -9879,6 +9909,35 @@ fn isStreamWriteCatchMultiline(t: []const u8, preceding_lines: ?[]const []const 
     if (isStreamWriteCall(t)) return true;
     const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
     return isStreamWriteCall(call_line);
+}
+
+/// Check if `catch {}` is on a continuation line of a multi-line defer expression.
+/// Covers patterns like:
+///   defer std.fs.cwd()
+///       .openFile("x", .{})
+///       .close() catch {};
+fn isDeferCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bool {
+    _ = t;
+    const prev = preceding_lines orelse return false;
+    // Walk backwards through preceding lines looking for `defer ` or `errdefer `
+    // within the same expression (stop at semicolons and closing braces)
+    var idx = prev.len;
+    while (idx > 0) {
+        idx -= 1;
+        const pl = mem.trim(u8, prev[idx], " \t\r");
+        if (pl.len == 0) continue;
+        if (isCommentOrMultilineString(pl)) continue;
+        if (mem.startsWith(u8, pl, "defer ") or mem.startsWith(u8, pl, "errdefer ")) return true;
+        // Stop at statement boundaries — the defer can't be further back
+        if (mem.endsWith(u8, pl, ";") or mem.endsWith(u8, pl, "{") or mem.endsWith(u8, pl, "}")) return false;
+    }
+    return false;
+}
+
+/// Check if `catch {}` result is explicitly discarded: `_ = expr catch {}`
+/// The `_ = ` prefix means the caller intentionally ignores both value and error.
+fn isDiscardedCatch(t: []const u8) bool {
+    return mem.startsWith(u8, t, "_ = ");
 }
 
 /// Check if a line contains a writer/stream write method call (not inside a string).
@@ -12448,7 +12507,7 @@ fn skipJsonValue(content: []const u8, start: usize) usize {
 
 /// Set threshold value by key name
 fn setThresholdValue(th: *Thresholds, k: []const u8, num: usize) void {
-    if (mem.eql(u8, k, "max_lines")) th.max_function_lines = num;
+    if (mem.eql(u8, k, "max_lines") or mem.eql(u8, k, "max_function_lines")) th.max_function_lines = num;
     if (mem.eql(u8, k, "max_nesting")) th.max_nesting_depth = num;
     if (mem.eql(u8, k, "max_params")) th.max_params = num;
     if (mem.eql(u8, k, "max_branches")) th.max_branches = num;
@@ -13245,7 +13304,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.9";
+const EPHOR_VERSION = "0.11.10";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -19799,6 +19858,207 @@ test "ZA201 suppressed for writer.writeAll catch {}" {
 test "ZA201 NOT suppressed in regular function" {
     const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null);
     try std.testing.expect(issue != null);
+}
+
+// ============================================================================
+// Enhancement 1: ZA202/ZA203 suppressed in test blocks
+// ============================================================================
+
+test "ZA202 suppressed in test block via analyzeErrors" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // catch unreachable inside a test block should NOT fire ZA202
+    const test_content =
+        \\const std = @import("std");
+        \\test "my test" {
+        \\    const x = bar() catch unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "za202_test_block.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za202_test_block.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE)) {
+            return error.TestUnexpectedResult; // Should not fire in test block
+        }
+    }
+}
+
+test "ZA203 suppressed in test block via analyzeErrors" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // orelse unreachable inside a test block should NOT fire ZA203
+    const test_content =
+        \\const std = @import("std");
+        \\test "my test" {
+        \\    const x = std.mem.indexOf(u8, "hello", "lo") orelse unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "za203_test_block.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za203_test_block.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE)) {
+            return error.TestUnexpectedResult; // Should not fire in test block
+        }
+    }
+}
+
+test "ZA202 still fires outside test block" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "za202_nontst.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za202_nontst.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+// ============================================================================
+// Enhancement 3: ZA201 suppressed for while(expr catch {}) |val|
+// ============================================================================
+
+test "ZA201 suppressed for while condition catch {}" {
+    // while (iter.next() catch {}) |val| — catch converts error to optional
+    const issue = checkSilentCatch(
+        "while (iter.next() catch {}) |val| {",
+        "test.zig",
+        1,
+        "process",
+        null,
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 suppressed for if condition catch {}" {
+    const issue = checkSilentCatch(
+        "if (getData() catch {}) |data| {",
+        "test.zig",
+        1,
+        "process",
+        null,
+    );
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 NOT suppressed for catch {} outside condition" {
+    // Regular statement — should still fire
+    const issue = checkSilentCatch(
+        "const x = foo() catch {};",
+        "test.zig",
+        1,
+        "process",
+        null,
+    );
+    try std.testing.expect(issue != null);
+}
+
+// ============================================================================
+// Enhancement 4: ZA201 suppressed for multi-line defer catch {}
+// ============================================================================
+
+test "ZA201 suppressed for multi-line defer catch {}" {
+    const prev = [_][]const u8{
+        "defer std.fs.cwd()",
+        "    .openFile(\"x\", .{})",
+    };
+    const issue = checkSilentCatch(
+        ".close() catch {}",
+        "test.zig",
+        3,
+        "init",
+        &prev,
+    );
+    // .close() is a cleanup method — already suppressed by isCleanupMethodCall
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 suppressed for multi-line defer non-cleanup catch {}" {
+    const prev = [_][]const u8{
+        "defer obj",
+        "    .flush()",
+    };
+    const issue = checkSilentCatch(
+        "    .finalize() catch {}",
+        "test.zig",
+        3,
+        "init",
+        &prev,
+    );
+    // Not a recognized cleanup method, but continuation of defer expression
+    try std.testing.expect(issue == null);
+}
+
+// ============================================================================
+// Enhancement 5: configurable threshold alias
+// ============================================================================
+
+test "setThresholdValue accepts max_function_lines alias" {
+    var th = Thresholds{};
+    setThresholdValue(&th, "max_function_lines", 75);
+    try std.testing.expectEqual(@as(usize, 75), th.max_function_lines);
+}
+
+test "setThresholdValue accepts max_lines" {
+    var th = Thresholds{};
+    setThresholdValue(&th, "max_lines", 60);
+    try std.testing.expectEqual(@as(usize, 60), th.max_function_lines);
+}
+
+// ============================================================================
+// Enhancement 2: word-boundary matching in checkOwnershipInLine
+// ============================================================================
+
+test "isInsideWhileCondition detects catch in while parens" {
+    try std.testing.expect(isInsideWhileCondition("while (iter.next() catch {}) |val| {", 19));
+}
+
+test "isInsideWhileCondition rejects catch outside parens" {
+    try std.testing.expect(!isInsideWhileCondition("const x = foo() catch {};", 16));
 }
 
 // ============================================================================

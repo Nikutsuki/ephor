@@ -31,3 +31,7 @@ ephor.json
 # Compiled example binaries (source .zig files are tracked)
 examples/all_issues_demo
 examples/leak_demo
+
+# direnv (per-project Zig cache isolation)
+.zig-global-cache/
+.envrc

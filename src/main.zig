@@ -8465,6 +8465,8 @@ fn checkConstNaming(
     path: []const u8,
     t: []const u8,
     line_num: usize,
+    content: []const u8,
+    t_start: usize,
 ) !void {
     const plen: usize = if (mem.startsWith(u8, t, "pub const ")) 10 else 6;
     var end = plen;
@@ -8473,16 +8475,33 @@ fn checkConstNaming(
     const name = t[plen..end];
     if (name.len > 0 and name[0] == '_') return;
 
-    if (isTypeDefinition(t)) {
-        if (!isTitleCase(name))
-            try reportNamingIssue(issues, allocator, .{
-                .path = path,
-                .line = line_num,
-                .col = plen + 1,
-                .kind = "type",
-                .name = name,
-                .expected = "TitleCase",
-            });
+    // Cheap line-only classification first. The multi-line closure check is
+    // expensive (byte-scans the full type body), so only run it on lines that
+    // look like type defs AND would actually be reported for naming.
+    if (isTypeDefinitionLine(t)) {
+        if (isTitleCase(name)) return;
+        // Non-TitleCase name on a type-looking line — check if it's actually a
+        // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
+        if (isClosureFunctionAlias(t, content, t_start)) {
+            if (!isCamelCase(name))
+                try reportNamingIssue(issues, allocator, .{
+                    .path = path,
+                    .line = line_num,
+                    .col = plen + 1,
+                    .kind = "function",
+                    .name = name,
+                    .expected = "camelCase",
+                });
+            return;
+        }
+        try reportNamingIssue(issues, allocator, .{
+            .path = path,
+            .line = line_num,
+            .col = plen + 1,
+            .kind = "type",
+            .name = name,
+            .expected = "TitleCase",
+        });
         return;
     }
     if (!isValidConstName(t, name))
@@ -8497,22 +8516,42 @@ fn checkConstNaming(
 }
 
 /// Detect if a var declaration holds a function pointer (callable).
-/// Matches: explicit fn type annotation or qualified name assignment (mod.funcName).
-/// Style guide: "If x is callable, then x should be camelCase."
+/// Matches: explicit fn-pointer type annotation or qualified name assignment
+/// (`mod.funcName`). Style guide: "If x is callable, then x should be camelCase."
 fn isFunctionPointerVar(t: []const u8) bool {
-    // Explicit fn type: `var x: fn(...) ... = ...` or `var x: fn (...) ...`
-    if (mem.indexOf(u8, t, ": fn(") != null) return true;
-    if (mem.indexOf(u8, t, ": fn (") != null) return true;
-    if (mem.indexOf(u8, t, ":fn(") != null) return true;
-    if (mem.indexOf(u8, t, ":fn (") != null) return true;
+    // Explicit function pointer type annotations.
+    // Modern Zig (0.10+) requires `*const fn(...)`; bare `fn(...)` is kept for
+    // legacy/type-expression forms.
+    const fn_type_patterns = [_][]const u8{
+        ": *const fn(",  ": *const fn (",
+        ": ?*const fn(", ": ?*const fn (",
+        ": *fn(",        ": *fn (",
+        ": ?*fn(",       ": ?*fn (",
+        ": fn(",         ": fn (",
+        ":*const fn(",   ":*const fn (",
+        ":?*const fn(",  ":?*const fn (",
+        ":*fn(",         ":*fn (",
+        ":?*fn(",        ":?*fn (",
+        ":fn(",          ":fn (",
+    };
+    for (fn_type_patterns) |p| {
+        if (mem.indexOf(u8, t, p) != null) return true;
+    }
     // Qualified function assignment: `var x = mod.someFn;`
-    // Bare identifiers (no dot) are ambiguous — could be value or function.
+    // Require the RHS to be a pure qualified identifier path ending in a
+    // camelCase segment. This rejects method calls (`.init(x)`), enum/struct
+    // literals (`.empty`, `.{...}`), and instance type exprs
+    // (`std.Foo(T).bar`). Bare identifiers (no dot) remain ambiguous.
     const eq_pos = mem.indexOf(u8, t, "= ") orelse return false;
     const rhs = mem.trim(u8, t[eq_pos + 2 ..], " \t;");
     if (rhs.len == 0) return false;
+    if (rhs[0] == '.') return false;
     const last_dot = mem.lastIndexOfScalar(u8, rhs, '.') orelse return false;
     const last_seg = rhs[last_dot + 1 ..];
     if (last_seg.len == 0) return false;
+    for (last_seg) |c| if (!isIdent(c)) return false;
+    const lhs = rhs[0..last_dot];
+    for (lhs) |c| if (!isIdent(c) and c != '.') return false;
     return isCamelCase(last_seg);
 }
 
@@ -8633,20 +8672,31 @@ fn analyzeNaming(
 
     while (iter.next()) |entry| {
         const a = entry.value_ptr.*;
+        const content = a.content;
         var line_num: usize = 1;
-        var lines = mem.splitScalar(u8, a.content, '\n');
+        var line_start: usize = 0;
 
-        while (lines.next()) |line| {
-            defer line_num += 1;
+        while (line_start <= content.len) {
+            const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
+            const line = content[line_start..newline];
+            // Compute trimmed slice's offset within content (for multi-line lookahead).
+            var lead: usize = 0;
+            while (lead < line.len and (line[lead] == ' ' or line[lead] == '\t' or line[lead] == '\r')) : (lead += 1) {}
             const t = mem.trim(u8, line, " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
+            const t_start = line_start + lead;
 
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
-                try checkConstNaming(&issues, allocator, a.path, t, line_num);
-            if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var "))
-                try checkVarNaming(&issues, allocator, a.path, t, line_num);
-            if (mem.indexOf(u8, t, "fn ") != null)
-                try checkFnNaming(&issues, allocator, a.path, t, line_num);
+            if (!isCommentOrMultilineString(t)) {
+                if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
+                    try checkConstNaming(&issues, allocator, a.path, t, line_num, content, t_start);
+                if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var "))
+                    try checkVarNaming(&issues, allocator, a.path, t, line_num);
+                if (mem.indexOf(u8, t, "fn ") != null)
+                    try checkFnNaming(&issues, allocator, a.path, t, line_num);
+            }
+
+            if (newline == content.len) break;
+            line_start = newline + 1;
+            line_num += 1;
         }
     }
     return issues;
@@ -8707,8 +8757,10 @@ fn isValidTypeBoundary(txt: []const u8, pos: usize, expect_brace: bool) bool {
     return c == '{' or c == '(' or c == ' ' or c == '\t';
 }
 
-/// Check if a type definition pattern appears in code, not inside a string literal.
-fn isTypeDefinition(line: []const u8) bool {
+/// Cheap line-only check: does the declaration RHS look like a type definition?
+/// Does NOT distinguish a real type def from a closure-wrapper function alias —
+/// use `isClosureFunctionAlias` to disambiguate when naming would be reported.
+fn isTypeDefinitionLine(line: []const u8) bool {
     const eq_pos = mem.indexOf(u8, line, "=") orelse return false;
     const after_eq = line[eq_pos + 1 ..];
     const quote_pos = mem.indexOf(u8, after_eq, "\"");
@@ -8726,6 +8778,134 @@ fn isTypeDefinition(line: []const u8) bool {
         if (quote_pos != null and quote_pos.? < pos) continue;
         if (!isValidTypeBoundary(after_eq, pos + pat.kw.len, pat.chk)) continue;
         return true;
+    }
+    return false;
+}
+
+/// Full check including multi-line closure-wrapper disambiguation.
+/// Returns true only for real type definitions, not function aliases.
+fn isTypeDefinition(line: []const u8, content: []const u8, line_offset: usize) bool {
+    if (!isTypeDefinitionLine(line)) return false;
+    return !isClosureFunctionAlias(line, content, line_offset);
+}
+
+/// True when `const x = struct { fn ... }.call;` (function alias). Mirrors
+/// the keyword scan in `isTypeDefinition`, but returns true ONLY for the closure
+/// case (struct/enum/union/opaque body whose matching `}` is followed by `.ident`).
+fn isClosureFunctionAlias(line: []const u8, content: []const u8, line_offset: usize) bool {
+    const eq_pos = mem.indexOf(u8, line, "=") orelse return false;
+    const after_eq = line[eq_pos + 1 ..];
+    const quote_pos = mem.indexOf(u8, after_eq, "\"");
+
+    const type_kws = [_]struct { kw: []const u8, chk: bool }{
+        .{ .kw = " struct", .chk = true },        .{ .kw = " enum", .chk = true },
+        .{ .kw = " union", .chk = true },         .{ .kw = " opaque", .chk = true },
+        .{ .kw = " packed struct", .chk = true }, .{ .kw = " packed union", .chk = true },
+        .{ .kw = " extern struct", .chk = true }, .{ .kw = " extern union", .chk = true },
+    };
+
+    for (type_kws) |pat| {
+        const pos = mem.indexOf(u8, after_eq, pat.kw) orelse continue;
+        if (quote_pos != null and quote_pos.? < pos) continue;
+        if (!isValidTypeBoundary(after_eq, pos + pat.kw.len, pat.chk)) continue;
+        const kw_end_global = line_offset + eq_pos + 1 + pos + pat.kw.len;
+        if (isClosureWrappingType(content, kw_end_global)) return true;
+    }
+    return false;
+}
+
+/// Returns true if the type body starting near `kw_end` is followed by `.ident`
+/// after its matching `}` — the closure-wrapper pattern used for function aliases.
+fn isClosureWrappingType(content: []const u8, kw_end: usize) bool {
+    if (kw_end >= content.len) return false;
+    var i = kw_end;
+    // Skip optional `(...)` after the keyword (e.g. `enum(u8)`, `packed struct(u32)`)
+    // and any whitespace, until we land on the type body's opening `{`.
+    while (i < content.len) {
+        const c = content[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '(') {
+            var pdepth: usize = 1;
+            i += 1;
+            while (i < content.len and pdepth > 0) : (i += 1) {
+                const cc = content[i];
+                if (cc == '(') pdepth += 1 else if (cc == ')') pdepth -= 1;
+            }
+            continue;
+        }
+        break;
+    }
+    if (i >= content.len or content[i] != '{') return false;
+
+    // Trace matching `}` with rudimentary string/char/comment/multiline-string skipping.
+    var depth: usize = 0;
+    var in_str = false;
+    var in_char = false;
+    var in_line_comment = false;
+    var in_ml_str = false;
+    while (i < content.len) : (i += 1) {
+        const c = content[i];
+        if (in_line_comment or in_ml_str) {
+            if (c == '\n') {
+                in_line_comment = false;
+                in_ml_str = false;
+            }
+            continue;
+        }
+        if (in_str) {
+            if (c == '\\' and i + 1 < content.len) {
+                i += 1;
+                continue;
+            }
+            if (c == '"') in_str = false;
+            continue;
+        }
+        if (in_char) {
+            if (c == '\\' and i + 1 < content.len) {
+                i += 1;
+                continue;
+            }
+            if (c == '\'') in_char = false;
+            continue;
+        }
+        if (c == '/' and i + 1 < content.len and content[i + 1] == '/') {
+            in_line_comment = true;
+            i += 1;
+            continue;
+        }
+        if (c == '\\' and i + 1 < content.len and content[i + 1] == '\\') {
+            in_ml_str = true;
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            continue;
+        }
+        if (c == '\'') {
+            in_char = true;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c == '}') {
+            if (depth == 0) return false;
+            depth -= 1;
+            if (depth == 0) {
+                var j = i + 1;
+                while (j < content.len) : (j += 1) {
+                    const cc = content[j];
+                    if (cc == ' ' or cc == '\t' or cc == '\r' or cc == '\n') continue;
+                    return cc == '.';
+                }
+                return false;
+            }
+        }
     }
     return false;
 }
@@ -13304,7 +13484,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.10";
+const EPHOR_VERSION = "0.11.11";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -14193,9 +14373,8 @@ fn parseArgs(allocator: Allocator) !Config {
 }
 
 fn printHelp() void {
+    std.debug.print("Ephor v{s} - The overseer of your Zig code\n\n", .{EPHOR_VERSION});
     const help =
-        \\Ephor v0.7.2 - The overseer of your Zig code
-        \\
         \\Static + Dynamic analysis for Zig (complements zig fmt/build/test)
         \\
         \\OUTPUT FORMAT:
@@ -14239,10 +14418,10 @@ fn printHelp() void {
         \\  --version=<X.Y.Z>   For 'install'/'upgrade': pin a specific version
         \\
         \\INSTALL/UPGRADE EXAMPLES:
-        \\  ephor install                    # Install current version (v0.7.4)
-        \\  ephor install --version=0.7.0    # Install specific version
+        \\  ephor install                    # Install current binary version
+        \\  ephor install --version=0.11.0   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.9.0    # Upgrade to specific version
+        \\  ephor upgrade --version=0.11.0   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -14257,7 +14436,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.7.4",
+        \\    "version": "0.11.11",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
@@ -17338,6 +17517,109 @@ test "isFunctionPointerVar rejects normal vars" {
     try std.testing.expect(!isFunctionPointerVar("var my_count: u32 = 0;"));
     try std.testing.expect(!isFunctionPointerVar("var buffer: [100]u8 = undefined;"));
     try std.testing.expect(!isFunctionPointerVar("var name = SOME_CONSTANT;"));
+}
+
+test "isFunctionPointerVar detects modern *const fn pointer types" {
+    try std.testing.expect(isFunctionPointerVar("var cb: *const fn(u32) void = myFunc;"));
+    try std.testing.expect(isFunctionPointerVar("var cb: *const fn (u32) void = myFunc;"));
+    try std.testing.expect(isFunctionPointerVar("var cb: ?*const fn(u32) void = null;"));
+    try std.testing.expect(isFunctionPointerVar("var cb: ?*const fn (u32) void = null;"));
+    try std.testing.expect(isFunctionPointerVar("var cb: *fn(u32) void = myFunc;"));
+    try std.testing.expect(isFunctionPointerVar("var cb: ?*fn(u32) void = null;"));
+}
+
+test "isFunctionPointerVar rejects method call initializer" {
+    // std.atomic.Value(bool).init(false) — `.init(...)` is a call, not a fn reference
+    try std.testing.expect(!isFunctionPointerVar(
+        "var g_initialized = std.atomic.Value(bool).init(false);",
+    ));
+}
+
+test "isFunctionPointerVar rejects enum literal / .empty initializer" {
+    // `.empty` is a field access / sentinel value, not a function pointer
+    try std.testing.expect(!isFunctionPointerVar(
+        "var g_validator_cache: std.AutoHashMapUnmanaged(u64, Info) = .empty;",
+    ));
+    try std.testing.expect(!isFunctionPointerVar("var x = .foo;"));
+    try std.testing.expect(!isFunctionPointerVar("var x = .{ .a = 1 };"));
+}
+
+test "isFunctionPointerVar rejects qualified method call on generic type" {
+    // Generic type construction then method call — parens in qualifier path
+    try std.testing.expect(!isFunctionPointerVar(
+        "var x = std.AutoHashMapUnmanaged(u64, Info).empty;",
+    ));
+}
+
+// ============================================================================
+// ZA703 Closure-Wrapper / Type-Definition Classification Tests
+// ============================================================================
+
+test "isTypeDefinition: real type defs detected" {
+    const c1 = "const Foo = struct {};";
+    try std.testing.expect(isTypeDefinition(c1, c1, 0));
+    const c2 = "const Color = enum { red, green };";
+    try std.testing.expect(isTypeDefinition(c2, c2, 0));
+    const c3 = "const Tag = union { a: u32, b: u64 };";
+    try std.testing.expect(isTypeDefinition(c3, c3, 0));
+    const c4 = "const Bits = packed struct(u32) { a: u16, b: u16 };";
+    try std.testing.expect(isTypeDefinition(c4, c4, 0));
+}
+
+test "isTypeDefinition: single-line closure NOT a type def" {
+    const c = "const readBytes = struct { fn call() void {} }.call;";
+    try std.testing.expect(!isTypeDefinition(c, c, 0));
+}
+
+test "isTypeDefinition: multi-line closure NOT a type def" {
+    const content =
+        "const readBytes = struct {\n" ++
+        "    fn call() void {}\n" ++
+        "}.call;\n";
+    // First line is what the analyzer trims and passes as `t`.
+    const line = "const readBytes = struct {";
+    try std.testing.expect(!isTypeDefinition(line, content, 0));
+}
+
+test "isTypeDefinition: nested braces inside closure body still resolved correctly" {
+    const content =
+        "const wrap = struct {\n" ++
+        "    fn call(a: u32) u32 {\n" ++
+        "        if (a > 0) { return a; } else { return 0; }\n" ++
+        "    }\n" ++
+        "}.call;\n";
+    const line = "const wrap = struct {";
+    try std.testing.expect(!isTypeDefinition(line, content, 0));
+}
+
+test "isTypeDefinition: multi-line REAL type def still detected" {
+    const content =
+        "const Foo = struct {\n" ++
+        "    field: u32,\n" ++
+        "};\n";
+    const line = "const Foo = struct {";
+    try std.testing.expect(isTypeDefinition(line, content, 0));
+}
+
+test "isTypeDefinition: array literal of anonymous struct not a type def" {
+    // `[_]struct { ... }{ ... }` has no space before `struct`, so the keyword
+    // pattern ` struct` must NOT match.
+    const c = "const keys = [_]struct { name: []const u8 }{ .{ .name = \"a\" } };";
+    try std.testing.expect(!isTypeDefinition(c, c, 0));
+}
+
+test "isClosureFunctionAlias: detects multi-line closure" {
+    const content =
+        "const readBytes = struct {\n" ++
+        "    fn call() void {}\n" ++
+        "}.call;\n";
+    const line = "const readBytes = struct {";
+    try std.testing.expect(isClosureFunctionAlias(line, content, 0));
+}
+
+test "isClosureFunctionAlias: rejects real type def" {
+    const c = "const Foo = struct { x: u32 };";
+    try std.testing.expect(!isClosureFunctionAlias(c, c, 0));
 }
 
 // ============================================================================

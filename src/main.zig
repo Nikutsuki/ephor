@@ -5016,6 +5016,12 @@ const ImportGraph = struct {
     }
 
     fn isSkippableDir(name: []const u8) bool {
+        // Skip all dot-prefixed directories (hidden dirs: .git, .zig-cache,
+        // .zig-global-cache, .tmp, .claude, etc.). direnv-per-project layouts
+        // produce many such dirs under the scan root — failing to skip them
+        // caused severe slowdowns in recursive traversals (thousands of
+        // openat/realpath calls into cache directories).
+        if (name.len > 0 and name[0] == '.') return true;
         for (skip_dirs) |d| {
             if (mem.eql(u8, name, d)) return true;
         }
@@ -13484,7 +13490,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.11";
+const EPHOR_VERSION = "0.11.12";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -14436,7 +14442,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.11.11",
+        \\    "version": "0.11.12",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
@@ -15398,6 +15404,28 @@ test "relativePath" {
         "src/main.zig",
         relativePath("/foo/bar/src/main.zig", "/other/path"),
     );
+}
+
+test "ImportGraph.isSkippableDir skips dot-prefixed directories" {
+    // Hardcoded skip list must still match.
+    try std.testing.expect(ImportGraph.isSkippableDir(".git"));
+    try std.testing.expect(ImportGraph.isSkippableDir("zig-out"));
+    try std.testing.expect(ImportGraph.isSkippableDir("node_modules"));
+    try std.testing.expect(ImportGraph.isSkippableDir("vendor"));
+
+    // Regression: any dot-prefixed dir must be skipped. direnv-per-project
+    // caches and project-local scratch dirs previously caused recursive
+    // traversals to walk thousands of cache entries.
+    try std.testing.expect(ImportGraph.isSkippableDir(".zig-global-cache"));
+    try std.testing.expect(ImportGraph.isSkippableDir(".zig-cache-ephor"));
+    try std.testing.expect(ImportGraph.isSkippableDir(".zig-cache-test"));
+    try std.testing.expect(ImportGraph.isSkippableDir(".tmp"));
+    try std.testing.expect(ImportGraph.isSkippableDir(".claude"));
+
+    // Non-hidden, non-listed dirs must still be traversable.
+    try std.testing.expect(!ImportGraph.isSkippableDir("src"));
+    try std.testing.expect(!ImportGraph.isSkippableDir("lib"));
+    try std.testing.expect(!ImportGraph.isSkippableDir("tests"));
 }
 
 // ============================================================================

@@ -35,3 +35,6 @@ examples/leak_demo
 # direnv (per-project Zig cache isolation)
 .zig-global-cache/
 .envrc
+
+# zenv (venv-style per-project Zig toolchain + cache)
+.zenv/

@@ -4372,6 +4372,13 @@ const ImportGraph = struct {
     allocator: Allocator,
     files: std.StringHashMap(FileAnalysis),
     reachable: std.StringHashMap(void),
+    /// Reverse index: resolved (realpath) → `files` key.
+    /// Enables O(1) lookup in `findImportsForPath` — without it, every
+    /// recursive reachability step called realpath() on every file in
+    /// the graph, producing O(N²) openat storms (millions of syscalls
+    /// on ~1,400-file codebases). Neither key nor value is owned here;
+    /// both alias the `files` map's entries.
+    resolved_to_key: std.StringHashMapUnmanaged([]const u8),
     scan_root: ?[]const u8,
 
     fn init(allocator: Allocator) ImportGraph {
@@ -4379,6 +4386,7 @@ const ImportGraph = struct {
             .allocator = allocator,
             .files = std.StringHashMap(FileAnalysis).init(allocator),
             .reachable = std.StringHashMap(void).init(allocator),
+            .resolved_to_key = .{},
             .scan_root = null,
         };
     }
@@ -4390,6 +4398,10 @@ const ImportGraph = struct {
     }
 
     fn deinit(self: *ImportGraph) void {
+        // resolved_to_key aliases entries owned by self.files — just
+        // drop the table, don't free the slices.
+        self.resolved_to_key.deinit(self.allocator);
+
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
             var analysis = entry.value_ptr.*;
@@ -4468,8 +4480,17 @@ const ImportGraph = struct {
         };
         const has_tests = mem.indexOf(u8, content, "test \"") != null;
         const pub_fn_count = types.countOccurrences(content, "pub fn ");
+        const path_copy = try self.allocator.dupe(u8, file_path);
+        const resolved_copy = blk: {
+            var buf: [fs.max_path_bytes]u8 = undefined;
+            const r = fs.cwd().realpath(file_path, &buf) catch {
+                break :blk path_copy;
+            };
+            break :blk self.allocator.dupe(u8, r) catch path_copy;
+        };
         var analysis = FileAnalysis{
-            .path = try self.allocator.dupe(u8, file_path),
+            .path = path_copy,
+            .resolved_path = resolved_copy,
             .imports = .{},
             .content = content,
             .has_tests = has_tests,
@@ -4478,6 +4499,13 @@ const ImportGraph = struct {
         };
         try self.extractImports(content, file_path, &analysis);
         try self.files.put(analysis.path, analysis);
+        if (resolved_copy.ptr != path_copy.ptr) {
+            try self.resolved_to_key.put(
+                self.allocator,
+                resolved_copy,
+                path_copy,
+            );
+        }
     }
 
     /// Extract variable name after "const "
@@ -4877,12 +4905,10 @@ const ImportGraph = struct {
     ) void {
         var file_iter = self.files.iterator();
         while (file_iter.next()) |entry| {
-            var rb: [fs.max_path_bytes]u8 = undefined;
-            const norm = fs.cwd().realpath(
-                entry.key_ptr.*,
-                &rb,
-            ) catch continue;
-            if (!self.reachable.contains(norm)) continue;
+            // Use cached resolved_path — realpath() was called once at
+            // ingest. Calling it per iteration here cost O(N) openat
+            // syscalls per pass on every invocation.
+            if (!self.reachable.contains(entry.value_ptr.resolved_path)) continue;
             for (entry.value_ptr.imports.items) |imp| {
                 if (!self.isUnresolvedModuleName(imp)) continue;
                 if (module_names.contains(imp.path)) continue;
@@ -5187,14 +5213,15 @@ const ImportGraph = struct {
     }
 
     fn findImportsForPath(self: *ImportGraph, path: []const u8) ?[]ImportInfo {
-        var iter = self.files.iterator();
-        while (iter.next()) |entry| {
-            var buf: [fs.max_path_bytes]u8 = undefined;
-            const norm = fs.cwd().realpath(entry.key_ptr.*, &buf) catch {
-                continue;
-            };
-            if (mem.eql(u8, norm, path)) return entry.value_ptr.imports.items;
+        // Fast path: resolved → key via reverse index (O(1)).
+        if (self.resolved_to_key.get(path)) |key| {
+            if (self.files.getPtr(key)) |entry| return entry.imports.items;
         }
+        // Fallback: path may already be a files key (no realpath needed),
+        // or may be a path form we haven't indexed. A single pointer
+        // lookup on the primary map handles the former; we deliberately
+        // do NOT call realpath on every file here — that's what blew up.
+        if (self.files.getPtr(path)) |entry| return entry.imports.items;
         return null;
     }
 
@@ -5206,14 +5233,13 @@ const ImportGraph = struct {
         var issues: std.ArrayListUnmanaged(Issue) = .{};
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
             const key = entry.key_ptr.*;
 
             // Skip files matching orphan_exclude patterns
             if (isOrphanExcluded(key, cfg)) continue;
 
-            const norm = fs.cwd().realpath(key, &buf) catch continue;
-            if (self.reachable.contains(norm)) continue;
+            // Use cached resolved_path instead of per-iteration realpath.
+            if (self.reachable.contains(entry.value_ptr.resolved_path)) continue;
             try issues.append(allocator, .{
                 .file = key,
                 .line = 1,
@@ -13490,7 +13516,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.12";
+const EPHOR_VERSION = "0.11.13";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -14442,7 +14468,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.11.12",
+        \\    "version": "0.11.13",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
@@ -15438,8 +15464,10 @@ fn createTestFileAnalysis(
     path: []const u8,
     content: []const u8,
 ) !FileAnalysis {
+    const path_copy = try allocator.dupe(u8, path);
     return .{
-        .path = try allocator.dupe(u8, path),
+        .path = path_copy,
+        .resolved_path = path_copy,
         .imports = .{},
         .content = try allocator.dupe(u8, content),
         .has_tests = false,

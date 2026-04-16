@@ -213,6 +213,12 @@ pub const ProjectStats = struct {
 
 pub const FileAnalysis = struct {
     path: []const u8,
+    /// Cached realpath of `path`, resolved once at ingest time.
+    /// When realpath fails (e.g. file no longer exists), this falls back
+    /// to `path`. Avoids per-lookup realpath calls in the import graph —
+    /// re-resolving on every `findImportsForPath` call scaled O(N²) and
+    /// blew up to millions of openat syscalls on large codebases.
+    resolved_path: []const u8,
     imports: std.ArrayListUnmanaged(ImportInfo),
     content: []const u8,
     has_tests: bool,
@@ -221,6 +227,9 @@ pub const FileAnalysis = struct {
 
     pub fn deinit(self: *FileAnalysis, allocator: Allocator) void {
         allocator.free(self.path);
+        if (self.resolved_path.ptr != self.path.ptr) {
+            allocator.free(self.resolved_path);
+        }
         for (self.imports.items) |import| {
             allocator.free(import.path);
             if (import.resolved) |r| allocator.free(r);

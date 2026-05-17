@@ -13502,29 +13502,52 @@ const EPHOR_BUILD_BLOCK =
 
 /// Update the ephor build steps in build.zig to match the current canonical block.
 /// Finds the ephor section by its start/end markers and replaces it entirely.
+/// Supports both the old snippet marker (// === Ephor Static Analysis ===) and
+/// the new canonical block marker (// Ephor static analysis).
 /// Best-effort: silently does nothing if build.zig is missing or has no ephor section.
 fn updateBuildZigIntegration(allocator: Allocator) void {
     const content = fs.cwd().readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
     defer allocator.free(content);
 
-    // Find the ephor section boundaries
-    const start_marker = "    // Ephor static analysis";
-    const end_marker = "ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);";
+    // Try multiple marker pairs: (start_marker, end_marker)
+    const MarkerPair = struct { start: []const u8, end: []const u8 };
+    const markers = &[_]MarkerPair{
+        .{
+            .start = "    // Ephor static analysis",
+            .end = "ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);",
+        },
+        .{
+            .start = "    // === Ephor Static Analysis ===",
+            .end = "ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);",
+        },
+    };
 
-    const start_pos = mem.indexOf(u8, content, start_marker) orelse return;
-    const end_search_start = start_pos + start_marker.len;
-    const end_pos = mem.indexOf(u8, content[end_search_start..], end_marker) orelse return;
-    const block_end = end_search_start + end_pos + end_marker.len;
+    var start_pos: ?usize = null;
+    var block_end: ?usize = null;
+
+    for (markers) |m| {
+        if (mem.indexOf(u8, content, m.start)) |sp| {
+            const end_search_start = sp + m.start.len;
+            if (mem.indexOf(u8, content[end_search_start..], m.end)) |ep| {
+                start_pos = sp;
+                block_end = end_search_start + ep + m.end.len;
+                break;
+            }
+        }
+    }
+
+    const sp = start_pos orelse return;
+    const be = block_end orelse return;
 
     // Extract current block and compare
-    const current_block = content[start_pos..block_end];
+    const current_block = content[sp..be];
     if (mem.eql(u8, current_block, EPHOR_BUILD_BLOCK)) return;
 
     // Replace the block
     const new_content = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-        content[0..start_pos],
+        content[0..sp],
         EPHOR_BUILD_BLOCK,
-        content[block_end..],
+        content[be..],
     }) catch return;
     defer allocator.free(new_content);
 

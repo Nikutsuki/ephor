@@ -914,6 +914,14 @@ Ephor uses three testing layers:
 
 ## Changelog
 
+### v0.12.2 — Zig Version-Aware Install
+
+**Fixed:** `install.sh` now detects your Zig version and installs the compatible ephor version:
+- Zig 0.16.0+ → ephor v0.12.x
+- Zig 0.15.x → ephor v0.11.13
+
+Before this fix, the install script always fetched the latest ephor version regardless of Zig version, causing build failures on Zig 0.15.x projects.
+
 ### v0.12.1 — Upgrade Path Fix
 
 **Fixed:** `ephor upgrade` (and `zig build ephor-upgrade`) now correctly detects and replaces the old v0.11.x `EPHOR_BUILD_SNIPPET` marker (`// === Ephor Static Analysis ===`) in `build.zig`.

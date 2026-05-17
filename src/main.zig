@@ -19,9 +19,56 @@
 //! - check:      Run all checks
 
 const std = @import("std");
-const fs = std.fs;
 const mem = std.mem;
 const Allocator = mem.Allocator;
+
+/// Compatibility layer for std.fs APIs removed in Zig 0.16.0.
+const fs = struct {
+    pub const path = std.Io.Dir.path;
+    pub const max_path_bytes = std.Io.Dir.max_path_bytes;
+    pub const Dir = CompatDir;
+
+    pub fn cwd() CompatDir {
+        return .{};
+    }
+
+    pub const CompatDir = struct {
+        pub fn access(_: CompatDir, sub_path: []const u8, options: std.Io.Dir.AccessOptions) !void {
+            return std.Io.Dir.cwd().access(global_io.?, sub_path, options);
+        }
+        pub fn openFile(_: CompatDir, sub_path: []const u8, options: std.Io.Dir.OpenFileOptions) !std.Io.File {
+            return std.Io.Dir.cwd().openFile(global_io.?, sub_path, options);
+        }
+        pub fn openDir(_: CompatDir, sub_path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
+            return std.Io.Dir.cwd().openDir(global_io.?, sub_path, options);
+        }
+        pub fn readFileAlloc(_: CompatDir, allocator: Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
+            return std.Io.Dir.cwd().readFileAlloc(global_io.?, sub_path, allocator, .limited(max_bytes));
+        }
+        pub fn createFile(_: CompatDir, sub_path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
+            return std.Io.Dir.cwd().createFile(global_io.?, sub_path, flags);
+        }
+        pub fn statFile(_: CompatDir, sub_path: []const u8) !std.Io.Dir.Stat {
+            return std.Io.Dir.cwd().statFile(global_io.?, sub_path, .{});
+        }
+        pub fn realpath(_: CompatDir, sub_path: []const u8, out_buffer: []u8) ![]u8 {
+            const n = try std.Io.Dir.cwd().realPathFile(global_io.?, sub_path, out_buffer);
+            return out_buffer[0..n];
+        }
+        pub fn realpathAlloc(_: CompatDir, allocator: Allocator, sub_path: []const u8) ![:0]u8 {
+            return std.Io.Dir.cwd().realPathFileAlloc(global_io.?, allocator, sub_path);
+        }
+        pub fn iterate(_: CompatDir) std.Io.Dir.Iterator {
+            return std.Io.Dir.cwd().iterate();
+        }
+        pub fn writeFile(_: CompatDir, sub_path: []const u8, data: []const u8, flags: std.Io.Dir.CreateFileOptions) !void {
+            return std.Io.Dir.cwd().writeFile(global_io.?, .{ .sub_path = sub_path, .data = data, .flags = flags });
+        }
+    };
+};
+
+/// Global I/O handle for child process and file operations.
+var global_io: ?std.Io = null;
 
 // Version compatibility layer
 pub const compat = @import("compat/compat.zig");
@@ -129,7 +176,7 @@ const BasicBlock = struct {
             .id = 0,
             .start_line = 0,
             .end_line = 0,
-            .allocations = .{},
+            .allocations = .empty,
             .has_defer_free = false,
             .has_errdefer = false,
             .is_return = false,
@@ -192,10 +239,10 @@ const ControlFlowGraph = struct {
             .allocator = alloc,
             .func_name = name,
             .func_line = line,
-            .blocks = .{},
-            .edges = .{},
+            .blocks = .empty,
+            .edges = .empty,
             .entry_block = 0,
-            .exit_blocks = .{},
+            .exit_blocks = .empty,
         };
     }
 
@@ -313,7 +360,7 @@ const BlockDataFlow = struct {
         return .{
             .def_gen = std.StringHashMap(usize).init(allocator),
             .def_kill = std.StringHashMap(void).init(allocator),
-            .alloc_gen = .{},
+            .alloc_gen = .empty,
             .defined_vars = std.StringHashMap(VarState).init(allocator),
         };
     }
@@ -545,7 +592,7 @@ const CFGBuildCtx = struct {
 
 fn hasInlineElseReturn(t: []const u8) bool {
     const else_pos = mem.indexOf(u8, t, "else") orelse return false;
-    const after_else = mem.trimLeft(u8, t[else_pos + 4 ..], " \t");
+    const after_else = mem.trimStart(u8, t[else_pos + 4 ..], " \t");
     return mem.startsWith(u8, after_else, "return ");
 }
 
@@ -560,7 +607,7 @@ fn buildCFG(
     cfg.entry_block = current_block;
     cfg.blocks.items[current_block].start_line = func_line;
 
-    var block_stack = std.ArrayListUnmanaged(StackEntry){};
+    var block_stack = std.ArrayListUnmanaged(StackEntry).empty;
     defer block_stack.deinit(allocator);
 
     var ctx = CFGBuildCtx{
@@ -803,7 +850,7 @@ fn isDirectFreeOfVar(t: []const u8, var_name: []const u8) bool {
 
         // Pattern 2: allocator.free(varname) or allocator.destroy(varname)
         if (var_pos >= 1 and t[var_pos - 1] == '(') {
-            const before_paren = mem.trimRight(u8, t[0 .. var_pos - 1], " ");
+            const before_paren = mem.trimEnd(u8, t[0 .. var_pos - 1], " ");
             if (mem.endsWith(u8, before_paren, ".free") or
                 mem.endsWith(u8, before_paren, ".destroy"))
             {
@@ -837,7 +884,7 @@ fn containsIdentifier(text: []const u8, name: []const u8) bool {
 fn isDirectAssignment(t: []const u8, name: []const u8, pos: usize) bool {
     if (pos + name.len >= t.len) return false;
     const after = t[pos + name.len ..];
-    const trimmed = mem.trimLeft(u8, after, " \t");
+    const trimmed = mem.trimStart(u8, after, " \t");
     // Only direct assignment: `name = value`
     // NOT subscript: `name[i] = value` (this is a USE of name)
     if (mem.startsWith(u8, trimmed, "==")) return false;
@@ -899,7 +946,7 @@ fn hasAssignmentAfterBracket(text: []const u8) ?bool {
         if (c == '[') depth += 1 else if (c == ']') {
             if (depth > 0) depth -= 1;
             if (depth == 0) {
-                const after = mem.trimLeft(u8, text[i + 1 ..], " \t");
+                const after = mem.trimStart(u8, text[i + 1 ..], " \t");
                 if (isAssignmentOp(after)) return true;
                 // Continue through chained field.index access
                 // e.g., [col].v[row] = sum
@@ -931,7 +978,7 @@ fn hasAssignmentAfterChain(text: []const u8) ?bool {
                 }
             } else return null;
         } else {
-            const after = mem.trimLeft(u8, text[pos..], " \t");
+            const after = mem.trimStart(u8, text[pos..], " \t");
             return isAssignmentOp(after);
         }
     }
@@ -941,7 +988,7 @@ fn hasAssignmentAfterChain(text: []const u8) ?bool {
 fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
     if (pos + name.len >= t.len) return false;
     const after = t[pos + name.len ..];
-    const trimmed = mem.trimLeft(u8, after, " \t");
+    const trimmed = mem.trimStart(u8, after, " \t");
     if (isAssignmentOp(trimmed)) return true;
 
     // Field chain: name.field = value or name.field.sub = value
@@ -951,12 +998,12 @@ fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
             j += 1;
             while (j < trimmed.len and isIdent(trimmed[j])) j += 1;
         }
-        const after_fields = mem.trimLeft(u8, trimmed[j..], " \t");
+        const after_fields = mem.trimStart(u8, trimmed[j..], " \t");
         if (isAssignmentOp(after_fields)) return true;
         if (mem.startsWith(u8, after_fields, "["))
             return hasAssignmentAfterBracket(after_fields) orelse false;
         if (mem.startsWith(u8, after_fields, "*"))
-            return isAssignmentOp(mem.trimLeft(u8, after_fields[1..], " \t"));
+            return isAssignmentOp(mem.trimStart(u8, after_fields[1..], " \t"));
     }
 
     // Subscript: name[i] = value or name[i][j] = value
@@ -1013,7 +1060,7 @@ fn getBlockPredecessors(
     block_id: usize,
     allocator: Allocator,
 ) !std.ArrayListUnmanaged(usize) {
-    var preds: std.ArrayListUnmanaged(usize) = .{};
+    var preds: std.ArrayListUnmanaged(usize) = .empty;
     for (cfg.edges.items) |edge| {
         if (edge.to == block_id) try preds.append(allocator, edge.from);
     }
@@ -1423,7 +1470,7 @@ fn removeAddressOfVars(
     undef_vars: *std.StringHashMap(usize),
     lines: []const []const u8,
 ) !void {
-    var remove = std.ArrayListUnmanaged([]const u8){};
+    var remove = std.ArrayListUnmanaged([]const u8).empty;
     defer remove.deinit(allocator);
     var it = undef_vars.iterator();
     while (it.next()) |entry| {
@@ -1445,7 +1492,7 @@ fn removeIndirectlyInitVars(
     undef_vars: *std.StringHashMap(usize),
     lines: []const []const u8,
 ) !void {
-    var remove = std.ArrayListUnmanaged([]const u8){};
+    var remove = std.ArrayListUnmanaged([]const u8).empty;
     defer remove.deinit(allocator);
     var it = undef_vars.iterator();
     while (it.next()) |entry| {
@@ -1879,7 +1926,7 @@ fn extractIfCondition(t: []const u8) ?[]const u8 {
     } else {
         return null;
     }
-    rest = mem.trimLeft(u8, rest, " \t");
+    rest = mem.trimStart(u8, rest, " \t");
     if (rest.len == 0 or rest[0] != '(') return null;
     // Find matching close paren
     var paren_depth: usize = 0;
@@ -2501,7 +2548,7 @@ fn analyzeCFGMemorySafety(
     file_path: []const u8,
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var allocs = try collectMemSafetyAllocs(allocator, lines, func_line, file_no_free_fields);
     defer allocs.deinit();
     if (allocs.count() == 0) return issues;
@@ -3355,7 +3402,7 @@ fn collectCFGAllocations(
     func_line: usize,
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(CFGAlloc) {
-    var allocs = std.ArrayListUnmanaged(CFGAlloc){};
+    var allocs = std.ArrayListUnmanaged(CFGAlloc).empty;
 
     // Pre-scan: build type-tracked allocator sets
     var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
@@ -3558,7 +3605,7 @@ fn trackOwnerVariables(
     func_line: usize,
     alloc_name: []const u8,
 ) !std.ArrayListUnmanaged(OwnerVar) {
-    var owner_vars = std.ArrayListUnmanaged(OwnerVar){};
+    var owner_vars = std.ArrayListUnmanaged(OwnerVar).empty;
     try owner_vars.append(allocator, .{ .name = alloc_name });
 
     for (cfg.blocks.items) |block| {
@@ -3658,7 +3705,7 @@ fn analyzeCFGDeferCoverage(
     file_path: []const u8,
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
 
     // Skip functions that take a no-free allocator by TYPE (e.g., *ArenaAllocator parameter)
     if (hasNoFreeAllocatorParameter(lines)) return issues;
@@ -4076,7 +4123,7 @@ fn checkErrdeferOwnershipTransfer(
 const BlockCollectState = struct {
     depth: usize = 0,
     start: usize = 0,
-    content: std.ArrayListUnmanaged(u8) = .{},
+    content: std.ArrayListUnmanaged(u8) = .empty,
 
     fn deinit(self: *BlockCollectState, a: Allocator) void {
         self.content.deinit(a);
@@ -4267,9 +4314,9 @@ fn scanErrdeferLines(
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !ErrdeferScanState {
     var state = ErrdeferScanState{
-        .try_allocs = .{},
-        .errdefers = .{},
-        .try_lines_list = .{},
+        .try_allocs = .empty,
+        .errdefers = .empty,
+        .try_lines_list = .empty,
         .bs = .{},
     };
 
@@ -4342,7 +4389,7 @@ fn analyzeCFGErrdeferCoverage(
     fn_returns_error: bool,
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     if (!fn_returns_error) return issues;
     if (hasNoFreeAllocatorType(lines)) return issues;
 
@@ -4386,7 +4433,7 @@ const ImportGraph = struct {
             .allocator = allocator,
             .files = std.StringHashMap(FileAnalysis).init(allocator),
             .reachable = std.StringHashMap(void).init(allocator),
-            .resolved_to_key = .{},
+            .resolved_to_key = .empty,
             .scan_root = null,
         };
     }
@@ -4409,7 +4456,7 @@ const ImportGraph = struct {
         }
         self.files.deinit();
 
-        var keys: std.ArrayListUnmanaged([]const u8) = .{};
+        var keys: std.ArrayListUnmanaged([]const u8) = .empty;
         defer keys.deinit(self.allocator);
         var reachable_iter = self.reachable.keyIterator();
         while (reachable_iter.next()) |key| {
@@ -4428,7 +4475,7 @@ const ImportGraph = struct {
             });
             return err;
         };
-        defer dir.close();
+        defer dir.close(global_io.?);
         try self.scanRecursive(dir, dir_path, 0);
     }
 
@@ -4440,10 +4487,10 @@ const ImportGraph = struct {
         }
     }
 
-    fn scanRecursive(self: *ImportGraph, dir: fs.Dir, base: []const u8, depth: u16) !void {
+    fn scanRecursive(self: *ImportGraph, dir: std.Io.Dir, base: []const u8, depth: u16) !void {
         if (depth > 32) return;
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(global_io.?)) |entry| {
             const path = try std.fmt.allocPrint(
                 self.allocator,
                 "{s}/{s}",
@@ -4460,10 +4507,11 @@ const ImportGraph = struct {
                     defer self.allocator.free(path);
                     if (isScanSkipDir(entry.name)) continue;
                     var subdir = dir.openDir(
+                        global_io.?,
                         entry.name,
                         .{ .iterate = true },
                     ) catch continue;
-                    defer subdir.close();
+                    defer subdir.close(global_io.?);
                     try self.scanRecursive(subdir, path, depth + 1);
                 },
                 else => self.allocator.free(path),
@@ -4472,10 +4520,8 @@ const ImportGraph = struct {
     }
 
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
-        const file = fs.cwd().openFile(file_path, .{}) catch return;
-        defer file.close();
         const max_size = 10 * 1024 * 1024;
-        const content = file.readToEndAlloc(self.allocator, max_size) catch {
+        const content = fs.cwd().readFileAlloc(self.allocator, file_path, max_size) catch {
             return;
         };
         const has_tests = mem.indexOf(u8, content, "test \"") != null;
@@ -4491,7 +4537,7 @@ const ImportGraph = struct {
         var analysis = FileAnalysis{
             .path = path_copy,
             .resolved_path = resolved_copy,
-            .imports = .{},
+            .imports = .empty,
             .content = content,
             .has_tests = has_tests,
             .pub_function_count = pub_fn_count,
@@ -4724,7 +4770,7 @@ const ImportGraph = struct {
 
         // Always resolve to absolute path for consistent comparison
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = std.fs.cwd().realpath(full, &buf) catch return null;
+        const resolved = fs.cwd().realpath(full, &buf) catch return null;
         if (!self.isWithinScanRoot(resolved)) return null;
         return try self.allocator.dupe(u8, resolved);
     }
@@ -4762,7 +4808,7 @@ const ImportGraph = struct {
             }
         }
         // 2. Try parent of target path
-        const trimmed = mem.trimRight(u8, cfg.path, "/");
+        const trimmed = mem.trimEnd(u8, cfg.path, "/");
         if (self.checkBuildZigAt(
             std.fs.path.dirname(trimmed) orelse ".",
             buf,
@@ -4861,7 +4907,7 @@ const ImportGraph = struct {
         const build_root = self.findBuildRoot(cfg, &root_buf) orelse return;
 
         // Snapshot reachable paths to avoid modify-while-iterate
-        var to_scan: std.ArrayListUnmanaged([]const u8) = .{};
+        var to_scan: std.ArrayListUnmanaged([]const u8) = .empty;
         defer to_scan.deinit(self.allocator);
         var iter = self.reachable.iterator();
         while (iter.next()) |entry| {
@@ -4948,7 +4994,7 @@ const ImportGraph = struct {
         self: *ImportGraph,
         cfg: *const Config,
     ) !void {
-        var module_names: std.StringHashMapUnmanaged(void) = .{};
+        var module_names: std.StringHashMapUnmanaged(void) = .empty;
         defer {
             var fi = module_names.iterator();
             while (fi.next()) |fe| self.allocator.free(fe.key_ptr.*);
@@ -4958,7 +5004,7 @@ const ImportGraph = struct {
         self.collectUnresolvedModuleNames(&module_names);
         if (module_names.count() == 0) return;
 
-        const trimmed = mem.trimRight(u8, cfg.path, "/");
+        const trimmed = mem.trimEnd(u8, cfg.path, "/");
         var search_roots: [2][]const u8 = undefined;
         var rc: usize = 0;
         var rb1: [fs.max_path_bytes]u8 = undefined;
@@ -4993,9 +5039,9 @@ const ImportGraph = struct {
             search_dir,
             .{ .iterate = true },
         ) catch return;
-        defer dir.close();
+        defer dir.close(global_io.?);
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(global_io.?)) |entry| {
             if (entry.kind != .directory) continue;
             if (isSkippableDir(entry.name)) continue;
             const full = std.fmt.allocPrint(
@@ -5019,7 +5065,7 @@ const ImportGraph = struct {
     /// Discover nested build.zig files in subdirectories and mark their
     /// @import and b.path references as reachable.
     fn discoverNestedBuildFiles(self: *ImportGraph, cfg: *const Config) !void {
-        const trimmed = mem.trimRight(u8, cfg.path, "/");
+        const trimmed = mem.trimEnd(u8, cfg.path, "/");
         var rbuf: [fs.max_path_bytes]u8 = undefined;
         const target_abs = fs.cwd().realpath(trimmed, &rbuf) catch return;
         const target_owned = self.allocator.dupe(u8, target_abs) catch return;
@@ -5075,9 +5121,9 @@ const ImportGraph = struct {
 
     fn scanForNestedBuildZig(self: *ImportGraph, dir_path: []const u8) !void {
         var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        defer dir.close(global_io.?);
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(global_io.?)) |entry| {
             if (entry.kind != .directory) continue;
             if (isSkippableDir(entry.name)) continue;
             const subdir = std.fmt.allocPrint(
@@ -5099,7 +5145,7 @@ const ImportGraph = struct {
         const abs_subdir = fs.cwd().realpath(subdir, &rbuf) catch return;
 
         // Snapshot reachable paths to check which are in this sub-project
-        var to_scan: std.ArrayListUnmanaged([]const u8) = .{};
+        var to_scan: std.ArrayListUnmanaged([]const u8) = .empty;
         defer to_scan.deinit(self.allocator);
         {
             var iter = self.reachable.iterator();
@@ -5195,9 +5241,9 @@ const ImportGraph = struct {
 
     fn markZigFilesRecursive(self: *ImportGraph, dir_path: []const u8) !void {
         var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        defer dir.close(global_io.?);
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(global_io.?)) |entry| {
             if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig"))
                 self.markSingleZigFile(dir_path, entry.name);
             if (entry.kind != .directory or isSkippableDir(entry.name))
@@ -5230,7 +5276,7 @@ const ImportGraph = struct {
         allocator: Allocator,
         cfg: *const Config,
     ) !std.ArrayListUnmanaged(Issue) {
-        var issues: std.ArrayListUnmanaged(Issue) = .{};
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
@@ -5532,7 +5578,7 @@ fn collectNoFreeFieldNamesFromContent(
     content: []const u8,
 ) !std.StringHashMapUnmanaged(void) {
     // Split content into lines
-    var file_lines = std.ArrayListUnmanaged([]const u8){};
+    var file_lines = std.ArrayListUnmanaged([]const u8).empty;
     defer file_lines.deinit(a);
     var line_iter = mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| {
@@ -5827,10 +5873,10 @@ const TypeContext = struct {
 
     fn init() TypeContext {
         return .{
-            .struct_methods = .{},
-            .function_returns = .{},
-            .var_types = .{},
-            .stdlib_vars = .{},
+            .struct_methods = .empty,
+            .function_returns = .empty,
+            .var_types = .empty,
+            .stdlib_vars = .empty,
         };
     }
 
@@ -6095,7 +6141,7 @@ fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
                     // Register as type method
                     const gop = try ctx.struct_methods.getOrPut(a, type_name);
                     if (!gop.found_existing) {
-                        gop.value_ptr.* = .{};
+                        gop.value_ptr.* = .empty;
                     }
                     try gop.value_ptr.put(a, fn_name, rk);
                 }
@@ -6497,7 +6543,7 @@ fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize
     if (!has_alloc_pattern) return null;
 
     // Check that the line ends with an open paren (possibly with trailing whitespace)
-    const trimmed = mem.trimRight(u8, t, " \t\r");
+    const trimmed = mem.trimEnd(u8, t, " \t\r");
     if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '(') return null;
 
     // Look at the next line for the first argument
@@ -7787,7 +7833,7 @@ fn analyzeFileErrors(
     defer type_ctx.deinit(allocator);
 
     // Collect all lines for preceding-line lookback (ZA202 multi-line suppression)
-    var all_lines_list: std.ArrayListUnmanaged([]const u8) = .{};
+    var all_lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer all_lines_list.deinit(allocator);
     var line_iter = mem.splitScalar(u8, a.content, '\n');
     while (line_iter.next()) |l| {
@@ -7844,7 +7890,7 @@ fn analyzeErrors(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeFileErrors(allocator, &issues, entry.value_ptr.*);
@@ -7953,7 +7999,7 @@ fn analyzeUnused(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const a = entry.value_ptr.*;
@@ -8320,7 +8366,7 @@ fn analyzeComplexity(
     graph: *ImportGraph,
     th: Thresholds,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeFileComplexity(allocator, &issues, entry.value_ptr.*, th);
@@ -8401,7 +8447,7 @@ fn analyzeStyle(
     graph: *ImportGraph,
     th: Thresholds,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
@@ -8422,7 +8468,7 @@ fn analyzeStyle(
         var lines = mem.splitScalar(u8, a.content, '\n');
         while (lines.next()) |line| {
             defer line_num += 1;
-            const trimmed = mem.trimLeft(u8, line, " \t");
+            const trimmed = mem.trimStart(u8, line, " \t");
             if (mem.startsWith(u8, trimmed, "\\\\")) continue;
 
             const visible_len = calculateVisibleLength(line);
@@ -8699,7 +8745,7 @@ fn analyzeNaming(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
@@ -9064,13 +9110,13 @@ fn runCFGMemoryAnalyses(
     defer r1.deinit(a);
     try out.appendSlice(a, r1.items);
     var r2 = if (is_no_free_recipient)
-        std.ArrayListUnmanaged(Issue){}
+        std.ArrayListUnmanaged(Issue).empty
     else
         try analyzeCFGDeferCoverage(a, cfg, fl, fstart, fp, no_free_fields);
     defer r2.deinit(a);
     try out.appendSlice(a, r2.items);
     var r3 = if (in_test or is_no_free_recipient)
-        std.ArrayListUnmanaged(Issue){}
+        std.ArrayListUnmanaged(Issue).empty
     else
         try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err, no_free_fields);
     defer r3.deinit(a);
@@ -9198,7 +9244,7 @@ fn analyzeCFGFile(
     };
     var line_num: usize = 1;
     var line_iter = mem.splitScalar(u8, content, '\n');
-    var func_lines = std.ArrayListUnmanaged([]const u8){};
+    var func_lines = std.ArrayListUnmanaged([]const u8).empty;
     defer func_lines.deinit(allocator);
     var prev = CFGPrevFunc{};
 
@@ -9313,7 +9359,7 @@ fn analyzeCFGMemory(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeCFGFile(allocator, &issues, entry.value_ptr.content, entry.key_ptr.*);
@@ -9505,7 +9551,7 @@ fn analyzeIgnoredErrors(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const content = entry.value_ptr.content;
@@ -9717,7 +9763,7 @@ fn removeAbsentKeys(
     intersection: *std.StringHashMapUnmanaged(void),
     pred_set: *const std.StringHashMapUnmanaged(void),
 ) !void {
-    var rm = std.ArrayListUnmanaged([]const u8){};
+    var rm = std.ArrayListUnmanaged([]const u8).empty;
     defer rm.deinit(allocator);
     var it = intersection.iterator();
     while (it.next()) |e| {
@@ -9733,14 +9779,14 @@ fn intersectPredChecks(
     bid: usize,
     checked: []std.StringHashMapUnmanaged(void),
 ) !bool {
-    var preds = std.ArrayListUnmanaged(usize){};
+    var preds = std.ArrayListUnmanaged(usize).empty;
     defer preds.deinit(allocator);
     for (cfg.edges.items) |edge| {
         if (edge.to == bid) try preds.append(allocator, edge.from);
     }
     if (preds.items.len == 0) return false;
 
-    var intersection: std.StringHashMapUnmanaged(void) = .{};
+    var intersection: std.StringHashMapUnmanaged(void) = .empty;
     defer intersection.deinit(allocator);
     for (preds.items, 0..) |pred, pi| {
         if (pi == 0) {
@@ -9903,7 +9949,7 @@ fn analyzeCFGNullSafety(
     func_line: usize,
     file_path: []const u8,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
@@ -9915,7 +9961,7 @@ fn analyzeCFGNullSafety(
         for (checked) |*map| map.deinit(allocator);
         allocator.free(checked);
     }
-    for (checked) |*map| map.* = .{};
+    for (checked) |*map| map.* = .empty;
 
     try collectNullChecksPerBlock(allocator, cfg, lines, func_line, checked);
     try propagateNullChecks(allocator, cfg, checked, num_blocks);
@@ -9946,7 +9992,7 @@ fn analyzeCFGErrors(
     func_name: []const u8,
     is_in_test_context: bool,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     const is_test_ctx = mem.startsWith(u8, func_name, "test ") or
         is_in_test_context;
 
@@ -10224,7 +10270,7 @@ fn checkCatchUndefined(
     if (isInsideString(t, col)) return null;
     // Ensure it's "catch undefined" not "catch |...| undefined"
     const after_catch = t[col + 5 ..]; // skip "catch"
-    const trimmed = mem.trimLeft(u8, after_catch, " \t");
+    const trimmed = mem.trimStart(u8, after_catch, " \t");
     if (trimmed.len > 0 and trimmed[0] == '|') return null;
     return .{
         .file = file_path,
@@ -10477,7 +10523,7 @@ fn narrowIntersection(
     pred_info: PredInfo,
     pred_has_both: bool,
 ) !void {
-    var to_remove = std.ArrayListUnmanaged([]const u8){};
+    var to_remove = std.ArrayListUnmanaged([]const u8).empty;
     defer to_remove.deinit(allocator);
     var iter = intersection.iterator();
     while (iter.next()) |entry| {
@@ -10494,7 +10540,7 @@ fn collectPredecessors(
     cfg: *ControlFlowGraph,
     bid: usize,
 ) !std.ArrayListUnmanaged(PredInfo) {
-    var preds = std.ArrayListUnmanaged(PredInfo){};
+    var preds = std.ArrayListUnmanaged(PredInfo).empty;
     for (cfg.edges.items) |edge| {
         if (edge.to != bid) continue;
         try preds.append(allocator, .{
@@ -10512,7 +10558,7 @@ fn computePredIntersection(
     guarded_per_block: []std.StringHashMapUnmanaged(void),
     preds: []const PredInfo,
 ) !std.StringHashMapUnmanaged(void) {
-    var intersection: std.StringHashMapUnmanaged(void) = .{};
+    var intersection: std.StringHashMapUnmanaged(void) = .empty;
     for (preds, 0..) |pi, i| {
         const both = hasBothBranches(cfg, pi.block);
         if (i == 0) {
@@ -10747,7 +10793,7 @@ fn analyzeCFGPanicPatterns(
     func_line: usize,
     file_path: []const u8,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
 
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
@@ -10760,7 +10806,7 @@ fn analyzeCFGPanicPatterns(
         for (guarded_per_block) |*m| m.deinit(allocator);
         allocator.free(guarded_per_block);
     }
-    for (guarded_per_block) |*m| m.* = .{};
+    for (guarded_per_block) |*m| m.* = .empty;
 
     try collectBlockGuards(allocator, cfg, lines, func_line, guarded_per_block);
     try propagateGuardsThroughCFG(allocator, cfg, guarded_per_block);
@@ -11472,7 +11518,7 @@ fn analyzeNullSafety(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const file_path = entry.key_ptr.*;
@@ -11776,13 +11822,13 @@ fn analyzePanicPatterns(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
         const file_path = entry.key_ptr.*;
         var line_num: usize = 1;
-        var lines_list: std.ArrayListUnmanaged([]const u8) = .{};
+        var lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
         defer lines_list.deinit(allocator);
 
         // Collect all lines for context
@@ -11827,10 +11873,9 @@ fn analyzePanicPatterns(
 }
 
 fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, global_io.?, .{
         .argv = &.{ "zig", "fmt", "--check", path },
     }) catch |err| {
         std.debug.print("error: cannot run zig fmt: {}\n", .{err});
@@ -11928,15 +11973,15 @@ fn runRuntimeAnalysis(
     verbose: bool,
     custom_command: ?[]const u8,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var argv_buf: [64][]const u8 = undefined;
     const argv_len = buildRuntimeArgv(custom_command, &argv_buf, verbose);
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, global_io.?, .{
         .argv = argv_buf[0..argv_len],
-        .cwd = path,
-        .max_output_bytes = 10 * 1024 * 1024,
+        .cwd = .{ .path = path },
+        .stdout_limit = .limited(10 * 1024 * 1024),
+        .stderr_limit = .limited(10 * 1024 * 1024),
     }) catch |err| {
         const cmd_str = custom_command orelse "zig build test";
         std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
@@ -11948,7 +11993,7 @@ fn runRuntimeAnalysis(
     try parseGPADiagnostics(allocator, &issues, result.stderr, verbose);
     try parseTestOutput(allocator, &issues, result.stdout, verbose);
 
-    if (result.term.Exited != 0 and issues.items.len == 0)
+    if (result.term.exited != 0 and issues.items.len == 0)
         try reportCommandFailure(allocator, &issues, custom_command != null);
 
     return issues;
@@ -12389,7 +12434,7 @@ fn checkFileIgnoreRule(line: []const u8, rule: []const u8) bool {
     if (mem.indexOf(u8, line, rule) != null) return true;
     if (mem.indexOf(u8, line, "ephor:ignore-file ")) |start_pos| {
         const after = line[start_pos + "ephor:ignore-file ".len ..];
-        const trimmed = mem.trimLeft(u8, after, " \t");
+        const trimmed = mem.trimStart(u8, after, " \t");
         if (trimmed.len > 0) return false;
     }
     return true;
@@ -12450,7 +12495,7 @@ fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool
 
         // Check if this is a comment-only ignore line that starts scope tracking
         if (prev_line) |pl| {
-            const prev_trimmed = mem.trimLeft(u8, pl, " \t");
+            const prev_trimmed = mem.trimStart(u8, pl, " \t");
             if (mem.startsWith(u8, prev_trimmed, "//") and checkLineIgnore(pl, rule)) {
                 // Previous line has an ignore directive — check if THIS line opens a scope
                 if (mem.indexOf(u8, line, "{") != null) {
@@ -12479,7 +12524,7 @@ fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool
 
         // Previous-line without scope: suppresses just this one line
         if (prev_line) |pl| {
-            const prev_trimmed = mem.trimLeft(u8, pl, " \t");
+            const prev_trimmed = mem.trimStart(u8, pl, " \t");
             if (mem.startsWith(u8, prev_trimmed, "//") and checkLineIgnore(pl, rule)) return true;
         }
         break;
@@ -12602,10 +12647,7 @@ const CONFIG_FILENAME = "ephor.json";
 
 fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
     // Try to load ephor.json config file from current directory
-    const file = fs.cwd().openFile(CONFIG_FILENAME, .{}) catch return;
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return;
+    const content = fs.cwd().readFileAlloc(allocator, CONFIG_FILENAME, 64 * 1024) catch return;
     defer allocator.free(content);
 
     // Simple JSON parsing for config format
@@ -12633,10 +12675,7 @@ fn tryLoadConfigFromDir(
     const dir_copy = try allocator.dupe(u8, dir);
     defer allocator.free(dir_copy);
 
-    const file = fs.cwd().openFile(config_path, .{}) catch return false;
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return false;
+    const content = fs.cwd().readFileAlloc(allocator, config_path, 64 * 1024) catch return false;
     defer allocator.free(content);
 
     parseConfigJson(allocator, content, cfg) catch |err| {
@@ -12927,11 +12966,7 @@ fn writeDefaultConfig() !void {
         \\
     ;
 
-    const file = fs.cwd().createFile(CONFIG_FILENAME, .{
-        .exclusive = true,
-    }) catch |err| return handleConfigCreateError(err);
-    defer file.close();
-    try file.writeAll(default_config);
+    fs.cwd().writeFile(CONFIG_FILENAME, default_config, .{ .exclusive = true }) catch |err| return handleConfigCreateError(err);
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
 }
 
@@ -12993,7 +13028,7 @@ fn collectInstallEntries(
     allocator: Allocator,
     root_dir: []const u8,
 ) !std.ArrayListUnmanaged([]const u8) {
-    var entries: std.ArrayListUnmanaged([]const u8) = .{};
+    var entries: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (entries.items) |e| allocator.free(e);
         entries.deinit(allocator);
@@ -13046,7 +13081,7 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
         }
 
         // Build entries JSON array string
-        var entries_json: std.ArrayListUnmanaged(u8) = .{};
+        var entries_json: std.ArrayListUnmanaged(u8) = .empty;
         defer entries_json.deinit(allocator);
         try entries_json.append(allocator, '[');
         for (entries.items, 0..) |entry, i| {
@@ -13095,9 +13130,7 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
         , .{ ver, root_dir, entries_json.items });
         defer allocator.free(config_content);
 
-        const file = try fs.cwd().createFile(CONFIG_FILENAME, .{});
-        defer file.close();
-        try file.writeAll(config_content);
+        try fs.cwd().writeFile(CONFIG_FILENAME, config_content, .{});
 
         std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
             CONFIG_FILENAME, ver, root_dir,
@@ -13205,12 +13238,11 @@ fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
     const url_z = try allocator.dupeZ(u8, package_url);
     defer allocator.free(url_z);
 
-    var child = std.process.Child.init(
-        &.{ "zig", "fetch", "--save=ephor", url_z },
-        allocator,
-    );
-    const term = try child.spawnAndWait();
-    if (term.Exited != 0) {
+    var child = try std.process.spawn(global_io.?, .{
+        .argv = &.{ "zig", "fetch", "--save=ephor", url_z },
+    });
+    const term = try child.wait(global_io.?);
+    if (term.exited != 0) {
         printFetchFailedHelp(package_url);
         return;
     }
@@ -13282,19 +13314,17 @@ fn updateBuildFnScanBraces(scan: *BuildFnScan, trimmed: []const u8, idx: usize) 
 }
 
 fn patchBuildZig(allocator: Allocator) !?usize {
-    const file = fs.cwd().openFile("build.zig", .{ .mode = .read_only }) catch |err| {
+    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch |err| {
         if (err == error.FileNotFound)
             std.debug.print("No build.zig found in current directory.\n", .{});
         return err;
     };
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(content);
 
     if (mem.indexOf(u8, content, "b.dependency(\"ephor\"") != null or
         mem.indexOf(u8, content, "b.dependency( \"ephor\"") != null) return null;
 
-    var line_list: std.ArrayListUnmanaged([]const u8) = .{};
+    var line_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer line_list.deinit(allocator);
     var line_iter = mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| try line_list.append(allocator, line);
@@ -13304,7 +13334,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
         return error.NoInsertionPoint;
     };
 
-    var new_content: std.ArrayListUnmanaged(u8) = .{};
+    var new_content: std.ArrayListUnmanaged(u8) = .empty;
     defer new_content.deinit(allocator);
     for (line_list.items, 0..) |line, idx| {
         try new_content.appendSlice(allocator, line);
@@ -13312,9 +13342,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
         if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_SNIPPET);
     }
 
-    const out_file = try fs.cwd().createFile("build.zig", .{});
-    defer out_file.close();
-    try out_file.writeAll(new_content.items);
+    try fs.cwd().writeFile("build.zig", new_content.items, .{});
     return insert_after + 2;
 }
 
@@ -13331,12 +13359,7 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
 
     // Check if build.zig.zon exists and has ephor dependency
     const has_ephor = blk: {
-        const file = fs.cwd().openFile(
-            "build.zig.zon",
-            .{ .mode = .read_only },
-        ) catch break :blk false;
-        defer file.close();
-        const content = file.readToEndAlloc(allocator, 64 * 1024) catch break :blk false;
+        const content = fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch break :blk false;
         defer allocator.free(content);
         break :blk mem.indexOf(u8, content, ".ephor") != null;
     };
@@ -13357,14 +13380,13 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
     defer allocator.free(url_z);
 
     // Run zig fetch --save to update the dependency
-    var child = std.process.Child.init(
-        &.{ "zig", "fetch", "--save=ephor", url_z },
-        allocator,
-    );
+    var child = try std.process.spawn(global_io.?, .{
+        .argv = &.{ "zig", "fetch", "--save=ephor", url_z },
+    });
 
-    const term = try child.spawnAndWait();
+    const term = try child.wait(global_io.?);
 
-    if (term.Exited != 0) {
+    if (term.exited != 0) {
         std.debug.print("Failed to upgrade ephor to v{s}.\n", .{ver});
         return;
     }
@@ -13454,9 +13476,7 @@ fn insertVersionField(
 
 /// Write content to the config file (ephor.json).
 fn writeConfigFile(content: []const u8) !void {
-    const out = try fs.cwd().createFile(CONFIG_FILENAME, .{});
-    defer out.close();
-    try out.writeAll(content);
+    try fs.cwd().writeFile(CONFIG_FILENAME, content, .{});
 }
 
 /// Canonical ephor build.zig integration block.
@@ -13508,15 +13528,13 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
     }) catch return;
     defer allocator.free(new_content);
 
-    const out = fs.cwd().createFile("build.zig", .{}) catch return;
-    defer out.close();
-    out.writeAll(new_content) catch return;
+    fs.cwd().writeFile("build.zig", new_content, .{}) catch return;
 
     std.debug.print("Updated build.zig (ephor build steps)\n", .{});
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.11.13";
+const EPHOR_VERSION = "0.12.0";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
@@ -13556,8 +13574,7 @@ fn checkForUpdates(allocator: Allocator) void {
 fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
     // Primary: use tags API (sorted by date, most recent first)
     const api_url = "https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1";
-    const api_result = std.process.Child.run(.{
-        .allocator = allocator,
+    const api_result = std.process.run(allocator, global_io.?, .{
         .argv = &.{ "curl", "-sL", "--max-time", "5", api_url },
     }) catch return fetchVersionFromZon(allocator);
     defer allocator.free(api_result.stdout);
@@ -13573,8 +13590,7 @@ fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
 
 /// Fetch version by parsing build.zig.zon from the main branch (CDN-cached fallback).
 fn fetchVersionFromZon(allocator: Allocator) ?[]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, global_io.?, .{
         .argv = &.{ "curl", "-sL", "--max-time", "3", EPHOR_VERSION_URL },
     }) catch return null;
     defer allocator.free(result.stdout);
@@ -13729,7 +13745,7 @@ fn scanBuildZigEntries(
     defer allocator.free(build_zig_path);
     try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, added, 0);
 
-    const parent = std.fs.path.dirname(mem.trimRight(u8, cfg.path, "/")) orelse ".";
+    const parent = std.fs.path.dirname(mem.trimEnd(u8, cfg.path, "/")) orelse ".";
     const parent_build = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{parent});
     defer allocator.free(parent_build);
     try extractBuildZigEntriesFromPath(allocator, cfg, parent_build, parent, added, 0);
@@ -14109,9 +14125,9 @@ fn scanDirForEntriesWithPrefix(
 ) !void {
     if (depth > 16) return;
     var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    defer dir.close(global_io.?);
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(global_io.?)) |entry| {
         if (entry.kind == .file and isEntryPointFile(entry.name)) {
             addDirEntry(allocator, cfg, dir_path, entry.name, added, true) catch continue;
         }
@@ -14132,9 +14148,9 @@ fn scanDirForEntries(
 ) !void {
     if (depth > 16) return;
     var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    defer dir.close(global_io.?);
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(global_io.?)) |entry| {
         if (entry.kind == .file and isEntryPointFile(entry.name)) {
             addDirEntry(allocator, cfg, dir_path, entry.name, added, false) catch continue;
         }
@@ -14181,9 +14197,9 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
 
     // Auto-discover test files in src/
     var dir = fs.cwd().openDir("src", .{ .iterate = true }) catch return;
-    defer dir.close();
+    defer dir.close(global_io.?);
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(global_io.?)) |entry| {
         const is_test_file = entry.kind == .file and mem.endsWith(u8, entry.name, "_test.zig");
         if (!is_test_file) continue;
         const path = try std.fmt.allocPrint(allocator, "src/{s}", .{entry.name});
@@ -14334,19 +14350,19 @@ fn parseCliArg(
     }
 }
 
-fn parseArgs(allocator: Allocator) !Config {
-    var args = try std.process.argsWithAllocator(allocator);
+fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
+    var args = try proc_args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next();
     var cfg = Config{
         .command = .check,
         .path = "src",
         .path_owned = false,
-        .entries = .{},
-        .exclude = .{},
-        .orphan_exclude = .{},
-        .disabled_rules = .{},
-        .enabled_rules = .{},
+        .entries = .empty,
+        .exclude = .empty,
+        .orphan_exclude = .empty,
+        .disabled_rules = .empty,
+        .enabled_rules = .empty,
         .verbose = false,
         .show_summary = false,
         .format = .text,
@@ -14354,7 +14370,7 @@ fn parseArgs(allocator: Allocator) !Config {
         .init_build = false,
         .export_path = null,
         .known_issues_path = null,
-        .known_issues = .{},
+        .known_issues = .empty,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
@@ -14451,9 +14467,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.11.0   # Install specific version
+        \\  ephor install --version=0.12.0   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.11.0   # Upgrade to specific version
+        \\  ephor upgrade --version=0.12.0   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -14468,7 +14484,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.11.13",
+        \\    "version": "0.12.0",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
@@ -14546,7 +14562,7 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
         // Auto-detect .ephor-ignore in project root
         const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
         defer allocator.free(ignore_path);
-        if (std.fs.cwd().access(ignore_path, .{})) |_| {
+        if (fs.cwd().access(ignore_path, .{})) |_| {
             cfg.known_issues_path = try allocator.dupe(u8, ignore_path);
             break :blk cfg.known_issues_path.?;
         } else |_| {
@@ -14554,9 +14570,7 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
         }
     };
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return;
-    defer file.close();
-    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return;
+    const content = fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
 
     // Track how many keys we've successfully added for cleanup on error
@@ -14602,18 +14616,16 @@ fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
 /// Write a code snippet around a given line from a file
 fn writeCodeSnippet(
     allocator: Allocator,
-    writer: anytype,
+    output: *std.ArrayListUnmanaged(u8),
     issue_file: []const u8,
     issue_line: usize,
 ) !void {
-    const f = std.fs.cwd().openFile(issue_file, .{}) catch return;
-    defer f.close();
-    const content = f.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return;
+    const content = fs.cwd().readFileAlloc(allocator, issue_file, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
     var line_num: usize = 1;
-    try writer.print("```zig\n", .{});
+    try output.print(allocator, "```zig\n", .{});
 
     const start_line = if (issue_line > 2) issue_line - 2 else 1;
     const end_line = issue_line + 2;
@@ -14623,25 +14635,25 @@ fn writeCodeSnippet(
         if (line_num > end_line) break;
         if (line_num < start_line) continue;
         const prefix: []const u8 = if (line_num == issue_line) ">>> " else "    ";
-        try writer.print("{s}{d}: {s}\n", .{ prefix, line_num, line });
+        try output.print(allocator, "{s}{d}: {s}\n", .{ prefix, line_num, line });
     }
-    try writer.print("```\n\n", .{});
+    try output.print(allocator, "```\n\n", .{});
 }
 
 /// Write a single issue entry to the export writer
-fn writeExportIssue(allocator: Allocator, writer: anytype, issue: Issue, base_path: []const u8) !void {
+fn writeExportIssue(allocator: Allocator, output: *std.ArrayListUnmanaged(u8), issue: Issue, base_path: []const u8) !void {
     const rel_path = types.relativePath(issue.file, base_path);
-    try writer.print("## {s}:{d}:{d} [{s}]\n", .{
+    try output.print(allocator, "## {s}:{d}:{d} [{s}]\n", .{
         rel_path, issue.line, issue.col, issue.rule,
     });
-    try writer.print("**{s}**: {s}\n", .{
+    try output.print(allocator, "**{s}**: {s}\n", .{
         @tagName(issue.severity), issue.message,
     });
     if (issue.help) |help| {
-        try writer.print("**Help**: {s}\n", .{help});
+        try output.print(allocator, "**Help**: {s}\n", .{help});
     }
-    try writeCodeSnippet(allocator, writer, issue.file, issue.line);
-    try writer.print("---\n\n", .{});
+    try writeCodeSnippet(allocator, output, issue.file, issue.line);
+    try output.print(allocator, "---\n\n", .{});
 }
 
 fn exportIssues(
@@ -14651,20 +14663,19 @@ fn exportIssues(
     cfg: *const Config,
     graph: ?*const ImportGraph,
 ) !usize {
-    var file = try std.fs.cwd().createFile(export_path, .{});
-    defer file.close();
+    var file = try fs.cwd().createFile(export_path, .{});
+    defer file.close(global_io.?);
 
-    var output = std.ArrayListUnmanaged(u8){};
+    var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(allocator);
-    var writer = output.writer(allocator);
 
-    const ts: u64 = @intCast(std.time.timestamp());
+    const ts: u64 = @intCast(std.Io.Clock.Timestamp.now(global_io.?, .real).raw.toSeconds());
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = ts };
     const day_secs = epoch_secs.getDaySeconds();
     const year_day = epoch_secs.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
-    try writer.print("# Ephor Issues Export\n", .{});
-    try writer.print("# Generated: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC\n", .{
+    try output.print(allocator, "# Ephor Issues Export\n", .{});
+    try output.print(allocator, "# Generated: {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC\n", .{
         year_day.year,
         @intFromEnum(month_day.month),
         month_day.day_index + 1,
@@ -14676,13 +14687,13 @@ fn exportIssues(
     for (all_issues) |issue| {
         if (shouldPrintIssue(issue, cfg, graph)) filtered_count += 1;
     }
-    try writer.print("# Total issues: {d}\n\n", .{filtered_count});
+    try output.print(allocator, "# Total issues: {d}\n\n", .{filtered_count});
 
     for (all_issues) |issue| {
         if (!shouldPrintIssue(issue, cfg, graph)) continue;
-        try writeExportIssue(allocator, writer, issue, cfg.path);
+        try writeExportIssue(allocator, &output, issue, cfg.path);
     }
-    try file.writeAll(output.items);
+    try file.writeStreamingAll(global_io.?, output.items);
     return filtered_count;
 }
 
@@ -14971,12 +14982,13 @@ fn scanPath(g: *ImportGraph, path: []const u8) !void {
 // Main
 // ============================================================================
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    global_io = init.io;
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var cfg = try parseArgs(alloc);
+    var cfg = try parseArgs(alloc, init.minimal.args);
     defer cfg.deinit(alloc);
 
     // Track if we should exit with error (checked at end of main after defers)
@@ -14990,7 +15002,7 @@ pub fn main() !void {
 
     // Get absolute base path for relative path calculation
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base_path = std.fs.cwd().realpath(cfg.path, &base_buf) catch cfg.path;
+    const base_path = fs.cwd().realpath(cfg.path, &base_buf) catch cfg.path;
 
     switch (cfg.command) {
         .help => printHelp(),
@@ -15132,7 +15144,8 @@ pub fn main() !void {
                     \\Proceed? [y/N]
                 , .{ base_path, cmd_str });
                 var read_buf: [16]u8 = undefined;
-                const n = std.fs.File.stdin().read(&read_buf) catch 0;
+                var stdin_reader = std.Io.File.stdin().reader(global_io.?, &read_buf);
+                const n = stdin_reader.interface.readSliceShort(&read_buf) catch 0;
                 if (n == 0 or (read_buf[0] != 'y' and read_buf[0] != 'Y')) {
                     std.debug.print("Aborted.\n", .{});
                     return;
@@ -15227,11 +15240,11 @@ pub fn main() !void {
                     &g,
                 );
                 // Filter cfg_mem_issues by rule category
-                var mem_only_issues = std.ArrayListUnmanaged(Issue){};
+                var mem_only_issues = std.ArrayListUnmanaged(Issue).empty;
                 defer mem_only_issues.deinit(alloc);
-                var null_safety_issues = std.ArrayListUnmanaged(Issue){};
+                var null_safety_issues = std.ArrayListUnmanaged(Issue).empty;
                 defer null_safety_issues.deinit(alloc);
-                var panic_issues = std.ArrayListUnmanaged(Issue){};
+                var panic_issues = std.ArrayListUnmanaged(Issue).empty;
                 defer panic_issues.deinit(alloc);
 
                 for (cfg_mem_issues.items) |issue| {
@@ -15356,7 +15369,7 @@ pub fn main() !void {
                 // Export issues to file if requested
                 if (cfg.export_path) |export_path| {
                     // Collect all issues into one list for export
-                    var all_issues = std.ArrayListUnmanaged(Issue){};
+                    var all_issues = std.ArrayListUnmanaged(Issue).empty;
                     defer all_issues.deinit(alloc);
 
                     for (orphan_issues.items) |i| try all_issues.append(alloc, i);
@@ -15468,7 +15481,7 @@ fn createTestFileAnalysis(
     return .{
         .path = path_copy,
         .resolved_path = path_copy,
-        .imports = .{},
+        .imports = .empty,
         .content = try allocator.dupe(u8, content),
         .has_tests = false,
         .pub_function_count = 0,
@@ -15477,7 +15490,7 @@ fn createTestFileAnalysis(
 }
 
 test "analyzeCFGMemory detects use-after-free (ZA105)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15514,7 +15527,7 @@ test "analyzeCFGMemory detects use-after-free (ZA105)" {
 test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" {
     // KEY TEST: This was the original false positive that motivated CFG-based analysis
     // Pattern: catch { free(x); return; } - free only on error path, data still valid after
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15561,7 +15574,7 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
 }
 
 test "analyzeCFGMemory detects double-free (ZA106)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15595,7 +15608,7 @@ test "analyzeCFGMemory detects double-free (ZA106)" {
 }
 
 test "analyzeCFGMemory no false positive for proper defer" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15629,7 +15642,7 @@ test "analyzeCFGMemory no false positive for proper defer" {
 }
 
 test "analyzeCFGMemory no false positive for switch arm frees (ZA106)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15672,7 +15685,7 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
     //   const result = tryGetOptionalValue() catch { cleanup(); return err; }
     //                                        orelse { cleanup(); return null_err; };
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15714,7 +15727,7 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
 }
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15751,7 +15764,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
 }
 
 test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15789,7 +15802,7 @@ test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" 
 // ============================================================================
 
 test "analyzeIgnoredErrors detects discarded error union (ZA205)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15824,7 +15837,7 @@ test "analyzeIgnoredErrors detects discarded error union (ZA205)" {
 }
 
 test "analyzeIgnoredErrors no false positive for try" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15856,7 +15869,7 @@ test "analyzeIgnoredErrors no false positive for try" {
 }
 
 test "analyzeIgnoredErrors no false positive for catch" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15895,7 +15908,7 @@ test "analyzeIgnoredErrors no false positive for catch" {
 // ============================================================================
 
 test "ZA205 type-aware: user-defined void method NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15932,7 +15945,7 @@ test "ZA205 type-aware: user-defined void method NOT flagged" {
 }
 
 test "ZA205 type-aware: user-defined error method IS flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -15971,7 +15984,7 @@ test "ZA205 type-aware: user-defined error method IS flagged" {
 }
 
 test "ZA205 type-aware: standalone void function NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16001,7 +16014,7 @@ test "ZA205 type-aware: standalone void function NOT flagged" {
 }
 
 test "ZA205 type-aware: standalone error function IS flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16035,7 +16048,7 @@ test "ZA205 type-aware: standalone error function IS flagged" {
 }
 
 test "ZA205 type-aware: value-returning method NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16071,7 +16084,7 @@ test "ZA205 type-aware: value-returning method NOT flagged" {
 }
 
 test "ZA205 type-aware: optional-returning method NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16108,7 +16121,7 @@ test "ZA205 type-aware: optional-returning method NOT flagged" {
 }
 
 test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16118,7 +16131,7 @@ test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
     const content =
         \\const std = @import("std");
         \\fn use() void {
-        \\    var list: std.ArrayListUnmanaged(u32) = .{};
+        \\    var list: std.ArrayListUnmanaged(u32) = .empty;
         \\    _ = list.pop();
         \\}
     ;
@@ -16139,7 +16152,7 @@ test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
 }
 
 test "ZA205 type-aware: mixed struct void and error methods" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16191,7 +16204,7 @@ test "ZA205 type-aware: user .clear() returning !void IS flagged (overrides voca
     // CRITICAL: This is the key test for TypeContext. The old code would NOT flag
     // this because .clear( matches safe_method_patterns vocab. The new code MUST
     // flag it because TypeContext resolves .clear() to error_union for this struct.
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16232,7 +16245,7 @@ test "ZA205 type-aware: user .clear() returning !void IS flagged (overrides voca
 
 test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
     // Verify that stdlib containers' .clear() is still suppressed via vocab
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16242,7 +16255,7 @@ test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
     const content =
         \\const std = @import("std");
         \\fn use() void {
-        \\    var list: std.ArrayListUnmanaged(u32) = .{};
+        \\    var list: std.ArrayListUnmanaged(u32) = .empty;
         \\    _ = list.clear();
         \\}
     ;
@@ -16263,7 +16276,7 @@ test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
 }
 
 test "ZA205 type-aware: unknown receiver falls through to legacy" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16295,7 +16308,7 @@ test "ZA205 type-aware: unknown receiver falls through to legacy" {
 }
 
 test "ZA205 type-aware: enum void method NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16332,7 +16345,7 @@ test "ZA205 type-aware: enum void method NOT flagged" {
 }
 
 test "ZA205 type-aware: enum error method IS flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16372,7 +16385,7 @@ test "ZA205 type-aware: enum error method IS flagged" {
 }
 
 test "ZA205 type-aware: union void method NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16409,7 +16422,7 @@ test "ZA205 type-aware: union void method NOT flagged" {
 }
 
 test "ZA205 type-aware: union error method IS flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16452,7 +16465,7 @@ test "ZA205 type-aware: union error method IS flagged" {
 
 test "ZA205 type-aware: enum value method NOT flagged" {
     // Enum method that returns a value (not error union) — safe to discard
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16495,7 +16508,7 @@ test "ZA205 type-aware: enum value method NOT flagged" {
 
 test "ZA205 type-aware: packed struct method works" {
     // Packed structs are used in real code (hardware registers, protocol headers)
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16535,7 +16548,7 @@ test "ZA205 type-aware: packed struct method works" {
 
 test "ZA205 type-aware: extern struct method works" {
     // Extern structs used for C FFI
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16580,7 +16593,7 @@ test "ZA205 type-aware: extern struct method works" {
 }
 
 test "ZA205 type-aware: noreturn function NOT flagged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16618,7 +16631,7 @@ test "ZA205 type-aware: noreturn function NOT flagged" {
 
 test "ZA205 type-aware: multiple user types in same file resolved independently" {
     // Real Zig files define multiple types. Each type's methods must resolve independently.
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16681,7 +16694,7 @@ test "ZA205 type-aware: multiple user types in same file resolved independently"
 // ============================================================================
 
 test "analyzeNullSafety detects unsafe optional unwrap (ZA801)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16714,7 +16727,7 @@ test "analyzeNullSafety detects unsafe optional unwrap (ZA801)" {
 }
 
 test "analyzeNullSafety no false positive for safe unwrap with orelse" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16745,7 +16758,7 @@ test "analyzeNullSafety no false positive for safe unwrap with orelse" {
 }
 
 test "analyzeNullSafety no false positive for if check" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16777,7 +16790,7 @@ test "analyzeNullSafety no false positive for if check" {
 }
 
 test "analyzeNullSafety detects unsafe deref of maybe_ variable (ZA802)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16814,7 +16827,7 @@ test "analyzeNullSafety detects unsafe deref of maybe_ variable (ZA802)" {
 // ============================================================================
 
 test "Config.isRuleEnabled respects explicit enable" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16822,11 +16835,11 @@ test "Config.isRuleEnabled respects explicit enable" {
         .command = .check,
         .path = "src",
         .path_owned = false,
-        .entries = .{},
-        .exclude = .{},
-        .orphan_exclude = .{},
-        .disabled_rules = .{},
-        .enabled_rules = .{},
+        .entries = .empty,
+        .exclude = .empty,
+        .orphan_exclude = .empty,
+        .disabled_rules = .empty,
+        .enabled_rules = .empty,
         .verbose = false,
         .show_summary = false,
         .format = .text,
@@ -16834,7 +16847,7 @@ test "Config.isRuleEnabled respects explicit enable" {
         .init_build = false,
         .export_path = null,
         .known_issues_path = null,
-        .known_issues = .{},
+        .known_issues = .empty,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
@@ -16849,7 +16862,7 @@ test "Config.isRuleEnabled respects explicit enable" {
 }
 
 test "Config.isRuleEnabled respects disable prefix" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16857,11 +16870,11 @@ test "Config.isRuleEnabled respects disable prefix" {
         .command = .check,
         .path = "src",
         .path_owned = false,
-        .entries = .{},
-        .exclude = .{},
-        .orphan_exclude = .{},
-        .disabled_rules = .{},
-        .enabled_rules = .{},
+        .entries = .empty,
+        .exclude = .empty,
+        .orphan_exclude = .empty,
+        .disabled_rules = .empty,
+        .enabled_rules = .empty,
         .verbose = false,
         .show_summary = false,
         .format = .text,
@@ -16869,7 +16882,7 @@ test "Config.isRuleEnabled respects disable prefix" {
         .init_build = false,
         .export_path = null,
         .known_issues_path = null,
-        .known_issues = .{},
+        .known_issues = .empty,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
@@ -16891,7 +16904,7 @@ test "Config.isRuleEnabled respects disable prefix" {
 }
 
 test "Config.isRuleEnabled enable overrides disable" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -16899,11 +16912,11 @@ test "Config.isRuleEnabled enable overrides disable" {
         .command = .check,
         .path = "src",
         .path_owned = false,
-        .entries = .{},
-        .exclude = .{},
-        .orphan_exclude = .{},
-        .disabled_rules = .{},
-        .enabled_rules = .{},
+        .entries = .empty,
+        .exclude = .empty,
+        .orphan_exclude = .empty,
+        .disabled_rules = .empty,
+        .enabled_rules = .empty,
         .verbose = false,
         .show_summary = false,
         .format = .text,
@@ -16911,7 +16924,7 @@ test "Config.isRuleEnabled enable overrides disable" {
         .init_build = false,
         .export_path = null,
         .known_issues_path = null,
-        .known_issues = .{},
+        .known_issues = .empty,
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
@@ -17145,7 +17158,7 @@ test "checkSilentCatch skips defer context" {
 }
 
 test "analyzeErrors detects silent catch (ZA201)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17177,7 +17190,7 @@ test "analyzeErrors detects silent catch (ZA201)" {
 }
 
 test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17193,7 +17206,7 @@ test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
     ;
 
     // Build CFG and analyze
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -17226,7 +17239,7 @@ test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for proper defer" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17239,7 +17252,7 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -17269,7 +17282,7 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
 }
 
 test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17281,7 +17294,7 @@ test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -17320,7 +17333,7 @@ test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
 // These patterns compile but have subtle runtime issues.
 
 test "integration: use-after-free patterns" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17365,7 +17378,7 @@ test "integration: use-after-free patterns" {
 }
 
 test "integration: double-free patterns" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17401,7 +17414,7 @@ test "integration: double-free patterns" {
 }
 
 test "integration: undefined variable read" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17424,7 +17437,7 @@ test "integration: undefined variable read" {
 }
 
 test "integration: no false positive for valid catch-free-return" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17500,7 +17513,7 @@ test "parseSemver rejects invalid versions" {
 }
 
 test "parseVersionFromZon extracts version" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17518,7 +17531,7 @@ test "parseVersionFromZon extracts version" {
 }
 
 test "parseVersionFromZon returns null for missing version" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -17795,7 +17808,7 @@ test "extractMethodCall returns null for non-method calls" {
 }
 
 test "resolveReturnKind resolves struct method returns" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -17825,7 +17838,7 @@ test "resolveReturnKind resolves struct method returns" {
 }
 
 test "resolveReturnKind resolves standalone functions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -17846,7 +17859,7 @@ test "resolveReturnKind resolves standalone functions" {
 }
 
 test "parseFileTypeContext builds struct methods" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -17872,7 +17885,7 @@ test "parseFileTypeContext builds struct methods" {
 }
 
 test "parseFileTypeContext builds var types" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -17891,12 +17904,12 @@ test "parseFileTypeContext builds var types" {
 }
 
 test "parseFileTypeContext builds stdlib vars" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
     const content =
-        \\var list: std.ArrayListUnmanaged(u32) = .{};
+        \\var list: std.ArrayListUnmanaged(u32) = .empty;
         \\var map = StringHashMap(u32).init(a);
     ;
 
@@ -17908,7 +17921,7 @@ test "parseFileTypeContext builds stdlib vars" {
 }
 
 test "parseFileTypeContext builds top-level functions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -17930,7 +17943,7 @@ test "parseFileTypeContext builds top-level functions" {
 }
 
 test "parseFileTypeContext parses enum methods" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -17957,7 +17970,7 @@ test "parseFileTypeContext parses enum methods" {
 }
 
 test "parseFileTypeContext parses union methods" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -17987,7 +18000,7 @@ test "parseFileTypeContext parses union methods" {
 }
 
 test "parseFileTypeContext parses packed and extern types" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -18018,7 +18031,7 @@ test "parseFileTypeContext parses packed and extern types" {
 }
 
 test "isSafeToDiscard uses TypeContext for user-defined void methods" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -18036,7 +18049,7 @@ test "isSafeToDiscard uses TypeContext for user-defined void methods" {
 }
 
 test "isSafeToDiscard rejects user-defined error methods" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -18054,7 +18067,7 @@ test "isSafeToDiscard rejects user-defined error methods" {
 }
 
 test "buildNoFreeParamFunctions detects single-line call" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -18070,7 +18083,7 @@ test "buildNoFreeParamFunctions detects single-line call" {
 }
 
 test "buildNoFreeParamFunctions detects multi-line call" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -18091,7 +18104,7 @@ test "buildNoFreeParamFunctions detects multi-line call" {
 }
 
 test "buildNoFreeParamFunctions skips function definitions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
@@ -18193,7 +18206,7 @@ test "findAllocCall does NOT detect .append(" {
 // ============================================================================
 
 test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18204,7 +18217,7 @@ test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18236,7 +18249,7 @@ test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
 }
 
 test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18247,7 +18260,7 @@ test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18279,7 +18292,7 @@ test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18291,7 +18304,7 @@ test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18320,7 +18333,7 @@ test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18332,7 +18345,7 @@ test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18365,7 +18378,7 @@ test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101
 // ============================================================================
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18399,7 +18412,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
 }
 
 test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18431,7 +18444,7 @@ test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103
 }
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18469,7 +18482,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)
 // ============================================================================
 
 test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18480,7 +18493,7 @@ test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18512,7 +18525,7 @@ test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
 }
 
 test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18526,7 +18539,7 @@ test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18558,7 +18571,7 @@ test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18590,7 +18603,7 @@ test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for ownership transfer via return (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18601,7 +18614,7 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18630,7 +18643,7 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
 }
 
 test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18667,7 +18680,7 @@ test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)"
 }
 
 test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice (ZA101)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18709,7 +18722,7 @@ test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice 
 // ============================================================================
 
 test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18741,7 +18754,7 @@ test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for create with defer destroy (ZA102)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18771,7 +18784,7 @@ test "analyzeCFGDeferCoverage no false positive for create with defer destroy (Z
 }
 
 test "analyzeCFGDeferCoverage no false positive for create with ownership transfer (ZA102)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18783,7 +18796,7 @@ test "analyzeCFGDeferCoverage no false positive for create with ownership transf
         \\}
     ;
 
-    var lines_list = std.ArrayListUnmanaged([]const u8){};
+    var lines_list = std.ArrayListUnmanaged([]const u8).empty;
     defer lines_list.deinit(allocator);
 
     var line_iter = mem.splitScalar(u8, test_content, '\n');
@@ -18812,7 +18825,7 @@ test "analyzeCFGDeferCoverage no false positive for create with ownership transf
 }
 
 test "analyzeCFGDeferCoverage no false positive for create on arena allocator (ZA102)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18848,7 +18861,7 @@ test "analyzeCFGDeferCoverage no false positive for create on arena allocator (Z
 // ============================================================================
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18882,7 +18895,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)
 }
 
 test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18922,7 +18935,7 @@ test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" 
 
 test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
     // Tests direct UAF: free(data) then data[idx] = val
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18957,7 +18970,7 @@ test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
 }
 
 test "analyzeCFGMemory no false positive for defer free (ZA105)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -18989,7 +19002,7 @@ test "analyzeCFGMemory no false positive for defer free (ZA105)" {
 
 test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
     // Tests alias UAF: const alias = data; free(data); use(alias);
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19027,7 +19040,7 @@ test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
 test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
     // Arena accessed through struct field: self.arena.allocator().alloc()
     // Type-based detection: field declared as std.heap.ArenaAllocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19065,7 +19078,7 @@ test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
 
 test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
     // FixedBufferAllocator accessed through struct field
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19108,7 +19121,7 @@ test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
     // Field named "arena" with type Allocator (not ArenaAllocator) should be
     // treated as no-free. This is the Zig compiler's pervasive pattern:
     // const Sema = struct { arena: Allocator, ... };
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19147,7 +19160,7 @@ test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
 test "no FP for function parameter arena: Allocator (ZA101)" {
     // Function parameter named "arena" with type Allocator should be no-free.
     // Pattern: fn foo(arena: Allocator) !void { arena.alloc(...) }
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19179,7 +19192,7 @@ test "no FP for function parameter arena: Allocator (ZA101)" {
 
 test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
     // Deep chain: self.ctx.arena.alloc() where arena field is Allocator type
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19218,7 +19231,7 @@ test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
 
 test "no FP for allocPrint with arena param (ZA101)" {
     // std.fmt.allocPrint(arena, ...) where arena is a function parameter
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19251,7 +19264,7 @@ test "no FP for allocPrint with arena param (ZA101)" {
 test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
     // A parameter named "allocator" (not "arena") should still trigger warnings.
     // This verifies the heuristic is name-specific, not over-broad.
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19290,7 +19303,7 @@ test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
 
 test "arena param no FP for ZA103 errdefer (name-based)" {
     // Arena-named parameter should not trigger ZA103 either
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19323,7 +19336,7 @@ test "arena param no FP for ZA103 errdefer (name-based)" {
 test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
     // var fba: std.heap.FixedBufferAllocator = .init(&buf);
     // Zig 0.15+ anonymous init syntax
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19357,7 +19370,7 @@ test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
 
 test "no FP for arena param used as receiver and first-arg (ZA103)" {
     // Reproduces git.zig pattern: fn init(arena: Allocator, ...) with arena.dupe() and allocPrint(arena, ...)
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19393,7 +19406,7 @@ test "no FP for arena param used as receiver and first-arg (ZA103)" {
 
 test "no FP for arena as non-first parameter (ZA103)" {
     // Reproduces Value.zig pattern: fn sqrt(val, float_type, arena: Allocator, pt)
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19428,7 +19441,7 @@ test "no FP for arena as non-first parameter (ZA103)" {
 
 test "no FP for multiline allocPrint with arena (ZA101)" {
     // Reproduces glibc.zig pattern: allocPrint(\n    arena,\n    fmt, ...)
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19467,7 +19480,7 @@ test "no FP for multiline allocPrint with arena (ZA101)" {
 
 test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
     // Reproduces glibc.zig pattern: arena_allocator.allocator() alias used in allocPrint
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19503,7 +19516,7 @@ test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
 test "no FP for local arena alias from struct field access (ZA101)" {
     // Reproduces git.zig pattern: const arena = session.arena; arena.alloc(...)
     // where Session has arena: Allocator field
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19543,7 +19556,7 @@ test "no FP for non-memory alloc method (ZA103)" {
     // These should NOT trigger ZA101/ZA103 since they don't allocate heap memory.
     // std.mem.Allocator.alloc() always takes a type as first arg (u8, MyStruct, etc.).
     // Non-memory .alloc() takes runtime values (ids, counts, etc.).
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19584,7 +19597,7 @@ test "no FP for non-memory alloc method (ZA103)" {
 
 test "real alloc with type arg still triggers (ZA101)" {
     // Ensure that real allocator.alloc(u8, 100) still triggers warnings
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19622,7 +19635,7 @@ test "real alloc with type arg still triggers (ZA101)" {
 // ============================================================================
 
 test "ZA204 fires for unfilled var undefined" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19657,7 +19670,7 @@ test "ZA204 fires for unfilled var undefined" {
 }
 
 test "ZA204 no FP for memset after undefined" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19691,7 +19704,7 @@ test "ZA204 no FP for memset after undefined" {
 // ============================================================================
 
 test "ZA202 catch unreachable fires via analyzeErrors" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19725,7 +19738,7 @@ test "ZA202 catch unreachable fires via analyzeErrors" {
 }
 
 test "ZA203 orelse unreachable fires via analyzeErrors" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19763,7 +19776,7 @@ test "ZA203 orelse unreachable fires via analyzeErrors" {
 // ============================================================================
 
 test "ZA207 catch undefined fires" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19797,7 +19810,7 @@ test "ZA207 catch undefined fires" {
 }
 
 test "ZA207 catch |_| undefined does NOT fire" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19830,7 +19843,7 @@ test "ZA207 catch |_| undefined does NOT fire" {
 // ============================================================================
 
 test "ZA208 @panic fires in non-test context" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19863,7 +19876,7 @@ test "ZA208 @panic fires in non-test context" {
 }
 
 test "ZA208 @panic does NOT fire in test block" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19895,7 +19908,7 @@ test "ZA208 @panic does NOT fire in test block" {
 // ============================================================================
 
 test "ZA206 std.posix.exit fires" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19929,7 +19942,7 @@ test "ZA206 std.posix.exit fires" {
 }
 
 test "ZA105: no false positive on variable reassignment after free" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -19968,7 +19981,7 @@ test "ZA105: no false positive on variable reassignment after free" {
 }
 
 test "ZA105: no false positive on for-loop capture variable" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -20009,7 +20022,7 @@ test "ZA105: no false positive on for-loop capture variable" {
 }
 
 test "ZA105: still detects real use-after-free with reassignment check" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -20203,7 +20216,7 @@ test "ZA201 NOT suppressed in regular function" {
 // ============================================================================
 
 test "ZA202 suppressed in test block via analyzeErrors" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -20234,7 +20247,7 @@ test "ZA202 suppressed in test block via analyzeErrors" {
 }
 
 test "ZA203 suppressed in test block via analyzeErrors" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -20265,7 +20278,7 @@ test "ZA203 suppressed in test block via analyzeErrors" {
 }
 
 test "ZA202 still fires outside test block" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -20434,7 +20447,7 @@ test "branchLimit applies 8x for data dispatch" {
 }
 
 test "ZA304 suppressed for fromJson with many branches" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

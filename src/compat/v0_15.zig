@@ -1101,8 +1101,8 @@ pub fn arrayListDeinit(
 }
 
 /// Create a test allocator with leak detection
-pub fn createTestAllocator() std.heap.GeneralPurposeAllocator(.{}) {
-    return std.heap.GeneralPurposeAllocator(.{}){};
+pub fn createTestAllocator() std.heap.DebugAllocator(.{}) {
+    return std.heap.DebugAllocator(.{}){};
 }
 
 // ============================================================================
@@ -1143,7 +1143,7 @@ test "checkDeprecated finds deprecated patterns" {
 }
 
 test "HashMapPut works with StringHashMap" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -1155,11 +1155,11 @@ test "HashMapPut works with StringHashMap" {
 }
 
 test "ArrayListAppend works with ArrayListUnmanaged" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var list: std.ArrayListUnmanaged(u32) = .{};
+    var list: std.ArrayListUnmanaged(u32) = .empty;
     defer arrayListDeinit(u32, &list, allocator);
 
     try arrayListAppend(u32, &list, allocator, 42);

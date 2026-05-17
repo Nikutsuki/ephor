@@ -1095,8 +1095,8 @@ pub fn arrayListDeinit(
 }
 
 /// Create a test allocator with leak detection
-pub fn createTestAllocator() std.heap.GeneralPurposeAllocator(.{}) {
-    return std.heap.GeneralPurposeAllocator(.{}){};
+pub fn createTestAllocator() std.heap.DebugAllocator(.{}) {
+    return std.heap.DebugAllocator(.{}){};
 }
 
 // ============================================================================

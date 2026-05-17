@@ -40,16 +40,38 @@ ZONEOF
     echo "Created build.zig.zon for project '${PROJECT_NAME}'"
 fi
 
-# Fetch latest tagged version from Bitbucket tags API (not cached raw files)
-TAGS_API="https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1"
-LATEST_TAG=$(curl -sL "$TAGS_API" | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
+# Detect Zig version and pick compatible ephor version
+ZIG_VERSION=$(zig version 2>/dev/null || echo "")
+if [ -n "$ZIG_VERSION" ]; then
+    ZIG_MAJOR=$(echo "$ZIG_VERSION" | cut -d. -f1)
+    ZIG_MINOR=$(echo "$ZIG_VERSION" | cut -d. -f2)
+    # Zig 0.16.0+ → ephor 0.12.x; Zig 0.15.x → ephor 0.11.13
+    if [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
+        EPHOR_TAG="v0.12.1"
+    else
+        EPHOR_TAG="v0.11.13"
+    fi
+else
+    echo "warning: could not detect zig version, defaulting to latest"
+    # Fetch latest tagged version from Bitbucket tags API
+    TAGS_API="https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1"
+    LATEST_TAG=$(curl -sL "$TAGS_API" | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
+    EPHOR_TAG="v${LATEST_TAG}"
+fi
 
-if [ -z "$LATEST_TAG" ]; then
-    echo "warning: could not detect latest version, using main branch"
+# Detect if this is an upgrade or fresh install
+if grep -q 'dependency("ephor"' build.zig 2>/dev/null || grep -q '"ephor"' build.zig.zon 2>/dev/null; then
+    ACTION="Upgrading"
+else
+    ACTION="Installing"
+fi
+
+if [ -z "$EPHOR_TAG" ] || [ "$EPHOR_TAG" = "v" ]; then
+    echo "warning: could not detect ephor version, using main branch"
     EPHOR_URL="${REPO}/get/main.tar.gz"
 else
-    echo "Installing ephor v${LATEST_TAG}..."
-    EPHOR_URL="${REPO}/get/v${LATEST_TAG}.tar.gz"
+    echo "${ACTION} ephor ${EPHOR_TAG} (Zig ${ZIG_VERSION})..."
+    EPHOR_URL="${REPO}/get/${EPHOR_TAG}.tar.gz"
 fi
 
 echo "Adding ephor dependency..."
@@ -85,6 +107,18 @@ if grep -q '// Ephor static analysis' build.zig; then
         mv build.zig.tmp build.zig
         echo "Updated ephor build steps in build.zig"
     fi
+elif grep -q '=== Ephor Static Analysis ===' build.zig; then
+    # Old v0.11.x snippet - replace with canonical block
+    START_LINE=$(grep -n '=== Ephor Static Analysis ===' build.zig | head -1 | cut -d: -f1)
+    END_LINE=$(grep -n 'ephor_step\.dependOn(&b.addRunArtifact(ephor_exe).step);' build.zig | head -1 | cut -d: -f1)
+
+    if [ -n "$START_LINE" ] && [ -n "$END_LINE" ]; then
+        head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
+        echo "$EPHOR_BLOCK" >> build.zig.tmp
+        tail -n +"$((END_LINE + 1))" build.zig >> build.zig.tmp
+        mv build.zig.tmp build.zig
+        echo "Updated ephor build steps in build.zig (migrated from v0.11.x snippet)"
+    fi
 elif grep -q 'dependency("ephor"' build.zig; then
     # Has dependency but non-standard block layout - leave it, warn user
     echo "warning: ephor dependency found but build steps have non-standard layout"
@@ -108,7 +142,7 @@ else
 fi
 
 echo ""
-echo "Done! Run static analysis with:"
-echo "  zig build ephor              (run all checks)"
-echo "  zig build ephor -- init      (create ephor.json config)"
+echo "Done!"
+echo ""
+echo "  zig build ephor              (run static analysis)"
 echo "  zig build ephor-upgrade      (upgrade to latest version)"

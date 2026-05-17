@@ -42,19 +42,22 @@ That's it.
 
 ### Upgrading
 
-```bash
-zig build ephor-upgrade
-```
-
-This updates the dependency, `ephor.json`, and `build.zig` integration in one step.
-
-Alternatively, re-run the install script to update everything:
+One command — same as install:
 
 ```bash
 curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
 ```
 
-With the standalone CLI: `ephor upgrade` or `ephor upgrade --version=0.11.13`
+The script detects if ephor is already present and upgrades it in place:
+- Updates the dependency in `build.zig.zon`
+- Replaces the `build.zig` integration block (handles both old v0.11.x and current formats)
+- Creates/updates `ephor.json`
+
+If you already have the `ephor-upgrade` step in `build.zig`:
+
+```bash
+zig build ephor-upgrade
+```
 
 ### Version Management
 
@@ -68,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.11.13.tar.gz
+zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.12.1.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -155,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.11.13",
+  "version": "0.12.1",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -633,8 +636,8 @@ src/memory.zig:45:1: error[ZR101]: memory leak detected at runtime
 ## Compatibility
 
 **Supported Zig Versions:**
-- Zig 0.15.x (current)
-- Zig 0.16.x (when released)
+- Zig 0.16.x (current)
+- Zig 0.15.x
 
 ### Version Compatibility System
 
@@ -908,6 +911,25 @@ Ephor uses three testing layers:
 **4. Corpus validation** (3000+ community Zig projects):
 - Dogfood: `ephor check src/` → zero issues
 - Community baseline regression testing against key projects
+
+## Changelog
+
+### v0.12.1 — Upgrade Path Fix
+
+**Fixed:** `ephor upgrade` (and `zig build ephor-upgrade`) now correctly detects and replaces the old v0.11.x `EPHOR_BUILD_SNIPPET` marker (`// === Ephor Static Analysis ===`) in `build.zig`.
+
+**Before this fix:** Projects installed with ephor v0.11.x could not have their `build.zig` updated to include the `ephor-upgrade` step when upgrading to v0.12.0. The upgrade appeared to succeed (dependency updated in `build.zig.zon`) but `build.zig` was silently left in the old state.
+
+**Impact:** If you installed ephor before v0.12.0 and your `build.zig` still uses `// === Ephor Static Analysis ===`, running `ephor upgrade` (or `zig build ephor-upgrade`) will now properly migrate your `build.zig` to the canonical block that includes both the `ephor` and `ephor-upgrade` steps.
+
+### v0.12.0 — Zig 0.16.0 Support
+
+- Added Zig 0.16.0 compatibility (`std.heap.GeneralPurposeAllocator` → `std.heap.DebugAllocator`, API changes)
+- Updated build integration block to include `ephor-upgrade` step
+
+### v0.11.13 — Performance
+
+- Cache resolved paths, eliminate O(N²) realpath storm
 
 ## License
 

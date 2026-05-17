@@ -939,6 +939,70 @@ Before this fix, the install script always fetched the latest ephor version rega
 
 - Cache resolved paths, eliminate O(N²) realpath storm
 
+## Testing Methodology
+
+Every ephor release is validated against four scenarios before tagging:
+
+### Test Matrix
+
+| Scenario | Zig Version | Starting State | Expected Result |
+|----------|-------------|----------------|-----------------|
+| Fresh install | 0.16.0 | No ephor | Installs v0.12.x, `zig build ephor` passes |
+| Fresh install | 0.15.2 | No ephor | Installs v0.11.13, `zig build ephor` passes |
+| Upgrade | 0.16.0 | v0.11.x snippet | Upgrades to v0.12.x, old snippet replaced with canonical block |
+| Upgrade | 0.15.2 | v0.11.x snippet | Upgrades to v0.11.13, old snippet replaced with canonical block |
+| Re-run | 0.16.0 | v0.12.x canonical | Idempotent — "up-to-date", no changes |
+
+### Running the Tests Locally
+
+```bash
+# 1. Build ephor from source
+cd /path/to/ephor
+git checkout main
+zig build -j1
+
+# 2. Create test projects with different Zig versions
+mkdir -p /tmp/test-ephor && cd /tmp/test-ephor
+
+# Zig 0.16.0 project
+mkdir fresh-0160 && cd fresh-0160
+zenv init --zig 0.16.0
+source .zenv/activate && zig init
+sh /path/to/ephor/install.sh
+zig build ephor
+
+# Zig 0.15.2 project  
+mkdir fresh-0152 && cd fresh-0152
+zenv init --zig 0.15.2
+source .zenv/activate && zig init
+sh /path/to/ephor/install.sh
+zig build ephor
+
+# Upgrade from v0.11.x (simulate old install)
+mkdir upgrade-0160 && cd upgrade-0160
+zenv init --zig 0.16.0
+source .zenv/activate && zig init
+# Manually inject old v0.11.x snippet into build.zig and build.zig.zon
+sh /path/to/ephor/install.sh
+zig build ephor
+```
+
+### What We Check
+
+1. **Install script output** — correct version detected for the Zig version
+2. **build.zig.zon** — dependency URL points to correct ephor version
+3. **build.zig** — canonical block present with both `ephor` and `ephor-upgrade` steps
+4. **`zig build ephor`** — compiles and runs without errors
+5. **`zig build ephor-upgrade`** — idempotent on already-up-to-date projects
+
+### CDN Cache Consideration
+
+Bitbucket raw file URLs (`/raw/main/install.sh`) are CDN-cached. After pushing a release, wait 2–3 minutes before testing the live `curl | sh` path, or add a cache-busting query parameter for immediate validation:
+
+```bash
+curl -fsSL "https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh?nocache=1" | sh
+```
+
 ## License
 
 MIT License - see [LICENSE](LICENSE)

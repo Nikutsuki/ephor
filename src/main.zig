@@ -8741,6 +8741,134 @@ fn checkFnNaming(
     }
 }
 
+/// Check error value (`error.MyError`) and error set member naming.
+/// Error values are not types; the style guide says "Otherwise, x should be snake_case."
+fn checkErrorNaming(
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    path: []const u8,
+    t: []const u8,
+    line_num: usize,
+    in_error_block: bool,
+) !void {
+    // 1. Check error values: error.MyError
+    var pos: usize = 0;
+    while (pos < t.len) {
+        const err_pos = mem.indexOfPos(u8, t, pos, "error.") orelse break;
+        // Ensure 'error.' is a standalone keyword, not part of a larger identifier
+        const at_start = err_pos == 0 or !isIdent(t[err_pos - 1]);
+        if (!at_start) {
+            pos = err_pos + 6;
+            continue;
+        }
+        // Skip if inside a string literal
+        if (isInsideString(t, err_pos)) {
+            pos = err_pos + 6;
+            continue;
+        }
+        // Extract identifier after 'error.'
+        var end = err_pos + 6;
+        while (end < t.len and isIdent(t[end])) end += 1;
+        if (end <= err_pos + 6) {
+            pos = err_pos + 6;
+            continue;
+        }
+        const name = t[err_pos + 6 .. end];
+        if (name.len > 0 and name[0] == '_') {
+            pos = end;
+            continue;
+        }
+        if (!isSnakeCase(name)) {
+            try reportNamingIssue(issues, allocator, .{
+                .path = path,
+                .line = line_num,
+                .col = err_pos + 7,
+                .kind = "error value",
+                .name = name,
+                .expected = "snake_case",
+            });
+        }
+        pos = end;
+    }
+
+    // 2. Check error set members inside error { ... }
+    if (!in_error_block) return;
+
+    // Find where the error set body starts on this line.
+    // For lines like `const E = error{ Foo, Bar }`, only check after `error{`.
+    // For continuation lines (no `error` keyword), check the whole line.
+    var scan_start: usize = 0;
+    var epos: usize = 0;
+    while (epos < t.len) {
+        const found = mem.indexOfPos(u8, t, epos, "error") orelse break;
+        const at_start = found == 0 or !isIdent(t[found - 1]);
+        if (at_start) {
+            var after = found + 5;
+            while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+            if (after < t.len and t[after] == '{') {
+                scan_start = after + 1;
+                break;
+            }
+        }
+        epos = found + 5;
+    }
+
+    var i: usize = scan_start;
+    while (i < t.len) {
+        // Skip whitespace
+        while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+        if (i >= t.len) break;
+
+        // Skip braces (opening/closing)
+        if (t[i] == '{' or t[i] == '}') {
+            i += 1;
+            continue;
+        }
+
+        // Skip comments
+        if (t[i] == '/' and i + 1 < t.len and t[i + 1] == '/') break;
+
+        // Skip string literals (simplified: anything starting with ")
+        if (t[i] == '"') {
+            i += 1;
+            while (i < t.len and t[i] != '"') {
+                if (t[i] == '\\' and i + 1 < t.len) i += 1;
+                i += 1;
+            }
+            if (i < t.len) i += 1;
+            continue;
+        }
+
+        // Extract identifier
+        const start = i;
+        while (i < t.len and isIdent(t[i])) i += 1;
+        if (i <= start) {
+            i += 1;
+            continue;
+        }
+        const name = t[start..i];
+        if (name.len > 0 and name[0] == '_') {
+            // skip optional trailing comma
+            while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+            if (i < t.len and t[i] == ',') i += 1;
+            continue;
+        }
+        if (!isSnakeCase(name)) {
+            try reportNamingIssue(issues, allocator, .{
+                .path = path,
+                .line = line_num,
+                .col = start + 1,
+                .kind = "error set member",
+                .name = name,
+                .expected = "snake_case",
+            });
+        }
+        // skip optional trailing comma
+        while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+        if (i < t.len and t[i] == ',') i += 1;
+    }
+}
+
 fn analyzeNaming(
     allocator: Allocator,
     graph: *ImportGraph,
@@ -8753,6 +8881,7 @@ fn analyzeNaming(
         const content = a.content;
         var line_num: usize = 1;
         var line_start: usize = 0;
+        var error_block_depth: usize = 0;
 
         while (line_start <= content.len) {
             const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
@@ -8763,6 +8892,25 @@ fn analyzeNaming(
             const t = mem.trim(u8, line, " \t\r");
             const t_start = line_start + lead;
 
+            // Determine if this line is inside an error block.
+            // We are inside if we were already inside one, OR if this line opens one.
+            var has_error_open = false;
+            var pos: usize = 0;
+            while (pos < t.len) {
+                const found = mem.indexOfPos(u8, t, pos, "error") orelse break;
+                const at_start = found == 0 or !isIdent(t[found - 1]);
+                if (at_start) {
+                    var after = found + 5;
+                    while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+                    if (after < t.len and t[after] == '{') {
+                        has_error_open = true;
+                        break;
+                    }
+                }
+                pos = found + 5;
+            }
+            const in_error_block = error_block_depth > 0 or has_error_open;
+
             if (!isCommentOrMultilineString(t)) {
                 if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
                     try checkConstNaming(&issues, allocator, a.path, t, line_num, content, t_start);
@@ -8770,6 +8918,31 @@ fn analyzeNaming(
                     try checkVarNaming(&issues, allocator, a.path, t, line_num);
                 if (mem.indexOf(u8, t, "fn ") != null)
                     try checkFnNaming(&issues, allocator, a.path, t, line_num);
+                try checkErrorNaming(&issues, allocator, a.path, t, line_num, in_error_block);
+            }
+
+            // Update error block depth for subsequent lines.
+            var i: usize = 0;
+            while (i < t.len) {
+                if (i + 5 <= t.len and mem.eql(u8, t[i .. i + 5], "error")) {
+                    const at_start = i == 0 or !isIdent(t[i - 1]);
+                    if (at_start) {
+                        var after = i + 5;
+                        while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+                        if (after < t.len and t[after] == '{') {
+                            error_block_depth += 1;
+                            i = after + 1;
+                            continue;
+                        }
+                    }
+                }
+                if (error_block_depth > 0) {
+                    if (t[i] == '{') error_block_depth += 1;
+                    if (t[i] == '}') {
+                        if (error_block_depth > 0) error_block_depth -= 1;
+                    }
+                }
+                i += 1;
             }
 
             if (newline == content.len) break;
@@ -17828,6 +18001,86 @@ test "extractMethodCall extracts receiver and method" {
 test "extractMethodCall returns null for non-method calls" {
     try std.testing.expect(extractMethodCall("_ = someFunction()") == null);
     try std.testing.expect(extractMethodCall("const x = 42;") == null);
+}
+
+// ============================================================================
+// ZA703 Error Naming Tests
+// ============================================================================
+
+test "checkErrorNaming: snake_case error values pass" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(&issues, a, "test.zig", "return error.file_not_found;", 1, false);
+    try checkErrorNaming(&issues, a, "test.zig", "return error.out_of_memory;", 1, false);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkErrorNaming: CamelCase error values are flagged" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(&issues, a, "test.zig", "return error.FileNotFound;", 1, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("error value 'FileNotFound' should be snake_case", issues.items[0].message);
+}
+
+test "checkErrorNaming: error set members must be snake_case" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // Single-line error set
+    try checkErrorNaming(&issues, a, "test.zig", "error{ FileNotFound, access_denied }", 1, true);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("error set member 'FileNotFound' should be snake_case", issues.items[0].message);
+}
+
+test "checkErrorNaming: underscore-prefixed error names are exempt" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(&issues, a, "test.zig", "error{ _FileNotFound, _internal }", 1, true);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkErrorNaming: does not flag someerror.foo as error value" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(&issues, a, "test.zig", "const x = someerror.foo;", 1, false);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkErrorNaming: does not flag error. inside string literal" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(&issues, a, "test.zig", "const msg = \"error.FileNotFound\";", 1, false);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 test "resolveReturnKind resolves struct method returns" {

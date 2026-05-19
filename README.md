@@ -267,6 +267,8 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | Constants (`const`) | `snake_case` | `const max_size = 1024;` |
 | Type aliases (`const`) | `TitleCase` | `const Allocator = std.mem.Allocator;` |
 | Function aliases (`const`) | `camelCase` | `const eql = std.mem.eql;` |
+| Error values (`error.foo`) | `snake_case` | `return error.file_not_found;` |
+| Error set members | `snake_case` | `error{ file_not_found }` |
 | Imports | (not checked) | `const std = @import("std");` |
 | Names starting with `_` | (exempt) | `fn _helper() void {}` |
 

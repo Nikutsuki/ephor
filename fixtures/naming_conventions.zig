@@ -127,3 +127,54 @@ var myCallback: fn () u32 = getValue;
 
 // Function pointer should be camelCase, not snake_case
 var my_callback: fn () u32 = getValue;
+
+// ============================================================================
+// VALID: Error values → snake_case (should NOT warn)
+// ============================================================================
+
+fn returnGoodError() !void {
+    return error.file_not_found;
+}
+
+fn returnGoodError2() !void {
+    return error.out_of_memory;
+}
+
+const GoodErrorSet = error{
+    file_not_found,
+    access_denied,
+    out_of_memory,
+};
+
+// ============================================================================
+// BAD: Error values with CamelCase (SHOULD warn)
+// ============================================================================
+
+fn returnBadError() !void {
+    return error.FileNotFound;
+}
+
+fn returnBadError2() !void {
+    return error.OutOfMemory;
+}
+
+// ============================================================================
+// BAD: Error set members with CamelCase (SHOULD warn)
+// ============================================================================
+
+const BadErrorSet = error{
+    FileNotFound,
+    AccessDenied,
+};
+
+// Single-line error set
+const BadErrorSetInline = error{ FileNotFound, AccessDenied };
+
+// ============================================================================
+// VALID: Underscore-prefixed error names are exempt
+// ============================================================================
+
+const ExemptErrors = error{
+    _internal_error,
+    _FileNotFound,
+};

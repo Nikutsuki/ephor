@@ -5,9 +5,9 @@
 
 .{
     .name = .ephor,
-    .version = "0.12.2",
+    .version = "0.12.3",
     .fingerprint = 0xe665525c8b28e1a7,
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

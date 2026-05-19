@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.12.1.tar.gz
+zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.12.3.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.12.1",
+  "version": "0.12.3",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -638,18 +638,18 @@ src/memory.zig:45:1: error[ZR101]: memory leak detected at runtime
 ## Compatibility
 
 **Supported Zig Versions:**
-- Zig 0.16.x (current)
-- Zig 0.15.x
+- Zig 0.16.x (current) — **required minimum**
+
+Ephor v0.12.3+ requires Zig 0.16.0 or later. Earlier ephor versions (v0.11.x) support Zig 0.15.x.
 
 ### Version Compatibility System
 
-Ephor uses a modular compatibility layer to support multiple Zig versions. The system is designed for easy extension:
+Ephor uses a modular compatibility layer to support Zig 0.16.x API patterns. The system is designed for easy extension as new Zig versions are released:
 
 ```
 src/compat/
 ├── compat.zig     # Main module: version detection, registry
-├── v0_15.zig      # Zig 0.15.x specific implementations
-└── v0_16.zig      # Zig 0.16.x specific implementations (placeholder)
+└── v0_16.zig      # Zig 0.16.x specific implementations
 ```
 
 **Adding support for a new Zig version:**
@@ -659,7 +659,7 @@ src/compat/
 3. Add import to `compat.zig`
 4. Register in `version_registry`
 
-Each version module exports consistent wrapper functions that handle API differences between Zig versions (e.g., HashMap.put signature changes).
+Each version module exports consistent wrapper functions that handle API differences between Zig versions (e.g., `std.process.Init` main signature changes).
 
 ## Technical: How Detection Works
 
@@ -915,6 +915,18 @@ Ephor uses three testing layers:
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.12.3 — Error Naming Enforcement (ZA703)
+
+**Added:** ZA703 now enforces `snake_case` for error values and error set members.
+
+- Error values: `error.file_not_found` (was silently allowed as `error.FileNotFound`)
+- Error set members: `error{ file_not_found }` (was silently allowed as `error{ FileNotFound }`)
+- Error set type aliases (the `const` binding) remain `TitleCase` since they are types
+
+Per the [Zig Style Guide](https://ziglang.org/documentation/master/#Names): "Otherwise, x should be snake_case." Error values are values, not types, so they fall under the "Otherwise" rule. The std lib's `PascalCase` errors are grandfathered, not normative.
+
+**Changed:** Minimum Zig version bumped to `0.16.0`.
 
 ### v0.12.2 — Zig Version-Aware Install
 

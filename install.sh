@@ -1,10 +1,10 @@
 #!/bin/sh
 # Ephor installer - adds ephor to your Zig project
-# Usage: curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
+# Usage: curl -fsSL https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.sh | sh
 
 set -e
 
-REPO="https://bitbucket.org/rhyoslabs/ephor"
+REPO="https://codeberg.org/RhyosLabs/ephor"
 
 # Check we're in a Zig project
 if [ ! -f "build.zig" ]; then
@@ -53,8 +53,8 @@ if [ -n "$ZIG_VERSION" ]; then
     fi
 else
     echo "warning: could not detect zig version, defaulting to latest"
-    # Fetch latest tagged version from Bitbucket tags API
-    TAGS_API="https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1"
+    # Fetch latest tagged version from Codeberg tags API
+    TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
     LATEST_TAG=$(curl -sL "$TAGS_API" | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
     EPHOR_TAG="v${LATEST_TAG}"
 fi
@@ -68,10 +68,10 @@ fi
 
 if [ -z "$EPHOR_TAG" ] || [ "$EPHOR_TAG" = "v" ]; then
     echo "warning: could not detect ephor version, using main branch"
-    EPHOR_URL="${REPO}/get/main.tar.gz"
+    EPHOR_URL="${REPO}/archive/main.tar.gz"
 else
     echo "${ACTION} ephor ${EPHOR_TAG} (Zig ${ZIG_VERSION})..."
-    EPHOR_URL="${REPO}/get/${EPHOR_TAG}.tar.gz"
+    EPHOR_URL="${REPO}/archive/${EPHOR_TAG}.tar.gz"
 fi
 
 echo "Adding ephor dependency..."

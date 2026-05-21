@@ -13317,14 +13317,14 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
 }
 
 /// Base URL for ephor repository (used to construct versioned package URLs)
-const EPHOR_REPO_BASE = "https://bitbucket.org/rhyoslabs/ephor";
+const EPHOR_REPO_BASE = "https://codeberg.org/RhyosLabs/ephor";
 
 /// Build a versioned package URL for install/upgrade.
 /// If version is null, defaults to EPHOR_VERSION (the binary's own version).
 /// Returns an allocated string that the caller must free.
 fn buildPackageUrl(allocator: Allocator, ver: ?[]const u8) ![]const u8 {
     const v = ver orelse EPHOR_VERSION;
-    return std.fmt.allocPrint(allocator, "{s}/get/v{s}.tar.gz", .{ EPHOR_REPO_BASE, v });
+    return std.fmt.allocPrint(allocator, "{s}/archive/v{s}.tar.gz", .{ EPHOR_REPO_BASE, v });
 }
 
 /// Code snippet to add to build.zig
@@ -13523,7 +13523,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
 /// If install_version is provided, upgrades to that specific version;
 /// otherwise defaults to the binary's own version (EPHOR_VERSION).
 fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
-    // If no explicit version, fetch the latest from Bitbucket tags API
+    // If no explicit version, fetch the latest from Codeberg tags API
     const fetched_ver = if (install_version == null) fetchLatestVersion(allocator) else null;
     defer if (fetched_ver) |fv| allocator.free(fv);
     const ver = install_version orelse (fetched_ver orelse EPHOR_VERSION);
@@ -13733,7 +13733,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 const EPHOR_VERSION = "0.12.3";
 
 /// URL to check for latest version
-const EPHOR_VERSION_URL = "https://bitbucket.org/rhyoslabs/ephor/raw/main/build.zig.zon";
+const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
 
 /// Stored update notification (printed after analysis output)
 var update_notification: ?[]const u8 = null;
@@ -13765,11 +13765,11 @@ fn checkForUpdates(allocator: Allocator) void {
     ) catch null;
 }
 
-/// Fetch latest version from the Bitbucket tags API (not cached raw files).
+/// Fetch latest version from the Codeberg tags API (not cached raw files).
 /// Falls back to parsing build.zig.zon from main branch if tags API fails.
 fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
     // Primary: use tags API (sorted by date, most recent first)
-    const api_url = "https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1";
+    const api_url = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1";
     const api_result = std.process.run(allocator, global_io.?, .{
         .argv = &.{ "curl", "-sL", "--max-time", "5", api_url },
     }) catch return fetchVersionFromZon(allocator);
@@ -13796,7 +13796,7 @@ fn fetchVersionFromZon(allocator: Allocator) ?[]const u8 {
     return parseVersionFromZon(allocator, result.stdout);
 }
 
-/// Parse version from Bitbucket tags API JSON response.
+/// Parse version from Codeberg tags API JSON response.
 /// Looks for `"name": "vX.Y.Z"` pattern.
 fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
     // Find "name": "vX.Y.Z" — the first match is the latest tag
@@ -14741,7 +14741,7 @@ fn printHelp() void {
         \\  ephor memory --disable=ZA102       # Disable specific rule
         \\  ephor check --enable=ZA702         # Enable specific rule
         \\
-        \\Ephor - Rhyos Labs - https://bitbucket.org/rhyoslabs/ephor
+        \\Ephor - Rhyos Labs - https://codeberg.org/RhyosLabs/ephor
         \\
     ;
     std.debug.print("{s}", .{help});

@@ -9,7 +9,7 @@
 #   2. src/main.zig          EPHOR_VERSION constant
 #   3. README.md             manual install URL (v*.tar.gz)
 #   4. README.md             example config "version" field
-#   5. Bitbucket tags API    latest remote tag matches
+#   5. Codeberg tags API     latest remote tag matches
 
 set -e
 
@@ -69,15 +69,15 @@ else
     echo "ok       README.md example config: ${README_CFG_VERSION}"
 fi
 
-# 5. Bitbucket tags API - latest remote tag
-TAGS_API="https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1"
+# 5. Codeberg tags API - latest remote tag
+TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
 REMOTE_TAG=$(curl -sL --max-time 5 "$TAGS_API" 2>/dev/null | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
 if [ -z "$REMOTE_TAG" ]; then
-    echo "SKIP     Bitbucket tags API: could not reach (offline?)"
+    echo "SKIP     Codeberg tags API: could not reach (offline?)"
 elif [ "$REMOTE_TAG" = "$EXPECTED" ]; then
-    echo "ok       Bitbucket latest tag: v${REMOTE_TAG}"
+    echo "ok       Codeberg latest tag: v${REMOTE_TAG}"
 else
-    echo "PENDING  Bitbucket latest tag: v${REMOTE_TAG} (will be v${EXPECTED} after push)"
+    echo "PENDING  Codeberg latest tag: v${REMOTE_TAG} (will be v${EXPECTED} after push)"
 fi
 
 echo ""

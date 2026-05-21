@@ -1,9 +1,9 @@
 # Ephor installer for Windows - adds ephor to your Zig project
-# Usage: irm https://bitbucket.org/rhyoslabs/ephor/raw/main/install.ps1 | iex
+# Usage: irm https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
-$REPO = "https://bitbucket.org/rhyoslabs/ephor"
+$REPO = "https://codeberg.org/RhyosLabs/ephor"
 
 # Check we're in a Zig project
 if (-not (Test-Path "build.zig")) {
@@ -43,8 +43,8 @@ if (-not (Test-Path "build.zig.zon")) {
     Write-Host "Created build.zig.zon for project '$projectName'"
 }
 
-# Fetch latest tagged version from Bitbucket tags API (not cached raw files)
-$TAGS_API = "https://api.bitbucket.org/2.0/repositories/rhyoslabs/ephor/refs/tags?sort=-target.date&pagelen=1"
+# Fetch latest tagged version from Codeberg tags API (not cached raw files)
+$TAGS_API = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
 try {
     $tagsJson = Invoke-RestMethod -Uri $TAGS_API -TimeoutSec 10
     $LATEST_TAG = $tagsJson.values[0].name -replace '^v', ''
@@ -54,10 +54,10 @@ try {
 
 if (-not $LATEST_TAG) {
     Write-Host "warning: could not detect latest version, using main branch"
-    $EPHOR_URL = "$REPO/get/main.tar.gz"
+    $EPHOR_URL = "$REPO/archive/main.tar.gz"
 } else {
     Write-Host "Installing ephor v$LATEST_TAG..."
-    $EPHOR_URL = "$REPO/get/v$LATEST_TAG.tar.gz"
+    $EPHOR_URL = "$REPO/archive/v$LATEST_TAG.tar.gz"
 }
 
 Write-Host "Adding ephor dependency..."

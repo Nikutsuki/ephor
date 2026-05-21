@@ -23,13 +23,13 @@
 **macOS / Linux:**
 ```bash
 cd /path/to/your-project
-curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
+curl -fsSL https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
 cd C:\path\to\your-project
-irm https://bitbucket.org/rhyoslabs/ephor/raw/main/install.ps1 | iex
+irm https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.ps1 | iex
 ```
 
 Then run:
@@ -45,7 +45,7 @@ That's it.
 One command — same as install:
 
 ```bash
-curl -fsSL https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh | sh
+curl -fsSL https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.sh | sh
 ```
 
 The script detects if ephor is already present and upgrades it in place:
@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://bitbucket.org/rhyoslabs/ephor/get/v0.12.3.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.12.3.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -1011,10 +1011,10 @@ zig build ephor
 
 ### CDN Cache Consideration
 
-Bitbucket raw file URLs (`/raw/main/install.sh`) are CDN-cached. After pushing a release, wait 2–3 minutes before testing the live `curl | sh` path, or add a cache-busting query parameter for immediate validation:
+Codeberg raw file URLs (`/raw/branch/main/install.sh`) are CDN-cached. After pushing a release, wait 2–3 minutes before testing the live `curl | sh` path, or add a cache-busting query parameter for immediate validation:
 
 ```bash
-curl -fsSL "https://bitbucket.org/rhyoslabs/ephor/raw/main/install.sh?nocache=1" | sh
+curl -fsSL "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.sh?nocache=1" | sh
 ```
 
 ## License
@@ -1023,7 +1023,7 @@ MIT License - see [LICENSE](LICENSE)
 
 ## Contributing
 
-Issues and pull requests welcome at [bitbucket.org/rhyoslabs/ephor](https://bitbucket.org/rhyoslabs/ephor)
+Issues and pull requests welcome at [codeberg.org/RhyosLabs/ephor](https://codeberg.org/RhyosLabs/ephor)
 
 ---
 

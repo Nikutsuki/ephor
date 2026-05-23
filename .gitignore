@@ -38,3 +38,4 @@ examples/leak_demo
 
 # zenv (venv-style per-project Zig toolchain + cache)
 .zenv/
+__pycache__/

@@ -97,6 +97,8 @@ const RULE_FUNC_TOO_LONG = types.RULE_FUNC_TOO_LONG;
 const RULE_NESTING_TOO_DEEP = types.RULE_NESTING_TOO_DEEP;
 const RULE_TOO_MANY_PARAMS = types.RULE_TOO_MANY_PARAMS;
 const RULE_TOO_MANY_BRANCHES = types.RULE_TOO_MANY_BRANCHES;
+const RULE_CYCLOMATIC = types.RULE_CYCLOMATIC;
+const RULE_COGNITIVE = types.RULE_COGNITIVE;
 const RULE_UNUSED_IMPORT = types.RULE_UNUSED_IMPORT;
 const RULE_UNUSED_CONST = types.RULE_UNUSED_CONST;
 const RULE_UNUSED_VAR = types.RULE_UNUSED_VAR;
@@ -8035,6 +8037,10 @@ const ComplexityState = struct {
     params: usize = 0,
     is_type_factory: bool = false,
     is_data_dispatch: bool = false,
+    cyclomatic: usize = 1,
+    cognitive: usize = 0,
+    cog_nest: usize = 0,
+    cog_markers: u32 = 0,
 };
 
 /// Count function parameters by counting colons at depth 1.
@@ -8081,6 +8087,71 @@ fn countLineBranches(t: []const u8) usize {
     if (hasNonInline(t, "for ", "inline for")) b += 1;
     if (mem.indexOf(u8, t, " catch ") != null) b += 1;
     return b;
+}
+
+/// Count cyclomatic complexity decision points per line (McCabe).
+/// CCN = sum of all decision points in a function + 1 (entry point).
+fn countLineCyclomatic(t: []const u8) usize {
+    var c: usize = 0;
+    // else if counts as 1 (not if+else separately)
+    if (mem.indexOf(u8, t, "else if") != null) {
+        c += 1;
+    } else {
+        if (mem.indexOf(u8, t, "if ") != null) c += 1;
+        // standalone else (not else if, not else =>, not part of orelse)
+        if (mem.indexOf(u8, t, "else ") != null and
+            mem.indexOf(u8, t, "else =>") == null and
+            mem.indexOf(u8, t, "orelse") == null) c += 1;
+    }
+    if (hasNonInline(t, "while ", "inline while")) c += 1;
+    if (hasNonInline(t, "for ", "inline for")) c += 1;
+    if (mem.indexOf(u8, t, "switch ") != null) c += 1;
+    if (mem.indexOf(u8, t, " catch ") != null) c += 1;
+    if (mem.indexOf(u8, t, "try ") != null) c += 1;
+    if (mem.indexOf(u8, t, "orelse") != null) c += 1;
+    if (mem.indexOf(u8, t, " and ") != null) c += 1;
+    if (mem.indexOf(u8, t, " or ") != null) c += 1;
+    return c;
+}
+
+/// Count cognitive complexity cost for a line based on current nesting level.
+fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
+    var cost: usize = 0;
+    // else if counts as 1, not as both if and else if
+    if (mem.indexOf(u8, t, "else if") != null) {
+        cost += 1 + cog_nest;
+    } else {
+        if (mem.indexOf(u8, t, "if ") != null) cost += 1 + cog_nest;
+    }
+    if (hasNonInline(t, "while ", "inline while")) cost += 1 + cog_nest;
+    if (hasNonInline(t, "for ", "inline for")) cost += 1 + cog_nest;
+    if (mem.indexOf(u8, t, "switch ") != null) cost += 1 + cog_nest;
+    if (mem.indexOf(u8, t, " catch ") != null) cost += 1 + cog_nest;
+    if (mem.indexOf(u8, t, "try ") != null) cost += 1 + cog_nest;
+    // else (not else if, not else =>, and not a substring of orelse)
+    if (mem.indexOf(u8, t, "else ") != null and
+        mem.indexOf(u8, t, "else if") == null and
+        mem.indexOf(u8, t, "else =>") == null and
+        mem.indexOf(u8, t, "orelse") == null)
+    {
+        cost += 1 + cog_nest;
+    }
+    // Secondary — no nesting impact
+    if (mem.indexOf(u8, t, "orelse") != null) cost += 1;
+    if (mem.indexOf(u8, t, " and ") != null) cost += 1;
+    if (mem.indexOf(u8, t, " or ") != null) cost += 1;
+    return cost;
+}
+
+/// Check if line opens a cognitive-nesting-increasing scope (has control keyword + {)
+fn opensCognitiveScope(t: []const u8) bool {
+    if (mem.indexOf(u8, t, "{") == null) return false;
+    return mem.indexOf(u8, t, "if ") != null or
+        mem.indexOf(u8, t, "switch ") != null or
+        mem.indexOf(u8, t, "while ") != null or
+        mem.indexOf(u8, t, "for ") != null or
+        mem.indexOf(u8, t, " catch ") != null or
+        mem.indexOf(u8, t, "try ") != null;
 }
 
 /// Calculate limit with type factory multiplier
@@ -8174,7 +8245,7 @@ const ComplexityCheck = struct {
 fn buildComplexityChecks(
     state: *const ComplexityState,
     th: Thresholds,
-) [4]ComplexityCheck {
+) [6]ComplexityCheck {
     const is_tf = state.is_type_factory;
     return .{
         .{
@@ -8204,6 +8275,20 @@ fn buildComplexityChecks(
             .limit = branchLimit(th.max_branches, is_tf, state.is_data_dispatch),
             .metric = "branches",
             .help = "simplify logic",
+        },
+        .{
+            .rule = RULE_CYCLOMATIC,
+            .actual = state.cyclomatic,
+            .limit = th.max_cyclomatic,
+            .metric = "cyclomatic complexity",
+            .help = "reduce decision points",
+        },
+        .{
+            .rule = RULE_COGNITIVE,
+            .actual = state.cognitive,
+            .limit = th.max_cognitive,
+            .metric = "cognitive complexity",
+            .help = "flatten or extract nested logic",
         },
     };
 }
@@ -8272,6 +8357,7 @@ fn detectFnStart(t: []const u8, state: *ComplexityState, line_num: usize) void {
         .is_data_dispatch = isDataDispatchFunction(name),
         .params = countFnParams(t),
         .fn_name = name,
+        .cyclomatic = 1,
     };
 }
 
@@ -8355,9 +8441,25 @@ fn analyzeFileComplexity(
         if (!state.in_fn) continue;
         state.fn_lines += 1;
         state.branches += countLineBranches(t);
+        state.cyclomatic += countLineCyclomatic(t);
+        state.cognitive += countLineCognitive(t, state.cog_nest);
+
+        // Track cognitive nesting: control structures open new scopes
+        const cog_before = state.cog_nest;
+        if (opensCognitiveScope(t)) {
+            state.cog_nest += 1;
+            if (state.nest < 32) state.cog_markers |= @as(u32, 1) << @intCast(state.nest);
+        }
         if (!trackBraceNesting(t, &state)) continue;
+
+        // Function ended — check if we need to unwind cognitive nesting
+        while (state.cog_nest > 0) state.cog_nest -= 1;
+        _ = cog_before;
+
         try reportComplexityIssues(issues, allocator, a.path, &state, th);
-        state = .{};
+        state = .{
+            .cyclomatic = 1,
+        };
     }
 }
 
@@ -12937,6 +13039,8 @@ fn setThresholdValue(th: *Thresholds, k: []const u8, num: usize) void {
     if (mem.eql(u8, k, "max_branches")) th.max_branches = num;
     if (mem.eql(u8, k, "max_line_length")) th.max_line_length = num;
     if (mem.eql(u8, k, "max_file_bytes")) th.max_file_bytes = num;
+    if (mem.eql(u8, k, "max_cyclomatic")) th.max_cyclomatic = num;
+    if (mem.eql(u8, k, "max_cognitive")) th.max_cognitive = num;
 }
 
 /// Parse threshold key-value pair
@@ -13114,7 +13218,8 @@ fn writeDefaultConfig() !void {
         \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer,
         \\  //                     ZA207 catch-undefined, ZA208 panic (note)
         \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
-        \\  //                     ZA303 too-many-params, ZA304 too-many-branches
+        \\  //                     ZA303 too-many-params, ZA304 too-many-branches,
+        \\  //                     ZA305 cyclomatic, ZA306 cognitive
         \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
         \\  //   ZA5xx Structure:  ZA501 orphan-file
         \\  //   ZA6xx Format:     ZA601 needs-format
@@ -13133,7 +13238,9 @@ fn writeDefaultConfig() !void {
         \\    "max_nesting": 3,
         \\    "max_params": 4,
         \\    "max_branches": 12,
-        \\    "max_line_length": 100
+        \\    "max_line_length": 100,
+        \\    "max_cyclomatic": 15,
+        \\    "max_cognitive": 15
         \\  }
         \\}
         \\
@@ -13296,7 +13403,9 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
             \\    "max_nesting": 3,
             \\    "max_params": 4,
             \\    "max_branches": 12,
-            \\    "max_line_length": 100
+            \\    "max_line_length": 100,
+            \\    "max_cyclomatic": 15,
+            \\    "max_cognitive": 15
             \\  }}
             \\}}
             \\
@@ -14692,6 +14801,8 @@ fn printHelp() void {
         \\      "max_params": 4,
         \\      "max_branches": 12,
         \\      "max_line_length": 100,
+        \\      "max_cyclomatic": 15,
+        \\      "max_cognitive": 15
         \\      "max_file_bytes": 50000
         \\    }
         \\  }
@@ -14713,7 +14824,8 @@ fn printHelp() void {
         \\  ZA9xx  Panic      (ZA901: decrement-no-guard, ZA902: subtraction-overflow,
         \\                     ZA903: index-arithmetic)
         \\  ZA3xx  Complexity (ZA301: func-too-long, ZA302: nesting-too-deep,
-        \\                     ZA303: too-many-params, ZA304: too-many-branches)
+        \\                     ZA303: too-many-params, ZA304: too-many-branches,
+        \\                     ZA305: cyclomatic, ZA306: cognitive)
         \\  ZA4xx  Unused     (ZA401: unused-import, ZA402: unused-const,
         \\                     ZA403: unused-var)
         \\  ZA5xx  Structure  (ZA501: orphan-file)
@@ -20884,4 +20996,394 @@ test "isCleanupMethodCall matches cleanup method names" {
 
 test "isStreamWriteCall matches writeSep pattern" {
     try std.testing.expect(isStreamWriteCall("ctr.writeSep(writer) catch {}"));
+}
+
+// ============================================================================
+// ZA305/ZA306 — Cyclomatic and Cognitive Complexity Tests
+// ============================================================================
+
+// --- Unit tests for helper functions ---
+
+test "countLineCyclomatic counts all decision points" {
+    // Control flow keywords
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("if (x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("} else if (y) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("} else {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("for (items) |item| {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("switch (x) {"));
+    // Error handling
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("try foo();"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("x catch |e| {"));
+    // Null coalescing and logical operators
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("const v = x orelse return;"));
+    try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a and b) {"));
+    try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a or b) {"));
+    // Multiple decision points on one line
+    try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a and b) |v| {"));
+    try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("try foo() catch |e| { return e; };"));
+    // No decision points
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("var x: u32 = 0;"));
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("_ = allocator;"));
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("return .{};"));
+    // Inline loops excluded (checked via hasNonInline)
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("inline for (fields) |f| {"));
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("inline while (cond) {"));
+}
+
+test "countLineCognitive weights by nesting and counts else/orelse" {
+    // Top level (nest=0): 1 cost each
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("if (x) {", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("while (true) {", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("for (items) |item| {", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("switch (x) {", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("try foo();", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x catch |e| {", 0));
+    // else costs 1 at current nest but doesn't increase nesting
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("} else {", 0));
+    // Nest level 3: 1 + 3 = 4
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("if (x) {", 3));
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("while (true) {", 3));
+    // orelse always costs 1 regardless of nesting
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 3));
+    // and/or always cost 1 regardless of nesting
+    try std.testing.expectEqual(@as(usize, 2), countLineCognitive("if (a and b) {", 0));
+    try std.testing.expectEqual(@as(usize, 7), countLineCognitive("if (a and b) {", 5));
+    // Non-branching lines cost 0
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("var x: u32 = 0;", 0));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("x += 1;", 3));
+}
+
+test "opensCognitiveScope detects control keyword + brace" {
+    try std.testing.expect(opensCognitiveScope("if (x) {"));
+    try std.testing.expect(opensCognitiveScope("while (true) {"));
+    try std.testing.expect(opensCognitiveScope("for (items) |item| {"));
+    try std.testing.expect(opensCognitiveScope("switch (x) {"));
+    try std.testing.expect(opensCognitiveScope("try foo() catch |e| {"));
+    try std.testing.expect(!opensCognitiveScope("var x: u32 = 0;"));
+    try std.testing.expect(!opensCognitiveScope("if (x) return;"));
+    try std.testing.expect(!opensCognitiveScope("} else {"));
+}
+
+// --- Integration tests with exact counts ---
+
+fn checkNoCyclomaticWarnings(issues: []const Issue, path: []const u8) !void {
+    for (issues) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC) and mem.eql(u8, issue.file, path)) {
+            std.debug.print("unexpected ZA305 for {s}: {s}\n", .{ path, issue.message });
+            return error.UnexpectedWarning;
+        }
+    }
+}
+
+fn checkNoCognitiveWarnings(issues: []const Issue, path: []const u8) !void {
+    for (issues) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, path)) {
+            std.debug.print("unexpected ZA306 for {s}: {s}\n", .{ path, issue.message });
+            return error.UnexpectedWarning;
+        }
+    }
+}
+
+test "ZA305: empty function has CCN 1, no warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const code = \\fn empty() void {}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "empty.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "empty.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+    try checkNoCyclomaticWarnings(issues.items, "empty.zig");
+    try checkNoCognitiveWarnings(issues.items, "empty.zig");
+}
+
+test "ZA305: 5-decision-point function no warning at default threshold" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 5 decision points (4 if + 1 while) → CCN = 6, below default 15
+    const code =
+        \\fn moderate(x: u32) u32 {
+        \\    if (x == 0) return 1;
+        \\    if (x == 1) return 2;
+        \\    if (x == 2) return 3;
+        \\    if (x == 3) return 4;
+        \\    var i: u32 = 0;
+        \\    while (i < 10) { i += 1; }
+        \\    return 0;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "moderate.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "moderate.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+    try checkNoCyclomaticWarnings(issues.items, "moderate.zig");
+}
+
+test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 20 flat if statements → CCN = 21, triggers at threshold 5
+    const code =
+        \\fn too_many(x: u32) u32 {
+        \\    if (x == 0) return 0;
+        \\    if (x == 1) return 1;
+        \\    if (x == 2) return 2;
+        \\    if (x == 3) return 3;
+        \\    if (x == 4) return 4;
+        \\    if (x == 5) return 5;
+        \\    if (x == 6) return 6;
+        \\    if (x == 7) return 7;
+        \\    if (x == 8) return 8;
+        \\    if (x == 9) return 9;
+        \\    if (x == 10) return 10;
+        \\    if (x == 11) return 11;
+        \\    if (x == 12) return 12;
+        \\    if (x == 13) return 13;
+        \\    if (x == 14) return 14;
+        \\    if (x == 15) return 15;
+        \\    if (x == 16) return 16;
+        \\    if (x == 17) return 17;
+        \\    if (x == 18) return 18;
+        \\    if (x == 19) return 19;
+        \\    return 0;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "too_many.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "too_many.zig"), {});
+
+    const th = Thresholds{ .max_cyclomatic = 5 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC) and mem.eql(u8, issue.file, "too_many.zig")) {
+            found = true;
+            try std.testing.expect(mem.containsAtLeast(u8, issue.message, 1, "cyclomatic complexity"));
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA306: flat branches have low cognitive, no warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 10 flat if-else at top level → cognitive = ~10 (below 15)
+    const code =
+        \\fn flat(x: u32) u32 {
+        \\    if (x == 0) return 1
+        \\    else if (x == 1) return 2
+        \\    else if (x == 2) return 3
+        \\    else if (x == 3) return 4
+        \\    else if (x == 4) return 5
+        \\    else if (x == 5) return 6
+        \\    else if (x == 6) return 7
+        \\    else if (x == 7) return 8
+        \\    else if (x == 8) return 9
+        \\    else return 0;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "flat.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "flat.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+    try checkNoCognitiveWarnings(issues.items, "flat.zig");
+}
+
+test "ZA306: nested structures produce higher cognitive than flat" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // while(nest1) > for(nest2) > if(nest3) > if(nest4)
+    // Cognitive: 1 + 2 + 3 + 4 = 10 (below 15, no warning)
+    const code =
+        \\fn deep(x: u32) void {
+        \\    while (true) {
+        \\        for (items) |item| {
+        \\            if (item == x) {
+        \\                if (x > 10) {
+        \\                    return;
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "deep.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "deep.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+    // Cognitive = 1+2+3+4 = 10, below 15
+    try checkNoCognitiveWarnings(issues.items, "deep.zig");
+}
+
+test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 5 levels of nesting → 1+2+3+4+5 = 15, at threshold
+    // 6 levels → 1+2+3+4+5+6 = 21, over threshold
+    const code =
+        \\fn very_deep(x: u32) void {
+        \\    if (x > 0) {
+        \\        if (x > 1) {
+        \\            if (x > 2) {
+        \\                if (x > 3) {
+        \\                    if (x > 4) {
+        \\                        if (x > 5) {
+        \\                            if (x > 6) {
+        \\                                return;
+        \\                            }
+        \\                        }
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "very_deep.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "very_deep.zig"), {});
+
+    const th = Thresholds{ .max_cognitive = 10 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "very_deep.zig")) {
+            found = true;
+            try std.testing.expect(mem.containsAtLeast(u8, issue.message, 1, "cognitive complexity"));
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA305: try and catch contribute to cyclomatic" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 3 try + 1 catch = 4 decision points, CCN = 5, below 15
+    const code =
+        \\fn load() !void {
+        \\    try open();
+        \\    try read();
+        \\    try write() catch |e| { return e; };
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "load.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "load.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+    try checkNoCyclomaticWarnings(issues.items, "load.zig");
+}
+
+test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 20 orelse chains → cyclomatic high, cognitive moderate
+    const code =
+        \\fn coalesce() u32 {
+        \\    const a = x orelse y orelse z orelse 0;
+        \\    const b = p orelse q orelse r orelse 0;
+        \\    const c = m orelse n orelse o orelse 0;
+        \\    const d = i orelse j orelse k orelse 0;
+        \\    const e = u orelse v orelse w orelse 0;
+        \\    return a + b + c + d + e;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "orelse.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "orelse.zig"), {});
+
+    const th = Thresholds{ .max_cyclomatic = 5, .max_cognitive = 4 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var found_cyclo = false;
+    var found_cog = false;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, "orelse.zig")) continue;
+        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC)) found_cyclo = true;
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) found_cog = true;
+    }
+    // orelse adds to cyclomatic (20 → triggers at threshold 10)
+    try std.testing.expect(found_cyclo);
+    // orelse costs 1 each regardless of nesting → 20 → triggers at threshold 5
+    try std.testing.expect(found_cog);
+}
+
+test "ZA305/ZA306: simple function has CCN=1 cognitive=0" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const code =
+        \\fn add(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "add.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "add.zig"), {});
+
+    // Low threshold to catch any false positive
+    const th = Thresholds{ .max_cyclomatic = 1, .max_cognitive = 0 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+    try checkNoCyclomaticWarnings(issues.items, "add.zig");
+    try checkNoCognitiveWarnings(issues.items, "add.zig");
 }

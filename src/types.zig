@@ -33,6 +33,8 @@ pub const RULE_FUNC_TOO_LONG = "ZA301";
 pub const RULE_NESTING_TOO_DEEP = "ZA302";
 pub const RULE_TOO_MANY_PARAMS = "ZA303";
 pub const RULE_TOO_MANY_BRANCHES = "ZA304";
+pub const RULE_CYCLOMATIC = "ZA305";
+pub const RULE_COGNITIVE = "ZA306";
 
 // ZA4xx - Unused
 pub const RULE_UNUSED_IMPORT = "ZA401";
@@ -196,6 +198,8 @@ pub const Thresholds = struct {
     max_branches: usize = 12,
     max_line_length: usize = 100,
     max_file_bytes: usize = 50_000,
+    max_cyclomatic: usize = 15,
+    max_cognitive: usize = 15,
 };
 
 pub const ProjectStats = struct {

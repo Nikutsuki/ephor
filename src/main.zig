@@ -14685,6 +14685,9 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
             cfg.command = c;
+        } else if (cmd.len > 0 and cmd[0] == '-') {
+            // First argument is a flag, not a path — parse it
+            try parseCliArg(allocator, cmd, &cfg, &cli_entries);
         } else {
             if (cfg.path_owned) allocator.free(cfg.path);
             cfg.path = try allocator.dupe(u8, cmd);

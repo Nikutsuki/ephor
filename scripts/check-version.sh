@@ -84,7 +84,7 @@ fi
 
 # 6. Codeberg tags API - latest remote tag
 TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
-REMOTE_TAG=$(curl -sL --max-time 5 "$TAGS_API" 2>/dev/null | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
+REMOTE_TAG=$(curl -sL --max-time 5 "$TAGS_API" 2>/dev/null | grep -o '"name"[[:space:]]*:[[:space:]]*"v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
 if [ -z "$REMOTE_TAG" ]; then
     echo "SKIP     Codeberg tags API: could not reach (offline?)"
 elif [ "$REMOTE_TAG" = "$EXPECTED" ]; then

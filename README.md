@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.12.7.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.12.8.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.12.7",
+  "version": "0.12.8",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -640,7 +640,7 @@ src/memory.zig:45:1: error[ZR101]: memory leak detected at runtime
 **Supported Zig Versions:**
 - Zig 0.16.x (current) — **required minimum**
 
-Ephor v0.12.3+ requires Zig 0.16.0 or later. Earlier ephor versions (v0.11.x) support Zig 0.15.x.
+Ephor v0.12.8+ requires Zig 0.16.0 or later. Earlier ephor versions (v0.11.x) support Zig 0.15.x.
 
 ### Version Compatibility System
 

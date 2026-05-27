@@ -9,7 +9,8 @@
 #   2. src/main.zig          EPHOR_VERSION constant
 #   3. README.md             manual install URL (v*.tar.gz)
 #   4. README.md             example config "version" field
-#   5. Codeberg tags API     latest remote tag matches
+#   5. install.sh            EPHOR_TAG
+#   6. Codeberg tags API     latest remote tag matches
 
 set -e
 
@@ -46,7 +47,7 @@ else
 fi
 
 # 3. README.md install URL
-README_URL_VERSION=$(grep 'ephor/get/v' README.md | head -1 | sed 's/.*\/v\([0-9][0-9.]*\)\.tar\.gz.*/\1/')
+README_URL_VERSION=$(grep 'ephor/archive/v' README.md | head -1 | sed 's/.*\/v\([0-9][0-9.]*\)\.tar\.gz.*/\1/')
 if [ -z "$README_URL_VERSION" ]; then
     echo "MISSING  README.md: no tagged install URL found"
     ERRORS=$((ERRORS + 1))
@@ -69,7 +70,19 @@ else
     echo "ok       README.md example config: ${README_CFG_VERSION}"
 fi
 
-# 5. Codeberg tags API - latest remote tag
+# 5. install.sh EPHOR_TAG
+INSTALL_VERSION=$(grep 'EPHOR_TAG=' install.sh | head -1 | sed 's/.*"v\([0-9][0-9.]*\)".*/\1/')
+if [ -z "$INSTALL_VERSION" ]; then
+    echo "MISSING  install.sh: EPHOR_TAG not found"
+    ERRORS=$((ERRORS + 1))
+elif [ "$INSTALL_VERSION" != "$EXPECTED" ]; then
+    echo "MISMATCH install.sh EPHOR_TAG: v${INSTALL_VERSION} (expected v${EXPECTED})"
+    ERRORS=$((ERRORS + 1))
+else
+    echo "ok       install.sh EPHOR_TAG: v${INSTALL_VERSION}"
+fi
+
+# 6. Codeberg tags API - latest remote tag
 TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
 REMOTE_TAG=$(curl -sL --max-time 5 "$TAGS_API" 2>/dev/null | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
 if [ -z "$REMOTE_TAG" ]; then

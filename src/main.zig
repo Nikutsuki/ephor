@@ -13731,6 +13731,74 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
     , .{ver});
 }
 
+/// Ensure the "thresholds" object has max_cyclomatic and max_cognitive keys.
+/// Only adds missing keys — never modifies existing values or the "disable" array.
+/// Returns new content if migration was needed, null otherwise.
+fn migrateThresholds(allocator: Allocator, content: []const u8) ?[]const u8 {
+    const thresholds_key = "\"thresholds\"";
+    const key_pos = mem.indexOf(u8, content, thresholds_key) orelse return null;
+
+    // Find the opening '{' of the thresholds object
+    var brace_start = key_pos + thresholds_key.len;
+    while (brace_start < content.len and content[brace_start] != '{') brace_start += 1;
+    if (brace_start >= content.len) return null;
+
+    // Find the matching closing '}' (thresholds object is flat, no nesting)
+    var brace_end = brace_start + 1;
+    while (brace_end < content.len and content[brace_end] != '}') brace_end += 1;
+    if (brace_end >= content.len) return null;
+
+    const thresholds_body = content[brace_start + 1 .. brace_end];
+
+    // Check which keys are missing
+    const has_cyclo = mem.indexOf(u8, thresholds_body, "\"max_cyclomatic\"") != null;
+    const has_cog = mem.indexOf(u8, thresholds_body, "\"max_cognitive\"") != null;
+
+    if (has_cyclo and has_cog) return null;
+
+    // Determine indentation used for the closing brace
+    var indent_end = brace_end;
+    while (indent_end > 0 and content[indent_end - 1] == ' ') indent_end -= 1;
+    const close_indent = content[indent_end..brace_end];
+    const entry_indent = std.fmt.allocPrint(allocator, "{s}  ", .{close_indent}) catch return null;
+    defer allocator.free(entry_indent);
+
+    // Find the last non-whitespace character before the closing brace
+    var last_end = indent_end;
+    while (last_end > brace_start + 1 and std.ascii.isWhitespace(content[last_end - 1])) last_end -= 1;
+
+    const needs_comma = last_end > brace_start + 1 and content[last_end - 1] != ',';
+
+    // Build insertion string for missing keys
+    var insert_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer insert_buf.deinit(allocator);
+
+    if (needs_comma) insert_buf.append(allocator, ',') catch return null;
+    insert_buf.append(allocator, '\n') catch return null;
+
+    if (!has_cyclo) {
+        insert_buf.appendSlice(allocator, entry_indent) catch return null;
+        insert_buf.appendSlice(allocator, "\"max_cyclomatic\": 15") catch return null;
+        if (!has_cog) {
+            insert_buf.append(allocator, ',') catch return null;
+            insert_buf.append(allocator, '\n') catch return null;
+        }
+    }
+
+    if (!has_cog) {
+        insert_buf.appendSlice(allocator, entry_indent) catch return null;
+        insert_buf.appendSlice(allocator, "\"max_cognitive\": 15") catch return null;
+    }
+
+    // Insert after the last existing entry, then restore closing brace indentation
+    return std.fmt.allocPrint(allocator, "{s}{s}\n{s}{s}", .{
+        content[0..last_end],
+        insert_buf.items,
+        close_indent,
+        content[brace_end..],
+    }) catch null;
+}
+
 /// Update the "version" field in ephor.json if the file exists.
 /// Best-effort: silently does nothing if file is missing or cannot be updated.
 fn updateConfigVersion(allocator: Allocator, ver: []const u8) void {
@@ -13741,10 +13809,17 @@ fn updateConfigVersion(allocator: Allocator, ver: []const u8) void {
     ) catch return;
     defer allocator.free(content);
 
-    const new_content = buildVersionUpdatedConfig(allocator, content, ver) orelse return;
-    defer allocator.free(new_content);
+    var versioned = buildVersionUpdatedConfig(allocator, content, ver) orelse return;
 
-    writeConfigFile(new_content) catch return;
+    // Apply config migration (ensure thresholds have max_cyclomatic/max_cognitive)
+    const final = migrateThresholds(allocator, versioned);
+    if (final) |migrated| {
+        allocator.free(versioned);
+        versioned = migrated;
+    }
+    defer allocator.free(versioned);
+
+    writeConfigFile(versioned) catch return;
     std.debug.print("Updated {s} (version: {s})\n", .{ CONFIG_FILENAME, ver });
 }
 
@@ -14840,7 +14915,7 @@ fn printHelp() void {
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
-        \\    "disable": ["ZA301"],
+        \\    "disable": ["ZA305", "ZA306"],
         \\    "enable": ["ZA702"],
         \\    "thresholds": {
         \\      "max_lines": 50,

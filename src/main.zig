@@ -13392,81 +13392,81 @@ fn collectInstallEntries(
 }
 
 /// Create ephor.json during install with auto-detected path_dir and entries.
-/// Returns the detected path_dir string (static, not owned) for display.
-fn createInstallConfig(allocator: Allocator, ver: []const u8) ![]const u8 {
-    // Don't overwrite existing config
-    fs.cwd().access(CONFIG_FILENAME, .{}) catch {
-        // File doesn't exist - create it
-        const root_dir = detectPathDirFromBuildZig(allocator);
-        var entries = try collectInstallEntries(allocator, root_dir);
-        defer {
-            for (entries.items) |e| allocator.free(e);
-            entries.deinit(allocator);
-        }
+/// Best-effort: prints a message but does not fail the install if config cannot be created.
+fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
+    if (fs.cwd().access(CONFIG_FILENAME, .{})) {
+        // Config already exists - update version if needed
+        updateConfigVersion(allocator, ver);
+        std.debug.print("{s} already exists (skipped)\n", .{CONFIG_FILENAME});
+        return;
+    } else |_| {}
 
-        // Build entries JSON array string
-        var entries_json: std.ArrayListUnmanaged(u8) = .empty;
-        defer entries_json.deinit(allocator);
-        try entries_json.append(allocator, '[');
-        for (entries.items, 0..) |entry, i| {
-            if (i > 0) try entries_json.appendSlice(allocator, ", ");
-            try entries_json.append(allocator, '"');
-            try entries_json.appendSlice(allocator, entry);
-            try entries_json.append(allocator, '"');
-        }
-        try entries_json.append(allocator, ']');
+    // File doesn't exist - create it
+    const root_dir = detectPathDirFromBuildZig(allocator);
+    defer allocator.free(root_dir);
+    var entries = try collectInstallEntries(allocator, root_dir);
+    defer {
+        for (entries.items) |e| allocator.free(e);
+        entries.deinit(allocator);
+    }
 
-        // Write config with version field
-        const config_content = try std.fmt.allocPrint(allocator,
-            \\{{
-            \\  // Installed ephor version
-            \\  "version": "{s}",
-            \\
-            \\  // Directory to analyze - auto-detected from build.zig
-            \\  // (e.g., "src", "lib", "app", or "." for project root)
-            \\  "path_dir": "{s}",
-            \\
-            \\  // Entry points for import graph analysis (orphan detection)
-            \\  "entries": {s},
-            \\
-            \\  // Directories to exclude from analysis
-            \\  "exclude": ["test", "vendor", "third_party"],
-            \\
-            \\  // Patterns to exclude from orphan detection only
-            \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
-            \\
-            \\  // Rules to disable (by ID or category prefix)
-            \\  "disable": [],
-            \\
-            \\  // Rules to explicitly enable (overrides disable)
-            \\  "enable": [],
-            \\
-            \\  // Configurable thresholds
-            \\  "thresholds": {{
-            \\    "max_lines": 50,
-            \\    "max_nesting": 3,
-            \\    "max_params": 4,
-            \\    "max_branches": 12,
-            \\    "max_line_length": 100,
-            \\    "max_cyclomatic": 15,
-            \\    "max_cognitive": 15
-            \\  }}
-            \\}}
-            \\
-        , .{ ver, root_dir, entries_json.items });
-        defer allocator.free(config_content);
+    // Build entries JSON array string
+    var entries_json: std.ArrayListUnmanaged(u8) = .empty;
+    defer entries_json.deinit(allocator);
+    try entries_json.append(allocator, '[');
+    for (entries.items, 0..) |entry, i| {
+        if (i > 0) try entries_json.appendSlice(allocator, ", ");
+        try entries_json.append(allocator, '"');
+        try entries_json.appendSlice(allocator, entry);
+        try entries_json.append(allocator, '"');
+    }
+    try entries_json.append(allocator, ']');
 
-        try fs.cwd().writeFile(CONFIG_FILENAME, config_content, .{});
+    // Write config with version field
+    const config_content = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  // Installed ephor version
+        \\  "version": "{s}",
+        \\
+        \\  // Directory to analyze - auto-detected from build.zig
+        \\  // (e.g., "src", "lib", "app", or "." for project root)
+        \\  "path_dir": "{s}",
+        \\
+        \\  // Entry points for import graph analysis (orphan detection)
+        \\  "entries": {s},
+        \\
+        \\  // Directories to exclude from analysis
+        \\  "exclude": ["test", "vendor", "third_party"],
+        \\
+        \\  // Patterns to exclude from orphan detection only
+        \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
+        \\
+        \\  // Rules to disable (by ID or category prefix)
+        \\  "disable": [],
+        \\
+        \\  // Rules to explicitly enable (overrides disable)
+        \\  "enable": [],
+        \\
+        \\  // Configurable thresholds
+        \\  "thresholds": {{
+        \\    "max_lines": 50,
+        \\    "max_nesting": 3,
+        \\    "max_params": 4,
+        \\    "max_branches": 12,
+        \\    "max_line_length": 100,
+        \\    "max_cyclomatic": 15,
+        \\    "max_cognitive": 15
+        \\  }}
+        \\}}
+        \\
+    , .{ ver, root_dir, entries_json.items });
+    defer allocator.free(config_content);
 
-        std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
-            CONFIG_FILENAME, ver, root_dir,
-        });
-        return root_dir;
-    };
-    // Config already exists - update version if needed
-    updateConfigVersion(allocator, ver);
-    std.debug.print("{s} already exists (skipped)\n", .{CONFIG_FILENAME});
-    return "src";
+    try fs.cwd().writeFile(CONFIG_FILENAME, config_content, .{});
+
+    std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
+        CONFIG_FILENAME, ver, root_dir,
+    });
 }
 
 /// Base URL for ephor repository (used to construct versioned package URLs)
@@ -13574,7 +13574,7 @@ fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
         std.debug.print("Ephor step already exists in build.zig\n", .{});
     }
 
-    _ = createInstallConfig(allocator, ver) catch |err| {
+    createInstallConfig(allocator, ver) catch |err| {
         std.debug.print("Could not create {s}: {}\n", .{ CONFIG_FILENAME, err });
     };
 
@@ -13944,7 +13944,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.13.2";
+const EPHOR_VERSION = "0.13.3";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -14880,9 +14880,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.13.2   # Install specific version
+        \\  ephor install --version=0.13.3   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.13.2   # Upgrade to specific version
+        \\  ephor upgrade --version=0.13.3   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -14897,7 +14897,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.13.2",
+        \\    "version": "0.13.3",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],

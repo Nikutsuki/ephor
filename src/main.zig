@@ -13480,20 +13480,6 @@ fn buildPackageUrl(allocator: Allocator, ver: ?[]const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/archive/v{s}.tar.gz", .{ EPHOR_REPO_BASE, v });
 }
 
-/// Code snippet to add to build.zig
-const EPHOR_BUILD_SNIPPET =
-    \\
-    \\    // === Ephor Static Analysis ===
-    \\    const ephor_dep = b.dependency("ephor", .{
-    \\        .target = target,
-    \\        .optimize = .ReleaseSafe,
-    \\    });
-    \\    const ephor_exe = ephor_dep.artifact("ephor");
-    \\    const ephor_step = b.step("ephor", "Run ephor static analysis");
-    \\    ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);
-    \\
-;
-
 /// Print instructions when build.zig.zon is missing during install.
 fn printMissingProjectFileHelp(file: []const u8) void {
     std.debug.print(
@@ -13577,7 +13563,7 @@ fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
 
     const patched = patchBuildZig(allocator) catch |err| {
         std.debug.print("Could not auto-patch build.zig: {}\n", .{err});
-        std.debug.print("\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_SNIPPET});
+        std.debug.print("\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_BLOCK});
         std.debug.print("Then run: zig build ephor\n", .{});
         return;
     };
@@ -13665,7 +13651,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
     for (line_list.items, 0..) |line, idx| {
         try new_content.appendSlice(allocator, line);
         try new_content.append(allocator, '\n');
-        if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_SNIPPET);
+        if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK);
     }
 
     try fs.cwd().writeFile("build.zig", new_content.items, .{});
@@ -13881,7 +13867,7 @@ fn writeConfigFile(content: []const u8) !void {
 }
 
 /// Canonical ephor build.zig integration block.
-/// This is the source of truth — upgrade replaces the entire ephor section with this.
+/// This is the source of truth — both install and upgrade use this block.
 /// When the integration needs to change, update this block and bump the version.
 const EPHOR_BUILD_BLOCK =
     \\    // Ephor static analysis
@@ -13958,7 +13944,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.13.1";
+const EPHOR_VERSION = "0.13.2";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -14894,9 +14880,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.13.1   # Install specific version
+        \\  ephor install --version=0.13.2   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.13.1   # Upgrade to specific version
+        \\  ephor upgrade --version=0.13.2   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -14911,7 +14897,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.13.1",
+        \\    "version": "0.13.2",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],

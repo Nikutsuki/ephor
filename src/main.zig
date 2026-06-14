@@ -8077,12 +8077,25 @@ fn hasNonInline(t: []const u8, kw: []const u8, inline_kw: []const u8) bool {
     return mem.indexOf(u8, t, kw) != null and mem.indexOf(u8, t, inline_kw) == null;
 }
 
+/// Count switch arms (`=>`) on a line, skipping matches inside string literals.
+fn countSwitchArms(t: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < t.len) {
+        const arrow_pos = mem.indexOfPos(u8, t, i, "=>") orelse break;
+        if (!types.isInsideString(t, arrow_pos)) count += 1;
+        i = arrow_pos + 2;
+    }
+    return count;
+}
+
 /// Count branches in a line (control flow decision points)
 fn countLineBranches(t: []const u8) usize {
     var b: usize = 0;
     if (mem.indexOf(u8, t, "if ") != null) b += 1;
     if (hasNonInline(t, "else ", "else =>")) b += 1;
     if (mem.indexOf(u8, t, "switch ") != null) b += 1;
+    b += countSwitchArms(t);
     if (hasNonInline(t, "while ", "inline while")) b += 1;
     if (hasNonInline(t, "for ", "inline for")) b += 1;
     if (mem.indexOf(u8, t, " catch ") != null) b += 1;
@@ -8106,6 +8119,7 @@ fn countLineCyclomatic(t: []const u8) usize {
     if (hasNonInline(t, "while ", "inline while")) c += 1;
     if (hasNonInline(t, "for ", "inline for")) c += 1;
     if (mem.indexOf(u8, t, "switch ") != null) c += 1;
+    c += countSwitchArms(t);
     if (mem.indexOf(u8, t, " catch ") != null) c += 1;
     if (mem.indexOf(u8, t, "try ") != null) c += 1;
     if (mem.indexOf(u8, t, "orelse") != null) c += 1;
@@ -8126,6 +8140,7 @@ fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
     if (hasNonInline(t, "while ", "inline while")) cost += 1 + cog_nest;
     if (hasNonInline(t, "for ", "inline for")) cost += 1 + cog_nest;
     if (mem.indexOf(u8, t, "switch ") != null) cost += 1 + cog_nest;
+    cost += countSwitchArms(t) * (1 + cog_nest);
     if (mem.indexOf(u8, t, " catch ") != null) cost += 1 + cog_nest;
     if (mem.indexOf(u8, t, "try ") != null) cost += 1 + cog_nest;
     // else (not else if, not else =>, and not a substring of orelse)
@@ -12917,8 +12932,9 @@ const Config = struct {
     /// Check if a rule is off by default (prefix or exact match)
     fn isOffByDefault(self: *const Config, rule: []const u8) bool {
         _ = self;
-        if (mem.eql(u8, rule, RULE_FILE_TOO_LONG))
-            return true;
+        if (mem.eql(u8, rule, RULE_FILE_TOO_LONG)) return true;
+        if (mem.eql(u8, rule, RULE_CYCLOMATIC)) return true;
+        if (mem.eql(u8, rule, RULE_COGNITIVE)) return true;
         for (off_by_default_prefixes) |prefix| {
             if (mem.startsWith(u8, rule, prefix)) return true;
         }
@@ -13246,7 +13262,7 @@ fn writeDefaultConfig() !void {
         \\  //                     ZA207 catch-undefined, ZA208 panic (note)
         \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
         \\  //                     ZA303 too-many-params, ZA304 too-many-branches,
-        \\  //                     ZA305 cyclomatic, ZA306 cognitive
+        \\  //                     ZA305 cyclomatic (OFF by default), ZA306 cognitive (OFF by default)
         \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
         \\  //   ZA5xx Structure:  ZA501 orphan-file
         \\  //   ZA6xx Format:     ZA601 needs-format
@@ -13254,9 +13270,10 @@ fn writeDefaultConfig() !void {
         \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
         \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
         \\  //                     ZA903 index-arithmetic
-        \\  "disable": [],
+        \\  "disable": ["ZA305", "ZA306"],
         \\
         \\  // Rules to explicitly enable (overrides disable)
+        \\  // Examples: "ZA305" (cyclomatic complexity), "ZA306" (cognitive complexity)
         \\  "enable": [],
         \\
         \\  // Configurable thresholds
@@ -13866,7 +13883,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.12.8";
+const EPHOR_VERSION = "0.13.0";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -14802,9 +14819,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.12.8   # Install specific version
+        \\  ephor install --version=0.13.0   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.12.8   # Upgrade to specific version
+        \\  ephor upgrade --version=0.13.0   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -14819,7 +14836,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.12.8",
+        \\    "version": "0.13.0",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
@@ -14832,7 +14849,7 @@ fn printHelp() void {
         \\      "max_branches": 12,
         \\      "max_line_length": 100,
         \\      "max_cyclomatic": 15,
-        \\      "max_cognitive": 15
+        \\      "max_cognitive": 15,
         \\      "max_file_bytes": 50000
         \\    }
         \\  }
@@ -14855,7 +14872,7 @@ fn printHelp() void {
         \\                     ZA903: index-arithmetic)
         \\  ZA3xx  Complexity (ZA301: func-too-long, ZA302: nesting-too-deep,
         \\                     ZA303: too-many-params, ZA304: too-many-branches,
-        \\                     ZA305: cyclomatic, ZA306: cognitive)
+        \\                     ZA305: cyclomatic (off by default), ZA306: cognitive (off by default))
         \\  ZA4xx  Unused     (ZA401: unused-import, ZA402: unused-const,
         \\                     ZA403: unused-var)
         \\  ZA5xx  Structure  (ZA501: orphan-file)
@@ -17235,6 +17252,10 @@ test "Config.isRuleEnabled respects disable prefix" {
     try std.testing.expect(!cfg.isRuleEnabled("ZA302"));
     try std.testing.expect(!cfg.isRuleEnabled("ZA303"));
     try std.testing.expect(!cfg.isRuleEnabled("ZA304"));
+
+    // ZA305 and ZA306 are off by default regardless of disable list
+    try std.testing.expect(!cfg.isRuleEnabled("ZA305"));
+    try std.testing.expect(!cfg.isRuleEnabled("ZA306"));
 
     // Other rules should still be enabled
     try std.testing.expect(cfg.isRuleEnabled("ZA101"));
@@ -21123,7 +21144,8 @@ test "ZA305: empty function has CCN 1, no warning" {
     var graph = ImportGraph.init(allocator);
     defer graph.deinit();
 
-    const code = \\fn empty() void {}
+    const code =
+        \\fn empty() void {}
     ;
     const analysis = try createTestFileAnalysis(allocator, "empty.zig", code);
     try graph.files.put(analysis.path, analysis);
@@ -21393,6 +21415,55 @@ test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
     // Cyclomatic 6 > 5 (base) but flat-chain 2x → limit 10, no warning
     try std.testing.expect(!found_cyclo);
     // Cognitive 5 > 1 (base), flat-chain 2x → limit 2, 5 > 2 → warning
+    try std.testing.expect(found_cog);
+}
+
+test "ZA305/ZA306: switch arms count as decision points" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const code =
+        \\fn dispatch(x: u32) u32 {
+        \\    switch (x) {
+        \\        0 => return 0,
+        \\        1 => return 1,
+        \\        2 => return 2,
+        \\        3 => return 3,
+        \\        4 => return 4,
+        \\        5 => return 5,
+        \\        6 => return 6,
+        \\        7 => return 7,
+        \\        8 => return 8,
+        \\        9 => return 9,
+        \\        10 => return 10,
+        \\        11 => return 11,
+        \\        12 => return 12,
+        \\        13 => return 13,
+        \\        14 => return 14,
+        \\        else => return 15,
+        \\    }
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "switch.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "switch.zig"), {});
+
+    // 16 switch arms + 1 switch = 17 decision points; threshold 15 should fire ZA305
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var found_cyclo = false;
+    var found_cog = false;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, "switch.zig")) continue;
+        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC)) found_cyclo = true;
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) found_cog = true;
+    }
+    try std.testing.expect(found_cyclo);
     try std.testing.expect(found_cog);
 }
 

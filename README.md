@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.12.8.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.13.0.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.12.8",
+  "version": "0.13.0",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -222,8 +222,18 @@ Example config:
 | **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
 | **ZA303** | warning | ON | Function has too many parameters (default: 4) |
 | **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
+| **ZA305** | warning | ON | Function has high cyclomatic complexity — McCabe CCN (default: 15) |
+| **ZA306** | warning | ON | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
 
 **Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they're metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they're compile-time unrolled.
+
+### Cyclomatic Complexity (ZA305)
+
+McCabe's cyclomatic complexity counts independent execution paths. Every `if`, `while`, `for`, `switch`, `catch`, `try`, `orelse`, `and`, and `or` adds 1 to the count. A function with no branching has a CCN of 1. Default threshold: 15.
+
+### Cognitive Complexity (ZA306)
+
+Sonar-style cognitive complexity weights branches by nesting depth. An `if` at the top level costs 1; the same `if` nested 3 levels deep costs 4 (1 + nesting depth). Logical operators (`and`/`or`) cost 1 each regardless of depth. Default threshold: 15.
 
 ### Unused Code (ZA4xx)
 
@@ -640,7 +650,7 @@ src/memory.zig:45:1: error[ZR101]: memory leak detected at runtime
 **Supported Zig Versions:**
 - Zig 0.16.x (current) — **required minimum**
 
-Ephor v0.12.8+ requires Zig 0.16.0 or later. Earlier ephor versions (v0.11.x) support Zig 0.15.x.
+Ephor v0.13.0+ requires Zig 0.16.0 or later. Earlier ephor versions (v0.11.x) support Zig 0.15.x.
 
 ### Version Compatibility System
 

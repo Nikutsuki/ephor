@@ -181,6 +181,48 @@ fn isSafeToDiscard(t: []const u8) bool {
 // Public API
 // ============================================================================
 
+fn appendIfPresent(
+    allocator: Allocator,
+    issue: ?Issue,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    if (issue) |i| try issues.append(allocator, i);
+}
+
+fn analyzeFile(
+    allocator: Allocator,
+    a: FileAnalysis,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var line_num: usize = 1;
+    var lines = mem.splitScalar(u8, a.content, '\n');
+    var in_test = false;
+    var test_depth: usize = 0;
+
+    while (lines.next()) |line| {
+        defer line_num += 1;
+        const t = mem.trim(u8, line, " \t\r");
+
+        if (mem.startsWith(u8, t, "\\\\") or mem.startsWith(u8, t, "//")) continue;
+
+        const state = trackTestBlock(t, in_test, test_depth);
+        in_test = state.in_test;
+        test_depth = state.depth;
+
+        try appendIfPresent(allocator, checkSilentCatch(t, a.path, line_num), issues);
+        try appendIfPresent(
+            allocator,
+            checkCatchUnreachable(t, a.path, line_num, in_test),
+            issues,
+        );
+        try appendIfPresent(
+            allocator,
+            checkOrelseUnreachable(t, a.path, line_num, in_test),
+            issues,
+        );
+    }
+}
+
 /// Analyze error handling patterns in all files
 pub fn analyze(
     allocator: Allocator,
@@ -190,33 +232,7 @@ pub fn analyze(
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
-        const a = entry.value_ptr.*;
-        var line_num: usize = 1;
-        var lines = mem.splitScalar(u8, a.content, '\n');
-        var in_test = false;
-        var test_depth: usize = 0;
-
-        while (lines.next()) |line| {
-            defer line_num += 1;
-            const t = mem.trim(u8, line, " \t\r");
-
-            // Skip multiline strings and comments
-            if (mem.startsWith(u8, t, "\\\\")) continue;
-            if (mem.startsWith(u8, t, "//")) continue;
-
-            // Track test blocks
-            const state = trackTestBlock(t, in_test, test_depth);
-            in_test = state.in_test;
-            test_depth = state.depth;
-
-            // Check for issues
-            if (checkSilentCatch(t, a.path, line_num)) |issue|
-                try issues.append(allocator, issue);
-            if (checkCatchUnreachable(t, a.path, line_num, in_test)) |issue|
-                try issues.append(allocator, issue);
-            if (checkOrelseUnreachable(t, a.path, line_num, in_test)) |issue|
-                try issues.append(allocator, issue);
-        }
+        try analyzeFile(allocator, entry.value_ptr.*, &issues);
     }
 
     return issues;

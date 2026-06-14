@@ -13442,7 +13442,7 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
         \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
         \\
         \\  // Rules to disable (by ID or category prefix)
-        \\  "disable": [],
+        \\  "disable": ["ZA305", "ZA306"],
         \\
         \\  // Rules to explicitly enable (overrides disable)
         \\  "enable": [],
@@ -13944,7 +13944,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.13.3";
+const EPHOR_VERSION = "0.13.4";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -14880,9 +14880,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.13.3   # Install specific version
+        \\  ephor install --version=0.13.4   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.13.3   # Upgrade to specific version
+        \\  ephor upgrade --version=0.13.4   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -14897,7 +14897,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.13.3",
+        \\    "version": "0.13.4",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],

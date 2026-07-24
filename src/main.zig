@@ -23,7 +23,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 /// Compatibility layer for std.fs APIs removed in Zig 0.16.0.
-const fs = struct {
+const Fs = struct {
     pub const path = std.Io.Dir.path;
     pub const max_path_bytes = std.Io.Dir.max_path_bytes;
     pub const Dir = CompatDir;
@@ -36,16 +36,34 @@ const fs = struct {
         pub fn access(_: CompatDir, sub_path: []const u8, options: std.Io.Dir.AccessOptions) !void {
             return std.Io.Dir.cwd().access(global_io.?, sub_path, options);
         }
-        pub fn openFile(_: CompatDir, sub_path: []const u8, options: std.Io.Dir.OpenFileOptions) !std.Io.File {
+        pub fn openFile(
+            _: CompatDir,
+            sub_path: []const u8,
+            options: std.Io.Dir.OpenFileOptions,
+        ) !std.Io.File {
             return std.Io.Dir.cwd().openFile(global_io.?, sub_path, options);
         }
-        pub fn openDir(_: CompatDir, sub_path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
+        pub fn openDir(
+            _: CompatDir,
+            sub_path: []const u8,
+            options: std.Io.Dir.OpenOptions,
+        ) !std.Io.Dir {
             return std.Io.Dir.cwd().openDir(global_io.?, sub_path, options);
         }
-        pub fn readFileAlloc(_: CompatDir, allocator: Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
-            return std.Io.Dir.cwd().readFileAlloc(global_io.?, sub_path, allocator, .limited(max_bytes));
+        pub fn readFileAlloc(
+            _: CompatDir,
+            allocator: Allocator,
+            sub_path: []const u8,
+            max_bytes: usize,
+        ) ![]u8 {
+            const limit: std.Io.Limit = .limited(max_bytes);
+            return std.Io.Dir.cwd().readFileAlloc(global_io.?, sub_path, allocator, limit);
         }
-        pub fn createFile(_: CompatDir, sub_path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
+        pub fn createFile(
+            _: CompatDir,
+            sub_path: []const u8,
+            flags: std.Io.Dir.CreateFileOptions,
+        ) !std.Io.File {
             return std.Io.Dir.cwd().createFile(global_io.?, sub_path, flags);
         }
         pub fn statFile(_: CompatDir, sub_path: []const u8) !std.Io.Dir.Stat {
@@ -61,8 +79,18 @@ const fs = struct {
         pub fn iterate(_: CompatDir) std.Io.Dir.Iterator {
             return std.Io.Dir.cwd().iterate();
         }
-        pub fn writeFile(_: CompatDir, sub_path: []const u8, data: []const u8, flags: std.Io.Dir.CreateFileOptions) !void {
-            return std.Io.Dir.cwd().writeFile(global_io.?, .{ .sub_path = sub_path, .data = data, .flags = flags });
+        pub fn writeFile(
+            _: CompatDir,
+            sub_path: []const u8,
+            data: []const u8,
+            flags: std.Io.Dir.CreateFileOptions,
+        ) !void {
+            const opts: std.Io.Dir.WriteFileOptions = .{
+                .sub_path = sub_path,
+                .data = data,
+                .flags = flags,
+            };
+            return std.Io.Dir.cwd().writeFile(global_io.?, opts);
         }
     };
 };
@@ -75,9 +103,6 @@ pub const compat = @import("compat/compat.zig");
 
 // Shared types and utilities
 const types = @import("types.zig");
-
-// Analyzer modules (for future use - keeps them as non-orphans)
-const analyzers = @import("analyzers/analyzers.zig");
 
 // Import shared types and constants from types.zig
 const RULE_ALLOC_NO_DEFER = types.RULE_ALLOC_NO_DEFER;
@@ -656,6 +681,16 @@ fn isCommentOrMultilineString(t: []const u8) bool {
     return mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\");
 }
 
+/// Count leading whitespace bytes — used to map a trimmed slice back to its
+/// absolute offset within the source line.
+fn skipLeadingWhitespace(line: []const u8) usize {
+    var lead: usize = 0;
+    while (lead < line.len and
+        (line[lead] == ' ' or line[lead] == '\t' or line[lead] == '\r')) : (lead += 1)
+    {}
+    return lead;
+}
+
 /// Check if line has a free/destroy pattern that's NOT inside a string
 fn hasRealFreePattern(t: []const u8) bool {
     // Check cleanup patterns from compat layer (excludes .deinit which is bulk cleanup)
@@ -793,7 +828,8 @@ fn hasTypeFirstArg(t: []const u8, open_paren_end: usize) bool {
     }
 
     // Float types: f16, f32, f64, f80, f128
-    if (c == 'f' and first_arg.len >= 2 and first_arg[1] >= '0' and first_arg[1] <= '9') return true;
+    if (c == 'f' and first_arg.len >= 2 and
+        first_arg[1] >= '0' and first_arg[1] <= '9') return true;
 
     // If we got here with a lowercase identifier that's not a primitive,
     // it's likely a runtime variable (e.g. object_ty_id, result, count)
@@ -4471,7 +4507,7 @@ const ImportGraph = struct {
     }
 
     fn scanDirectory(self: *ImportGraph, dir_path: []const u8) !void {
-        var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
+        var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
             std.debug.print("error: cannot open '{s}': {}\n", .{
                 dir_path, err,
             });
@@ -4484,8 +4520,8 @@ const ImportGraph = struct {
     fn scanSingleFile(self: *ImportGraph, file_path: []const u8) !void {
         if (mem.endsWith(u8, file_path, ".zig")) {
             const path_copy = try self.allocator.dupe(u8, file_path);
+            defer self.allocator.free(path_copy);
             try self.analyzeFile(path_copy);
-            self.allocator.free(path_copy);
         }
     }
 
@@ -4523,15 +4559,15 @@ const ImportGraph = struct {
 
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
         const max_size = 10 * 1024 * 1024;
-        const content = fs.cwd().readFileAlloc(self.allocator, file_path, max_size) catch {
+        const content = Fs.cwd().readFileAlloc(self.allocator, file_path, max_size) catch {
             return;
         };
         const has_tests = mem.indexOf(u8, content, "test \"") != null;
         const pub_fn_count = types.countOccurrences(content, "pub fn ");
         const path_copy = try self.allocator.dupe(u8, file_path);
         const resolved_copy = blk: {
-            var buf: [fs.max_path_bytes]u8 = undefined;
-            const r = fs.cwd().realpath(file_path, &buf) catch {
+            var buf: [Fs.max_path_bytes]u8 = undefined;
+            const r = Fs.cwd().realpath(file_path, &buf) catch {
                 break :blk path_copy;
             };
             break :blk self.allocator.dupe(u8, r) catch path_copy;
@@ -4772,14 +4808,14 @@ const ImportGraph = struct {
 
         // Always resolve to absolute path for consistent comparison
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = fs.cwd().realpath(full, &buf) catch return null;
+        const resolved = Fs.cwd().realpath(full, &buf) catch return null;
         if (!self.isWithinScanRoot(resolved)) return null;
         return try self.allocator.dupe(u8, resolved);
     }
 
     fn markReachable(self: *ImportGraph, entry: []const u8) !void {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const norm = fs.cwd().realpath(entry, &buf) catch return;
+        const norm = Fs.cwd().realpath(entry, &buf) catch return;
         try self.markReachableRecursive(norm);
     }
 
@@ -4800,13 +4836,13 @@ const ImportGraph = struct {
     fn findBuildRoot(
         self: *ImportGraph,
         cfg: *const Config,
-        buf: *[fs.max_path_bytes]u8,
+        buf: *[Fs.max_path_bytes]u8,
     ) ?[]const u8 {
         // 1. Check entries for build.zig
         for (cfg.entries.items) |e| {
             if (mem.endsWith(u8, e, "build.zig")) {
                 const dir = std.fs.path.dirname(e) orelse ".";
-                return fs.cwd().realpath(dir, buf) catch continue;
+                return Fs.cwd().realpath(dir, buf) catch continue;
             }
         }
         // 2. Try parent of target path
@@ -4823,7 +4859,7 @@ const ImportGraph = struct {
     fn checkBuildZigAt(
         self: *ImportGraph,
         dir: []const u8,
-        buf: *[fs.max_path_bytes]u8,
+        buf: *[Fs.max_path_bytes]u8,
     ) ?[]const u8 {
         const check = std.fmt.allocPrint(
             self.allocator,
@@ -4831,8 +4867,8 @@ const ImportGraph = struct {
             .{dir},
         ) catch return null;
         defer self.allocator.free(check);
-        fs.cwd().access(check, .{}) catch return null;
-        return fs.cwd().realpath(dir, buf) catch null;
+        Fs.cwd().access(check, .{}) catch return null;
+        return Fs.cwd().realpath(dir, buf) catch null;
     }
 
     /// Scan already-loaded content for b.path("...zig") and pathJoin refs, marking reachable.
@@ -4894,8 +4930,8 @@ const ImportGraph = struct {
             .{ build_root, ref_path },
         ) catch return;
         defer self.allocator.free(full);
-        var rbuf: [fs.max_path_bytes]u8 = undefined;
-        const resolved = fs.cwd().realpath(full, &rbuf) catch return;
+        var rbuf: [Fs.max_path_bytes]u8 = undefined;
+        const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
         if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved)) {
             self.markReachableRecursive(resolved) catch return;
@@ -4905,7 +4941,7 @@ const ImportGraph = struct {
     /// After markReachable, scan reachable files for b.path("...") references
     /// and mark those targets as reachable too.
     fn markBuildPathReferences(self: *ImportGraph, cfg: *const Config) !void {
-        var root_buf: [fs.max_path_bytes]u8 = undefined;
+        var root_buf: [Fs.max_path_bytes]u8 = undefined;
         const build_root = self.findBuildRoot(cfg, &root_buf) orelse return;
 
         // Snapshot reachable paths to avoid modify-while-iterate
@@ -4917,7 +4953,7 @@ const ImportGraph = struct {
         }
 
         for (to_scan.items) |path| {
-            const content = fs.cwd().readFileAlloc(
+            const content = Fs.cwd().readFileAlloc(
                 self.allocator,
                 path,
                 4 * 1024 * 1024,
@@ -4980,11 +5016,11 @@ const ImportGraph = struct {
     fn addSearchRoot(
         self: *ImportGraph,
         dir: []const u8,
-        buf: *[fs.max_path_bytes]u8,
+        buf: *[Fs.max_path_bytes]u8,
         roots: *[2][]const u8,
         rc: *usize,
     ) void {
-        const r = fs.cwd().realpath(dir, buf) catch return;
+        const r = Fs.cwd().realpath(dir, buf) catch return;
         const o = self.allocator.dupe(u8, r) catch return;
         roots[rc.*] = o;
         rc.* += 1;
@@ -5009,14 +5045,14 @@ const ImportGraph = struct {
         const trimmed = mem.trimEnd(u8, cfg.path, "/");
         var search_roots: [2][]const u8 = undefined;
         var rc: usize = 0;
-        var rb1: [fs.max_path_bytes]u8 = undefined;
+        var rb1: [Fs.max_path_bytes]u8 = undefined;
         self.addSearchRoot(
             std.fs.path.dirname(trimmed) orelse ".",
             &rb1,
             &search_roots,
             &rc,
         );
-        var rb2: [fs.max_path_bytes]u8 = undefined;
+        var rb2: [Fs.max_path_bytes]u8 = undefined;
         self.addSearchRoot(trimmed, &rb2, &search_roots, &rc);
         defer for (search_roots[0..rc]) |r| self.allocator.free(r);
 
@@ -5037,7 +5073,7 @@ const ImportGraph = struct {
         depth: usize,
     ) !void {
         if (depth == 0) return;
-        var dir = fs.cwd().openDir(
+        var dir = Fs.cwd().openDir(
             search_dir,
             .{ .iterate = true },
         ) catch return;
@@ -5068,8 +5104,8 @@ const ImportGraph = struct {
     /// @import and b.path references as reachable.
     fn discoverNestedBuildFiles(self: *ImportGraph, cfg: *const Config) !void {
         const trimmed = mem.trimEnd(u8, cfg.path, "/");
-        var rbuf: [fs.max_path_bytes]u8 = undefined;
-        const target_abs = fs.cwd().realpath(trimmed, &rbuf) catch return;
+        var rbuf: [Fs.max_path_bytes]u8 = undefined;
+        const target_abs = Fs.cwd().realpath(trimmed, &rbuf) catch return;
         const target_owned = self.allocator.dupe(u8, target_abs) catch return;
         defer self.allocator.free(target_owned);
 
@@ -5111,9 +5147,9 @@ const ImportGraph = struct {
         ) catch return;
         defer self.allocator.free(build_path);
 
-        if (fs.cwd().access(build_path, .{})) |_| {
-            var buf2: [fs.max_path_bytes]u8 = undefined;
-            if (fs.cwd().realpath(build_path, &buf2)) |resolved| {
+        if (Fs.cwd().access(build_path, .{})) |_| {
+            var buf2: [Fs.max_path_bytes]u8 = undefined;
+            if (Fs.cwd().realpath(build_path, &buf2)) |resolved| {
                 if (!self.reachable.contains(resolved))
                     self.markReachableRecursive(resolved) catch return;
             } else |_| {}
@@ -5122,7 +5158,7 @@ const ImportGraph = struct {
     }
 
     fn scanForNestedBuildZig(self: *ImportGraph, dir_path: []const u8) !void {
-        var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
         defer dir.close(global_io.?);
         var iter = dir.iterate();
         while (try iter.next(global_io.?)) |entry| {
@@ -5143,8 +5179,8 @@ const ImportGraph = struct {
 
     /// Scan all reachable files under a sub-project directory for b.path() references
     fn scanSubprojectBuildPaths(self: *ImportGraph, subdir: []const u8) !void {
-        var rbuf: [fs.max_path_bytes]u8 = undefined;
-        const abs_subdir = fs.cwd().realpath(subdir, &rbuf) catch return;
+        var rbuf: [Fs.max_path_bytes]u8 = undefined;
+        const abs_subdir = Fs.cwd().realpath(subdir, &rbuf) catch return;
 
         // Snapshot reachable paths to check which are in this sub-project
         var to_scan: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -5176,8 +5212,8 @@ const ImportGraph = struct {
             .{ base_dir, ref_path },
         ) catch return;
         defer self.allocator.free(full);
-        var rbuf: [fs.max_path_bytes]u8 = undefined;
-        const resolved = fs.cwd().realpath(full, &rbuf) catch return;
+        var rbuf: [Fs.max_path_bytes]u8 = undefined;
+        const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
         if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved))
             self.markReachableRecursive(resolved) catch return;
@@ -5188,7 +5224,7 @@ const ImportGraph = struct {
         file_path: []const u8,
         base_dir: []const u8,
     ) !void {
-        const content = fs.cwd().readFileAlloc(
+        const content = Fs.cwd().readFileAlloc(
             self.allocator,
             file_path,
             4 * 1024 * 1024,
@@ -5235,14 +5271,14 @@ const ImportGraph = struct {
             .{ dir_path, name },
         ) catch return;
         defer self.allocator.free(full);
-        var rbuf: [fs.max_path_bytes]u8 = undefined;
-        const resolved = fs.cwd().realpath(full, &rbuf) catch return;
+        var rbuf: [Fs.max_path_bytes]u8 = undefined;
+        const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
         if (!self.reachable.contains(resolved))
             self.markReachableRecursive(resolved) catch return;
     }
 
     fn markZigFilesRecursive(self: *ImportGraph, dir_path: []const u8) !void {
-        var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
         defer dir.close(global_io.?);
         var iter = dir.iterate();
         while (try iter.next(global_io.?)) |entry| {
@@ -5482,7 +5518,10 @@ fn collectNoFreeAllocatorNames(
 /// Scans the entire file for struct field declarations matching stdlib no-free
 /// allocator types (e.g. `arena: std.heap.ArenaAllocator,`).
 /// Type-based only — matches on declared types, never on field names.
-fn collectNoFreeFieldNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
+fn collectNoFreeFieldNames(
+    a: Allocator,
+    lines: []const []const u8,
+) !std.StringHashMapUnmanaged(void) {
     var names = std.StringHashMapUnmanaged(void){};
     const field_type_patterns = compat.getNoFreeFieldTypePatterns();
 
@@ -5645,7 +5684,10 @@ fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnm
 /// Build set of ALL allocator variable names (both no-free and need-free).
 /// Used to determine if `.create()` receiver is an allocator.
 /// Tracks stdlib type initializations + .allocator() calls + global singletons.
-fn collectAllAllocatorNames(a: Allocator, lines: []const []const u8) !std.StringHashMapUnmanaged(void) {
+fn collectAllAllocatorNames(
+    a: Allocator,
+    lines: []const []const u8,
+) !std.StringHashMapUnmanaged(void) {
     var names = std.StringHashMapUnmanaged(void){};
 
     // All allocator type init patterns from stdlib vocabulary (compat layer)
@@ -6676,7 +6718,8 @@ fn isModuleLevelAssignment(t: []const u8, alloc_name: []const u8) bool {
     const lhs = mem.trim(u8, t[0..eq_pos], " \t");
     if (lhs.len == 0) return false;
 
-    // Skip field assignments (any identifier.field pattern — ownership transfer, not module-level)
+    // Skip field assignments (any identifier.field pattern — ownership
+    // transfer, not module-level)
     if (mem.indexOf(u8, lhs, ".") != null) return false;
 
     // LHS is a simple identifier = module-level variable assignment
@@ -6839,7 +6882,8 @@ fn checkSilentCatch(
     if (isCleanupFunction(func_name)) return null;
     // Suppress when the called method is a cleanup/best-effort operation
     if (isCleanupMethodCall(t)) return null;
-    // Suppress explicit discard: `_ = expr catch {}` — caller intentionally ignores both value and error
+    // Suppress explicit discard: `_ = expr catch {}` — caller intentionally
+    // ignores both value and error
     if (isDiscardedCatch(t)) return null;
     // Suppress catch {} on continuation lines of multi-line defer expressions
     if (isDeferCatchMultiline(t, preceding_lines)) return null;
@@ -8066,7 +8110,7 @@ fn countFnParams(t: []const u8) usize {
 /// Check if function signature has a `self` parameter (first param after open paren).
 fn hasSelfParam(t: []const u8, paren_pos: usize) bool {
     if (paren_pos + 1 >= t.len) return false;
-    const after = mem.trim(u8, t[paren_pos + 1 ..], " \t");
+    const after = mem.trim(u8, t[paren_pos + 1 ..], " \t\r\n");
     return mem.startsWith(u8, after, "self:") or
         mem.startsWith(u8, after, "self,") or
         mem.startsWith(u8, after, "self)");
@@ -8178,7 +8222,9 @@ fn calcLimit(base: usize, is_factory: bool, mult: usize) usize {
 /// Flat chain: functions where cognitive ≈ cyclomatic (ratio ≤ 1.5) indicate flat branch
 /// patterns (routers, dispatchers) rather than deeply nested control flow.
 fn isFlatChain(state: *const ComplexityState) bool {
-    return state.cyclomatic > 0 and state.cognitive <= (state.cyclomatic * 3) / 2 and state.max_nest <= 2;
+    return state.cyclomatic > 0 and
+        state.cognitive <= (state.cyclomatic * 3) / 2 and
+        state.max_nest <= 2;
 }
 
 fn cognitiveLimit(base: usize, is_data_dispatch: bool, state: *const ComplexityState) usize {
@@ -8246,7 +8292,12 @@ fn reportSingleComplexity(
     help: []const u8,
 ) !void {
     if (actual <= limit) return;
-    const suffix: []const u8 = if (state.is_type_factory) " [tf]" else if (state.is_data_dispatch) " [dd]" else "";
+    const suffix: []const u8 = if (state.is_type_factory)
+        " [tf]"
+    else if (state.is_data_dispatch)
+        " [dd]"
+    else
+        "";
     const fmt = "function '{s}' has {d} {s} (max {d}){s}";
     const msg = try std.fmt.allocPrint(
         allocator,
@@ -8369,7 +8420,21 @@ fn findRealFnDef(t: []const u8) ?usize {
 }
 
 /// Detect function start and initialize complexity state
-fn detectFnStart(t: []const u8, state: *ComplexityState, line_num: usize) void {
+/// Bounded lookahead when counting params of a multi-line signature — a
+/// wrapped param list is at most a few hundred bytes; 16 KiB caps the scan on
+/// pathological input without ever truncating a realistic signature.
+const max_signature_lookahead = 16384;
+
+/// Read-only view of one trimmed source line within its file, for signature
+/// lookahead beyond the line itself.
+const LineView = struct {
+    t: []const u8,
+    content: []const u8,
+    line_offset: usize,
+};
+
+fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void {
+    const t = view.t;
     const pos = findRealFnDef(t) orelse return;
 
     // New top-level function definition resets state even if in_fn is true
@@ -8382,13 +8447,17 @@ fn detectFnStart(t: []const u8, state: *ComplexityState, line_num: usize) void {
     var end = pos + 3;
     while (end < t.len and isIdent(t[end])) end += 1;
     const name = t[pos + 3 .. end];
+    // Params may span multiple lines — count over the full content from the
+    // fn keyword (bounded lookahead) so wrapped signatures are not undercounted.
+    const fn_abs_start = view.line_offset + pos;
+    const sig_end = @min(fn_abs_start + max_signature_lookahead, view.content.len);
     state.* = .{
         .in_fn = true,
         .fn_start = line_num,
         .fn_col = pos + 1,
         .is_type_factory = isTypeFactory(t),
         .is_data_dispatch = isDataDispatchFunction(name),
-        .params = countFnParams(t),
+        .params = countFnParams(view.content[fn_abs_start..sig_end]),
         .fn_name = name,
         .cyclomatic = 1,
     };
@@ -8473,12 +8542,25 @@ fn analyzeFileComplexity(
 ) !void {
     var state = ComplexityState{};
     var line_num: usize = 1;
-    var lines = mem.splitScalar(u8, a.content, '\n');
-    while (lines.next()) |line| {
-        defer line_num += 1;
+    var line_start: usize = 0;
+    const content = a.content;
+    while (line_start <= content.len) {
+        const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
+        defer {
+            // Advance past this line (or past the end to terminate the loop).
+            line_start = if (newline == content.len) content.len + 1 else newline + 1;
+            line_num += 1;
+        }
+        const line = content[line_start..newline];
+        const lead = skipLeadingWhitespace(line);
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        detectFnStart(t, &state, line_num);
+        const view: LineView = .{
+            .t = t,
+            .content = content,
+            .line_offset = line_start + lead,
+        };
+        detectFnStart(view, &state, line_num);
         if (!state.in_fn) continue;
         state.fn_lines += 1;
         state.branches += countLineBranches(t);
@@ -8531,6 +8613,68 @@ fn calculateVisibleLength(line: []const u8) usize {
         } else if (c != '\r') {
             visible_len += 1;
         }
+    }
+    return visible_len;
+}
+
+/// Length of the char literal starting at `line[i]` (which must be `'`), or
+/// null when this is not a char literal. Conservative: only matches forms that
+/// close within the longest valid escape (`'\u{10FFFF}'` = 12 source chars) so
+/// apostrophe-like `'` in ordinary code is left alone.
+fn charLiteralSpan(line: []const u8, i: usize) ?usize {
+    // 'x' — any single character that is not an escape or a quote
+    if (i + 2 < line.len and line[i + 2] == '\'' and
+        line[i + 1] != '\\' and line[i + 1] != '\'') return 3;
+    // '\n', '\'', '\u{10FFFF}' — escape forms
+    if (i + 3 < line.len and line[i + 1] == '\\') {
+        const max_end = @min(i + 12, line.len - 1);
+        var j = i + 3;
+        while (j <= max_end) : (j += 1) {
+            if (line[j] == '\'') return j - i + 1;
+        }
+    }
+    return null;
+}
+
+/// Index of the closing quote of the string literal opening at `line[i]`
+/// (`line.len` when the literal is unterminated).
+fn stringLiteralEnd(line: []const u8, i: usize) usize {
+    var j = i + 1;
+    while (j < line.len and line[j] != '"') {
+        if (line[j] == '\\' and j + 1 < line.len) j += 1;
+        j += 1;
+    }
+    return j;
+}
+
+/// Visible length when string-literal CONTENT is excluded (only the two quote
+/// characters count). Unbreakable opaque tokens (ENRs, hashes, enodes) have no
+/// meaningful break point, so a line over-length solely due to one is exempt.
+fn visibleLengthExcludingStrings(line: []const u8) usize {
+    var visible_len: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (c == '\t') {
+            visible_len = ((visible_len / 4) + 1) * 4;
+            continue;
+        }
+        if (c == '\r') continue;
+        // Char literals are code, not string data — skip their span so a
+        // '"' inside one ('"') is not mistaken for a string opener.
+        if (c == '\'') {
+            const n = charLiteralSpan(line, i) orelse 1;
+            visible_len += n;
+            i += n - 1;
+            continue;
+        }
+        if (c != '"' or (i > 0 and line[i - 1] == '\\')) {
+            visible_len += 1;
+            continue;
+        }
+        visible_len += 1;
+        i = stringLiteralEnd(line, i);
+        if (i < line.len) visible_len += 1;
     }
     return visible_len;
 }
@@ -8617,6 +8761,7 @@ fn analyzeStyle(
 
             const visible_len = calculateVisibleLength(line);
             if (visible_len <= th.max_line_length) continue;
+            if (visibleLengthExcludingStrings(line) <= th.max_line_length) continue;
             try reportLineTooLong(
                 &issues,
                 allocator,
@@ -8737,46 +8882,6 @@ fn checkConstNaming(
         });
 }
 
-/// Detect if a var declaration holds a function pointer (callable).
-/// Matches: explicit fn-pointer type annotation or qualified name assignment
-/// (`mod.funcName`). Style guide: "If x is callable, then x should be camelCase."
-fn isFunctionPointerVar(t: []const u8) bool {
-    // Explicit function pointer type annotations.
-    // Modern Zig (0.10+) requires `*const fn(...)`; bare `fn(...)` is kept for
-    // legacy/type-expression forms.
-    const fn_type_patterns = [_][]const u8{
-        ": *const fn(",  ": *const fn (",
-        ": ?*const fn(", ": ?*const fn (",
-        ": *fn(",        ": *fn (",
-        ": ?*fn(",       ": ?*fn (",
-        ": fn(",         ": fn (",
-        ":*const fn(",   ":*const fn (",
-        ":?*const fn(",  ":?*const fn (",
-        ":*fn(",         ":*fn (",
-        ":?*fn(",        ":?*fn (",
-        ":fn(",          ":fn (",
-    };
-    for (fn_type_patterns) |p| {
-        if (mem.indexOf(u8, t, p) != null) return true;
-    }
-    // Qualified function assignment: `var x = mod.someFn;`
-    // Require the RHS to be a pure qualified identifier path ending in a
-    // camelCase segment. This rejects method calls (`.init(x)`), enum/struct
-    // literals (`.empty`, `.{...}`), and instance type exprs
-    // (`std.Foo(T).bar`). Bare identifiers (no dot) remain ambiguous.
-    const eq_pos = mem.indexOf(u8, t, "= ") orelse return false;
-    const rhs = mem.trim(u8, t[eq_pos + 2 ..], " \t;");
-    if (rhs.len == 0) return false;
-    if (rhs[0] == '.') return false;
-    const last_dot = mem.lastIndexOfScalar(u8, rhs, '.') orelse return false;
-    const last_seg = rhs[last_dot + 1 ..];
-    if (last_seg.len == 0) return false;
-    for (last_seg) |c| if (!isIdent(c)) return false;
-    const lhs = rhs[0..last_dot];
-    for (lhs) |c| if (!isIdent(c) and c != '.') return false;
-    return isCamelCase(last_seg);
-}
-
 fn checkVarNaming(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
@@ -8790,20 +8895,6 @@ fn checkVarNaming(
     if (end <= prefix) return;
     const name = t[prefix..end];
     if (name.len > 0 and name[0] == '_') return;
-    // Function pointer vars use camelCase per style guide
-    if (isFunctionPointerVar(t)) {
-        if (!isCamelCase(name)) {
-            try reportNamingIssue(issues, allocator, .{
-                .path = path,
-                .line = line_num,
-                .col = prefix + 1,
-                .kind = "function pointer",
-                .name = name,
-                .expected = "camelCase",
-            });
-        }
-        return;
-    }
     if (!isSnakeCase(name)) {
         try reportNamingIssue(issues, allocator, .{
             .path = path,
@@ -8856,7 +8947,12 @@ fn checkFnNaming(
     t: []const u8,
     line_num: usize,
 ) !void {
+    // Extern declaration names are ABI-fixed and can never conform.
+    // `export fn` is NOT exempt — those names are project-chosen identifiers.
+    if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
     const fn_pos = mem.indexOf(u8, t, "fn ") orelse return;
+    // `fn ` inside a string literal is data (fixture text), not a declaration.
+    if (isInsideString(t, fn_pos)) return;
     const start = fn_pos + 3;
     var end = start;
     while (end < t.len and isIdent(t[end])) end += 1;
@@ -8922,6 +9018,10 @@ fn checkErrorNaming(
             pos = end;
             continue;
         }
+        if (isStdErrorName(name)) {
+            pos = end;
+            continue;
+        }
         if (!isSnakeCase(name)) {
             try reportNamingIssue(issues, allocator, .{
                 .path = path,
@@ -8983,6 +9083,12 @@ fn checkErrorNaming(
             continue;
         }
 
+        // Error-set composition (`error{...} || other.Error`) — identifiers
+        // after `||` reference other error sets, not members of this one.
+        // Accepted trade-off: also skips a second inline error set on the same
+        // line (`error{ a } || error{ BadMember }`) — a near-nonexistent idiom.
+        if (t[i] == '|' and i + 1 < t.len and t[i + 1] == '|') break;
+
         // Extract identifier
         const start = i;
         while (i < t.len and isIdent(t[i])) i += 1;
@@ -8992,9 +9098,11 @@ fn checkErrorNaming(
         }
         const name = t[start..i];
         if (name.len > 0 and name[0] == '_') {
-            // skip optional trailing comma
-            while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
-            if (i < t.len and t[i] == ',') i += 1;
+            i = skipOptionalComma(t, i);
+            continue;
+        }
+        if (isStdErrorName(name)) {
+            i = skipOptionalComma(t, i);
             continue;
         }
         if (!isSnakeCase(name)) {
@@ -9007,9 +9115,81 @@ fn checkErrorNaming(
                 .expected = "snake_case",
             });
         }
-        // skip optional trailing comma
-        while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
-        if (i < t.len and t[i] == ',') i += 1;
+        i = skipOptionalComma(t, i);
+    }
+}
+
+/// Advance past whitespace and one optional `,` — members in an error set may
+/// carry a trailing comma that is not part of the next member's name.
+fn skipOptionalComma(t: []const u8, start: usize) usize {
+    var i = start;
+    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+    if (i < t.len and t[i] == ',') i += 1;
+    return i;
+}
+
+/// Quote is escaped when preceded by an odd run of backslashes (`\\"` is an
+/// escaped backslash followed by a real quote).
+fn isEscapedQuote(t: []const u8, i: usize) bool {
+    var backslashes: usize = 0;
+    var j = i;
+    while (j > 0 and t[j - 1] == '\\') {
+        backslashes += 1;
+        j -= 1;
+    }
+    return backslashes % 2 == 1;
+}
+
+/// If position i starts `error{` (standalone keyword + optional ws + `{`),
+/// returns the index just past the `{`.
+fn matchesErrorSetOpen(t: []const u8, i: usize) ?usize {
+    if (i + 5 > t.len or !mem.eql(u8, t[i .. i + 5], "error")) return null;
+    if (i > 0 and isIdent(t[i - 1])) return null;
+    var after = i + 5;
+    while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+    if (after < t.len and t[after] == '{') return after + 1;
+    return null;
+}
+
+/// Does this code line open an error set? Text inside string literals and
+/// line comments is data, not syntax, so it cannot open one.
+fn lineOpensErrorBlock(t: []const u8) bool {
+    var in_str = false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == '"' and !isEscapedQuote(t, i)) {
+            in_str = !in_str;
+            continue;
+        }
+        if (in_str) continue;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return false;
+        if (matchesErrorSetOpen(t, i) != null) return true;
+    }
+    return false;
+}
+
+/// Track error-set brace depth across one code line, ignoring string literals
+/// and line comments — their braces and `error{` text are data, not syntax.
+fn trackErrorBlockDepth(t: []const u8, depth: *usize) void {
+    var in_str = false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == '"' and !isEscapedQuote(t, i)) {
+            in_str = !in_str;
+            continue;
+        }
+        if (in_str) continue;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
+        if (matchesErrorSetOpen(t, i)) |after_open| {
+            depth.* += 1;
+            i = after_open - 1;
+            continue;
+        }
+        if (depth.* == 0) continue;
+        if (c == '{') depth.* += 1;
+        if (c == '}') depth.* -= 1;
     }
 }
 
@@ -9031,31 +9211,17 @@ fn analyzeNaming(
             const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
             const line = content[line_start..newline];
             // Compute trimmed slice's offset within content (for multi-line lookahead).
-            var lead: usize = 0;
-            while (lead < line.len and (line[lead] == ' ' or line[lead] == '\t' or line[lead] == '\r')) : (lead += 1) {}
+            const lead = skipLeadingWhitespace(line);
             const t = mem.trim(u8, line, " \t\r");
             const t_start = line_start + lead;
 
             // Determine if this line is inside an error block.
             // We are inside if we were already inside one, OR if this line opens one.
-            var has_error_open = false;
-            var pos: usize = 0;
-            while (pos < t.len) {
-                const found = mem.indexOfPos(u8, t, pos, "error") orelse break;
-                const at_start = found == 0 or !isIdent(t[found - 1]);
-                if (at_start) {
-                    var after = found + 5;
-                    while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
-                    if (after < t.len and t[after] == '{') {
-                        has_error_open = true;
-                        break;
-                    }
-                }
-                pos = found + 5;
-            }
+            const is_trivia = isCommentOrMultilineString(t);
+            const has_error_open = !is_trivia and lineOpensErrorBlock(t);
             const in_error_block = error_block_depth > 0 or has_error_open;
 
-            if (!isCommentOrMultilineString(t)) {
+            if (!is_trivia) {
                 if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
                     try checkConstNaming(&issues, allocator, a.path, t, line_num, content, t_start);
                 if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var "))
@@ -9063,30 +9229,7 @@ fn analyzeNaming(
                 if (mem.indexOf(u8, t, "fn ") != null)
                     try checkFnNaming(&issues, allocator, a.path, t, line_num);
                 try checkErrorNaming(&issues, allocator, a.path, t, line_num, in_error_block);
-            }
-
-            // Update error block depth for subsequent lines.
-            var i: usize = 0;
-            while (i < t.len) {
-                if (i + 5 <= t.len and mem.eql(u8, t[i .. i + 5], "error")) {
-                    const at_start = i == 0 or !isIdent(t[i - 1]);
-                    if (at_start) {
-                        var after = i + 5;
-                        while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
-                        if (after < t.len and t[after] == '{') {
-                            error_block_depth += 1;
-                            i = after + 1;
-                            continue;
-                        }
-                    }
-                }
-                if (error_block_depth > 0) {
-                    if (t[i] == '{') error_block_depth += 1;
-                    if (t[i] == '}') {
-                        if (error_block_depth > 0) error_block_depth -= 1;
-                    }
-                }
-                i += 1;
+                trackErrorBlockDepth(t, &error_block_depth);
             }
 
             if (newline == content.len) break;
@@ -9142,6 +9285,446 @@ fn isScreamingCase(name: []const u8) bool {
         }
     }
     return true;
+}
+
+/// Error names declared by the Zig standard library. Std-declared error names
+/// are exempt from ZA703 — project code cannot rename them.
+///
+/// Provenance: curated subset of public std error names, drawn from the union
+/// of supported std versions (0.15/0.16) — e.g. `NotConnected` is 0.14-era.
+/// Extracted from the std sources of public API modules (fs, posix, Io, net,
+/// crypto, compress, fmt, json, unicode, math, process, testing, http, tls,
+/// zon, os); excludes std-internal/test junk and single generic words that
+/// would mask common project errors. The list may grow.
+const std_error_names = [_][]const u8{
+    // std.mem.Allocator.Error
+    "OutOfMemory",
+    // std.fs / std.posix file system errors
+    "AccessDenied",
+    "BadFd",
+    "BadPathName",
+    "CrossDevice",
+    "CurrentDirUnlinked",
+    "DeadLock",
+    "DeviceBusy",
+    "DirNotEmpty",
+    "DiskQuota",
+    "FileBusy",
+    "FileDescriptorInBadState",
+    "FileDescriptorInvalid",
+    "FileDescriptorNotASocket",
+    "FileLocksUnsupported",
+    "FileNotFound",
+    "FileSystem",
+    "FileTooBig",
+    "FilesNotRegistered",
+    "InodeMountFail",
+    "InvalidFileDescriptor",
+    "InvalidProtocolOption",
+    "InvalidUserId",
+    "IsDir",
+    "LimitTooBig",
+    "LinkQuotaExceeded",
+    "LockViolation",
+    "MessageOversize",
+    "NameTooLong",
+    "NoDevice",
+    "NoSpaceLeft",
+    "NotAssociatedWithFileSystem",
+    "NotATerminal",
+    "InvalidProcessGroupId",
+    "NotDir",
+    "NotLink",
+    "NotTerminalDevice",
+    "ParamsOutsideAccessibleAddressSpace",
+    "PathAlreadyExists",
+    "PermissionDenied",
+    "PipeBusy",
+    "ProcessFdQuotaExceeded",
+    "ProcessNotFound",
+    "ProtocolUnreachable",
+    "ReadOnlyFileSystem",
+    "ResourceLimitReached",
+    "SharingViolation",
+    "SocketUnconnected",
+    "SymLinkLoop",
+    "SystemFdQuotaExceeded",
+    "SizeTooSmall",
+    "SystemResources",
+    "TooManyBreakpoints",
+    "TooManyParentDirs",
+    // std.Io / net errors
+    "AddressFamilyUnsupported",
+    "AddressInUse",
+    "AddressUnavailable",
+    "AlreadyConnected",
+    "AlreadyReported",
+    "AlreadyTerminated",
+    "AntivirusInterference",
+    "BlockedByFirewall",
+    "BrokenPipe",
+    "BufferTooSmall",
+    "BufferUnderrun",
+    "CancelRequested",
+    "Canceled",
+    "ClockUnavailable",
+    "ConcurrencyUnavailable",
+    "ConnectionAborted",
+    "ConnectionPending",
+    "ConnectionRefused",
+    "ConnectionResetByPeer",
+    "ConnectionTimedOut",
+    "DetectingNetworkConfigurationFailed",
+    "EntropyUnavailable",
+    "EventNotFound",
+    "FastOpenAlreadyInProgress",
+    "HostUnreachable",
+    "InputOutput",
+    "InterfaceNotFound",
+    "InvalidAddress",
+    "InvalidDnsAAAARecord",
+    "InvalidDnsARecord",
+    "InvalidDnsCnameRecord",
+    "InvalidDnsPacket",
+    "InvalidHostName",
+    "InvalidPort",
+    "IpAddressConflict",
+    "LockedMemoryLimitExceeded",
+    "MadviseUnavailable",
+    "MappingAlreadyExists",
+    "MemoryMappingNotSupported",
+    "MessageTooLong",
+    "MincoreUnavailable",
+    "NameServerFailure",
+    "NetworkDown",
+    "NetworkNotFound",
+    "NetworkUnreachable",
+    "NoAddressReturned",
+    "NoBufferSelected",
+    "NotConnected",
+    "NotOpenForReading",
+    "NotOpenForWriting",
+    "OperationAborted",
+    "PortUnreachable",
+    "ProtocolUnsupportedByAddressFamily",
+    "ProtocolUnsupportedBySystem",
+    "ReadFailed",
+    "ResolvConfParseFailed",
+    "SignalInterrupt",
+    "SocketModeUnsupported",
+    "SocketNotConnected",
+    "SocketNotListening",
+    "SystemCannotYield",
+    "SystemOutdated",
+    "Timeout",
+    "TimeoutTooBig",
+    "UnknownHostName",
+    "UnmappedMemory",
+    "UnresolvedScope",
+    "WouldBlock",
+    "WriteFailed",
+    // std.os.linux io_uring / bpf errors
+    "ArgumentsInvalid",
+    "BufferInvalid",
+    "BuffersNotRegistered",
+    "CompletionQueueOvercommitted",
+    "EntriesNotInRange",
+    "EntriesNotPowerOfTwo",
+    "EntriesZero",
+    "EventNotSupported",
+    "EventRequiresUnsupportedCpuFeature",
+    "FieldInAttrNeedsZeroing",
+    "FilesAlreadyRegistered",
+    "FilesEmpty",
+    "InvalidProgram",
+    "InvalidSyscall",
+    "InvalidSyscallParameters",
+    "MapTypeOrAttrInvalid",
+    "MarkAlreadyExists",
+    "OpcodeNotSupported",
+    "ReachedMaxEntries",
+    "RingShuttingDown",
+    "RingShuttingDownOrAlreadyRegisteringFiles",
+    "SubmissionQueueEntryInvalid",
+    "SubmissionQueueFull",
+    "UserFdQuotaExceeded",
+    "UserMarkQuotaExceeded",
+    // streams, fmt, parse
+    "Closed",
+    "EndOfFile",
+    "EndOfStream",
+    "InvalidCharacter",
+    "InvalidEnumTag",
+    "InvalidFormat",
+    "InvalidPadding",
+    "StreamTooLong",
+    "Unexpected",
+    // std.math
+    "DivisionByZero",
+    "NegativeDenominator",
+    "NegativeIntoUnsigned",
+    "Overflow",
+    "SqrtOfNegativeNumber",
+    "TargetTooSmall",
+    "Underflow",
+    // std.unicode
+    "CodepointTooLarge",
+    "DanglingSurrogateHalf",
+    "ExpectedSecondSurrogateHalf",
+    "InvalidCodepoint",
+    "InvalidUtf8",
+    "InvalidWtf8",
+    "TruncatedInput",
+    "UnexpectedEof",
+    "UnexpectedSecondSurrogateHalf",
+    "Utf16InvalidStartCodeUnit",
+    "Utf8CannotEncodeSurrogateHalf",
+    "Utf8CodepointTooLarge",
+    "Utf8EncodesSurrogateHalf",
+    "Utf8ExpectedContinuation",
+    "Utf8InvalidStartByte",
+    "Utf8OverlongEncoding",
+    // std.crypto
+    "AuthenticationFailed",
+    "ContextTooLong",
+    "EvenModulus",
+    "IdentityElement",
+    "InsufficientEntropy",
+    "InsufficientRandomness",
+    "InsufficientSeed",
+    "InvalidBool",
+    "InvalidEncoding",
+    "InvalidLength",
+    "InvalidSignature",
+    "KeyMismatch",
+    "LargeValue",
+    "LengthMismatch",
+    "ModulusTooSmall",
+    "NonCanonical",
+    "NotSquare",
+    "NullExponent",
+    "PasswordVerificationFailed",
+    "RejectionSamplingFailed",
+    "SignatureVerificationFailed",
+    "UnexpectedElement",
+    "UnexpectedRepresentation",
+    "UnexpectedSubgroup",
+    "UnknownOid",
+    "UnsupportedCertificateVersion",
+    "WeakParameters",
+    "WeakPublicKey",
+    // std.crypto TLS / X.509 certificates
+    "CertificateAuthorityBundleTooBig",
+    "CertificateBundleLoadFailure",
+    "CertificateExpired",
+    "CertificateFieldHasInvalidLength",
+    "CertificateFieldHasWrongDataType",
+    "CertificateHasInvalidBitString",
+    "CertificateHasUnrecognizedObjectId",
+    "CertificateHostMismatch",
+    "CertificateIssuerMismatch",
+    "CertificateIssuerNotFound",
+    "CertificateNotYetValid",
+    "CertificatePublicKeyInvalid",
+    "CertificateSignatureAlgorithmMismatch",
+    "CertificateSignatureAlgorithmUnsupported",
+    "CertificateSignatureInvalid",
+    "CertificateSignatureInvalidLength",
+    "CertificateSignatureNamedCurveUnsupported",
+    "CertificateSignatureUnsupportedBitCount",
+    "CertificateTimeInvalid",
+    "MissingEndCertificateMarker",
+    "TlsAlert",
+    "TlsAlertAccessDenied",
+    "TlsAlertBadCertificate",
+    "TlsAlertBadCertificateStatusResponse",
+    "TlsAlertBadRecordMac",
+    "TlsAlertCertificateExpired",
+    "TlsAlertCertificateRequired",
+    "TlsAlertCertificateRevoked",
+    "TlsAlertCertificateUnknown",
+    "TlsAlertDecodeError",
+    "TlsAlertDecryptError",
+    "TlsAlertHandshakeFailure",
+    "TlsAlertIllegalParameter",
+    "TlsAlertInappropriateFallback",
+    "TlsAlertInsufficientSecurity",
+    "TlsAlertInternalError",
+    "TlsAlertMissingExtension",
+    "TlsAlertNoApplicationProtocol",
+    "TlsAlertProtocolVersion",
+    "TlsAlertRecordOverflow",
+    "TlsAlertUnexpectedMessage",
+    "TlsAlertUnknown",
+    "TlsAlertUnknownCa",
+    "TlsAlertUnknownPskIdentity",
+    "TlsAlertUnrecognizedName",
+    "TlsAlertUnsupportedCertificate",
+    "TlsAlertUnsupportedExtension",
+    "TlsBadLength",
+    "TlsBadRecordMac",
+    "TlsBadRsaSignatureBitCount",
+    "TlsBadSignatureScheme",
+    "TlsCertificateNotVerified",
+    "TlsConnectionTruncated",
+    "TlsDecodeError",
+    "TlsDecryptError",
+    "TlsDecryptFailure",
+    "TlsIllegalParameter",
+    "TlsInitializationFailed",
+    "TlsRecordOverflow",
+    "TlsSequenceOverflow",
+    "TlsUnexpectedMessage",
+    // std.compress
+    "BadGzipHeader",
+    "BadHeader",
+    "BadMagic",
+    "BadZlibHeader",
+    "BlockOversize",
+    "ChecksumFailure",
+    "CompressedSizeMismatch",
+    "ContentOversize",
+    "CorruptInput",
+    "CrcError",
+    "DecompressedSizeMismatch",
+    "DictionaryIdFlagUnsupported",
+    "EndOfMedia",
+    "HuffmanTreeIncomplete",
+    "IncompleteHuffmanTree",
+    "InputBufferUndersize",
+    "InvalidBitStream",
+    "InvalidBitString",
+    "InvalidBlockType",
+    "InvalidDynamicBlockHeader",
+    "InvalidMatch",
+    "InvalidRangeCode",
+    "MalformedAccuracyLog",
+    "MalformedCompressedBlock",
+    "MalformedFrame",
+    "MalformedFseBits",
+    "MalformedFseTable",
+    "MalformedHuffmanTree",
+    "MalformedLiteralsLength",
+    "MalformedLiteralsSection",
+    "MalformedSequence",
+    "MissingEndOfBlockCode",
+    "MissingMaskBit",
+    "MissingPrefix",
+    "MissingStartBit",
+    "NotXzStream",
+    "OutputBufferUndersize",
+    "OutputTooLong",
+    "OverheadTooLarge",
+    "OversubscribedHuffmanTree",
+    "RepeatModeFirst",
+    "ReservedBitSet",
+    "ReservedBlock",
+    "SequenceBufferUndersize",
+    "SuccessfulEndOfStream",
+    "TreelessLiteralsFirst",
+    "UnexpectedEndOfLiteralStream",
+    "UnexpectedOpCode",
+    "UnsupportedCompressionMethod",
+    "WindowOversize",
+    "WindowSizeUnknown",
+    "WrongChecksum",
+    "WrongStoredBlockNlen",
+    // std.http
+    "ConnectionClose",
+    "HttpChunkInvalid",
+    "HttpChunkTruncated",
+    "HttpConnectionClosing",
+    "HttpContentEncodingUnsupported",
+    "HttpExpectationFailed",
+    "HttpHeaderContinuationsUnsupported",
+    "HttpHeadersInvalid",
+    "HttpHeadersOversize",
+    "HttpRedirectLocationInvalid",
+    "HttpRedirectLocationMissing",
+    "HttpRedirectLocationOversize",
+    "HttpRequestTruncated",
+    "HttpTransferEncodingUnsupported",
+    "InvalidContentLength",
+    "MissingFinalNewline",
+    "RedirectRequiresResend",
+    "TooManyHttpRedirects",
+    "TunnelNotSupported",
+    "UnknownHttpMethod",
+    "UnsupportedUriScheme",
+    // std.json / std.zon parse errors
+    "DuplicateField",
+    "ExceededMaxDepth",
+    "InnerCarriageReturn",
+    "InvalidNumber",
+    "MissingField",
+    "ParseZon",
+    "UnexpectedCharacter",
+    "UnexpectedEndOfInput",
+    "UnexpectedRemainder",
+    "UnexpectedToken",
+    "UnknownField",
+    "ValueTooLong",
+    "WrongType",
+    // std.process
+    "CorruptPasswordFile",
+    "InvalidArg0",
+    "InvalidBatchScriptArg",
+    "InvalidExe",
+    "ProcessAlreadyExec",
+    "ProcessOrphaned",
+    "ProcessResources",
+    "UnrecoverableInvalidExe",
+    "UnsafeProgram",
+    "UserNotFound",
+    // std.testing
+    "ExpectedError",
+    "FailedTest",
+    "MemoryLeakDetected",
+    "NondeterministicMemoryUsage",
+    "SampleMaxStackOverflow",
+    "SampleStackNotSupported",
+    "SkipZigTest",
+    "SwallowedOutOfMemoryError",
+    "TestExpectedApproxEqAbs",
+    "TestExpectedApproxEqRel",
+    "TestExpectedEndsWith",
+    "TestExpectedEqual",
+    "TestExpectedError",
+    "TestExpectedStartsWith",
+    "TestFailed",
+    "TestUnexpectedError",
+    "TestUnexpectedResult",
+    // misc public std errors
+    "BadBufferSize",
+    "EnvironmentVariableMissing",
+    "IncompatibleVersion",
+    "InvalidName",
+    "NotFound",
+    "NotNtPath",
+    "OperationUnsupported",
+    "OptionUnsupported",
+    "OutOfResources",
+    "ParseError",
+    "ParseFailed",
+    "SectionOversize",
+    "UnalignedMemory",
+    "UnexpectedRemapFailure",
+    "UnknownTotalSystemMemory",
+    "Unsupported",
+    "UnsupportedClock",
+    "UnsupportedFeature",
+    "UnsupportedFlags",
+    "UnsupportedOperation",
+    "UnsupportedReparsePointType",
+    "WouldExceedMaximumResidentSetSize",
+};
+
+/// Std-declared error names are exempt from ZA703 — project code cannot rename them.
+fn isStdErrorName(name: []const u8) bool {
+    for (std_error_names) |std_name| {
+        if (mem.eql(u8, name, std_name)) return true;
+    }
+    return false;
 }
 
 /// Check if keyword is followed by valid boundary char
@@ -9749,7 +10332,11 @@ fn findAllocCall(
 
 /// Determine if .create() at the given position is called on an allocator.
 /// Type-based: checks if receiver is in tracked allocator variable set or is uppercase (factory).
-fn isAllocatorCreateTypeBased(t: []const u8, create_pos: usize, alloc_names: ?*const std.StringHashMapUnmanaged(void)) bool {
+fn isAllocatorCreateTypeBased(
+    t: []const u8,
+    create_pos: usize,
+    alloc_names: ?*const std.StringHashMapUnmanaged(void),
+) bool {
     const name = extractCreateCaller(t, create_pos) orelse return false;
     // Uppercase first letter = Type.create() factory method, NOT an allocator
     if (name.len > 0 and name[0] >= 'A' and name[0] <= 'Z') return false;
@@ -10504,7 +11091,8 @@ fn isDeferCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bo
         if (isCommentOrMultilineString(pl)) continue;
         if (mem.startsWith(u8, pl, "defer ") or mem.startsWith(u8, pl, "errdefer ")) return true;
         // Stop at statement boundaries — the defer can't be further back
-        if (mem.endsWith(u8, pl, ";") or mem.endsWith(u8, pl, "{") or mem.endsWith(u8, pl, "}")) return false;
+        if (mem.endsWith(u8, pl, ";") or mem.endsWith(u8, pl, "{") or
+            mem.endsWith(u8, pl, "}")) return false;
     }
     return false;
 }
@@ -12757,6 +13345,22 @@ fn checkFileIgnoreRule(line: []const u8, rule: []const u8) bool {
     return true;
 }
 
+/// Find the start of a `//` comment that is real code, not inside a string
+/// literal. Directives are only honored in comment context — a substring match
+/// inside a string (or in code mentioning the directive) is not a directive.
+fn findCommentStart(line: []const u8) ?usize {
+    // A line whose content starts with `\\` is a multiline-string body — its
+    // text is string data, so no real comment can begin on it.
+    const t = mem.trimStart(u8, line, " \t");
+    if (mem.startsWith(u8, t, "\\\\")) return null;
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, line, pos, "//")) |idx| {
+        if (!isInsideString(line, idx)) return idx;
+        pos = idx + 2;
+    }
+    return null;
+}
+
 /// Check if a line/block/file has an inline ignore directive for the given rule.
 ///
 /// Supports three forms:
@@ -12769,8 +13373,10 @@ fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool
     // First pass: check for file-level ignores (can appear anywhere in file)
     var file_lines = mem.splitScalar(u8, content, '\n');
     while (file_lines.next()) |line| {
-        if (mem.indexOf(u8, line, "ephor:ignore-file") != null) {
-            if (checkFileIgnoreRule(line, rule)) return true;
+        const comment_start = findCommentStart(line) orelse continue;
+        const comment = line[comment_start..];
+        if (mem.indexOf(u8, comment, "ephor:ignore-file") != null) {
+            if (checkFileIgnoreRule(comment, rule)) return true;
         }
     }
 
@@ -12965,7 +13571,7 @@ const CONFIG_FILENAME = "ephor.json";
 
 fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
     // Try to load ephor.json config file from current directory
-    const content = fs.cwd().readFileAlloc(allocator, CONFIG_FILENAME, 64 * 1024) catch return;
+    const content = Fs.cwd().readFileAlloc(allocator, CONFIG_FILENAME, 64 * 1024) catch return;
     defer allocator.free(content);
 
     // Simple JSON parsing for config format
@@ -12993,7 +13599,7 @@ fn tryLoadConfigFromDir(
     const dir_copy = try allocator.dupe(u8, dir);
     defer allocator.free(dir_copy);
 
-    const content = fs.cwd().readFileAlloc(allocator, config_path, 64 * 1024) catch return false;
+    const content = Fs.cwd().readFileAlloc(allocator, config_path, 64 * 1024) catch return false;
     defer allocator.free(content);
 
     parseConfigJson(allocator, content, cfg) catch |err| {
@@ -13290,14 +13896,15 @@ fn writeDefaultConfig() !void {
         \\
     ;
 
-    fs.cwd().writeFile(CONFIG_FILENAME, default_config, .{ .exclusive = true }) catch |err| return handleConfigCreateError(err);
+    Fs.cwd().writeFile(CONFIG_FILENAME, default_config, .{ .exclusive = true }) catch |err|
+        return handleConfigCreateError(err);
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
 }
 
 /// Detect the path_dir from build.zig by finding root_source_file patterns.
 /// Returns an allocator-owned string. Caller must free.
 fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
-    const content = fs.cwd().readFileAlloc(
+    const content = Fs.cwd().readFileAlloc(
         allocator,
         "build.zig",
         1024 * 1024,
@@ -13310,13 +13917,10 @@ fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
         return allocator.dupe(u8, ".") catch ".";
     };
 
+    defer allocator.free(content);
+
     const result = findPathDirInContent(content);
-    const duped = allocator.dupe(u8, result) catch {
-        allocator.free(content);
-        return allocator.dupe(u8, ".") catch ".";
-    };
-    allocator.free(content);
-    return duped;
+    return allocator.dupe(u8, result) catch ".";
 }
 
 /// Scan build.zig content for root_source_file pattern, return dir portion.
@@ -13368,7 +13972,7 @@ fn collectInstallEntries(
         try std.fmt.allocPrint(allocator, "{s}/main.zig", .{root_dir});
 
     const main_exists = blk: {
-        fs.cwd().access(main_path, .{}) catch break :blk false;
+        Fs.cwd().access(main_path, .{}) catch break :blk false;
         break :blk true;
     };
 
@@ -13394,7 +13998,7 @@ fn collectInstallEntries(
 /// Create ephor.json during install with auto-detected path_dir and entries.
 /// Best-effort: prints a message but does not fail the install if config cannot be created.
 fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
-    if (fs.cwd().access(CONFIG_FILENAME, .{})) {
+    if (Fs.cwd().access(CONFIG_FILENAME, .{})) {
         // Config already exists - update version if needed
         updateConfigVersion(allocator, ver);
         std.debug.print("{s} already exists (skipped)\n", .{CONFIG_FILENAME});
@@ -13462,7 +14066,7 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
     , .{ ver, root_dir, entries_json.items });
     defer allocator.free(config_content);
 
-    try fs.cwd().writeFile(CONFIG_FILENAME, config_content, .{});
+    try Fs.cwd().writeFile(CONFIG_FILENAME, config_content, .{});
 
     std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
         CONFIG_FILENAME, ver, root_dir,
@@ -13519,7 +14123,7 @@ fn printFetchFailedHelp(package_url: []const u8) void {
 /// and prints help if either is missing.
 fn checkProjectPrerequisites() bool {
     const has_build_zig = blk: {
-        fs.cwd().access("build.zig", .{}) catch break :blk false;
+        Fs.cwd().access("build.zig", .{}) catch break :blk false;
         break :blk true;
     };
     if (!has_build_zig) {
@@ -13527,7 +14131,7 @@ fn checkProjectPrerequisites() bool {
         return false;
     }
     const has_zon = blk: {
-        fs.cwd().access("build.zig.zon", .{}) catch break :blk false;
+        Fs.cwd().access("build.zig.zon", .{}) catch break :blk false;
         break :blk true;
     };
     if (!has_zon) {
@@ -13626,7 +14230,7 @@ fn updateBuildFnScanBraces(scan: *BuildFnScan, trimmed: []const u8, idx: usize) 
 }
 
 fn patchBuildZig(allocator: Allocator) !?usize {
-    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch |err| {
+    const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch |err| {
         if (err == error.FileNotFound)
             std.debug.print("No build.zig found in current directory.\n", .{});
         return err;
@@ -13643,7 +14247,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
 
     const insert_after = findBuildZigInsertionPoint(line_list.items) orelse {
         std.debug.print("Could not find insertion point in build.zig\n", .{});
-        return error.NoInsertionPoint;
+        return error.no_insertion_point;
     };
 
     var new_content: std.ArrayListUnmanaged(u8) = .empty;
@@ -13654,7 +14258,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
         if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK);
     }
 
-    try fs.cwd().writeFile("build.zig", new_content.items, .{});
+    try Fs.cwd().writeFile("build.zig", new_content.items, .{});
     return insert_after + 2;
 }
 
@@ -13671,7 +14275,7 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
 
     // Check if build.zig.zon exists and has ephor dependency
     const has_ephor = blk: {
-        const content = fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch break :blk false;
+        const content = Fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch break :blk false;
         defer allocator.free(content);
         break :blk mem.indexOf(u8, content, ".ephor") != null;
     };
@@ -13751,7 +14355,8 @@ fn migrateThresholds(allocator: Allocator, content: []const u8) ?[]const u8 {
 
     // Find the last non-whitespace character before the closing brace
     var last_end = indent_end;
-    while (last_end > brace_start + 1 and std.ascii.isWhitespace(content[last_end - 1])) last_end -= 1;
+    while (last_end > brace_start + 1 and
+        std.ascii.isWhitespace(content[last_end - 1])) last_end -= 1;
 
     const needs_comma = last_end > brace_start + 1 and content[last_end - 1] != ',';
 
@@ -13788,7 +14393,7 @@ fn migrateThresholds(allocator: Allocator, content: []const u8) ?[]const u8 {
 /// Update the "version" field in ephor.json if the file exists.
 /// Best-effort: silently does nothing if file is missing or cannot be updated.
 fn updateConfigVersion(allocator: Allocator, ver: []const u8) void {
-    const content = fs.cwd().readFileAlloc(
+    const content = Fs.cwd().readFileAlloc(
         allocator,
         CONFIG_FILENAME,
         64 * 1024,
@@ -13863,7 +14468,7 @@ fn insertVersionField(
 
 /// Write content to the config file (ephor.json).
 fn writeConfigFile(content: []const u8) !void {
-    try fs.cwd().writeFile(CONFIG_FILENAME, content, .{});
+    try Fs.cwd().writeFile(CONFIG_FILENAME, content, .{});
 }
 
 /// Canonical ephor build.zig integration block.
@@ -13893,7 +14498,7 @@ const EPHOR_BUILD_BLOCK =
 /// the new canonical block marker (// Ephor static analysis).
 /// Best-effort: silently does nothing if build.zig is missing or has no ephor section.
 fn updateBuildZigIntegration(allocator: Allocator) void {
-    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
+    const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
     defer allocator.free(content);
 
     // Try multiple marker pairs: (start_marker, end_marker)
@@ -13938,13 +14543,13 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
     }) catch return;
     defer allocator.free(new_content);
 
-    fs.cwd().writeFile("build.zig", new_content, .{}) catch return;
+    Fs.cwd().writeFile("build.zig", new_content, .{}) catch return;
 
     std.debug.print("Updated build.zig (ephor build steps)\n", .{});
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.13.4";
+const EPHOR_VERSION = "0.13.5";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -14132,7 +14737,7 @@ fn tryAddEntryFiles(
 ) !void {
     for (candidates) |f| {
         const full = try buildPathWithPrefix(allocator, cfg.path, f);
-        fs.cwd().access(full, .{}) catch {
+        Fs.cwd().access(full, .{}) catch {
             allocator.free(full);
             continue;
         };
@@ -14193,7 +14798,7 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
 
 /// Extract entry points from build.zig by parsing common patterns
 fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
-    const content = fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return;
+    const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return;
     defer allocator.free(content);
 
     // Track already-added entries to avoid duplicates
@@ -14345,7 +14950,7 @@ fn addEntryIfValid(
     added: *std.StringHashMap(void),
 ) !void {
     if (added.contains(path)) return;
-    fs.cwd().access(path, .{}) catch return;
+    Fs.cwd().access(path, .{}) catch return;
     const duped = try allocator.dupe(u8, path);
     try cfg.entries.append(allocator, duped);
     try added.put(duped, {});
@@ -14367,7 +14972,7 @@ fn addEntryWithPrefix(
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, path });
     defer allocator.free(full_path);
     if (added.contains(full_path)) return;
-    fs.cwd().access(full_path, .{}) catch return;
+    Fs.cwd().access(full_path, .{}) catch return;
     const duped = try allocator.dupe(u8, full_path);
     try cfg.entries.append(allocator, duped);
     try added.put(duped, {});
@@ -14476,7 +15081,7 @@ fn extractBuildZigEntriesFromPath(
     // Prevent stack overflow from circular @import chains (e.g., A imports B imports A)
     if (depth > 4) return;
 
-    const content = fs.cwd().readFileAlloc(allocator, build_path, 1024 * 1024) catch return;
+    const content = Fs.cwd().readFileAlloc(allocator, build_path, 1024 * 1024) catch return;
     defer allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -14515,7 +15120,7 @@ fn addDirEntry(
         return;
     }
     if (check_access) {
-        fs.cwd().access(full, .{}) catch {
+        Fs.cwd().access(full, .{}) catch {
             allocator.free(full);
             return;
         };
@@ -14534,7 +15139,7 @@ fn scanDirForEntriesWithPrefix(
     depth: u8,
 ) !void {
     if (depth > 16) return;
-    var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close(global_io.?);
     var iter = dir.iterate();
     while (try iter.next(global_io.?)) |entry| {
@@ -14557,7 +15162,7 @@ fn scanDirForEntries(
     depth: u8,
 ) !void {
     if (depth > 16) return;
-    var dir = fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+    var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close(global_io.?);
     var iter = dir.iterate();
     while (try iter.next(global_io.?)) |entry| {
@@ -14578,7 +15183,7 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
 
     const entries = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig", "build.zig" };
     for (entries) |e| {
-        fs.cwd().access(e, .{}) catch continue;
+        Fs.cwd().access(e, .{}) catch continue;
         const duped = try allocator.dupe(u8, e);
         try cfg.entries.append(allocator, duped);
         try added.put(duped, {});
@@ -14606,7 +15211,7 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
     }
 
     // Auto-discover test files in src/
-    var dir = fs.cwd().openDir("src", .{ .iterate = true }) catch return;
+    var dir = Fs.cwd().openDir("src", .{ .iterate = true }) catch return;
     defer dir.close(global_io.?);
     var iter = dir.iterate();
     while (try iter.next(global_io.?)) |entry| {
@@ -14880,9 +15485,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.13.4   # Install specific version
+        \\  ephor install --version=0.13.5   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.13.4   # Upgrade to specific version
+        \\  ephor upgrade --version=0.13.5   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -14897,7 +15502,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.13.4",
+        \\    "version": "0.13.5",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
@@ -14978,7 +15583,7 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
         // Auto-detect .ephor-ignore in project root
         const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
         defer allocator.free(ignore_path);
-        if (fs.cwd().access(ignore_path, .{})) |_| {
+        if (Fs.cwd().access(ignore_path, .{})) |_| {
             cfg.known_issues_path = try allocator.dupe(u8, ignore_path);
             break :blk cfg.known_issues_path.?;
         } else |_| {
@@ -14986,7 +15591,7 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
         }
     };
 
-    const content = fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return;
+    const content = Fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
 
     // Track how many keys we've successfully added for cleanup on error
@@ -15036,7 +15641,7 @@ fn writeCodeSnippet(
     issue_file: []const u8,
     issue_line: usize,
 ) !void {
-    const content = fs.cwd().readFileAlloc(allocator, issue_file, 10 * 1024 * 1024) catch return;
+    const content = Fs.cwd().readFileAlloc(allocator, issue_file, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -15057,7 +15662,12 @@ fn writeCodeSnippet(
 }
 
 /// Write a single issue entry to the export writer
-fn writeExportIssue(allocator: Allocator, output: *std.ArrayListUnmanaged(u8), issue: Issue, base_path: []const u8) !void {
+fn writeExportIssue(
+    allocator: Allocator,
+    output: *std.ArrayListUnmanaged(u8),
+    issue: Issue,
+    base_path: []const u8,
+) !void {
     const rel_path = types.relativePath(issue.file, base_path);
     try output.print(allocator, "## {s}:{d}:{d} [{s}]\n", .{
         rel_path, issue.line, issue.col, issue.rule,
@@ -15079,7 +15689,7 @@ fn exportIssues(
     cfg: *const Config,
     graph: ?*const ImportGraph,
 ) !usize {
-    var file = try fs.cwd().createFile(export_path, .{});
+    var file = try Fs.cwd().createFile(export_path, .{});
     defer file.close(global_io.?);
 
     var output = std.ArrayListUnmanaged(u8).empty;
@@ -15384,7 +15994,7 @@ fn sortIssuesByFile(issues: []Issue) void {
 /// Scan a path (file or directory) into the import graph
 fn scanPath(g: *ImportGraph, path: []const u8) !void {
     const is_file = blk: {
-        const stat = fs.cwd().statFile(path) catch break :blk false;
+        const stat = Fs.cwd().statFile(path) catch break :blk false;
         break :blk stat.kind == .file;
     };
     if (is_file) {
@@ -15418,7 +16028,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Get absolute base path for relative path calculation
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base_path = fs.cwd().realpath(cfg.path, &base_buf) catch cfg.path;
+    const base_path = Fs.cwd().realpath(cfg.path, &base_buf) catch cfg.path;
 
     switch (cfg.command) {
         .help => printHelp(),
@@ -15800,7 +16410,8 @@ pub fn main(init: std.process.Init) !void {
                     for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
                     for (panic_issues.items) |i| try all_issues.append(alloc, i);
 
-                    if (exportIssues(alloc, export_path, all_issues.items, &cfg, &g)) |exported_count| {
+                    const slice = all_issues.items;
+                    if (exportIssues(alloc, export_path, slice, &cfg, &g)) |exported_count| {
                         std.debug.print(
                             "exported {d} issues to {s}\n",
                             .{ exported_count, export_path },
@@ -17552,6 +18163,86 @@ test "ephor:ignore-file works from anywhere in file" {
     try std.testing.expect(isInlineDisabled(content, 3, "ZA201"));
 }
 
+test "ephor:ignore-file inside a string literal does not suppress" {
+    const content =
+        \\const s = "ephor:ignore-file ";
+        \\const a = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA101"));
+}
+
+test "ephor:ignore-file mentioned in code does not suppress" {
+    // main.zig itself contains this pattern — matching it made dogfooding
+    // file-wide vacuous for every rule.
+    const content =
+        \\const has_file_ignore = mem.indexOf(u8, line, "ephor:ignore-file") != null;
+        \\const a = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 1, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA101"));
+}
+
+test "ephor:ignore-file in trailing comment still suppresses" {
+    const content =
+        \\const marker = 1; // ephor:ignore-file ZA201
+        \\const a = foo() catch {};
+    ;
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA202"));
+}
+
+test "ephor:ignore-file inside a multiline string body does not suppress" {
+    // Test fixtures are \\ string bodies — a directive-looking line in one is
+    // string data, not a comment (this vacated the dogfood gate on main.zig).
+    const content =
+        \\    const fixture =
+        \\        \\// ephor:ignore-file
+        \\        \\const a = foo() catch {};
+        \\    ;
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 5, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(content, 5, "ZA101"));
+}
+
+test "analyzeNaming: error{ in comments and strings does not open an error block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // The comment and the string both mention error{ — neither may put the
+    // scanner into error-block state (it flagged 3k phantom members on main.zig).
+    const code =
+        \\// For lines like `const E = error{ Foo, Bar }`, only check after `error{`.
+        \\const my_const = 1;
+        \\const s = "error{ AlsoNotAMember }";
+        \\var my_var: u32 = 0;
+        \\fn myFunction() void {}
+        \\const RealSet = error{
+        \\    Snake_Member,
+        \\};
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_errblock.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_errblock.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // Only the genuine member of the real error set is flagged.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "error set member 'Snake_Member' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
 test "ephor:ignore before non-scope line suppresses just next line" {
     const content =
         \\// ephor:ignore ZA201
@@ -17990,54 +18681,35 @@ test "fnReturnsType rejects type-prefixed identifiers" {
     try std.testing.expect(!fnReturnsType("fn foo() typedef {", 6));
 }
 
-test "isFunctionPointerVar detects fn type annotation" {
-    try std.testing.expect(isFunctionPointerVar("var callback: fn(u32) void = myFunc;"));
-    try std.testing.expect(isFunctionPointerVar("var callback: fn (u32) void = myFunc;"));
-    try std.testing.expect(isFunctionPointerVar("var cb :fn(u32) void = myFunc;"));
-    try std.testing.expect(isFunctionPointerVar("var cb :fn (u32) void = myFunc;"));
+test "checkVarNaming: fn-valued vars are still snake_case (declaration kind rules)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // Field access / method reference RHS is ambiguous — var kind decides.
+    const mutex_line = "pub var group_storage_mutex = compat.Mutex.init;";
+    try checkVarNaming(&issues, a, "test.zig", mutex_line, 1);
+    try checkVarNaming(&issues, a, "test.zig", "var current_key = snapshot.key;", 2);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "isFunctionPointerVar detects qualified function assignment" {
-    try std.testing.expect(isFunctionPointerVar("var handler = module.handleRequest;"));
-    try std.testing.expect(isFunctionPointerVar("var cb = std.debug.print;"));
-}
+test "checkVarNaming: non-snake_case var is flagged" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
 
-test "isFunctionPointerVar rejects normal vars" {
-    try std.testing.expect(!isFunctionPointerVar("var my_count: u32 = 0;"));
-    try std.testing.expect(!isFunctionPointerVar("var buffer: [100]u8 = undefined;"));
-    try std.testing.expect(!isFunctionPointerVar("var name = SOME_CONSTANT;"));
-}
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
 
-test "isFunctionPointerVar detects modern *const fn pointer types" {
-    try std.testing.expect(isFunctionPointerVar("var cb: *const fn(u32) void = myFunc;"));
-    try std.testing.expect(isFunctionPointerVar("var cb: *const fn (u32) void = myFunc;"));
-    try std.testing.expect(isFunctionPointerVar("var cb: ?*const fn(u32) void = null;"));
-    try std.testing.expect(isFunctionPointerVar("var cb: ?*const fn (u32) void = null;"));
-    try std.testing.expect(isFunctionPointerVar("var cb: *fn(u32) void = myFunc;"));
-    try std.testing.expect(isFunctionPointerVar("var cb: ?*fn(u32) void = null;"));
-}
-
-test "isFunctionPointerVar rejects method call initializer" {
-    // std.atomic.Value(bool).init(false) — `.init(...)` is a call, not a fn reference
-    try std.testing.expect(!isFunctionPointerVar(
-        "var g_initialized = std.atomic.Value(bool).init(false);",
-    ));
-}
-
-test "isFunctionPointerVar rejects enum literal / .empty initializer" {
-    // `.empty` is a field access / sentinel value, not a function pointer
-    try std.testing.expect(!isFunctionPointerVar(
-        "var g_validator_cache: std.AutoHashMapUnmanaged(u64, Info) = .empty;",
-    ));
-    try std.testing.expect(!isFunctionPointerVar("var x = .foo;"));
-    try std.testing.expect(!isFunctionPointerVar("var x = .{ .a = 1 };"));
-}
-
-test "isFunctionPointerVar rejects qualified method call on generic type" {
-    // Generic type construction then method call — parens in qualifier path
-    try std.testing.expect(!isFunctionPointerVar(
-        "var x = std.AutoHashMapUnmanaged(u64, Info).empty;",
-    ));
+    try checkVarNaming(&issues, a, "test.zig", "var myBadVar = 5;", 1);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "variable 'myBadVar' should be snake_case",
+        issues.items[0].message,
+    );
 }
 
 // ============================================================================
@@ -18252,9 +18924,12 @@ test "checkErrorNaming: CamelCase error values are flagged" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkErrorNaming(&issues, a, "test.zig", "return error.FileNotFound;", 1, false);
+    try checkErrorNaming(&issues, a, "test.zig", "return error.MyCustomFailure;", 1, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
-    try std.testing.expectEqualStrings("error value 'FileNotFound' should be snake_case", issues.items[0].message);
+    try std.testing.expectEqualStrings(
+        "error value 'MyCustomFailure' should be snake_case",
+        issues.items[0].message,
+    );
 }
 
 test "checkErrorNaming: error set members must be snake_case" {
@@ -18266,9 +18941,85 @@ test "checkErrorNaming: error set members must be snake_case" {
     defer deinitIssues(&issues, a);
 
     // Single-line error set
-    try checkErrorNaming(&issues, a, "test.zig", "error{ FileNotFound, access_denied }", 1, true);
+    try checkErrorNaming(&issues, a, "test.zig", "error{ NotSnakeCase, access_denied }", 1, true);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
-    try std.testing.expectEqualStrings("error set member 'FileNotFound' should be snake_case", issues.items[0].message);
+    try std.testing.expectEqualStrings(
+        "error set member 'NotSnakeCase' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "checkErrorNaming: std-lib error names are exempt" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    const oom_line = "    if (err == error.OutOfMemory) return error.OutOfMemory;";
+    try checkErrorNaming(&issues, a, "test.zig", oom_line, 1, false);
+    try checkErrorNaming(&issues, a, "test.zig", "error.OutOfMemory => continue,", 2, false);
+    try checkErrorNaming(&issues, a, "test.zig", "    OutOfMemory,", 3, true);
+    try checkErrorNaming(&issues, a, "test.zig", "return error.FileNotFound;", 4, false);
+    try checkErrorNaming(&issues, a, "test.zig", "return error.my_project_error;", 5, false);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkErrorNaming: non-std TitleCase error values are still flagged" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(&issues, a, "test.zig", "return error.TotallyMadeUp;", 1, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "error value 'TotallyMadeUp' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "checkErrorNaming: error set composition stops at ||" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    const composed = "pub const Error = error{ key_too_long } || rlp.Error || Allocator.Error;";
+    try checkErrorNaming(&issues, a, "test.zig", composed, 1, true);
+    try checkErrorNaming(&issues, a, "test.zig", "} || rlp.Error || Allocator.Error;", 2, true);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkFnNaming: extern declarations are exempt" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    const extern_line = "pub extern fn secp256k1_context_create(flags: c_uint) ?*anyopaque;";
+    try checkFnNaming(&issues, a, "test.zig", extern_line, 1);
+    try checkFnNaming(&issues, a, "test.zig", "extern \"c\" fn some_c_symbol(x: c_int) c_int;", 2);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkFnNaming: non-camelCase fn is still flagged" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkFnNaming(&issues, a, "test.zig", "fn Bad_Name() void {}", 1);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
 }
 
 test "checkErrorNaming: underscore-prefixed error names are exempt" {
@@ -18686,7 +19437,7 @@ test "findAllocCall detects process.getEnvVarOwned(" {
     try std.testing.expect(result != null);
 }
 
-test "findAllocCall detects fs.getAppDataDir(" {
+test "findAllocCall detects Fs.getAppDataDir(" {
     const result = findAllocCall("    const dir = try std.fs.getAppDataDir(allocator, \"myapp\");", null);
     try std.testing.expect(result != null);
 }
@@ -19869,7 +20620,8 @@ test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
 }
 
 test "no FP for arena param used as receiver and first-arg (ZA103)" {
-    // Reproduces git.zig pattern: fn init(arena: Allocator, ...) with arena.dupe() and allocPrint(arena, ...)
+    // Reproduces git.zig pattern: fn init(arena: Allocator, ...) with
+    // arena.dupe() and allocPrint(arena, ...)
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -21013,6 +21765,149 @@ test "countFnParams excludes self parameter" {
     try std.testing.expectEqual(@as(usize, 0), countFnParams("fn deinit(self: *Self) void"));
 }
 
+test "countFnParams counts across multi-line signatures" {
+    const five_params =
+        "fn foo(\n    a: u8,\n    b: u8,\n    c: u8,\n    d: u8,\n    e: u8,\n) void";
+    try std.testing.expectEqual(@as(usize, 5), countFnParams(five_params));
+    // fn-pointer param: inner colons are at depth 2, only cb and y count
+    const fn_ptr_param =
+        "fn foo(\n    cb: *const fn (err: anyerror, x: u8) void,\n    y: u8,\n) void";
+    try std.testing.expectEqual(@as(usize, 2), countFnParams(fn_ptr_param));
+    // Multi-line method: self is still excluded when wrapped after the paren
+    const wrapped_self =
+        "fn exec(\n    self: *Pool,\n    sql: []const u8,\n    params: anytype,\n) !void";
+    try std.testing.expectEqual(@as(usize, 2), countFnParams(wrapped_self));
+}
+
+test "ZA303 fires on multi-line signature with too many params" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const code =
+        \\fn processFive(
+        \\    a: u8,
+        \\    b: u8,
+        \\    c: u8,
+        \\    d: u8,
+        \\    e: u8,
+        \\) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = c;
+        \\    _ = d;
+        \\    _ = e;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_multiline_params.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multiline_params.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var za303_count: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS) and
+            mem.eql(u8, issue.file, "test_multiline_params.zig")) za303_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), za303_count);
+}
+
+// ============================================================================
+// ZA701 Tests — unbreakable string-literal exemption
+// ============================================================================
+
+test "visibleLengthExcludingStrings counts only quote characters of literals" {
+    // 4 spaces + quote + 113 x's + quote + comma = 120 visible, 7 excluding
+    const long_literal = "    \"" ++ "x" ** 113 ++ "\",";
+    try std.testing.expectEqual(@as(usize, 120), calculateVisibleLength(long_literal));
+    try std.testing.expectEqual(@as(usize, 7), visibleLengthExcludingStrings(long_literal));
+    // Pure code line — nothing excluded
+    const pure_code = "x" ** 120;
+    try std.testing.expectEqual(@as(usize, 120), visibleLengthExcludingStrings(pure_code));
+    // Escaped quote inside a literal must not terminate it
+    try std.testing.expectEqual(
+        @as(usize, 13),
+        visibleLengthExcludingStrings("const s = \"a\\\"b\";"),
+    );
+}
+
+test "visibleLengthExcludingStrings does not treat '\"' char literal as a string" {
+    // The '"' char literal must not mask the rest of the line as string content
+    const char_line =
+        "if (c == '\"') return self.handleTheStringLiteral" ++
+        "WithAnExcessivelyLongFunctionName(alpha, beta, gamma);";
+    try std.testing.expect(calculateVisibleLength(char_line) > 100);
+    try std.testing.expect(visibleLengthExcludingStrings(char_line) > 100);
+    // Char literals count as ordinary code, whatever their form
+    try std.testing.expectEqual(
+        @as(usize, 14),
+        visibleLengthExcludingStrings("const q = '\"';"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 16),
+        visibleLengthExcludingStrings("const nl = '\\n';"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 16),
+        visibleLengthExcludingStrings("const sq = '\\'';"),
+    );
+    // Apostrophe-like ' not part of a char literal is ordinary code too
+    try std.testing.expectEqual(
+        @as(usize, 13),
+        visibleLengthExcludingStrings("// don't stop"),
+    );
+    // Real string overage adjacent to a char literal stays exempt
+    const mixed = "    if (c == '\"') return \"" ++ "x" ** 100 ++ "\";";
+    try std.testing.expect(calculateVisibleLength(mixed) > 100);
+    try std.testing.expectEqual(@as(usize, 28), visibleLengthExcludingStrings(mixed));
+}
+
+test "ZA701 exempts lines over-length solely due to string literals" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const long_literal = "    \"" ++ "x" ** 113 ++ "\",";
+    const short_string_long_code = "x" ** 50 ++ " \"ab\" " ++ "y" ** 60;
+    const pure_code = "x" ** 120;
+    const char_literal_line =
+        "if (c == '\"') return self.handleTheStringLiteral" ++
+        "WithAnExcessivelyLongFunctionName(alpha, beta, gamma);";
+    const mixed_char_and_string = "    if (c == '\"') return \"" ++ "x" ** 100 ++ "\";";
+    const code = long_literal ++ "\n" ++
+        short_string_long_code ++ "\n" ++
+        pure_code ++ "\n" ++
+        char_literal_line ++ "\n" ++
+        mixed_char_and_string ++ "\n";
+
+    const analysis = try createTestFileAnalysis(allocator, "test_long_lines.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_long_lines.zig"), {});
+
+    var issues = try analyzeStyle(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var flagged_lines: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_LINE_TOO_LONG)) {
+            // Lines 1 (unbreakable literal) and 5 (literal + char literal) are
+            // exempt; lines 2, 3, and 4 (char literal masking) are not.
+            try std.testing.expect(issue.line != 1 and issue.line != 5);
+            flagged_lines += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), flagged_lines);
+}
+
 test "isInsideTypeOf detects @TypeOf context" {
     try std.testing.expect(isInsideTypeOf("const T = @TypeOf(foo() catch unreachable);", 30, null));
     try std.testing.expect(!isInsideTypeOf("const x = foo() catch unreachable;", 22, null));
@@ -21183,7 +22078,7 @@ fn checkNoCyclomaticWarnings(issues: []const Issue, path: []const u8) !void {
     for (issues) |issue| {
         if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC) and mem.eql(u8, issue.file, path)) {
             std.debug.print("unexpected ZA305 for {s}: {s}\n", .{ path, issue.message });
-            return error.UnexpectedWarning;
+            return error.unexpected_warning;
         }
     }
 }
@@ -21192,7 +22087,7 @@ fn checkNoCognitiveWarnings(issues: []const Issue, path: []const u8) !void {
     for (issues) |issue| {
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, path)) {
             std.debug.print("unexpected ZA306 for {s}: {s}\n", .{ path, issue.message });
-            return error.UnexpectedWarning;
+            return error.unexpected_warning;
         }
     }
 }
@@ -21461,7 +22356,8 @@ test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
 
     // orelse is flat (no control braces) — both get flat-chain 2x multiplier
     // cyclomatic: 6 <= 5*2=10, cognitive: 5 <= 2*2=4? No, 5 > 4.
-    // But coalesce IS flat (all orelse at same level), so cognitive gets 2x → limit=4, score=5 → warning
+    // But coalesce IS flat (all orelse at same level), so cognitive gets
+    // 2x → limit=4, score=5 → warning
     const th = Thresholds{ .max_cyclomatic = 5, .max_cognitive = 1 };
     var issues = try analyzeComplexity(allocator, &graph, th);
     defer deinitIssues(&issues, allocator);

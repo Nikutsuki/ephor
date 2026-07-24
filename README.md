@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.13.4.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.13.5.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.13.4",
+  "version": "0.13.5",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -220,7 +220,7 @@ Example config:
 |------|----------|---------|-------------|
 | **ZA301** | warning | ON | Function exceeds max lines (default: 50; type factories get 3x) |
 | **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
-| **ZA303** | warning | ON | Function has too many parameters (default: 4) |
+| **ZA303** | warning | ON | Function has too many parameters (default: 4; counted across multi-line signatures) |
 | **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
 | **ZA305** | warning | OFF | Function has high cyclomatic complexity — McCabe CCN (default: 15) |
 | **ZA306** | warning | OFF | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
@@ -263,7 +263,7 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA701** | warning | ON | Line exceeds max length (default: 100 columns) |
+| **ZA701** | warning | ON | Line exceeds max length (default: 100 columns; lines over-length solely due to unbreakable string-literal content are exempt) |
 | **ZA702** | warning | OFF | File exceeds max size (set `max_file_bytes` to enable) |
 | **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
 
@@ -285,6 +285,8 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | Error set members | `snake_case` | `error{ file_not_found }` |
 | Imports | (not checked) | `const std = @import("std");` |
 | Names starting with `_` | (exempt) | `fn _helper() void {}` |
+
+**ZA703 exemptions:** std-lib error names (`error.OutOfMemory`, `error.FileNotFound`, …) are exempt — project code cannot rename them. `extern fn` declarations are exempt — their names are ABI-fixed (`export fn` names are NOT exempt — they are project-chosen identifiers). Identifiers on the right-hand side of error-set composition (`error{ a, b } || other.Error`) are references to other error sets, not members, and are not checked. Variables are judged by declaration kind: `var` is always `snake_case`, even when its value is a function reference.
 
 ### Null Safety (ZA8xx)
 

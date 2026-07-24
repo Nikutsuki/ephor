@@ -1062,18 +1062,6 @@ pub fn checkDeprecated(line: []const u8) ?DeprecatedPattern {
 // NOTE: 0.16.0 is released - update if APIs change
 // ============================================================================
 
-/// HashMap wrapper for consistent API across versions
-pub fn hashMapPut(
-    comptime K: type,
-    comptime V: type,
-    map: *std.StringHashMap(V),
-    key: K,
-    value: V,
-) !void {
-    // Assuming same API as 0.15 until 0.16 is released
-    return map.put(key, value);
-}
-
 /// ArrayList wrapper for consistent API across versions
 pub fn arrayListAppend(
     comptime T: type,

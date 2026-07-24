@@ -1068,18 +1068,6 @@ pub fn checkDeprecated(line: []const u8) ?DeprecatedPattern {
 // API Wrappers for consistent interface across versions
 // ============================================================================
 
-/// HashMap wrapper for consistent API across versions
-pub fn hashMapPut(
-    comptime K: type,
-    comptime V: type,
-    map: *std.StringHashMap(V),
-    key: K,
-    value: V,
-) !void {
-    // In 0.15.x, allocator is stored in the map itself
-    return map.put(key, value);
-}
-
 /// ArrayList wrapper for consistent API across versions
 pub fn arrayListAppend(
     comptime T: type,
@@ -1140,18 +1128,6 @@ test "checkDeprecated finds deprecated patterns" {
     const result = checkDeprecated(line);
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("ZAV101", result.?.rule);
-}
-
-test "HashMapPut works with StringHashMap" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var map = std.StringHashMap(u32).init(allocator);
-    defer map.deinit();
-
-    try hashMapPut([]const u8, u32, &map, "test", 42);
-    try std.testing.expectEqual(@as(u32, 42), map.get("test").?);
 }
 
 test "ArrayListAppend works with ArrayListUnmanaged" {

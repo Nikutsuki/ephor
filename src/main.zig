@@ -129,6 +129,7 @@ const RULE_UNUSED_CONST = types.RULE_UNUSED_CONST;
 const RULE_UNUSED_VAR = types.RULE_UNUSED_VAR;
 const RULE_ORPHAN_FILE = types.RULE_ORPHAN_FILE;
 const RULE_NEEDS_FORMAT = types.RULE_NEEDS_FORMAT;
+const RULE_DEFINITE_ASSIGNMENT = types.RULE_DEFINITE_ASSIGNMENT;
 const RULE_LINE_TOO_LONG = types.RULE_LINE_TOO_LONG;
 const RULE_FILE_TOO_LONG = types.RULE_FILE_TOO_LONG;
 const RULE_NAMING_CONVENTION = types.RULE_NAMING_CONVENTION;
@@ -7288,7 +7289,7 @@ fn trackTestBlock(
 }
 
 /// Check for silent catch patterns (ZA201)
-/// Skip note in defer/errdefer contexts (best-effort cleanup)
+/// Skip the warning in defer/errdefer contexts (best-effort cleanup)
 fn checkSilentCatch(
     t: []const u8,
     path: []const u8,
@@ -7315,7 +7316,7 @@ fn checkSilentCatch(
         .file = path,
         .line = line,
         .col = found.col + 1,
-        .severity = .note,
+        .severity = .warning,
         .rule = RULE_SILENT_CATCH,
         .message = found.msg,
         .help = "use catch |err| with logging, or propagate with try",
@@ -10684,7 +10685,6 @@ fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
     return closed and state.brace_depth == 0;
 }
 
-/// Process a single function's analysis (memory, CFG, etc.)
 /// Convert definite assignment issues to ZA607 warnings
 fn emitDefiniteAssignmentIssues(
     allocator: Allocator,
@@ -10705,7 +10705,7 @@ fn emitDefiniteAssignmentIssues(
             .line = entry.value_ptr.*,
             .col = 1,
             .severity = .warning,
-            .rule = "ZA607",
+            .rule = RULE_DEFINITE_ASSIGNMENT,
             .message = msg,
             .help = "ensure variable is assigned " ++
                 "on all code paths",
@@ -11736,7 +11736,7 @@ fn checkCatchUnreachable(
             .file = file_path,
             .line = line_num,
             .col = site.col + 1,
-            .severity = .note,
+            .severity = .warning,
             .rule = RULE_CATCH_UNREACHABLE,
             .message = "catch unreachable will panic on error",
             .help = "use explicit error handling",
@@ -11925,7 +11925,7 @@ fn checkOrelseUnreachable(
         .file = file_path,
         .line = line_num,
         .col = col + 1,
-        .severity = .note,
+        .severity = .warning,
         .rule = RULE_ORELSE_UNREACHABLE,
         .message = "orelse unreachable will panic",
         .help = "use explicit null handling",
@@ -11949,7 +11949,7 @@ fn checkLineOrelseUnreachable(
             .file = file_path,
             .line = line_num,
             .col = col + 1,
-            .severity = .note,
+            .severity = .warning,
             .rule = RULE_ORELSE_UNREACHABLE,
             .message = "orelse unreachable will panic",
             .help = "use explicit null handling",
@@ -14756,8 +14756,8 @@ fn writeDefaultConfig() !void {
         \\  //   ZA1xx Memory:     ZA101 alloc-no-defer, ZA102 create-no-defer,
         \\  //                     ZA103 alloc-no-errdefer,
         \\  //                     ZA105 use-after-free, ZA106 double-free
-        \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (note), ZA202 catch-unreachable (note),
-        \\  //                     ZA203 orelse-unreachable (note), ZA204 undefined (note),
+        \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (warning), ZA202 catch-unreachable (warning),
+        \\  //                     ZA203 orelse-unreachable (warning), ZA204 undefined (warning),
         \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer,
         \\  //                     ZA207 catch-undefined, ZA208 panic (note)
         \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
@@ -14765,7 +14765,8 @@ fn writeDefaultConfig() !void {
         \\  //                     ZA305 cyclomatic (OFF by default), ZA306 cognitive (OFF by default)
         \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
         \\  //   ZA5xx Structure:  ZA501 orphan-file
-        \\  //   ZA6xx Format:     ZA601 needs-format
+        \\  //   ZA6xx Format:     ZA601 needs-format,
+        \\  //                     ZA607 read-before-assign (semantic, not formatting)
         \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long, ZA703 naming
         \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
         \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
@@ -16367,7 +16368,7 @@ fn printHelp() void {
         \\  --max-params=N       Max parameters (default: 4)
         \\  --max-branches=N     Max branches per function (default: 12)
         \\  --max-line-length=N  Max columns per line (default: 100)
-        \\  --max-file-bytes=N   Max file size in bytes (optional)
+        \\  --max-file-bytes=N   Max file size in bytes (requires --enable=ZA702)
         \\  -V, --verbose        Verbose output
         \\  -s, --summary        Show summary at end
         \\  -b, --build          With 'init': also show build.zig integration
@@ -16426,7 +16427,8 @@ fn printHelp() void {
         \\                     ZA105: use-after-free, ZA106: double-free)
         \\  ZA2xx  ErrHandle  (ZA201: silent-catch, ZA202: catch-unreachable,
         \\                     ZA203: orelse-unreachable, ZA204: undefined,
-        \\                     ZA205: ignored-error, ZA206: exit-bypasses-defer)
+        \\                     ZA205: ignored-error, ZA206: exit-bypasses-defer,
+        \\                     ZA207: catch-undefined, ZA208: panic)
         \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap, ZA802: unsafe-deref)
         \\  ZA9xx  Panic      (ZA901: decrement-no-guard, ZA902: subtraction-overflow,
         \\                     ZA903: index-arithmetic)
@@ -16436,10 +16438,12 @@ fn printHelp() void {
         \\  ZA4xx  Unused     (ZA401: unused-import, ZA402: unused-const,
         \\                     ZA403: unused-var)
         \\  ZA5xx  Structure  (ZA501: orphan-file)
-        \\  ZA6xx  Format     (ZA601: needs-format)
+        \\  ZA6xx  Format     (ZA601: needs-format,
+        \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long, ZA703: naming)
-        \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: use-after-free,
-        \\                     ZR103: double-free, ZR104: invalid-free)
+        \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
+        \\                     ZR103: use-after-free, ZR104: test-failure,
+        \\                     ZR105: panic)
         \\
         \\RUNTIME ANALYSIS (ephor runtime):
         \\  Runs 'zig build test' with GeneralPurposeAllocator diagnostics enabled.
@@ -19894,10 +19898,12 @@ test "analyzeErrors detects silent catch (ZA201)" {
     var issues = try analyzeErrors(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should detect the silent catch
+    // Should detect the silent catch, as a warning (README documents ZA201 as
+    // warning severity)
     var found_za201 = false;
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_SILENT_CATCH)) {
+            try std.testing.expect(issue.severity == .warning);
             found_za201 = true;
             break;
         }
@@ -22587,6 +22593,7 @@ test "ZA202 catch unreachable fires via analyzeErrors" {
         if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE) and
             mem.eql(u8, issue.file, "test_za202.zig"))
         {
+            try std.testing.expect(issue.severity == .warning);
             found = true;
             break;
         }
@@ -22621,6 +22628,7 @@ test "ZA203 orelse unreachable fires via analyzeErrors" {
         if (mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE) and
             mem.eql(u8, issue.file, "test_za203.zig"))
         {
+            try std.testing.expect(issue.severity == .warning);
             found = true;
             break;
         }

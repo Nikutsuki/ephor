@@ -135,7 +135,7 @@ ephor init                # Create ephor.json config file
 Industry-standard format compatible with GCC, clang, ESLint, IntelliJ IDEA, and VS Code:
 
 ```
-src/main.zig:506:25: note[ZA201]: silent catch {} discards error without handling
+src/main.zig:506:25: warning[ZA201]: silent catch {} discards error without handling
   help: use 'catch |err| { log.err(...); return err; }' or propagate with 'try'
 ```
 
@@ -258,13 +258,19 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA601** | warning | ON | File needs `zig fmt` |
+| **ZA607** | warning | ON | Variable potentially read before assignment on some code path |
+
+**Note:** ZA607 is a semantic definite-assignment check (CFG-based), not a
+formatting rule — it lives in the ZA6xx range only for backward compatibility
+with existing inline-ignores, and is reported under the Memory category in
+`--summary` output.
 
 ### Style (ZA7xx)
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA701** | warning | ON | Line exceeds max length (default: 100 columns; lines over-length solely due to unbreakable string-literal content are exempt) |
-| **ZA702** | warning | OFF | File exceeds max size (set `max_file_bytes` to enable) |
+| **ZA702** | warning | OFF | File exceeds max size (requires `--enable=ZA702` or config `enable`; threshold via `max_file_bytes`, default 50000) |
 | **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
 
 #### ZA703 Naming Rules
@@ -292,7 +298,7 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA801** | warning | OFF | Optional unwrap (.?) may panic if null (use `--enable=ZA8`) |
+| **ZA801** | warning | OFF | Chained optional unwrap (`.?` immediately followed by field/index/call) may panic if null; bare `.?;` unwraps are not flagged today (use `--enable=ZA8`) |
 | **ZA802** | warning | OFF | Dereferencing optional pointer may panic if null (use `--enable=ZA8`) |
 
 **When to enable ZA8xx:** Pre-release audits for safety-critical code (servers, databases) where a null panic means downtime. Off by default because `.?` is extremely common in Zig and usually intentionally guarded.
@@ -395,7 +401,7 @@ Options:
   --max-params=N       Max parameters (default: 4)
   --max-branches=N     Max branches per function (default: 12)
   --max-line-length=N  Max columns per line (default: 100)
-  --max-file-bytes=N   Max file size in bytes (enables ZA702)
+  --max-file-bytes=N   Max file size in bytes (requires --enable=ZA702)
   -y, --yes            Skip interactive confirmation (e.g., runtime approval)
   --version=<X.Y.Z>   For install/upgrade: pin a specific version
   --command=<cmd>      For runtime: custom command instead of 'zig build test'
@@ -592,10 +598,10 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 
 | Code | Meaning |
 |------|---------|
-| 0 | No warnings or errors found |
-| 1 | Warnings or errors found |
+| 0 | Analysis completed (regardless of findings) |
+| 1 | Usage error (no entry points, bad arguments, init/install failures) |
 
-Notes (informational issues like ZA205 and ZA208) are printed but do **not** cause a non-zero exit code. Only warnings and errors affect the exit code.
+All findings are informational: `ephor check` exits 0 whether or not issues are found. Gate CI on the output (or `--summary` counts) instead.
 
 ## Examples
 
@@ -603,7 +609,7 @@ Notes (informational issues like ZA205 and ZA208) are printed but do **not** cau
 
 ```bash
 $ ephor check
-src/main.zig:506:25: note[ZA201]: silent catch {} discards error without handling
+src/main.zig:506:25: warning[ZA201]: silent catch {} discards error without handling
   help: use 'catch |err| { log.err(...); return err; }' or propagate with 'try'
 
 ephor summary
@@ -873,7 +879,7 @@ Allocations transferred to stdlib containers (e.g., `list.append(ptr)`) or retur
 | Comptime-generated types | Types from `comptime` blocks | Falls through to `.unknown` → vocab |
 | Pointer chain stripping | `**MyStruct` keeps one `*` | May cause lookup mismatch |
 
-All limitations fall through to `.unknown`, which triggers vocab-based detection (Tier 3/4). This means: **no false negatives from parsing limitations** — the worst case is falling back to the same behavior as before TypeContext existed.
+All limitations fall through to `.unknown`, which triggers vocab-based detection (Tier 3/4) — the worst case is falling back to the same behavior as before TypeContext existed. This fallback limits but does **not** eliminate false negatives: ephor handles common multi-line signatures and allocations, but line-based analysis retains documented blind spots (some multi-line signature/extraction edge cases are still missed; these are tracked in the project issue tracker).
 
 #### Known False Positive Patterns
 

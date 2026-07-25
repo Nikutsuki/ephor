@@ -18,7 +18,7 @@ pub const RULE_ALLOC_NO_ERRDEFER = "ZA103";
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
 
-// ZA2xx - Error handling patterns (informational notes + ZA206 warning)
+// ZA2xx - Error handling patterns (warnings; ZA205/ZA208 are notes)
 pub const RULE_SILENT_CATCH = "ZA201";
 pub const RULE_CATCH_UNREACHABLE = "ZA202";
 pub const RULE_ORELSE_UNREACHABLE = "ZA203";
@@ -44,8 +44,10 @@ pub const RULE_UNUSED_VAR = "ZA403";
 // ZA5xx - Structure
 pub const RULE_ORPHAN_FILE = "ZA501";
 
-// ZA6xx - Formatting
+// ZA6xx - Formatting (ZA607 is a semantic definite-assignment check that kept
+// its ZA6xx ID for backward compatibility with existing inline-ignores)
 pub const RULE_NEEDS_FORMAT = "ZA601";
+pub const RULE_DEFINITE_ASSIGNMENT = "ZA607";
 
 // ZA7xx - Style
 pub const RULE_LINE_TOO_LONG = "ZA701";

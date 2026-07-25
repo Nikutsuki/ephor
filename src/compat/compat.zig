@@ -590,3 +590,103 @@ test "getStdlibContainerInitPatterns returns non-empty list" {
     }
     try std.testing.expect(found_arraylist);
 }
+
+test "isVersionSupported accepts the running compiler version" {
+    try std.testing.expect(isVersionSupported());
+}
+
+test "getSupportedVersionsString names the supported minor versions" {
+    const s = getSupportedVersionsString();
+    try std.testing.expect(std.mem.indexOf(u8, s, "0.15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "0.16") != null);
+}
+
+test "getErrorMethods returns non-empty list" {
+    const methods = getErrorMethods();
+    try std.testing.expect(methods.len > 0);
+    var found_read = false;
+    for (methods) |m| {
+        if (std.mem.eql(u8, m, ".read(")) found_read = true;
+    }
+    try std.testing.expect(found_read);
+}
+
+test "getAllocPatterns returns non-empty list" {
+    const patterns = getAllocPatterns();
+    try std.testing.expect(patterns.len > 0);
+    var found_alloc = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, ".alloc(")) found_alloc = true;
+    }
+    try std.testing.expect(found_alloc);
+}
+
+test "getCreatePatterns covers create call forms" {
+    const patterns = getCreatePatterns();
+    try std.testing.expect(patterns.len > 0);
+    var found = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, ".create(")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "getFreePatterns covers free call forms" {
+    const patterns = getFreePatterns();
+    try std.testing.expect(patterns.len > 0);
+    var found = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, ".free(")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "getDestroyPatterns covers destroy call forms" {
+    const patterns = getDestroyPatterns();
+    try std.testing.expect(patterns.len > 0);
+    var found = false;
+    for (patterns) |p| {
+        if (std.mem.eql(u8, p, ".destroy(")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "getKeywords includes core declaration keywords" {
+    const kws = getKeywords();
+    try std.testing.expect(kws.len > 0);
+    var found_fn = false;
+    var found_const = false;
+    for (kws) |k| {
+        if (std.mem.eql(u8, k, "fn ")) found_fn = true;
+        if (std.mem.eql(u8, k, "const ")) found_const = true;
+    }
+    try std.testing.expect(found_fn);
+    try std.testing.expect(found_const);
+}
+
+test "getBreakingChanges returns non-empty list" {
+    try std.testing.expect(getBreakingChanges().len > 0);
+}
+
+test "getStdModules includes std.mem" {
+    const modules = getStdModules();
+    try std.testing.expect(modules.len > 0);
+    var found = false;
+    for (modules) |m| {
+        if (std.mem.eql(u8, m, "std.mem")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "getAllocMethodShortNames includes alloc and create" {
+    const names = getAllocMethodShortNames();
+    try std.testing.expect(names.len > 0);
+    var found_alloc = false;
+    var found_create = false;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, "alloc")) found_alloc = true;
+        if (std.mem.eql(u8, n, "create")) found_create = true;
+    }
+    try std.testing.expect(found_alloc);
+    try std.testing.expect(found_create);
+}

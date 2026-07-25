@@ -1195,3 +1195,11 @@ test "vocabulary all_init_patterns includes MemoryPool" {
     }
     try std.testing.expect(found);
 }
+
+test "createTestAllocator returns a working leak-detecting allocator" {
+    var da = createTestAllocator();
+    const allocator = da.allocator();
+    const buf = try allocator.alloc(u8, 16);
+    allocator.free(buf);
+    try std.testing.expect(da.deinit() == .ok);
+}

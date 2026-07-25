@@ -70,12 +70,12 @@ pub const RULE_RUNTIME_USE_AFTER_FREE = "ZR103";
 pub const RULE_RUNTIME_TEST_FAILURE = "ZR104";
 pub const RULE_RUNTIME_PANIC = "ZR105";
 
-// ZT1xx - Tests (ZT105 reserved — lands in a later batch)
+// ZT1xx - Tests
 pub const RULE_TEST_LIE = "ZT101";
 pub const RULE_TEST_NO_ASSERTIONS = "ZT102";
 pub const RULE_TEST_TRIVIAL_ASSERT = "ZT103";
 pub const RULE_TEST_SWALLOWED_ERROR = "ZT104";
-pub const RULE_ZT105 = "ZT105";
+pub const RULE_TEST_UNTESTED_PUBLIC_FN = "ZT105";
 
 // ============================================================================
 // Return Type Classification (for type-based detection)

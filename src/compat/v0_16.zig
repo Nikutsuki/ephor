@@ -1144,3 +1144,11 @@ test "vocabulary alloc_methods includes dupe and dupeZ" {
 }
 
 // Note: Add deprecated pattern tests as 0.16 API changes are identified
+
+test "createTestAllocator returns a working leak-detecting allocator" {
+    var da = createTestAllocator();
+    const allocator = da.allocator();
+    const buf = try allocator.alloc(u8, 16);
+    allocator.free(buf);
+    try std.testing.expect(da.deinit() == .ok);
+}

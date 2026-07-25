@@ -722,6 +722,22 @@ fn hasPatternNotInString(t: []const u8, pattern: []const u8) bool {
     return false;
 }
 
+/// Check if a keyword appears as real code: not inside a string literal and
+/// not embedded in a longer identifier (`@panic("Retry ...")` contains
+/// "try " on both counts). Iterates ALL occurrences — an early one may be
+/// inside a string while a later one is real.
+fn hasRealKeyword(t: []const u8, kw: []const u8) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], kw)) |rel| {
+        const pos = s + rel;
+        s = pos + kw.len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (isInsideString(t, pos)) continue;
+        return true;
+    }
+    return false;
+}
+
 /// Check if the caller before .alloc() or .create() is a Type (starts uppercase)
 /// Type.alloc() is a factory method, not an allocator call
 /// Handles patterns like: Type.alloc(), module.Type.alloc(), Type(T).alloc()
@@ -895,6 +911,25 @@ fn isDirectFreeOfVar(t: []const u8, var_name: []const u8) bool {
                 return true;
             }
         }
+    }
+    return false;
+}
+
+/// Check if a line directly frees var_name OR any alias of var_name.
+/// Freeing through an alias releases the root allocation:
+///   `const a = buf; allocator.free(a);` frees buf's memory.
+/// Aliases resolve to the root at collection time (see collectAliases), so a
+/// single map scan covers the whole chain.
+fn isDirectFreeOfVarOrAlias(
+    t: []const u8,
+    var_name: []const u8,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
+) bool {
+    if (isDirectFreeOfVar(t, var_name)) return true;
+    var it = aliases.iterator();
+    while (it.next()) |entry| {
+        if (!mem.eql(u8, entry.value_ptr.*, var_name)) continue;
+        if (isDirectFreeOfVar(t, entry.key_ptr.*)) return true;
     }
     return false;
 }
@@ -2523,6 +2558,7 @@ fn analyzeOneAllocSafety(
         in_defer,
         in_errdefer,
         num_blocks,
+        aliases,
     );
     defer bstate.deinit(allocator);
     try detectUseAfterFree(
@@ -2551,7 +2587,17 @@ fn analyzeOneAllocSafety(
         in_errdefer,
         &bstate,
         issues,
+        aliases,
     );
+    try detectDeferDoubleFree(allocator, &.{
+        .lines = lines,
+        .func_line = func_line,
+        .file_path = file_path,
+        .var_name = alloc_info.name,
+        .in_defer = in_defer,
+        .in_errdefer = in_errdefer,
+        .aliases = aliases,
+    }, issues);
 }
 
 fn initAndScanFreeState(
@@ -2563,6 +2609,7 @@ fn initAndScanFreeState(
     in_defer: []const bool,
     in_errdefer: []const bool,
     num_blocks: usize,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !BlockFreeState {
     var bstate = try initBlockFreeState(allocator, num_blocks);
     scanBlocksForFreeOps(
@@ -2574,6 +2621,7 @@ fn initAndScanFreeState(
         in_errdefer,
         alloc_info,
         &bstate,
+        aliases,
     );
     return bstate;
 }
@@ -2621,9 +2669,54 @@ fn analyzeCFGMemorySafety(
     return issues;
 }
 
+/// Extract the RHS of `const X = rhs;` when rhs is a plain identifier.
+fn extractSimpleIdentRhs(t: []const u8) ?[]const u8 {
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
+    var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+    if (rhs.len > 0 and rhs[rhs.len - 1] == ';') rhs = rhs[0 .. rhs.len - 1];
+    rhs = mem.trim(u8, rhs, " \t");
+    if (rhs.len == 0) return null;
+    for (rhs) |c| {
+        if (!isIdent(c)) return null;
+    }
+    return rhs;
+}
+
+/// Resolve an alias RHS to its root allocation name: either a tracked
+/// allocation or the root of an already-collected alias. Chains resolve at
+/// collection time, so lookup depth stays O(1) regardless of chain length.
+fn resolveAliasRoot(
+    rhs: []const u8,
+    allocs: *const std.StringHashMap(CFGAllocation),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
+) ?[]const u8 {
+    if (allocs.contains(rhs)) return rhs;
+    return aliases.get(rhs);
+}
+
+/// Register `const alias = root;` in the alias map when the RHS resolves to
+/// a tracked allocation.
+fn collectAliasFromLine(
+    a: Allocator,
+    t: []const u8,
+    allocs: *const std.StringHashMap(CFGAllocation),
+    aliases: *std.StringHashMapUnmanaged([]const u8),
+) !void {
+    if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return;
+    const name = extractVarDeclName(t) orelse return;
+    // Don't track if this name is itself an allocation (not an alias)
+    if (allocs.contains(name)) return;
+    const rhs = extractSimpleIdentRhs(t) orelse return;
+    const root = resolveAliasRoot(rhs, allocs, aliases) orelse return;
+    try aliases.put(a, name, root);
+}
+
 /// Collect variable aliases for tracked allocations.
 /// Scans for `const alias = original;` or `var alias = original;` patterns
 /// where `original` is a tracked allocation name. Returns alias_name -> original_name map.
+/// The map is position-insensitive: a var REBOUND after aliasing
+/// (`var a = buf; a = other; free(a); use(buf);`) can misattribute the
+/// alias's free to the root allocation.
 fn collectAliases(
     a: Allocator,
     lines: []const []const u8,
@@ -2634,36 +2727,7 @@ fn collectAliases(
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-
-        // Match: const X = Y; or var X = Y;
-        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
-        const name = extractVarDeclName(t) orelse continue;
-
-        // Don't track if this name is itself an allocation (not an alias)
-        if (allocs.contains(name)) continue;
-
-        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
-        var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
-
-        // Strip trailing semicolon
-        if (rhs.len > 0 and rhs[rhs.len - 1] == ';') rhs = rhs[0 .. rhs.len - 1];
-        rhs = mem.trim(u8, rhs, " \t");
-
-        // RHS must be a simple identifier (the original variable name)
-        if (rhs.len == 0) continue;
-        var all_ident = true;
-        for (rhs) |c| {
-            if (!isIdent(c)) {
-                all_ident = false;
-                break;
-            }
-        }
-        if (!all_ident) continue;
-
-        // Check if RHS is a tracked allocation
-        if (allocs.contains(rhs)) {
-            try aliases.put(a, name, rhs);
-        }
+        try collectAliasFromLine(a, t, allocs, &aliases);
     }
 
     return aliases;
@@ -2711,9 +2775,11 @@ fn collectMemSafetyAllocs(
     defer all_alloc_names.deinit(allocator);
 
     var allocs = std.StringHashMap(CFGAllocation).init(allocator);
-    for (lines, 0..) |line, idx| {
+    // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
+    var join_buf: [max_join_bytes]u8 = undefined;
+    for (lines, 0..) |_, idx| {
         const actual_line = func_line + idx;
-        const t = mem.trim(u8, line, " \t\r");
+        const t = joinParenContinuation(lines, idx, &join_buf);
         // Type-based allocation detection: .alloc() or .create() on tracked allocators
         const alloc_call = findAllocCall(t, &all_alloc_names) orelse continue;
         // Skip allocations from type-tracked no-free allocators (stdlib types only)
@@ -2737,7 +2803,10 @@ fn collectMemSafetyAllocs(
         }
         // Dotted first-arg arena heuristic: allocPrint(cg.module.arena, ...)
         if (isFirstArgArena(t)) continue;
-        const name = extractVarDeclName(t) orelse continue;
+        // Name comes from the physical line — slices into join_buf dangle
+        // (the buffer is reused on the next iteration and dies with this frame).
+        const phys = mem.trim(u8, lines[idx], " \t\r");
+        const name = extractVarDeclName(phys) orelse continue;
         try allocs.put(name, .{
             .name = name,
             .alloc_line = actual_line,
@@ -2774,6 +2843,7 @@ fn scanBlockForFreeOp(
     var_name: []const u8,
     in_defer: []const bool,
     in_errdefer: []const bool,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) BlockScanResult {
     var r = BlockScanResult{};
     for (block.start_line..block.end_line + 1) |ln| {
@@ -2783,7 +2853,7 @@ fn scanBlockForFreeOp(
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (shouldSkipForFreeAnalysis(t, idx, in_defer, in_errdefer))
             continue;
-        if (hasRealFreePattern(t) and isDirectFreeOfVar(t, var_name)) {
+        if (hasRealFreePattern(t) and isDirectFreeOfVarOrAlias(t, var_name, aliases)) {
             r.free_seen = true;
             r.free_line = ln;
         }
@@ -2802,6 +2872,7 @@ fn scanBlocksForFreeOps(
     in_errdefer: []const bool,
     alloc_info: *CFGAllocation,
     bstate: *BlockFreeState,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) void {
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or
@@ -2813,6 +2884,7 @@ fn scanBlocksForFreeOps(
             var_name,
             in_defer,
             in_errdefer,
+            aliases,
         );
         bstate.freed_in_block[bid] = r.free_seen;
         bstate.freed_line_in_block[bid] = r.free_line;
@@ -2822,12 +2894,22 @@ fn scanBlocksForFreeOps(
     }
 }
 
+/// True if the line contains an `} else` branch separator — both `} else {`
+/// and `} else if (...) {` arms are mutually exclusive with the if-arm. The
+/// char after "else" must not be an identifier char (`} elsewhere` is a
+/// variable name, not a branch).
+fn hasElseBranchMarker(t: []const u8) bool {
+    const pos = mem.indexOf(u8, t, "} else") orelse return false;
+    const after = pos + "} else".len;
+    return after >= t.len or !isIdent(t[after]);
+}
+
 fn isExclusiveBranchLine(t: []const u8) bool {
     if (mem.indexOf(u8, t, "=>") != null) return true;
     if (mem.indexOf(u8, t, "} orelse {") != null) return true;
     if (mem.indexOf(u8, t, "} orelse return") != null) return true;
     if (mem.startsWith(u8, t, "orelse {")) return true;
-    if (mem.indexOf(u8, t, "} else {") != null) return true;
+    if (hasElseBranchMarker(t)) return true;
     return false;
 }
 
@@ -2838,7 +2920,9 @@ fn hasExclusiveBranchBetween(
     func_line: usize,
 ) bool {
     if (from_line == 0 or from_line >= to_line) return false;
-    for (from_line + 1..to_line) |ln| {
+    // to_line inclusive: inline switch arms put the `.b =>` marker on the
+    // free's own line, leaving an empty exclusive range otherwise.
+    for (from_line + 1..to_line + 1) |ln| {
         if (ln < func_line) continue;
         const idx = ln - func_line;
         if (idx >= lines.len) continue;
@@ -2880,6 +2964,7 @@ fn checkSameBlockFree(
     alloc_info: *CFGAllocation,
     in_defer: []const bool,
     in_errdefer: []const bool,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) SameBlockFreeResult {
     var freed = false;
     var ret = false;
@@ -2890,7 +2975,7 @@ fn checkSameBlockFree(
         const ct = mem.trim(u8, lines[ci], " \t\r");
         if (shouldSkipForFreeAnalysis(ct, ci, in_defer, in_errdefer))
             continue;
-        if (hasRealFreePattern(ct) and isDirectFreeOfVar(ct, var_name)) {
+        if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(ct, var_name, aliases)) {
             freed = true;
             alloc_info.freed_line = cl;
         }
@@ -2949,11 +3034,27 @@ fn checkPredecessorsFreed(
     return any_normal and def_freed;
 }
 
-fn isUAFSkipLine(t: []const u8) bool {
-    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return true;
+/// Decide whether a line is irrelevant when scanning for uses of a freed var.
+/// Declaration lines are skipped only when the tracked var's occurrence IS the
+/// declaration: an alias declaration (`const a = buf;` — aliasing is handled
+/// by the alias pass) or a re-declaration of the var itself. Every other
+/// const/var line may hold a real use (`const copy = buf[0];`).
+fn isUAFSkipLine(
+    t: []const u8,
+    var_name: []const u8,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
+) bool {
     if (hasRealFreePattern(t)) return true;
     if (mem.startsWith(u8, t, "defer")) return true;
-    return isCommentOrMultilineString(t);
+    if (isCommentOrMultilineString(t)) return true;
+    const is_decl = mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ");
+    if (!is_decl) return false;
+    const decl_name = extractVarDeclName(t) orelse return false;
+    if (mem.eql(u8, decl_name, var_name)) return true;
+    if (aliases.get(decl_name)) |root| {
+        if (mem.eql(u8, root, var_name)) return true;
+    }
+    return false;
 }
 
 fn checkLineForUAF(
@@ -2970,6 +3071,7 @@ fn checkLineForUAF(
     issues: *std.ArrayListUnmanaged(Issue),
     t: []const u8,
     actual_line: usize,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
     const use_col = findVarUseOnLine(t, var_name) orelse return;
     const bid = findBlockForLine(cfg, actual_line) orelse return;
@@ -2988,6 +3090,7 @@ fn checkLineForUAF(
         use_col,
         file_path,
         issues,
+        aliases,
     )) return;
     const preds_freed = try checkPredecessorsFreed(allocator, cfg, bid, bstate);
     if (preds_freed and alloc_info.freed_line > 0) {
@@ -3020,6 +3123,7 @@ fn checkSameBlockUAF(
     use_col: usize,
     file_path: []const u8,
     issues: *std.ArrayListUnmanaged(Issue),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !bool {
     const sbf = checkSameBlockFree(
         lines,
@@ -3030,6 +3134,7 @@ fn checkSameBlockUAF(
         alloc_info,
         in_defer,
         in_errdefer,
+        aliases,
     );
     if (!sbf.freed or sbf.intervening_return) return false;
     try appendUAFIssue(
@@ -3062,7 +3167,7 @@ fn detectUseAfterFree(
     for (lines, 0..) |line, idx| {
         if (in_errdefer[idx]) continue;
         const t = mem.trim(u8, line, " \t\r");
-        if (isUAFSkipLine(t)) continue;
+        if (isUAFSkipLine(t, var_name, aliases)) continue;
         try checkLineForUAF(
             allocator,
             cfg,
@@ -3077,6 +3182,7 @@ fn detectUseAfterFree(
             issues,
             t,
             func_line + idx,
+            aliases,
         );
     }
 
@@ -3097,14 +3203,8 @@ fn detectUseAfterFree(
             if (in_errdefer[idx]) continue;
             if (in_defer[idx]) continue;
             const t = mem.trim(u8, line, " \t\r");
-            if (isUAFSkipLine(t)) continue;
-
-            // Skip the alias definition line itself
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) {
-                if (extractVarDeclName(t)) |decl_name| {
-                    if (mem.eql(u8, decl_name, alias_name)) continue;
-                }
-            }
+            // Alias's own declaration line is skipped by isUAFSkipLine
+            if (isUAFSkipLine(t, alias_name, aliases)) continue;
 
             const use_col = findVarUseOnLine(t, alias_name) orelse continue;
             try appendUAFIssue(
@@ -3177,6 +3277,7 @@ fn checkLineForDoubleFree(
     issues: *std.ArrayListUnmanaged(Issue),
     t: []const u8,
     actual_line: usize,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
     const bid = findBlockForLine(cfg, actual_line) orelse return;
     const bs = cfg.blocks.items[bid].start_line;
@@ -3194,6 +3295,7 @@ fn checkLineForDoubleFree(
         file_path,
         t,
         issues,
+        aliases,
     )) return;
     try detectCrossBlockDoubleFree(
         allocator,
@@ -3225,6 +3327,7 @@ fn checkSameBlockDoubleFree(
     file_path: []const u8,
     t: []const u8,
     issues: *std.ArrayListUnmanaged(Issue),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !bool {
     const sbf = checkSameBlockFree(
         lines,
@@ -3235,6 +3338,7 @@ fn checkSameBlockDoubleFree(
         alloc_info,
         in_defer,
         in_errdefer,
+        aliases,
     );
     if (!sbf.freed) return false;
     const freed = alloc_info.freed_line;
@@ -3266,12 +3370,13 @@ fn detectDoubleFree(
     in_errdefer: []const bool,
     bstate: *const BlockFreeState,
     issues: *std.ArrayListUnmanaged(Issue),
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
         if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVar(t, var_name)) continue;
+        if (!isDirectFreeOfVarOrAlias(t, var_name, aliases)) continue;
         try checkLineForDoubleFree(
             allocator,
             cfg,
@@ -3286,6 +3391,7 @@ fn detectDoubleFree(
             issues,
             t,
             func_line + idx,
+            aliases,
         );
     }
 }
@@ -3297,6 +3403,212 @@ const PredFreeAnalysis = struct {
     any_normal: bool,
     freed_pred_line: usize,
 };
+
+/// A free registered via `defer` (runs at scope exit).
+const DeferFree = struct {
+    line: usize,
+    indent: usize,
+    is_conditional: bool,
+};
+
+/// Shared context for defer/direct double-free pairing (param limit).
+const DeferPairCtx = struct {
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    var_name: []const u8,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
+};
+
+/// Collect frees of var_name registered through `defer` statements (single-line
+/// `defer free(x);` and frees inside `defer { ... }` blocks). errdefer frees
+/// are deliberately excluded — conservatively: the pair errdefer-free +
+/// defer-free of the same variable is usually the canonical error/success
+/// cleanup split, but defer ALSO runs on error exits, so the pair can in fact
+/// double-free on the error path. Suppressing it here is an accepted FN,
+/// tracked in EPH-I0006.
+fn collectDeferFrees(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+) !std.ArrayListUnmanaged(DeferFree) {
+    var frees: std.ArrayListUnmanaged(DeferFree) = .empty;
+    for (ctx.lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (ctx.in_errdefer[idx] or mem.startsWith(u8, t, "errdefer ")) continue;
+        if (!ctx.in_defer[idx] and !mem.startsWith(u8, t, "defer ")) continue;
+        if (!hasRealFreePattern(t)) continue;
+        if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
+        // Conditional defer (`defer if (c) free(x);`): may or may not run, so
+        // a pairing is reported at warning severity. An `if` on a line INSIDE
+        // a defer block above the free is not seen here (documented limit).
+        const is_conditional = mem.indexOf(u8, t, "if ") != null or
+            mem.indexOf(u8, t, "if(") != null;
+        try frees.append(allocator, .{
+            .line = ctx.func_line + idx,
+            .indent = countIndent(line),
+            .is_conditional = is_conditional,
+        });
+    }
+    return frees;
+}
+
+/// True when the var is reassigned anywhere after `from_line` (1-based,
+/// exclusive). A defer evaluates its argument at scope exit, so a
+/// reassignment can make the defer target different memory — in which case
+/// free-then-reassign is the CORRECT pattern. The reverse order
+/// (defer, then reassign, then direct free) is still a definite double-free
+/// of the NEW allocation; suppressing on any later reassignment is therefore
+/// an accepted heuristic FN, not a proof of safety.
+fn hasReassignmentAfter(
+    lines: []const []const u8,
+    func_line: usize,
+    from_line: usize,
+    var_name: []const u8,
+) bool {
+    if (from_line < func_line) return false;
+    for (from_line + 1..func_line + lines.len) |ln| {
+        const idx = ln - func_line;
+        if (idx >= lines.len) break;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (hasDirectReassignment(t, var_name)) return true;
+    }
+    return false;
+}
+
+/// Span between two frees for exclusivity checks.
+const FreeSpan = struct {
+    first: usize,
+    second: usize,
+    min_indent: usize,
+};
+
+/// True when the two frees sit in different switch arms: a `=>` arm header
+/// appears in the inclusive span at an indent no deeper than both statements.
+/// Same-arm pairs have no arm header between them; a defer OUTSIDE the switch
+/// is shallower than any arm header (still reported). Like
+/// hasExclusiveBranchBetween, this is textual: a switch that merely sits
+/// between the two frees also suppresses (accepted FN, consistent with the
+/// existing direct/direct double-free heuristic).
+fn hasSwitchArmBetween(
+    lines: []const []const u8,
+    func_line: usize,
+    span: FreeSpan,
+) bool {
+    if (span.first < func_line or span.second <= span.first) return false;
+    const end = @min(span.second, func_line + lines.len - 1);
+    for (span.first..end + 1) |ln| {
+        const idx = ln - func_line;
+        if (idx >= lines.len) break;
+        if (countIndent(lines[idx]) > span.min_indent) continue;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (mem.indexOf(u8, t, "=>") != null) return true;
+    }
+    return false;
+}
+
+/// Else/orelse branch separators between two frees (defer pairing only).
+/// `=>` arm headers are deliberately NOT matched here: for a defer/direct
+/// pair, arm exclusivity is decided by hasSwitchArmBetween, which accounts
+/// for the defer sitting OUTSIDE the switch — an arm header between such a
+/// pair means nothing, the defer runs on every path.
+fn hasElseBranchBetween(
+    lines: []const []const u8,
+    func_line: usize,
+    first: usize,
+    second: usize,
+) bool {
+    if (first < func_line or second <= first) return false;
+    // second inclusive: inline `} else { free(x); }` puts the separator on
+    // the free's own line.
+    for (first + 1..second + 1) |ln| {
+        const idx = ln - func_line;
+        if (idx >= lines.len) break;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (mem.indexOf(u8, t, "} orelse {") != null) return true;
+        if (mem.indexOf(u8, t, "} orelse return") != null) return true;
+        if (mem.startsWith(u8, t, "orelse {")) return true;
+        if (hasElseBranchMarker(t)) return true;
+    }
+    return false;
+}
+
+/// Detect double-free between a defer-registered free and a direct free.
+/// `defer free(x)` runs at scope exit, so an unconditional direct free of the
+/// same variable on an overlapping path double-frees it (both orders:
+/// defer-then-free and free-then-defer). Suppressed when the variable is
+/// reassigned after the first of the two frees, when the two are on exclusive
+/// branches, or when the only registered frees are errdefers (error paths).
+fn detectDeferDoubleFree(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var defer_frees = try collectDeferFrees(allocator, ctx);
+    defer defer_frees.deinit(allocator);
+    if (defer_frees.items.len == 0) return;
+
+    for (ctx.lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isDoubleFreeSkipLine(t)) continue;
+        if (ctx.in_defer[idx] or ctx.in_errdefer[idx]) continue;
+        if (!hasRealFreePattern(t)) continue;
+        if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
+        try pairDirectFreeWithDefers(allocator, ctx, .{
+            .frees = defer_frees.items,
+            .free_line = ctx.func_line + idx,
+            .free_indent = countIndent(line),
+            .t = t,
+        }, issues);
+    }
+}
+
+/// One direct free plus the defer-registered frees to pair it with.
+const DirectFreeSite = struct {
+    frees: []const DeferFree,
+    free_line: usize,
+    free_indent: usize,
+    t: []const u8,
+};
+
+/// Pair one direct free with every defer-registered free of the same var.
+fn pairDirectFreeWithDefers(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+    site: DirectFreeSite,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    for (site.frees) |df| {
+        const first = @min(df.line, site.free_line);
+        // Reassignment after the first free: safe only when the direct free
+        // precedes the rebound value's lifetime; defer→reassign→free is a
+        // definite double-free of the NEW allocation. Staying silent here is
+        // an accepted heuristic FN (see hasReassignmentAfter).
+        if (hasReassignmentAfter(ctx.lines, ctx.func_line, first, ctx.var_name)) continue;
+        const second = @max(df.line, site.free_line);
+        if (hasElseBranchBetween(ctx.lines, ctx.func_line, first, second))
+            continue;
+        if (hasSwitchArmBetween(ctx.lines, ctx.func_line, .{
+            .first = first,
+            .second = second,
+            .min_indent = @min(df.indent, site.free_indent),
+        })) continue;
+        const severity: Severity = if (df.is_conditional) .warning else .err;
+        try appendDoubleFreeIssue(
+            allocator,
+            issues,
+            ctx.file_path,
+            site.t,
+            site.free_line,
+            ctx.var_name,
+            df.line,
+            severity,
+            "defer frees at scope exit — remove the duplicate free",
+        );
+    }
+}
 
 /// Analyze predecessor blocks to determine free state
 fn analyzePredFreeState(
@@ -3450,9 +3762,11 @@ fn collectCFGAllocations(
     var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
     defer all_alloc_names.deinit(allocator);
 
-    for (lines, 0..) |line, idx| {
+    // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
+    var join_buf: [max_join_bytes]u8 = undefined;
+    for (lines, 0..) |_, idx| {
         const actual_line = func_line + idx;
-        const t = mem.trim(u8, line, " \t\r");
+        const t = joinParenContinuation(lines, idx, &join_buf);
 
         // Detect allocations using type-based detection for .create()
         const alloc_info = findAllocCall(t, &all_alloc_names) orelse continue;
@@ -3480,7 +3794,10 @@ fn collectCFGAllocations(
         // Dotted first-arg arena heuristic: allocPrint(cg.module.arena, ...)
         if (isFirstArgArena(t)) continue;
 
-        const name = extractVarDeclName(t) orelse continue;
+        // Name comes from the physical line — slices into join_buf dangle
+        // (the buffer is reused on the next iteration and dies with this frame).
+        const phys = mem.trim(u8, lines[idx], " \t\r");
+        const name = extractVarDeclName(phys) orelse continue;
         const block = findBlockForLine(cfg, actual_line) orelse continue;
 
         try allocs.append(allocator, .{
@@ -3998,8 +4315,9 @@ fn checkDeferCoverageForAlloc(
 
 /// Find the indent level of an allocation line by name
 fn findAllocIndent(lines: []const []const u8, alloc_name: []const u8) usize {
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
+    var join_buf: [max_join_bytes]u8 = undefined;
+    for (lines, 0..) |line, idx| {
+        const t = joinParenContinuation(lines, idx, &join_buf);
         // Check for .alloc( or .create( (not in string, not Type factory)
         if (findAllocCall(t, null) != null and containsIdentifier(t, alloc_name))
             return countIndent(line);
@@ -4086,6 +4404,7 @@ const TryAlloc = struct {
     name: []const u8,
     line: usize,
     col: usize,
+    indent: usize = 0,
     has_errdefer: bool = false,
     is_create: bool,
 };
@@ -4093,6 +4412,7 @@ const TryAlloc = struct {
 /// Errdefer/defer statement info
 const ErrdeferInfo = struct {
     line: usize,
+    indent: usize = 0,
     content: []const u8,
 };
 
@@ -4161,6 +4481,7 @@ fn checkErrdeferOwnershipTransfer(
 const BlockCollectState = struct {
     depth: usize = 0,
     start: usize = 0,
+    indent: usize = 0,
     content: std.ArrayListUnmanaged(u8) = .empty,
 
     fn deinit(self: *BlockCollectState, a: Allocator) void {
@@ -4179,11 +4500,15 @@ fn continueBlockCollection(
     if (bs.depth == 0) return false;
     try bs.content.appendSlice(allocator, t);
     try bs.content.append(allocator, ' ');
+    // bs.start/bs.indent are fixed when the block opens and never mutate
+    // during the char scan — hoist the invariant literal out of the loop so
+    // its braces don't count toward nesting depth (ZA302).
+    const site: StmtSite = .{ .line = bs.start, .indent = bs.indent };
     for (t) |c| {
         if (c == '{') bs.depth += 1;
         if (c == '}' and bs.depth > 0) bs.depth -= 1;
         if (bs.depth == 0) {
-            try tryAppendCleanupInfo(bs.content.items, bs.start, errdefers, allocator);
+            try tryAppendCleanupInfo(bs.content.items, site, errdefers, allocator);
             bs.content.clearRetainingCapacity();
         }
     }
@@ -4191,9 +4516,13 @@ fn continueBlockCollection(
 }
 
 /// Collect a try allocation from a line, skipping arena/no-free.
+/// `phys` is the trimmed physical line: the recorded name must slice into
+/// file content, not into a join buffer reused by the caller's loop.
 fn collectTryAllocFromLine(
     t: []const u8,
+    phys: []const u8,
     actual_line: usize,
+    indent: usize,
     try_allocs: *std.ArrayListUnmanaged(TryAlloc),
     try_lines: *std.ArrayListUnmanaged(usize),
     allocator: Allocator,
@@ -4214,27 +4543,35 @@ fn collectTryAllocFromLine(
         try try_lines.append(allocator, actual_line);
         return;
     }
-    if (extractVarDeclName(t)) |name| {
+    if (extractVarDeclName(phys)) |name| {
         const alloc_info = findAllocCall(t, null) orelse return;
         try try_allocs.append(allocator, .{
             .name = name,
             .line = actual_line,
             .col = alloc_info.col + 1,
+            .indent = indent,
             .is_create = alloc_info.is_create,
         });
     }
 }
 
+/// Source position of a defer/errdefer statement (param bundling).
+const StmtSite = struct {
+    line: usize,
+    indent: usize,
+};
+
 /// Start collecting an errdefer/defer block.
 fn tryAppendCleanupInfo(
     items: []const u8,
-    line_num: usize,
+    site: StmtSite,
     errdefers: *std.ArrayListUnmanaged(ErrdeferInfo),
     allocator: Allocator,
 ) !void {
     if (!hasRealCleanupPattern(items)) return;
     try errdefers.append(allocator, .{
-        .line = line_num,
+        .line = site.line,
+        .indent = site.indent,
         .content = try allocator.dupe(u8, items),
     });
 }
@@ -4242,6 +4579,7 @@ fn tryAppendCleanupInfo(
 fn collectDeferFromLine(
     t: []const u8,
     actual_line: usize,
+    indent: usize,
     bs: *BlockCollectState,
     errdefers: *std.ArrayListUnmanaged(ErrdeferInfo),
     allocator: Allocator,
@@ -4252,12 +4590,14 @@ fn collectDeferFromLine(
 
     const prefix_len: usize = if (is_errdefer) 9 else 6;
     const content = if (prefix_len < t.len) t[prefix_len..] else "";
+    const site: StmtSite = .{ .line = actual_line, .indent = indent };
 
     if (!mem.startsWith(u8, content, "{")) {
-        try tryAppendCleanupInfo(t, actual_line, errdefers, allocator);
+        try tryAppendCleanupInfo(t, site, errdefers, allocator);
         return;
     }
     bs.start = actual_line;
+    bs.indent = indent;
     bs.depth = 1;
     bs.content.clearRetainingCapacity();
     try bs.content.appendSlice(allocator, content);
@@ -4267,20 +4607,49 @@ fn collectDeferFromLine(
         if (c == '}' and bs.depth > 0) bs.depth -= 1;
     }
     if (bs.depth == 0) {
-        try tryAppendCleanupInfo(bs.content.items, actual_line, errdefers, allocator);
+        try tryAppendCleanupInfo(bs.content.items, site, errdefers, allocator);
         bs.content.clearRetainingCapacity();
     }
 }
 
-/// Check for errdefer gaps and report issues.
+/// Find an errdefer/defer that actually covers this allocation.
+/// Coverage heuristic (documented): the statement must appear AFTER the alloc
+/// line at the same or deeper indentation. A statement before the alloc can
+/// only be a coincidental name match (Zig forbids use-before-decl), and a
+/// shallower one cannot reference the alloc's variable either.
 fn findMatchingErrdefer(
     errdefers_list: []const ErrdeferInfo,
-    name: []const u8,
+    alloc: *const TryAlloc,
 ) ?usize {
     for (errdefers_list) |ed| {
-        if (containsIdentifier(ed.content, name)) return ed.line;
+        if (ed.line <= alloc.line) continue;
+        if (ed.indent < alloc.indent) continue;
+        if (containsIdentifier(ed.content, alloc.name)) return ed.line;
     }
     return null;
+}
+
+/// Context for errdefer gap analysis (keeps helpers under the param limit).
+const ErrdeferGapCtx = struct {
+    errdefers: []const ErrdeferInfo,
+    try_lines: []const usize,
+    error_returns: []const usize,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+};
+
+/// Per-trigger gap test: a trigger (try or error-return) after the alloc
+/// leaks unless a covering errdefer sits between the alloc and the trigger.
+fn isGapTrigger(
+    alloc: *const TryAlloc,
+    errdefer_line: usize,
+    trigger_line: usize,
+) bool {
+    if (trigger_line <= alloc.line) return false;
+    if (alloc.has_errdefer and errdefer_line > alloc.line and
+        errdefer_line < trigger_line) return false;
+    return !alloc.has_errdefer or errdefer_line >= trigger_line;
 }
 
 fn hasErrdeferGap(
@@ -4289,11 +4658,46 @@ fn hasErrdeferGap(
     try_lines: []const usize,
 ) bool {
     for (try_lines) |try_line| {
-        if (try_line <= alloc.line) continue;
-        if (alloc.has_errdefer and errdefer_line > alloc.line and
-            errdefer_line < try_line) continue;
-        if (!alloc.has_errdefer or errdefer_line >= try_line)
-            return true;
+        if (isGapTrigger(alloc, errdefer_line, try_line)) return true;
+    }
+    return false;
+}
+
+/// True when a direct free of the var appears between the alloc and the
+/// error-return trigger (inclusive) — the catch-free-return idiom cleans up
+/// manually on the error path, so no errdefer is required.
+fn hasDirectFreeBetween(
+    ctx: *const ErrdeferGapCtx,
+    alloc: *const TryAlloc,
+    trigger_line: usize,
+) bool {
+    if (alloc.line < ctx.func_line or trigger_line < ctx.func_line) return false;
+    const end = @min(trigger_line, ctx.func_line + ctx.lines.len - 1);
+    for (alloc.line + 1..end + 1) |ln| {
+        const idx = ln - ctx.func_line;
+        if (idx >= ctx.lines.len) break;
+        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+        if (hasRealFreePattern(t) and isDirectFreeOfVar(t, alloc.name)) return true;
+    }
+    return false;
+}
+
+/// Gap test for error-return triggers. An error return inside the alloc's own
+/// catch/orelse statement is skipped (the allocation failed there — nothing
+/// to free); an error return covered by a manual free is skipped (idiom).
+fn hasErrorReturnGap(
+    alloc: *const TryAlloc,
+    errdefer_line: usize,
+    ctx: *const ErrdeferGapCtx,
+) bool {
+    const alloc_idx = alloc.line - ctx.func_line;
+    if (alloc_idx >= ctx.lines.len) return false;
+    const stmt_end = ctx.func_line + findAllocStatementEnd(ctx.lines, alloc_idx);
+    for (ctx.error_returns) |er| {
+        if (er <= stmt_end) continue;
+        if (!isGapTrigger(alloc, errdefer_line, er)) continue;
+        if (hasDirectFreeBetween(ctx, alloc, er)) continue;
+        return true;
     }
     return false;
 }
@@ -4301,21 +4705,21 @@ fn hasErrdeferGap(
 fn checkErrdeferGaps(
     allocator: Allocator,
     try_allocs: []TryAlloc,
-    errdefers_list: []const ErrdeferInfo,
-    try_lines: []const usize,
-    file_path: []const u8,
+    ctx: *const ErrdeferGapCtx,
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
     for (try_allocs) |*alloc| {
         if (alloc.has_errdefer) continue;
         var errdefer_line: usize = 0;
-        if (findMatchingErrdefer(errdefers_list, alloc.name)) |el| {
+        if (findMatchingErrdefer(ctx.errdefers, alloc)) |el| {
             errdefer_line = el;
             alloc.has_errdefer = true;
         }
-        if (!hasErrdeferGap(alloc, errdefer_line, try_lines)) continue;
+        const try_gap = hasErrdeferGap(alloc, errdefer_line, ctx.try_lines);
+        if (!try_gap and !hasErrorReturnGap(alloc, errdefer_line, ctx))
+            continue;
         try issues.append(allocator, .{
-            .file = file_path,
+            .file = ctx.file_path,
             .line = alloc.line,
             .col = alloc.col,
             .severity = .warning,
@@ -4333,6 +4737,7 @@ const ErrdeferScanState = struct {
     try_allocs: std.ArrayListUnmanaged(TryAlloc),
     errdefers: std.ArrayListUnmanaged(ErrdeferInfo),
     try_lines_list: std.ArrayListUnmanaged(usize),
+    error_returns: std.ArrayListUnmanaged(usize),
     bs: BlockCollectState,
 
     fn deinit(self: *ErrdeferScanState, allocator: Allocator) void {
@@ -4340,6 +4745,7 @@ const ErrdeferScanState = struct {
         for (self.errdefers.items) |e| allocator.free(e.content);
         self.errdefers.deinit(allocator);
         self.try_lines_list.deinit(allocator);
+        self.error_returns.deinit(allocator);
         self.bs.deinit(allocator);
     }
 };
@@ -4355,6 +4761,7 @@ fn scanErrdeferLines(
         .try_allocs = .empty,
         .errdefers = .empty,
         .try_lines_list = .empty,
+        .error_returns = .empty,
         .bs = .{},
     };
 
@@ -4367,6 +4774,8 @@ fn scanErrdeferLines(
     // Merge file-level fields: use file-level if available, else local only
     const effective_fields = file_no_free_fields orelse &local_no_free_fields;
 
+    // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (lines, 0..) |line, idx| {
         const actual_line = func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
@@ -4377,11 +4786,20 @@ fn scanErrdeferLines(
             &state.errdefers,
             allocator,
         )) continue;
-        const has_try = mem.indexOf(u8, t, "try ") != null;
-        if (has_try and isTryAllocation(t)) {
+        // Alloc detection runs on the joined logical line so wrapped calls
+        // (type first-arg on the next line) are visible; line-structure
+        // detection (defer blocks, try presence) stays on the physical line.
+        const joined = joinParenContinuation(lines, idx, &join_buf);
+        const indent = countIndent(line);
+        // Keyword matches must skip string literals/word fragments:
+        // @panic("Retry transaction not found") is not a gap trigger.
+        const has_try = hasRealKeyword(t, "try ");
+        if (hasRealKeyword(t, "return error."))
+            try state.error_returns.append(allocator, actual_line);
+        if (has_try and isTryAllocation(joined)) {
             // Check standalone first-arg allocator (single-line and multiline)
             const standalone_skip = blk: {
-                if (extractStandaloneAllocator(t)) |sa| {
+                if (extractStandaloneAllocator(joined)) |sa| {
                     if (no_free_names.contains(sa)) break :blk true;
                     if (isArenaName(sa)) break :blk true;
                 } else if (extractMultilineFirstArg(t, lines, idx)) |ml| {
@@ -4389,13 +4807,15 @@ fn scanErrdeferLines(
                     if (isArenaName(ml)) break :blk true;
                 }
                 // Dotted first-arg arena heuristic
-                if (isFirstArgArena(t)) break :blk true;
+                if (isFirstArgArena(joined)) break :blk true;
                 break :blk false;
             };
             if (!standalone_skip) {
                 try collectTryAllocFromLine(
+                    joined,
                     t,
                     actual_line,
+                    indent,
                     &state.try_allocs,
                     &state.try_lines_list,
                     allocator,
@@ -4409,6 +4829,7 @@ fn scanErrdeferLines(
         try collectDeferFromLine(
             t,
             actual_line,
+            indent,
             &state.bs,
             &state.errdefers,
             allocator,
@@ -4438,14 +4859,14 @@ fn analyzeCFGErrdeferCoverage(
     for (state.try_allocs.items) |*alloc| {
         checkErrdeferOwnershipTransfer(alloc, lines, func_line);
     }
-    try checkErrdeferGaps(
-        allocator,
-        state.try_allocs.items,
-        state.errdefers.items,
-        state.try_lines_list.items,
-        file_path,
-        &issues,
-    );
+    try checkErrdeferGaps(allocator, state.try_allocs.items, &.{
+        .errdefers = state.errdefers.items,
+        .try_lines = state.try_lines_list.items,
+        .error_returns = state.error_returns.items,
+        .lines = lines,
+        .func_line = func_line,
+        .file_path = file_path,
+    }, &issues);
     return issues;
 }
 
@@ -6410,10 +6831,9 @@ fn isStructFieldStorage(t: []const u8, alloc_name: []const u8) bool {
         const lhs = mem.trim(u8, t[0..eq_pos], " \t");
         if (mem.indexOf(u8, lhs, ".") == null) return false;
 
-        // Check if alloc_name appears after the =
-        if (mem.indexOf(u8, t, alloc_name)) |name_pos| {
-            if (name_pos > eq_pos) return true;
-        }
+        // alloc_name must appear on the RHS — searching from the start would
+        // match the LHS first when the field shares the name (self.buf = buf)
+        if (containsIdentifier(t[eq_pos + 3 ..], alloc_name)) return true;
     }
     return false;
 }
@@ -9952,15 +10372,21 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     return was_in_func; // True if we interrupted another function
 }
 
-/// Track braces and return true when function ends
+/// Track braces and return true when function ends.
+/// Evaluated at END of line: a signature with a balanced anonymous container
+/// (`fn f(x: enum { a, b }) !void {`) dips to depth 0 mid-line before the
+/// body brace reopens — ending there would truncate the function to its
+/// signature line. The function ends only when a `}` closed the depth AND
+/// the line still ends at depth 0.
 fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
+    var closed = false;
     for (t) |c| {
         if (c == '{') state.brace_depth += 1;
         if (c != '}') continue;
         if (state.brace_depth > 0) state.brace_depth -= 1;
-        if (state.brace_depth == 0) return true;
+        if (state.brace_depth == 0) closed = true;
     }
-    return false;
+    return closed and state.brace_depth == 0;
 }
 
 /// Process a single function's analysis (memory, CFG, etc.)
@@ -10290,6 +10716,67 @@ fn detectErrorReturns(lines: []const []const u8) bool {
         if (mem.indexOf(u8, t, "!usize") != null) return true;
     }
     return false;
+}
+
+/// Signed paren balance of a line (`(` minus `)`). Naive by design — string
+/// literals containing parens can skew it, consistent with countBraceBalance.
+fn parenBalance(t: []const u8) i32 {
+    var balance: i32 = 0;
+    for (t) |c| {
+        if (c == '(') balance += 1;
+        if (c == ')') balance -= 1;
+    }
+    return balance;
+}
+
+/// True if the line mentions any allocation call pattern (method or qualified).
+fn hasAllocCallPattern(t: []const u8) bool {
+    for (compat.getAllocMethodPatterns()) |p| {
+        if (mem.indexOf(u8, t, p) != null) return true;
+    }
+    for (compat.getQualifiedAllocFnPatterns()) |p| {
+        if (mem.indexOf(u8, t, p) != null) return true;
+    }
+    return false;
+}
+
+/// Bounds for joinParenContinuation. zig-fmt wraps call args one per line,
+/// so a handful of lines covers any realistic signature; the byte cap keeps
+/// the caller's stack buffer small and the join cheap on the hot path.
+const max_join_lines = 4;
+const max_join_bytes = 512;
+
+/// Join a logical line whose parenthesized call spans multiple source lines.
+/// zig-fmt wraps long calls as `allocator.alloc(\n    u8,\n    4096,\n);` — the
+/// first line ends right after `(`, hiding the type first-arg from
+/// findAllocCall. Returns the trimmed line unchanged when parens already
+/// balance; otherwise joins up to max_join_lines following lines (bounded by
+/// buf size). No heap allocation: caller provides a fixed stack buffer.
+fn joinParenContinuation(
+    lines: []const []const u8,
+    idx: usize,
+    buf: []u8,
+) []const u8 {
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    if (!hasAllocCallPattern(t)) return t;
+    var depth = parenBalance(t);
+    if (depth <= 0) return t;
+    if (t.len > buf.len) return t;
+    @memcpy(buf[0..t.len], t);
+    var len = t.len;
+    var joined: usize = 0;
+    var next_idx = idx + 1;
+    while (depth > 0 and joined < max_join_lines and next_idx < lines.len) : (next_idx += 1) {
+        const next = mem.trim(u8, lines[next_idx], " \t\r");
+        joined += 1;
+        if (len + 1 + next.len > buf.len) break;
+        buf[len] = ' ';
+        len += 1;
+        @memcpy(buf[len..][0..next.len], next);
+        len += next.len;
+        depth += parenBalance(next);
+    }
+    return buf[0..len];
 }
 
 /// Check if line contains allocation call using vocab from compat layer.
@@ -16514,6 +17001,717 @@ fn createTestFileAnalysis(
         .pub_function_count = 0,
         .line_count = countLines(content),
     };
+}
+
+/// Graph + issues from running the CFG memory pipeline on one in-memory file.
+const CFGTestRun = struct {
+    graph: ImportGraph,
+    issues: std.ArrayListUnmanaged(Issue),
+
+    fn deinit(self: *CFGTestRun, allocator: Allocator) void {
+        self.graph.deinit();
+        deinitIssues(&self.issues, allocator);
+    }
+};
+
+/// Test helper: build a one-file graph and run the full CFG memory pipeline.
+fn runCFGMemoryTest(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !CFGTestRun {
+    var graph = ImportGraph.init(allocator);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
+/// Count issues for a rule within one file (test assertion helper).
+fn countRuleIssues(
+    issues: []const Issue,
+    file: []const u8,
+    rule: []const u8,
+) usize {
+    var n: usize = 0;
+    for (issues) |issue| {
+        if (mem.eql(u8, issue.file, file) and mem.eql(u8, issue.rule, rule)) n += 1;
+    }
+    return n;
+}
+
+test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zig-fmt canonical wrap: first line ends after `(` — the type first-arg
+    // only becomes visible by joining continuation lines.
+    const content =
+        \\fn wrapped_alloc(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(
+        \\        u8,
+        \\        4096,
+        \\    );
+        \\    const more = try allocator.alloc(u8, 64);
+        \\    _ = more;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_wrapped_alloc.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_wrapped_alloc.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) >= 1);
+    // Second try with no errdefer on either alloc => errdefer gap tracked
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) >= 1);
+}
+
+test "ZA101: single-line .alloc( detection unchanged by line joining" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn single_line(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 4096);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_single_alloc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_single_alloc.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: wrapped alloc with proper defer stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn wrapped_ok(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(
+        \\        u8,
+        \\        4096,
+        \\    );
+        \\    defer allocator.free(buf);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_wrapped_ok.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_wrapped_ok.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+}
+
+test "ZA105: free through alias then use root" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Freeing an alias releases the root allocation: use of buf is UAF.
+    const content =
+        \\fn free_alias_use_root(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    allocator.free(a);
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_free_alias_use.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_free_alias_use.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA106: free through alias then free root" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn free_alias_free_root(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    allocator.free(a);
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_alias_dfree.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_alias_dfree.zig",
+        RULE_DOUBLE_FREE,
+    ) == 1);
+}
+
+test "ZA105: free root then use alias (existing direction)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn free_root_use_alias(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    allocator.free(buf);
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_root_alias.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_root_alias.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: use inside new declaration after free (subscript)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn decl_subscript(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    const copy = buf[0];
+        \\    _ = copy;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_decl_subscript.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_decl_subscript.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: use inside new declaration after free (field access)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const Pair = struct { x: u8, y: u8 };
+        \\fn decl_field(allocator: std.mem.Allocator) !void {
+        \\    const pair = try allocator.alloc(Pair, 4);
+        \\    allocator.free(pair);
+        \\    const field = pair[0].x;
+        \\    _ = field;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_decl_field.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_decl_field.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: free then reassign then use stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn free_reassign(allocator: std.mem.Allocator) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    buf = try allocator.alloc(u8, 128);
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_free_reassign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_free_reassign.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA106: defer free plus direct free is a double-free" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer runs at scope exit and frees buf a second time.
+    const content =
+        \\fn defer_then_direct(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer allocator.free(buf);
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_defer_direct.zig", content);
+    defer run.deinit(allocator);
+
+    const n = countRuleIssues(run.issues.items, "test_defer_direct.zig", RULE_DOUBLE_FREE);
+    try std.testing.expect(n == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: direct free plus later defer free is a double-free" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Mirror order: the defer frees the already-freed pointer at scope exit.
+    const content =
+        \\fn direct_then_defer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    defer allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_direct_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_direct_defer.zig",
+        RULE_DOUBLE_FREE,
+    ) == 1);
+}
+
+test "ZA106: defer free with reassignment after direct free stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // defer evaluates buf at scope exit — after reassignment it frees the NEW
+    // allocation; the direct free released the old one. Correct pattern.
+    const content =
+        \\fn defer_reassigned(allocator: std.mem.Allocator) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    defer allocator.free(buf);
+        \\    allocator.free(buf);
+        \\    buf = try allocator.alloc(u8, 128);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_defer_reassign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_defer_reassign.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA106: errdefer free plus defer free stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Canonical error/success split: errdefer frees on error paths, defer on
+    // success paths — they never run together.
+    const content =
+        \\fn errdefer_defer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    defer allocator.free(buf);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_errdefer_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_defer.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA106: conditional defer plus direct free is a warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn cond_defer(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer if (c) allocator.free(buf);
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_cond_defer.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_cond_defer.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
+}
+
+test "ZA106: defer free and direct free in different switch arms stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Arms are mutually exclusive: the defer's arm and the direct free's arm
+    // never execute together (ephor's own scanRecursive shape).
+    const content =
+        \\fn switch_arms(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (kind) {
+        \\        .a => {
+        \\            defer allocator.free(buf);
+        \\            use(buf);
+        \\        },
+        \\        .b => allocator.free(buf),
+        \\    }
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_switch_arms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_switch_arms.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA106: defer outside switch plus direct free inside an arm fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer is shallower than the arm header and runs on every path —
+    // the arm's direct free double-frees on that arm's path.
+    const content =
+        \\fn defer_outside(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer allocator.free(buf);
+        \\    switch (kind) {
+        \\        .a => allocator.free(buf),
+        \\        .b => {},
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_defer_outside.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_defer_outside.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: defer in if-arm plus direct free in else-if arm stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `} else if` arms are mutually exclusive with the if-arm — the two
+    // frees never execute on the same path.
+    const content =
+        \\fn else_if_arms(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        defer allocator.free(buf);
+        \\    } else if (d) {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_else_if_arms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_else_if_arms.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA103: try inside a string literal is not a gap trigger" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // @panic("Retry transaction not found in pool") contains "try " inside a
+    // string — it must not count as a gap trigger (tigerbeetle
+    // transaction_pool.zig shape).
+    const content =
+        \\fn panic_string(allocator: std.mem.Allocator, items: []const u8) ![]u8 {
+        \\    const buf = try allocator.alloc(u8, items.len);
+        \\    for (items, 0..) |it, i| {
+        \\        buf[i] = lookup(it) orelse {
+        \\            @panic("Retry transaction not found in pool");
+        \\        };
+        \\    }
+        \\    return buf;
+        \\}
+        \\fn lookup(x: u8) ?u8 {
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_panic_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_panic_string.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: struct field storage with colliding name transfers ownership" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // self.buf = buf — the first "buf" occurrence is the LHS field; the
+    // transfer is only visible by searching the RHS (bun linear_fifo shape).
+    const content =
+        \\const Holder = struct {
+        \\    buf: []u8,
+        \\};
+        \\fn store(self: *Holder, allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    self.buf = buf;
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_field_storage.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_field_storage.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA106: plain defer with no direct free stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn plain_defer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer allocator.free(buf);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_plain_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_plain_defer.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA103: return error after alloc without errdefer is a gap" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // No later try: the error-returning exit IS the leak trigger.
+    const content =
+        \\fn return_error_gap(allocator: std.mem.Allocator, bad: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (bad) return error.Bad;
+        \\    store(buf);
+        \\}
+        \\fn store(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_return_error.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_return_error.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: errdefer before the alloc does not cover it" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Textually-early errdefer mentioning the same name must not silence the
+    // gap check (it cannot cover an alloc that does not exist yet).
+    const content =
+        \\fn errdefer_before(allocator: std.mem.Allocator, bad: bool) !void {
+        \\    errdefer allocator.free(buf);
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (bad) return error.Bad;
+        \\    try storeGlobally(buf);
+        \\}
+        \\fn storeGlobally(d: []u8) !void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_errdefer_before.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_before.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: errdefer after alloc with later try stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn proper_errdefer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    try storeGlobally(buf);
+        \\}
+        \\fn storeGlobally(d: []u8) !void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_proper_errdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_proper_errdefer.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: plain defer covers error returns (ZA101's domain)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // defer frees on ALL exits including error returns — no ZA103. (Defer
+    // coverage itself is ZA101's job.)
+    const content =
+        \\fn defer_return_error(allocator: std.mem.Allocator, bad: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer allocator.free(buf);
+        \\    if (bad) return error.Bad;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_defer_ret_err.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_defer_ret_err.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: catch-free-return idiom stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Manual free on the error path covers the error return — no errdefer
+    // required. Flagging this idiom would be a false positive.
+    const content =
+        \\fn catch_free_return(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    risky() catch {
+        \\        allocator.free(buf);
+        \\        return error.Failed;
+        \\    };
+        \\    allocator.free(buf);
+        \\}
+        \\fn risky() !void {
+        \\    return error.Oops;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_catch_free_ret.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_catch_free_ret.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: alloc's own multi-line catch is not a gap trigger" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The error return belongs to the failing allocation expression itself —
+    // nothing was allocated on that path.
+    const content =
+        \\fn alloc_own_catch(allocator: std.mem.Allocator) !void {
+        \\    const buf = allocator.alloc(u8, 64) catch {
+        \\        return error.OutOfMemory;
+        \\    };
+        \\    defer allocator.free(buf);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_alloc_own_catch.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_alloc_own_catch.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
 }
 
 test "analyzeCFGMemory detects use-after-free (ZA105)" {

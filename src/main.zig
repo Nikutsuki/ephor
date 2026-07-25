@@ -143,6 +143,10 @@ const RULE_RUNTIME_DOUBLE_FREE = types.RULE_RUNTIME_DOUBLE_FREE;
 const RULE_RUNTIME_USE_AFTER_FREE = types.RULE_RUNTIME_USE_AFTER_FREE;
 const RULE_RUNTIME_TEST_FAILURE = types.RULE_RUNTIME_TEST_FAILURE;
 const RULE_RUNTIME_PANIC = types.RULE_RUNTIME_PANIC;
+const RULE_TEST_LIE = types.RULE_TEST_LIE;
+const RULE_TEST_NO_ASSERTIONS = types.RULE_TEST_NO_ASSERTIONS;
+const RULE_TEST_TRIVIAL_ASSERT = types.RULE_TEST_TRIVIAL_ASSERT;
+const RULE_TEST_SWALLOWED_ERROR = types.RULE_TEST_SWALLOWED_ERROR;
 
 const Severity = types.Severity;
 
@@ -8350,8 +8354,10 @@ fn checkLineErrors(
     preceding_lines: ?[]const []const u8,
     next_line: ?[]const u8,
 ) !void {
-    // ZA201 (silent catch) - only from line-based analyzer
-    if (!in_defer) {
+    // ZA201 (silent catch) — suppressed in test context, where ZT104's
+    // note is the replacement (same inversion as ZA202/ZA203 below): a
+    // test gets exactly one report per catch, never two.
+    if (!in_defer and !in_test) {
         if (checkSilentCatch(t, path, ln, func_name, preceding_lines, next_line)) |i| {
             try issues.append(allocator, i);
         }
@@ -8557,6 +8563,1090 @@ fn analyzeErrors(
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeFileErrors(allocator, &issues, entry.value_ptr.*);
+    }
+    return issues;
+}
+
+// ============================================================================
+// Test Quality Analysis (ZT1xx)
+// ============================================================================
+// Detects what `zig build test` cannot: tests whose name promises a fn the
+// body never calls (ZT101), tests that pass while verifying nothing (ZT102),
+// assertions that are true by construction (ZT103), and errors a test
+// swallows so failure is unobservable (ZT104).
+
+/// Destination for test-quality issues, bundled to keep param counts low.
+const TestIssueSink = struct {
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    path: []const u8,
+};
+
+/// Per-test-block counters accumulated while scanning (ZT102).
+const TestBlockCounters = struct {
+    assertions: usize = 0,
+    try_calls: usize = 0,
+    start_line: usize = 0,
+    start_col: usize = 1,
+    ref_lines: usize = 0,
+    has_real_code: bool = false,
+};
+
+/// A located call site: the target text range plus the index of its `(`.
+const CallSite = struct {
+    start: usize,
+    open_paren: usize,
+};
+
+/// Index just past the closing quote of the string literal starting at
+/// `start` (code[start] == '"'). Unterminated literal scans to end.
+fn skipPastString(code: []const u8, start: usize) usize {
+    var i = start + 1;
+    while (i < code.len) {
+        if (code[i] == '\\') {
+            i += 2;
+            continue;
+        }
+        if (code[i] == '"') return i + 1;
+        i += 1;
+    }
+    return code.len;
+}
+
+/// Index just past the closing quote of the char literal starting at
+/// `start` (code[start] == '\''). Unterminated literal scans to end.
+fn skipPastChar(code: []const u8, start: usize) usize {
+    var i = start + 1;
+    while (i < code.len) {
+        if (code[i] == '\\') {
+            i += 2;
+            continue;
+        }
+        if (code[i] == '\'') return i + 1;
+        i += 1;
+    }
+    return code.len;
+}
+
+/// End index of the identifier run (dots allowed) starting at `start`.
+fn identRunEnd(code: []const u8, start: usize) usize {
+    var i = start;
+    while (i < code.len and (isIdent(code[i]) or code[i] == '.')) i += 1;
+    return i;
+}
+
+/// Find the next call site at/after `from`, skipping string/char literals.
+/// A call site is an identifier run (dots allowed) immediately followed by
+/// `(` — distinguishes calls from same-named variables.
+fn nextCallSite(code: []const u8, from: usize) ?CallSite {
+    var i = from;
+    while (i < code.len) {
+        if (code[i] == '"') {
+            i = skipPastString(code, i);
+            continue;
+        }
+        if (code[i] == '\'') {
+            i = skipPastChar(code, i);
+            continue;
+        }
+        if (!isIdent(code[i])) {
+            i += 1;
+            continue;
+        }
+        const end = identRunEnd(code, i);
+        if (end < code.len and code[end] == '(') return .{ .start = i, .open_paren = end };
+        i = end;
+    }
+    return null;
+}
+
+/// Last dotted segment of a call target: `std.debug.assert` -> `assert`.
+fn lastSegment(target: []const u8) []const u8 {
+    if (mem.lastIndexOfScalar(u8, target, '.')) |dot| return target[dot + 1 ..];
+    return target;
+}
+
+/// An assertion call's final segment names an expect/assert helper
+/// (expectEqual, std.debug.assert, custom assertFoo/fxAssertFoo helpers).
+/// Case-insensitive: camelCase word boundaries capitalize (`fxAssert…`).
+/// Over-matching only suppresses ZT102 warnings — the safe direction.
+fn isAssertionTarget(target: []const u8) bool {
+    const seg = lastSegment(target);
+    return std.ascii.indexOfIgnoreCase(seg, "expect") != null or
+        std.ascii.indexOfIgnoreCase(seg, "assert") != null;
+}
+
+/// Count assertion calls in one comment-stripped code slice (ZT102).
+fn countAssertions(code: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (nextCallSite(code, pos)) |site| {
+        if (isAssertionTarget(code[site.start..site.open_paren])) count += 1;
+        pos = site.open_paren + 1;
+    }
+    return count;
+}
+
+/// True when a `(` appears before the statement ends — the operand of a
+/// `try` is (or contains) a call rather than a bare error-union value.
+fn hasCallBeforeSemicolon(rest: []const u8) bool {
+    var i: usize = 0;
+    while (i < rest.len) {
+        if (rest[i] == ';') return false;
+        if (rest[i] == '"') {
+            i = skipPastString(rest, i);
+            continue;
+        }
+        if (rest[i] == '(') return true;
+        i += 1;
+    }
+    return false;
+}
+
+/// Count `try`-propagated calls in one comment-stripped code slice (ZT102).
+fn countTryCalls(code: []const u8) usize {
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, code, pos, "try")) |idx| {
+        pos = idx + 3;
+        const before_ok = idx == 0 or !isIdent(code[idx - 1]);
+        const after_ok = idx + 3 >= code.len or !isIdent(code[idx + 3]);
+        if (!before_ok or !after_ok) continue;
+        if (isInsideString(code, idx)) continue;
+        if (hasCallBeforeSemicolon(code[idx + 3 ..])) count += 1;
+    }
+    return count;
+}
+
+/// Extract the argument text between the parens of the call whose `(` is at
+/// `open_paren`. String/char-literal and nesting aware. Returns null when
+/// the call does not close on this line (multi-line calls are skipped).
+fn callArgs(code: []const u8, open_paren: usize) ?[]const u8 {
+    var depth: usize = 1;
+    var i = open_paren + 1;
+    while (i < code.len) {
+        if (code[i] == '"') {
+            i = skipPastString(code, i);
+            continue;
+        }
+        if (code[i] == '\'') {
+            i = skipPastChar(code, i);
+            continue;
+        }
+        if (code[i] == '(') depth += 1;
+        if (code[i] == ')') {
+            depth -= 1;
+            if (depth == 0) return code[open_paren + 1 .. i];
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// Split an argument list on top-level commas (string/literal/nesting
+/// aware) so `expectEqual("a,b", s)` is not split inside the string.
+/// Returns the number of parts written to `out` (capped at out.len).
+fn splitTopLevelArgs(args: []const u8, out: *[4][]const u8) usize {
+    var depth: usize = 0;
+    var start: usize = 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) {
+        const c = args[i];
+        if (c == '"') {
+            i = skipPastString(args, i);
+            continue;
+        }
+        if (c == '\'') {
+            i = skipPastChar(args, i);
+            continue;
+        }
+        if (c == '(' or c == '[' or c == '{') depth += 1;
+        if (c == ')' or c == ']' or c == '}') {
+            if (depth > 0) depth -= 1;
+        }
+        if (c == ',' and depth == 0 and n < out.len) {
+            out[n] = args[start..i];
+            n += 1;
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (n < out.len) {
+        out[n] = args[start..];
+        n += 1;
+    }
+    return n;
+}
+
+/// Position of a top-level `==` or `!=` in an expect() argument, skipping
+/// literals and nested expressions (a comparison inside call args is not
+/// the asserted condition).
+fn findTopLevelEqOp(args: []const u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < args.len) {
+        const c = args[i];
+        if (c == '"') {
+            i = skipPastString(args, i);
+            continue;
+        }
+        if (c == '\'') {
+            i = skipPastChar(args, i);
+            continue;
+        }
+        if (c == '(' or c == '[' or c == '{') depth += 1;
+        if (c == ')' or c == ']' or c == '}') {
+            if (depth > 0) depth -= 1;
+        }
+        if (depth == 0 and c == '=' and args[i + 1] == '=') return i;
+        if (depth == 0 and c == '!' and args[i + 1] == '=') return i;
+        i += 1;
+    }
+    return null;
+}
+
+/// ZT103 message when an expect() argument is trivially true, else null.
+fn trivialExpectMessage(args: []const u8) ?[]const u8 {
+    const trimmed = mem.trim(u8, args, " \t\r");
+    if (mem.eql(u8, trimmed, "true")) {
+        return "assertion is always true: expect(true)";
+    }
+    const op = findTopLevelEqOp(trimmed) orelse return null;
+    const lhs = mem.trim(u8, trimmed[0..op], " \t\r");
+    const rhs = mem.trim(u8, trimmed[op + 2 ..], " \t\r");
+    if (lhs.len == 0 or !mem.eql(u8, lhs, rhs)) return null;
+    return "assertion compares identical operands";
+}
+
+/// ZT103 message when expectEqual() args are textually identical, else null.
+fn trivialExpectEqualMessage(args: []const u8) ?[]const u8 {
+    var parts: [4][]const u8 = undefined;
+    const n = splitTopLevelArgs(args, &parts);
+    if (n != 2) return null;
+    const lhs = mem.trim(u8, parts[0], " \t\r");
+    const rhs = mem.trim(u8, parts[1], " \t\r");
+    if (lhs.len == 0 or !mem.eql(u8, lhs, rhs)) return null;
+    return "expectEqual compares identical arguments";
+}
+
+/// ZT103: emit an issue when one expect/expectEqual call is trivially true.
+fn checkTrivialAssertCall(
+    sink: *const TestIssueSink,
+    line_num: usize,
+    code: []const u8,
+    site: CallSite,
+) !void {
+    const seg = lastSegment(code[site.start..site.open_paren]);
+    if (!mem.eql(u8, seg, "expect") and !mem.eql(u8, seg, "expectEqual")) return;
+    const args = callArgs(code, site.open_paren) orelse return;
+    const msg = if (mem.eql(u8, seg, "expect"))
+        trivialExpectMessage(args)
+    else
+        trivialExpectEqualMessage(args);
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = line_num,
+        .col = site.start + 1,
+        .severity = .warning,
+        .rule = RULE_TEST_TRIVIAL_ASSERT,
+        .message = msg orelse return,
+        .help = "assert on two different values, or drop the assertion",
+    });
+}
+
+/// True when a line inside a test block carries no test logic: the
+/// `test ... {` opener, pure brace/punctuation, a `_ = ...;` discard,
+/// or a refAllDecls call (the Zig test-reference idioms).
+fn isTestBoilerplateLine(t: []const u8) bool {
+    if (mem.startsWith(u8, t, "test ")) return true;
+    if (mem.startsWith(u8, t, "_ = ")) return true;
+    if (mem.indexOf(u8, t, "refAllDecls") != null) return true;
+    for (t) |c| {
+        if (c != '{' and c != '}' and c != ';' and c != ' ' and c != '\t') return false;
+    }
+    return true;
+}
+
+/// True when a line references another declaration to force its analysis:
+/// `_ = @import("x_tests.zig")`, `_ = some_decl;`, `refAllDecls(@This())`.
+fn isTestRefLine(t: []const u8) bool {
+    if (mem.startsWith(u8, t, "_ = ")) return true;
+    if (mem.indexOf(u8, t, "refAllDecls") != null) return true;
+    // single-line form: `test { _ = @import("x.zig"); }`
+    if (mem.startsWith(u8, t, "test ") and mem.indexOf(u8, t, "@import(") != null) {
+        return true;
+    }
+    return false;
+}
+
+/// ZT102: evaluate a finished test block for missing assertions.
+fn reportTestBlock(sink: *const TestIssueSink, c: TestBlockCounters) !void {
+    if (c.assertions > 0) return;
+    // Test-reference blocks (`_ = @import(...)`, refAllDecls, `_ = decl;`)
+    // exist to force compilation of other declarations — never vacuous.
+    if (!c.has_real_code and c.ref_lines > 0) return;
+    if (c.try_calls > 0) {
+        // try-propagated calls still catch errors — a smoke test, not vacuous
+        try sink.issues.append(sink.allocator, .{
+            .file = sink.path,
+            .line = c.start_line,
+            .col = c.start_col,
+            .severity = .note,
+            .rule = RULE_TEST_NO_ASSERTIONS,
+            .message = "smoke test: no assertions",
+            .help = "assert on results or state, not just absence of errors",
+        });
+        return;
+    }
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = c.start_line,
+        .col = c.start_col,
+        .severity = .warning,
+        .rule = RULE_TEST_NO_ASSERTIONS,
+        .message = "test has no assertions",
+        .help = "add expect/assert calls, or remove the vacuous test",
+    });
+}
+
+/// Copy `line` into `buf` with every string/char literal blanked to spaces,
+/// so brace tracking ignores literal braces: test names like
+/// `test "catch {}"` and fixtures like `"} || rlp.Error"` would otherwise
+/// corrupt the block depth and misplace the block boundary.
+/// Lines longer than `buf` fall back to the raw line.
+fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
+    if (line.len > buf.len) return line;
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
+        if (c == '"' or c == '\'') {
+            const end = if (c == '"') skipPastString(line, i) else skipPastChar(line, i);
+            while (i < end) : (i += 1) buf[i] = ' ';
+            continue;
+        }
+        buf[i] = c;
+        i += 1;
+    }
+    return buf[0..line.len];
+}
+
+/// Counters for a newly entered test block whose `test` keyword is on `line`.
+fn resetTestCounters(line: []const u8, line_num: usize) TestBlockCounters {
+    return .{
+        .start_line = line_num,
+        .start_col = (mem.indexOf(u8, line, "test ") orelse 0) + 1,
+    };
+}
+
+/// ZT103: check every expect/expectEqual call on one comment-stripped line.
+fn checkLineTrivialAsserts(
+    sink: *const TestIssueSink,
+    line_num: usize,
+    code: []const u8,
+) !void {
+    var pos: usize = 0;
+    while (nextCallSite(code, pos)) |site| {
+        pos = site.open_paren + 1;
+        try checkTrivialAssertCall(sink, line_num, code, site);
+    }
+}
+
+// --- ZT101: lie tests (the name promises a fn the body never calls) ---
+
+/// Bounded candidate set: fn names referenced by a test's own name (ZT101).
+/// A test name mentioning more than 8 distinct local fns is pathological;
+/// dropped extras only ever suppress the warning — the safe direction.
+const max_lie_candidates = 8;
+
+/// Per-test-block ZT101 state: the fns the test name claims to exercise.
+/// Whether any was called is decided at block close from the accumulated
+/// body calls plus file-local call-graph reachability; `referenced` marks
+/// candidates appearing as values in the body.
+const LieTestState = struct {
+    candidates: [max_lie_candidates][]const u8 = undefined,
+    candidate_count: usize = 0,
+    name: []const u8 = "",
+    referenced: [max_lie_candidates]bool = @splat(false),
+};
+
+/// True when `name` occurs in `code` as a whole identifier outside string
+/// literals — a value reference like `Duration.parse_flag_value` handed to
+/// a fuzz/table harness, which exercises the fn without a call expression.
+fn hasIdentRef(code: []const u8, name: []const u8) bool {
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, code, pos, name)) |idx| {
+        pos = idx + name.len;
+        const before_ok = idx == 0 or !isIdent(code[idx - 1]);
+        const after_ok = pos >= code.len or !isIdent(code[pos]);
+        if (!before_ok or !after_ok) continue;
+        if (isInsideString(code, idx)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Mark candidates referenced as values on this line (ZT101): passing
+/// `Duration.parse_flag_value` to a fuzz/table harness exercises the fn
+/// without a syntactic call — a reference the compiler itself checks.
+fn markLieReferences(code: []const u8, lie: *LieTestState) void {
+    for (lie.candidates[0..lie.candidate_count], 0..) |cand, i| {
+        if (lie.referenced[i]) continue;
+        lie.referenced[i] = hasIdentRef(code, cand);
+    }
+}
+
+/// Word-boundary membership test: `word` appears in `text` as a whole
+/// identifier, not glued to identifier chars on either side.
+fn containsIdentWord(text: []const u8, word: []const u8) bool {
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, text, pos, word)) |idx| {
+        pos = idx + word.len;
+        const before_ok = idx == 0 or !isIdent(text[idx - 1]);
+        const after_ok = pos >= text.len or !isIdent(text[pos]);
+        if (before_ok and after_ok) return true;
+    }
+    return false;
+}
+
+/// True when the fn signature on this line declares generic params
+/// (`comptime` or `anytype` in the param list). ZT101 excludes generic
+/// fns: tests name the generic but only call its concrete instantiations,
+/// so "never calls the generic directly" is not a lie.
+fn hasGenericParams(t: []const u8, after_name: usize) bool {
+    var i = after_name;
+    while (i < t.len and t[i] != '(') : (i += 1) {}
+    if (i >= t.len) return false;
+    const params_start = i + 1;
+    var depth: usize = 1;
+    i += 1;
+    while (i < t.len and depth > 0) : (i += 1) {
+        if (t[i] == '(') depth += 1;
+        if (t[i] == ')') depth -= 1;
+    }
+    if (depth != 0) return false;
+    const params = t[params_start .. i - 1];
+    return containsIdentWord(params, "comptime") or
+        containsIdentWord(params, "anytype");
+}
+
+/// A located fn definition: its name, plus whether ZT101 must exclude it
+/// from candidacy (generic params or a type-factory `type` return).
+const FnDef = struct {
+    name: []const u8,
+    excluded: bool,
+};
+
+/// Extract the fn defined on this trimmed line, if any: a real `fn name`
+/// with a word boundary on BOTH sides — `findRealFnDef` alone accepts the
+/// "fn " inside `has_fn and ...`, inventing a fn named `and`.
+fn extractFnDef(t: []const u8) ?FnDef {
+    const pos = findRealFnDef(t) orelse return null;
+    if (pos > 0 and isIdent(t[pos - 1])) return null;
+    var end = pos + 3;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    const excluded = fnReturnsType(t, end) or hasGenericParams(t, end);
+    return .{ .name = t[pos + 3 .. end], .excluded = excluded };
+}
+
+/// One source line in the forms the ZT101 call-graph scan needs: trimmed,
+/// comment-stripped, and literal-blanked (for brace counting).
+const LineForms = struct {
+    t: []const u8,
+    code: []const u8,
+    blanked: []const u8,
+};
+
+/// File-local call facts for ZT101: every fn's direct callees, plus the fn
+/// names excluded from candidacy. Keys and callee names borrow the file
+/// content, which outlives the maps. The graph includes excluded fns as
+/// intermediate nodes — a test reaching fn X through a local helper (or a
+/// pipeline entry delegating to X) is not lying; the call edge is a fact.
+const FnCallFacts = struct {
+    callees: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
+    excluded: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *FnCallFacts, allocator: Allocator) void {
+        var it = self.callees.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        self.callees.deinit(allocator);
+        self.excluded.deinit(allocator);
+    }
+
+    /// Guarantee a callees entry for `name` (even when it calls nothing)
+    /// so candidacy can test "defined in this file" by key membership.
+    fn ensureFn(self: *FnCallFacts, allocator: Allocator, name: []const u8) !void {
+        const gop = try self.callees.getOrPut(allocator, name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+    }
+
+    /// Record one line's direct call targets under fn `name`.
+    fn recordCallees(
+        self: *FnCallFacts,
+        allocator: Allocator,
+        name: []const u8,
+        code: []const u8,
+    ) !void {
+        try self.ensureFn(allocator, name);
+        const list = self.callees.getPtr(name).?;
+        var pos: usize = 0;
+        while (nextCallSite(code, pos)) |site| {
+            pos = site.open_paren + 1;
+            const seg = lastSegment(code[site.start..site.open_paren]);
+            if (containsName(list.items, seg)) continue;
+            try list.append(allocator, seg);
+        }
+    }
+
+    /// Notice a fn def outside any body and open its span when the `{` is
+    /// on the same line. A pending def ended by `;` is a bodiless extern
+    /// declaration, not a definition — drop it.
+    fn updatePending(
+        self: *FnCallFacts,
+        allocator: Allocator,
+        span: *FnSpanState,
+        forms: LineForms,
+    ) !void {
+        if (span.pending == null) {
+            const def = extractFnDef(forms.t) orelse return;
+            span.pending = def.name;
+            if (def.excluded) try self.excluded.put(allocator, def.name, {});
+            try self.ensureFn(allocator, def.name);
+        }
+        if (mem.indexOfScalar(u8, forms.blanked, '{') == null) {
+            if (mem.endsWith(u8, forms.t, ";")) span.pending = null;
+            return;
+        }
+        span.current = span.pending;
+        span.pending = null;
+        span.depth = 0;
+    }
+
+    /// Update the fn-span tracker and record one line's direct callees.
+    /// Fns nested inside another fn (local struct methods) are not tracked
+    /// separately — their calls roll up into the outer fn, which only ever
+    /// widens reachability (the FP-safe direction).
+    fn trackLine(
+        self: *FnCallFacts,
+        allocator: Allocator,
+        span: *FnSpanState,
+        forms: LineForms,
+    ) !void {
+        if (span.current == null) try self.updatePending(allocator, span, forms);
+        if (span.current) |name| {
+            try self.recordCallees(allocator, name, forms.code);
+            span.depth = braceDelta(span.depth, forms.blanked);
+            if (span.depth == 0) span.current = null;
+        }
+    }
+};
+
+/// State for tracking which fn body a line belongs to (ZT101 call graph).
+const FnSpanState = struct {
+    current: ?[]const u8 = null,
+    pending: ?[]const u8 = null,
+    depth: usize = 0,
+};
+
+/// Brace depth after processing one literal-blanked line.
+fn braceDelta(depth: usize, blanked: []const u8) usize {
+    var d = depth;
+    for (blanked) |c| {
+        if (c == '{') d += 1;
+        if (c == '}' and d > 0) d -= 1;
+    }
+    return d;
+}
+
+/// Slice membership by string equality (small bounded lists only).
+fn containsName(list: []const []const u8, name: []const u8) bool {
+    for (list) |item| {
+        if (mem.eql(u8, item, name)) return true;
+    }
+    return false;
+}
+
+/// Build the file-local call facts for ZT101 in one pass over `content`.
+fn collectFnCallFacts(allocator: Allocator, content: []const u8) !FnCallFacts {
+    var facts = FnCallFacts{};
+    errdefer facts.deinit(allocator);
+    var span = FnSpanState{};
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = line[0..code_end];
+        const forms: LineForms = .{
+            .t = t,
+            .code = code,
+            .blanked = blankLiteralContents(code, &blank_buf),
+        };
+        try facts.trackLine(allocator, &span, forms);
+    }
+    return facts;
+}
+
+/// True when a string-form test-name word looks like a deliberate code
+/// reference (contains an uppercase, a digit, or an underscore) rather
+/// than an English prose word. Single lowercase words like "access" or
+/// "deinit" collide with common method names while appearing constantly
+/// as prose — admitting them as candidates floods ZT101 with FPs.
+fn looksLikeCodeRef(word: []const u8) bool {
+    for (word) |c| {
+        if (std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '_') return true;
+    }
+    return false;
+}
+
+/// ZT101 candidates from a string-form test name (`rest` starts with `"`).
+/// A word becomes a candidate only when it looks like a code reference AND
+/// exactly names a non-excluded local fn; prose words fail both gates —
+/// the exact-match requirement is the FP guard.
+fn lieStateFromStringName(
+    rest: []const u8,
+    facts: *const FnCallFacts,
+) LieTestState {
+    var state = LieTestState{};
+    const close = skipPastString(rest, 0);
+    // Unterminated literal: no reliable name to extract candidates from.
+    if (close < 2 or rest[close - 1] != '"') return state;
+    const inner = rest[1 .. close - 1];
+    state.name = inner;
+    var pos: usize = 0;
+    while (pos < inner.len and state.candidate_count < max_lie_candidates) {
+        if (!isIdent(inner[pos])) {
+            pos += 1;
+            continue;
+        }
+        var end = pos;
+        while (end < inner.len and isIdent(inner[end])) end += 1;
+        const word = inner[pos..end];
+        pos = end;
+        if (!looksLikeCodeRef(word)) continue;
+        if (!facts.callees.contains(word) or facts.excluded.contains(word)) continue;
+        state.candidates[state.candidate_count] = word;
+        state.candidate_count += 1;
+    }
+    return state;
+}
+
+/// Extract ZT101 state from a test opener line (`t` starts with "test "):
+/// ident form (`test fooBar`) contributes the name itself — an explicit
+/// identifier, no prose ambiguity, so no shape filter; string form splits
+/// into words. Anonymous `test {` has no name to lie about.
+fn extractLieTestState(
+    t: []const u8,
+    facts: *const FnCallFacts,
+) LieTestState {
+    const rest = mem.trim(u8, t[4..], " \t");
+    if (rest.len == 0 or rest[0] == '{') return .{};
+    if (rest[0] == '"') return lieStateFromStringName(rest, facts);
+    var state = LieTestState{};
+    var end: usize = 0;
+    while (end < rest.len and isIdent(rest[end])) end += 1;
+    const name = rest[0..end];
+    state.name = name;
+    if (facts.callees.contains(name) and !facts.excluded.contains(name)) {
+        state.candidates[0] = name;
+        state.candidate_count = 1;
+    }
+    return state;
+}
+
+/// Cap on distinct call targets collected per test body (ZT101). A test
+/// calling more is pathological; over-cap shrinks the reachable set, which
+/// can only cost a TP — never invent an FP — so the cap stays generous.
+const max_body_calls = 512;
+
+/// Append every call target's last dotted segment on this line to `calls`
+/// (deduped, string-aware) — the root set for ZT101 reachability.
+fn collectLineCalls(
+    code: []const u8,
+    calls: *std.ArrayListUnmanaged([]const u8),
+    allocator: Allocator,
+) !void {
+    var pos: usize = 0;
+    while (nextCallSite(code, pos)) |site| {
+        pos = site.open_paren + 1;
+        if (calls.items.len >= max_body_calls) return;
+        const seg = lastSegment(code[site.start..site.open_paren]);
+        if (containsName(calls.items, seg)) continue;
+        try calls.append(allocator, seg);
+    }
+}
+
+/// Max BFS depth when resolving helper-mediated calls (ZT101). Deeper
+/// mediation chains are pathological; the cap keeps the walk bounded.
+const max_call_depth = 8;
+
+/// Bounded call-graph work item: a callee plus its BFS depth.
+const ReachWork = struct {
+    name: []const u8,
+    depth: usize,
+};
+
+/// BFS frontier + visited set for computeReachableCalls, bundled to keep
+/// param counts low.
+const ReachBfs = struct {
+    reachable: std.StringHashMapUnmanaged(void) = .empty,
+    stack: std.ArrayListUnmanaged(ReachWork) = .empty,
+
+    fn deinit(self: *ReachBfs, allocator: Allocator) void {
+        self.reachable.deinit(allocator);
+        self.stack.deinit(allocator);
+    }
+
+    /// Enqueue `name` at `depth` when not already visited (cycle guard).
+    fn push(self: *ReachBfs, allocator: Allocator, name: []const u8, depth: usize) !void {
+        if (self.reachable.contains(name)) return;
+        try self.reachable.put(allocator, name, {});
+        try self.stack.append(allocator, .{ .name = name, .depth = depth });
+    }
+
+    /// Expand one work item: enqueue every unseen callee (ZT101).
+    fn expand(
+        self: *ReachBfs,
+        allocator: Allocator,
+        facts: *const FnCallFacts,
+        item: ReachWork,
+    ) !void {
+        if (item.depth >= max_call_depth) return;
+        const kids = facts.callees.get(item.name) orelse return;
+        for (kids.items) |kid| try self.push(allocator, kid, item.depth + 1);
+    }
+};
+
+/// All fn names reachable from a test body's direct calls through the
+/// file-local call graph (BFS, depth-capped, cycle-safe via the reachable
+/// set itself). The direct calls are included: a body that calls the
+/// candidate needs no graph edge.
+fn computeReachableCalls(
+    allocator: Allocator,
+    facts: *const FnCallFacts,
+    body_calls: []const []const u8,
+) !std.StringHashMapUnmanaged(void) {
+    var bfs = ReachBfs{};
+    errdefer bfs.reachable.deinit(allocator);
+    defer bfs.stack.deinit(allocator);
+    for (body_calls) |call| try bfs.push(allocator, call, 0);
+    while (bfs.stack.pop()) |item| try bfs.expand(allocator, facts, item);
+    return bfs.reachable;
+}
+
+/// True when the body directly calls a distinctive fn the candidate itself
+/// calls — the delegating-wrapper pattern: `pub fn fromPath(...) { return
+/// fromPathWithOs(...); }` tested via `fromPathWithOs(...)` covers the
+/// candidate's substance (everything but the delegation line), so the name
+/// is not a lie. The shared callee must look like a code reference:
+/// ubiquitous lowercase methods (deinit, alloc, free) are called by
+/// everything and would mask real lies.
+fn sharesImplCallee(
+    facts: *const FnCallFacts,
+    candidates: []const []const u8,
+    body_calls: []const []const u8,
+) bool {
+    for (candidates) |cand| {
+        const own = facts.callees.get(cand) orelse continue;
+        for (own.items) |f| {
+            if (!looksLikeCodeRef(f)) continue;
+            if (containsName(body_calls, f)) return true;
+        }
+    }
+    return false;
+}
+
+/// ZT101: a test whose name references a local fn but whose body never
+/// calls it — directly, through file-local helpers, or via the candidate's
+/// own implementation — lies about what it verifies; `zig build test`
+/// reports it green either way.
+fn reportLieTest(ctx: *const TestScanCtx, state: *const TestFileScanState) !void {
+    const lie = state.lie;
+    if (lie.candidate_count == 0) return;
+    // Test-reference blocks (`_ = @import(...)`, refAllDecls) pull the named
+    // decl's tests into the binary — same boilerplate carve-out as ZT102.
+    if (!state.counters.has_real_code and state.counters.ref_lines > 0) return;
+    const candidates = lie.candidates[0..lie.candidate_count];
+    var reachable = try computeReachableCalls(
+        ctx.sink.allocator,
+        ctx.facts,
+        state.body_calls.items,
+    );
+    defer reachable.deinit(ctx.sink.allocator);
+    for (candidates, 0..) |cand, i| {
+        if (lie.referenced[i]) return;
+        if (reachable.contains(cand)) return;
+    }
+    if (sharesImplCallee(ctx.facts, candidates, state.body_calls.items)) return;
+    const msg = try std.fmt.allocPrint(
+        ctx.sink.allocator,
+        "test '{s}' never calls function '{s}'",
+        .{ lie.name, lie.candidates[0] },
+    );
+    try ctx.sink.issues.append(ctx.sink.allocator, .{
+        .file = ctx.sink.path,
+        .line = state.counters.start_line,
+        .col = state.counters.start_col,
+        .severity = .warning,
+        .rule = RULE_TEST_LIE,
+        .message = msg,
+        .message_owned = true,
+        .help = "call the named function, or rename the test to match what it exercises",
+    });
+}
+
+// --- ZT104: swallowed errors in test context ---
+
+/// Shared ZT104 message for the empty-catch form (one-line `{}` or the
+/// bounded 2-line close).
+const empty_test_catch_msg =
+    "test swallows error: empty catch {} leaves failures unobservable";
+
+/// One test-context line plus the context ZT104 needs (bundled for param
+/// counts): trimmed and comment-stripped forms, lookahead and lookback.
+const CatchLineCtx = struct {
+    t: []const u8,
+    code: []const u8,
+    next_line: ?[]const u8,
+    preceding: ?[]const []const u8,
+    in_defer_block: bool,
+};
+
+/// True when this empty catch is best-effort cleanup rather than test
+/// logic — the ZA201 catch-{} exemptions carry into test context (they
+/// matter more now that ZA201 itself is gated out of it): a defer/errdefer
+/// cleanup (single-line, multi-line, or block form), an explicitly
+/// discarded result, a cleanup-method call (`.close()`, `.destroy()`, …),
+/// or a stream write failing is not the test's subject, and flagging it
+/// would cry wolf on the standard temp-file teardown idiom.
+fn isCleanupCatchForm(clc: CatchLineCtx) bool {
+    if (clc.in_defer_block) return true;
+    if (mem.startsWith(u8, clc.t, "defer ")) return true;
+    if (mem.startsWith(u8, clc.t, "errdefer ")) return true;
+    if (isDiscardedCatch(clc.t)) return true;
+    if (isCleanupMethodCall(clc.t)) return true;
+    if (isDeferCatchMultiline(clc.t, clc.preceding)) return true;
+    return isStreamWriteCatchMultiline(clc.t, clc.preceding);
+}
+
+/// ZT104 message for one catch site in test context, else null.
+/// In test context ZA201 (empty catch) and ZA202 (catch unreachable) are
+/// suppressed; ZT104 is their exact replacement — a test that cannot
+/// observe failure lies, because `zig build test` reports it green either
+/// way. `catch undefined` is deliberately NOT covered: ZA207 keeps firing
+/// in tests (UB earns the warning) as the strictly stronger reporter, so a
+/// ZT104 note would only double-report. The empty-catch form mirrors the
+/// ZA201 shape, including its condition-position exemption:
+/// `while (it.next() catch {})` converts the error to end-of-iteration, an
+/// accepted idiom rather than a swallow.
+fn testSwallowedCatchMsg(
+    clc: CatchLineCtx,
+    site: CatchSite,
+) ?[]const u8 {
+    const rest = clc.code[site.rest..];
+    if (mem.startsWith(u8, rest, "unreachable") and
+        (rest.len == 11 or !isIdent(rest[11])))
+        return "catch unreachable in a test panics instead of reporting a failure";
+    if (rest.len == 0 or rest[0] != '{') return null;
+    if (isInsideWhileCondition(clc.code, site.col)) return null;
+    if (isCleanupCatchForm(clc)) return null;
+    const body = mem.trim(u8, rest[1..], " \t");
+    if (body.len > 0 and body[0] == '}') return empty_test_catch_msg;
+    if (body.len == 0 and isCatchCloseLine(clc.next_line)) return empty_test_catch_msg;
+    return null;
+}
+
+/// ZT104: report every swallowed-error catch on one test-context line.
+fn checkTestSwallowedCatch(
+    sink: *const TestIssueSink,
+    line_num: usize,
+    clc: CatchLineCtx,
+) !void {
+    var start: usize = 0;
+    while (findCatchSite(clc.code, start)) |site| {
+        start = site.col + 5;
+        const msg = testSwallowedCatchMsg(clc, site) orelse continue;
+        try sink.issues.append(sink.allocator, .{
+            .file = sink.path,
+            .line = line_num,
+            .col = site.col + 1,
+            .severity = .note,
+            .rule = RULE_TEST_SWALLOWED_ERROR,
+            .message = msg,
+            .help = "propagate with try, or catch |err| { ... } and assert on the error",
+        });
+    }
+}
+
+/// Read-only inputs for the per-file test-quality scan, bundled to keep
+/// param counts low.
+const TestScanCtx = struct {
+    sink: *const TestIssueSink,
+    facts: *const FnCallFacts,
+    lines: []const []const u8,
+};
+
+/// Mutable state for the per-file test-quality scan (ZT101-ZT104).
+const TestFileScanState = struct {
+    in_test: bool = false,
+    depth: usize = 0,
+    counters: TestBlockCounters = .{},
+    lie: LieTestState = .{},
+    body_calls: std.ArrayListUnmanaged([]const u8) = .empty,
+    blank_buf: [16 * 1024]u8 = undefined,
+    in_defer: bool = false,
+    defer_depth: usize = 0,
+};
+
+/// Update defer-block tracking for one literal-blanked line (ZT104):
+/// inside a `defer { ... }` / `errdefer { ... }` block, an empty catch is
+/// best-effort cleanup, not a swallowed test failure.
+fn trackTestDeferBlock(neutral: []const u8, state: *TestFileScanState) void {
+    const starts_defer = mem.startsWith(u8, neutral, "defer ") or
+        mem.startsWith(u8, neutral, "errdefer ");
+    if (starts_defer and mem.indexOfScalar(u8, neutral, '{') != null) {
+        state.in_defer = true;
+        state.defer_depth = 0;
+    }
+    if (!state.in_defer) return;
+    for (neutral) |c| {
+        if (c == '{') state.defer_depth += 1;
+        if (c == '}') {
+            if (state.defer_depth > 0) state.defer_depth -= 1;
+            if (state.defer_depth == 0) state.in_defer = false;
+        }
+    }
+}
+
+/// Mark ZT101 candidates referenced as values on this line. On the block's
+/// start line only text after the opening `{` counts — the test's own name
+/// precedes the brace and is not a body reference.
+fn markLineLieReferences(
+    code: []const u8,
+    starts_test: bool,
+    state: *TestFileScanState,
+) void {
+    if (!starts_test) return markLieReferences(code, &state.lie);
+    const blanked = blankLiteralContents(code, &state.blank_buf);
+    const open = mem.indexOfScalar(u8, blanked, '{') orelse code.len;
+    markLieReferences(code[open..], &state.lie);
+}
+
+/// Trimmed + comment-stripped forms of the current line plus block status,
+/// bundled to keep param counts low.
+const ScanLineCtx = struct {
+    t: []const u8,
+    code: []const u8,
+    in_block_now: bool,
+};
+
+/// ZT104 hook: check this line's catches when it is in test context — the
+/// domain where ZA201/ZA202 stay silent (ZT104 replaces them), while
+/// ZA207 keeps the catch-undefined report at warning severity.
+fn scanLineCatches(
+    ctx: *const TestScanCtx,
+    idx: usize,
+    sl: ScanLineCtx,
+    state: *const TestFileScanState,
+) !void {
+    if (!isInTestContext(ctx.sink.path, sl.in_block_now)) return;
+    const clc: CatchLineCtx = .{
+        .t = sl.t,
+        .code = sl.code,
+        .next_line = if (idx + 1 < ctx.lines.len) ctx.lines[idx + 1] else null,
+        .preceding = if (idx > 0) ctx.lines[0..idx] else null,
+        .in_defer_block = state.in_defer,
+    };
+    try checkTestSwallowedCatch(ctx.sink, idx + 1, clc);
+}
+
+/// Scan one line of a file for test-quality issues, updating `state`.
+fn scanTestLine(
+    ctx: *const TestScanCtx,
+    idx: usize,
+    state: *TestFileScanState,
+) !void {
+    const sink = ctx.sink;
+    const line_num = idx + 1;
+    const line = ctx.lines[idx];
+    const t = mem.trim(u8, line, " \t\r");
+    if (isCommentOrMultilineString(t)) return;
+    const code_end = findCommentStart(line) orelse line.len;
+    const code = line[0..code_end];
+
+    const was_in_test = state.in_test;
+    const starts_test = !was_in_test and mem.startsWith(u8, t, "test ") and
+        mem.indexOfScalar(u8, t, '{') != null;
+    if (starts_test) {
+        state.counters = resetTestCounters(line, line_num);
+        state.lie = extractLieTestState(t, ctx.facts);
+        state.body_calls.clearRetainingCapacity();
+    }
+    const neutral = mem.trim(u8, blankLiteralContents(code, &state.blank_buf), " \t\r");
+    const ts = trackTestBlock(neutral, state.in_test, state.depth);
+    state.in_test = ts.in_test;
+    state.depth = ts.depth;
+    trackTestDeferBlock(neutral, state);
+
+    const sl: ScanLineCtx = .{
+        .t = t,
+        .code = code,
+        .in_block_now = was_in_test or starts_test,
+    };
+    try scanLineCatches(ctx, idx, sl, state);
+    // Lines inside a test block include the start line (which may also be
+    // the end line for single-line tests) and every line until close.
+    if (!sl.in_block_now) return;
+
+    if (!isTestBoilerplateLine(t)) state.counters.has_real_code = true;
+    if (isTestRefLine(t)) state.counters.ref_lines += 1;
+    state.counters.assertions += countAssertions(code);
+    state.counters.try_calls += countTryCalls(code);
+    try checkLineTrivialAsserts(sink, line_num, code);
+    try collectLineCalls(code, &state.body_calls, sink.allocator);
+    markLineLieReferences(code, starts_test, state);
+    if (!state.in_test) {
+        try reportTestBlock(sink, state.counters);
+        try reportLieTest(ctx, state);
+    }
+}
+
+/// Analyze a single file for test-quality issues (ZT101/ZT102 per test
+/// block, ZT103 per block line, ZT104 per test-context line).
+fn analyzeFileTests(sink: *const TestIssueSink, a: FileAnalysis) !void {
+    var facts = try collectFnCallFacts(sink.allocator, a.content);
+    defer facts.deinit(sink.allocator);
+    // Lines are collected (not streamed) for the bounded 2-line empty-catch
+    // lookahead (ZT104): a `catch {` opener closes on the next line.
+    var all_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer all_lines.deinit(sink.allocator);
+    var split = mem.splitScalar(u8, a.content, '\n');
+    while (split.next()) |l| try all_lines.append(sink.allocator, l);
+
+    const ctx: TestScanCtx = .{
+        .sink = sink,
+        .facts = &facts,
+        .lines = all_lines.items,
+    };
+    var state = TestFileScanState{};
+    defer state.body_calls.deinit(sink.allocator);
+    for (0..all_lines.items.len) |idx| try scanTestLine(&ctx, idx, &state);
+}
+
+fn analyzeTests(
+    allocator: Allocator,
+    graph: *ImportGraph,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    var iter = graph.files.iterator();
+    while (iter.next()) |entry| {
+        const sink: TestIssueSink = .{
+            .issues = &issues,
+            .allocator = allocator,
+            .path = entry.value_ptr.path,
+        };
+        try analyzeFileTests(&sink, entry.value_ptr.*);
     }
     return issues;
 }
@@ -14771,6 +15861,9 @@ fn writeDefaultConfig() !void {
         \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
         \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
         \\  //                     ZA903 index-arithmetic
+        \\  //   ZT1xx Tests:      ZT101 lie-test (name promises fn body never calls),
+        \\  //                     ZT102 no-assertions (note for try-only smoke tests),
+        \\  //                     ZT103 trivially-true-assert, ZT104 swallowed-error
         \\  "disable": ["ZA305", "ZA306"],
         \\
         \\  // Rules to explicitly enable (overrides disable)
@@ -16444,6 +17537,9 @@ fn printHelp() void {
         \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
         \\                     ZR103: use-after-free, ZR104: test-failure,
         \\                     ZR105: panic)
+        \\  ZT1xx  Tests      (ZT101: lie-test, ZT102: no-assertions (note for
+        \\                     try-only smoke tests), ZT103: trivially-true-assert,
+        \\                     ZT104: swallowed-error; ZT105 planned)
         \\
         \\RUNTIME ANALYSIS (ephor runtime):
         \\  Runs 'zig build test' with GeneralPurposeAllocator diagnostics enabled.
@@ -16783,11 +17879,13 @@ const IssueCounts = struct {
     style: usize = 0,
     null_safety: usize = 0,
     panic: usize = 0,
+    tests: usize = 0,
 };
 
 fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void {
     const total = counts.orphan + counts.memory + counts.err + counts.unused +
-        counts.complexity + counts.fmt + counts.style + counts.null_safety + counts.panic;
+        counts.complexity + counts.fmt + counts.style + counts.null_safety + counts.panic +
+        counts.tests;
 
     if (format == .json) {
         std.debug.print(
@@ -16805,6 +17903,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             \\      "style": {d},
             \\      "null_safety": {d},
             \\      "panic": {d},
+            \\      "tests": {d},
             \\      "total": {d}
             \\    }},
             \\    "quality": {{
@@ -16827,6 +17926,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             counts.style,
             counts.null_safety,
             counts.panic,
+            counts.tests,
             total,
             s.not_implemented_count,
             s.todo_count,
@@ -16849,6 +17949,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             \\  Style:      {d}
             \\  NullSafety: {d}
             \\  Panic:      {d}
+            \\  Tests:      {d}
             \\  TOTAL:      {d}
             \\
             \\Quality: NotImplemented={d} {s}={d}
@@ -16867,6 +17968,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             counts.style,
             counts.null_safety,
             counts.panic,
+            counts.tests,
             total,
             s.not_implemented_count,
             @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
@@ -17145,6 +18247,10 @@ pub fn main(init: std.process.Init) !void {
                 var naming_issues = try analyzeNaming(alloc, &g);
                 defer deinitIssues(&naming_issues, alloc);
 
+                // Test quality (ZT1xx): vacuous tests, trivially-true assertions
+                var test_issues = try analyzeTests(alloc, &g);
+                defer deinitIssues(&test_issues, alloc);
+
                 // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
                 var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
                 defer deinitIssues(&ignored_err_issues, alloc);
@@ -17264,6 +18370,14 @@ pub fn main(init: std.process.Init) !void {
                     &cfg,
                     &g,
                 );
+                const test_count = printIssues(
+                    test_issues.items,
+                    base_path,
+                    cfg.format,
+                    "tests",
+                    &cfg,
+                    &g,
+                );
 
                 // Accumulate totals
                 const total = orphan_count
@@ -17271,7 +18385,8 @@ pub fn main(init: std.process.Init) !void {
                     .add(err_count).add(null_safety_count)
                     .add(panic_count).add(unused_count)
                     .add(cx_count).add(fmt_count)
-                    .add(naming_count).add(style_count);
+                    .add(naming_count).add(style_count)
+                    .add(test_count);
 
                 if (cfg.show_summary) {
                     printSummary(.{
@@ -17284,6 +18399,7 @@ pub fn main(init: std.process.Init) !void {
                         .style = style_count.warnings + naming_count.warnings,
                         .null_safety = null_safety_count.warnings,
                         .panic = panic_count.warnings,
+                        .tests = test_count.warnings,
                     }, stats, cfg.format);
                 }
 
@@ -17307,6 +18423,7 @@ pub fn main(init: std.process.Init) !void {
                     for (naming_issues.items) |i| try all_issues.append(alloc, i);
                     for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
                     for (panic_issues.items) |i| try all_issues.append(alloc, i);
+                    for (test_issues.items) |i| try all_issues.append(alloc, i);
 
                     const slice = all_issues.items;
                     if (exportIssues(alloc, export_path, slice, &cfg, &g)) |exported_count| {
@@ -23114,11 +24231,10 @@ test "ZA202 suppressed in test block via analyzeErrors" {
     var issues = try analyzeErrors(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE)) {
-            return error.TestUnexpectedResult; // Should not fire in test block
-        }
-    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(issues.items, "za202_test_block.zig", RULE_CATCH_UNREACHABLE),
+    );
 }
 
 test "ZA203 suppressed in test block via analyzeErrors" {
@@ -23145,11 +24261,10 @@ test "ZA203 suppressed in test block via analyzeErrors" {
     var issues = try analyzeErrors(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE)) {
-            return error.TestUnexpectedResult; // Should not fire in test block
-        }
-    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(issues.items, "za203_test_block.zig", RULE_ORELSE_UNREACHABLE),
+    );
 }
 
 test "ZA202 still fires outside test block" {
@@ -24353,22 +25468,14 @@ test "opensCognitiveScope detects control keyword + brace" {
 
 // --- Integration tests with exact counts ---
 
-fn checkNoCyclomaticWarnings(issues: []const Issue, path: []const u8) !void {
-    for (issues) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC) and mem.eql(u8, issue.file, path)) {
-            std.debug.print("unexpected ZA305 for {s}: {s}\n", .{ path, issue.message });
-            return error.unexpected_warning;
-        }
-    }
+fn expectNoCyclomaticWarnings(issues: []const Issue, path: []const u8) !void {
+    const n = countRuleIssues(issues, path, RULE_CYCLOMATIC);
+    try std.testing.expectEqual(@as(usize, 0), n);
 }
 
-fn checkNoCognitiveWarnings(issues: []const Issue, path: []const u8) !void {
-    for (issues) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, path)) {
-            std.debug.print("unexpected ZA306 for {s}: {s}\n", .{ path, issue.message });
-            return error.unexpected_warning;
-        }
-    }
+fn expectNoCognitiveWarnings(issues: []const Issue, path: []const u8) !void {
+    const n = countRuleIssues(issues, path, RULE_COGNITIVE);
+    try std.testing.expectEqual(@as(usize, 0), n);
 }
 
 test "ZA305: empty function has CCN 1, no warning" {
@@ -24388,8 +25495,8 @@ test "ZA305: empty function has CCN 1, no warning" {
 
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
-    try checkNoCyclomaticWarnings(issues.items, "empty.zig");
-    try checkNoCognitiveWarnings(issues.items, "empty.zig");
+    try expectNoCyclomaticWarnings(issues.items, "empty.zig");
+    try expectNoCognitiveWarnings(issues.items, "empty.zig");
 }
 
 test "ZA305: 5-decision-point function no warning at default threshold" {
@@ -24418,7 +25525,7 @@ test "ZA305: 5-decision-point function no warning at default threshold" {
 
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
-    try checkNoCyclomaticWarnings(issues.items, "moderate.zig");
+    try expectNoCyclomaticWarnings(issues.items, "moderate.zig");
 }
 
 test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
@@ -24502,7 +25609,7 @@ test "ZA306: flat branches have low cognitive, no warning" {
 
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
-    try checkNoCognitiveWarnings(issues.items, "flat.zig");
+    try expectNoCognitiveWarnings(issues.items, "flat.zig");
 }
 
 test "ZA306: nested structures produce higher cognitive than flat" {
@@ -24535,7 +25642,7 @@ test "ZA306: nested structures produce higher cognitive than flat" {
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
     // Cognitive = 1+2+3+4 = 10, below 15
-    try checkNoCognitiveWarnings(issues.items, "deep.zig");
+    try expectNoCognitiveWarnings(issues.items, "deep.zig");
 }
 
 test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
@@ -24607,7 +25714,7 @@ test "ZA305: try and catch contribute to cyclomatic" {
 
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
-    try checkNoCyclomaticWarnings(issues.items, "load.zig");
+    try expectNoCyclomaticWarnings(issues.items, "load.zig");
 }
 
 test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
@@ -24724,8 +25831,8 @@ test "ZA305/ZA306: simple function has CCN=1 cognitive=0" {
     const th = Thresholds{ .max_cyclomatic = 1, .max_cognitive = 0 };
     var issues = try analyzeComplexity(allocator, &graph, th);
     defer deinitIssues(&issues, allocator);
-    try checkNoCyclomaticWarnings(issues.items, "add.zig");
-    try checkNoCognitiveWarnings(issues.items, "add.zig");
+    try expectNoCyclomaticWarnings(issues.items, "add.zig");
+    try expectNoCognitiveWarnings(issues.items, "add.zig");
 }
 
 // ============================================================================
@@ -25445,4 +26552,1099 @@ test "ZA302: char-literal braces do not inflate nesting depth" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
         }
     }
+}
+
+// ============================================================================
+// Test Quality Analysis Tests (ZT102, ZT103)
+// ============================================================================
+
+/// Test helper: build a one-file graph and run the test-quality pipeline.
+fn runTestQualityCheck(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !CFGTestRun {
+    var graph = ImportGraph.init(allocator);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var issues = try analyzeTests(allocator, &graph);
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
+/// Count issues by rule and severity (test assertion helper).
+fn countBySeverity(
+    issues: []const Issue,
+    rule: []const u8,
+    severity: Severity,
+) usize {
+    var n: usize = 0;
+    for (issues) |issue| {
+        if (mem.eql(u8, issue.rule, rule) and issue.severity == severity) n += 1;
+    }
+    return n;
+}
+
+test "ZT102: test with no assertions warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() void {}
+        \\test "x" { foo(); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_warn.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: try-only smoke test is a note, not a warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() !void {}
+        \\test "x" { try foo(); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_smoke.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: try expectEqual counts as an assertion" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ZT103 fires on the identical args here (covered in ZT103 tests);
+    // ZT102 must stay silent because an assertion call is present.
+    const content =
+        \\test "x" { try expectEqual(1, 1); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_expect.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_expect.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: std.debug.assert counts as an assertion" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "x" {
+        \\    const ok = true;
+        \\    std.debug.assert(ok);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_assert.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_assert.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: camelCase Assert helpers count as assertions" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn fxAssertCarolExcluded(fx: u32) !void {
+        \\    _ = fx;
+        \\}
+        \\test "x" {
+        \\    const fx = try setup();
+        \\    try fxAssertCarolExcluded(fx);
+        \\}
+        \\fn setup() !u32 {
+        \\    return 1;
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_fxassert.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT102: multi-line vacuous test warns at the test line" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() void {}
+        \\fn bar() void {}
+        \\test "multi" {
+        \\    foo();
+        \\    bar();
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_multi.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+    for (run.issues.items) |issue| {
+        try std.testing.expectEqual(@as(usize, 3), issue.line);
+    }
+}
+
+test "ZT102: expect text in strings and comments is not an assertion" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() void {}
+        \\test "x" {
+        \\    foo(); // expect(fails) is commented out
+        \\    const s = "expect(notreal)";
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT103: expect(true) warns, including whitespace variant" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "a" { try std.testing.expect(true); }
+        \\test "b" { try std.testing.expect( true ); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt103_true.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "zt103_true.zig", RULE_TEST_TRIVIAL_ASSERT),
+    );
+}
+
+test "ZT103: expectEqual with identical args warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "x" {
+        \\    const x: u32 = 1;
+        \\    try std.testing.expectEqual(x, x);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt103_eqeq.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "zt103_eqeq.zig", RULE_TEST_TRIVIAL_ASSERT),
+    );
+}
+
+test "ZT103: expect with identical comparison operands warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "a" {
+        \\    const ok = true;
+        \\    try std.testing.expect(ok == ok);
+        \\}
+        \\test "b" {
+        \\    const a: u32 = 1;
+        \\    try std.testing.expect(a != a);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt103_operands.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "zt103_operands.zig", RULE_TEST_TRIVIAL_ASSERT),
+    );
+}
+
+test "ZT103: real assertions with different args are silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "x" {
+        \\    const expected: u32 = 3;
+        \\    const actual: u32 = 3;
+        \\    const count: u32 = 3;
+        \\    try std.testing.expectEqual(expected, actual);
+        \\    try std.testing.expect(count == 3);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt103_real.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT103: string-literal args are not split or misread" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "x" {
+        \\    const s = "a,b";
+        \\    try std.testing.expectEqual("a,b", s);
+        \\    try std.testing.expectEqual("true", s);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt103_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT103: trivially-true assertion outside a test block is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn helper() !void {
+        \\    try std.testing.expect(true);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt103_outside.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT102: braces in test names and strings do not corrupt block tracking" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `catch {}` in the test name and a lone `}` inside a fixture string
+    // both balance/misplace the block boundary for a string-blind tracker.
+    const content =
+        \\test "ZA201 suppressed for catch {}" {
+        \\    const s = "} || other.Error";
+        \\    try std.testing.expect(s.len > 0);
+        \\}
+        \\test "second" {
+        \\    const n: usize = 2;
+        \\    try std.testing.expect(n == 2);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_braces.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT102: test-reference blocks are not vacuous" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The Zig idioms for pulling other declarations into the test binary:
+    // `_ = @import(...)`, bare `_ = decl;`, and refAllDecls. These fail the
+    // build when a referenced decl breaks — they verify something real.
+    const content =
+        \\const some_mod = struct {};
+        \\test {
+        \\    _ = @import("other_tests.zig");
+        \\}
+        \\test {
+        \\    _ = @import("a.zig");
+        \\    _ = some_mod;
+        \\    _ = @import("b.zig");
+        \\}
+        \\test { _ = @import("single_line.zig"); }
+        \\test {
+        \\    @import("std").testing.refAllDecls(@This());
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_refs.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT102: vacuous test still warns next to a reference block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() void {}
+        \\test {
+        \\    _ = @import("other_tests.zig");
+        \\}
+        \\test "real but empty" {
+        \\    foo();
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_mixed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+// ============================================================================
+// Test Quality Analysis Tests (ZT101, ZT104)
+// ============================================================================
+
+test "ZT101: warns when the fn a test is named after is never called" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The body asserts something unrelated but never touches parseHeader:
+    // `zig build test` passes while the name promises coverage it lacks.
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\test "parseHeader rejects empty" {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_lie.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
+    );
+    for (run.issues.items) |issue| {
+        try std.testing.expect(mem.indexOf(u8, issue.message, "parseHeader") != null);
+    }
+}
+
+test "ZT101: silent when the body calls the named fn" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\test "parseHeader rejects empty" {
+        \\    try parseHeader("");
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_called.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_called.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: prose-only test names have no candidates" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\test "rejects empty input" {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_prose.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_prose.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: ident-form test calling its fn is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn fooBar() void {}
+        \\test fooBar {
+        \\    fooBar();
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_ident.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_ident.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: ident-form test that never calls its fn warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn fooBar() void {}
+        \\test fooBar {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_ident_lie.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
+    );
+}
+
+test "ZT101: fns from other files are not candidates" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // parseHeader is not defined in this file — the name references a fn
+    // owned elsewhere, so nothing here can be required of the body.
+    const content =
+        \\fn localHelper() void {}
+        \\test "parseHeader rejects empty" {
+        \\    localHelper();
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_cross.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_cross.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: generic fns are not lie candidates" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Tests name the generic but only call its instantiations — absence of
+    // a direct maxInt( call proves nothing.
+    const content =
+        \\fn maxInt(comptime T: type, a: T, b: T) T {
+        \\    return if (a > b) a else b;
+        \\}
+        \\test "maxInt returns the larger value" {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_generic.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_generic.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: type-factory fns are not lie candidates" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn Handler() type {
+        \\    return struct {};
+        \\}
+        \\test "Handler produces a struct" {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_factory.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_factory.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: one of several candidates called is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\fn parseFooter(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\test "parseHeader and parseFooter round-trip" {
+        \\    try parseFooter("");
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_multi_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_multi_ok.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: no candidate called warns once" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\fn parseFooter(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\test "parseHeader and parseFooter round-trip" {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_multi_lie.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
+    );
+}
+
+test "ZT101: dotted calls satisfy the candidate" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const parser = struct {
+        \\    fn parseHeader(raw: []const u8) !void {
+        \\        _ = raw;
+        \\    }
+        \\};
+        \\test "parseHeader rejects empty" {
+        \\    try parser.parseHeader("");
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_dotted.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_dotted.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: helper-mediated calls satisfy the candidate" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The test exercises parseHeader through a file-local helper — the
+    // call-graph edge makes the coverage real, not a lie.
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\fn headerHelper() !void {
+        \\    try parseHeader("x");
+        \\}
+        \\test "parseHeader rejects empty" {
+        \\    try headerHelper();
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_helper.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: lowercase prose words are not candidates" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // "access" is a fn here, but in the test name it is an English prose
+    // word ("field access") — single lowercase words are never candidates.
+    const content =
+        \\fn access(path: []const u8) void {
+        \\    _ = path;
+        \\}
+        \\test "ZA105: field access after free" {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_shape.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_shape.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT104: empty catch in a test is a note" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The error is eaten and the test still passes — the failure is
+    // unobservable, exactly what `zig build test` cannot catch.
+    const content =
+        \\fn foo() !void {}
+        \\test "x" {
+        \\    foo() catch {};
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_empty.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_SWALLOWED_ERROR, .note),
+    );
+}
+
+test "ZT104: payload forms of empty catch are notes" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() !void {}
+        \\test "a" {
+        \\    foo() catch |err| {};
+        \\}
+        \\test "b" {
+        \\    foo() catch |_| {};
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_payload.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countBySeverity(run.issues.items, RULE_TEST_SWALLOWED_ERROR, .note),
+    );
+}
+
+test "ZT104: catch unreachable in a test is a note" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() !void {}
+        \\test "x" {
+        \\    foo() catch unreachable;
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_unreach.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_SWALLOWED_ERROR, .note),
+    );
+}
+
+/// Issues from BOTH the error-analysis and test-quality pipelines over one
+/// in-memory file — ZA2xx/ZT104 overlap regression tests must count across
+/// pipelines to prove exactly one report per catch.
+const CombinedRun = struct {
+    graph: ImportGraph,
+    err_issues: std.ArrayListUnmanaged(Issue),
+    test_issues: std.ArrayListUnmanaged(Issue),
+
+    fn deinit(self: *CombinedRun, allocator: Allocator) void {
+        self.graph.deinit();
+        deinitIssues(&self.err_issues, allocator);
+        deinitIssues(&self.test_issues, allocator);
+    }
+
+    /// Count issues for one rule across both pipelines.
+    fn countRule(self: *const CombinedRun, rule: []const u8) usize {
+        var n: usize = 0;
+        for (self.err_issues.items) |i| {
+            if (mem.eql(u8, i.rule, rule)) n += 1;
+        }
+        for (self.test_issues.items) |i| {
+            if (mem.eql(u8, i.rule, rule)) n += 1;
+        }
+        return n;
+    }
+};
+
+/// Test helper: build a one-file graph and run both analyzer pipelines.
+fn runBothPipelines(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !CombinedRun {
+    var graph = ImportGraph.init(allocator);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var err_issues = try analyzeErrors(allocator, &graph);
+    errdefer deinitIssues(&err_issues, allocator);
+    var test_issues = try analyzeTests(allocator, &graph);
+    errdefer deinitIssues(&test_issues, allocator);
+    return .{
+        .graph = graph,
+        .err_issues = err_issues,
+        .test_issues = test_issues,
+    };
+}
+
+test "ZA201/ZT104 overlap: empty catch in a test reports exactly ZT104" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn failingCall() !void {}
+        \\test "x" {
+        \\    failingCall() catch {};
+        \\}
+    ;
+    var run = try runBothPipelines(allocator, "overlap_empty.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.countRule(RULE_SILENT_CATCH));
+    try std.testing.expectEqual(@as(usize, 1), run.countRule(RULE_TEST_SWALLOWED_ERROR));
+}
+
+test "ZA202/ZT104 overlap: catch unreachable in a test reports exactly ZT104" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn failingCall() !void {}
+        \\test "x" {
+        \\    failingCall() catch unreachable;
+        \\}
+    ;
+    var run = try runBothPipelines(allocator, "overlap_unreach.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.countRule(RULE_CATCH_UNREACHABLE));
+    try std.testing.expectEqual(@as(usize, 1), run.countRule(RULE_TEST_SWALLOWED_ERROR));
+}
+
+test "ZA207/ZT104 overlap: catch undefined in a test reports exactly ZA207" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ZA207 keeps the catch-undefined report at warning severity — ZT104
+    // must not double it with a weaker note.
+    const content =
+        \\fn failingCall() !void {}
+        \\test "x" {
+        \\    failingCall() catch undefined;
+        \\}
+    ;
+    var run = try runBothPipelines(allocator, "overlap_undef.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.countRule(RULE_TEST_SWALLOWED_ERROR));
+    try std.testing.expectEqual(@as(usize, 1), run.countRule(RULE_CATCH_UNDEFINED));
+}
+
+test "ZA201 still fires outside test context" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn failingCall() !void {}
+        \\fn helper() void {
+        \\    failingCall() catch {};
+        \\}
+    ;
+    var run = try runBothPipelines(allocator, "overlap_outside.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), run.countRule(RULE_SILENT_CATCH));
+    try std.testing.expectEqual(@as(usize, 0), run.countRule(RULE_TEST_SWALLOWED_ERROR));
+}
+
+test "ZT104: two-line empty catch form is a note" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() !void {}
+        \\test "x" {
+        \\    foo() catch {
+        \\    };
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_twoline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_SWALLOWED_ERROR, .note),
+    );
+}
+
+test "ZT104: handled catch is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The payload is bound and the body asserts on the error — the failure
+    // is observable, so there is nothing to flag.
+    const content =
+        \\fn foo() !void {}
+        \\test "x" {
+        \\    foo() catch |err| {
+        \\        try std.testing.expectEqual(error.Foo, err);
+        \\    };
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_handled.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt104_handled.zig", RULE_TEST_SWALLOWED_ERROR),
+    );
+}
+
+test "ZT104: catch outside test context is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Non-test path, not inside a test block: ZA2xx's domain, not ZT104's.
+    const content =
+        \\fn foo() !void {}
+        \\fn helper() void {
+        \\    foo() catch {};
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_outside.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt104_outside.zig", RULE_TEST_SWALLOWED_ERROR),
+    );
+}
+
+test "ZT104: test-file path is test context" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ZA2xx is suppressed across whole *_test.zig files; ZT104 inverts the
+    // suppression over exactly the same domain, helpers included.
+    const content =
+        \\fn foo() !void {}
+        \\fn helper() void {
+        \\    foo() catch {};
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "helper_test.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_SWALLOWED_ERROR, .note),
+    );
+}
+
+test "ZT104: while-condition catch idiom is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `catch {}` in condition position converts the error to end-of-
+    // iteration — an accepted idiom, not a swallowed statement-level error.
+    const content =
+        \\fn next(it: *u8) !?u8 {
+        \\    _ = it;
+        \\    return null;
+        \\}
+        \\test "x" {
+        \\    var it: u8 = 0;
+        \\    while (next(&it) catch {}) |v| {
+        \\        try std.testing.expect(v > 0);
+        \\    }
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_while.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt104_while.zig", RULE_TEST_SWALLOWED_ERROR),
+    );
+}
+
+test "ZT101: candidates passed as values are exercised" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Passing the fn as a value to a fuzz/table harness exercises it
+    // without a call expression — the reference is compiler-checked.
+    const content =
+        \\const Duration = struct {};
+        \\fn parse_flag_value(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\fn parseFuzzHarness(f: *const fn () void) !void {
+        \\    _ = f;
+        \\}
+        \\test "Duration.parse_flag_value" {
+        \\    try parseFuzzHarness(parse_flag_value);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_valueref.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_valueref.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT104: defer cleanup catch is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Best-effort teardown of a temp file is not the test's subject.
+    const content =
+        \\fn deleteFile(path: []const u8) !void {
+        \\    _ = path;
+        \\}
+        \\test "x" {
+        \\    defer deleteFile("a") catch {};
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt104_defer.zig", RULE_TEST_SWALLOWED_ERROR),
+    );
+}
+
+test "ZT104: defer-block cleanup catch is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn deleteFile(path: []const u8) !void {
+        \\    _ = path;
+        \\}
+        \\test "x" {
+        \\    defer {
+        \\        deleteFile("a") catch {};
+        \\        deleteFile("b") catch {};
+        \\    }
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_deferblk.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt104_deferblk.zig", RULE_TEST_SWALLOWED_ERROR),
+    );
+}
+
+test "ZT104: catch unreachable in a defer still notes" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The cleanup exemption covers only the empty-catch form; converting
+    // an error to a panic is never a cleanup idiom, defer or not.
+    const content =
+        \\fn reset() !void {}
+        \\test "x" {
+        \\    defer reset() catch unreachable;
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt104_deferunreach.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_SWALLOWED_ERROR, .note),
+    );
 }

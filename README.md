@@ -313,6 +313,18 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 
 **When to enable ZA9xx:** Before switching from `Debug` to `ReleaseFast` builds — in debug mode, integer overflow panics helpfully; in `ReleaseFast` it becomes undefined behavior. Also useful for security-sensitive or financial code where overflow = vulnerability.
 
+### Tests (ZT1xx)
+
+| Rule | Severity | Default | Description |
+|------|----------|---------|-------------|
+| **ZT101** | warning | ON | Lie test: test name references a fn defined in this file that the body never calls, directly or through file-local helpers |
+| **ZT102** | warning/note | ON | Test block with no assertions: `warning` when the body has no calls that can fail, `note` for try-only smoke tests (errors still propagate) |
+| **ZT103** | warning | ON | Trivially-true assertion: `expect(true)`, `expectEqual(x, x)`, or `expect(x == x)` with textually identical operands |
+| **ZT104** | note | ON | Test swallows error: empty `catch {}` (any payload) or `catch unreachable` in test context — the failure stays unobservable |
+| **ZT105** | — | planned | Reserved for a future test-quality rule |
+
+`zig build test` cannot catch these: a test whose name promises coverage the body never exercises passes anyway, a test with no assertions passes trivially, an assertion that is true by construction verifies nothing, and a swallowed error keeps the test green. ZT101 extracts fn-name candidates from the test name (ident form, or string-form words that look like code references and exactly match a non-generic local fn — prose words never match) and requires at least one candidate to be reachable from the body through the file-local call graph. ZT102 counts calls whose target name contains `expect` or `assert` (e.g. `expectEqual`, `std.debug.assert`, custom `assertFoo` helpers) inside each `test {}` block. ZT103 inspects `expect`/`expectEqual` arguments string-aware, so `expectEqual("a,b", s)` and `expectEqual("true", s)` are not flagged. ZT104 inverts ZA201/ZA202 in test context (each fires only outside it), keeping the condition-position idiom (`while (it.next() catch {})`) and best-effort cleanup (defer/discard/cleanup-method/stream forms) exempt; for `catch undefined` it defers to ZA207's higher-severity report, which keeps firing in tests.
+
 ### Runtime Analysis (ZR1xx)
 
 | Rule | Severity | Description |

@@ -7295,6 +7295,7 @@ fn checkSilentCatch(
     line: usize,
     func_name: []const u8,
     preceding_lines: ?[]const []const u8,
+    next_line: ?[]const u8,
 ) ?Issue {
     if (mem.startsWith(u8, t, "defer ") or
         mem.startsWith(u8, t, "errdefer ")) return null;
@@ -7309,7 +7310,7 @@ fn checkSilentCatch(
     if (isDeferCatchMultiline(t, preceding_lines)) return null;
     // Suppress writer/stream catch {} — uses paren-balanced lookback for multi-line
     if (isStreamWriteCatchMultiline(t, preceding_lines)) return null;
-    const found = findSilentCatchCol(t) orelse return null;
+    const found = findSilentCatchCol(t, next_line) orelse return null;
     return .{
         .file = path,
         .line = line,
@@ -7383,13 +7384,69 @@ fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
     return false;
 }
 
-fn findSilentCatchCol(t: []const u8) ?struct { col: usize, msg: []const u8 } {
-    if (mem.indexOf(u8, t, "catch {}")) |col| {
-        if (!isInsideString(t, col) and !isInsideWhileCondition(t, col))
-            return .{ .col = col, .msg = "silent catch {} discards error" };
-    } else if (mem.indexOf(u8, t, "catch |_| {}")) |col| {
-        if (!isInsideString(t, col) and !isInsideWhileCondition(t, col))
-            return .{ .col = col, .msg = "silent catch |_| {} discards error" };
+/// A located `catch` keyword: its column, plus `rest` — the index of the
+/// first byte after an optional `|payload|` and surrounding whitespace.
+const CatchSite = struct { col: usize, rest: usize };
+
+/// Find the first real `catch` keyword at/after `start`: not inside a string
+/// literal, not embedded in a longer identifier on either side, not inside a
+/// `//` comment. `rest` skips an optional `|payload|` so callers match what
+/// follows (`{}`, `unreachable`, `undefined`) without hardcoding exact
+/// whitespace/payload spellings (`catch{}`, `catch |err| unreachable`).
+fn findCatchSite(t: []const u8, start: usize) ?CatchSite {
+    var s = start;
+    while (mem.indexOfPos(u8, t, s, "catch")) |pos| {
+        s = pos + 5;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        const after = pos + 5;
+        if (after < t.len and isIdent(t[after])) continue;
+        if (isInsideString(t, pos)) continue;
+        // A comment swallows the rest of the line — no real catch beyond it.
+        if (isInTrailingComment(t, pos)) return null;
+        var rest = after + skipLeadingWhitespace(t[after..]);
+        if (rest < t.len and t[rest] == '|') {
+            const close = mem.indexOfScalarPos(u8, t, rest + 1, '|') orelse break;
+            rest = close + 1 + skipLeadingWhitespace(t[close + 1 ..]);
+        }
+        return .{ .col = pos, .rest = rest };
+    }
+    return null;
+}
+
+/// Pick the ZA201 message for a catch site: distinguish no payload, the
+/// explicit `|_|` discard, and a named-but-unused payload.
+fn silentCatchMsg(t: []const u8, site: CatchSite) []const u8 {
+    const seg = t[site.col + 5 .. site.rest];
+    if (mem.indexOfScalar(u8, seg, '|') == null)
+        return "silent catch {} discards error";
+    if (mem.eql(u8, mem.trim(u8, seg, " \t"), "|_|"))
+        return "silent catch |_| {} discards error";
+    return "silent catch |err| {} discards error";
+}
+
+/// Check if a line is just the close of an empty catch body: `}` or `};`.
+fn isCatchCloseLine(next_line: ?[]const u8) bool {
+    const nl = next_line orelse return false;
+    const t = mem.trim(u8, nl, " \t\r");
+    return mem.eql(u8, t, "}") or mem.eql(u8, t, "};");
+}
+
+fn findSilentCatchCol(
+    t: []const u8,
+    next_line: ?[]const u8,
+) ?struct { col: usize, msg: []const u8 } {
+    var start: usize = 0;
+    while (findCatchSite(t, start)) |site| {
+        start = site.col + 5;
+        if (isInsideWhileCondition(t, site.col)) continue;
+        if (site.rest >= t.len or t[site.rest] != '{') continue;
+        const body = mem.trim(u8, t[site.rest + 1 ..], " \t");
+        const msg = silentCatchMsg(t, site);
+        if (body.len > 0 and body[0] == '}')
+            return .{ .col = site.col, .msg = msg };
+        // `catch {` ending the line: empty only if the next line just closes it
+        if (body.len == 0 and isCatchCloseLine(next_line))
+            return .{ .col = site.col, .msg = msg };
     }
     return null;
 }
@@ -7687,17 +7744,61 @@ fn isStructFieldPattern(t: []const u8, col: usize) bool {
     return i > 0 and t[i - 1] == '.';
 }
 
-/// Try to start tracking a new undefined variable
-fn tryTrackNewUndefined(
-    t: []const u8,
-    line: usize,
-    pending: *?PendingUndefined,
-) void {
-    const col = mem.indexOf(u8, t, "= undefined") orelse return;
-    if (isInsideString(t, col)) return;
-    if (isStructFieldPattern(t, col)) return;
-    const name = extractVarDeclName(t) orelse return;
-    pending.* = .{ .name = name, .line = line, .col = col + 1 };
+/// Bounded set of pending undefined vars per file. ZA204 previously tracked
+/// a single slot, so `var a = undefined; var b = undefined;` never tracked
+/// `b` while `a` was pending. 8 slots cover realistic scopes; past that, new
+/// decls are skipped (bounded memory) rather than silently evicting older
+/// ones closest to their scope end.
+const max_pending_undefined = 8;
+
+const PendingUndefinedSet = struct {
+    items: [max_pending_undefined]PendingUndefined = undefined,
+    len: usize = 0,
+    // Multi-line decl state: a `var x =` line arms the next line; a
+    // following line that is just `undefined;`/`undefined,`/`undefined }`
+    // completes the declaration.
+    armed_name: ?[]const u8 = null,
+    armed_line: usize = 0,
+    armed_col: usize = 0,
+
+    fn add(self: *PendingUndefinedSet, name: []const u8, line: usize, col: usize) void {
+        for (self.items[0..self.len]) |item| {
+            // Same decl re-seen (e.g. both tracking passes on one line).
+            if (mem.eql(u8, item.name, name) and item.line == line) return;
+        }
+        if (self.len >= max_pending_undefined) return;
+        self.items[self.len] = .{ .name = name, .line = line, .col = col };
+        self.len += 1;
+    }
+
+    fn removeAt(self: *PendingUndefinedSet, idx: usize) void {
+        // Swap-remove: reporting order is unaffected because each item
+        // carries its own declaration line/col.
+        self.items[idx] = self.items[self.len - 1];
+        self.len -= 1;
+    }
+};
+
+/// A `var`/`const` decl line ending in a bare `=` arms multi-line undefined
+/// detection (`var x =\n    undefined;`). Comparison/compound operators
+/// (`==`, `<=`, `+=`, ...) do not arm — their operand is not an initializer.
+fn lineArmsUndefinedDecl(t: []const u8) ?[]const u8 {
+    if (!mem.startsWith(u8, t, "var ") and !mem.startsWith(u8, t, "const ")) return null;
+    if (t.len < 2 or t[t.len - 1] != '=') return null;
+    const prev = t[t.len - 2];
+    const compound = "=<>!+-*/%|&^";
+    if (mem.indexOfScalar(u8, compound, prev) != null) return null;
+    if (isInsideString(t, t.len - 1)) return null;
+    return extractVarDeclName(t);
+}
+
+/// Check if a trimmed line is just an undefined initializer completing a
+/// multi-line declaration: `undefined;`, `undefined,`, `undefined }`.
+fn isUndefinedContinuationLine(t: []const u8) bool {
+    if (!mem.startsWith(u8, t, "undefined")) return false;
+    if (t.len == "undefined".len) return true;
+    const next = t["undefined".len];
+    return next == ';' or next == ',' or next == '}' or next == ' ' or next == '\t';
 }
 
 /// Create undefined issue (returns null if should be skipped)
@@ -7733,31 +7834,138 @@ fn hasScopeEnded(t: []const u8, brace_depth: usize) bool {
     return has_fn and mem.indexOf(u8, t, "(") != null;
 }
 
-/// Handle pending undefined variable
-fn handlePendingUndefined(
+/// Line context bundle for ZA204 undefined tracking (keeps helpers ≤4 params)
+const UndefinedLineCtx = struct {
     t: []const u8,
     path: []const u8,
     line: usize,
-    pending: *?PendingUndefined,
-) ?Issue {
-    const p = pending.*.?;
-    if (isFillPattern(t, p.name)) {
-        pending.* = null;
-        return null;
+};
+
+/// Update all pending undefineds for a new line: drop filled vars, report
+/// vars whose scope ended unfilled.
+fn updatePendingUndefinedSet(
+    ctx: UndefinedLineCtx,
+    set: *PendingUndefinedSet,
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+) !void {
+    var i: usize = 0;
+    while (i < set.len) {
+        const item = set.items[i];
+        if (isFillPattern(ctx.t, item.name)) {
+            set.removeAt(i);
+            continue;
+        }
+        var depth = item.brace_depth;
+        updateBraceDepth(ctx.t, &depth);
+        if (!hasScopeEnded(ctx.t, depth)) {
+            set.items[i].brace_depth = depth;
+            i += 1;
+            continue;
+        }
+        if (makeUndefinedIssue(ctx.path, item.line, item.col)) |issue| {
+            try issues.append(allocator, issue);
+        }
+        set.removeAt(i);
     }
-    var depth = p.brace_depth;
-    updateBraceDepth(t, &depth);
-    pending.* = .{
-        .name = p.name,
-        .line = p.line,
-        .col = p.col,
-        .brace_depth = depth,
-    };
-    if (!hasScopeEnded(t, depth)) return null;
-    const issue = makeUndefinedIssue(path, p.line, p.col);
-    pending.* = null;
-    tryTrackNewUndefined(t, line, pending);
-    return issue;
+}
+
+/// Check if a `var `/`const ` keyword at `pos` starts a declaration: it must
+/// follow a statement boundary (line start, `;`, `{`, `}`). A `const` inside
+/// a type expression (`[]const u8`, `[*:0]const u8`) is a qualifier, not a
+/// declaration keyword.
+fn isDeclKeywordAt(before: []const u8, pos: usize) bool {
+    if (pos > 0 and isIdent(before[pos - 1])) return false;
+    if (isInsideString(before, pos)) return false;
+    var i = pos;
+    while (i > 0 and (before[i - 1] == ' ' or before[i - 1] == '\t')) i -= 1;
+    if (i == 0) return true;
+    const prev = before[i - 1];
+    return prev == ';' or prev == '{' or prev == '}';
+}
+
+/// Find the last `var `/`const ` DECLARATION keyword before `= undefined`.
+fn lastVarConstKeyword(before: []const u8) ?usize {
+    var best: ?usize = null;
+    var pos: usize = 0;
+    while (pos + 4 <= before.len) : (pos += 1) {
+        const is_var = mem.startsWith(u8, before[pos..], "var ");
+        const is_const = pos + 6 <= before.len and
+            mem.startsWith(u8, before[pos..], "const ");
+        if (!is_var and !is_const) continue;
+        if (!isDeclKeywordAt(before, pos)) continue;
+        best = pos;
+    }
+    return best;
+}
+
+/// Extract the declared name when `col` (an `= undefined` match) belongs to
+/// a `var`/`const` declaration earlier on the same line. Handles multiple
+/// decls on one line (`var a = undefined; var b = undefined;`); a `;`
+/// between the decl keyword and col means the decl closed a previous
+/// statement.
+fn extractVarDeclNameBefore(t: []const u8, col: usize) ?[]const u8 {
+    const before = t[0..col];
+    const kw_pos = lastVarConstKeyword(before) orelse return null;
+    const name = extractVarDeclName(before[kw_pos..]) orelse return null;
+    const kw_len: usize = if (mem.startsWith(u8, before[kw_pos..], "var ")) 4 else 6;
+    const name_end = kw_pos + kw_len + name.len;
+    if (mem.indexOfScalar(u8, before[name_end..], ';') != null) return null;
+    return name;
+}
+
+/// Scan a line for `= undefined` occurrences: track new decl-var pendings,
+/// and report non-decl undefined assignments immediately.
+fn scanUndefinedOccurrences(
+    ctx: UndefinedLineCtx,
+    set: *PendingUndefinedSet,
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+) !void {
+    var s: usize = 0;
+    while (mem.indexOfPos(u8, ctx.t, s, "= undefined")) |col| {
+        s = col + 1;
+        if (isUndefinedContinuation(ctx.t, col)) continue;
+        if (isInsideString(ctx.t, col)) continue;
+        // Everything from the comment start on is prose, not code.
+        if (isInTrailingComment(ctx.t, col)) return;
+        if (isStructFieldPattern(ctx.t, col)) continue;
+        if (isCleanupUndefinedPattern(ctx.t, col)) continue;
+        if (extractVarDeclNameBefore(ctx.t, col)) |name| {
+            set.add(name, ctx.line, col + 1);
+            continue;
+        }
+        if (isStructFieldDefault(ctx.t, col)) continue;
+        if (makeUndefinedIssue(ctx.path, ctx.line, col + 1)) |issue| {
+            try issues.append(allocator, issue);
+        }
+    }
+}
+
+/// Track new undefined decls on a line: complete an armed multi-line decl,
+/// scan `= undefined` occurrences, arm on a trailing bare `=`.
+fn trackNewUndefined(
+    ctx: UndefinedLineCtx,
+    set: *PendingUndefinedSet,
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+) !void {
+    if (set.armed_name) |name| {
+        const armed_line = set.armed_line;
+        const armed_col = set.armed_col;
+        set.armed_name = null;
+        if (isUndefinedContinuationLine(ctx.t)) {
+            set.add(name, armed_line, armed_col);
+            return;
+        }
+    }
+    try scanUndefinedOccurrences(ctx, set, issues, allocator);
+    if (lineArmsUndefinedDecl(ctx.t)) |name| {
+        set.armed_name = name;
+        set.armed_line = ctx.line;
+        // col of the trailing '=' (1-based past-the-end position)
+        set.armed_col = ctx.t.len;
+    }
 }
 
 /// Check if line is a module-level declaration (no leading whitespace)
@@ -7798,31 +8006,13 @@ fn isUndefinedContinuation(t: []const u8, col: usize) bool {
     return isIdent(t[after]);
 }
 
+/// Check if `col` falls inside a trailing `//` comment: the first `//` that
+/// is NOT inside a string literal starts at or before `col`. Point-pattern
+/// rules (ZA201/202/203/204/207/208) use this so a pattern mentioned in
+/// comment prose (`foo(); // catch {}`) is not reported as real code.
 fn isInTrailingComment(t: []const u8, col: usize) bool {
-    const comment_start = mem.indexOf(u8, t, "//") orelse return false;
-    return col > comment_start and !isInsideString(t, comment_start);
-}
-
-fn checkUndefinedUsage(
-    t: []const u8,
-    path: []const u8,
-    line: usize,
-    pending: *?PendingUndefined,
-) ?Issue {
-    if (pending.* != null)
-        return handlePendingUndefined(t, path, line, pending);
-    const col = mem.indexOf(u8, t, "= undefined") orelse return null;
-    if (isUndefinedContinuation(t, col)) return null;
-    if (isInsideString(t, col)) return null;
-    if (isInTrailingComment(t, col)) return null;
-    if (isStructFieldPattern(t, col)) return null;
-    if (isCleanupUndefinedPattern(t, col)) return null;
-    if (extractVarDeclName(t)) |name| {
-        pending.* = .{ .name = name, .line = line, .col = col + 1 };
-        return null;
-    }
-    if (isStructFieldDefault(t, col)) return null;
-    return makeUndefinedIssue(path, line, col + 1);
+    const comment_start = findCommentStart(t) orelse return false;
+    return col >= comment_start;
 }
 
 /// Detect struct type field defaults: `field_name: Type = undefined`
@@ -7878,7 +8068,7 @@ fn checkDiscardedResult(
 const ErrorAnalysisState = struct {
     in_test_block: bool = false,
     test_brace_depth: usize = 0,
-    pending_undefined: ?PendingUndefined = null,
+    pending_undefined: PendingUndefinedSet = .{},
     struct_state: StructLiteralState = .{},
     pending_struct_fields: [64]PendingStructField =
         [_]PendingStructField{.{}} ** 64,
@@ -8151,16 +8341,17 @@ fn checkLineErrors(
     skip_undefined: bool,
     in_defer: bool,
     in_test: bool,
-    pending: *?PendingUndefined,
+    pending: *PendingUndefinedSet,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
     type_ctx: ?*const TypeContext,
     func_name: []const u8,
     preceding_lines: ?[]const []const u8,
+    next_line: ?[]const u8,
 ) !void {
     // ZA201 (silent catch) - only from line-based analyzer
     if (!in_defer) {
-        if (checkSilentCatch(t, path, ln, func_name, preceding_lines)) |i| {
+        if (checkSilentCatch(t, path, ln, func_name, preceding_lines, next_line)) |i| {
             try issues.append(allocator, i);
         }
     }
@@ -8182,25 +8373,36 @@ fn checkLineErrors(
     }
     // Always resolve pending undefineds (even at module boundary) to avoid
     // losing ZA204 issues when skip_undefined transitions from false→true.
-    // handlePendingUndefined checks fill patterns and scope boundaries.
-    if (pending.* != null) {
-        if (handlePendingUndefined(t, path, ln, pending)) |i| {
-            try issues.append(allocator, i);
-        }
-    }
-    // Only track NEW undefineds when not in test/module-level context
-    // and when no pending is active (handlePendingUndefined already ran above)
-    if (!skip_undefined and pending.* == null) {
-        // checkUndefinedUsage: only detects new "= undefined" when pending is null
-        if (checkUndefinedUsage(t, path, ln, pending)) |i| {
-            try issues.append(allocator, i);
-        }
+    // The update pass checks fill patterns and scope boundaries per var.
+    const undef_ctx: UndefinedLineCtx = .{ .t = t, .path = path, .line = ln };
+    try updatePendingUndefinedSet(undef_ctx, pending, issues, allocator);
+    // Only track NEW undefineds when not in test/module-level context.
+    // Multiple vars may be pending at once (the old single-slot tracker
+    // dropped every decl after the first).
+    if (!skip_undefined) {
+        try trackNewUndefined(undef_ctx, pending, issues, allocator);
     }
     if (checkDiscardedResult(t, path, ln, type_ctx)) |i| try issues.append(allocator, i);
     // ZA208: @panic() detection — suppress in test blocks and test files
     if (!in_test and !isTestFilePath(path)) {
         if (checkPanic(t, path, ln)) |i| {
             try issues.append(allocator, i);
+        }
+    }
+}
+
+/// Report still-pending undefined vars at end of file (scope never filled)
+fn reportRemainingUndefined(
+    state: *ErrorAnalysisState,
+    path: []const u8,
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+) !void {
+    if (isTestFilePath(path)) return;
+    const set = &state.pending_undefined;
+    for (set.items[0..set.len]) |item| {
+        if (makeUndefinedIssue(path, item.line, item.col)) |issue| {
+            try issues.append(allocator, issue);
         }
     }
 }
@@ -8212,19 +8414,7 @@ fn reportEndOfFileIssues(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
 ) !void {
-    // Skip undefined reports for test files
-    if (!isTestFilePath(path)) {
-        if (state.pending_undefined) |pending|
-            try issues.append(allocator, .{
-                .file = path,
-                .line = pending.line,
-                .col = pending.col,
-                .severity = .warning,
-                .rule = RULE_UNDEFINED_USAGE,
-                .message = "undefined may leak data",
-                .help = "initialize or write before use",
-            });
-    }
+    try reportRemainingUndefined(state, path, issues, allocator);
     const fields = state.pending_struct_fields[0..state.pending_field_count];
     for (fields) |pf| {
         try reportUnfilledField(issues, allocator, path, &pf);
@@ -8322,6 +8512,11 @@ fn analyzeFileErrors(
             try checkPendingFields(t, a.path, &state, issues, allocator);
         }
         const preceding: ?[]const []const u8 = if (line_idx > 0) all_lines[0..line_idx] else null;
+        // Needed for the bounded 2-line empty-catch form: `catch {` + `}` alone
+        const next_line: ?[]const u8 = if (line_idx + 1 < all_lines.len)
+            all_lines[line_idx + 1]
+        else
+            null;
         const in_test = isInTestContext(a.path, state.in_test_block);
         try checkLineErrors(
             t,
@@ -8336,6 +8531,7 @@ fn analyzeFileErrors(
             &type_ctx,
             state.current_func_name,
             preceding,
+            next_line,
         );
 
         if (checkExitBypassesDefer(
@@ -8368,16 +8564,40 @@ fn analyzeErrors(
 // Unused Analysis Helpers
 // ============================================================================
 
-/// Count word-boundary occurrences of name in content
-fn countIdentOccurrences(content: []const u8, name: []const u8) usize {
+/// Count word-boundary occurrences of name in one code slice, skipping
+/// occurrences inside string literals — an import's own "name.zig" string
+/// must not count as a use of the alias.
+fn countIdentInCode(code: []const u8, name: []const u8) usize {
     var count: usize = 0;
     var i: usize = 0;
-    while (i + name.len <= content.len) : (i += 1) {
-        if (!mem.eql(u8, content[i .. i + name.len], name)) continue;
-        const before_ok = i == 0 or !isIdent(content[i - 1]);
+    while (i + name.len <= code.len) : (i += 1) {
+        if (!mem.eql(u8, code[i .. i + name.len], name)) continue;
+        const before_ok = i == 0 or !isIdent(code[i - 1]);
         const end_idx = i + name.len;
-        const after_ok = end_idx >= content.len or !isIdent(content[end_idx]);
-        if (before_ok and after_ok) count += 1;
+        const after_ok = end_idx >= code.len or !isIdent(code[end_idx]);
+        if (!before_ok or !after_ok) continue;
+        if (isInsideString(code, i)) continue;
+        count += 1;
+    }
+    return count;
+}
+
+/// Count real uses of name across content: skips `//` comment lines and
+/// `\\` multiline-string lines, drops everything after a trailing `//`
+/// comment, and ignores string-literal occurrences. The declaring line
+/// contributes one less than its raw count — the declaration itself
+/// (and, for imports, the filename string) is not a use.
+fn countRealIdentUses(content: []const u8, name: []const u8, decl_line: usize) usize {
+    var count: usize = 0;
+    var line_num: usize = 1;
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        defer line_num += 1;
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(line) orelse line.len;
+        const n = countIdentInCode(line[0..code_end], name);
+        count += if (line_num == decl_line) n -| 1 else n;
     }
     return count;
 }
@@ -8406,7 +8626,7 @@ fn checkUnusedImport(
     if (imp.name.len > 0 and imp.name[0] == '_') return;
     // Skip public re-exports - they're intentional library API
     if (imp.is_pub) return;
-    if (countIdentOccurrences(content, imp.name) > 1) return;
+    if (countRealIdentUses(content, imp.name, imp.line) > 0) return;
     const msg = try std.fmt.allocPrint(
         allocator,
         "unused import '{s}'",
@@ -8441,7 +8661,7 @@ fn checkUnusedDecl(
     const is_var = mem.startsWith(u8, t, "var ");
     if (!is_const and !is_var) return;
     const name = extractUnusedDeclName(t, is_const) orelse return;
-    if (countIdentOccurrences(content, name) != 1) return;
+    if (countRealIdentUses(content, name, line_num) > 0) return;
     const rule = if (is_const) RULE_UNUSED_CONST else RULE_UNUSED_VAR;
     const kind = if (is_const) "const" else "var";
     const msg = try std.fmt.allocPrint(
@@ -8536,9 +8756,55 @@ fn hasSelfParam(t: []const u8, paren_pos: usize) bool {
         mem.startsWith(u8, after, "self)");
 }
 
-/// Check if keyword exists but not with inline prefix
-fn hasNonInline(t: []const u8, kw: []const u8, inline_kw: []const u8) bool {
-    return mem.indexOf(u8, t, kw) != null and mem.indexOf(u8, t, inline_kw) == null;
+/// Check if `needle` occurs as a real code token: identifier-boundary on
+/// BOTH sides (so `orelse` never matches `else`, `modify` never matches
+/// `if`), not inside a string literal, and not inside a trailing `//`
+/// comment. Iterates ALL occurrences — an early one may be inside a string
+/// or comment while a later one is real code.
+fn hasToken(t: []const u8, needle: []const u8) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], needle)) |rel| {
+        const pos = s + rel;
+        s = pos + needle.len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + needle.len < t.len and isIdent(t[pos + needle.len])) continue;
+        if (isInsideString(t, pos)) continue;
+        if (isInTrailingComment(t, pos)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Check if a loop keyword appears as a runtime loop: `for`/`while` present
+/// but not in `inline for`/`inline while` form (comptime-unrolled loops are
+/// not runtime decision points).
+fn hasRuntimeLoop(t: []const u8, comptime kw: []const u8) bool {
+    if (hasToken(t, "inline " ++ kw)) return false;
+    return hasToken(t, kw);
+}
+
+/// Check if an `else` token is a switch prong (`else =>`), which is already
+/// counted by countSwitchArms and must not double-count as a branch.
+fn hasElseArrow(t: []const u8) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], "else")) |rel| {
+        const pos = s + rel;
+        s = pos + 4;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + 4 < t.len and isIdent(t[pos + 4])) continue;
+        if (isInsideString(t, pos)) continue;
+        if (isInTrailingComment(t, pos)) continue;
+        var j = pos + 4;
+        while (j < t.len and t[j] == ' ') j += 1;
+        if (j + 1 < t.len and t[j] == '=' and t[j + 1] == '>') return true;
+    }
+    return false;
+}
+
+/// Check if a standalone `else` branch appears (not `else if`, not `else =>`).
+fn hasElseBranch(t: []const u8) bool {
+    if (hasElseArrow(t)) return false;
+    return hasToken(t, "else");
 }
 
 /// Count switch arms (`=>`) on a line, skipping matches inside string literals.
@@ -8556,13 +8822,13 @@ fn countSwitchArms(t: []const u8) usize {
 /// Count branches in a line (control flow decision points)
 fn countLineBranches(t: []const u8) usize {
     var b: usize = 0;
-    if (mem.indexOf(u8, t, "if ") != null) b += 1;
-    if (hasNonInline(t, "else ", "else =>")) b += 1;
-    if (mem.indexOf(u8, t, "switch ") != null) b += 1;
+    if (hasToken(t, "if")) b += 1;
+    if (hasElseBranch(t)) b += 1;
+    if (hasToken(t, "switch")) b += 1;
     b += countSwitchArms(t);
-    if (hasNonInline(t, "while ", "inline while")) b += 1;
-    if (hasNonInline(t, "for ", "inline for")) b += 1;
-    if (mem.indexOf(u8, t, " catch ") != null) b += 1;
+    if (hasRuntimeLoop(t, "while")) b += 1;
+    if (hasRuntimeLoop(t, "for")) b += 1;
+    if (hasToken(t, "catch")) b += 1;
     return b;
 }
 
@@ -8571,20 +8837,19 @@ fn countLineBranches(t: []const u8) usize {
 fn countLineCyclomatic(t: []const u8) usize {
     var c: usize = 0;
     // else if counts as 1 (not if+else separately)
-    if (mem.indexOf(u8, t, "else if") != null) {
+    if (hasToken(t, "else if")) {
         c += 1;
     } else {
-        if (mem.indexOf(u8, t, "if ") != null) c += 1;
-        // standalone else (not else if, not else =>, not part of orelse)
-        if (mem.indexOf(u8, t, "else ") != null and
-            mem.indexOf(u8, t, "else =>") == null and
-            mem.indexOf(u8, t, "orelse") == null) c += 1;
+        if (hasToken(t, "if")) c += 1;
+        // standalone else (not else if, not else =>; `orelse` cannot match
+        // the token-bounded `else`)
+        if (hasElseBranch(t)) c += 1;
     }
-    if (hasNonInline(t, "while ", "inline while")) c += 1;
-    if (hasNonInline(t, "for ", "inline for")) c += 1;
-    if (mem.indexOf(u8, t, "switch ") != null) c += 1;
+    if (hasRuntimeLoop(t, "while")) c += 1;
+    if (hasRuntimeLoop(t, "for")) c += 1;
+    if (hasToken(t, "switch")) c += 1;
     c += countSwitchArms(t);
-    if (mem.indexOf(u8, t, " catch ") != null) c += 1;
+    if (hasToken(t, "catch")) c += 1;
     if (mem.indexOf(u8, t, "try ") != null) c += 1;
     if (mem.indexOf(u8, t, "orelse") != null) c += 1;
     if (mem.indexOf(u8, t, " and ") != null) c += 1;
@@ -8596,25 +8861,18 @@ fn countLineCyclomatic(t: []const u8) usize {
 fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
     var cost: usize = 0;
     // else if counts as 1, not as both if and else if
-    if (mem.indexOf(u8, t, "else if") != null) {
+    if (hasToken(t, "else if")) {
         cost += 1 + cog_nest;
     } else {
-        if (mem.indexOf(u8, t, "if ") != null) cost += 1 + cog_nest;
+        if (hasToken(t, "if")) cost += 1 + cog_nest;
+        if (hasElseBranch(t)) cost += 1 + cog_nest;
     }
-    if (hasNonInline(t, "while ", "inline while")) cost += 1 + cog_nest;
-    if (hasNonInline(t, "for ", "inline for")) cost += 1 + cog_nest;
-    if (mem.indexOf(u8, t, "switch ") != null) cost += 1 + cog_nest;
+    if (hasRuntimeLoop(t, "while")) cost += 1 + cog_nest;
+    if (hasRuntimeLoop(t, "for")) cost += 1 + cog_nest;
+    if (hasToken(t, "switch")) cost += 1 + cog_nest;
     cost += countSwitchArms(t) * (1 + cog_nest);
-    if (mem.indexOf(u8, t, " catch ") != null) cost += 1 + cog_nest;
+    if (hasToken(t, "catch")) cost += 1 + cog_nest;
     if (mem.indexOf(u8, t, "try ") != null) cost += 1 + cog_nest;
-    // else (not else if, not else =>, and not a substring of orelse)
-    if (mem.indexOf(u8, t, "else ") != null and
-        mem.indexOf(u8, t, "else if") == null and
-        mem.indexOf(u8, t, "else =>") == null and
-        mem.indexOf(u8, t, "orelse") == null)
-    {
-        cost += 1 + cog_nest;
-    }
     // Secondary — no nesting impact
     if (mem.indexOf(u8, t, "orelse") != null) cost += 1;
     if (mem.indexOf(u8, t, " and ") != null) cost += 1;
@@ -8625,11 +8883,11 @@ fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
 /// Check if line opens a cognitive-nesting-increasing scope (has control keyword + {)
 fn opensCognitiveScope(t: []const u8) bool {
     if (mem.indexOf(u8, t, "{") == null) return false;
-    return mem.indexOf(u8, t, "if ") != null or
-        mem.indexOf(u8, t, "switch ") != null or
-        mem.indexOf(u8, t, "while ") != null or
-        mem.indexOf(u8, t, "for ") != null or
-        mem.indexOf(u8, t, " catch ") != null or
+    return hasToken(t, "if") or
+        hasToken(t, "switch") or
+        hasToken(t, "while") or
+        hasToken(t, "for") or
+        hasToken(t, "catch") or
         mem.indexOf(u8, t, "try ") != null;
 }
 
@@ -8853,6 +9111,16 @@ const LineView = struct {
     line_offset: usize,
 };
 
+/// True when this line starts a new top-level fn while another fn is still
+/// open — detectFnStart will reset state, discarding the in-flight fn's
+/// accumulated metrics. The caller must report those verdicts first or
+/// outer fns containing local structs with methods never get ZA301-306.
+fn resetsInFlightFn(view: LineView, state: *const ComplexityState) bool {
+    if (!state.in_fn) return false;
+    if (!isNewFunctionDef(view.t)) return false;
+    return findRealFnDef(view.t) != null;
+}
+
 fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void {
     const t = view.t;
     const pos = findRealFnDef(t) orelse return;
@@ -8888,17 +9156,19 @@ const LiteralState = struct {
     in_str: bool = false,
     in_chr: bool = false,
 
+    /// Returns the position to process as code, or null when the char is
+    /// string/char-literal data (including the delimiters themselves).
     fn updateForChar(self: *LiteralState, t: []const u8, i: usize) ?usize {
         const c = t[i];
         if (c == '\'' and !self.in_str) {
-            if (!self.in_chr) {
-                self.in_chr = true;
-                // Skip char content
-                if (i + 1 < t.len and t[i + 1] == '\\') return i + 2;
-                if (i + 1 < t.len) return i + 1;
-            } else {
-                self.in_chr = false;
-            }
+            // A quote is a char-literal delimiter only when the backslash
+            // run before it is EVEN; an odd run escapes it (`'\''`, `'\\'`),
+            // making it content. Toggling on escaped content quotes leaves
+            // in_chr stuck and swallows the rest of the line's braces.
+            var backslashes: usize = 0;
+            var j = i;
+            while (j > 0 and t[j - 1] == '\\') : (j -= 1) backslashes += 1;
+            if (backslashes % 2 == 0) self.in_chr = !self.in_chr;
             return null;
         }
         if (c == '"' and !self.in_chr and (i == 0 or t[i - 1] != '\\')) {
@@ -8917,10 +9187,7 @@ fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     var first = true;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
-        const pos = lit.updateForChar(t, i) orelse {
-            if (lit.in_chr and i + 1 < t.len) i += 1;
-            continue;
-        };
+        const pos = lit.updateForChar(t, i) orelse continue;
         if (updateBraceState(t[pos], is_switch, &first, state))
             return true;
     }
@@ -8953,6 +9220,51 @@ fn updateBraceState(
     return false;
 }
 
+/// Shared reporting context for complexity accumulation (keeps ≤4 params)
+const ComplexityReporter = struct {
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    path: []const u8,
+    th: Thresholds,
+
+    fn report(self: *const ComplexityReporter, state: *const ComplexityState) !void {
+        try reportComplexityIssues(self.issues, self.allocator, self.path, state, self.th);
+    }
+};
+
+/// Accumulate one line's complexity metrics and report when the fn ends.
+fn processComplexityLine(
+    reporter: *const ComplexityReporter,
+    view: LineView,
+    state: *ComplexityState,
+    line_num: usize,
+) !void {
+    const t = view.t;
+    // A nested fn start (e.g. a method of a local struct) makes
+    // detectFnStart reset state; report the in-flight fn's accumulated
+    // verdicts first or they are silently discarded.
+    if (resetsInFlightFn(view, state)) try reporter.report(state);
+    detectFnStart(view, state, line_num);
+    if (!state.in_fn) return;
+    state.fn_lines += 1;
+    state.branches += countLineBranches(t);
+    state.cyclomatic += countLineCyclomatic(t);
+    state.cognitive += countLineCognitive(t, state.cog_nest);
+
+    // Track cognitive nesting: control structures open new scopes
+    if (opensCognitiveScope(t)) {
+        state.cog_nest += 1;
+        const next_nest = state.nest + 1;
+        if (next_nest < 32) state.cog_markers |= @as(u32, 1) << @intCast(next_nest);
+    }
+    if (!trackBraceNesting(t, state)) return;
+
+    // Function ended — unwind cognitive nesting, then report
+    while (state.cog_nest > 0) state.cog_nest -= 1;
+    try reporter.report(state);
+    state.* = .{ .cyclomatic = 1 };
+}
+
 /// Analyze complexity of a single file
 fn analyzeFileComplexity(
     allocator: Allocator,
@@ -8964,6 +9276,12 @@ fn analyzeFileComplexity(
     var line_num: usize = 1;
     var line_start: usize = 0;
     const content = a.content;
+    const reporter: ComplexityReporter = .{
+        .issues = issues,
+        .allocator = allocator,
+        .path = a.path,
+        .th = th,
+    };
     while (line_start <= content.len) {
         const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
         defer {
@@ -8980,30 +9298,7 @@ fn analyzeFileComplexity(
             .content = content,
             .line_offset = line_start + lead,
         };
-        detectFnStart(view, &state, line_num);
-        if (!state.in_fn) continue;
-        state.fn_lines += 1;
-        state.branches += countLineBranches(t);
-        state.cyclomatic += countLineCyclomatic(t);
-        state.cognitive += countLineCognitive(t, state.cog_nest);
-
-        // Track cognitive nesting: control structures open new scopes
-        const cog_before = state.cog_nest;
-        if (opensCognitiveScope(t)) {
-            state.cog_nest += 1;
-            const next_nest = state.nest + 1;
-            if (next_nest < 32) state.cog_markers |= @as(u32, 1) << @intCast(next_nest);
-        }
-        if (!trackBraceNesting(t, &state)) continue;
-
-        // Function ended — check if we need to unwind cognitive nesting
-        while (state.cog_nest > 0) state.cog_nest -= 1;
-        _ = cog_before;
-
-        try reportComplexityIssues(issues, allocator, a.path, &state, th);
-        state = .{
-            .cyclomatic = 1,
-        };
+        try processComplexityLine(&reporter, view, &state, line_num);
     }
 }
 
@@ -11425,23 +11720,29 @@ fn checkCatchUnreachable(
     line_num: usize,
     preceding_lines: ?[]const []const u8,
 ) ?Issue {
-    const col = mem.indexOf(u8, t, "catch unreachable") orelse return null;
-    if (isInsideString(t, col)) return null;
-    // Suppress inside @TypeOf() — compile-time only, never executed at runtime
-    if (isInsideTypeOf(t, col, preceding_lines)) return null;
-    // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe
-    if (isBufPrintCatchUnreachable(t, preceding_lines)) return null;
-    // Suppress stdlib functions called with string literals (parseIp("0.0.0.0", ...))
-    if (isSafeStdlibLiteralCall(t, preceding_lines)) return null;
-    return .{
-        .file = file_path,
-        .line = line_num,
-        .col = col + 1,
-        .severity = .note,
-        .rule = RULE_CATCH_UNREACHABLE,
-        .message = "catch unreachable will panic on error",
-        .help = "use explicit error handling",
-    };
+    var start: usize = 0;
+    while (findCatchSite(t, start)) |site| {
+        start = site.col + 5;
+        const rest = t[site.rest..];
+        if (!mem.startsWith(u8, rest, "unreachable")) continue;
+        if (rest.len > 11 and isIdent(rest[11])) continue;
+        // Suppress inside @TypeOf() — compile-time only, never executed at runtime
+        if (isInsideTypeOf(t, site.col, preceding_lines)) return null;
+        // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe
+        if (isBufPrintCatchUnreachable(t, preceding_lines)) return null;
+        // Suppress stdlib functions called with string literals (parseIp("0.0.0.0", ...))
+        if (isSafeStdlibLiteralCall(t, preceding_lines)) return null;
+        return .{
+            .file = file_path,
+            .line = line_num,
+            .col = site.col + 1,
+            .severity = .note,
+            .rule = RULE_CATCH_UNREACHABLE,
+            .message = "catch unreachable will panic on error",
+            .help = "use explicit error handling",
+        };
+    }
+    return null;
 }
 
 /// Find the call-site line for a `) catch ...` by paren-balanced lookback.
@@ -11638,17 +11939,23 @@ fn checkLineOrelseUnreachable(
     file_path: []const u8,
     line_num: usize,
 ) ?Issue {
-    const col = mem.indexOf(u8, t, "orelse unreachable") orelse return null;
-    if (isInsideString(t, col)) return null;
-    return .{
-        .file = file_path,
-        .line = line_num,
-        .col = col + 1,
-        .severity = .note,
-        .rule = RULE_ORELSE_UNREACHABLE,
-        .message = "orelse unreachable will panic",
-        .help = "use explicit null handling",
-    };
+    var s: usize = 0;
+    while (mem.indexOfPos(u8, t, s, "orelse unreachable")) |col| {
+        s = col + 1;
+        if (isInsideString(t, col)) continue;
+        // A mention inside a trailing comment is prose, not code.
+        if (isInTrailingComment(t, col)) return null;
+        return .{
+            .file = file_path,
+            .line = line_num,
+            .col = col + 1,
+            .severity = .note,
+            .rule = RULE_ORELSE_UNREACHABLE,
+            .message = "orelse unreachable will panic",
+            .help = "use explicit null handling",
+        };
+    }
+    return null;
 }
 
 /// ZA207: catch undefined converts errors to undefined behavior
@@ -11657,22 +11964,25 @@ fn checkCatchUndefined(
     file_path: []const u8,
     line_num: usize,
 ) ?Issue {
-    // Match "catch undefined" but not "catch |_| undefined" or "catch |err| undefined"
-    const col = mem.indexOf(u8, t, "catch undefined") orelse return null;
-    if (isInsideString(t, col)) return null;
-    // Ensure it's "catch undefined" not "catch |...| undefined"
-    const after_catch = t[col + 5 ..]; // skip "catch"
-    const trimmed = mem.trimStart(u8, after_catch, " \t");
-    if (trimmed.len > 0 and trimmed[0] == '|') return null;
-    return .{
-        .file = file_path,
-        .line = line_num,
-        .col = col + 1,
-        .severity = .warning,
-        .rule = RULE_CATCH_UNDEFINED,
-        .message = "catch undefined converts errors to undefined behavior",
-        .help = "handle the error explicitly or use catch |err| { ... }",
-    };
+    // Any payload form (`catch |_| undefined`, `catch |err| undefined`) is
+    // equally UB — the payload does not rescue the error.
+    var start: usize = 0;
+    while (findCatchSite(t, start)) |site| {
+        start = site.col + 5;
+        const rest = t[site.rest..];
+        if (!mem.startsWith(u8, rest, "undefined")) continue;
+        if (rest.len > 9 and isIdent(rest[9])) continue;
+        return .{
+            .file = file_path,
+            .line = line_num,
+            .col = site.col + 1,
+            .severity = .warning,
+            .rule = RULE_CATCH_UNDEFINED,
+            .message = "catch undefined converts errors to undefined behavior",
+            .help = "handle the error explicitly or use catch |err| { ... }",
+        };
+    }
+    return null;
 }
 
 /// ZA208: @panic() will crash the program
@@ -11681,17 +11991,23 @@ fn checkPanic(
     file_path: []const u8,
     line_num: usize,
 ) ?Issue {
-    const col = mem.indexOf(u8, t, "@panic(") orelse return null;
-    if (isInsideString(t, col)) return null;
-    return .{
-        .file = file_path,
-        .line = line_num,
-        .col = col + 1,
-        .severity = .note,
-        .rule = RULE_PANIC,
-        .message = "@panic() will crash the program",
-        .help = "consider returning an error instead, or document why panic is necessary",
-    };
+    var s: usize = 0;
+    while (mem.indexOfPos(u8, t, s, "@panic(")) |col| {
+        s = col + 1;
+        if (isInsideString(t, col)) continue;
+        // A mention inside a trailing comment is prose, not code.
+        if (isInTrailingComment(t, col)) return null;
+        return .{
+            .file = file_path,
+            .line = line_num,
+            .col = col + 1,
+            .severity = .note,
+            .rule = RULE_PANIC,
+            .message = "@panic() will crash the program",
+            .help = "consider returning an error instead, or document why panic is necessary",
+        };
+    }
+    return null;
 }
 
 /// Extract variable name before "orelse unreachable"
@@ -12075,6 +12391,27 @@ fn isArrayIndexGuarded(
     return false;
 }
 
+/// Find a `-=` decrement operator with a real operand on its right side,
+/// tolerating any surrounding whitespace (`x-=1`, `x -=1`, `x-= 1`,
+/// `x -= 2`, `x -= n`). `-|=` cannot match (`-` and `=` are not adjacent)
+/// and `x = -1` cannot match (the chars are `= -`, not `-=`). Matches
+/// inside string literals and trailing comments are not code.
+fn findDecrementOp(t: []const u8) ?usize {
+    var s: usize = 0;
+    while (mem.indexOfPos(u8, t, s, "-=")) |pos| {
+        s = pos + 2;
+        var j = pos + 2;
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+        if (j >= t.len) continue;
+        const rhs = t[j];
+        if (!isIdent(rhs) and rhs != '(' and rhs != '@' and rhs != '-') continue;
+        if (isInsideString(t, pos)) continue;
+        if (isInTrailingComment(t, pos)) continue;
+        return pos;
+    }
+    return null;
+}
+
 /// ZA901: Check for unguarded decrement on a single line
 fn checkDecrementOverflow(
     allocator: Allocator,
@@ -12087,8 +12424,7 @@ fn checkDecrementOverflow(
     guarded: *const std.StringHashMapUnmanaged(void),
     reported: *std.AutoHashMap(usize, void),
 ) !void {
-    const col = mem.indexOf(u8, t, "-= 1") orelse return;
-    if (isInsideString(t, col)) return;
+    const col = findDecrementOp(t) orelse return;
     const var_name = extractDecrementVar(t, col) orelse return;
     if (isDecrementGuarded(t, lines, idx, var_name, guarded)) return;
     try issues.append(allocator, .{
@@ -12118,6 +12454,8 @@ fn checkArrayIndexOverflow(
 ) !void {
     const col = hasArrayIndexSubtraction(t) orelse return;
     if (isInsideString(t, col)) return;
+    // A bracket expression mentioned in a trailing comment is prose, not code.
+    if (isInTrailingComment(t, col)) return;
     if (isArrayIndexGuarded(t, lines, idx, guarded)) return;
     try issues.append(allocator, .{
         .file = file_path,
@@ -12598,24 +12936,27 @@ fn hasEarlyReturnLengthGuard(
 const IdxSub = struct { idx_var: []const u8, subtrahend: usize };
 
 fn extractIndexSubtraction(line: []const u8) ?IdxSub {
-    const bpos = mem.indexOf(u8, line, "[") orelse return null;
-    const spos = mem.indexOf(u8, line, " - ") orelse return null;
-    if (spos <= bpos) return null;
-    const idx_var = mem.trim(u8, line[bpos + 1 .. spos], " ");
-    if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
-    var sub_end = spos + 3;
-    while (sub_end < line.len and
-        line[sub_end] >= '0' and line[sub_end] <= '9')
-    {
-        sub_end += 1;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] != '[') continue;
+        const end = findMatchingBracket(line, i) orelse continue;
+        const inside = line[i + 1 .. end];
+        const sub = findIndexSubtraction(inside) orelse {
+            i = end;
+            continue;
+        };
+        const idx_var = mem.trim(u8, inside[0..sub], " \t");
+        if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
+        // Parse the numeric subtrahend after the '-', skipping whitespace.
+        var dpos = i + 1 + sub + 1;
+        while (dpos < line.len and (line[dpos] == ' ' or line[dpos] == '\t')) dpos += 1;
+        var dend = dpos;
+        while (dend < line.len and line[dend] >= '0' and line[dend] <= '9') dend += 1;
+        if (dend == dpos) return null;
+        const val = std.fmt.parseInt(usize, line[dpos..dend], 10) catch return null;
+        return .{ .idx_var = idx_var, .subtrahend = val };
     }
-    if (sub_end == spos + 3) return null;
-    const val = std.fmt.parseInt(
-        usize,
-        line[spos + 3 .. sub_end],
-        10,
-    ) catch return null;
-    return .{ .idx_var = idx_var, .subtrahend = val };
+    return null;
 }
 
 /// Check if init value after = is >= subtrahend (direct or via + offset)
@@ -12658,15 +12999,23 @@ fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line:
 }
 
 /// Extract the subtraction variable from an array index pattern [VAR - N]
-/// Returns the variable name between [ and -
+/// Returns the variable name between [ and - at any spacing ([i-1], [i -1])
 fn extractIndexSubVar(t: []const u8) ?[]const u8 {
-    const bracket_pos = mem.indexOf(u8, t, "[") orelse return null;
-    const sub_pos = mem.indexOf(u8, t, " - ") orelse return null;
-    if (sub_pos <= bracket_pos) return null;
-    const idx_var = mem.trim(u8, t[bracket_pos + 1 .. sub_pos], " ");
-    if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
-    // Make sure it's a simple identifier (no dots for .len which are handled elsewhere)
-    return idx_var;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '[') continue;
+        const end = findMatchingBracket(t, i) orelse continue;
+        const inside = t[i + 1 .. end];
+        const sub = findIndexSubtraction(inside) orelse {
+            i = end;
+            continue;
+        };
+        const idx_var = mem.trim(u8, inside[0..sub], " \t");
+        if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
+        // Make sure it's a simple identifier (no dots for .len which are handled elsewhere)
+        return idx_var;
+    }
+    return null;
 }
 
 /// Check if a line has a conditional (if/while) with comparison guard for a variable
@@ -12720,10 +13069,68 @@ fn hasEnclosingVarGuard(lines: []const []const u8, current_idx: usize, var_name:
     return hasEnclosingGuardForVar(lines, current_idx, var_name);
 }
 
+/// Check if a real operand ends at or before `pos` in an index expression:
+/// ident char / `)` / `]` / char-literal quote / `.*` deref, skipping
+/// whitespace.
+fn hasIndexOperandBefore(inside: []const u8, pos: usize) bool {
+    var i = pos;
+    while (i > 0 and (inside[i - 1] == ' ' or inside[i - 1] == '\t')) i -= 1;
+    if (i == 0) return false;
+    const c = inside[i - 1];
+    if (isIdent(c) or c == ')' or c == ']' or c == '\'') return true;
+    // `ptr.* - 1` — a dereferenced index is a real operand; `x * -1` is a
+    // multiply by a negative, not a subtraction.
+    return c == '*' and i >= 2 and inside[i - 2] == '.';
+}
+
+/// Check if a real operand starts after `pos` in an index expression.
+fn hasIndexOperandAfter(inside: []const u8, pos: usize) bool {
+    var j = pos + 1;
+    while (j < inside.len and (inside[j] == ' ' or inside[j] == '\t')) j += 1;
+    if (j >= inside.len) return false;
+    const c = inside[j];
+    return isIdent(c) or c == '(' or c == '\'';
+}
+
+/// Length of the char literal starting at `i` (0 when not a literal).
+fn charLiteralAt(inside: []const u8, i: usize) usize {
+    if (inside[i] != '\'') return 0;
+    return charLiteralSpan(inside, i) orelse 0;
+}
+
+/// Check if `inside[i]` is a subtraction operator: a `-` with a real operand
+/// on both sides, not a negative literal, not saturating `-|`, not in a
+/// string.
+fn isSubtractionOpAt(inside: []const u8, i: usize) bool {
+    if (inside[i] != '-') return false;
+    if (isInsideString(inside, i)) return false;
+    if (i + 1 < inside.len and inside[i + 1] == '|') return false;
+    if (!hasIndexOperandBefore(inside, i)) return false;
+    return hasIndexOperandAfter(inside, i);
+}
+
+/// Find a subtraction operator inside an index expression: a `-` with a
+/// real operand on both sides and any surrounding whitespace (`i-1`,
+/// `i -1`, `i- 1`, `i - 1`). A leading `-` (`[-1]`) is a negative literal,
+/// not a subtraction — it has no left operand. Char-literal content is data
+/// (`a['-']`), and `-|` is saturating subtraction (guarded by design).
+fn findIndexSubtraction(inside: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < inside.len) : (i += 1) {
+        const lit = charLiteralAt(inside, i);
+        if (lit > 0) {
+            i += lit - 1;
+            continue;
+        }
+        if (isSubtractionOpAt(inside, i)) return i;
+    }
+    return null;
+}
+
 /// Check if bracket contents are a safe zero-based range pattern [0 .. x - N]
 fn isSafeZeroBasedRange(inside: []const u8) bool {
     const range_pos = mem.indexOf(u8, inside, "..") orelse return false;
-    const sub_pos = mem.indexOf(u8, inside, " - ") orelse return false;
+    const sub_pos = findIndexSubtraction(inside) orelse return false;
     if (sub_pos <= range_pos) return false;
     return mem.eql(u8, mem.trim(u8, inside[0..range_pos], " "), "0");
 }
@@ -12740,8 +13147,8 @@ fn hasArrayIndexSubtraction(t: []const u8) ?usize {
             i = end;
             continue;
         }
-        if (mem.indexOf(u8, inside, " - ")) |sub_pos| {
-            return i + sub_pos + 1;
+        if (findIndexSubtraction(inside)) |sub_pos| {
+            return i + 1 + sub_pos;
         }
         i = end;
     }
@@ -19455,14 +19862,14 @@ test "ephor:ignore before non-scope line suppresses just next line" {
 
 test "checkSilentCatch detects catch {}" {
     // Basic catch {} should be detected
-    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null);
+    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null, null);
     try std.testing.expect(issue != null);
     try std.testing.expectEqualStrings("ZA201", issue.?.rule);
 }
 
 test "checkSilentCatch skips defer context" {
     // Same-line defer should not be detected
-    const issue = checkSilentCatch("defer foo() catch {}", "test.zig", 1, "init", null);
+    const issue = checkSilentCatch("defer foo() catch {}", "test.zig", 1, "init", null, null);
     try std.testing.expect(issue == null);
 }
 
@@ -22259,7 +22666,7 @@ test "ZA207 catch undefined fires" {
     try std.testing.expect(found);
 }
 
-test "ZA207 catch |_| undefined does NOT fire" {
+test "ZA207 catch |_| undefined fires" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -22267,6 +22674,9 @@ test "ZA207 catch |_| undefined does NOT fire" {
     var graph = ImportGraph.init(allocator);
     defer graph.deinit();
 
+    // `catch |_| undefined` discards the error AND yields undefined — the
+    // payload does not rescue the error, so it is just as UB as the
+    // payload-less form.
     const test_content =
         \\fn foo() void {
         \\    const x = bar() catch |_| undefined;
@@ -22274,18 +22684,23 @@ test "ZA207 catch |_| undefined does NOT fire" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_za207_no_fp.zig", test_content);
+    const analysis = try createTestFileAnalysis(allocator, "test_za207_payload.zig", test_content);
     try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, "test_za207_no_fp.zig"), {});
+    try graph.reachable.put(try allocator.dupe(u8, "test_za207_payload.zig"), {});
 
     var issues = try analyzeErrors(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
+    var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_za207_no_fp.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED));
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED) and
+            mem.eql(u8, issue.file, "test_za207_payload.zig"))
+        {
+            found = true;
+            break;
         }
     }
+    try std.testing.expect(found);
 }
 
 // ============================================================================
@@ -22620,17 +23035,17 @@ test "ZA202 NOT suppressed for non-bufPrint multi-line" {
 // ============================================================================
 
 test "ZA201 suppressed in deinit function" {
-    const issue = checkSilentCatch("resource.revoke() catch {}", "test.zig", 1, "deinit", null);
+    const issue = checkSilentCatch("resource.revoke() catch {}", "test.zig", 1, "deinit", null, null);
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed in shutdown function" {
-    const issue = checkSilentCatch("lease.revoke() catch {}", "test.zig", 1, "shutdown", null);
+    const issue = checkSilentCatch("lease.revoke() catch {}", "test.zig", 1, "shutdown", null, null);
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed in cleanup function" {
-    const issue = checkSilentCatch("conn.close() catch {}", "test.zig", 1, "cleanup", null);
+    const issue = checkSilentCatch("conn.close() catch {}", "test.zig", 1, "cleanup", null, null);
     try std.testing.expect(issue == null);
 }
 
@@ -22640,6 +23055,7 @@ test "ZA201 suppressed for writer.print catch {}" {
         "test.zig",
         1,
         "handleRequest",
+        null,
         null,
     );
     try std.testing.expect(issue == null);
@@ -22652,12 +23068,13 @@ test "ZA201 suppressed for writer.writeAll catch {}" {
         1,
         "streamResponse",
         null,
+        null,
     );
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 NOT suppressed in regular function" {
-    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null);
+    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null, null);
     try std.testing.expect(issue != null);
 }
 
@@ -22771,6 +23188,7 @@ test "ZA201 suppressed for while condition catch {}" {
         1,
         "process",
         null,
+        null,
     );
     try std.testing.expect(issue == null);
 }
@@ -22781,6 +23199,7 @@ test "ZA201 suppressed for if condition catch {}" {
         "test.zig",
         1,
         "process",
+        null,
         null,
     );
     try std.testing.expect(issue == null);
@@ -22793,6 +23212,7 @@ test "ZA201 NOT suppressed for catch {} outside condition" {
         "test.zig",
         1,
         "process",
+        null,
         null,
     );
     try std.testing.expect(issue != null);
@@ -22813,6 +23233,7 @@ test "ZA201 suppressed for multi-line defer catch {}" {
         3,
         "init",
         &prev,
+        null,
     );
     // .close() is a cleanup method — already suppressed by isCleanupMethodCall
     try std.testing.expect(issue == null);
@@ -22829,6 +23250,7 @@ test "ZA201 suppressed for multi-line defer non-cleanup catch {}" {
         3,
         "init",
         &prev,
+        null,
     );
     // Not a recognized cleanup method, but continuation of defer expression
     try std.testing.expect(issue == null);
@@ -22860,6 +23282,657 @@ test "isInsideWhileCondition detects catch in while parens" {
 
 test "isInsideWhileCondition rejects catch outside parens" {
     try std.testing.expect(!isInsideWhileCondition("const x = foo() catch {};", 16));
+}
+
+// ============================================================================
+// ZA401/ZA402/ZA403 Tests — real-use counting (string/comment/decl-line)
+// ============================================================================
+
+/// Test helper: FileAnalysis with one recorded import (for ZA401 tests).
+fn createImportTestAnalysis(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+    imp: ImportInfo,
+) !FileAnalysis {
+    var analysis = try createTestFileAnalysis(allocator, path, content);
+    errdefer analysis.deinit(allocator);
+    var owned = imp;
+    owned.path = try allocator.dupe(u8, imp.path);
+    owned.name = try allocator.dupe(u8, imp.name);
+    owned.resolved = null;
+    try analysis.imports.append(allocator, owned);
+    return analysis;
+}
+
+test "ZA401 unused import flagged despite filename string match" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // The alias appears twice on its own line (declaration + "json.zig"
+    // string) — the filename string must not count as a use of the alias.
+    const test_content =
+        \\const json = @import("json.zig");
+        \\
+        \\pub fn f() void {}
+    ;
+
+    const analysis = try createImportTestAnalysis(
+        allocator,
+        "test_za401_stem.zig",
+        test_content,
+        .{ .path = "json.zig", .resolved = null, .name = "json", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za401_stem.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za401_stem.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA401 silent when import has a real use" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const json = @import("json.zig");
+        \\
+        \\pub fn f() void {
+        \\    json.stringify();
+        \\}
+    ;
+
+    const analysis = try createImportTestAnalysis(
+        allocator,
+        "test_za401_used.zig",
+        test_content,
+        .{ .path = "json.zig", .resolved = null, .name = "json", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za401_used.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za401_used.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA401 flagged when uses are only in strings and comments" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Mentions in a comment and in a string literal are not uses.
+    const test_content =
+        \\const json = @import("json.zig");
+        \\// json handles serialization
+        \\const label = "json";
+        \\
+        \\pub fn f() void {
+        \\    _ = label;
+        \\}
+    ;
+
+    const analysis = try createImportTestAnalysis(
+        allocator,
+        "test_za401_strcmt.zig",
+        test_content,
+        .{ .path = "json.zig", .resolved = null, .name = "json", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za401_strcmt.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za401_strcmt.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA401 another file importing same filename does not count as use" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // File B's @import("json.zig") string must not count as a use of file
+    // A's `json` alias — usage counting is per-file.
+    const content_a =
+        \\const json = @import("json.zig");
+        \\
+        \\pub fn a() void {}
+    ;
+    const content_b =
+        \\const cfg = @import("json.zig");
+        \\
+        \\pub fn b() void {
+        \\    cfg.load();
+        \\}
+    ;
+
+    const analysis_a = try createImportTestAnalysis(
+        allocator,
+        "test_za401_a.zig",
+        content_a,
+        .{ .path = "json.zig", .resolved = null, .name = "json", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis_a.path, analysis_a);
+    const analysis_b = try createImportTestAnalysis(
+        allocator,
+        "test_za401_b.zig",
+        content_b,
+        .{ .path = "json.zig", .resolved = null, .name = "cfg", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis_b.path, analysis_b);
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const na = countRuleIssues(issues.items, "test_za401_a.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 1), na);
+    const nb = countRuleIssues(issues.items, "test_za401_b.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 0), nb);
+}
+
+test "ZA401 alias differing from filename stem still flagged" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const aliased = @import("other.zig");
+        \\
+        \\pub fn f() void {}
+    ;
+
+    const analysis = try createImportTestAnalysis(
+        allocator,
+        "test_za401_alias.zig",
+        test_content,
+        .{ .path = "other.zig", .resolved = null, .name = "aliased", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za401_alias.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za401_alias.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA402 unused const flagged despite string and comment mentions" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const frobnicate = 1;
+        \\// frobnicate is important
+        \\const label = "frobnicate";
+        \\
+        \\pub fn f() void {
+        \\    _ = label;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za402.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za402.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za402.zig", RULE_UNUSED_CONST);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA402 silent when const has a real use" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const frobnicate = 1;
+        \\
+        \\pub fn get() u32 {
+        \\    return frobnicate;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za402_used.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za402_used.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za402_used.zig", RULE_UNUSED_CONST);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA403 unused var flagged despite string mention" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn f() void {
+        \\    var counter = 0;
+        \\    const label = "counter";
+        \\    _ = label;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za403.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za403.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za403.zig", RULE_UNUSED_VAR);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+// ============================================================================
+// ZA201/ZA202/ZA207 Tests — whitespace and payload variants
+// ============================================================================
+
+test "ZA201 catch |err| {} fires via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    bar() catch |err| {};
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za201_payload.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za201_payload.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za201_payload.zig", RULE_SILENT_CATCH);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA201 catch{} without whitespace fires via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    bar() catch{};
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za201_nows.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za201_nows.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za201_nows.zig", RULE_SILENT_CATCH);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA201 multi-line empty catch fires via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Bounded 2-line form: `catch {` ends the line, next line just closes it
+    const test_content =
+        \\fn foo() void {
+        \\    bar() catch {
+        \\    };
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za201_ml.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za201_ml.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za201_ml.zig", RULE_SILENT_CATCH);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA201 multi-line catch closes only on exact brace line" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Body is not empty — the next line does real work, so no ZA201.
+    const test_content =
+        \\fn foo() void {
+        \\    bar() catch {
+        \\        recover();
+        \\    };
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za201_ml_body.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za201_ml_body.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za201_ml_body.zig", RULE_SILENT_CATCH);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA201 one-line catch with handled body stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        handle(err);
+        \\    };
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za201_handled.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za201_handled.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za201_handled.zig", RULE_SILENT_CATCH);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA202 catch |e| unreachable fires via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch |e| unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_payload.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_payload.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za202_payload.zig", RULE_CATCH_UNREACHABLE);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA202 catch unreachable with extra whitespace fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch  unreachable;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_ws.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_ws.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za202_ws.zig", RULE_CATCH_UNREACHABLE);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA207 catch |err| undefined fires via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    const x = bar() catch |err| undefined;
+        \\    _ = x;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za207_err.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za207_err.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za207_err.zig", RULE_CATCH_UNDEFINED);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+// ============================================================================
+// ZA2xx Trailing-Comment Tests — patterns in comment prose are not code
+// ============================================================================
+
+test "ZA201 silent in trailing comment via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    bar(); // catch {}
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za201_cmt.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za201_cmt.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za201_cmt.zig", RULE_SILENT_CATCH);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA202 silent in trailing comment via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    bar(); // catch unreachable
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_cmt.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_cmt.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za202_cmt.zig", RULE_CATCH_UNREACHABLE);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA203 silent in trailing comment via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo(opt: ?u32) void {
+        \\    _ = opt; // orelse unreachable
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za203_cmt.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za203_cmt.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za203_cmt.zig", RULE_ORELSE_UNREACHABLE);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA207 silent in trailing comment via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    bar(); // catch undefined
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za207_cmt.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za207_cmt.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za207_cmt.zig", RULE_CATCH_UNDEFINED);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA208 silent in trailing comment via analyzeErrors" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn foo() void {
+        \\    zap(); // @panic("x")
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "za208_comment.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za208_comment.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "za208_comment.zig", RULE_PANIC);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "ZA201 fires when double-slash is inside a string literal" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // The `//` inside "http://x" is string data, not a comment — the real
+    // catch {} after it must still be reported.
+    const test_content =
+        \\fn foo() void {
+        \\    const s = "http://x"; bar() catch {};
+        \\    _ = s;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za201_url.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za201_url.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za201_url.zig", RULE_SILENT_CATCH);
+    try std.testing.expectEqual(@as(usize, 1), n);
 }
 
 // ============================================================================
@@ -23230,7 +24303,7 @@ test "countLineCyclomatic counts all decision points" {
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("var x: u32 = 0;"));
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("_ = allocator;"));
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("return .{};"));
-    // Inline loops excluded (checked via hasNonInline)
+    // Inline loops excluded (checked via hasRuntimeLoop)
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("inline for (fields) |f| {"));
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("inline while (cond) {"));
 }
@@ -23645,4 +24718,723 @@ test "ZA305/ZA306: simple function has CCN=1 cognitive=0" {
     defer deinitIssues(&issues, allocator);
     try checkNoCyclomaticWarnings(issues.items, "add.zig");
     try checkNoCognitiveWarnings(issues.items, "add.zig");
+}
+
+// ============================================================================
+// Batch B2 regression tests — false-negative fixes
+// ZA901/ZA903 spacing tolerance, outer-fn complexity verdicts, unspaced
+// control-flow keywords, ZA204 multi-var + multi-line tracking.
+// ============================================================================
+
+test "ZA901: unspaced and non-1 decrement forms fire" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn dec_forms(x: u32) void {
+        \\    var a = x;
+        \\    a-=1;
+        \\    var b = x;
+        \\    b -=1;
+        \\    var c = x;
+        \\    c-= 1;
+        \\    var d = x;
+        \\    d -= 2;
+        \\    var e = x;
+        \\    e -= x;
+        \\    sink(a);
+        \\    sink(b);
+        \\    sink(c);
+        \\    sink(d);
+        \\    sink(e);
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za901_forms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_forms.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 5);
+}
+
+test "ZA901: spaced decrement still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn spaced(x: u32) void {
+        \\    var a = x;
+        \\    a -= 1;
+        \\    sink(a);
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za901_spaced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_spaced.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: guarded unspaced decrement stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn guarded(x: u32) void {
+        \\    var a = x;
+        \\    if (a > 0) a-=1;
+        \\    sink(a);
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za901_guarded.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_guarded.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "ZA901: literal, increment, comment, and string forms stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn quiet(x: u32) void {
+        \\    var a = x;
+        \\    a = 0 - 1;
+        \\    var b = x;
+        \\    b = -1;
+        \\    var c = x;
+        \\    c += 1;
+        \\    sink(a); // d -= 1
+        \\    const s = "d -= 1";
+        \\    _ = s;
+        \\    sink(b);
+        \\    sink(c);
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za901_quiet.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_quiet.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "ZA903 matcher: unspaced bracket subtraction forms" {
+    // Unguarded subtraction forms (any spacing) must match.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[i-1];") != null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[i -1];") != null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[i- 1];") != null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[i - 1];") != null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[x.len-1];") != null);
+    // Addition is not subtraction.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[i+1];") == null);
+    // Zero-based ranges stay exempt at any spacing.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[0 .. i-1];") == null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[0 .. i - 1];") == null);
+    // A leading minus is a negative literal, not a subtraction.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[-1];") == null);
+    // A char literal '-' is data; char arithmetic is a real subtraction.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a['-'];") == null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a['x' - '0'];") != null);
+    // A dereferenced index is a real operand; a bare `* -` is multiplication.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[ptr.* - 1];") != null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[x * -1];") == null);
+}
+
+test "ZA903: unspaced index subtraction fires end-to-end" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn unspaced(a: []u8, i: usize) u8 {
+        \\    return a[i-1];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za903_unspaced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_unspaced.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: guarded unspaced subtraction stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn guarded(a: []u8, i: usize) u8 {
+        \\    if (i > 0) return a[i-1];
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za903_guarded.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_guarded.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: trailing comment and string forms stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn comment_str(a: []u8, i: usize) u8 {
+        \\    const x = a[i - 1];
+        \\    sink(x); // a[i - 1]
+        \\    const s = "a[i - 1]";
+        \\    _ = s;
+        \\    return x;
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za903_comment.zig", content);
+    defer run.deinit(allocator);
+
+    // Only the real subtraction on line 2 may fire — the comment and the
+    // string literal are not code.
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_comment.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA301: outer fn with local struct method is reported" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // 55 body lines + local struct with a method: the nested `fn` previously
+    // reset complexity state and silently discarded the outer fn's verdict.
+    var content: []u8 = try aa.dupe(u8, "fn outer_with_struct() void {\n");
+    for (0..55) |i| {
+        const line = try std.fmt.allocPrint(aa, "    var v{d}: u32 = {d};\n", .{ i, i });
+        content = try mem.concat(aa, u8, &.{ content, line });
+    }
+    content = try mem.concat(aa, u8, &.{
+        content,
+        "    const S = struct {\n        fn method() void {}\n    };\n    _ = S;\n}\n",
+    });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "outer_struct.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "outer_struct.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        if (!mem.eql(u8, issue.file, "outer_struct.zig")) continue;
+        found = true;
+        try std.testing.expectEqual(@as(usize, 1), issue.line);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "outer_with_struct") != null);
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA301: short outer fn with local struct stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const code =
+        \\fn short_outer() void {
+        \\    const S = struct {
+        \\        fn method() void {}
+        \\    };
+        \\    _ = S;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "short_outer.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "short_outer.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "short_outer.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG));
+        }
+    }
+}
+
+test "ZA304: outer fn branches reported despite local struct" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // 13 branches (> default max 12) before the local struct: the outer fn's
+    // ZA304 verdict was discarded when the nested method reset state.
+    var content: []u8 = try aa.dupe(u8, "fn branchy_outer(x: u32) u32 {\n");
+    for (0..13) |i| {
+        const line = try std.fmt.allocPrint(aa, "    if (x == {d}) return {d};\n", .{ i, i });
+        content = try mem.concat(aa, u8, &.{ content, line });
+    }
+    content = try mem.concat(aa, u8, &.{
+        content,
+        "    const S = struct {\n        fn method() void {}\n    };\n    _ = S;\n    return 99;\n}\n",
+    });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "branchy_outer.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "branchy_outer.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_TOO_MANY_BRANCHES)) continue;
+        if (!mem.eql(u8, issue.file, "branchy_outer.zig")) continue;
+        found = true;
+        try std.testing.expect(mem.indexOf(u8, issue.message, "branchy_outer") != null);
+    }
+    try std.testing.expect(found);
+}
+
+test "countLineCyclomatic counts unspaced control flow" {
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("if(x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("while(x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("for(xs) |x| {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}else{"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}else if(x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}catch{"));
+    // comptime-unrolled loops are not runtime decision points
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("inline for(xs) |x| {"));
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("inline while(x) {"));
+    // Keywords inside string literals or trailing comments are not code
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("const s = \"if(x)\";"));
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("foo(); // if(x)"));
+    // Identifier substrings are not keywords
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("modify(x);"));
+}
+
+test "countLineBranches counts unspaced control flow" {
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("if(x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("}else{"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("switch(x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("while(x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("for(xs) |x| {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("}catch{"));
+    try std.testing.expectEqual(@as(usize, 0), countLineBranches("inline for(xs) |x| {"));
+    try std.testing.expectEqual(@as(usize, 0), countLineBranches("const s = \"while(x)\";"));
+    try std.testing.expectEqual(@as(usize, 0), countLineBranches("foo(); // while(x)"));
+}
+
+test "countLineCognitive counts unspaced control flow" {
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("if(x) {", 0));
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("if(x) {", 3));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("}else{", 0));
+    try std.testing.expectEqual(@as(usize, 3), countLineCognitive("}else if(x) {", 2));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("inline for(xs) |x| {", 0));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("const s = \"if(x)\";", 0));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("foo(); // if(x)", 0));
+}
+
+test "opensCognitiveScope ignores keywords inside strings" {
+    try std.testing.expect(opensCognitiveScope("if(x) {"));
+    try std.testing.expect(opensCognitiveScope("while(x) {"));
+    try std.testing.expect(!opensCognitiveScope("const s = \"if (x) {\";"));
+}
+
+test "ZA305: unspaced if-chain trips cyclomatic threshold" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 20 unspaced decision points -> CCN 21; previously undercounted to 1.
+    const code =
+        \\fn unspaced_chain(x: u32) u32 {
+        \\    if(x == 0) return 0;
+        \\    if(x == 1) return 1;
+        \\    if(x == 2) return 2;
+        \\    if(x == 3) return 3;
+        \\    if(x == 4) return 4;
+        \\    if(x == 5) return 5;
+        \\    if(x == 6) return 6;
+        \\    if(x == 7) return 7;
+        \\    if(x == 8) return 8;
+        \\    if(x == 9) return 9;
+        \\    if(x == 10) return 10;
+        \\    if(x == 11) return 11;
+        \\    if(x == 12) return 12;
+        \\    if(x == 13) return 13;
+        \\    if(x == 14) return 14;
+        \\    if(x == 15) return 15;
+        \\    if(x == 16) return 16;
+        \\    if(x == 17) return 17;
+        \\    if(x == 18) return 18;
+        \\    if(x == 19) return 19;
+        \\    return 0;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "unspaced_chain.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "unspaced_chain.zig"), {});
+
+    const th = Thresholds{ .max_cyclomatic = 5 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC) and
+            mem.eql(u8, issue.file, "unspaced_chain.zig"))
+        {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA204: multiple pending undefined vars are all tracked" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\fn multi_var() void {
+        \\    var a = undefined;
+        \\    var b = undefined;
+        \\    use(b);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_multi.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_multi.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expect(countRuleIssues(
+        issues.items,
+        "za204_multi.zig",
+        RULE_UNDEFINED_USAGE,
+    ) == 2);
+}
+
+test "ZA204: two undefined decls on one line are both tracked" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\fn one_line() void {
+        \\    var a = undefined; var b = undefined;
+        \\    use(a);
+        \\    use(b);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_one_line.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_one_line.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expect(countRuleIssues(
+        issues.items,
+        "za204_one_line.zig",
+        RULE_UNDEFINED_USAGE,
+    ) == 2);
+}
+
+test "ZA204: multi-line undefined declaration is tracked" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\fn multi_line() void {
+        \\    var x =
+        \\        undefined;
+        \\    use(x);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_multiline.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_multiline.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_line: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
+            mem.eql(u8, issue.file, "za204_multiline.zig"))
+        {
+            found_line = issue.line;
+        }
+    }
+    // The report must point at the `var x =` decl line, not the continuation.
+    try std.testing.expectEqual(@as(usize, 2), found_line);
+}
+
+test "ZA204: type-qualified const in decl does not shadow the var name" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // `[]const u8` contains "const " — the decl keyword scan must still find
+    // `var` and track `x` (a tracked `u8` phantom would never be filled).
+    const content =
+        \\fn typed() void {
+        \\    var x: []const u8 = undefined;
+        \\    x = "abc";
+        \\    use(x);
+        \\}
+        \\fn use(v: []const u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_typed.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_typed.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expect(countRuleIssues(
+        issues.items,
+        "za204_typed.zig",
+        RULE_UNDEFINED_USAGE,
+    ) == 0);
+}
+
+test "extractVarDeclNameBefore skips type-qualifier const" {
+    const decl = "var x: [*:0]const u8 ";
+    try std.testing.expectEqualStrings("x", extractVarDeclNameBefore(decl, decl.len).?);
+    const multi = "var a = undefined; var b ";
+    try std.testing.expectEqualStrings("b", extractVarDeclNameBefore(multi, multi.len).?);
+    try std.testing.expect(extractVarDeclNameBefore("y ", 2) == null);
+}
+
+test "ZA204: filled vars stay silent with multi-var tracking" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\fn filled() void {
+        \\    var a = undefined;
+        \\    var b = undefined;
+        \\    a = 1;
+        \\    b = 2;
+        \\    use(a);
+        \\    use(b);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_filled.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_filled.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expect(countRuleIssues(
+        issues.items,
+        "za204_filled.zig",
+        RULE_UNDEFINED_USAGE,
+    ) == 0);
+}
+
+test "ZA204: struct literal field default stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const content =
+        \\const S = struct { x: u32 };
+        \\fn field_default() void {
+        \\    var s: S = .{ .x = undefined };
+        \\    use(s);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_field.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_field.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expect(countRuleIssues(
+        issues.items,
+        "za204_field.zig",
+        RULE_UNDEFINED_USAGE,
+    ) == 0);
+}
+
+test "lineArmsUndefinedDecl arms only bare-assign var/const decls" {
+    try std.testing.expectEqualStrings("x", lineArmsUndefinedDecl("var x =").?);
+    try std.testing.expectEqualStrings("y", lineArmsUndefinedDecl("const y: u32 =").?);
+    try std.testing.expect(lineArmsUndefinedDecl("var x ==") == null);
+    try std.testing.expect(lineArmsUndefinedDecl("var x +=") == null);
+    try std.testing.expect(lineArmsUndefinedDecl("x =") == null);
+    try std.testing.expect(lineArmsUndefinedDecl("var x = undefined;") == null);
+    try std.testing.expect(lineArmsUndefinedDecl("var x = 5;") == null);
+    try std.testing.expect(lineArmsUndefinedDecl("if (x) =") == null);
+}
+
+test "isUndefinedContinuationLine accepts undefined terminators" {
+    try std.testing.expect(isUndefinedContinuationLine("undefined;"));
+    try std.testing.expect(isUndefinedContinuationLine("undefined,"));
+    try std.testing.expect(isUndefinedContinuationLine("undefined }"));
+    try std.testing.expect(isUndefinedContinuationLine("undefined"));
+    try std.testing.expect(!isUndefinedContinuationLine("undefinedx;"));
+    try std.testing.expect(!isUndefinedContinuationLine("var y = undefined;"));
+}
+
+test "trackBraceNesting ignores braces inside char literals" {
+    // `'{'` / `'}'` are char data, not scope delimiters — counting them as
+    // braces corrupts max_nest and can delay fn-end detection past the real
+    // closing brace.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(!trackBraceNesting("if (c == '{') x += 1;", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+    try std.testing.expect(!trackBraceNesting("if (c == '}') x -= 1;", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+    try std.testing.expect(trackBraceNesting("}", &state));
+}
+
+test "trackBraceNesting handles escaped-quote char literals" {
+    // `'\''` — the escaped quote is content (odd backslash run), only the
+    // last quote is the delimiter; the `{` after the literal must count.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(!trackBraceNesting("if (c == '\\'') {", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    // `'\\'` — backslash literal (even backslash run before the delimiter);
+    // the `{` after the literal must count.
+    try std.testing.expect(!trackBraceNesting("if (c == '\\\\') {", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expect(!trackBraceNesting("}", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "ZA302: char-literal braces do not inflate nesting depth" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Real nesting is 3 (fn > if > for); the `'{'` char literal on a
+    // brace-free line must not add a phantom fourth level.
+    const code =
+        \\fn char_lit(c: u8) void {
+        \\    if (c == '{') {
+        \\        for (items) |item| {
+        \\            if (item == '{') count += 1;
+        \\        }
+        \\    }
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "char_lit.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "char_lit.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "char_lit.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
+        }
+    }
 }

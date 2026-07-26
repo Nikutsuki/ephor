@@ -13838,6 +13838,40 @@ const CFGState = struct {
     no_free_fields: ?*const std.StringHashMapUnmanaged(void) = null,
 };
 
+/// File-level plumbing for the CFG pass (keeps param count ≤4): the
+/// allocator, issue sink, and path of the file under analysis.
+const CFGFileCtx = struct {
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+};
+
+/// Function-under-analysis descriptor for the CFG pass: everything
+/// processFunction needs to know about the fn being scanned.
+const CFGFuncCtx = struct {
+    name: []const u8,
+    start: usize,
+    lines: []const []const u8,
+    fn_returns_error: bool,
+    in_test: bool,
+    no_free_param_fns: ?*const std.StringHashMapUnmanaged(void),
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+};
+
+/// Per-function CFG run context: file plumbing + fn descriptor + built graph.
+const CFGRunCtx = struct {
+    file: CFGFileCtx,
+    func: CFGFuncCtx,
+    cfg: *ControlFlowGraph,
+};
+
+/// Mutable scan cursors threaded through the CFG file pass.
+const CFGScanCtx = struct {
+    state: *CFGState,
+    prev: *CFGPrevFunc,
+    func_lines: *std.ArrayListUnmanaged([]const u8),
+};
+
 /// Detect function start and initialize state
 /// Returns true if a nested function was detected (caller should process current func first)
 fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
@@ -13927,20 +13961,20 @@ fn emitDefiniteAssignmentIssues(
 }
 
 /// Run memory-related CFG analyses
-fn runCFGMemoryAnalyses(
-    a: Allocator,
-    out: *std.ArrayListUnmanaged(Issue),
-    cfg: *ControlFlowGraph,
-    fl: []const []const u8,
-    fstart: usize,
-    fp: []const u8,
-    fn_ret_err: bool,
-    in_test: bool,
-    is_no_free_recipient: bool,
-    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
-) !void {
-    const body: FuncBodyCtx = .{ .lines = fl, .func_line = fstart, .file_path = fp };
-    var r1 = try analyzeCFGMemorySafety(a, cfg, body, no_free_fields);
+fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
+    const a = run.file.allocator;
+    const out = run.file.issues;
+    const body: FuncBodyCtx = .{
+        .lines = run.func.lines,
+        .func_line = run.func.start,
+        .file_path = run.file.file_path,
+    };
+    // Check if this function receives a no-free allocator via call-site propagation
+    const is_no_free_recipient = if (run.func.no_free_param_fns) |fns|
+        fns.contains(run.func.name)
+    else
+        false;
+    var r1 = try analyzeCFGMemorySafety(a, run.cfg, body, run.func.no_free_fields);
     defer r1.deinit(a);
     try out.appendSlice(a, r1.items);
     var r2 = if (is_no_free_recipient)
@@ -13948,19 +13982,30 @@ fn runCFGMemoryAnalyses(
     else
         try analyzeCFGDeferCoverage(.{
             .allocator = a,
-            .cfg = cfg,
+            .cfg = run.cfg,
             .body = body,
-            .file_no_free_fields = no_free_fields,
+            .file_no_free_fields = run.func.no_free_fields,
         });
     defer r2.deinit(a);
     try out.appendSlice(a, r2.items);
-    var r3 = if (in_test or is_no_free_recipient)
+    var r3 = if (run.func.in_test or is_no_free_recipient)
         std.ArrayListUnmanaged(Issue).empty
     else
-        try analyzeCFGErrdeferCoverage(a, body, fn_ret_err, no_free_fields);
+        try analyzeCFGErrdeferCoverage(
+            a,
+            body,
+            run.func.fn_returns_error,
+            run.func.no_free_fields,
+        );
     defer r3.deinit(a);
     try out.appendSlice(a, r3.items);
-    try checkMustReturnRef(.{ .a = a, .out = out, .fl = fl, .fstart = fstart, .fp = fp });
+    try checkMustReturnRef(.{
+        .a = a,
+        .out = out,
+        .fl = run.func.lines,
+        .fstart = run.func.start,
+        .fp = run.file.file_path,
+    });
 }
 
 // ============================================================================
@@ -14216,102 +14261,62 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
 }
 
 /// Run safety and error CFG analyses
-fn runCFGSafetyAnalyses(
-    a: Allocator,
-    out: *std.ArrayListUnmanaged(Issue),
-    cfg: *ControlFlowGraph,
-    fl: []const []const u8,
-    fstart: usize,
-    fp: []const u8,
-    fn_name: []const u8,
-    in_test: bool,
-) !void {
-    var r1 = try analyzeCFGNullSafety(a, cfg, fl, fstart, fp);
+fn runCFGSafetyAnalyses(run: CFGRunCtx) !void {
+    const a = run.file.allocator;
+    const out = run.file.issues;
+    const fl = run.func.lines;
+    const fstart = run.func.start;
+    const fp = run.file.file_path;
+    var r1 = try analyzeCFGNullSafety(run);
     defer r1.deinit(a);
     try out.appendSlice(a, r1.items);
-    var r2 = try analyzeCFGPanicPatterns(a, cfg, fl, fstart, fp);
+    var r2 = try analyzeCFGPanicPatterns(a, run.cfg, fl, fstart, fp);
     defer r2.deinit(a);
     try out.appendSlice(a, r2.items);
-    var r3 = try analyzeCFGErrors(
-        a,
-        cfg,
-        fl,
-        fstart,
-        fp,
-        fn_name,
-        in_test,
-    );
+    var r3 = try analyzeCFGErrors(run);
     defer r3.deinit(a);
     try out.appendSlice(a, r3.items);
 }
 
 /// Run definite-assignment analysis and emit issues
-fn runDefiniteAssignmentAnalysis(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    cfg: *ControlFlowGraph,
-    func_lines_items: []const []const u8,
-    func_start: usize,
-    file_path: []const u8,
-) !void {
-    var def_issues = try analyzeDefiniteAssignment(
-        allocator,
-        cfg,
-        func_lines_items,
-        func_start,
-    );
+fn runDefiniteAssignmentAnalysis(run: CFGRunCtx) !void {
+    const a = run.file.allocator;
+    var def_issues = try analyzeDefiniteAssignment(a, run.cfg, run.func.lines, run.func.start);
     defer def_issues.deinit();
-    try emitDefiniteAssignmentIssues(allocator, issues, &def_issues, file_path);
+    try emitDefiniteAssignmentIssues(a, run.file.issues, &def_issues, run.file.file_path);
 }
 
-fn processFunction(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    file_path: []const u8,
-    func_name: []const u8,
-    func_start: usize,
-    func_lines_items: []const []const u8,
-    fn_returns_error: bool,
-    is_in_test_context: bool,
-    no_free_param_fns: ?*const std.StringHashMapUnmanaged(void),
-    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
-) !void {
-    // Check if this function receives a no-free allocator via call-site propagation
-    const is_no_free_recipient = if (no_free_param_fns) |fns| fns.contains(func_name) else false;
-
-    var cfg = try buildCFG(allocator, func_name, func_start, func_lines_items);
+/// Build the CFG for one function and run all CFG-backed analyses over it.
+fn processFunction(file: CFGFileCtx, func: CFGFuncCtx) !void {
+    var cfg = try buildCFG(file.allocator, func.name, func.start, func.lines);
     defer cfg.deinit();
 
-    try runDefiniteAssignmentAnalysis(
-        allocator,
-        issues,
-        &cfg,
-        func_lines_items,
-        func_start,
-        file_path,
-    );
-    try runCFGMemoryAnalyses(
-        allocator,
-        issues,
-        &cfg,
-        func_lines_items,
-        func_start,
-        file_path,
-        fn_returns_error,
-        is_in_test_context,
-        is_no_free_recipient,
-        no_free_fields,
-    );
-    try runCFGSafetyAnalyses(
-        allocator,
-        issues,
-        &cfg,
-        func_lines_items,
-        func_start,
-        file_path,
-        func_name,
-        is_in_test_context,
-    );
+    const run: CFGRunCtx = .{ .file = file, .func = func, .cfg = &cfg };
+    try runDefiniteAssignmentAnalysis(run);
+    try runCFGMemoryAnalyses(run);
+    try runCFGSafetyAnalyses(run);
+}
+
+/// The two no-free pre-scan maps for one file (arena propagation + field chains).
+const CFGFilePrescan = struct {
+    no_free_fns: std.StringHashMapUnmanaged(void),
+    no_free_fields: std.StringHashMapUnmanaged(void),
+
+    fn deinit(self: *CFGFilePrescan, allocator: Allocator) void {
+        self.no_free_fns.deinit(allocator);
+        self.no_free_fields.deinit(allocator);
+    }
+};
+
+fn buildCFGFilePrescan(allocator: Allocator, content: []const u8) !CFGFilePrescan {
+    // Pre-scan: find functions called with no-free allocator args (arena propagation)
+    var no_free_fns = try buildNoFreeParamFunctions(allocator, content);
+    errdefer no_free_fns.deinit(allocator);
+    // Pre-scan: collect struct field names declared with no-free allocator types
+    // (e.g. `arena: std.heap.ArenaAllocator,`) for field-chain suppression
+    var no_free_fields = try collectNoFreeFieldNamesFromContent(allocator, content);
+    errdefer no_free_fields.deinit(allocator);
+    return .{ .no_free_fns = no_free_fns, .no_free_fields = no_free_fields };
 }
 
 /// Analyze a single file for CFG memory issues
@@ -14321,24 +14326,28 @@ fn analyzeCFGFile(
     content: []const u8,
     file_path: []const u8,
 ) !void {
-    // Pre-scan: find functions called with no-free allocator args (arena propagation)
-    var no_free_fns = try buildNoFreeParamFunctions(allocator, content);
-    defer no_free_fns.deinit(allocator);
-
-    // Pre-scan: collect struct field names declared with no-free allocator types
-    // (e.g. `arena: std.heap.ArenaAllocator,`) for field-chain suppression
-    var no_free_fields = try collectNoFreeFieldNamesFromContent(allocator, content);
-    defer no_free_fields.deinit(allocator);
+    var prescan = try buildCFGFilePrescan(allocator, content);
+    defer prescan.deinit(allocator);
 
     var state = CFGState{
-        .no_free_param_fns = &no_free_fns,
-        .no_free_fields = &no_free_fields,
+        .no_free_param_fns = &prescan.no_free_fns,
+        .no_free_fields = &prescan.no_free_fields,
     };
     var line_num: usize = 1;
     var line_iter = mem.splitScalar(u8, content, '\n');
     var func_lines = std.ArrayListUnmanaged([]const u8).empty;
     defer func_lines.deinit(allocator);
     var prev = CFGPrevFunc{};
+    const file: CFGFileCtx = .{
+        .allocator = allocator,
+        .issues = issues,
+        .file_path = file_path,
+    };
+    const scan: CFGScanCtx = .{
+        .state = &state,
+        .prev = &prev,
+        .func_lines = &func_lines,
+    };
 
     while (line_iter.next()) |line| {
         defer line_num += 1;
@@ -14349,16 +14358,7 @@ fn analyzeCFGFile(
             const ts = trackTestBlock(t, state.in_test_block, state.test_brace_depth);
             state.in_test_block = ts.in_test;
             state.test_brace_depth = ts.depth;
-            try handleCFGFuncDetection(
-                allocator,
-                issues,
-                file_path,
-                &state,
-                &prev,
-                &func_lines,
-                t,
-                line_num,
-            );
+            try handleCFGFuncDetection(file, scan, t, line_num);
         }
         if (!state.in_func) continue;
         try func_lines.append(allocator, line);
@@ -14366,38 +14366,26 @@ fn analyzeCFGFile(
         if (is_comment) continue;
         if (!trackCFGBraces(t, &state)) continue;
 
-        try finishCFGFunction(
-            allocator,
-            issues,
-            file_path,
-            &state,
-            &func_lines,
-        );
+        try finishCFGFunction(file, scan);
     }
 }
 
-fn finishCFGFunction(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    file_path: []const u8,
-    state: *CFGState,
-    func_lines: *std.ArrayListUnmanaged([]const u8),
-) !void {
-    const in_test = state.func_in_test or isInTestContext(file_path, false);
-    try processFunction(
-        allocator,
-        issues,
-        file_path,
-        state.func_name,
-        state.func_start,
-        func_lines.items,
-        state.fn_returns_error,
-        in_test,
-        state.no_free_param_fns,
-        state.no_free_fields,
-    );
+/// Process the just-finished function and reset the scan for the next one.
+fn finishCFGFunction(file: CFGFileCtx, scan: CFGScanCtx) !void {
+    const state = scan.state;
+    const in_test = state.func_in_test or isInTestContext(file.file_path, false);
+    const func: CFGFuncCtx = .{
+        .name = state.func_name,
+        .start = state.func_start,
+        .lines = scan.func_lines.items,
+        .fn_returns_error = state.fn_returns_error,
+        .in_test = in_test,
+        .no_free_param_fns = state.no_free_param_fns,
+        .no_free_fields = state.no_free_fields,
+    };
+    try processFunction(file, func);
     state.in_func = false;
-    func_lines.clearRetainingCapacity();
+    scan.func_lines.clearRetainingCapacity();
 }
 
 /// Saved state for the previous function during CFG file analysis
@@ -14409,15 +14397,13 @@ const CFGPrevFunc = struct {
 
 /// Handle function detection and nested function processing in CFG file analysis
 fn handleCFGFuncDetection(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    file_path: []const u8,
-    state: *CFGState,
-    prev: *CFGPrevFunc,
-    func_lines: *std.ArrayListUnmanaged([]const u8),
+    file: CFGFileCtx,
+    scan: CFGScanCtx,
     t: []const u8,
     line_num: usize,
 ) !void {
+    const state = scan.state;
+    const prev = scan.prev;
     const was_in_func = state.in_func;
     prev.name = state.func_name;
     prev.start = state.func_start;
@@ -14428,21 +14414,19 @@ fn handleCFGFuncDetection(
         state.func_in_test = state.in_test_block;
     } else if (found_nested) {
         state.func_in_test = state.in_test_block;
-        if (func_lines.items.len >= 3) {
-            try processFunction(
-                allocator,
-                issues,
-                file_path,
-                prev.name,
-                prev.start,
-                func_lines.items,
-                false,
-                prev.in_test,
-                state.no_free_param_fns,
-                state.no_free_fields,
-            );
-        }
-        if (func_lines.items.len > 0) func_lines.clearRetainingCapacity();
+        // Bound at branch depth 2: a struct literal nested deeper (inside the
+        // len guard) would read as depth 4 to ZA302's brace counter.
+        const func: CFGFuncCtx = .{
+            .name = prev.name,
+            .start = prev.start,
+            .lines = scan.func_lines.items,
+            .fn_returns_error = false,
+            .in_test = prev.in_test,
+            .no_free_param_fns = state.no_free_param_fns,
+            .no_free_fields = state.no_free_fields,
+        };
+        if (scan.func_lines.items.len >= 3) try processFunction(file, func);
+        if (scan.func_lines.items.len > 0) scan.func_lines.clearRetainingCapacity();
     }
 }
 
@@ -14681,19 +14665,25 @@ fn isKnownVoidFunction(t: []const u8, type_ctx: ?*const TypeContext) bool {
     return false;
 }
 
-/// Check a single line for ignored error pattern
-fn checkIgnoredError(
+/// Per-file context for the ignored-error scan (ZA205): output plumbing plus
+/// the file's type context used to recognize safe builtin discards.
+const IgnoredErrorFileCtx = struct {
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
     file_path: []const u8,
+    type_ctx: *const TypeContext,
+};
+
+/// Check a single line for ignored error pattern
+fn checkIgnoredError(
+    ctx: IgnoredErrorFileCtx,
     t: []const u8,
     line_num: usize,
-    type_ctx: ?*const TypeContext,
 ) !void {
     const is_discard = mem.startsWith(u8, t, "_ = ") and mem.indexOf(u8, t, "(") != null;
-    if (!is_discard or hasErrorHandling(t) or isSafeBuiltin(t, type_ctx)) return;
-    try issues.append(allocator, .{
-        .file = file_path,
+    if (!is_discard or hasErrorHandling(t) or isSafeBuiltin(t, ctx.type_ctx)) return;
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
         .line = line_num,
         .col = 1,
         .severity = .note, // Changed from warning - discarding is often intentional
@@ -14755,6 +14745,12 @@ fn analyzeIgnoredErrorsInFile(
     var type_ctx = try parseFileTypeContext(allocator, content);
     defer type_ctx.deinit(allocator);
 
+    const ctx: IgnoredErrorFileCtx = .{
+        .allocator = allocator,
+        .issues = issues,
+        .file_path = file_path,
+        .type_ctx = &type_ctx,
+    };
     var line_num: usize = 1;
     var defer_depth: usize = 0;
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -14772,7 +14768,7 @@ fn analyzeIgnoredErrorsInFile(
             defer_depth = updateDeferBraceDepth(t, defer_depth);
             continue;
         }
-        try checkIgnoredError(allocator, issues, file_path, t, line_num, &type_ctx);
+        try checkIgnoredError(ctx, t, line_num);
     }
 }
 
@@ -14801,18 +14797,23 @@ fn isUnsafeUnwrapUsage(t: []const u8, col: usize) bool {
     return after[0] != ';' and after[0] != ',' and after[0] != ')';
 }
 
+/// Per-file context for the legacy line-based null-safety scan (ZA801/ZA802).
+const NullScanFileCtx = struct {
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+};
+
 /// Check for unsafe .? unwrap (ZA801)
 fn checkUnsafeUnwrap(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
+    ctx: NullScanFileCtx,
     t: []const u8,
     line_num: usize,
 ) !void {
     const col = mem.indexOf(u8, t, ".?") orelse return;
     if (isInSafeContext(t) or !isUnsafeUnwrapUsage(t, col)) return;
-    try issues.append(allocator, .{
-        .file = path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
         .line = line_num,
         .col = col + 1,
         .severity = .warning,
@@ -14824,9 +14825,7 @@ fn checkUnsafeUnwrap(
 
 /// Check for unsafe optional pointer deref (ZA802)
 fn checkUnsafeDeref(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
+    ctx: NullScanFileCtx,
     t: []const u8,
     line_num: usize,
 ) !void {
@@ -14838,8 +14837,8 @@ fn checkUnsafeDeref(
     const prefix_maybe = mem.indexOf(u8, before, "maybe_") != null;
     const prefix_opt = mem.indexOf(u8, before, "opt_") != null;
     if ((!prefix_maybe and !prefix_opt) or isInSafeContext(t)) return;
-    try issues.append(allocator, .{
-        .file = path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
         .line = line_num,
         .col = col + 1,
         .severity = .warning,
@@ -14859,45 +14858,57 @@ fn isNullCheckConditional(t: []const u8) bool {
         mem.startsWith(u8, t, "while (");
 }
 
-fn collectNullChecksPerBlock(
+/// Shared context for the CFG null-safety passes (ZA801/ZA802): the graph,
+/// the function's lines, and the per-block null-check sets the collect phase
+/// builds and the scan phase consumes.
+const NullSafetyCtx = struct {
     allocator: Allocator,
     cfg: *ControlFlowGraph,
     lines: []const []const u8,
     func_line: usize,
+    file_path: []const u8,
     checked: []std.StringHashMapUnmanaged(void),
-) !void {
-    for (cfg.blocks.items, 0..) |block, bid| {
+    issues: *std.ArrayListUnmanaged(Issue),
+};
+
+/// Per-line descriptor for the CFG null-safety scan: the trimmed line, its
+/// position, and the null-check set in scope for its CFG block.
+const NullLineCtx = struct {
+    t: []const u8,
+    line_num: usize,
+    idx: usize,
+    checked_set: *const std.StringHashMapUnmanaged(void),
+};
+
+fn collectNullChecksPerBlock(ctx: NullSafetyCtx) !void {
+    for (ctx.cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or
             block.start_line > block.end_line) continue;
         try collectNullChecksInBlock(
-            allocator,
-            lines,
-            func_line,
+            ctx,
             block.start_line,
             block.end_line,
-            &checked[bid],
+            &ctx.checked[bid],
         );
     }
 }
 
 /// Collect null-checked variables from conditionals within a single block
 fn collectNullChecksInBlock(
-    allocator: Allocator,
-    lines: []const []const u8,
-    func_line: usize,
+    ctx: NullSafetyCtx,
     start_line: usize,
     end_line: usize,
     checked: *std.StringHashMapUnmanaged(void),
 ) !void {
     for (start_line..end_line + 1) |ln| {
-        if (ln < func_line) continue;
-        const idx = ln - func_line;
-        if (idx >= lines.len) continue;
-        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (ln < ctx.func_line) continue;
+        const idx = ln - ctx.func_line;
+        if (idx >= ctx.lines.len) continue;
+        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (!isNullCheckConditional(t)) continue;
         const var_name = extractNullCheckedVar(t) orelse continue;
-        try checked.put(allocator, var_name, {});
+        try checked.put(ctx.allocator, var_name, {});
     }
 }
 
@@ -14962,25 +14973,16 @@ fn intersectPredChecks(
 }
 
 /// Check for unsafe .? unwrap on a line
-fn checkOptionalUnwrap(
-    allocator: Allocator,
-    t: []const u8,
-    line_num: usize,
-    idx: usize,
-    lines: []const []const u8,
-    file_path: []const u8,
-    checked_set: *const std.StringHashMapUnmanaged(void),
-    issues: *std.ArrayListUnmanaged(Issue),
-) !void {
-    const col = mem.indexOf(u8, t, ".?") orelse return;
-    if (isInSafeContext(t)) return;
-    if (!isUnsafeUnwrapUsage(t, col)) return;
-    const var_name = extractUnwrappedVar(t, col) orelse return;
-    if (checked_set.contains(var_name)) return;
-    if (hasEarlyReturnNullGuard(lines, idx, var_name)) return;
-    try issues.append(allocator, .{
-        .file = file_path,
-        .line = line_num,
+fn checkOptionalUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
+    const col = mem.indexOf(u8, line.t, ".?") orelse return;
+    if (isInSafeContext(line.t)) return;
+    if (!isUnsafeUnwrapUsage(line.t, col)) return;
+    const var_name = extractUnwrappedVar(line.t, col) orelse return;
+    if (line.checked_set.contains(var_name)) return;
+    if (hasEarlyReturnNullGuard(ctx.lines, line.idx, var_name)) return;
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
+        .line = line.line_num,
         .col = col + 1,
         .severity = .warning,
         .rule = RULE_OPTIONAL_UNWRAP_UNSAFE,
@@ -14990,24 +14992,17 @@ fn checkOptionalUnwrap(
 }
 
 /// Check for unsafe .* deref on optional pointer (maybe_/opt_ prefix)
-fn checkOptionalDeref(
-    allocator: Allocator,
-    t: []const u8,
-    line_num: usize,
-    file_path: []const u8,
-    checked_set: *const std.StringHashMapUnmanaged(void),
-    issues: *std.ArrayListUnmanaged(Issue),
-) !void {
-    const col = mem.indexOf(u8, t, ".*") orelse return;
-    const before = t[0..col];
+fn checkOptionalDeref(ctx: NullSafetyCtx, line: NullLineCtx) !void {
+    const col = mem.indexOf(u8, line.t, ".*") orelse return;
+    const before = line.t[0..col];
     const has_opt = mem.indexOf(u8, before, "maybe_") != null or
         mem.indexOf(u8, before, "opt_") != null;
-    if (!has_opt or isInSafeContext(t)) return;
-    const var_name = extractDerefVar(t, col) orelse return;
-    if (checked_set.contains(var_name)) return;
-    try issues.append(allocator, .{
-        .file = file_path,
-        .line = line_num,
+    if (!has_opt or isInSafeContext(line.t)) return;
+    const var_name = extractDerefVar(line.t, col) orelse return;
+    if (line.checked_set.contains(var_name)) return;
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
+        .line = line.line_num,
         .col = col + 1,
         .severity = .warning,
         .rule = RULE_ORELSE_QUESTION_UNSAFE,
@@ -15017,34 +15012,9 @@ fn checkOptionalDeref(
 }
 
 /// Phase 3: Check for unsafe unwraps on a line
-fn checkLineForUnsafeUnwrap(
-    allocator: Allocator,
-    t: []const u8,
-    line_num: usize,
-    idx: usize,
-    lines: []const []const u8,
-    file_path: []const u8,
-    checked_set: *const std.StringHashMapUnmanaged(void),
-    issues: *std.ArrayListUnmanaged(Issue),
-) !void {
-    try checkOptionalUnwrap(
-        allocator,
-        t,
-        line_num,
-        idx,
-        lines,
-        file_path,
-        checked_set,
-        issues,
-    );
-    try checkOptionalDeref(
-        allocator,
-        t,
-        line_num,
-        file_path,
-        checked_set,
-        issues,
-    );
+fn checkLineForUnsafeUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
+    try checkOptionalUnwrap(ctx, line);
+    try checkOptionalDeref(ctx, line);
 }
 
 /// Propagate null checks across CFG until fixpoint
@@ -15067,47 +15037,41 @@ fn propagateNullChecks(
 }
 
 /// Scan all CFG blocks for unsafe unwraps using checked sets
-fn scanBlocksForUnsafeUnwraps(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-    checked: []std.StringHashMapUnmanaged(void),
-    issues: *std.ArrayListUnmanaged(Issue),
-) !void {
-    for (cfg.blocks.items, 0..) |block, bid| {
+fn scanBlocksForUnsafeUnwraps(ctx: NullSafetyCtx) !void {
+    for (ctx.cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or
             block.start_line > block.end_line) continue;
-        for (block.start_line..block.end_line + 1) |ln| {
-            if (ln < func_line) continue;
-            const idx = ln - func_line;
-            if (idx >= lines.len) continue;
-            const t = mem.trim(u8, lines[idx], " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-            try checkLineForUnsafeUnwrap(
-                allocator,
-                t,
-                ln,
-                idx,
-                lines,
-                file_path,
-                &checked[bid],
-                issues,
-            );
-        }
+        try scanBlockForUnsafeUnwraps(ctx, bid, block.start_line, block.end_line);
     }
 }
 
-fn analyzeCFGNullSafety(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-) !std.ArrayListUnmanaged(Issue) {
+/// Scan one CFG block's lines for unsafe unwraps (checked set selected by bid)
+fn scanBlockForUnsafeUnwraps(
+    ctx: NullSafetyCtx,
+    bid: usize,
+    start_line: usize,
+    end_line: usize,
+) !void {
+    for (start_line..end_line + 1) |ln| {
+        if (ln < ctx.func_line) continue;
+        const idx = ln - ctx.func_line;
+        if (idx >= ctx.lines.len) continue;
+        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const line: NullLineCtx = .{
+            .t = t,
+            .line_num = ln,
+            .idx = idx,
+            .checked_set = &ctx.checked[bid],
+        };
+        try checkLineForUnsafeUnwrap(ctx, line);
+    }
+}
+
+fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
+    const allocator = run.file.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    const num_blocks = cfg.blocks.items.len;
+    const num_blocks = run.cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
     const checked = try allocator.alloc(
@@ -15120,17 +15084,18 @@ fn analyzeCFGNullSafety(
     }
     for (checked) |*map| map.* = .empty;
 
-    try collectNullChecksPerBlock(allocator, cfg, lines, func_line, checked);
-    try propagateNullChecks(allocator, cfg, checked, num_blocks);
-    try scanBlocksForUnsafeUnwraps(
-        allocator,
-        cfg,
-        lines,
-        func_line,
-        file_path,
-        checked,
-        &issues,
-    );
+    const ctx: NullSafetyCtx = .{
+        .allocator = allocator,
+        .cfg = run.cfg,
+        .lines = run.func.lines,
+        .func_line = run.func.start,
+        .file_path = run.file.file_path,
+        .checked = checked,
+        .issues = &issues,
+    };
+    try collectNullChecksPerBlock(ctx);
+    try propagateNullChecks(allocator, run.cfg, checked, num_blocks);
+    try scanBlocksForUnsafeUnwraps(ctx);
     return issues;
 }
 
@@ -15140,41 +15105,34 @@ fn analyzeCFGNullSafety(
 /// - Cleanup function context (deinit, close, destroy, etc.)
 /// - Defer block context (best-effort cleanup)
 /// - Test block context (nested functions inside tests)
-fn analyzeCFGErrors(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-    func_name: []const u8,
-    is_in_test_context: bool,
-) !std.ArrayListUnmanaged(Issue) {
+fn analyzeCFGErrors(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
+    const allocator = run.file.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    const is_test_ctx = mem.startsWith(u8, func_name, "test ") or
-        is_in_test_context;
+    const is_test_ctx = mem.startsWith(u8, run.func.name, "test ") or
+        run.func.in_test;
 
-    for (cfg.blocks.items) |block| {
+    for (run.cfg.blocks.items) |block| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
 
         for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < func_line) continue;
-            const idx = line_num - func_line;
-            if (idx >= lines.len) continue;
+            if (line_num < run.func.start) continue;
+            const idx = line_num - run.func.start;
+            if (idx >= run.func.lines.len) continue;
 
-            const t = mem.trim(u8, lines[idx], " \t\r");
+            const t = mem.trim(u8, run.func.lines[idx], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
             if (is_test_ctx) continue;
 
-            const preceding: ?[]const []const u8 = if (idx > 0) lines[0..idx] else null;
-            if (checkCatchUnreachable(t, file_path, line_num, preceding)) |issue|
+            const preceding: ?[]const []const u8 = if (idx > 0) run.func.lines[0..idx] else null;
+            if (checkCatchUnreachable(t, run.file.file_path, line_num, preceding)) |issue|
                 try issues.append(allocator, issue);
             if (checkOrelseUnreachable(
                 t,
-                file_path,
+                run.file.file_path,
                 line_num,
-                lines,
+                run.func.lines,
                 idx,
-                func_line,
+                run.func.start,
             )) |issue|
                 try issues.append(allocator, issue);
         }
@@ -16791,15 +16749,19 @@ fn analyzeNullSafety(
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
-        const file_path = entry.key_ptr.*;
+        const ctx: NullScanFileCtx = .{
+            .allocator = allocator,
+            .issues = &issues,
+            .file_path = entry.key_ptr.*,
+        };
         var line_num: usize = 1;
         var lines_iter = mem.splitScalar(u8, entry.value_ptr.content, '\n');
         while (lines_iter.next()) |line| {
             defer line_num += 1;
             const t = mem.trim(u8, line, " \t\r");
             if (isCommentOrMultilineString(t)) continue;
-            try checkUnsafeUnwrap(&issues, allocator, file_path, t, line_num);
-            try checkUnsafeDeref(&issues, allocator, file_path, t, line_num);
+            try checkUnsafeUnwrap(ctx, t, line_num);
+            try checkUnsafeDeref(ctx, t, line_num);
         }
     }
     return issues;

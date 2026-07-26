@@ -1655,22 +1655,28 @@ fn isIndirectlyInitialized(
             return true;
         // Track for-loop depth and detect array element assignment
         // inside for loops: for (...) |...| { ... args[i] = ...; }
-        if (mem.startsWith(u8, t, "for ") or
-            mem.startsWith(u8, t, "for("))
-        {
-            for (t) |c| {
-                if (c == '{') in_for_loop += 1;
-            }
-        } else if (in_for_loop > 0) {
-            for (t) |c| {
-                if (c == '{') in_for_loop += 1;
-                if (c == '}' and in_for_loop > 0) in_for_loop -= 1;
-            }
-            if (in_for_loop > 0 and isArrayIndexAssignment(t, vn))
-                return true;
+        const opens_for = mem.startsWith(u8, t, "for ") or
+            mem.startsWith(u8, t, "for(");
+        if (opens_for) {
+            in_for_loop += countChar(t, '{');
+            continue;
         }
+        if (in_for_loop == 0) continue;
+        in_for_loop += countChar(t, '{');
+        in_for_loop -|= countChar(t, '}');
+        if (in_for_loop > 0 and isArrayIndexAssignment(t, vn))
+            return true;
     }
     return false;
+}
+
+/// Count occurrences of a byte in a slice.
+fn countChar(t: []const u8, ch: u8) usize {
+    var n: usize = 0;
+    for (t) |c| {
+        if (c == ch) n += 1;
+    }
+    return n;
 }
 
 /// Check if a line assigns to a variable via array indexing: `var_name[...] = ...`
@@ -5702,25 +5708,7 @@ fn collectNoFreeAllocatorNames(
             mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "if ") or
             mem.startsWith(u8, t, "return ") or mem.startsWith(u8, t, "try "))
             break;
-        // Look for ALL `arena: Allocator` or `arena: std.mem.Allocator` patterns on the line.
-        // A function signature may have multiple params: fn foo(gpa: Allocator, arena: Allocator)
-        {
-            var search_start: usize = 0;
-            while (mem.indexOf(u8, t[search_start..], ": ")) |rel_pos| {
-                const colon_pos = search_start + rel_pos;
-                // Extract parameter name (ident chars before the colon)
-                var pname_start = colon_pos;
-                while (pname_start > 0 and isIdent(t[pname_start - 1])) pname_start -= 1;
-                const pname = t[pname_start..colon_pos];
-                if (pname.len > 0 and isArenaName(pname)) {
-                    const type_str = mem.trim(u8, t[colon_pos + 2 ..], " \t,)");
-                    if (isAllocatorType(type_str)) {
-                        try names.put(a, pname, {});
-                    }
-                }
-                search_start = colon_pos + 2;
-            }
-        }
+        try collectSigArenaParams(a, t, &names);
     }
 
     // No-free allocator type init patterns from stdlib vocabulary (compat layer)
@@ -5732,90 +5720,108 @@ fn collectNoFreeAllocatorNames(
         if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
         const name = extractVarDeclName(t) orelse continue;
 
-        // Track variables initialized with known no-free allocator types
-        for (no_free_inits) |init_pat| {
-            if (mem.indexOf(u8, t, init_pat) != null) {
-                try names.put(a, name, {});
-                break;
-            }
-        }
-
-        // Anonymous init syntax (Zig 0.15+): `var fba: std.heap.FixedBufferAllocator = .init(`
-        // The type annotation declares the no-free type but `.init(` doesn't match
-        // the normal `FixedBufferAllocator.init(` pattern.
-        if (!names.contains(name)) {
-            if (mem.indexOf(u8, t, "= .init(") != null or mem.indexOf(u8, t, "= .{") != null) {
-                // Check if the type annotation is a no-free allocator type
-                if (mem.indexOf(u8, t, ": ")) |colon_pos| {
-                    const after_colon = mem.trim(u8, t[colon_pos + 2 ..], " \t");
-                    const field_type_patterns = compat.getNoFreeFieldTypePatterns();
-                    for (field_type_patterns) |pat| {
-                        if (mem.startsWith(u8, after_colon, pat)) {
-                            try names.put(a, name, {});
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        try trackNoFreeTypeInit(a, t, name, no_free_inits, &names);
 
         // Track local variables named "arena" as no-free allocators:
-        // `const arena = session.arena;`, `const arena = s.owner.allocator;`,
-        // `const arena = b.allocator;` etc.
+        // `const arena = session.arena;`, `const arena = b.allocator;` etc.
         // Naming a variable "arena" is a strong convention signal in Zig that
         // it's backed by an arena allocator. False negative risk is near-zero.
         const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
         var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
         if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
 
-        if (!names.contains(name)) {
-            if (isArenaName(name)) {
-                try names.put(a, name, {});
-                continue;
-            }
-        }
+        if (!names.contains(name) and isArenaName(name)) try names.put(a, name, {});
+        if (!names.contains(name) and isArenaName(name)) continue;
 
-        // Track .allocator() aliases: const X = Y.allocator()
-        // where Y is a tracked no-free allocator variable (or Y.field is)
-        const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse continue;
-        const source = rhs[0..dot_alloc];
-        if (source.len == 0) continue;
-
-        // Check if source is a tracked no-free variable (simple identifier)
-        var all_ident = true;
-        for (source) |c| {
-            if (!isIdent(c)) {
-                all_ident = false;
-                break;
-            }
-        }
-        if (all_ident and names.contains(source)) {
-            try names.put(a, name, {});
-            continue;
-        }
-
-        // Check dotted sources: self.arena.allocator(), x.fba.allocator()
-        // The last segment before .allocator() might be a tracked no-free var
-        // or a file-level no-free field (e.g. arena declared as ArenaAllocator or
-        // as Allocator with arena name in a struct definition).
-        if (mem.lastIndexOf(u8, source, ".")) |last_dot| {
-            const field = source[last_dot + 1 ..];
-            if (field.len > 0) {
-                if (names.contains(field)) {
-                    try names.put(a, name, {});
-                    continue;
-                }
-                if (file_no_free_fields) |fields| {
-                    if (fields.contains(field)) {
-                        try names.put(a, name, {});
-                        continue;
-                    }
-                }
-            }
-        }
+        const alias_ctx: NoFreeAliasCtx = .{
+            .names = &names,
+            .file_fields = file_no_free_fields,
+        };
+        try trackAllocatorAlias(a, rhs, name, alias_ctx);
     }
 
     return names;
+}
+
+const NoFreeAliasCtx = struct {
+    names: *std.StringHashMapUnmanaged(void),
+    file_fields: ?*const std.StringHashMapUnmanaged(void),
+};
+
+/// Scan one signature line for `arena: Allocator`-style parameters.
+fn collectSigArenaParams(
+    a: Allocator,
+    t: []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+) !void {
+    var search_start: usize = 0;
+    while (mem.indexOf(u8, t[search_start..], ": ")) |rel_pos| {
+        const colon_pos = search_start + rel_pos;
+        // Extract parameter name (ident chars before the colon)
+        var pname_start = colon_pos;
+        while (pname_start > 0 and isIdent(t[pname_start - 1])) pname_start -= 1;
+        const pname = t[pname_start..colon_pos];
+        if (pname.len > 0 and isArenaName(pname)) {
+            const type_str = mem.trim(u8, t[colon_pos + 2 ..], " \t,)");
+            if (isAllocatorType(type_str)) try names.put(a, pname, {});
+        }
+        search_start = colon_pos + 2;
+    }
+}
+
+/// Track variables initialized with known no-free allocator types, including
+/// the anonymous-init form `var fba: std.heap.FixedBufferAllocator = .init(`.
+fn trackNoFreeTypeInit(
+    a: Allocator,
+    t: []const u8,
+    name: []const u8,
+    no_free_inits: []const []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+) !void {
+    for (no_free_inits) |init_pat| {
+        if (mem.indexOf(u8, t, init_pat) != null) {
+            try names.put(a, name, {});
+            return;
+        }
+    }
+    if (names.contains(name)) return;
+    if (mem.indexOf(u8, t, "= .init(") == null and mem.indexOf(u8, t, "= .{") == null) return;
+    const colon_pos = mem.indexOf(u8, t, ": ") orelse return;
+    const after_colon = mem.trim(u8, t[colon_pos + 2 ..], " \t");
+    const field_type_patterns = compat.getNoFreeFieldTypePatterns();
+    for (field_type_patterns) |pat| {
+        if (mem.startsWith(u8, after_colon, pat)) {
+            try names.put(a, name, {});
+            return;
+        }
+    }
+}
+
+/// Track .allocator() aliases: const X = Y.allocator() where Y (or the last
+/// field of a dotted Y) is a tracked no-free variable or file-level field.
+fn trackAllocatorAlias(
+    a: Allocator,
+    rhs: []const u8,
+    name: []const u8,
+    ctx: NoFreeAliasCtx,
+) !void {
+    const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse return;
+    const source = rhs[0..dot_alloc];
+    if (source.len == 0) return;
+    if (isAllIdent(source) and ctx.names.contains(source)) {
+        try ctx.names.put(a, name, {});
+        return;
+    }
+    // Dotted sources: self.arena.allocator(), x.fba.allocator()
+    const last_dot = mem.lastIndexOf(u8, source, ".") orelse return;
+    const field = source[last_dot + 1 ..];
+    if (field.len == 0) return;
+    if (ctx.names.contains(field)) {
+        try ctx.names.put(a, name, {});
+        return;
+    }
+    const fields = ctx.file_fields orelse return;
+    if (fields.contains(field)) try ctx.names.put(a, name, {});
 }
 
 /// Collect struct field names whose declared type is a no-free allocator.

@@ -282,16 +282,20 @@ with existing inline-ignores, and is reported under the Memory category in
 | **ZA701** | warning | ON | Line exceeds max length (default: 100 columns; lines over-length solely due to unbreakable string-literal content are exempt) |
 | **ZA702** | warning | OFF | File exceeds max size (requires `--enable=ZA702` or config `enable`; threshold via `max_file_bytes`, default 50000) |
 | **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
-| **ZA704** | warning | ON | `std.debug.print` left in non-test code (pre-merge hygiene; test blocks, `*_test.zig` files, and `/test` paths are exempt — see note below) |
+| **ZA704** | warning | OFF | `std.debug.print` left in non-test code (pre-merge hygiene; test blocks, `*_test.zig` files, and `/test` paths are exempt — use `--enable=ZA704`, see note below) |
 
-**ZA704 and CLI apps:** the rule exists to catch debug prints forgotten before
-a merge. Applications whose output channel *is* `std.debug.print` (CLI tools
-writing to stderr) should disable it — `"disable": ["ZA704"]` in `ephor.json`,
-`// ephor:ignore-file ZA704` per file, or route output through `std.log` with a
-custom log function. **Known limitation:** prints in helper *functions* that
-are only ever called from tests still fire (the rule tracks test blocks, not
-the call graph) — suppress per file or disable the rule for test-helper
-modules.
+**ZA704 is an opt-in sweep.** The rule exists to catch debug prints forgotten
+before a merge: enable it deliberately (`--enable=ZA704` or `"enable":
+["ZA704"]` in `ephor.json`), clean up what it finds, and turn it back off. It
+is off by default because on CLI-heavy projects it fires hundreds of warnings
+on *intentional* output — 392 on the abi bindings generator, 577 on a CLI
+messenger (measured 2026-07-26) — which trained users to disable the rule
+rather than use it; as an opt-in pre-merge sweep it keeps its teeth.
+Applications whose output channel *is* `std.debug.print` (CLI tools writing
+to stderr) simply leave it off — there is nothing to disable. **Known
+limitation:** prints in helper *functions* that are only ever called from
+tests still fire (the rule tracks test blocks, not the call graph) — suppress
+per file for test-helper modules.
 
 #### ZA703 Naming Rules
 

@@ -3,12 +3,6 @@
 // Copyright (C) 2025 Rhyos Labs LLC
 // SPDX-License-Identifier: MIT
 
-// ephor:ignore-file ZA704 — ephor is a CLI: std.debug.print on stderr IS its
-// user-facing output channel (issues, help, summaries, errors). std.log is
-// not a drop-in replacement: its default impl itself calls std.debug.print
-// and adds level prefixes that would break the GCC-style output format that
-// IDEs parse. Audited 2026-07-26: every print site is user-facing output.
-
 //! Ephor: The overseer of your Zig code - Static + Dynamic analysis
 //!
 //! Output format: path:line:col: severity[rule-id]: message
@@ -12550,7 +12544,8 @@ const StyleSink = struct {
     path: []const u8,
 };
 
-/// ZA704: std.debug.print left in non-test code (pre-merge hygiene).
+/// ZA704: std.debug.print left in non-test code (opt-in pre-merge hygiene;
+/// off by default — CLI apps print to stderr by design).
 /// Every match is iterated with a leading word-boundary check — a bare
 /// indexOf would also fire on `xstd.debug.print(` (patterns.md F2) — and
 /// gets the uniform string/comment treatment (patterns.md F1).
@@ -12570,16 +12565,15 @@ fn checkDebugPrints(sink: StyleSink, line: []const u8, line_num: usize) !void {
             .severity = .warning,
             .rule = RULE_DEBUG_PRINT,
             .message = "std.debug.print left in non-test code",
-            .help = "remove before merge, route through std.log, " ++
-                "or disable ZA704 for CLI apps",
+            .help = "remove before merge or route through std.log",
         });
     }
 }
 
 /// Update test-block state for one line and run the ZA704 check when the
-/// line is outside test context (tests print freely; CLI apps config-disable
-/// — see README). Comment-only / multiline-string lines are skipped: a call
-/// cannot live in prose.
+/// line is outside test context (tests print freely; CLI apps leave the
+/// rule off — it is opt-in, see README). Comment-only / multiline-string
+/// lines are skipped: a call cannot live in prose.
 fn checkDebugPrintsUnlessTest(
     sink: StyleSink,
     line: []const u8,
@@ -18084,6 +18078,9 @@ const Config = struct {
         if (mem.eql(u8, rule, RULE_IGNORED_ERROR)) return true;
         if (mem.eql(u8, rule, RULE_UNDEFINED_USAGE)) return true;
         if (mem.eql(u8, rule, RULE_NO_CATCH_RETURN)) return true;
+        // ZA704 is an exact entry, not a "ZA7" prefix — the rest of ZA7xx
+        // stays ON. Opt-in sweep: CLI apps print to stderr by design.
+        if (mem.eql(u8, rule, RULE_DEBUG_PRINT)) return true;
         return false;
     }
 
@@ -18458,7 +18455,8 @@ fn writeDefaultConfig() !void {
         \\  //   ZA6xx Format:     ZA601 needs-format,
         \\  //                     ZA607 read-before-assign (semantic, not formatting)
         \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long,
-        \\  //                     ZA703 naming, ZA704 debug-print
+        \\  //                     ZA703 naming,
+        \\  //                     ZA704 debug-print (OFF by default)
         \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
         \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
         \\  //                     ZA903 index-arithmetic,
@@ -20181,7 +20179,7 @@ fn printHelp() void {
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long,
-        \\                     ZA703: naming, ZA704: debug-print)
+        \\                     ZA703: naming, ZA704: debug-print (off by default))
         \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
         \\                     ZR103: use-after-free, ZR104: test-failure,
         \\                     ZR105: panic)
@@ -33378,7 +33376,7 @@ test "ZA704: different receiver and glued prefix stay silent" {
     );
 }
 
-test "ZA704: on by default, ZA904: off by default via ZA9 prefix" {
+test "ZA704: off by default (exact entry, rest of ZA7 stays on), ZA904: off via ZA9 prefix" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33386,11 +33384,65 @@ test "ZA704: on by default, ZA904: off by default via ZA9 prefix" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
 
-    try std.testing.expect(cfg.isRuleEnabled(RULE_DEBUG_PRINT));
+    try std.testing.expect(cfg.isRuleDisabled(RULE_DEBUG_PRINT));
     try std.testing.expect(cfg.isRuleDisabled(RULE_INTCAST_NO_BOUNDS));
+    // ZA704's off-by-default entry is exact — it must not drag ZA7xx down.
+    try std.testing.expect(cfg.isRuleEnabled(RULE_LINE_TOO_LONG));
+    try std.testing.expect(cfg.isRuleEnabled(RULE_NAMING_CONVENTION));
+
+    try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_DEBUG_PRINT));
+    try std.testing.expect(cfg.isRuleEnabled(RULE_DEBUG_PRINT));
 
     try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_INTCAST_NO_BOUNDS));
     try std.testing.expect(cfg.isRuleEnabled(RULE_INTCAST_NO_BOUNDS));
+}
+
+/// Count issues for `rule` that pass the shouldPrintIssue config gate.
+fn countPrintableIssues(
+    issues: []const Issue,
+    rule: []const u8,
+    cfg: *const Config,
+    graph: *const ImportGraph,
+) usize {
+    var n: usize = 0;
+    for (issues) |issue| {
+        if (!mem.eql(u8, issue.rule, rule)) continue;
+        if (shouldPrintIssue(issue, cfg, graph)) n += 1;
+    }
+    return n;
+}
+
+test "ZA704: print gate suppresses by default, enable restores findings" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn diag() void {
+        \\    std.debug.print("x", .{});
+        \\}
+    ;
+    var run = try runStyleTest(allocator, "app_widget.zig", content);
+    defer run.deinit(allocator);
+
+    // The analyzer fires regardless of config; gating happens at print time.
+    const found = countRuleIssues(run.issues.items, "app_widget.zig", RULE_DEBUG_PRINT);
+    try std.testing.expectEqual(@as(usize, 1), found);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.path = "app_widget.zig";
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countPrintableIssues(run.issues.items, RULE_DEBUG_PRINT, &cfg, &run.graph),
+    );
+
+    try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_DEBUG_PRINT));
+    try std.testing.expectEqual(
+        found,
+        countPrintableIssues(run.issues.items, RULE_DEBUG_PRINT, &cfg, &run.graph),
+    );
 }
 
 test "ZA904: unguarded @intCast fires" {

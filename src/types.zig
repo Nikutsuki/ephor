@@ -3,10 +3,6 @@
 // Copyright (C) 2025 Rhyos Labs LLC
 // SPDX-License-Identifier: MIT
 
-// ephor:ignore-file ZA704 — Issue.printText/printJson are the CLI's
-// user-facing output channel (stderr). See src/main.zig for the full
-// justification; std.log would corrupt the GCC-style output format.
-
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;

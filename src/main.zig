@@ -6023,33 +6023,34 @@ fn collectAllAllocatorNames(
     }
 
     // Also track function parameters typed as Allocator
+    try trackAllocatorParams(a, lines, &names);
+
+    return names;
+}
+
+/// Scan the first ~10 lines for parameters typed as Allocator and track them.
+fn trackAllocatorParams(
+    a: Allocator,
+    lines: []const []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+) !void {
     for (lines[0..@min(10, lines.len)]) |line| {
         const t = mem.trim(u8, line, " \t\r");
         // Parameter with Allocator type: "name: Allocator" or "name: std.mem.Allocator"
-        if (mem.indexOf(u8, t, ": Allocator") != null or
-            mem.indexOf(u8, t, ": std.mem.Allocator") != null or
-            mem.indexOf(u8, t, ": *Allocator") != null or
-            mem.indexOf(u8, t, ":Allocator") != null)
-        {
-            // Extract parameter name (word before the colon)
-            if (mem.indexOf(u8, t, ": Allocator") orelse
-                mem.indexOf(u8, t, ": std.mem.Allocator") orelse
-                mem.indexOf(u8, t, ": *Allocator") orelse
-                mem.indexOf(u8, t, ":Allocator")) |colon_pos|
-            {
-                var start = colon_pos;
-                while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '_')) start -= 1;
-                if (start < colon_pos) {
-                    const param_name = t[start..colon_pos];
-                    if (param_name.len > 0) try names.put(a, param_name, {});
-                }
-            }
-        }
+        const colon_pos = mem.indexOf(u8, t, ": Allocator") orelse
+            mem.indexOf(u8, t, ": std.mem.Allocator") orelse
+            mem.indexOf(u8, t, ": *Allocator") orelse
+            mem.indexOf(u8, t, ":Allocator") orelse {
+            if (mem.indexOf(u8, t, ") ") != null and mem.indexOf(u8, t, "{") != null) break;
+            continue;
+        };
+        // Extract parameter name (word before the colon)
+        var start = colon_pos;
+        while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '_')) start -= 1;
+        if (start < colon_pos) try names.put(a, t[start..colon_pos], {});
         // Stop at function body
         if (mem.indexOf(u8, t, ") ") != null and mem.indexOf(u8, t, "{") != null) break;
     }
-
-    return names;
 }
 
 /// Scan file content to find functions called with no-free allocator arguments.
@@ -6071,12 +6072,13 @@ fn buildNoFreeParamFunctions(a: Allocator, content: []const u8) !std.StringHashM
         if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
         const name = extractVarDeclName(t) orelse continue;
 
+        var init_match = false;
         for (no_free_inits) |pat| {
-            if (mem.indexOf(u8, t, pat) != null) {
-                try no_free_vars.put(a, name, {});
-                break;
-            }
+            if (mem.indexOf(u8, t, pat) == null) continue;
+            init_match = true;
+            break;
         }
+        if (init_match) try no_free_vars.put(a, name, {});
 
         // Track .allocator() aliases of tracked no-free vars
         const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
@@ -6084,17 +6086,8 @@ fn buildNoFreeParamFunctions(a: Allocator, content: []const u8) !std.StringHashM
         if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
         const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse continue;
         const source = rhs[0..dot_alloc];
-        if (source.len == 0) continue;
-        var all_ident = true;
-        for (source) |c| {
-            if (!isIdent(c)) {
-                all_ident = false;
-                break;
-            }
-        }
-        if (all_ident and no_free_vars.contains(source)) {
+        if (source.len > 0 and isAllIdent(source) and no_free_vars.contains(source))
             try no_free_vars.put(a, name, {});
-        }
     }
 
     if (no_free_vars.count() == 0) return result;
@@ -6132,39 +6125,40 @@ fn buildNoFreeParamFunctions(a: Allocator, content: []const u8) !std.StringHashM
         var depth: usize = 0;
         const max_scan = @min(content.len, paren_pos + 2000); // Limit scan range
         while (close < max_scan) : (close += 1) {
-            if (content[close] == '(') {
-                depth += 1;
-            } else if (content[close] == ')') {
-                if (depth == 0) break;
-                depth -= 1;
-            }
+            if (content[close] == '(') depth += 1;
+            if (content[close] == ')' and depth == 0) break;
+            if (content[close] == ')') depth -= 1;
         }
         if (close >= max_scan) continue;
 
         const args = content[paren_pos + 1 .. close];
 
         // Check if any no-free var is referenced in the arguments
+        var references_no_free = false;
         var nfi = no_free_vars.iterator();
         while (nfi.next()) |nf_entry| {
-            const nf_name = nf_entry.key_ptr.*;
-            var search_pos: usize = 0;
-            while (search_pos < args.len) {
-                const found = mem.indexOfPos(u8, args, search_pos, nf_name) orelse break;
-                const end = found + nf_name.len;
-                const before_ok = found == 0 or !isIdent(args[found - 1]);
-                const after_ok = end >= args.len or
-                    !isIdent(args[end]);
-                if (before_ok and after_ok) {
-                    try result.put(a, func_name, {});
-                    break;
-                }
-                search_pos = end;
-            }
-            if (result.contains(func_name)) break;
+            if (!argsContainIdent(args, nf_entry.key_ptr.*)) continue;
+            references_no_free = true;
+            break;
         }
+        if (references_no_free) try result.put(a, func_name, {});
     }
 
     return result;
+}
+
+/// Word-boundary scan for `name` inside an argument list.
+fn argsContainIdent(args: []const u8, name: []const u8) bool {
+    var search_pos: usize = 0;
+    while (search_pos < args.len) {
+        const found = mem.indexOfPos(u8, args, search_pos, name) orelse break;
+        const end = found + name.len;
+        const before_ok = found == 0 or !isIdent(args[found - 1]);
+        const after_ok = end >= args.len or !isIdent(args[end]);
+        if (before_ok and after_ok) return true;
+        search_pos = end;
+    }
+    return false;
 }
 
 // ============================================================================

@@ -17,8 +17,9 @@ pub const RULE_CREATE_NO_DEFER = "ZA102";
 pub const RULE_ALLOC_NO_ERRDEFER = "ZA103";
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
+pub const RULE_MUST_RETURN_REF = "ZA110";
 
-// ZA2xx - Error handling patterns (warnings; ZA205/ZA208 are notes)
+// ZA2xx - Error handling patterns (warnings; ZA205/ZA208/ZA209/ZA210 are notes)
 pub const RULE_SILENT_CATCH = "ZA201";
 pub const RULE_CATCH_UNREACHABLE = "ZA202";
 pub const RULE_ORELSE_UNREACHABLE = "ZA203";
@@ -27,6 +28,8 @@ pub const RULE_IGNORED_ERROR = "ZA205";
 pub const RULE_EXIT_BYPASSES_DEFER = "ZA206";
 pub const RULE_CATCH_UNDEFINED = "ZA207";
 pub const RULE_PANIC = "ZA208";
+pub const RULE_USELESS_ERROR_RETURN = "ZA209";
+pub const RULE_NO_CATCH_RETURN = "ZA210";
 
 // ZA3xx - Complexity
 pub const RULE_FUNC_TOO_LONG = "ZA301";

@@ -110,6 +110,7 @@ const RULE_CREATE_NO_DEFER = types.RULE_CREATE_NO_DEFER;
 const RULE_ALLOC_NO_ERRDEFER = types.RULE_ALLOC_NO_ERRDEFER;
 const RULE_USE_AFTER_FREE = types.RULE_USE_AFTER_FREE;
 const RULE_DOUBLE_FREE = types.RULE_DOUBLE_FREE;
+const RULE_MUST_RETURN_REF = types.RULE_MUST_RETURN_REF;
 const RULE_SILENT_CATCH = types.RULE_SILENT_CATCH;
 const RULE_CATCH_UNREACHABLE = types.RULE_CATCH_UNREACHABLE;
 const RULE_ORELSE_UNREACHABLE = types.RULE_ORELSE_UNREACHABLE;
@@ -118,6 +119,8 @@ const RULE_IGNORED_ERROR = types.RULE_IGNORED_ERROR;
 const RULE_EXIT_BYPASSES_DEFER = types.RULE_EXIT_BYPASSES_DEFER;
 const RULE_CATCH_UNDEFINED = types.RULE_CATCH_UNDEFINED;
 const RULE_PANIC = types.RULE_PANIC;
+const RULE_USELESS_ERROR_RETURN = types.RULE_USELESS_ERROR_RETURN;
+const RULE_NO_CATCH_RETURN = types.RULE_NO_CATCH_RETURN;
 const RULE_FUNC_TOO_LONG = types.RULE_FUNC_TOO_LONG;
 const RULE_NESTING_TOO_DEEP = types.RULE_NESTING_TOO_DEEP;
 const RULE_TOO_MANY_PARAMS = types.RULE_TOO_MANY_PARAMS;
@@ -5393,8 +5396,8 @@ const ImportGraph = struct {
             self.scanContentBuildPathRefs(content, build_root);
         }
 
-        try self.discoverNestedBuildFiles(cfg);
-        try self.markBuildModuleDirectories(cfg);
+        self.discoverNestedBuildFiles(cfg);
+        self.markBuildModuleDirectories(cfg);
     }
 
     /// Check if an import looks like an unresolved module name.
@@ -5462,7 +5465,7 @@ const ImportGraph = struct {
     fn markBuildModuleDirectories(
         self: *ImportGraph,
         cfg: *const Config,
-    ) !void {
+    ) void {
         var module_names: std.StringHashMapUnmanaged(void) = .empty;
         defer {
             var fi = module_names.iterator();
@@ -5520,7 +5523,7 @@ const ImportGraph = struct {
             ) catch continue;
             defer self.allocator.free(full);
             if (mem.eql(u8, entry.name, mod_name)) {
-                self.markAllZigFilesReachable(full) catch continue;
+                self.markAllZigFilesReachable(full);
             } else {
                 self.findAndMarkModuleDir(
                     full,
@@ -5533,7 +5536,7 @@ const ImportGraph = struct {
 
     /// Discover nested build.zig files in subdirectories and mark their
     /// @import and b.path references as reachable.
-    fn discoverNestedBuildFiles(self: *ImportGraph, cfg: *const Config) !void {
+    fn discoverNestedBuildFiles(self: *ImportGraph, cfg: *const Config) void {
         const trimmed = mem.trimEnd(u8, cfg.path, "/");
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
         const target_abs = Fs.cwd().realpath(trimmed, &rbuf) catch return;
@@ -5584,7 +5587,7 @@ const ImportGraph = struct {
                 if (!self.reachable.contains(resolved))
                     self.markReachableRecursive(resolved) catch return;
             } else |_| {}
-            self.markAllZigFilesReachable(subdir) catch return;
+            self.markAllZigFilesReachable(subdir);
         } else |_| {}
     }
 
@@ -5603,7 +5606,7 @@ const ImportGraph = struct {
             defer self.allocator.free(subdir);
             self.handleNestedSubdir(subdir);
             if (isBuildManagedDir(entry.name))
-                self.markAllZigFilesReachable(subdir) catch continue;
+                self.markAllZigFilesReachable(subdir);
             self.scanForNestedBuildZig(subdir) catch continue;
         }
     }
@@ -5624,7 +5627,7 @@ const ImportGraph = struct {
             }
         }
         for (to_scan.items) |path| {
-            self.scanFileBuildPathRefs(path, subdir) catch continue;
+            self.scanFileBuildPathRefs(path, subdir);
         }
     }
 
@@ -5654,7 +5657,7 @@ const ImportGraph = struct {
         self: *ImportGraph,
         file_path: []const u8,
         base_dir: []const u8,
-    ) !void {
+    ) void {
         const content = Fs.cwd().readFileAlloc(
             self.allocator,
             file_path,
@@ -5690,7 +5693,7 @@ const ImportGraph = struct {
 
     /// Mark all .zig files under a directory as reachable (for nested build.zig sub-projects
     /// where we can't statically resolve b.path(variable) calls)
-    fn markAllZigFilesReachable(self: *ImportGraph, dir_path: []const u8) !void {
+    fn markAllZigFilesReachable(self: *ImportGraph, dir_path: []const u8) void {
         self.markZigFilesRecursive(dir_path) catch return;
     }
 
@@ -8343,6 +8346,354 @@ fn reportUnfilledField(
     });
 }
 
+// ============================================================================
+// ZA210: no-catch-return — `catch |e| return e` is a verbose `try`
+// ============================================================================
+// Single-line, same-payload form only. The multi-line block form
+// (`catch |e| { log(e); return e; }`) does real work between catch and
+// return and is deliberately out of scope (v1, documented).
+
+/// Index of the first `catch |` outside a string literal, or null.
+fn findCatchPayloadStart(t: []const u8) ?usize {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "catch |")) |pos| {
+        if (!isInsideString(t, pos)) return pos;
+        from = pos + 1;
+    }
+    return null;
+}
+
+/// Skip spaces/tabs from `i`, returning the next non-blank index.
+fn skipBlanks(t: []const u8, i: usize) usize {
+    var j = i;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    return j;
+}
+
+/// ZA210: flag `expr catch |e| return e;` — identical payload both sides.
+fn checkNoCatchReturn(t: []const u8, path: []const u8, ln: usize) ?Issue {
+    const catch_pos = findCatchPayloadStart(t) orelse return null;
+    var i = catch_pos + "catch |".len;
+    const pstart = i;
+    while (i < t.len and isIdent(t[i])) i += 1;
+    if (i == pstart) return null;
+    const payload = t[pstart..i];
+    i = skipBlanks(t, i);
+    if (i >= t.len or t[i] != '|') return null;
+    i = skipBlanks(t, i + 1);
+    if (!mem.startsWith(u8, t[i..], "return ")) return null;
+    i += "return ".len;
+    const rstart = i;
+    while (i < t.len and isIdent(t[i])) i += 1;
+    if (i == rstart) return null;
+    if (!mem.eql(u8, t[rstart..i], payload)) return null;
+    i = skipBlanks(t, i);
+    if (i < t.len and t[i] != ';') return null;
+    return .{
+        .file = path,
+        .line = ln,
+        .col = catch_pos + 1,
+        .severity = .note,
+        .rule = RULE_NO_CATCH_RETURN,
+        .message = "catch |e| return e is a verbose try",
+        .help = "use 'try' instead of catch |e| return e",
+    };
+}
+
+// ============================================================================
+// ZA209: useless-error-return — !T fn that never fails
+// ============================================================================
+// An error-union return type is a promise the body must keep. When a fn
+// contains no `try`, no `return error.*`, no propagated catch payload, and
+// no returned call result, the '!' lies to every caller (they write
+// try/catch for an impossible error) — and the compiler cannot see it.
+// Evidence is deliberately over-counted (note severity, FP-safe direction):
+// `unreachable` bodies (assertion-style), any `return f(...)` whose callee
+// is unresolved, returns of call-derived locals, and interface/vtable fns
+// (accepted FN — their bodies stay small to satisfy the fn-pointer type,
+// documented). Nested fns roll up into the outer fn (same precedent as
+// ZT101): their evidence silences the outer fn, never the reverse.
+
+const max_err_ret_payloads = 4;
+const max_err_ret_call_idents = 4;
+
+/// Per-fn scan state for ZA209 (bounded ident sets, no allocation).
+const ErrRetFnScan = struct {
+    in_fn: bool = false,
+    fn_line: usize = 0,
+    fn_name: []const u8 = "",
+    brace_depth: usize = 0,
+    /// The fn finishes only after its body brace opened — a multi-line
+    /// signature sits at depth 0 for lines before the `{`.
+    body_started: bool = false,
+    has_error_path: bool = false,
+    payload_count: usize = 0,
+    payloads: [max_err_ret_payloads][]const u8 = undefined,
+    call_ident_count: usize = 0,
+    call_idents: [max_err_ret_call_idents][]const u8 = undefined,
+};
+
+/// Word-boundary, string-literal-aware substring search. The after-boundary
+/// is only enforced when the word ends in an identifier char (so "try "
+/// still matches before an operand).
+fn hasWordOutsideString(t: []const u8, word: []const u8) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, word)) |pos| {
+        const before_ok = pos == 0 or !isIdent(t[pos - 1]);
+        const after_pos = pos + word.len;
+        const after_ok = after_pos >= t.len or
+            !isIdent(word[word.len - 1]) or !isIdent(t[after_pos]);
+        if (before_ok and after_ok and !isInsideString(t, pos)) return true;
+        from = pos + 1;
+    }
+    return false;
+}
+
+/// First `catch |payload|` identifier outside a string literal, or null.
+fn extractCatchPayloadIdent(t: []const u8) ?[]const u8 {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "catch |")) |pos| {
+        if (isInsideString(t, pos)) {
+            from = pos + 1;
+            continue;
+        }
+        var i = pos + "catch |".len;
+        const start = i;
+        while (i < t.len and isIdent(t[i])) i += 1;
+        if (i > start) return t[start..i];
+        return null;
+    }
+    return null;
+}
+
+/// Word-boundary search for `return <ident>` anywhere on the line —
+/// catches mid-line forms (`{ return err; }`, `catch |e| return e;`) that
+/// a statement-start check misses.
+fn hasReturnOfIdent(t: []const u8, ident: []const u8) bool {
+    var needle_buf: [80]u8 = undefined;
+    if (ident.len + 8 > needle_buf.len) return true; // fail safe toward silence
+    const needle = std.fmt.bufPrint(&needle_buf, "return {s}", .{ident}) catch return true;
+    return hasWordOutsideString(t, needle);
+}
+
+/// Any `return <expr with '('>;` — a returned call result may carry an
+/// error union ephor cannot resolve (cross-module), so it counts as an
+/// error path (FP-safe over-suppression for a note rule).
+fn hasReturnCallEvidence(t: []const u8) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "return ")) |pos| {
+        const before_ok = pos == 0 or !isIdent(t[pos - 1]);
+        if (before_ok and !isInsideString(t, pos)) {
+            const rest = t[pos + "return ".len ..];
+            const semi = mem.indexOfScalar(u8, rest, ';') orelse rest.len;
+            if (mem.indexOfScalar(u8, rest[0..semi], '(') != null) return true;
+        }
+        from = pos + 1;
+    }
+    return false;
+}
+
+/// True when the text after a `return ` starts with `Uppercase.member`.
+fn returnExprIsNamespaced(rest: []const u8) bool {
+    if (rest.len == 0 or !std.ascii.isUpper(rest[0])) return false;
+    var i: usize = 0;
+    while (i < rest.len and isIdent(rest[i])) i += 1;
+    return i + 1 < rest.len and rest[i] == '.' and isIdent(rest[i + 1]);
+}
+
+/// `return Namespace.member;` — a type-namespaced constant may be an error
+/// value (ghostty's `pub const help_error = error.ActionHelpRequested;`
+/// idiom, returned as `return Action.help_error;`) that text analysis
+/// cannot resolve, so it counts as an error path (FP-safe). Lowercase-head
+/// qualified returns (`self.x`) stay non-evidence.
+fn hasNamespacedReturnEvidence(t: []const u8) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "return ")) |pos| {
+        const before_ok = pos == 0 or !isIdent(t[pos - 1]);
+        if (before_ok and !isInsideString(t, pos) and
+            returnExprIsNamespaced(t[pos + "return ".len ..])) return true;
+        from = pos + 1;
+    }
+    return false;
+}
+
+/// Record `const/var x = <call or error literal>` idents: a later bare
+/// `return x;` may propagate the call's error union or the literal itself.
+fn recordCallDerivedIdent(t: []const u8, scan: *ErrRetFnScan) void {
+    const is_decl = mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ");
+    if (!is_decl or mem.indexOf(u8, t, " = ") == null) return;
+    const fallible_rhs = mem.indexOfScalar(u8, t, '(') != null or
+        mem.indexOf(u8, t, "error.") != null or mem.indexOf(u8, t, "error{") != null;
+    if (!fallible_rhs) return;
+    const name = extractVarDeclName(t) orelse return;
+    if (scan.call_ident_count < max_err_ret_call_idents) {
+        scan.call_idents[scan.call_ident_count] = name;
+        scan.call_ident_count += 1;
+    } else {
+        // Bounded set full — fail safe toward silence (note rule).
+        scan.has_error_path = true;
+    }
+}
+
+/// Record one error-typed param ident (walked back from a type marker).
+fn recordOneErrorParam(sig: []const u8, pos: usize, scan: *ErrRetFnScan) void {
+    var start = pos;
+    while (start > 0 and isIdent(sig[start - 1])) start -= 1;
+    if (start == pos) return;
+    if (scan.call_ident_count >= max_err_ret_call_idents) {
+        // Bounded set full — fail safe toward silence (note rule).
+        scan.has_error_path = true;
+        return;
+    }
+    scan.call_idents[scan.call_ident_count] = sig[start..pos];
+    scan.call_ident_count += 1;
+}
+
+/// Record error-TYPED fn params (`err: anyerror`, `e: error{X}`) from a
+/// signature line: a bare `return err;` of one is an error path even
+/// though the ident is neither a catch payload nor call-derived.
+fn recordErrorTypedParams(sig: []const u8, scan: *ErrRetFnScan) void {
+    const markers = [_][]const u8{ ": anyerror", ": error{", ": error." };
+    for (markers) |marker| {
+        var from: usize = 0;
+        while (mem.indexOfPos(u8, sig, from, marker)) |pos| {
+            from = pos + marker.len;
+            recordOneErrorParam(sig, pos, scan);
+        }
+    }
+}
+
+/// Record a catch payload and detect the same-line `catch |e| return e`
+/// propagation form (both prove the fn can fail).
+fn recordCatchEvidence(t: []const u8, scan: *ErrRetFnScan) void {
+    const payload = extractCatchPayloadIdent(t) orelse return;
+    if (scan.payload_count < max_err_ret_payloads) {
+        scan.payloads[scan.payload_count] = payload;
+        scan.payload_count += 1;
+    } else {
+        // Bounded set full — fail safe toward silence (note rule).
+        scan.has_error_path = true;
+    }
+    if (hasReturnOfIdent(t, payload)) scan.has_error_path = true;
+}
+
+/// A bare `return ident;` of a catch payload, error-typed param, or
+/// call/error-literal-derived local is a propagated error path.
+fn recordBareReturnEvidence(t: []const u8, scan: *ErrRetFnScan) void {
+    for (scan.payloads[0..scan.payload_count]) |ident| {
+        if (hasReturnOfIdent(t, ident)) {
+            scan.has_error_path = true;
+            return;
+        }
+    }
+    for (scan.call_idents[0..scan.call_ident_count]) |ident| {
+        if (hasReturnOfIdent(t, ident)) {
+            scan.has_error_path = true;
+            return;
+        }
+    }
+}
+
+/// Accumulate one body line's error-path evidence into the fn scan.
+fn scanErrRetEvidence(t: []const u8, scan: *ErrRetFnScan) void {
+    if (scan.has_error_path) return;
+    if (hasWordOutsideString(t, "try ") or
+        hasWordOutsideString(t, "return error") or
+        hasWordOutsideString(t, "unreachable") or
+        hasReturnCallEvidence(t) or
+        hasNamespacedReturnEvidence(t))
+    {
+        scan.has_error_path = true;
+        return;
+    }
+    recordCatchEvidence(t, scan);
+    recordBareReturnEvidence(t, scan);
+    recordCallDerivedIdent(t, scan);
+}
+
+/// Begin tracking a fn whose declared return type is an error union.
+/// Uses the isNewFunctionDef line-start guard so fn-pointer fields and
+/// params (`cb: *const fn () !void`) never start a phantom scan.
+fn startErrRetFn(lines: []const []const u8, line_num: usize, scan: *ErrRetFnScan) void {
+    const t = mem.trim(u8, lines[0], " \t\r");
+    if (!isNewFunctionDef(t)) return;
+    if (mem.indexOfScalar(u8, t, '(') == null) return;
+    var sig_buf: [max_sig_bytes]u8 = undefined;
+    const sig = joinFnSignature(lines, &sig_buf) orelse return;
+    const ret = extractFnReturnType(sig) orelse return;
+    if (classifyReturnType(ret) != .error_union) return;
+    scan.in_fn = true;
+    scan.fn_line = line_num;
+    // Name from the original line (content-backed) — the joined signature
+    // is a stack buffer that dies when this function returns.
+    scan.fn_name = extractFnName(t) orelse "";
+    scan.brace_depth = 0;
+    scan.body_started = false;
+    scan.has_error_path = false;
+    scan.payload_count = 0;
+    scan.call_ident_count = 0;
+}
+
+/// Emit ZA209 when the finished fn never exhibited an error path.
+fn finishErrRetFn(
+    a: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    path: []const u8,
+    scan: *ErrRetFnScan,
+) !void {
+    defer scan.in_fn = false;
+    if (scan.has_error_path) return;
+    const msg = try std.fmt.allocPrint(
+        a,
+        "error union return type '!' but '{s}' never fails",
+        .{scan.fn_name},
+    );
+    try issues.append(a, .{
+        .file = path,
+        .line = scan.fn_line,
+        .col = 1,
+        .severity = .note,
+        .rule = RULE_USELESS_ERROR_RETURN,
+        .message = msg,
+        .message_owned = true,
+        .help = "drop the '!' so callers stop writing try/catch " ++
+            "for an impossible error",
+    });
+}
+
+/// Walk a file's lines and flag error-union fns with no error path.
+fn checkUselessErrorReturns(
+    a: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    path: []const u8,
+    all_lines: []const []const u8,
+) !void {
+    var scan = ErrRetFnScan{};
+    var blank_buf: [512]u8 = undefined;
+    for (all_lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!scan.in_fn) {
+            startErrRetFn(all_lines[idx..], idx + 1, &scan);
+            if (!scan.in_fn) continue;
+        }
+        // Signature lines (before the body brace) may declare error-typed
+        // params on their own continuation lines — record them from the
+        // content-backed line, never from the joined stack buffer.
+        if (!scan.body_started) recordErrorTypedParams(t, &scan);
+        scanErrRetEvidence(t, &scan);
+        // Braces count only real code: trailing comments stripped, string
+        // and char literal contents blanked (a `"}"` must not close the fn).
+        const code_end = findCommentStart(line) orelse line.len;
+        const blanked = blankLiteralContents(line[0..code_end], &blank_buf);
+        if (mem.indexOfScalar(u8, blanked, '{') != null) scan.body_started = true;
+        scan.brace_depth = braceDelta(scan.brace_depth, blanked);
+        if (scan.body_started and scan.brace_depth == 0) {
+            try finishErrRetFn(a, issues, path, &scan);
+        }
+    }
+}
+
 /// Check all error patterns on a single line
 fn checkLineErrors(
     t: []const u8,
@@ -8400,6 +8751,10 @@ fn checkLineErrors(
         if (checkPanic(t, path, ln)) |i| {
             try issues.append(allocator, i);
         }
+    }
+    // ZA210: catch |e| return e (note, off by default — print-time filtered)
+    if (checkNoCatchReturn(t, path, ln)) |i| {
+        try issues.append(allocator, i);
     }
 }
 
@@ -8557,6 +8912,8 @@ fn analyzeFileErrors(
             try issues.append(allocator, issue);
         }
     }
+    // ZA209: error-union fns with no error path (whole-body scan, own walk)
+    try checkUselessErrorReturns(allocator, issues, a.path, all_lines);
     try reportEndOfFileIssues(&state, a.path, issues, allocator);
 }
 
@@ -13412,6 +13769,259 @@ fn runCFGMemoryAnalyses(
         try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err, no_free_fields);
     defer r3.deinit(a);
     try out.appendSlice(a, r3.items);
+    try checkMustReturnRef(.{ .a = a, .out = out, .fl = fl, .fstart = fstart, .fp = fp });
+}
+
+// ============================================================================
+// ZA110: must-return-ref — managed container local returned by value while a
+// deferred deinit is still armed
+// ============================================================================
+// Zig has no move semantics: `return list;` copies the container header into
+// the result slot, so the returned value and the local share one backing
+// allocation. The PLAIN idiom (`var list = ...; return list;`) is safe —
+// the local is dead after the copy and the caller holds the only owner; it
+// is the stdlib/community ownership-transfer pattern, so firing on it is a
+// false positive (39/39 hits on ephor itself were exactly this idiom).
+// The defect is the armed defer: `defer list.deinit()` runs at scope close,
+// AFTER the copy — the returned value's backing is freed before the caller
+// can use it (certain use-after-free; a double-free once the caller deinits).
+// errdefer does NOT fire on the success path, so it is correctly silent.
+// Accepted FNs (v1): labeled-block returns (`break :blk list`), and
+// `return self.field` dual-owner forms (the `take()` idiom needs a visible
+// field reset to adjudicate — v2).
+
+const max_sig_join_lines = 16;
+const max_sig_bytes = 1024;
+const max_tracked_locals = 64;
+const max_defer_paths = 8;
+
+/// Join a (possibly multi-line) fn signature from fl[0] until the body `{`.
+/// Returns null for bodiless declarations (`fn f() void;`) and over-long
+/// signatures — both have no body to analyze.
+fn joinFnSignature(fl: []const []const u8, buf: []u8) ?[]const u8 {
+    var len: usize = 0;
+    var idx: usize = 0;
+    while (idx < fl.len and idx < max_sig_join_lines) : (idx += 1) {
+        const t = mem.trim(u8, fl[idx], " \t\r");
+        if (len + 1 + t.len > buf.len) return null;
+        if (len > 0) {
+            buf[len] = ' ';
+            len += 1;
+        }
+        @memcpy(buf[len..][0..t.len], t);
+        len += t.len;
+        if (mem.indexOfScalar(u8, t, '{') != null) return buf[0..len];
+        if (mem.indexOfScalar(u8, t, ';') != null) return null;
+    }
+    return null;
+}
+
+/// Word-boundary substring match: `std.ArrayList(` matches `ArrayList(`,
+/// `MyBufMap` does not match `BufMap`.
+fn containsTypePattern(haystack: []const u8, pat: []const u8) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, haystack, from, pat)) |pos| {
+        if (pos == 0 or !isIdent(haystack[pos - 1])) return true;
+        from = pos + 1;
+    }
+    return false;
+}
+
+/// The managed-container payload of a return type, or null when the return
+/// cannot alias a backing allocation: pointer (`*T`, `?*T`) and slice (`[]T`)
+/// returns copy no header, and non-managed types own no heap backing.
+fn managedContainerPayload(ret: []const u8) ?[]const u8 {
+    var payload = mem.trim(u8, ret, " \t\r");
+    // Error union: the single '!' separates error set from payload type.
+    if (mem.indexOfScalar(u8, payload, '!')) |bang| {
+        payload = mem.trim(u8, payload[bang + 1 ..], " \t\r");
+    }
+    if (payload.len == 0) return null;
+    if (payload[0] == '*' or payload[0] == '[') return null;
+    if (payload[0] == '?') {
+        if (payload.len > 1 and payload[1] == '*') return null;
+        payload = mem.trim(u8, payload[1..], " \t\r");
+    }
+    for (compat.getManagedContainerTypePatterns()) |pat| {
+        if (containsTypePattern(payload, pat)) return payload;
+    }
+    return null;
+}
+
+/// The path of a bare `return ident;` / `return ident.field;`, or null for
+/// any compound expression (call, init, literal, block).
+fn returnedLocalPath(t: []const u8) ?[]const u8 {
+    if (!mem.startsWith(u8, t, "return ")) return null;
+    var expr = mem.trim(u8, t["return ".len..], " \t\r");
+    if (expr.len == 0 or expr[0] == '.') return null;
+    var stop: usize = 0;
+    while (stop < expr.len and expr[stop] != ';' and
+        expr[stop] != ' ' and expr[stop] != '\t') : (stop += 1)
+    {}
+    expr = expr[0..stop];
+    if (mem.indexOfAny(u8, expr, "({") != null) return null;
+    var end: usize = 0;
+    while (end < expr.len and isIdent(expr[end])) end += 1;
+    if (end == 0) return null;
+    if (end == expr.len) return expr[0..end];
+    if (expr[end] == '.' and end + 1 < expr.len and isIdent(expr[end + 1])) {
+        var fend = end + 1;
+        while (fend < expr.len and isIdent(expr[fend])) fend += 1;
+        return expr[0..fend];
+    }
+    return null;
+}
+
+/// Bundled context for ZA110 (keeps param count ≤4).
+const MustReturnRefCtx = struct {
+    a: Allocator,
+    out: *std.ArrayListUnmanaged(Issue),
+    fl: []const []const u8,
+    fstart: usize,
+    fp: []const u8,
+};
+
+/// Record `var/const x` declarations (bounded; overflow only narrows the
+/// defer-armed set — never a false positive).
+fn trackLocalDecl(
+    t: []const u8,
+    locals: *[max_tracked_locals][]const u8,
+    count: *usize,
+) void {
+    if (count.* >= max_tracked_locals) return;
+    if (!mem.startsWith(u8, t, "var ") and !mem.startsWith(u8, t, "const ")) return;
+    const name = extractVarDeclName(t) orelse return;
+    locals[count.*] = name;
+    count.* += 1;
+}
+
+/// Receiver path (`ident` or `ident.field`) of a deferred `.deinit(` call,
+/// or null. errdefer is excluded: it runs only on the error path, never
+/// behind a successful value return. fn-wide collection deliberately
+/// over-approximates "armed": a defer on a path mutually exclusive with
+/// the return still fires — dual-lifetime code is suspicious either way.
+/// True when `t` contains a real `defer ` keyword. A match immediately
+/// preceded by `err` at a word boundary is `errdefer` — which never runs
+/// on the success path and must not arm ("errdefer " contains "defer "
+/// at offset 3, so a plain substring search misclassifies it).
+fn hasRealDeferKeyword(t: []const u8) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "defer ")) |pos| {
+        const is_errdefer = pos >= 3 and
+            mem.eql(u8, t[pos - 3 .. pos], "err") and
+            (pos == 3 or !isIdent(t[pos - 4]));
+        if (!is_errdefer) return true;
+        from = pos + 1;
+    }
+    return false;
+}
+
+fn deferDeinitPath(t: []const u8) ?[]const u8 {
+    if (!hasRealDeferKeyword(t)) return null;
+    const call = mem.indexOf(u8, t, ".deinit(") orelse return null;
+    if (isInsideString(t, call)) return null;
+    var start = call;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) start -= 1;
+    if (start == call) return null;
+    const path = t[start..call];
+    if (path[0] == '.' or path[path.len - 1] == '.') return null;
+    if (mem.indexOf(u8, path, "..") != null) return null;
+    return path;
+}
+
+/// True when some armed defer-deinit path matches the returned path: an
+/// exact path match, or a whole-owner return (`return w;`) while one of
+/// its fields (`w.list`) is armed — both copies alias the freed backing.
+fn deferPathArmsReturn(
+    paths: []const []const u8,
+    ret_path: []const u8,
+    head: []const u8,
+) bool {
+    for (paths) |p| {
+        if (mem.eql(u8, p, ret_path)) return true;
+        const whole_owner = mem.eql(u8, ret_path, head) and
+            mem.startsWith(u8, p, head) and p.len > head.len and p[head.len] == '.';
+        if (whole_owner) return true;
+    }
+    return false;
+}
+
+/// Emit the ZA110 warning for one defer-armed by-value return.
+fn emitMustReturnRef(
+    ctx: MustReturnRefCtx,
+    line: []const u8,
+    idx: usize,
+    ident: []const u8,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        ctx.a,
+        "returned local '{s}' is deinited by an armed defer — " ++
+            "the returned copy's backing is freed at scope exit",
+        .{ident},
+    );
+    try ctx.out.append(ctx.a, .{
+        .file = ctx.fp,
+        .line = ctx.fstart + idx,
+        .col = skipLeadingWhitespace(line) + 1,
+        .severity = .warning,
+        .rule = RULE_MUST_RETURN_REF,
+        .message = msg,
+        .message_owned = true,
+        .help = "remove the defer (ownership transfers to the caller) " ++
+            "or return a pointer/slice",
+    });
+}
+
+/// Bounded fn-scan sets for ZA110 (locals + armed defer paths).
+const MustReturnRefScan = struct {
+    locals: [max_tracked_locals][]const u8 = undefined,
+    local_count: usize = 0,
+    defer_paths: [max_defer_paths][]const u8 = undefined,
+    defer_count: usize = 0,
+};
+
+/// First pass: collect local declarations and armed defer-deinit paths.
+fn collectLocalsAndDefers(fl: []const []const u8, scan: *MustReturnRefScan) void {
+    for (fl) |line| {
+        // Analyze code only: trailing-comment text must never arm a defer
+        // (`x(); // was: defer list.deinit();`) or declare a local — the
+        // same findCommentStart discipline as ZA209's brace tracking.
+        const code_end = findCommentStart(line) orelse line.len;
+        const t = mem.trim(u8, line[0..code_end], " \t\r");
+        if (t.len == 0 or isCommentOrMultilineString(t)) continue;
+        trackLocalDecl(t, &scan.locals, &scan.local_count);
+        if (scan.defer_count >= max_defer_paths) continue;
+        if (deferDeinitPath(t)) |p| {
+            scan.defer_paths[scan.defer_count] = p;
+            scan.defer_count += 1;
+        }
+    }
+}
+
+/// ZA110: flag managed-container fns returning a local whose deinit is
+/// still armed by a defer when the by-value copy leaves.
+fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
+    if (ctx.fl.len == 0) return;
+    var sig_buf: [max_sig_bytes]u8 = undefined;
+    const sig = joinFnSignature(ctx.fl, &sig_buf) orelse return;
+    const ret = extractFnReturnType(sig) orelse return;
+    // The managed-container return type is the gate; the payload text is
+    // not needed beyond it (the message names the local, not the type).
+    if (managedContainerPayload(ret) == null) return;
+
+    var scan = MustReturnRefScan{};
+    collectLocalsAndDefers(ctx.fl, &scan);
+    if (scan.defer_count == 0) return;
+
+    for (ctx.fl, 0..) |line, i| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const path = returnedLocalPath(t) orelse continue;
+        const head = mem.sliceTo(path, '.');
+        if (!containsName(scan.locals[0..scan.local_count], head)) continue;
+        if (!deferPathArmsReturn(scan.defer_paths[0..scan.defer_count], path, head)) continue;
+        try emitMustReturnRef(ctx, line, i, path);
+    }
 }
 
 /// Run safety and error CFG analyses
@@ -17110,6 +17720,7 @@ const Config = struct {
         }
         if (mem.eql(u8, rule, RULE_IGNORED_ERROR)) return true;
         if (mem.eql(u8, rule, RULE_UNDEFINED_USAGE)) return true;
+        if (mem.eql(u8, rule, RULE_NO_CATCH_RETURN)) return true;
         return false;
     }
 
@@ -17133,7 +17744,7 @@ const Config = struct {
 
 const CONFIG_FILENAME = "ephor.json";
 
-fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
+fn loadConfigFile(allocator: Allocator, cfg: *Config) void {
     // Try to load ephor.json config file from current directory
     const content = Fs.cwd().readFileAlloc(allocator, CONFIG_FILENAME, 64 * 1024) catch return;
     defer allocator.free(content);
@@ -17425,11 +18036,14 @@ fn writeDefaultConfig() !void {
         \\  // Available rules:
         \\  //   ZA1xx Memory:     ZA101 alloc-no-defer, ZA102 create-no-defer,
         \\  //                     ZA103 alloc-no-errdefer,
-        \\  //                     ZA105 use-after-free, ZA106 double-free
+        \\  //                     ZA105 use-after-free, ZA106 double-free,
+        \\  //                     ZA110 must-return-ref
         \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (warning), ZA202 catch-unreachable (warning),
         \\  //                     ZA203 orelse-unreachable (warning), ZA204 undefined (warning),
         \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer,
-        \\  //                     ZA207 catch-undefined, ZA208 panic (note)
+        \\  //                     ZA207 catch-undefined, ZA208 panic (note),
+        \\  //                     ZA209 useless-error-return (note),
+        \\  //                     ZA210 no-catch-return (note, OFF by default)
         \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
         \\  //                     ZA303 too-many-params, ZA304 too-many-branches,
         \\  //                     ZA305 cyclomatic (OFF by default), ZA306 cognitive (OFF by default)
@@ -18961,7 +19575,7 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
         .runtime_command = null,
         .install_version = null,
     };
-    try loadConfigFile(allocator, &cfg);
+    loadConfigFile(allocator, &cfg);
     var cli_entries = false;
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
@@ -19100,11 +19714,14 @@ fn printHelp() void {
         \\RULE IDS:
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
         \\                     ZA103: alloc-no-errdefer,
-        \\                     ZA105: use-after-free, ZA106: double-free)
+        \\                     ZA105: use-after-free, ZA106: double-free,
+        \\                     ZA110: must-return-ref)
         \\  ZA2xx  ErrHandle  (ZA201: silent-catch, ZA202: catch-unreachable,
         \\                     ZA203: orelse-unreachable, ZA204: undefined,
         \\                     ZA205: ignored-error, ZA206: exit-bypasses-defer,
-        \\                     ZA207: catch-undefined, ZA208: panic)
+        \\                     ZA207: catch-undefined, ZA208: panic,
+        \\                     ZA209: useless-error-return (note),
+        \\                     ZA210: no-catch-return (note, off by default))
         \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap, ZA802: unsafe-deref)
         \\  ZA9xx  Panic      (ZA901: decrement-no-guard, ZA902: subtraction-overflow,
         \\                     ZA903: index-arithmetic)
@@ -31225,4 +31842,688 @@ test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+// ============================================================================
+// ZA110 Tests — must-return-ref (managed container returned by value)
+// ============================================================================
+
+/// Test helper: build a one-file graph and run the errors pipeline.
+fn runErrorsCheck(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !CFGTestRun {
+    var graph = ImportGraph.init(allocator);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var issues = try analyzeErrors(allocator, &graph);
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
+test "ZA110: plain ownership-transfer idiom is silent (established pattern)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `var list = ...; return list;` with no armed defer: the local is dead
+    // after the copy and the caller holds the only owner. Firing here is a
+    // false positive (39/39 hits on ephor itself were this idiom).
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_basic.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_basic.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: error-union form with armed defer fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) !std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    try list.append('x');
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_errunion.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_errunion.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: errdefer deinit is silent (never runs on success path)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) !std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    errdefer list.deinit();
+        \\    try list.append('x');
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_errdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_errdefer.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: conditional defer deinit still fires (armed on some path)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator, shrink: bool) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer if (shrink) list.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_conddefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_conddefer.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: trailing-comment defer text is not an armed defer (F1)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `defer list.deinit();` lives inside a trailing `//` comment —
+    // comment text must never arm a defer (phantom FP on safe code).
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    list.clearRetainingCapacity(); // was: defer list.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_commentdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_commentdefer.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: same-line errdefer is not an armed defer (F2)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `errdefer` contains "defer " at offset 3 — a mid-line errdefer must
+    // not be misread as an armed defer (errdefer never runs on success).
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) !std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a); errdefer list.deinit();
+        \\    try list.append('x');
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_samelineerrdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_samelineerrdefer.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: deferred deinit makes the by-value return a certain dangle" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_dangle.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_dangle.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: moveToOwnedSlice return is silent (slice, single owner)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn makeSlice(a: std.mem.Allocator) ![]u8 {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    return list.moveToOwnedSlice();
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_slice.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_slice.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: empty-init expression return is silent (no aliasing)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    return .init(a);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_initexpr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_initexpr.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: pointer return type is silent (not a by-value copy)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn listPtr(list: *std.ArrayList(u8)) *std.ArrayList(u8) {
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_ptr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_ptr.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: field of a local with armed defer fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\const Wrapper = struct { list: std.ArrayList(u8) };
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var w: Wrapper = .{ .list = std.ArrayList(u8).init(a) };
+        \\    defer w.list.deinit();
+        \\    return w.list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_field.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_field.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: self field return is silent (receiver owned by caller)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    list: std.ArrayList(u8),
+        \\    fn take(self: *Store) std.ArrayList(u8) {
+        \\        return self.list;
+        \\    }
+        \\};
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_selffield.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_selffield.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: inline-storage container (EnumSet) by value is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EnumSet is inline storage — copying does NOT alias a heap backing,
+    // so stdlib_container_init_patterns membership must not imply ZA110.
+    const content =
+        \\const std = @import("std");
+        \\const Op = enum { add, sub };
+        \\fn makeSet() std.EnumSet(Op) {
+        \\    var s = std.EnumSet(Op).initEmpty();
+        \\    return s;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_enumset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_enumset.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: multi-line signature with armed defer fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(
+        \\    a: std.mem.Allocator,
+        \\) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "za110_multiline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_multiline.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+// ============================================================================
+// ZA209 Tests — useless-error-return (!T fn that never fails)
+// ============================================================================
+
+test "ZA209: error-union fn that never fails fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    work();
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_basic.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_basic.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: single-line body fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn work() void {}
+        \\fn f() !void { work(); }
+    ;
+    var run = try runErrorsCheck(allocator, "za209_oneline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_oneline.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: body with try is silent (real error path)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn mayFail() !void {
+        \\    return error.Boom;
+        \\}
+        \\fn f() !void {
+        \\    try mayFail();
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_try.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_try.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: body with return error is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn f() !void {
+        \\    return error.Bogus;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_retErr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_retErr.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: non-error-union fn is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn work() void {}
+        \\fn f() void {
+        \\    work();
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_plain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_plain.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: catch-payload return propagation is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn mayFail() !void {
+        \\    return error.Boom;
+        \\}
+        \\fn f() !void {
+        \\    mayFail() catch |err| return err;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_catchret.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_catchret.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: multi-line catch block with payload return is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn mayFail() !void {
+        \\    return error.Boom;
+        \\}
+        \\fn log(e: anyerror) void { _ = e; }
+        \\fn f() !void {
+        \\    mayFail() catch |err| {
+        \\        log(err);
+        \\        return err;
+        \\    };
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_catchblock.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_catchblock.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: unreachable body is silent (assertion-style fn)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn f() !void {
+        \\    unreachable;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_unreach.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_unreach.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: unresolved call result return is silent (possible propagation)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `return g();` with g from another module: over-suppressed (note rule,
+    // FP-safe direction) — the call may carry an error union ephor cannot see.
+    const content =
+        \\fn g() !void {
+        \\    return error.Boom;
+        \\}
+        \\fn f() !void {
+        \\    return g();
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_tailcall.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_tailcall.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: multi-line signature with error-union return fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn work() void {}
+        \\fn f(
+        \\    x: u32,
+        \\) !void {
+        \\    _ = x;
+        \\    work();
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_multiline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_multiline.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: error-set member return is silent (return ErrSet.Member idiom)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Corpus FP (abi connector.zig): `return ConnectorError.Timeout;` is a
+    // real error path — the type-namespaced member is an error value.
+    const content =
+        \\const ConnectorError = error{ AuthenticationError, Timeout };
+        \\fn validate(c: u8) ConnectorError!void {
+        \\    if (c == 0) return ConnectorError.Timeout;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_errset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_errset.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: namespaced error constant return is silent (ghostty idiom)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Corpus FP (ghostty cli): `pub const help_error = error.X;` inside an
+    // enum namespace, returned as `return Action.help_error;`.
+    const content =
+        \\const Action = enum {
+        \\    version,
+        \\    pub const help_error = error.ActionHelpRequested;
+        \\};
+        \\fn help() !void {
+        \\    return Action.help_error;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_nsconst.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_nsconst.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+// ============================================================================
+// ZA210 Tests — no-catch-return (catch |e| return e is a verbose try)
+// ============================================================================
+
+test "ZA210: catch |err| return err fires when enabled" {
+    const issue = checkNoCatchReturn("foo() catch |err| return err;", "t.zig", 1);
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_NO_CATCH_RETURN, issue.?.rule);
+    try std.testing.expect(issue.?.severity == .note);
+}
+
+test "ZA210: catch |err| return different is silent" {
+    const issue = checkNoCatchReturn("foo() catch |err| return other;", "t.zig", 1);
+    try std.testing.expect(issue == null);
+}
+
+test "ZA210: multi-line catch block form is silent (v1 scope)" {
+    const issue = checkNoCatchReturn("foo() catch |err| { log(err); return err; }", "t.zig", 1);
+    try std.testing.expect(issue == null);
+}
+
+test "ZA210: try form produces no issue" {
+    const issue = checkNoCatchReturn("try foo();", "t.zig", 1);
+    try std.testing.expect(issue == null);
+}
+
+test "ZA210: integration through analyzeErrors emits the note" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn mayFail() !void {}
+        \\fn f() !void {
+        \\    mayFail() catch |err| return err;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za210_integ.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za210_integ.zig", RULE_NO_CATCH_RETURN),
+    );
+}
+
+test "ZA210: off by default; explicit enable turns it on" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = Config{
+        .command = .check,
+        .path = "src",
+        .path_owned = false,
+        .entries = .empty,
+        .exclude = .empty,
+        .orphan_exclude = .empty,
+        .disabled_rules = .empty,
+        .enabled_rules = .empty,
+        .verbose = false,
+        .show_summary = false,
+        .format = .text,
+        .thresholds = .{},
+        .init_build = false,
+        .export_path = null,
+        .known_issues_path = null,
+        .known_issues = .empty,
+        .auto_approve = false,
+        .runtime_command = null,
+        .install_version = null,
+    };
+    defer cfg.deinit(allocator);
+
+    // Default config: ZA210 silent; the new ON-by-default rules are not.
+    try std.testing.expect(cfg.isRuleDisabled(RULE_NO_CATCH_RETURN));
+    try std.testing.expect(cfg.isRuleEnabled(RULE_MUST_RETURN_REF));
+    try std.testing.expect(cfg.isRuleEnabled(RULE_USELESS_ERROR_RETURN));
+
+    try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_NO_CATCH_RETURN));
+    try std.testing.expect(cfg.isRuleEnabled(RULE_NO_CATCH_RETURN));
 }

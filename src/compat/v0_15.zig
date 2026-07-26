@@ -1015,6 +1015,35 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
     "BufferedWriter(",
 };
 
+/// Managed-container type families: structs that own a heap backing store
+/// (ptr + capacity + allocator fields), so a BY-VALUE copy aliases the same
+/// backing allocation — returning one from a fn creates a second owner with
+/// no language-level transfer (double-free on deinit, dangle after a callee
+/// defer). Deliberately EXCLUDES the inline-storage entries of
+/// stdlib_container_init_patterns (EnumArray/EnumMap/EnumSet/StaticStringMap
+/// copy safely) and node-based linked lists (nodes stay user-owned).
+/// Patterns carry the trailing `(` of a generic instantiation except the
+/// non-generic BufMap/BufSet. Used by ZA110 return-type classification.
+pub const managed_container_type_patterns: []const []const u8 = &.{
+    "ArrayList(",
+    "ArrayListUnmanaged(",
+    "ArrayListAligned(",
+    "MultiArrayList(",
+    "SegmentedList(",
+    "PriorityQueue(",
+    "PriorityDequeue(",
+    "StringHashMap(",
+    "StringHashMapUnmanaged(",
+    "AutoHashMap(",
+    "AutoHashMapUnmanaged(",
+    "AutoArrayHashMap(",
+    "AutoArrayHashMapUnmanaged(",
+    "StringArrayHashMap(",
+    "StringArrayHashMapUnmanaged(",
+    "BufMap",
+    "BufSet",
+};
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -1194,6 +1223,22 @@ test "vocabulary all_init_patterns includes MemoryPool" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "managed_container_type_patterns: heap-backed in, inline-storage out" {
+    var found_arraylist = false;
+    var found_hashmap = false;
+    for (managed_container_type_patterns) |p| {
+        if (std.mem.eql(u8, p, "ArrayList(")) found_arraylist = true;
+        if (std.mem.eql(u8, p, "StringHashMap(")) found_hashmap = true;
+        // Inline-storage types copy safely — they must never enter the
+        // ZA110 set (EnumSet/EnumArray/StaticStringMap/BoundedArray).
+        try std.testing.expect(!std.mem.startsWith(u8, p, "Enum"));
+        try std.testing.expect(!std.mem.startsWith(u8, p, "StaticStringMap"));
+        try std.testing.expect(!std.mem.startsWith(u8, p, "BoundedArray"));
+    }
+    try std.testing.expect(found_arraylist);
+    try std.testing.expect(found_hashmap);
 }
 
 test "createTestAllocator returns a working leak-detecting allocator" {

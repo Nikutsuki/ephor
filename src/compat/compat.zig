@@ -55,7 +55,7 @@ pub const VersionInfo = struct {
 };
 
 /// Parse version string like "0.15.2" or "0.16.0-dev"
-pub fn parseVersion(version_str: []const u8) !VersionInfo {
+pub fn parseVersion(version_str: []const u8) VersionInfo {
     var info = VersionInfo{ .major = 0, .minor = 0, .patch = 0, .dev = false };
 
     // Check for -dev suffix
@@ -81,12 +81,7 @@ pub fn parseVersion(version_str: []const u8) !VersionInfo {
 
 /// Get the current Zig version at comptime
 pub fn getCurrentVersion() VersionInfo {
-    return comptime parseVersion(builtin.zig_version_string) catch .{
-        .major = 0,
-        .minor = 0,
-        .patch = 0,
-        .dev = false,
-    };
+    return comptime parseVersion(builtin.zig_version_string);
 }
 
 /// Version compatibility interface
@@ -431,12 +426,19 @@ pub fn getStdlibContainerInitPatterns() []const []const u8 {
     return v0_15.stdlib_container_init_patterns;
 }
 
+/// Managed-container type families (heap backing store; by-value copy aliases)
+pub fn getManagedContainerTypePatterns() []const []const u8 {
+    const version = getCurrentVersion();
+    if (version.minor >= 16) return v0_16.managed_container_type_patterns;
+    return v0_15.managed_container_type_patterns;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
 
 test "parseVersion parses standard version" {
-    const v = try parseVersion("0.15.2");
+    const v = parseVersion("0.15.2");
     try std.testing.expectEqual(@as(u16, 0), v.major);
     try std.testing.expectEqual(@as(u16, 15), v.minor);
     try std.testing.expectEqual(@as(u16, 2), v.patch);
@@ -444,7 +446,7 @@ test "parseVersion parses standard version" {
 }
 
 test "parseVersion parses dev version" {
-    const v = try parseVersion("0.16.0-dev");
+    const v = parseVersion("0.16.0-dev");
     try std.testing.expectEqual(@as(u16, 0), v.major);
     try std.testing.expectEqual(@as(u16, 16), v.minor);
     try std.testing.expectEqual(@as(u16, 0), v.patch);

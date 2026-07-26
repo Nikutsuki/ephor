@@ -121,7 +121,7 @@ If you have the `ephor` binary installed directly, it accepts commands and optio
 ephor                     # Defaults to 'check' on configured src directory
 ephor check src/          # Explicit path
 ephor memory              # Alloc without defer patterns
-ephor errors              # Error handling patterns (ZA201-ZA208)
+ephor errors              # Error handling patterns (ZA201-ZA210)
 ephor orphans             # Files not imported
 ephor complexity          # Function complexity
 ephor fmt-check           # Files needing zig fmt
@@ -200,6 +200,7 @@ Example config:
 | **ZA103** | warning | ON | Stdlib allocation without `errdefer` in error-returning function |
 | **ZA105** | error | ON | Use-after-free: accessing memory after free |
 | **ZA106** | error | ON | Double-free: calling free twice on same pointer |
+| **ZA110** | warning | ON | Managed container local returned by value while a `defer x.deinit()` is still armed — the returned copy's backing is freed (the plain `var x = ...; return x;` ownership-transfer idiom is correct and stays silent) |
 
 ### Error Handling Patterns (ZA2xx)
 
@@ -213,6 +214,12 @@ Example config:
 | **ZA206** | warning | ON | `exit()` bypasses defers (memory leak!) |
 | **ZA207** | warning | ON | `catch undefined` (dangerous — converts errors to UB) |
 | **ZA208** | note | ON | `@panic()` crash point (informational) |
+| **ZA209** | note | ON | Error union return type `!` but function never fails (no `try`, no `return error`, no propagated payload) — drop the `!` |
+| **ZA210** | note | OFF | `catch \|e\| return e` is a verbose `try` (use `--enable=ZA210`) |
+
+**ZA209 scope:** error paths are deliberately over-counted (note severity, false-positive-safe direction). Silent when the body has `try`, `return error.*`, a returned catch payload (`catch \|e\| return e` or a later `return e;`), a returned error-typed parameter (`err: anyerror`) or error-literal/call-derived local, any `return f(...)` or `return Namespace.member;` (the target may carry an error union ephor cannot resolve cross-module), or `unreachable` (assertion-style bodies). Two classes are accepted with eyes open: (1) interface-conformance bodies — uniform-signature implementations such as tigerbeetle's generated `decode` fns or ghostty's shaper backends — **fire** with a factually-accurate "never fails" note that is often unactionable (the error union exists for interface uniformity); accepted as note-level noise. (2) Error paths behind labeled blocks (`break :blk error.X`) are not scanned, so a function whose only error path is block-carried still fires — a rule-level false positive. Error evidence inside nested functions rolls up into the outer function (ZT101 precedent), an accepted false negative.
+
+**ZA210 scope:** single-line, same-payload form only (`foo() catch \|err\| return err;`). The multi-line block form (`catch \|err\| { log(err); return err; }`) does real work between catch and return and is intentionally not flagged.
 
 ### Complexity (ZA3xx)
 
@@ -413,7 +420,7 @@ Commands:
   runtime     Run tests with memory diagnostics (dynamic analysis)
   orphans     Files not imported from entry points
   memory      Stdlib allocation without defer patterns (50+ patterns)
-  errors      Error handling patterns (ZA201-ZA208)
+  errors      Error handling patterns (ZA201-ZA210)
   unused      Unused imports/const/var declarations
   complexity  Function complexity metrics
   fmt-check   Files needing zig fmt
@@ -724,7 +731,7 @@ Ephor has three analysis entry points:
 
 | Entry Point | Scope | Rules | Context |
 |-------------|-------|-------|---------|
-| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA208 (in `checkLineErrors`) | `TypeContext` via `parseFileTypeContext(content)` |
+| `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA208, ZA210 (in `checkLineErrors`), ZA209 (whole-body scan) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA8xx, ZA9xx | `CFGState` with file-level `no_free_fields` |
 
@@ -961,7 +968,7 @@ Ephor uses three testing layers:
 - `naming_conventions.zig` — Naming rule test patterns
 - `fixtures/memory/tp_*.zig` — True positive memory fixtures (ZA101-ZA106)
 - `fixtures/memory/fp_*.zig` — False positive memory fixtures (arena field chains, ownership transfer, deferred alloc)
-- `examples/error_handling_demo.zig` — Error handling patterns (ZA201-ZA208)
+- `examples/error_handling_demo.zig` — Error handling patterns (ZA201-ZA210)
 
 **4. Corpus validation** (3000+ community Zig projects):
 - Dogfood: `ephor check src/` → zero issues

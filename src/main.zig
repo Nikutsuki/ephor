@@ -5851,41 +5851,30 @@ fn collectNoFreeFieldNames(
 
         // Extract field name (everything before the colon must be a valid identifier)
         const field_name = t[0..colon_pos];
-        var valid_field = true;
-        for (field_name) |c| {
-            if (!isIdent(c)) {
-                valid_field = false;
-                break;
-            }
-        }
-        if (!valid_field or field_name.len == 0) continue;
+        if (field_name.len == 0 or !isAllIdent(field_name)) continue;
 
         // Check if the type after `: ` matches a no-free allocator type
         const type_part = mem.trim(u8, t[colon_pos + 2 ..], " \t");
+        var matched = false;
         for (field_type_patterns) |pat| {
-            if (mem.startsWith(u8, type_part, pat)) {
-                // Verify the match is a complete type (followed by , or = or end)
-                if (type_part.len == pat.len or
-                    type_part[pat.len] == ',' or
-                    type_part[pat.len] == ' ' or
-                    type_part[pat.len] == '=')
-                {
-                    try names.put(a, field_name, {});
-                    break;
-                }
-            }
+            if (!mem.startsWith(u8, type_part, pat)) continue;
+            // Verify the match is a complete type (followed by , or = or end)
+            matched = type_part.len == pat.len or
+                type_part[pat.len] == ',' or
+                type_part[pat.len] == ' ' or
+                type_part[pat.len] == '=';
+            if (matched) break;
         }
+        if (matched) try names.put(a, field_name, {});
 
         // Name-based heuristic: fields named "arena" (or containing "arena")
         // with type Allocator/std.mem.Allocator/mem.Allocator are treated as no-free.
         // In the Zig ecosystem, arena-named Allocator fields are always backed by
         // ArenaAllocator — naming a GPA-backed allocator "arena" would be a severe
         // convention violation.
-        if (!names.contains(field_name) and isArenaName(field_name)) {
-            if (isAllocatorType(type_part)) {
-                try names.put(a, field_name, {});
-            }
-        }
+        const arena_no_free = !names.contains(field_name) and isArenaName(field_name) and
+            isAllocatorType(type_part);
+        if (arena_no_free) try names.put(a, field_name, {});
     }
 
     return names;
@@ -5908,16 +5897,12 @@ fn isAllocatorType(type_part: []const u8) bool {
         "mem.Allocator",
     };
     for (allocator_types) |at| {
-        if (mem.startsWith(u8, type_part, at)) {
-            // Verify complete type (followed by terminator char or end of string)
-            if (type_part.len == at.len) return true;
-            const next = type_part[at.len];
-            if (next == ',' or next == ' ' or next == '=' or
-                next == ')' or next == '}' or next == ';')
-            {
-                return true;
-            }
-        }
+        if (!mem.startsWith(u8, type_part, at)) continue;
+        // Verify complete type (followed by terminator char or end of string)
+        if (type_part.len == at.len) return true;
+        const next = type_part[at.len];
+        if (next == ',' or next == ' ' or next == '=' or
+            next == ')' or next == '}' or next == ';') return true;
     }
     return false;
 }
@@ -5973,18 +5958,11 @@ fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnm
         // Find next dot or end of chain
         const dot_pos = mem.indexOf(u8, chain[iter_start..], ".") orelse (chain.len - iter_start);
         const segment = chain[iter_start .. iter_start + dot_pos];
-        if (segment.len > 0) {
-            // Type-based: field declared as no-free allocator type
-            if (no_free_fields.count() > 0 and no_free_fields.contains(segment)) {
-                return true;
-            }
-            // Name-based: field named "arena" — cross-file heuristic.
-            // The struct definition may be in another file (e.g., Sema.zig defines
-            // `arena: Allocator` but Sema/arith.zig uses `sema.arena.alloc()`).
-            if (isArenaName(segment)) {
-                return true;
-            }
-        }
+        // Type-based: field declared as no-free allocator type
+        if (segment.len > 0 and no_free_fields.count() > 0 and
+            no_free_fields.contains(segment)) return true;
+        // Name-based: field named "arena" — cross-file heuristic.
+        if (segment.len > 0 and isArenaName(segment)) return true;
         iter_start += dot_pos + 1;
     }
 

@@ -203,6 +203,7 @@ Example config:
 | **ZA105** | error | ON | Use-after-free: accessing memory after free |
 | **ZA106** | error | ON | Double-free: calling free twice on same pointer |
 | **ZA110** | warning | ON | Managed container local returned by value while a `defer x.deinit()` is still armed — the returned copy's backing is freed (the plain `var x = ...; return x;` ownership-transfer idiom is correct and stays silent) |
+| **ZA111** | error | ON | Returned-stack-reference (AST tier): returned pointer/slice provably refers to a stack local or by-value parameter (`return &s.field;`, `return &param;`, `const p = &x; return p;`, `return arr[0..n];`). Covers the forms Zig's Sema misses; the bare `return &var;` form is a hard compile error and is never echoed. Chains through pointer/slice bindings or fields are safe and stay silent, as do `comptime var`s and unresolvable types |
 
 ### Error Handling Patterns (ZA2xx)
 

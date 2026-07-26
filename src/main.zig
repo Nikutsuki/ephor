@@ -127,6 +127,9 @@ pub const compat = @import("compat/compat.zig");
 // Shared types and utilities
 const types = @import("types.zig");
 
+// AST tier: checks that need a real parse tree (host std.Ast)
+const ast_tier = @import("ast_tier.zig");
+
 // Import shared types and constants from types.zig
 const RULE_ALLOC_NO_DEFER = types.RULE_ALLOC_NO_DEFER;
 const RULE_CREATE_NO_DEFER = types.RULE_CREATE_NO_DEFER;
@@ -12369,6 +12372,26 @@ fn analyzeComplexity(
     return issues;
 }
 
+/// AST tier driver: parse each file with the host std.Ast and run the
+/// AST-native rules (currently ZA111). Files with parse errors are skipped
+/// inside the tier; the line tier still covers them.
+fn analyzeAstTier(
+    allocator: Allocator,
+    graph: *ImportGraph,
+    stats: ?*ast_tier.Stats,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    var iter = graph.files.iterator();
+    while (iter.next()) |entry| {
+        const fa = entry.value_ptr.*;
+        try ast_tier.analyzeFileAstTier(allocator, .{
+            .issues = &issues,
+            .stats = stats,
+        }, fa.path, fa.content);
+    }
+    return issues;
+}
+
 // ============================================================================
 // Style Analysis Helpers
 // ============================================================================
@@ -20117,7 +20140,7 @@ fn printHelp() void {
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
         \\                     ZA103: alloc-no-errdefer,
         \\                     ZA105: use-after-free, ZA106: double-free,
-        \\                     ZA110: must-return-ref)
+        \\                     ZA110: must-return-ref, ZA111: returned-stack-ref)
         \\  ZA2xx  ErrHandle  (ZA201: silent-catch, ZA202: catch-unreachable,
         \\                     ZA203: orelse-unreachable, ZA204: undefined,
         \\                     ZA205: ignored-error, ZA206: exit-bypasses-defer,
@@ -20770,6 +20793,11 @@ pub fn main(init: std.process.Init) !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
+            // AST tier (ZA111) is a memory-family rule — include it here too.
+            var ast_issues = try analyzeAstTier(alloc, &g, null);
+            defer ast_issues.deinit(alloc);
+            for (ast_issues.items) |ai| try issues.append(alloc, ai);
+            ast_issues.items.len = 0; // ownership moved to issues
             const c = printIssues(issues.items, base_path, cfg.format, "memory", &cfg, &g);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
@@ -20938,6 +20966,24 @@ pub fn main(init: std.process.Init) !void {
                 // Concurrency (ZC1xx): lock/unlock pairing defects
                 var conc_issues = try analyzeConcurrency(alloc, &g);
                 defer deinitIssues(&conc_issues, alloc);
+
+                // AST tier (ZA111): merged into cfg_mem_issues so it flows
+                // through the ZA1 → memory category filter and the export
+                // list. Item ownership moves with the append (same pattern
+                // as cast_issues above), so ast_issues only frees its array.
+                var ast_stats = ast_tier.Stats{};
+                var ast_issues = try analyzeAstTier(alloc, &g, &ast_stats);
+                defer ast_issues.deinit(alloc);
+                for (ast_issues.items) |ai| try cfg_mem_issues.append(alloc, ai);
+                ast_issues.items.len = 0;
+                // Debug instrumentation for corpus robustness runs (off by
+                // default): parse coverage of the AST tier.
+                if (init.environ_map.get("EPHOR_DEBUG_AST") != null) {
+                    std.debug.print(
+                        "ast tier: {d} files parsed, {d} skipped (parse errors)\n",
+                        .{ ast_stats.parsed, ast_stats.skipped },
+                    );
+                }
 
                 // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
                 var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
@@ -33624,4 +33670,11 @@ test "setOptionalPath OOM keeps the old value freeable exactly once" {
         setOptionalPath(failing.allocator(), &field, "new"),
     );
     try std.testing.expectEqualStrings("old", field.?);
+}
+
+test {
+    // Test-reference idiom: pull the AST tier's tests into `zig build test`.
+    // ast_tier is only referenced from inside function bodies, which does
+    // not force analysis of its test declarations.
+    _ = ast_tier;
 }

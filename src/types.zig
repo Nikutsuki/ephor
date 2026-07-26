@@ -22,6 +22,7 @@ pub const RULE_ALLOC_NO_ERRDEFER = "ZA103";
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
 pub const RULE_MUST_RETURN_REF = "ZA110";
+pub const RULE_RETURNED_STACK_REF = "ZA111";
 
 // ZA2xx - Error handling patterns (warnings; ZA205/ZA208/ZA209/ZA210 are notes)
 pub const RULE_SILENT_CATCH = "ZA201";

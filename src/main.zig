@@ -6872,17 +6872,15 @@ fn isDirectFieldAssignment(t: []const u8, alloc_name: []const u8) bool {
     // RHS should contain an allocation method pattern (skip patterns in strings)
     var has_alloc = false;
     for (compat.getAllocMethodPatterns()) |pat| {
-        if (hasPatternNotInString(rhs, pat)) {
-            has_alloc = true;
-            break;
-        }
+        if (!hasPatternNotInString(rhs, pat)) continue;
+        has_alloc = true;
+        break;
     }
     if (!has_alloc) {
         for (compat.getQualifiedAllocFnPatterns()) |pat| {
-            if (hasPatternNotInString(rhs, pat)) {
-                has_alloc = true;
-                break;
-            }
+            if (!hasPatternNotInString(rhs, pat)) continue;
+            has_alloc = true;
+            break;
         }
     }
     if (!has_alloc) return false;
@@ -6927,13 +6925,14 @@ fn isInsideFunctionCallArg(t: []const u8, pos: usize) bool {
         i -= 1;
         if (t[i] == ')') {
             depth += 1;
-        } else if (t[i] == '(') {
-            if (depth > 0) {
-                depth -= 1;
-                continue;
-            }
-            return isNonAllocFnCallAt(t, i);
+            continue;
         }
+        if (t[i] != '(') continue;
+        if (depth > 0) {
+            depth -= 1;
+            continue;
+        }
+        return isNonAllocFnCallAt(t, i);
     }
     return false;
 }
@@ -7355,22 +7354,8 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // Pattern 4: @memcpy/@memset where var_name is the DESTINATION (first arg)
     // @memcpy(dest, src) - dest is filled, src is read
     // @memset(dest, value) - dest is filled
-    if (mem.indexOf(u8, t, "@memcpy(")) |pos| {
-        const after_paren = pos + 8; // "@memcpy(" is 8 chars
-        if (after_paren < t.len) {
-            if (mem.indexOf(u8, t[after_paren..], var_name)) |var_pos| {
-                if (var_pos == 0 or (var_pos == 1 and t[after_paren] == '&')) return true;
-            }
-        }
-    }
-    if (mem.indexOf(u8, t, "@memset(")) |pos| {
-        const after_paren = pos + 8; // "@memset(" is 8 chars
-        if (after_paren < t.len) {
-            if (mem.indexOf(u8, t[after_paren..], var_name)) |var_pos| {
-                if (var_pos == 0 or (var_pos == 1 and t[after_paren] == '&')) return true;
-            }
-        }
-    }
+    if (isBuiltinDest(t, var_name, "@memcpy(")) return true;
+    if (isBuiltinDest(t, var_name, "@memset(")) return true;
 
     // Pattern 5: Loop with indexed assignment to var_name
     // Only count as fill if we see var_name[...] = inside the loop
@@ -7859,14 +7844,21 @@ fn isStructFieldDefault(t: []const u8, undefined_col: usize) bool {
     if (undefined_col == 0) return false;
     var i: usize = 0;
     while (i < undefined_col) : (i += 1) {
-        if (t[i] == ':') {
-            // Verify identifier before colon
-            if (i > 0 and (isIdent(t[i - 1]) or t[i - 1] == '@' or t[i - 1] == '"')) {
-                return true;
-            }
-        }
+        if (t[i] != ':') continue;
+        // Verify identifier before colon
+        if (i > 0 and (isIdent(t[i - 1]) or t[i - 1] == '@' or t[i - 1] == '"'))
+            return true;
     }
     return false;
+}
+
+/// var_name as the destination (first arg, optionally &-prefixed) of a builtin call.
+fn isBuiltinDest(t: []const u8, var_name: []const u8, builtin: []const u8) bool {
+    const pos = mem.indexOf(u8, t, builtin) orelse return false;
+    const after_paren = pos + builtin.len;
+    if (after_paren >= t.len) return false;
+    const var_pos = mem.indexOf(u8, t[after_paren..], var_name) orelse return false;
+    return var_pos == 0 or (var_pos == 1 and t[after_paren] == '&');
 }
 
 /// Check for discarded error union results

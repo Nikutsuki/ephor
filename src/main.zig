@@ -8434,11 +8434,27 @@ fn checkNoCatchReturn(t: []const u8, path: []const u8, ln: usize) ?Issue {
 // `unreachable` bodies (assertion-style), any `return f(...)` whose callee
 // is unresolved, returns of call-derived locals, and interface/vtable fns
 // (accepted FN — their bodies stay small to satisfy the fn-pointer type,
-// documented). Nested fns roll up into the outer fn (same precedent as
+// documented). One interface class IS carved out: the noop shim — a body
+// of `_ = param;` discards, no call-containing statement, only constant or
+// void returns, and at most a few non-discard statements (ghostty's
+// KeymapNoop.translate / OpenGL.threadEnter shape). The `!` there is
+// forced by the interface, so the note is unactionable; real infallible
+// logic (calls, computed returns, or simply no discards) keeps firing.
+// Nested fns roll up into the outer fn (same precedent as
 // ZT101): their evidence silences the outer fn, never the reverse.
 
 const max_err_ret_payloads = 4;
 const max_err_ret_call_idents = 4;
+
+/// Cap on non-discard body statements for the ZA209 interface-shim
+/// carve-out: a shim is a handful of param discards plus at most a
+/// constant return; more real statements means real logic (the ghostty
+/// draw* class), which keeps the note.
+const max_shim_body_stmts = 4;
+
+/// Max bytes of one accumulated statement kept for shim classification.
+/// Overflow counts the statement as call-containing (fail toward firing).
+const max_shim_stmt_bytes = 4096;
 
 /// Per-fn scan state for ZA209 (bounded ident sets, no allocation).
 const ErrRetFnScan = struct {
@@ -8454,6 +8470,16 @@ const ErrRetFnScan = struct {
     payloads: [max_err_ret_payloads][]const u8 = undefined,
     call_ident_count: usize = 0,
     call_idents: [max_err_ret_call_idents][]const u8 = undefined,
+    /// Interface-shim evidence: `_ = expr;` discards with a call-free RHS
+    /// mark unused interface params; every other `;`-terminated statement
+    /// is body work — real work when it contains a call, and any computed
+    /// (non-constant) return disqualifies the shim.
+    shim_discards: usize = 0,
+    non_discard_stmts: usize = 0,
+    call_stmts: usize = 0,
+    has_nonconst_return: bool = false,
+    stmt_buf: [max_shim_stmt_bytes]u8 = undefined,
+    stmt_len: usize = 0,
 };
 
 /// Word-boundary, string-literal-aware substring search. The after-boundary
@@ -8655,6 +8681,114 @@ fn startErrRetFn(lines: []const []const u8, line_num: usize, scan: *ErrRetFnScan
     scan.has_error_path = false;
     scan.payload_count = 0;
     scan.call_ident_count = 0;
+    scan.shim_discards = 0;
+    scan.non_discard_stmts = 0;
+    scan.call_stmts = 0;
+    scan.has_nonconst_return = false;
+    scan.stmt_len = 0;
+}
+
+/// True when a return expression is compile-time trivial: void/empty, an
+/// aggregate or enum literal (`.{...}`, `.member`), a `{...}` initializer,
+/// a numeric literal, or a keyword constant. String contents are already
+/// literal-blanked, so `return "...";` reads as an empty (constant)
+/// expression. Anything else is computed state, not a noop.
+fn isConstReturnExpr(expr_raw: []const u8) bool {
+    const expr = mem.trim(u8, expr_raw, " \t\r");
+    if (expr.len == 0) return true;
+    if (expr[0] == '.' or expr[0] == '{') return true;
+    if (std.ascii.isDigit(expr[0])) return true;
+    if (expr[0] == '-' and expr.len > 1 and std.ascii.isDigit(expr[1])) return true;
+    const keywords = [_][]const u8{ "true", "false", "null", "undefined" };
+    for (keywords) |kw| {
+        if (mem.eql(u8, expr, kw)) return true;
+    }
+    return false;
+}
+
+/// Flag any `return <expr>` in the segment whose expression is not a
+/// trivial constant — an interface shim returns void or a literal, never
+/// computed state.
+fn scanReturnConstness(seg: []const u8, scan: *ErrRetFnScan) void {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, seg, from, "return")) |pos| {
+        from = pos + "return".len;
+        const before_ok = pos == 0 or !isIdent(seg[pos - 1]);
+        const after_ok = from >= seg.len or !isIdent(seg[from]);
+        if (!before_ok or !after_ok) continue;
+        if (!isConstReturnExpr(seg[from..])) scan.has_nonconst_return = true;
+    }
+}
+
+/// Classify one accumulated `;`-terminated statement for the shim
+/// carve-out: `_ = expr;` with a call-free RHS is a param discard (a `_ =
+/// foo();` call-result discard is real work, not a shim marker); anything
+/// else is body work — real when it contains a call — and returns are
+/// checked for computed expressions. Leading block braces are stripped so
+/// `} _ = self;` still anchors the discard.
+fn classifyShimStatement(seg_raw: []const u8, scan: *ErrRetFnScan) void {
+    var seg = mem.trim(u8, seg_raw, " \t\r");
+    while (seg.len > 0 and (seg[0] == '{' or seg[0] == '}')) {
+        seg = mem.trim(u8, seg[1..], " \t\r");
+    }
+    if (seg.len == 0) return;
+    if (mem.startsWith(u8, seg, "_ = ")) {
+        if (mem.indexOfScalar(u8, seg, '(') == null) {
+            scan.shim_discards += 1;
+            return;
+        }
+        scan.non_discard_stmts += 1;
+        scan.call_stmts += 1;
+        return;
+    }
+    scan.non_discard_stmts += 1;
+    if (mem.indexOfScalar(u8, seg, '(') != null) scan.call_stmts += 1;
+    scanReturnConstness(seg, scan);
+}
+
+/// Accumulate one literal-blanked body slice into the shim statement
+/// buffer, classifying each completed (`;`-terminated) statement.
+/// Statements span lines (a zig-fmt-wrapped call finalizes at its distant
+/// `;`, keeping its parens visible); semicolon-free constructs (a comptime
+/// dispatch switch) never finalize and are dropped at fn end.
+fn scanShimEvidence(blanked: []const u8, scan: *ErrRetFnScan) void {
+    for (blanked) |c| {
+        if (c == ';') {
+            classifyShimStatement(scan.stmt_buf[0..scan.stmt_len], scan);
+            scan.stmt_len = 0;
+            continue;
+        }
+        if (scan.stmt_len < max_shim_stmt_bytes) {
+            scan.stmt_buf[scan.stmt_len] = c;
+            scan.stmt_len += 1;
+            continue;
+        }
+        // Overflow: unclassifiable statement — count it as real work.
+        scan.non_discard_stmts += 1;
+        scan.call_stmts += 1;
+        scan.stmt_len = 0;
+    }
+}
+
+/// Feed one literal-blanked line into the shim scan. Signature lines only
+/// contribute text after the body's opening `{`; lines inside the body
+/// contribute in full.
+fn feedShimLine(scan: *ErrRetFnScan, blanked: []const u8) void {
+    if (scan.body_started) return scanShimEvidence(blanked, scan);
+    const open = mem.indexOfScalar(u8, blanked, '{') orelse return;
+    scanShimEvidence(blanked[open + 1 ..], scan);
+}
+
+/// True when the finished fn body is an interface shim: at least one
+/// param discard, no call-containing statement, only constant/void
+/// returns, and a body bounded to a few statements — the noop interface
+/// implementation whose `!` is forced by the interface (ghostty's
+/// KeymapNoop / OpenGL threadEnter class).
+fn isInterfaceShim(scan: *const ErrRetFnScan) bool {
+    return scan.shim_discards >= 1 and
+        scan.call_stmts == 0 and
+        !scan.has_nonconst_return and
+        scan.non_discard_stmts <= max_shim_body_stmts;
 }
 
 /// Emit ZA209 when the finished fn never exhibited an error path.
@@ -8666,6 +8800,9 @@ fn finishErrRetFn(
 ) !void {
     defer scan.in_fn = false;
     if (scan.has_error_path) return;
+    // Interface-shim carve-out: the body only discards params and returns
+    // a constant — the '!' is interface-forced, so the note is unactionable.
+    if (isInterfaceShim(scan)) return;
     const msg = try std.fmt.allocPrint(
         a,
         "error union return type '!' but '{s}' never fails",
@@ -8709,6 +8846,7 @@ fn checkUselessErrorReturns(
         // and char literal contents blanked (a `"}"` must not close the fn).
         const code_end = findCommentStart(line) orelse line.len;
         const blanked = blankLiteralContents(line[0..code_end], &blank_buf);
+        if (!scan.has_error_path) feedShimLine(&scan, blanked);
         if (mem.indexOfScalar(u8, blanked, '{') != null) scan.body_started = true;
         scan.brace_depth = braceDelta(scan.brace_depth, blanked);
         if (scan.body_started and scan.brace_depth == 0) {
@@ -9053,14 +9191,51 @@ fn lastSegment(target: []const u8) []const u8 {
     return target;
 }
 
+/// True when `seg` contains the snapshot-testing verb `snap` as a whole
+/// word (split on case transitions and underscores): `snap(@src(), ...)`,
+/// `snap_fn`, `takeSnap`. Substring matching would pull in data-shaped
+/// names like `initWithSnaplen` (RhyOS pcap) and `snapshot_max_for_table_
+/// input` (tigerbeetle compaction), inventing assertions where none exist.
+fn isSnapshotVerb(seg: []const u8) bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < seg.len) {
+        const word_end = seg[i] == '_' or std.ascii.isUpper(seg[i]);
+        if (!word_end) {
+            i += 1;
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(seg[start..i], "snap")) return true;
+        // An uppercase letter opens the next word; an underscore is consumed.
+        if (seg[i] == '_') {
+            start = i + 1;
+            i = start;
+        } else {
+            start = i;
+            i += 1;
+        }
+    }
+    return std.ascii.eqlIgnoreCase(seg[start..], "snap");
+}
+
 /// An assertion call's final segment names an expect/assert helper
-/// (expectEqual, std.debug.assert, custom assertFoo/fxAssertFoo helpers).
+/// (expectEqual, std.debug.assert, custom assertFoo/fxAssertFoo helpers)
+/// or a snapshot-testing verb (whole-word `snap`, plus the dotted
+/// snapshot-diff method family: `.diff(...)`, `.diff_fmt(...)`, …).
 /// Case-insensitive: camelCase word boundaries capitalize (`fxAssert…`).
-/// Over-matching only suppresses ZT102 warnings — the safe direction.
+/// The diff family requires a dotted (method) target — a bare `diff(...)`
+/// fn is not assertion-shaped. Over-matching only suppresses ZT102
+/// warnings — the safe direction.
 fn isAssertionTarget(target: []const u8) bool {
     const seg = lastSegment(target);
-    return std.ascii.indexOfIgnoreCase(seg, "expect") != null or
-        std.ascii.indexOfIgnoreCase(seg, "assert") != null;
+    if (std.ascii.indexOfIgnoreCase(seg, "expect") != null or
+        std.ascii.indexOfIgnoreCase(seg, "assert") != null or
+        isSnapshotVerb(seg))
+    {
+        return true;
+    }
+    return mem.indexOfScalar(u8, target, '.') != null and
+        mem.startsWith(u8, seg, "diff");
 }
 
 /// Count assertion calls in one comment-stripped code slice (ZT102).
@@ -9278,8 +9453,31 @@ fn referencesTestingAllocator(neutral: []const u8) bool {
         hasIdentRef(neutral, "FailingAllocator");
 }
 
+/// True when any fn the test body calls — directly or through the
+/// file-local call graph (BFS, depth-capped, cycle-safe) — contains an
+/// assertion call in its own body (ZT102 helper-mediation): the test
+/// delegates verification to the helper, so it is not smoke. The
+/// project-wide witness set covers cross-file helpers (ghostty's
+/// `lib.checkGhosttyHEnum` idiom) but is consulted for distinctive names
+/// only: ubiquitous lowercase method names (init, read, write) collide
+/// project-wide and would mask real smoke tests — the same prose guard
+/// ZT101 applies to candidacy. Remaining collisions only ever suppress a
+/// note — the safe direction.
+fn bodyReachesAssertingFn(ctx: *const TestScanCtx, body_calls: []const []const u8) !bool {
+    var reachable = try computeReachableCalls(ctx.sink.allocator, ctx.facts, body_calls);
+    defer reachable.deinit(ctx.sink.allocator);
+    var it = reachable.keyIterator();
+    while (it.next()) |name| {
+        if (ctx.facts.asserting.contains(name.*)) return true;
+        if (looksLikeCodeRef(name.*) and ctx.project_asserting.contains(name.*)) return true;
+    }
+    return false;
+}
+
 /// ZT102: evaluate a finished test block for missing assertions.
-fn reportTestBlock(sink: *const TestIssueSink, c: TestBlockCounters) !void {
+fn reportTestBlock(ctx: *const TestScanCtx, state: *const TestFileScanState) !void {
+    const sink = ctx.sink;
+    const c = state.counters;
     if (c.assertions > 0) return;
     // Leak-sweep blocks: std.testing.allocator (and FailingAllocator
     // wrapping it) fails the test at deinit on any leak — the allocator's
@@ -9288,6 +9486,9 @@ fn reportTestBlock(sink: *const TestIssueSink, c: TestBlockCounters) !void {
     // Test-reference blocks (`_ = @import(...)`, refAllDecls, `_ = decl;`)
     // exist to force compilation of other declarations — never vacuous.
     if (!c.has_real_code and c.ref_lines > 0) return;
+    // Helper-mediated assertions: the block delegates to a fn whose own
+    // body asserts (file-local or cross-file) — delegation is verification.
+    if (try bodyReachesAssertingFn(ctx, state.body_calls.items)) return;
     if (c.try_calls > 0) {
         // try-propagated calls still catch errors — a smoke test, not vacuous
         try sink.issues.append(sink.allocator, .{
@@ -9464,15 +9665,20 @@ const LineForms = struct {
 /// content, which outlives the maps. The graph includes excluded fns as
 /// intermediate nodes — a test reaching fn X through a local helper (or a
 /// pipeline entry delegating to X) is not lying; the call edge is a fact.
+/// `asserting` holds every fn whose own body contains an assertion call —
+/// the ZT102 helper-mediation witness set: a test delegating to one of
+/// these verifies through it, so the block is never smoke.
 const FnCallFacts = struct {
     callees: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
     excluded: std.StringHashMapUnmanaged(void) = .empty,
+    asserting: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(self: *FnCallFacts, allocator: Allocator) void {
         var it = self.callees.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
         self.callees.deinit(allocator);
         self.excluded.deinit(allocator);
+        self.asserting.deinit(allocator);
     }
 
     /// Guarantee a callees entry for `name` (even when it calls nothing)
@@ -9482,7 +9688,10 @@ const FnCallFacts = struct {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
     }
 
-    /// Record one line's direct call targets under fn `name`.
+    /// Record one line's direct call targets under fn `name`. A fn whose
+    /// body contains an assertion call joins the `asserting` witness set
+    /// (ZT102 helper-mediation); nested-fn assertions roll up into the
+    /// outer fn, the same FP-safe precedent as the call edges.
     fn recordCallees(
         self: *FnCallFacts,
         allocator: Allocator,
@@ -9494,15 +9703,21 @@ const FnCallFacts = struct {
         var pos: usize = 0;
         while (nextCallSite(code, pos)) |site| {
             pos = site.open_paren + 1;
-            const seg = lastSegment(code[site.start..site.open_paren]);
+            const target = code[site.start..site.open_paren];
+            if (isAssertionTarget(target)) try self.asserting.put(allocator, name, {});
+            const seg = lastSegment(target);
             if (containsName(list.items, seg)) continue;
             try list.append(allocator, seg);
         }
     }
 
-    /// Notice a fn def outside any body and open its span when the `{` is
-    /// on the same line. A pending def ended by `;` is a bodiless extern
-    /// declaration, not a definition — drop it.
+    /// Notice a fn def outside any body and open its span when the body
+    /// `{` arrives — the first brace OUTSIDE the signature's parens: a
+    /// brace literal inside the param list (`cases: struct { ... }`) is
+    /// not the body, and opening there would close the span before the
+    /// body starts, losing every callee and assertion in it (tigerbeetle
+    /// flags.zig's parse_flag_value_fuzz). A pending def ended by `;` is
+    /// a bodiless extern declaration, not a definition — drop it.
     fn updatePending(
         self: *FnCallFacts,
         allocator: Allocator,
@@ -9514,8 +9729,18 @@ const FnCallFacts = struct {
             span.pending = def.name;
             if (def.excluded) try self.excluded.put(allocator, def.name, {});
             try self.ensureFn(allocator, def.name);
+            span.sig_parens = 0;
         }
-        if (mem.indexOfScalar(u8, forms.blanked, '{') == null) {
+        var body_open = false;
+        for (forms.blanked) |c| {
+            if (c == '(') span.sig_parens += 1;
+            if (c == ')' and span.sig_parens > 0) span.sig_parens -= 1;
+            if (c == '{' and span.sig_parens == 0) {
+                body_open = true;
+                break;
+            }
+        }
+        if (!body_open) {
             if (mem.endsWith(u8, forms.t, ";")) span.pending = null;
             return;
         }
@@ -9544,10 +9769,13 @@ const FnCallFacts = struct {
 };
 
 /// State for tracking which fn body a line belongs to (ZT101 call graph).
+/// `sig_parens` is the paren depth while awaiting a pending def's body
+/// brace, so brace literals inside the signature cannot open the span.
 const FnSpanState = struct {
     current: ?[]const u8 = null,
     pending: ?[]const u8 = null,
     depth: usize = 0,
+    sig_parens: usize = 0,
 };
 
 /// Brace depth after processing one literal-blanked line.
@@ -9882,10 +10110,12 @@ fn checkTestSwallowedCatch(
 }
 
 /// Read-only inputs for the per-file test-quality scan, bundled to keep
-/// param counts low.
+/// param counts low. `project_asserting` is the cross-file witness set of
+/// fn names whose bodies contain an assertion call (ZT102 mediation).
 const TestScanCtx = struct {
     sink: *const TestIssueSink,
     facts: *const FnCallFacts,
+    project_asserting: *const std.StringHashMapUnmanaged(void),
     lines: []const []const u8,
 };
 
@@ -10014,16 +10244,20 @@ fn scanTestLine(
     try collectLineCalls(code, &state.body_calls, sink.allocator);
     markLineLieReferences(code, starts_test, state);
     if (!state.in_test) {
-        try reportTestBlock(sink, state.counters);
+        try reportTestBlock(ctx, state);
         try reportLieTest(ctx, state);
     }
 }
 
 /// Analyze a single file for test-quality issues (ZT101/ZT102 per test
-/// block, ZT103 per block line, ZT104 per test-context line).
-fn analyzeFileTests(sink: *const TestIssueSink, a: FileAnalysis) !void {
-    var facts = try collectFnCallFacts(sink.allocator, a.content);
-    defer facts.deinit(sink.allocator);
+/// block, ZT103 per block line, ZT104 per test-context line). The call
+/// facts are built once per project pass and shared (see analyzeTests).
+fn analyzeFileTests(
+    sink: *const TestIssueSink,
+    a: FileAnalysis,
+    facts: *const FnCallFacts,
+    project_asserting: *const std.StringHashMapUnmanaged(void),
+) !void {
     // Lines are collected (not streamed) for the bounded 2-line empty-catch
     // lookahead (ZT104): a `catch {` opener closes on the next line.
     var all_lines: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -10033,7 +10267,8 @@ fn analyzeFileTests(sink: *const TestIssueSink, a: FileAnalysis) !void {
 
     const ctx: TestScanCtx = .{
         .sink = sink,
-        .facts = &facts,
+        .facts = facts,
+        .project_asserting = project_asserting,
         .lines = all_lines.items,
     };
     var state = TestFileScanState{};
@@ -10116,10 +10351,12 @@ const UntestedFnEvidence = struct {
 };
 
 /// Scan context for one file's ZT105 pass (bundled for param counts).
+/// `facts` is the file's shared call graph, built once per project pass.
 const UntestedFnScanCtx = struct {
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
+    facts: *const FnCallFacts,
     evidence: *UntestedFnEvidence,
     is_test_file: bool,
 };
@@ -10300,7 +10537,8 @@ fn scanUntestedFnLine(
 
 /// Add every name reachable from the test blocks' direct calls through the
 /// file-local call graph to the tested set (ZT101 machinery): a test that
-/// calls a private helper which calls the pub fn still exercises it.
+/// calls a private helper which calls the pub fn still exercises it. The
+/// facts are the shared per-file graph built by collectProjectTestFacts.
 fn addReachableTested(
     ctx: *const UntestedFnScanCtx,
     state: *const UntestedFnFileState,
@@ -10310,9 +10548,7 @@ fn addReachableTested(
     defer seed_list.deinit(ctx.allocator);
     var seed_it = state.seeds.keyIterator();
     while (seed_it.next()) |k| try seed_list.append(ctx.allocator, k.*);
-    var facts = try collectFnCallFacts(ctx.allocator, ctx.content);
-    defer facts.deinit(ctx.allocator);
-    var reachable = try computeReachableCalls(ctx.allocator, &facts, seed_list.items);
+    var reachable = try computeReachableCalls(ctx.allocator, ctx.facts, seed_list.items);
     defer reachable.deinit(ctx.allocator);
     var reach_it = reachable.keyIterator();
     while (reach_it.next()) |k| try ctx.evidence.tested.put(ctx.allocator, k.*, {});
@@ -10365,9 +10601,11 @@ fn reportUntestedPubFns(
 
 /// Project-level ZT105 pass: gather test-corpus and alias evidence across
 /// every analyzed file, then judge each pub fn declaration against it.
+/// Call facts come from the shared per-project build (never rebuilt).
 fn analyzeUntestedPubFns(
     allocator: Allocator,
     graph: *ImportGraph,
+    facts_cache: *const std.StringHashMapUnmanaged(FnCallFacts),
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
     var evidence = UntestedFnEvidence{};
@@ -10378,6 +10616,7 @@ fn analyzeUntestedPubFns(
             .allocator = allocator,
             .path = entry.value_ptr.path,
             .content = entry.value_ptr.content,
+            .facts = facts_cache.getPtr(entry.key_ptr.*).?,
             .evidence = &evidence,
             .is_test_file = isTestFilePath(entry.value_ptr.path),
         };
@@ -10386,11 +10625,46 @@ fn analyzeUntestedPubFns(
     try reportUntestedPubFns(allocator, &evidence, issues);
 }
 
+/// Per-project test-analysis facts: every file's call graph built once
+/// (shared by ZT101-ZT105), plus the cross-file assertion witness set —
+/// every fn name whose body contains an assertion call anywhere in the
+/// project (ZT102 helper-mediation for cross-file helpers like ghostty's
+/// `lib.checkGhosttyHEnum`).
+const TestProjectFacts = struct {
+    cache: std.StringHashMapUnmanaged(FnCallFacts) = .empty,
+    asserting: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *TestProjectFacts, allocator: Allocator) void {
+        var it = self.cache.valueIterator();
+        while (it.next()) |facts| facts.deinit(allocator);
+        self.cache.deinit(allocator);
+        self.asserting.deinit(allocator);
+    }
+};
+
+/// Build every file's call facts in one pre-pass and merge each file's
+/// assertion-containing fn names into the project witness set.
+fn collectProjectTestFacts(allocator: Allocator, graph: *ImportGraph) !TestProjectFacts {
+    var project = TestProjectFacts{};
+    errdefer project.deinit(allocator);
+    var iter = graph.files.iterator();
+    while (iter.next()) |entry| {
+        var facts = try collectFnCallFacts(allocator, entry.value_ptr.content);
+        errdefer facts.deinit(allocator);
+        var assert_it = facts.asserting.keyIterator();
+        while (assert_it.next()) |name| try project.asserting.put(allocator, name.*, {});
+        try project.cache.put(allocator, entry.key_ptr.*, facts);
+    }
+    return project;
+}
+
 fn analyzeTests(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    var project = try collectProjectTestFacts(allocator, graph);
+    defer project.deinit(allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const sink: TestIssueSink = .{
@@ -10398,11 +10672,13 @@ fn analyzeTests(
             .allocator = allocator,
             .path = entry.value_ptr.path,
         };
-        try analyzeFileTests(&sink, entry.value_ptr.*);
+        // Present by construction: collectProjectTestFacts cached every file.
+        const facts = project.cache.getPtr(entry.key_ptr.*).?;
+        try analyzeFileTests(&sink, entry.value_ptr.*, facts, &project.asserting);
     }
     // ZT105 judges a pub fn against the WHOLE project's test corpus, so it
     // runs as a second, project-level pass after the per-file scans.
-    try analyzeUntestedPubFns(allocator, graph, &issues);
+    try analyzeUntestedPubFns(allocator, graph, &project.cache, &issues);
     return issues;
 }
 
@@ -29836,6 +30112,285 @@ test "ZT102: vacuous test still warns next to a reference block" {
     );
 }
 
+// --- ZT102 helper-mediation + snapshot-verb tests (EPH-I0047 classes) ---
+// Multi-file runs use runTestQualityCheckFiles / TestQualityFile (defined
+// with the ZT105 tests below).
+
+test "ZT102: helper-mediated assertion via file-local helper is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The test body has no assertion of its own, but the file-local helper
+    // it delegates to contains the expect — not a smoke test.
+    const content =
+        \\fn check_thing(x: u32) !void {
+        \\    try std.testing.expectEqual(@as(u32, 1), x);
+        \\}
+        \\test "x" { try check_thing(1); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_helper.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: transitive helper-mediated assertion is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The assertion lives one delegation hop further: test -> outer -> inner.
+    const content =
+        \\fn inner() !void {
+        \\    try std.testing.expect(true);
+        \\}
+        \\fn outer() !void {
+        \\    try inner();
+        \\}
+        \\test "x" { try outer(); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_transit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_transit.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: helper with no assertions anywhere still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn check_thing() !void {
+        \\    std.debug.print("nothing asserted", .{});
+        \\}
+        \\test "x" { try check_thing(); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_noassert.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: call-graph cycle terminates with the correct verdict" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // a <-> b recursion, no assertions on either side: the BFS must not
+    // hang and the smoke-test note must still fire.
+    const content =
+        \\fn a() !void {
+        \\    try b();
+        \\}
+        \\fn b() !void {
+        \\    try a();
+        \\}
+        \\test "x" { try a(); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_cycle.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: cross-file asserting helper is silent (project-wide witness)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ghostty's `try lib.checkGhosttyHEnum(State, ...)` shape: the helper
+    // lives in another file but its body carries the assertions.
+    const specs = [_]TestQualityFile{
+        .{ .path = "main.zig", .content =
+        \\const lib = @import("lib.zig");
+        \\test "header enum check" { try lib.checkHeaderEnum(1); }
+        },
+        .{ .path = "lib.zig", .content =
+        \\pub fn checkHeaderEnum(x: u32) !void {
+        \\    try std.testing.expectEqual(@as(u32, 1), x);
+        \\}
+        },
+    };
+    var run = try runTestQualityCheckFiles(allocator, &specs);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "main.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: lowercase cross-file name collisions do not suppress" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // RhyOS bzip2 shape: the block calls BitReader.init + a non-asserting
+    // helper; an UNRELATED asserting `init` elsewhere in the project must
+    // not cover the block — ubiquitous lowercase names collide project-wide.
+    const specs = [_]TestQualityFile{
+        .{ .path = "main.zig", .content =
+        \\const BitReader = struct {
+        \\    pub fn init() BitReader {
+        \\        return .{};
+        \\    }
+        \\};
+        \\fn validateStreamHeader(r: *BitReader) !void {
+        \\    _ = r;
+        \\}
+        \\test "headers" {
+        \\    var reader = BitReader.init();
+        \\    try validateStreamHeader(&reader);
+        \\}
+        },
+        .{ .path = "other.zig", .content =
+        \\pub fn init() !void {
+        \\    try std.testing.expect(true);
+        \\}
+        },
+    };
+    var run = try runTestQualityCheckFiles(allocator, &specs);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: asserting helper with brace literal in signature is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle flags.zig parse_flag_value_fuzz shape: the `struct {`
+    // inside the param list must not close the fn-span tracking before the
+    // body — the body's assertions still mark the helper as asserting.
+    const specs = [_]TestQualityFile{
+        .{ .path = "main.zig", .content =
+        \\const stdx = @import("flags.zig");
+        \\test "Duration.parse_flag_value" {
+        \\    try stdx.parse_flag_value_fuzz(u32, .{ .ok = &.{} });
+        \\}
+        },
+        .{ .path = "flags.zig", .content =
+        \\pub fn parse_flag_value_fuzz(
+        \\    comptime T: type,
+        \\    cases: struct {
+        \\        ok: []const struct { []const u8, T },
+        \\    },
+        \\) !void {
+        \\    for (cases.ok) |case| {
+        \\        _ = case;
+        \\        try std.testing.expectEqual(@as(u32, 1), 1);
+        \\    }
+        \\}
+        },
+    };
+    var run = try runTestQualityCheckFiles(allocator, &specs);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "main.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: snapshot snap/diff_fmt assertion verbs are silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle stdx/prng.zig shape: `try snap(@src(), ...).diff_fmt(...)`
+    // asserts against a recorded snapshot with no expect/assert identifier.
+    const content =
+        \\test "chance" {
+        \\    const balance: i32 = 46;
+        \\    try snap(@src(),
+        \\        \\balance = 46
+        \\    ).diff_fmt("balance = {d}", .{balance});
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_snap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_snap.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: dotted diff method call counts as an assertion" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "x" { try want.diff(got); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_diff.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_diff.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: snaplen-style data names are not snapshot assertions" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // RhyOS pcap shape: `initWithSnaplen` merely contains the substring
+    // "snap" — a try-only test calling it is still a smoke test.
+    const content =
+        \\fn initWithSnaplen(link_type: u32, snaplen: u32) !void {
+        \\    _ = link_type;
+        \\    _ = snaplen;
+        \\}
+        \\test "x" { try initWithSnaplen(1, 65535); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_snaplen.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: print-only test still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "x" { std.debug.print("hi", .{}); }
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_print.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
 // ============================================================================
 // Test Quality Analysis Tests (ZT101, ZT104)
 // ============================================================================
@@ -31086,7 +31641,7 @@ test "ZC101: tiny acquire wrapper is silent" {
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
-test "ZC101: cross-fn acquire/release pair is silent (zls string_pool)" {
+test "ZC101: cross-fn acquire/release pair is silent" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31382,7 +31937,7 @@ test "ZC101: lock calls inside test blocks are not attributed" {
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
-test "ZC101: failure-branch release with sibling unlock API is silent (zls tryLockConfig)" {
+test "ZC101: failure-branch release with sibling unlock API is silent" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32195,7 +32750,7 @@ test "ZC103: semaphore post without in-fn wait is the producer shape" {
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
-test "ZC103: unlock with deferred re-lock is the borrow idiom (ghostty mailbox)" {
+test "ZC103: unlock with deferred re-lock is the borrow idiom" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32218,7 +32773,7 @@ test "ZC103: unlock with deferred re-lock is the borrow idiom (ghostty mailbox)"
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
-test "ZC103: discarded tryLock satisfies the deferred unlock (ghostty DiskCache)" {
+test "ZC103: discarded tryLock satisfies the deferred unlock" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32441,7 +32996,7 @@ test "ZC104: join text in strings and comments is not evidence" {
     try expectZC104Counts(run.issues.items, 1, 0);
 }
 
-test "ZC104: field handle joined through an alias copy is silent (tigerbeetle)" {
+test "ZC104: field handle joined through an alias copy is silent" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32488,7 +33043,7 @@ test "ZC104: field-stored handle never joined still warns" {
     try expectZC104Counts(run.issues.items, 1, 0);
 }
 
-test "ZC104: optional handle joined with .?.join() is silent (messenger)" {
+test "ZC104: optional handle joined with .?.join() is silent" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33109,7 +33664,7 @@ test "ZA209: error-set member return is silent (return ErrSet.Member idiom)" {
     );
 }
 
-test "ZA209: namespaced error constant return is silent (ghostty idiom)" {
+test "ZA209: namespaced error constant return is silent" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33131,6 +33686,151 @@ test "ZA209: namespaced error constant return is silent (ghostty idiom)" {
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "za209_nsconst.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: interface shim with discards and constant return is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ghostty KeymapNoop.translate shape: the body is param discards plus
+    // a constant aggregate return — the '!' is forced by the interface.
+    const content =
+        \\const T = struct { text: []const u8 = "" };
+        \\fn translate(self: *const T, out: []u8) !T {
+        \\    _ = self;
+        \\    _ = out;
+        \\    return .{};
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_shim.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_shim.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: single-line interface shim is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const T = struct {};
+        \\fn reload(self: *T) !void {
+        \\    _ = self;
+        \\}
+        \\fn deinitShim(self: *T) !void { _ = self; }
+    ;
+    var run = try runErrorsCheck(allocator, "za209_shim1.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_shim1.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: real infallible computation without discards still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // parseVersion-style real computation: no discards, so the shim
+    // carve-out must not apply — the '!' is genuinely droppable.
+    const content =
+        \\fn parseVersion(text: []const u8) !u32 {
+        \\    var it = std.mem.splitScalar(u8, text, '.');
+        \\    var version: u32 = 0;
+        \\    while (it.next()) |part| {
+        \\        version = version * 100 + part.len;
+        \\    }
+        \\    return version;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_parse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_parse.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: discards plus real call logic still fires (draw class)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ghostty draw*-style body: an unused-param discard but real computed
+    // work (calls) — accepted note noise, NOT the shim carve-out.
+    const content =
+        \\const Canvas = struct {
+        \\    fn rect(self: *Canvas, w: u32) void {
+        \\        _ = self;
+        \\        _ = w;
+        \\    }
+        \\};
+        \\const T = struct { height: u32, canvas: *Canvas };
+        \\fn draw(self: *T, width: u32) !void {
+        \\    _ = width;
+        \\    const y = @min(width, self.height);
+        \\    self.canvas.rect(y);
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_draw.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_draw.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: discard of a call result is not a shim discard" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn work() u32 {
+        \\    return 1;
+        \\}
+        \\fn f() !void {
+        \\    _ = work();
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_calldisc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_calldisc.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: discards with a computed return still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Param discards but the return carries computed state — not a noop.
+    const content =
+        \\const T = struct { x: u32 };
+        \\fn f(self: *T) !u32 {
+        \\    _ = self;
+        \\    return self.x;
+        \\}
+    ;
+    var run = try runErrorsCheck(allocator, "za209_compret.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_compret.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

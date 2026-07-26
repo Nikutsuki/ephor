@@ -8982,6 +8982,7 @@ const TestBlockCounters = struct {
     start_col: usize = 1,
     ref_lines: usize = 0,
     has_real_code: bool = false,
+    uses_testing_allocator: bool = false,
 };
 
 /// A located call site: the target text range plus the index of its `(`.
@@ -9272,9 +9273,24 @@ fn isTestRefLine(t: []const u8) bool {
     return false;
 }
 
+/// True when a literal-blanked, comment-stripped test-block line references
+/// the testing allocator or FailingAllocator. std.testing.allocator (and
+/// FailingAllocator wrapping it) reports leaks as test failures at deinit,
+/// so a block using either already has an assertion mechanism (ZT102).
+/// `testing.allocator` matches any dotted path ending in it; whole-identifier
+/// boundaries keep `contesting.allocator` from matching.
+fn referencesTestingAllocator(neutral: []const u8) bool {
+    return hasIdentRef(neutral, "testing.allocator") or
+        hasIdentRef(neutral, "FailingAllocator");
+}
+
 /// ZT102: evaluate a finished test block for missing assertions.
 fn reportTestBlock(sink: *const TestIssueSink, c: TestBlockCounters) !void {
     if (c.assertions > 0) return;
+    // Leak-sweep blocks: std.testing.allocator (and FailingAllocator
+    // wrapping it) fails the test at deinit on any leak — the allocator's
+    // leak detector IS the assertion mechanism.
+    if (c.uses_testing_allocator) return;
     // Test-reference blocks (`_ = @import(...)`, refAllDecls, `_ = decl;`)
     // exist to force compilation of other declarations — never vacuous.
     if (!c.has_real_code and c.ref_lines > 0) return;
@@ -9993,6 +10009,11 @@ fn scanTestLine(
 
     if (!isTestBoilerplateLine(t)) state.counters.has_real_code = true;
     if (isTestRefLine(t)) state.counters.ref_lines += 1;
+    // `neutral` is literal-blanked, so the test's own name string cannot
+    // satisfy the allocator carve-out — only body code can.
+    if (referencesTestingAllocator(neutral)) {
+        state.counters.uses_testing_allocator = true;
+    }
     state.counters.assertions += countAssertions(code);
     state.counters.try_calls += countTryCalls(code);
     try checkLineTrivialAsserts(sink, line_num, code);
@@ -29472,6 +29493,152 @@ test "ZT102: expect text in strings and comments is not an assertion" {
         \\}
     ;
     var run = try runTestQualityCheck(allocator, "zt102_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: FailingAllocator leak-sweep test is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The leak detector in std.testing.allocator (via FailingAllocator) is
+    // the assertion mechanism: the test fails at deinit on any leak.
+    const content =
+        \\const std = @import("std");
+        \\const Trie = struct {
+        \\    fn init(a: std.mem.Allocator) Trie {
+        \\        _ = a;
+        \\        return .{};
+        \\    }
+        \\    fn deinit(self: *Trie) void {
+        \\        _ = self;
+        \\    }
+        \\    fn insert(self: *Trie, k: []const u8) !void {
+        \\        _ = self;
+        \\        _ = k;
+        \\    }
+        \\};
+        \\test "insert: allocation failure sweeps leak nothing (FailingAllocator)" {
+        \\    for (0..120) |fail_at| {
+        \\        var fa = std.testing.FailingAllocator.init(
+        \\            std.testing.allocator,
+        \\            .{ .fail_index = fail_at },
+        \\        );
+        \\        var trie = Trie.init(fa.allocator());
+        \\        defer trie.deinit();
+        \\        trie.insert("key") catch break;
+        \\    }
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_fa_sweep.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: direct std.testing.allocator use is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // No expect calls and no FailingAllocator — but the testing allocator's
+    // leak detector still asserts at the defers, so neither the warning nor
+    // the smoke-test note may fire.
+    const content =
+        \\const std = @import("std");
+        \\test "buf write" {
+        \\    const buf = try std.testing.allocator.alloc(u8, 16);
+        \\    defer std.testing.allocator.free(buf);
+        \\    buf[0] = 1;
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_alloc_use.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: loop without allocator or assertions still warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo(x: usize) void {
+        \\    _ = x;
+        \\}
+        \\test "x" {
+        \\    for (0..10) |i| {
+        \\        foo(i);
+        \\    }
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_loop_warn.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: try-only smoke test without allocator stays a note" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn foo() !void {}
+        \\test "x" {
+        \\    try foo();
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_smoke_keep.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: allocator mention in the test name alone still warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The carve-out reads block-body code only — a name-string mention is
+    // not a leak-detector assertion.
+    const content =
+        \\fn foo() void {}
+        \\test "FailingAllocator behavior" {
+        \\    foo();
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt102_name_only.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(

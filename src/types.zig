@@ -77,6 +77,11 @@ pub const RULE_TEST_TRIVIAL_ASSERT = "ZT103";
 pub const RULE_TEST_SWALLOWED_ERROR = "ZT104";
 pub const RULE_TEST_UNTESTED_PUBLIC_FN = "ZT105";
 
+// ZC1xx - Concurrency (ZC102/ZC103 reserved, not yet implemented)
+pub const RULE_LOCK_NO_DEFER_UNLOCK = "ZC101";
+pub const RULE_DOUBLE_LOCK = "ZC102";
+pub const RULE_UNLOCK_WITHOUT_LOCK = "ZC103";
+
 // ============================================================================
 // Return Type Classification (for type-based detection)
 // ============================================================================

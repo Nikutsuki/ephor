@@ -148,6 +148,7 @@ const RULE_TEST_NO_ASSERTIONS = types.RULE_TEST_NO_ASSERTIONS;
 const RULE_TEST_TRIVIAL_ASSERT = types.RULE_TEST_TRIVIAL_ASSERT;
 const RULE_TEST_SWALLOWED_ERROR = types.RULE_TEST_SWALLOWED_ERROR;
 const RULE_TEST_UNTESTED_PUBLIC_FN = types.RULE_TEST_UNTESTED_PUBLIC_FN;
+const RULE_LOCK_NO_DEFER_UNLOCK = types.RULE_LOCK_NO_DEFER_UNLOCK;
 
 const Severity = types.Severity;
 
@@ -10002,6 +10003,516 @@ fn analyzeTests(
 }
 
 // ============================================================================
+// Concurrency Analysis (ZC1xx)
+// ============================================================================
+// Detects what neither `zig build` nor `zig build test` catches mechanically:
+// lock/unlock pairing defects that manifest as deadlocks or lock leaks on
+// error paths. ZC101 is API-agnostic — it matches on method NAMES in the
+// lock/unlock families, so 0.15 (`std.Thread.Mutex`: `m.lock()`/`m.unlock()`)
+// and 0.16 (`std.Io.Mutex`/`std.Io.RwLock`: `m.lock(io)`, `rw.lockShared(io)`)
+// codebases are covered by the same scan.
+
+/// A located lock-family acquire call: where it is, on what receiver.
+/// `receiver` and `method` borrow the file content, which outlives the
+/// scan. `depth` is the brace depth at the call relative to the fn body.
+/// `cond_position` is true when the acquire's line opens a block after
+/// the call (`if (mu.tryLock()) {`) — the opened block is the acquire's
+/// guard, so a defer one level deeper still registers on every acquired
+/// path.
+const LockAcquire = struct {
+    line: usize,
+    col: usize,
+    receiver: []const u8,
+    method: []const u8,
+    depth: usize,
+    cond_position: bool,
+};
+
+/// A located release call (unlock/unlockShared/post family). `depth` for
+/// a plain release is the brace depth at the call site relative to the fn
+/// body: 1 = top-level statement (covers every path that reaches it),
+/// deeper = inside a branch (covers only some paths — the
+/// acquire/release-API failure-branch form). For a deferred release it is
+/// the defer STATEMENT's depth (the opener line for a `defer { }` block),
+/// which is what determines on which paths the defer registers.
+const LockRelease = struct {
+    receiver: []const u8,
+    method: []const u8,
+    depth: usize,
+};
+
+/// Per-fn lock facts accumulated while scanning (ZC101).
+const FnLockRecord = struct {
+    acquires: std.ArrayListUnmanaged(LockAcquire) = .empty,
+    defer_releases: std.ArrayListUnmanaged(LockRelease) = .empty,
+    plain_releases: std.ArrayListUnmanaged(LockRelease) = .empty,
+    stmt_count: usize = 0,
+
+    fn deinit(self: *FnLockRecord, allocator: Allocator) void {
+        self.acquires.deinit(allocator);
+        self.defer_releases.deinit(allocator);
+        self.plain_releases.deinit(allocator);
+    }
+};
+
+/// Mutable state for the per-file concurrency scan (ZC101).
+const ConcurrencyScanState = struct {
+    allocator: Allocator,
+    records: std.ArrayListUnmanaged(FnLockRecord) = .empty,
+    in_fn: bool = false,
+    pending_fn: bool = false,
+    fn_depth: usize = 0,
+    in_defer: bool = false,
+    defer_depth: usize = 0,
+    defer_stmt_depth: usize = 0,
+    blank_buf: [16 * 1024]u8 = undefined,
+
+    fn deinit(self: *ConcurrencyScanState) void {
+        for (self.records.items) |*rec| rec.deinit(self.allocator);
+        self.records.deinit(self.allocator);
+    }
+
+    /// The fn record currently being filled (always the last appended).
+    fn current(self: *ConcurrencyScanState) *FnLockRecord {
+        return &self.records.items[self.records.items.len - 1];
+    }
+};
+
+/// Destination for concurrency issues, bundled to keep param counts low.
+const ConcurrencyIssueSink = struct {
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    path: []const u8,
+};
+
+/// One line's call-scan context for ZC101 (bundled for param counts).
+/// `defer_attr_depth` is the depth attributed to releases in defer
+/// context: the defer STATEMENT's depth — this line's start depth for a
+/// single-line defer or block opener, the depth captured at the opener
+/// for lines inside a `defer { }` block.
+const ConcLineCtx = struct {
+    code: []const u8,
+    blanked: []const u8,
+    line_num: usize,
+    defer_ctx: bool,
+    defer_attr_depth: usize,
+};
+
+/// ZC101 acquire family: std mutex/rwlock/semaphore method names across
+/// Zig 0.15 (`std.Thread.Mutex`/`RwLock`) and 0.16 (`std.Io.Mutex`/`RwLock`,
+/// verified against std 0.16.0: lock/lockUncancelable/tryLock/tryLockShared/
+/// lockShared/lockSharedUncancelable; `std.Io.Semaphore`: wait/
+/// waitUncancelable, paired with post).
+fn isAcquireMethod(seg: []const u8) bool {
+    const methods = [_][]const u8{
+        "lock",                   "lockShared",       "lockUncancelable",
+        "lockSharedUncancelable", "tryLock",          "tryLockShared",
+        "wait",                   "waitUncancelable",
+    };
+    for (methods) |m| {
+        if (mem.eql(u8, seg, m)) return true;
+    }
+    return false;
+}
+
+/// Semaphore acquire names (ZC101): both pair with `post` and both need
+/// same-receiver post evidence before they are evaluated (WaitGroup/
+/// condvar/process waits never have any).
+fn isSemaphoreAcquire(seg: []const u8) bool {
+    return mem.eql(u8, seg, "wait") or mem.eql(u8, seg, "waitUncancelable");
+}
+
+/// ZC101 release family, paired to acquires by `releaseMatchesAcquire`.
+/// The Uncancelable unlock variants are not std 0.16 but appear in
+/// third-party lock impls; over-matching releases only ever suppresses a
+/// warning — the safe direction.
+fn isReleaseMethod(seg: []const u8) bool {
+    const methods = [_][]const u8{
+        "unlock",                   "unlockUncancelable", "unlockShared",
+        "unlockSharedUncancelable", "post",
+    };
+    for (methods) |m| {
+        if (mem.eql(u8, seg, m)) return true;
+    }
+    return false;
+}
+
+/// Strict acquire/release pairing (ZC101): exclusive locks pair with
+/// `unlock`/`unlockUncancelable`, shared (read) locks with `unlockShared`/
+/// `unlockSharedUncancelable`, semaphore `wait` with `post`. A mis-paired
+/// release does NOT count as coverage — releasing an RwLock with the wrong
+/// mode is itself a defect, not a pairing.
+fn releaseMatchesAcquire(acquire: []const u8, release: []const u8) bool {
+    if (isSemaphoreAcquire(acquire)) return mem.eql(u8, release, "post");
+    const shared_acquire = mem.indexOf(u8, acquire, "Shared") != null;
+    const shared_release = mem.indexOf(u8, release, "Shared") != null;
+    if (shared_acquire != shared_release) return false;
+    return mem.startsWith(u8, release, "unlock");
+}
+
+/// Receiver text of a dotted call target (`self.mu.lock` -> `self.mu`).
+/// Bare calls (`lock(...)`) have no receiver — free fns and fn DECLARATIONS
+/// named `lock` are not method-call acquires.
+fn callReceiver(target: []const u8) ?[]const u8 {
+    const dot = mem.lastIndexOfScalar(u8, target, '.') orelse return null;
+    if (dot == 0) return null;
+    return target[0..dot];
+}
+
+/// True when the statement discards the call result (`_ = file.tryLock(...)`).
+/// A discarded acquire is not scoped ownership — it is the hold-till-close
+/// file-lock idiom — so ZC101 does not treat it as an acquire.
+fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
+    const prefix = mem.trim(u8, code[0..call_start], " \t");
+    return mem.endsWith(u8, prefix, "_ =");
+}
+
+/// Update defer/errdefer block tracking for one literal-blanked line
+/// (ZC101): releases inside `defer { ... }` blocks are deferred releases,
+/// and `errdefer` releases count as deferred coverage (the documented
+/// blind spot: a SOLO errdefer release with no success-path release still
+/// leaks on the success path, but flagging the dominant correct
+/// `lock(); errdefer unlock(); work(); unlock();` form would be worse).
+/// A block opener also captures the defer STATEMENT's depth (the opener
+/// line's start depth): releases inside the block are attributed that
+/// depth, not their own — the defer registers at the opener's scope.
+fn trackConcurrencyDefer(
+    blanked: []const u8,
+    defer_line: bool,
+    state: *ConcurrencyScanState,
+) void {
+    if (defer_line and mem.indexOfScalar(u8, blanked, '{') != null) {
+        state.in_defer = true;
+        state.defer_depth = 0;
+        state.defer_stmt_depth = state.fn_depth;
+    }
+    if (!state.in_defer) return;
+    for (blanked) |c| {
+        if (c == '{') state.defer_depth += 1;
+        if (c == '}') {
+            if (state.defer_depth > 0) state.defer_depth -= 1;
+            if (state.defer_depth == 0) state.in_defer = false;
+        }
+    }
+}
+
+/// Open a fn record when a pending fn def gains its body `{` (ZC101).
+/// A pending def ended by `;` first is a bodiless extern decl — drop it.
+/// Fns nested inside another fn are not tracked separately; their calls
+/// roll up into the outer fn's record (widens coverage — FP-safe).
+fn updateConcurrencySpan(
+    state: *ConcurrencyScanState,
+    tc: []const u8,
+    blanked: []const u8,
+) !void {
+    if (!state.pending_fn) {
+        if (extractFnDef(tc) == null) return;
+        state.pending_fn = true;
+    }
+    if (mem.indexOfScalar(u8, blanked, '{') == null) {
+        if (mem.endsWith(u8, tc, ";")) state.pending_fn = false;
+        return;
+    }
+    state.pending_fn = false;
+    state.in_fn = true;
+    state.fn_depth = 0;
+    try state.records.append(state.allocator, .{});
+}
+
+/// Lock-family classification of one call's final segment (ZC101).
+const CallKind = enum { acquire, release, other };
+
+/// Classify one call target's final segment (ZC101).
+fn classifyCall(seg: []const u8) CallKind {
+    if (isAcquireMethod(seg)) return .acquire;
+    if (isReleaseMethod(seg)) return .release;
+    return .other;
+}
+
+/// A call site resolved to the facts ZC101 records (bundled for param
+/// counts). `depth` is the brace depth at the call relative to the fn body.
+const ResolvedCall = struct {
+    start: usize,
+    seg: []const u8,
+    receiver: []const u8,
+    depth: usize,
+};
+
+/// Record one classified lock-family call into the open fn record (ZC101).
+/// Acquires inside defer context or with discarded results are skipped;
+/// releases are split deferred vs plain for the coverage cascade. Deferred
+/// releases are attributed the defer STATEMENT's depth; plain releases
+/// keep their call-site depth.
+fn recordLockCall(
+    state: *ConcurrencyScanState,
+    lc: ConcLineCtx,
+    kind: CallKind,
+    call: ResolvedCall,
+) !void {
+    const rec = state.current();
+    switch (kind) {
+        .acquire => {
+            if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) return;
+            try rec.acquires.append(state.allocator, .{
+                .line = lc.line_num,
+                .col = call.start + 1,
+                .receiver = call.receiver,
+                .method = call.seg,
+                .depth = call.depth,
+                .cond_position = mem.indexOfScalar(u8, lc.blanked[call.start..], '{') != null,
+            });
+        },
+        .release => {
+            const list = if (lc.defer_ctx) &rec.defer_releases else &rec.plain_releases;
+            const depth = if (lc.defer_ctx) lc.defer_attr_depth else call.depth;
+            try list.append(state.allocator, .{
+                .receiver = call.receiver,
+                .method = call.seg,
+                .depth = depth,
+            });
+        },
+        .other => {},
+    }
+}
+
+/// Record one line's lock-family calls into the open fn record (ZC101).
+fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
+    var pos: usize = 0;
+    while (nextCallSite(lc.code, pos)) |site| {
+        pos = site.open_paren + 1;
+        const target = lc.code[site.start..site.open_paren];
+        const seg = lastSegment(target);
+        const kind = classifyCall(seg);
+        if (kind == .other) continue;
+        const receiver = callReceiver(target) orelse continue;
+        try recordLockCall(state, lc, kind, .{
+            .start = site.start,
+            .seg = seg,
+            .receiver = receiver,
+            .depth = braceDelta(state.fn_depth, lc.blanked[0..site.start]),
+        });
+    }
+}
+
+/// Scan one line of a file for concurrency facts, updating `state`.
+fn scanConcurrencyLine(
+    state: *ConcurrencyScanState,
+    line: []const u8,
+    line_num: usize,
+) !void {
+    const t = mem.trim(u8, line, " \t\r");
+    if (isCommentOrMultilineString(t)) return;
+    const code_end = findCommentStart(line) orelse line.len;
+    const code = line[0..code_end];
+    const blanked = blankLiteralContents(code, &state.blank_buf);
+    if (!state.in_fn) {
+        const tc = mem.trim(u8, code, " \t\r");
+        try updateConcurrencySpan(state, tc, blanked);
+    }
+    if (!state.in_fn) return;
+    const defer_line = isDeferOrErrdefer(t);
+    const defer_ctx = defer_line or state.in_defer;
+    // Depth attributed to defer-context releases: the defer STATEMENT's
+    // depth. Computed BEFORE trackConcurrencyDefer mutates block state —
+    // for an opener line that is this line's start depth, for lines
+    // inside a block the depth captured at the opener.
+    const defer_attr_depth = if (state.in_defer) state.defer_stmt_depth else state.fn_depth;
+    trackConcurrencyDefer(blanked, defer_line, state);
+    try scanConcurrencyCalls(state, .{
+        .code = code,
+        .blanked = blanked,
+        .line_num = line_num,
+        .defer_ctx = defer_ctx,
+        .defer_attr_depth = defer_attr_depth,
+    });
+    state.current().stmt_count += mem.count(u8, blanked, ";");
+    state.fn_depth = braceDelta(state.fn_depth, blanked);
+    if (state.fn_depth == 0) state.in_fn = false;
+}
+
+/// True when `releases` holds a release matching this acquire's receiver
+/// and pairing rules.
+fn hasMatchingRelease(releases: []const LockRelease, acq: LockAcquire) bool {
+    for (releases) |rel| {
+        if (!mem.eql(u8, rel.receiver, acq.receiver)) continue;
+        if (releaseMatchesAcquire(acq.method, rel.method)) return true;
+    }
+    return false;
+}
+
+/// True when one deferred release covers this acquire (ZC101). A defer
+/// registers only on the paths that reach its STATEMENT, so coverage
+/// requires the defer's depth ≤ the acquire's depth — a defer nested
+/// deeper than the acquire registers only on the branch that contains it
+/// and runs at that block's exit, leaving later code unlocked or the lock
+/// leaked on the sibling paths. The one-deeper exception: an acquire in
+/// condition position (`if (mu.tryLock()) {`) opens its own guard block,
+/// so a defer immediately inside registers exactly on the acquired paths.
+fn deferCovers(acq: LockAcquire, rel: LockRelease) bool {
+    if (!mem.eql(u8, rel.receiver, acq.receiver)) return false;
+    if (!releaseMatchesAcquire(acq.method, rel.method)) return false;
+    if (rel.depth <= acq.depth) return true;
+    return acq.cond_position and rel.depth == acq.depth + 1;
+}
+
+/// True when `releases` holds a deferred release covering this acquire.
+fn hasCoveringDeferRelease(releases: []const LockRelease, acq: LockAcquire) bool {
+    for (releases) |rel| {
+        if (deferCovers(acq, rel)) return true;
+    }
+    return false;
+}
+
+/// True when the fn holds a matching plain release at the requested
+/// path-covering level (ZC101): `top_level` selects depth-1 statements
+/// (cover every path that reaches them) vs deeper branch-scoped releases
+/// (cover only the paths through their branch — the failure-branch half
+/// of a cross-fn acquire/release API).
+fn hasPlainReleaseAtDepth(
+    rec: *const FnLockRecord,
+    acq: LockAcquire,
+    top_level: bool,
+) bool {
+    for (rec.plain_releases.items) |rel| {
+        if (!mem.eql(u8, rel.receiver, acq.receiver)) continue;
+        if (!releaseMatchesAcquire(acq.method, rel.method)) continue;
+        if ((rel.depth <= 1) == top_level) return true;
+    }
+    return false;
+}
+
+/// True when any OTHER fn record in the file releases this acquire — the
+/// cross-function acquire/release idiom (zls: `pool.mutex.lock()` in
+/// `stringToSliceLock`, unlocked in `LockedString.release`; InternPool's
+/// `ip.lock` pairs). The receiver field-chain text must match exactly.
+fn hasCrossFnRelease(
+    records: []const FnLockRecord,
+    self_idx: usize,
+    acq: LockAcquire,
+) bool {
+    for (records, 0..) |rec, idx| {
+        if (idx == self_idx) continue;
+        if (hasMatchingRelease(rec.defer_releases.items, acq)) return true;
+        if (hasMatchingRelease(rec.plain_releases.items, acq)) return true;
+    }
+    return false;
+}
+
+/// True when `releases` holds a `post` on this receiver.
+fn hasPostRelease(releases: []const LockRelease, receiver: []const u8) bool {
+    for (releases) |rel| {
+        if (!mem.eql(u8, rel.method, "post")) continue;
+        if (mem.eql(u8, rel.receiver, receiver)) return true;
+    }
+    return false;
+}
+
+/// True when some fn in the file posts this receiver — evidence it is a
+/// Semaphore, so its `wait` is a lock-family acquire. Without it, `wait`
+/// is assumed to be WaitGroup/condvar/process/event waiting (none pair
+/// with `post`) and the call is not evaluated.
+fn hasSemaphoreEvidence(records: []const FnLockRecord, acq: LockAcquire) bool {
+    for (records) |rec| {
+        if (hasPostRelease(rec.defer_releases.items, acq.receiver)) return true;
+        if (hasPostRelease(rec.plain_releases.items, acq.receiver)) return true;
+    }
+    return false;
+}
+
+/// ZC101 note for a non-deferred in-fn release (both call sites share the
+/// wording — the defect is the missing defer, not the release's shape).
+fn emitUnlockNotDeferred(sink: *const ConcurrencyIssueSink, acq: LockAcquire) !void {
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = acq.line,
+        .col = acq.col,
+        .severity = .note,
+        .rule = RULE_LOCK_NO_DEFER_UNLOCK,
+        .message = "unlock not deferred — error paths leak the lock",
+        .help = "move the release into a `defer` so early returns and " ++
+            "error paths cannot skip it",
+    });
+}
+
+/// ZC101 verdict cascade for one acquire: a same-fn defer release whose
+/// statement depth covers the acquire (even a conditional one) is
+/// covered; a top-level plain release is a note (error paths before it
+/// skip it); a tiny acquire wrapper is intentional API design; a
+/// branch-scoped release whose other half lives in a sibling release fn
+/// (zls tryLockConfig/unlockConfig) is that idiom; a lone branch-scoped
+/// release is a note (some paths release, some leak); no release anywhere
+/// is a warning.
+fn evaluateAcquire(
+    sink: *const ConcurrencyIssueSink,
+    records: []const FnLockRecord,
+    rec_idx: usize,
+    acq: LockAcquire,
+) !void {
+    const rec = &records[rec_idx];
+    if (isSemaphoreAcquire(acq.method) and !hasSemaphoreEvidence(records, acq)) return;
+    if (hasCoveringDeferRelease(rec.defer_releases.items, acq)) return;
+    if (hasPlainReleaseAtDepth(rec, acq, true)) return emitUnlockNotDeferred(sink, acq);
+    // Tiny acquire wrapper (`fn acquire() void { mu.lock(); }`): the
+    // release belongs to a sibling unlock API by design.
+    if (rec.stmt_count <= 1) return;
+    if (hasCrossFnRelease(records, rec_idx, acq)) return;
+    if (hasPlainReleaseAtDepth(rec, acq, false)) return emitUnlockNotDeferred(sink, acq);
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = acq.line,
+        .col = acq.col,
+        .severity = .warning,
+        .rule = RULE_LOCK_NO_DEFER_UNLOCK,
+        .message = "lock without defer unlock — error paths leak the lock",
+        .help = "release it in a `defer` immediately after the acquire so " ++
+            "error paths cannot skip the release",
+    });
+}
+
+/// Evaluate every fn record's acquires once the file scan is complete —
+/// cross-fn evidence needs the whole file first.
+fn evaluateLockRecords(
+    sink: *const ConcurrencyIssueSink,
+    records: []const FnLockRecord,
+) !void {
+    for (records, 0..) |*rec, rec_idx| {
+        for (rec.acquires.items) |acq| {
+            try evaluateAcquire(sink, records, rec_idx, acq);
+        }
+    }
+}
+
+/// Analyze a single file for lock/unlock pairing defects (ZC101).
+fn analyzeFileConcurrency(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
+    var state = ConcurrencyScanState{ .allocator = sink.allocator };
+    defer state.deinit();
+    var lines = mem.splitScalar(u8, a.content, '\n');
+    var line_num: usize = 0;
+    while (lines.next()) |line| {
+        line_num += 1;
+        try scanConcurrencyLine(&state, line, line_num);
+    }
+    try evaluateLockRecords(sink, state.records.items);
+}
+
+fn analyzeConcurrency(
+    allocator: Allocator,
+    graph: *ImportGraph,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    var iter = graph.files.iterator();
+    while (iter.next()) |entry| {
+        const sink: ConcurrencyIssueSink = .{
+            .issues = &issues,
+            .allocator = allocator,
+            .path = entry.value_ptr.path,
+        };
+        try analyzeFileConcurrency(&sink, entry.value_ptr.*);
+    }
+    return issues;
+}
+
+// ============================================================================
 // Unused Analysis Helpers
 // ============================================================================
 
@@ -16215,6 +16726,7 @@ fn writeDefaultConfig() !void {
         \\  //                     ZT102 no-assertions (note for try-only smoke tests),
         \\  //                     ZT103 trivially-true-assert, ZT104 swallowed-error,
         \\  //                     ZT105 untested-pub-fn (note)
+        \\  //   ZC1xx Concurrency: ZC101 lock-no-defer-unlock (ZC102/ZC103 planned)
         \\  "disable": ["ZA305", "ZA306"],
         \\
         \\  // Rules to explicitly enable (overrides disable)
@@ -17891,6 +18403,8 @@ fn printHelp() void {
         \\  ZT1xx  Tests      (ZT101: lie-test, ZT102: no-assertions (note for
         \\                     try-only smoke tests), ZT103: trivially-true-assert,
         \\                     ZT104: swallowed-error, ZT105: untested-pub-fn (note))
+        \\  ZC1xx  Concurrency (ZC101: lock-no-defer-unlock;
+        \\                     ZC102/ZC103 planned)
         \\
         \\RUNTIME ANALYSIS (ephor runtime):
         \\  Runs 'zig build test' with GeneralPurposeAllocator diagnostics enabled.
@@ -18231,12 +18745,13 @@ const IssueCounts = struct {
     null_safety: usize = 0,
     panic: usize = 0,
     tests: usize = 0,
+    concurrency: usize = 0,
 };
 
 fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void {
     const total = counts.orphan + counts.memory + counts.err + counts.unused +
         counts.complexity + counts.fmt + counts.style + counts.null_safety + counts.panic +
-        counts.tests;
+        counts.tests + counts.concurrency;
 
     if (format == .json) {
         std.debug.print(
@@ -18255,6 +18770,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             \\      "null_safety": {d},
             \\      "panic": {d},
             \\      "tests": {d},
+            \\      "concurrency": {d},
             \\      "total": {d}
             \\    }},
             \\    "quality": {{
@@ -18278,6 +18794,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             counts.null_safety,
             counts.panic,
             counts.tests,
+            counts.concurrency,
             total,
             s.not_implemented_count,
             s.todo_count,
@@ -18301,6 +18818,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             \\  NullSafety: {d}
             \\  Panic:      {d}
             \\  Tests:      {d}
+            \\  Concurrency: {d}
             \\  TOTAL:      {d}
             \\
             \\Quality: NotImplemented={d} {s}={d}
@@ -18320,6 +18838,7 @@ fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void
             counts.null_safety,
             counts.panic,
             counts.tests,
+            counts.concurrency,
             total,
             s.not_implemented_count,
             @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
@@ -18602,6 +19121,10 @@ pub fn main(init: std.process.Init) !void {
                 var test_issues = try analyzeTests(alloc, &g);
                 defer deinitIssues(&test_issues, alloc);
 
+                // Concurrency (ZC1xx): lock/unlock pairing defects
+                var conc_issues = try analyzeConcurrency(alloc, &g);
+                defer deinitIssues(&conc_issues, alloc);
+
                 // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
                 var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
                 defer deinitIssues(&ignored_err_issues, alloc);
@@ -18729,6 +19252,14 @@ pub fn main(init: std.process.Init) !void {
                     &cfg,
                     &g,
                 );
+                const conc_count = printIssues(
+                    conc_issues.items,
+                    base_path,
+                    cfg.format,
+                    "concurrency",
+                    &cfg,
+                    &g,
+                );
 
                 // Accumulate totals
                 const total = orphan_count
@@ -18737,7 +19268,7 @@ pub fn main(init: std.process.Init) !void {
                     .add(panic_count).add(unused_count)
                     .add(cx_count).add(fmt_count)
                     .add(naming_count).add(style_count)
-                    .add(test_count);
+                    .add(test_count).add(conc_count);
 
                 if (cfg.show_summary) {
                     printSummary(.{
@@ -18751,6 +19282,7 @@ pub fn main(init: std.process.Init) !void {
                         .null_safety = null_safety_count.warnings,
                         .panic = panic_count.warnings,
                         .tests = test_count.warnings,
+                        .concurrency = conc_count.warnings,
                     }, stats, cfg.format);
                 }
 
@@ -18775,6 +19307,7 @@ pub fn main(init: std.process.Init) !void {
                     for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
                     for (panic_issues.items) |i| try all_issues.append(alloc, i);
                     for (test_issues.items) |i| try all_issues.append(alloc, i);
+                    for (conc_issues.items) |i| try all_issues.append(alloc, i);
 
                     const slice = all_issues.items;
                     if (exportIssues(alloc, export_path, slice, &cfg, &g)) |exported_count| {
@@ -28383,4 +28916,602 @@ test "ZT105: pub fn used only inside a test file is silent" {
         @as(usize, 1),
         countUntestedFnNotes(run.issues.items, "never_api"),
     );
+}
+
+// ============================================================================
+// Concurrency Analysis Tests (ZC101)
+// ============================================================================
+
+/// Test helper: build a one-file graph and run the concurrency pipeline.
+fn runConcurrencyCheck(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !CFGTestRun {
+    var graph = ImportGraph.init(allocator);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var issues = try analyzeConcurrency(allocator, &graph);
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
+/// Assert the exact ZC101 warning/note counts (both — a silent analyzer
+/// passes a warnings==0 check vacuously, so every silent test also has a
+/// firing sibling elsewhere in this section).
+fn expectZC101Counts(
+    issues: []const Issue,
+    warnings: usize,
+    notes: usize,
+) !void {
+    try std.testing.expectEqual(
+        warnings,
+        countBySeverity(issues, RULE_LOCK_NO_DEFER_UNLOCK, .warning),
+    );
+    try std.testing.expectEqual(
+        notes,
+        countBySeverity(issues, RULE_LOCK_NO_DEFER_UNLOCK, .note),
+    );
+}
+
+test "ZC101: lock with plain unlock is a note, not a warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    doWork();
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_note.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 1);
+}
+
+test "ZC101: lock with no release at all is a warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_warn.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: lock with defer unlock is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    defer mu.unlock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: conditional and block-form defers count as coverage" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `defer if (c) mu.unlock();` is the zls InternPool should_lock idiom;
+    // `defer { mu.unlock(); }` is the multi-statement cleanup form.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    defer if (c) mu.unlock();
+        \\    doWork();
+        \\}
+        \\fn g() void {
+        \\    mu.lock();
+        \\    defer {
+        \\        mu.unlock();
+        \\    }
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_condefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: tiny acquire wrapper is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `fn acquire() void { mu.lock(); }` is one half of an intentional
+    // acquire/release API pair — the release lives in a sibling fn. The
+    // second fn exercises the single-line open-and-close-on-one-line form.
+    const content =
+        \\fn acquire() void {
+        \\    mu.lock();
+        \\}
+        \\fn acquire_inline() void { mu.lock(); }
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_tiny.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: cross-fn acquire/release pair is silent (zls string_pool)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Mirrors zls string_pool.zig: lock in stringToSliceLock (two
+    // statements, so the tiny-wrapper suppression cannot mask the
+    // cross-fn path), unlock in LockedString.release.
+    const content =
+        \\fn lockForRead(pool: *Pool) []const u8 {
+        \\    pool.mutex.lock();
+        \\    return pool.slice;
+        \\}
+        \\fn release(pool: *Pool) void {
+        \\    pool.mutex.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_crossfn.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: cross-fn release on a DIFFERENT receiver does not suppress" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // other.mutex.unlock() exists in the file but names a different
+    // receiver field-chain than mu.lock() — no suppression.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    doWork();
+        \\}
+        \\fn release(other: *Pool) void {
+        \\    other.mutex.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_diffrecv.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: 0.16 form lock(io) with defer unlock(io) is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn doWork() !void {}
+        \\fn f(io: std.Io) !void {
+        \\    try mu.lock(io);
+        \\    defer mu.unlock(io);
+        \\    try doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_io.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: lockShared pairs with unlockShared, not plain unlock" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // f is correctly paired (silent); g releases a shared lock with the
+    // exclusive unlock — a mis-paired release is not coverage. Distinct
+    // receivers: a same-receiver unlockShared elsewhere in the file would
+    // legitimately suppress g via the cross-fn rule (textual matching
+    // cannot tell g's mis-pair from a valid release — documented FN).
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    rw.lockShared();
+        \\    defer rw.unlockShared();
+        \\    doWork();
+        \\}
+        \\fn g() void {
+        \\    rw2.lockShared();
+        \\    defer rw2.unlock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_shared.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: semaphore wait/post is silent; WaitGroup wait is not an acquire" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // f is a real semaphore (post evidence exists). g's wg.wait() has no
+    // post on wg anywhere — WaitGroup/condvar/process waits are skipped.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    sem.wait();
+        \\    defer sem.post();
+        \\    doWork();
+        \\}
+        \\fn g() void {
+        \\    wg.wait();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_sem.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: discarded tryLock result is not an acquire (file-lock idiom)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ghostty DiskCache: `_ = file.tryLock(.exclusive) catch return ...`
+    // holds the lock till close by design — a discarded acquire is not
+    // scoped ownership.
+    const content =
+        \\fn doWork() !void {}
+        \\fn f(file: std.fs.File) !void {
+        \\    _ = file.tryLock(.exclusive) catch return error.CacheIsLocked;
+        \\    try doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_discard.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: strings and comments are neither acquires nor releases" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The comment `// defer mu.unlock();` and the string "mu.unlock()"
+    // must NOT cover the real acquire; comment/string `mu.lock()` text
+    // must NOT fire. One real unpaired acquire => exactly one warning.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    // defer mu.unlock();
+        \\    doWork();
+        \\    const s = "mu.unlock(); mu.lock();";
+        \\    _ = s;
+        \\    // mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_strings.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: bare lock() calls and fn decls named lock are not acquires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `fn lock(...)` is a declaration, `lock(self)` a free call — neither
+    // has a receiver. `mu.locking()` is not in the lock family.
+    const content =
+        \\fn doWork() void {}
+        \\fn lock(self: *Self) void {
+        \\    self.inner.impl();
+        \\}
+        \\fn f(self: *Self) void {
+        \\    lock(self);
+        \\    mu.locking();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_bare.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: errdefer unlock counts as deferred coverage" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The dominant correct form: success path unlocks plainly, error path
+    // via errdefer. Flagging it would punish correct code.
+    const content =
+        \\fn doWork() !void {}
+        \\fn f() !void {
+        \\    mu.lock();
+        \\    errdefer mu.unlock();
+        \\    try doWork();
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_errdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: each acquire is judged independently" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // a is defer-covered; b is never released => exactly one warning.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    a.lock();
+        \\    defer a.unlock();
+        \\    b.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_two.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: tryLock in an if-condition with defer inside is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    if (mu.tryLock()) {
+        \\        defer mu.unlock();
+        \\        doWork();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_trylock.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: acquires inside defer blocks are not evaluated" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zls diagnostics.zig idiom: lock inside a defer-block cleanup.
+    // Without the defer-context skip this would warn — the skip is what
+    // the test discriminates.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    defer {
+        \\        state.mutex.lock();
+        \\        state.close();
+        \\    }
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_deferblk.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: lock calls inside test blocks are not attributed" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Fn-span tracking never enters a test block — lock hygiene in tests
+    // is the ZT band's domain, not ZC101's.
+    const content =
+        \\fn doWork() void {}
+        \\test "x" {
+        \\    mu.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_test.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: failure-branch release with sibling unlock API is silent (zls tryLockConfig)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zls DocumentStore.tryLockConfig/unlockConfig: the in-fn unlock
+    // covers only the failure branch; the success path returns locked and
+    // the caller releases via unlockConfig. A branch-scoped release plus
+    // a cross-fn release is the acquire/release idiom, not a defect.
+    const content =
+        \\fn tryLockConfig(self: *Self) ?u8 {
+        \\    self.impl.mutex.lock();
+        \\    return if (self.impl.config) |cfg| cfg else {
+        \\        self.impl.mutex.unlock();
+        \\        return null;
+        \\    };
+        \\}
+        \\fn unlockConfig(self: *Self) void {
+        \\    self.impl.mutex.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_branchapi.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: lone branch-scoped release is a note (some paths leak)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The unlock covers only the c==true path; c==false leaks. No defer,
+    // no cross-fn release — the note flags the non-deferred partial pair.
+    const content =
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    if (c) {
+        \\        mu.unlock();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_partial.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 1);
+}
+
+test "ZC101: branch-scoped defer does not cover an outer-depth acquire" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // f: the defer registers only on the c path and runs at the BLOCK
+    // exit — doWork runs unlocked (c) or the lock leaks (!c) => warning.
+    // g: a same-depth conditional defer registers on every path => silent.
+    // h: lock and defer both inside the loop body (2<=2) => silent.
+    // Distinct receivers so cross-fn suppression cannot mask f's defect.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    if (c) {
+        \\        defer mu.unlock();
+        \\    }
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mu2.lock();
+        \\    defer if (c) mu2.unlock();
+        \\    doWork();
+        \\}
+        \\fn h(c: bool) void {
+        \\    while (c) {
+        \\        mu3.lock();
+        \\        defer mu3.unlock();
+        \\        doWork();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_branchdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: waitUncancelable is a semaphore acquire (0.16 Io.Semaphore)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // f is defer-covered => silent. g has a top-level plain post, which
+    // is also the semaphore evidence making the acquire evaluated => note.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(io: std.Io) void {
+        \\    sem.waitUncancelable(io);
+        \\    defer sem.post(io);
+        \\    doWork();
+        \\}
+        \\fn g(io: std.Io) void {
+        \\    sem2.waitUncancelable(io);
+        \\    doWork();
+        \\    sem2.post(io);
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc101_waitunc.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 1);
+}
+
+test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = Config{
+        .command = .check,
+        .path = "src",
+        .path_owned = false,
+        .entries = .empty,
+        .exclude = .empty,
+        .orphan_exclude = .empty,
+        .disabled_rules = .empty,
+        .enabled_rules = .empty,
+        .verbose = false,
+        .show_summary = false,
+        .format = .text,
+        .thresholds = .{},
+        .init_build = false,
+        .export_path = null,
+        .known_issues_path = null,
+        .known_issues = .empty,
+        .auto_approve = false,
+        .runtime_command = null,
+        .install_version = null,
+    };
+    defer cfg.deinit(allocator);
+
+    // Default: ZC101 is on.
+    try std.testing.expect(cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
+
+    // "ZC" prefix disables the whole band, "ZC1" the ZC1xx family.
+    const zc = try allocator.dupe(u8, "ZC");
+    try cfg.disabled_rules.append(allocator, zc);
+    try std.testing.expect(!cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
+    allocator.free(zc);
+    cfg.disabled_rules.clearRetainingCapacity();
+    const zc1 = try allocator.dupe(u8, "ZC1");
+    try cfg.disabled_rules.append(allocator, zc1);
+    try std.testing.expect(!cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
+    allocator.free(zc1);
+    cfg.disabled_rules.clearRetainingCapacity();
+
+    // Unrelated prefixes do not touch it.
+    try cfg.disabled_rules.append(allocator, try allocator.dupe(u8, "ZT"));
+    try std.testing.expect(cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
 }

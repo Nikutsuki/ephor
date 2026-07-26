@@ -156,7 +156,6 @@ const RULE_DEFINITE_ASSIGNMENT = types.RULE_DEFINITE_ASSIGNMENT;
 const RULE_LINE_TOO_LONG = types.RULE_LINE_TOO_LONG;
 const RULE_FILE_TOO_LONG = types.RULE_FILE_TOO_LONG;
 const RULE_NAMING_CONVENTION = types.RULE_NAMING_CONVENTION;
-const RULE_DEBUG_PRINT = types.RULE_DEBUG_PRINT;
 const RULE_OPTIONAL_UNWRAP_UNSAFE = types.RULE_OPTIONAL_UNWRAP_UNSAFE;
 const RULE_ORELSE_QUESTION_UNSAFE = types.RULE_ORELSE_QUESTION_UNSAFE;
 const RULE_DECREMENT_WITHOUT_CHECK = types.RULE_DECREMENT_WITHOUT_CHECK;
@@ -12813,61 +12812,9 @@ fn reportLineTooLong(
     });
 }
 
-/// Per-file sink for the style line checks (keeps arity ≤ 4, ZA303).
-const StyleSink = struct {
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-};
-
-/// ZA704: std.debug.print left in non-test code (opt-in pre-merge hygiene;
-/// off by default — CLI apps print to stderr by design).
-/// Every match is iterated with a leading word-boundary check — a bare
-/// indexOf would also fire on `xstd.debug.print(` (patterns.md F2) — and
-/// gets the uniform string/comment treatment (patterns.md F1).
-fn checkDebugPrints(sink: StyleSink, line: []const u8, line_num: usize) !void {
-    const needle = "std.debug.print(";
-    var pos: usize = 0;
-    while (mem.indexOfPos(u8, line, pos, needle)) |idx| {
-        pos = idx + needle.len;
-        // Boundary: `xstd.debug.print(` is a different receiver.
-        if (idx > 0 and isIdent(line[idx - 1])) continue;
-        if (isInsideString(line, idx)) continue;
-        if (isInTrailingComment(line, idx)) continue;
-        try sink.issues.append(sink.allocator, .{
-            .file = sink.path,
-            .line = line_num,
-            .col = idx + 1,
-            .severity = .warning,
-            .rule = RULE_DEBUG_PRINT,
-            .message = "std.debug.print left in non-test code",
-            .help = "remove before merge or route through std.log",
-        });
-    }
-}
-
-/// Update test-block state for one line and run the ZA704 check when the
-/// line is outside test context (tests print freely; CLI apps leave the
-/// rule off — it is opt-in, see README). Comment-only / multiline-string
-/// lines are skipped: a call cannot live in prose.
-fn checkDebugPrintsUnlessTest(
-    sink: StyleSink,
-    line: []const u8,
-    line_num: usize,
-    state: *TestBlockState,
-) !void {
-    const t = mem.trim(u8, line, " \t\r");
-    if (isCommentOrMultilineString(t)) return;
-    const ts = trackTestBlock(t, state.in_test, state.depth);
-    state.in_test = ts.in_test;
-    state.depth = ts.depth;
-    if (isInTestContext(sink.path, state.in_test)) return;
-    try checkDebugPrints(sink, line, line_num);
-}
-
-/// Per-file style scan: ZA701 line length, ZA702 file size, ZA704 debug
-/// prints. ZA701 keeps its own narrower line skip (only multiline strings)
-/// so long comment lines still count toward line length.
+/// Per-file style scan: ZA701 line length, ZA702 file size. ZA701 keeps its
+/// own narrower line skip (only multiline strings) so long comment lines
+/// still count toward line length.
 fn analyzeStyleFile(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
@@ -12880,11 +12827,8 @@ fn analyzeStyleFile(
 
     var line_num: usize = 1;
     var lines = mem.splitScalar(u8, a.content, '\n');
-    var ts_state = TestBlockState{ .in_test = false, .depth = 0 };
-    const sink = StyleSink{ .issues = issues, .allocator = allocator, .path = a.path };
     while (lines.next()) |line| {
         defer line_num += 1;
-        try checkDebugPrintsUnlessTest(sink, line, line_num, &ts_state);
 
         // ZA701: Line too long
         const trimmed = mem.trimStart(u8, line, " \t");
@@ -18354,9 +18298,6 @@ const Config = struct {
         if (mem.eql(u8, rule, RULE_IGNORED_ERROR)) return true;
         if (mem.eql(u8, rule, RULE_UNDEFINED_USAGE)) return true;
         if (mem.eql(u8, rule, RULE_NO_CATCH_RETURN)) return true;
-        // ZA704 is an exact entry, not a "ZA7" prefix — the rest of ZA7xx
-        // stays ON. Opt-in sweep: CLI apps print to stderr by design.
-        if (mem.eql(u8, rule, RULE_DEBUG_PRINT)) return true;
         return false;
     }
 
@@ -18731,8 +18672,7 @@ fn writeDefaultConfig() !void {
         \\  //   ZA6xx Format:     ZA601 needs-format,
         \\  //                     ZA607 read-before-assign (semantic, not formatting)
         \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long,
-        \\  //                     ZA703 naming,
-        \\  //                     ZA704 debug-print (OFF by default)
+        \\  //                     ZA703 naming
         \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
         \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
         \\  //                     ZA903 index-arithmetic,
@@ -20455,7 +20395,7 @@ fn printHelp() void {
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long,
-        \\                     ZA703: naming, ZA704: debug-print (off by default))
+        \\                     ZA703: naming)
         \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
         \\                     ZR103: use-after-free, ZR104: test-failure,
         \\                     ZR105: panic)
@@ -33918,7 +33858,7 @@ test "ZA210: off by default; explicit enable turns it on" {
 }
 
 // ============================================================================
-// ZA704 / ZA904 tests
+// ZA904 tests
 // ============================================================================
 
 /// Default-config builder for rule-gating tests (no allocations to free).
@@ -33946,22 +33886,6 @@ fn testConfig() Config {
     };
 }
 
-/// Test helper: build a one-file graph and run analyzeStyle (ZA701-ZA704).
-fn runStyleTest(
-    allocator: Allocator,
-    path: []const u8,
-    content: []const u8,
-) !CFGTestRun {
-    var graph = ImportGraph.init(allocator);
-    errdefer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeStyle(allocator, &graph, .{});
-    errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
-}
-
 /// Test helper: build a one-file graph and run analyzeIntCastGuards (ZA904).
 fn runIntCastTest(
     allocator: Allocator,
@@ -33978,105 +33902,7 @@ fn runIntCastTest(
     return .{ .graph = graph, .issues = issues };
 }
 
-test "ZA704: std.debug.print fires outside test blocks" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const content =
-        \\fn diag() void {
-        \\    std.debug.print("x", .{});
-        \\}
-        \\fn two() void { std.debug.print("a", .{}); std.debug.print("b", .{}); }
-    ;
-    var run = try runStyleTest(allocator, "app_widget.zig", content);
-    defer run.deinit(allocator);
-
-    const n = countRuleIssues(run.issues.items, "app_widget.zig", RULE_DEBUG_PRINT);
-    try std.testing.expectEqual(@as(usize, 3), n);
-    // Exact sites: line 2 col 5, and two hits on line 4 (multi-occurrence).
-    try std.testing.expectEqual(@as(usize, 2), run.issues.items[0].line);
-    try std.testing.expectEqual(@as(usize, 5), run.issues.items[0].col);
-    try std.testing.expectEqual(@as(usize, 4), run.issues.items[1].line);
-    try std.testing.expectEqual(@as(usize, 4), run.issues.items[2].line);
-}
-
-test "ZA704: silent inside test blocks and test file paths" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const content =
-        \\test "prints freely" {
-        \\    std.debug.print("x", .{});
-        \\}
-        \\fn helper() void {
-        \\    std.debug.print("still a test file", .{});
-        \\}
-    ;
-    // Inside a test block: suppressed by block tracking.
-    var run = try runStyleTest(allocator, "app_widget.zig", content);
-    defer run.deinit(allocator);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        countRuleIssues(run.issues.items, "app_widget.zig", RULE_DEBUG_PRINT),
-    );
-
-    // Same content in a _test.zig path: everything suppressed by path.
-    var run2 = try runStyleTest(allocator, "widget_test.zig", content);
-    defer run2.deinit(allocator);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        countRuleIssues(run2.issues.items, "widget_test.zig", RULE_DEBUG_PRINT),
-    );
-}
-
-test "ZA704: string and comment forms stay silent" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const content =
-        \\fn f() void {
-        \\    const s = "std.debug.print(";
-        \\    _ = s;
-        \\}
-        \\// std.debug.print("x", .{});
-        \\fn g() void {
-        \\    var n: u32 = 1; // std.debug.print("y", .{});
-        \\    _ = n;
-        \\}
-    ;
-    var run = try runStyleTest(allocator, "app_strings.zig", content);
-    defer run.deinit(allocator);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        countRuleIssues(run.issues.items, "app_strings.zig", RULE_DEBUG_PRINT),
-    );
-}
-
-test "ZA704: different receiver and glued prefix stay silent" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // `myapp.debug.print(` is a different receiver; `xstd.debug.print(` only
-    // contains the needle as a substring — the boundary check must reject it.
-    const content =
-        \\fn f() void {
-        \\    myapp.debug.print("x", .{});
-        \\    xstd.debug.print("y", .{});
-        \\}
-    ;
-    var run = try runStyleTest(allocator, "app_receivers.zig", content);
-    defer run.deinit(allocator);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        countRuleIssues(run.issues.items, "app_receivers.zig", RULE_DEBUG_PRINT),
-    );
-}
-
-test "ZA704: off by default (exact entry, rest of ZA7 stays on), ZA904: off via ZA9 prefix" {
+test "ZA904: off via ZA9 prefix" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34084,65 +33910,10 @@ test "ZA704: off by default (exact entry, rest of ZA7 stays on), ZA904: off via 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
 
-    try std.testing.expect(cfg.isRuleDisabled(RULE_DEBUG_PRINT));
     try std.testing.expect(cfg.isRuleDisabled(RULE_INTCAST_NO_BOUNDS));
-    // ZA704's off-by-default entry is exact — it must not drag ZA7xx down.
-    try std.testing.expect(cfg.isRuleEnabled(RULE_LINE_TOO_LONG));
-    try std.testing.expect(cfg.isRuleEnabled(RULE_NAMING_CONVENTION));
-
-    try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_DEBUG_PRINT));
-    try std.testing.expect(cfg.isRuleEnabled(RULE_DEBUG_PRINT));
 
     try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_INTCAST_NO_BOUNDS));
     try std.testing.expect(cfg.isRuleEnabled(RULE_INTCAST_NO_BOUNDS));
-}
-
-/// Count issues for `rule` that pass the shouldPrintIssue config gate.
-fn countPrintableIssues(
-    issues: []const Issue,
-    rule: []const u8,
-    cfg: *const Config,
-    graph: *const ImportGraph,
-) usize {
-    var n: usize = 0;
-    for (issues) |issue| {
-        if (!mem.eql(u8, issue.rule, rule)) continue;
-        if (shouldPrintIssue(issue, cfg, graph)) n += 1;
-    }
-    return n;
-}
-
-test "ZA704: print gate suppresses by default, enable restores findings" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const content =
-        \\fn diag() void {
-        \\    std.debug.print("x", .{});
-        \\}
-    ;
-    var run = try runStyleTest(allocator, "app_widget.zig", content);
-    defer run.deinit(allocator);
-
-    // The analyzer fires regardless of config; gating happens at print time.
-    const found = countRuleIssues(run.issues.items, "app_widget.zig", RULE_DEBUG_PRINT);
-    try std.testing.expectEqual(@as(usize, 1), found);
-
-    var cfg = testConfig();
-    defer cfg.deinit(allocator);
-    cfg.path = "app_widget.zig";
-
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        countPrintableIssues(run.issues.items, RULE_DEBUG_PRINT, &cfg, &run.graph),
-    );
-
-    try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_DEBUG_PRINT));
-    try std.testing.expectEqual(
-        found,
-        countPrintableIssues(run.issues.items, RULE_DEBUG_PRINT, &cfg, &run.graph),
-    );
 }
 
 test "ZA904: unguarded @intCast fires" {

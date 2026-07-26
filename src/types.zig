@@ -57,7 +57,8 @@ pub const RULE_DEFINITE_ASSIGNMENT = "ZA607";
 pub const RULE_LINE_TOO_LONG = "ZA701";
 pub const RULE_FILE_TOO_LONG = "ZA702";
 pub const RULE_NAMING_CONVENTION = "ZA703";
-pub const RULE_DEBUG_PRINT = "ZA704";
+// ZA704 (std.debug.print) is RETIRED — removed in 0.14.0 as intent-based
+// (EPH-I0049). Never reuse the ID: consumer inline-ignores reference it.
 
 // ZA8xx - Null Safety
 pub const RULE_OPTIONAL_UNWRAP_UNSAFE = "ZA801";

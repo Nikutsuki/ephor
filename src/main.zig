@@ -12362,13 +12362,10 @@ fn updateBraceState(
     }
     if (c == '}' and state.nest > 0) {
         // Decrement cognitive nesting if this depth was marked cognitive
-        if (state.nest < 32) {
-            const mask = @as(u32, 1) << @intCast(state.nest);
-            if ((state.cog_markers & mask) != 0) {
-                state.cog_markers &= ~mask;
-                if (state.cog_nest > 0) state.cog_nest -= 1;
-            }
-        }
+        const marked = state.nest < 32 and
+            (state.cog_markers & (@as(u32, 1) << @intCast(state.nest))) != 0;
+        if (marked) state.cog_markers &= ~(@as(u32, 1) << @intCast(state.nest));
+        if (marked and state.cog_nest > 0) state.cog_nest -= 1;
         state.nest -= 1;
         if (state.nest == 0) return true;
     }
@@ -12709,6 +12706,25 @@ fn reportNamingIssue(
     });
 }
 
+/// Emit a naming-convention issue from a NamingLineCtx (keeps call sites
+/// brace-less so the struct literal doesn't inflate nesting).
+fn reportNaming(
+    ctx: NamingLineCtx,
+    col: usize,
+    kind: []const u8,
+    name: []const u8,
+    expected: []const u8,
+) !void {
+    try reportNamingIssue(ctx.issues, ctx.allocator, .{
+        .path = ctx.path,
+        .line = ctx.line_num,
+        .col = col,
+        .kind = kind,
+        .name = name,
+        .expected = expected,
+    });
+}
+
 /// Check if this is a function alias (const fooBar = module.fooBar)
 fn isFunctionAlias(t: []const u8, name: []const u8) bool {
     if (!isCamelCase(name)) return false;
@@ -12747,14 +12763,7 @@ fn checkConstNaming(
         // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
         if (isClosureFunctionAlias(t, content, t_start)) {
             if (!isCamelCase(name))
-                try reportNamingIssue(ctx.issues, ctx.allocator, .{
-                    .path = ctx.path,
-                    .line = ctx.line_num,
-                    .col = plen + 1,
-                    .kind = "function",
-                    .name = name,
-                    .expected = "camelCase",
-                });
+                try reportNaming(ctx, plen + 1, "function", name, "camelCase");
             return;
         }
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
@@ -12902,16 +12911,7 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
             pos = end;
             continue;
         }
-        if (!isSnakeCase(name)) {
-            try reportNamingIssue(ctx.issues, ctx.allocator, .{
-                .path = ctx.path,
-                .line = ctx.line_num,
-                .col = err_pos + 7,
-                .kind = "error value",
-                .name = name,
-                .expected = "snake_case",
-            });
-        }
+        if (!isSnakeCase(name)) try reportNaming(ctx, err_pos + 7, "error value", name, "snake_case");
         pos = end;
     }
 
@@ -12985,16 +12985,8 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
             i = skipOptionalComma(t, i);
             continue;
         }
-        if (!isSnakeCase(name)) {
-            try reportNamingIssue(ctx.issues, ctx.allocator, .{
-                .path = ctx.path,
-                .line = ctx.line_num,
-                .col = start + 1,
-                .kind = "error set member",
-                .name = name,
-                .expected = "snake_case",
-            });
-        }
+        if (!isSnakeCase(name))
+            try reportNaming(ctx, start + 1, "error set member", name, "snake_case");
         i = skipOptionalComma(t, i);
     }
 }

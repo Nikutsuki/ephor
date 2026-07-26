@@ -5993,41 +5993,33 @@ fn collectAllAllocatorNames(
         const name = extractVarDeclName(t) orelse continue;
 
         // Track variables initialized with known allocator types
+        var init_match = false;
         for (alloc_inits) |init_pat| {
-            if (mem.indexOf(u8, t, init_pat) != null) {
-                try names.put(a, name, {});
-                break;
-            }
+            if (mem.indexOf(u8, t, init_pat) == null) continue;
+            init_match = true;
+            break;
         }
+        if (init_match) try names.put(a, name, {});
 
         // Track variables assigned global singleton allocators
         const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
         const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t;");
+        var global_match = false;
         for (global_allocs) |g| {
-            if (mem.endsWith(u8, rhs, g)) {
-                try names.put(a, name, {});
-                break;
-            }
+            if (!mem.endsWith(u8, rhs, g)) continue;
+            global_match = true;
+            break;
         }
+        if (global_match) try names.put(a, name, {});
 
         // Track .allocator() aliases: const X = Y.allocator()
         // where Y is any tracked allocator variable
-        if (mem.indexOf(u8, rhs, ".allocator()") != null) {
-            const dot_pos = mem.indexOf(u8, rhs, ".allocator()").?;
-            const source = rhs[0..dot_pos];
-            if (source.len > 0) {
-                var all_ident = true;
-                for (source) |c| {
-                    if (!isIdent(c)) {
-                        all_ident = false;
-                        break;
-                    }
-                }
-                if (all_ident and names.contains(source)) {
-                    try names.put(a, name, {});
-                }
-            }
+        var alias_of_tracked = false;
+        if (mem.indexOf(u8, rhs, ".allocator()")) |dp| {
+            const source = rhs[0..dp];
+            alias_of_tracked = source.len > 0 and isAllIdent(source) and names.contains(source);
         }
+        if (alias_of_tracked) try names.put(a, name, {});
     }
 
     // Also track function parameters typed as Allocator
@@ -6252,34 +6244,29 @@ fn extractMethodCall(t: []const u8) ?MethodCall {
 /// Resolve the return kind for a call expression on a trimmed line.
 /// Checks TypeContext in order: parsed struct methods, parsed functions, then unknown.
 fn resolveReturnKind(ctx: *const TypeContext, t: []const u8) ReturnKind {
-    // Try method call resolution: receiver.method(
-    if (extractMethodCall(t)) |call| {
-        if (ctx.var_types.get(call.receiver)) |type_name| {
-            if (ctx.struct_methods.get(type_name)) |methods| {
-                if (methods.get(call.method)) |rk| return rk;
-            }
-        }
-    }
-    // Try standalone function call: _ = funcName(
-    if (mem.startsWith(u8, t, "_ = ")) {
-        const after = t[4..];
-        const paren = mem.indexOf(u8, after, "(") orelse return .unknown;
-        const name = after[0..paren];
-        // Must be a simple identifier (no dots = not a method call)
-        if (mem.indexOf(u8, name, ".") != null) return .unknown;
-        if (name.len == 0) return .unknown;
-        var all_ident = true;
-        for (name) |c| {
-            if (!isIdent(c)) {
-                all_ident = false;
-                break;
-            }
-        }
-        if (all_ident) {
-            if (ctx.function_returns.get(name)) |rk| return rk;
-        }
-    }
-    return .unknown;
+    if (resolveMethodReturn(ctx, t)) |rk| return rk;
+    return resolveStandaloneReturn(ctx, t);
+}
+
+/// Method call resolution: receiver.method( → struct_methods[type][method].
+fn resolveMethodReturn(ctx: *const TypeContext, t: []const u8) ?ReturnKind {
+    const call = extractMethodCall(t) orelse return null;
+    const type_name = ctx.var_types.get(call.receiver) orelse return null;
+    const methods = ctx.struct_methods.get(type_name) orelse return null;
+    return methods.get(call.method);
+}
+
+/// Standalone function call: _ = funcName( → function_returns[name].
+fn resolveStandaloneReturn(ctx: *const TypeContext, t: []const u8) ReturnKind {
+    if (!mem.startsWith(u8, t, "_ = ")) return .unknown;
+    const after = t[4..];
+    const paren = mem.indexOf(u8, after, "(") orelse return .unknown;
+    const name = after[0..paren];
+    // Must be a simple identifier (no dots = not a method call)
+    if (mem.indexOf(u8, name, ".") != null) return .unknown;
+    if (name.len == 0) return .unknown;
+    if (!isAllIdent(name)) return .unknown;
+    return ctx.function_returns.get(name) orelse .unknown;
 }
 
 /// Extract return type text from a function signature line.
@@ -6294,13 +6281,15 @@ fn extractFnReturnType(t: []const u8) ?[]const u8 {
     var depth: usize = 0;
     var close_paren: ?usize = null;
     for (t[open_paren..], 0..) |c, offset| {
-        if (c == '(') depth += 1;
-        if (c == ')') {
-            depth -= 1;
-            if (depth == 0) {
-                close_paren = open_paren + offset;
-                break;
-            }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c != ')') continue;
+        depth -= 1;
+        if (depth == 0) {
+            close_paren = open_paren + offset;
+            break;
         }
     }
     const cp = close_paren orelse return null;

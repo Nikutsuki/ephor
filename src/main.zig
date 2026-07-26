@@ -4689,6 +4689,13 @@ fn scanErrdeferLines(
         // (type first-arg on the next line) are visible; line-structure
         // detection (defer blocks, try presence) stays on the physical line.
         const joined = joinParenContinuation(lines, idx, &join_buf);
+        const skip_ctx: NoFreeAllocCtx = .{
+            .joined = joined,
+            .t = t,
+            .lines = lines,
+            .idx = idx,
+            .no_free_names = &no_free_names,
+        };
         const indent = countIndent(line);
         const site: StmtSite = .{ .line = actual_line, .indent = indent };
         // Keyword matches must skip string literals/word fragments:
@@ -4698,13 +4705,6 @@ fn scanErrdeferLines(
             try state.error_returns.append(allocator, actual_line);
         if (has_try and isTryAllocation(joined)) {
             // Standalone/multiline first-arg allocator checks (no-free set or arena)
-            const skip_ctx: NoFreeAllocCtx = .{
-                .joined = joined,
-                .t = t,
-                .lines = lines,
-                .idx = idx,
-                .no_free_names = &no_free_names,
-            };
             const no_free = isNoFreeAllocLine(skip_ctx);
             if (no_free) try state.try_lines_list.append(allocator, actual_line);
             if (!no_free) try collectTryAllocFromLine(joined, t, site, &collect_ctx);

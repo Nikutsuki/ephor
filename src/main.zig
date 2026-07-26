@@ -5761,10 +5761,9 @@ fn collectSigArenaParams(
         var pname_start = colon_pos;
         while (pname_start > 0 and isIdent(t[pname_start - 1])) pname_start -= 1;
         const pname = t[pname_start..colon_pos];
-        if (pname.len > 0 and isArenaName(pname)) {
-            const type_str = mem.trim(u8, t[colon_pos + 2 ..], " \t,)");
-            if (isAllocatorType(type_str)) try names.put(a, pname, {});
-        }
+        const type_str = mem.trim(u8, t[colon_pos + 2 ..], " \t,)");
+        if (pname.len > 0 and isArenaName(pname) and isAllocatorType(type_str))
+            try names.put(a, pname, {});
         search_start = colon_pos + 2;
     }
 }
@@ -5778,23 +5777,26 @@ fn trackNoFreeTypeInit(
     no_free_inits: []const []const u8,
     names: *std.StringHashMapUnmanaged(void),
 ) !void {
+    var matched = false;
     for (no_free_inits) |init_pat| {
-        if (mem.indexOf(u8, t, init_pat) != null) {
-            try names.put(a, name, {});
-            return;
-        }
+        if (mem.indexOf(u8, t, init_pat) == null) continue;
+        matched = true;
+        break;
     }
+    if (matched) try names.put(a, name, {});
+    if (matched) return;
     if (names.contains(name)) return;
     if (mem.indexOf(u8, t, "= .init(") == null and mem.indexOf(u8, t, "= .{") == null) return;
     const colon_pos = mem.indexOf(u8, t, ": ") orelse return;
     const after_colon = mem.trim(u8, t[colon_pos + 2 ..], " \t");
     const field_type_patterns = compat.getNoFreeFieldTypePatterns();
+    var type_match = false;
     for (field_type_patterns) |pat| {
-        if (mem.startsWith(u8, after_colon, pat)) {
-            try names.put(a, name, {});
-            return;
-        }
+        if (!mem.startsWith(u8, after_colon, pat)) continue;
+        type_match = true;
+        break;
     }
+    if (type_match) try names.put(a, name, {});
 }
 
 /// Track .allocator() aliases: const X = Y.allocator() where Y (or the last

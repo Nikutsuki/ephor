@@ -5079,25 +5079,18 @@ const ImportGraph = struct {
                 continue;
             }
 
-            if (pos + import_tag.len < content.len and
-                mem.eql(u8, content[pos .. pos + import_tag.len], import_tag))
-            {
-                const path_start = pos + import_tag.len;
-                var path_end = path_start;
-                while (path_end < content.len and content[path_end] != '"') {
-                    path_end += 1;
-                }
-                if (path_end > path_start) {
-                    try self.tryAddBareImport(
-                        file_path,
-                        analysis,
-                        content[path_start..path_end],
-                    );
-                }
-                pos = path_end + 1;
+            const matches_tag = pos + import_tag.len < content.len and
+                mem.eql(u8, content[pos .. pos + import_tag.len], import_tag);
+            if (!matches_tag) {
+                pos += 1;
                 continue;
             }
-            pos += 1;
+            const path_start = pos + import_tag.len;
+            var path_end = path_start;
+            while (path_end < content.len and content[path_end] != '"') path_end += 1;
+            if (path_end > path_start)
+                try self.tryAddBareImport(file_path, analysis, content[path_start..path_end]);
+            pos = path_end + 1;
         }
     }
 
@@ -6793,23 +6786,7 @@ fn extractFirstArgDotted(t: []const u8, start: usize) ?[]const u8 {
 /// Check if a dotted first-arg expression contains an arena-named segment.
 /// Handles patterns like `std.fmt.allocPrint(cg.module.arena, ...)`
 fn isFirstArgArena(t: []const u8) bool {
-    // Try all standalone allocator extraction patterns
-    var arg_start: ?usize = null;
-    for (compat.getQualifiedAllocFnPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            arg_start = pos + pat.len;
-            break;
-        }
-    }
-    if (arg_start == null) {
-        for (first_arg_alloc_patterns) |pat| {
-            if (mem.indexOf(u8, t, pat)) |pos| {
-                arg_start = pos + pat.len;
-                break;
-            }
-        }
-    }
-    const start = arg_start orelse return false;
+    const start = findAllocArgStart(t) orelse return false;
     const dotted = extractFirstArgDotted(t, start) orelse return false;
 
     // Check if any segment of the dotted expression is arena-named
@@ -6823,6 +6800,18 @@ fn isFirstArgArena(t: []const u8) bool {
     return false;
 }
 
+/// Find the position after an allocating-call pattern (standalone or qualified),
+/// in pattern-list order. Null when the line has no allocating pattern.
+fn findAllocArgStart(t: []const u8) ?usize {
+    for (compat.getQualifiedAllocFnPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| return pos + pat.len;
+    }
+    for (first_arg_alloc_patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| return pos + pat.len;
+    }
+    return null;
+}
+
 /// Extract the first argument of a multiline allocating call.
 /// When a line ends with an allocating pattern like `allocPrint(` and the first
 /// argument is on the next line, extract that identifier from the next line.
@@ -6832,17 +6821,15 @@ fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize
     // (i.e., extractStandaloneAllocator returned null because the arg is on the next line)
     var has_alloc_pattern = false;
     for (compat.getQualifiedAllocFnPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) {
-            has_alloc_pattern = true;
-            break;
-        }
+        if (mem.indexOf(u8, t, pat) == null) continue;
+        has_alloc_pattern = true;
+        break;
     }
     if (!has_alloc_pattern) {
         for (first_arg_alloc_patterns) |pat| {
-            if (mem.indexOf(u8, t, pat) != null) {
-                has_alloc_pattern = true;
-                break;
-            }
+            if (mem.indexOf(u8, t, pat) == null) continue;
+            has_alloc_pattern = true;
+            break;
         }
     }
     if (!has_alloc_pattern) return null;

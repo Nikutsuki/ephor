@@ -17418,50 +17418,49 @@ fn matchesAnyPattern(t: []const u8, patterns: []const []const u8) bool {
     return false;
 }
 
-/// Emit a simple runtime issue (file=runtime, line=1)
-fn emitRuntimeIssue(
+/// Shared emit targets for runtime-diagnostic issues (GPA stderr + test output)
+const RuntimeEmitCtx = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
+};
+
+/// Static rule content of a runtime-diagnostic issue
+const RuntimeIssueSpec = struct {
     rule: []const u8,
     message: []const u8,
     help: []const u8,
-) !void {
-    try issues.append(allocator, .{
+};
+
+/// Emit a simple runtime issue (file=runtime, line=1)
+fn emitRuntimeIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec) !void {
+    try ctx.issues.append(ctx.allocator, .{
         .file = "runtime",
         .line = 1,
         .col = 1,
         .severity = .err,
-        .rule = rule,
-        .message = message,
-        .help = help,
+        .rule = spec.rule,
+        .message = spec.message,
+        .help = spec.help,
     });
 }
 
 /// Emit a runtime issue with file location extracted from the line
-fn emitLocatedIssue(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    t: []const u8,
-    rule: []const u8,
-    message: []const u8,
-    help: []const u8,
-) !void {
+fn emitLocatedIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec, t: []const u8) !void {
     const loc = extractFileLocation(t);
-    try issues.append(allocator, .{
+    try ctx.issues.append(ctx.allocator, .{
         .file = loc.file,
         .line = loc.line,
         .col = 1,
         .severity = .err,
-        .rule = rule,
-        .message = message,
-        .help = help,
+        .rule = spec.rule,
+        .message = spec.message,
+        .help = spec.help,
     });
 }
 
 /// Handle memory leak detection with next-line stack trace
 fn handleMemoryLeak(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
+    ctx: RuntimeEmitCtx,
     line_iter: *mem.SplitIterator(u8, .scalar),
     verbose: bool,
     t: []const u8,
@@ -17475,14 +17474,14 @@ fn handleMemoryLeak(
         FileLocation{ .file = "unknown", .line = 0 };
     if (loc.line > 0) {
         msg = try std.fmt.allocPrint(
-            allocator,
+            ctx.allocator,
             "memory leak at {s}:{d}",
             .{ loc.file, loc.line },
         );
         owned = true;
         if (verbose) std.debug.print("  at: {s}:{d}\n", .{ loc.file, loc.line });
     }
-    try issues.append(allocator, .{
+    try ctx.issues.append(ctx.allocator, .{
         .file = "runtime",
         .line = 1,
         .col = 1,
@@ -17502,12 +17501,13 @@ fn parseGPADiagnostics(
     verbose: bool,
 ) !void {
     var line_iter = mem.splitScalar(u8, stderr_output, '\n');
+    const ctx = RuntimeEmitCtx{ .issues = issues, .allocator = allocator };
 
     while (line_iter.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
 
-        try classifyGPALine(allocator, issues, &line_iter, verbose, t);
+        try classifyGPALine(ctx, &line_iter, verbose, t);
     }
 }
 
@@ -17566,27 +17566,24 @@ const gpa_classifications = [_]GPAClassification{
 };
 
 fn classifyGPALine(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
+    ctx: RuntimeEmitCtx,
     line_iter: *mem.SplitIterator(u8, .scalar),
     verbose: bool,
     t: []const u8,
 ) !void {
     const leak_pats = [_][]const u8{ "memory leak", "Memory leak", "leaked:" };
     if (matchesAnyPattern(t, &leak_pats))
-        return handleMemoryLeak(allocator, issues, line_iter, verbose, t);
+        return handleMemoryLeak(ctx, line_iter, verbose, t);
     for (gpa_classifications) |cls| {
         if (!matchesAnyPattern(t, cls.patterns)) continue;
         if (verbose) std.debug.print("GPA: {s}\n", .{t});
-        if (cls.located) return emitLocatedIssue(
-            issues,
-            allocator,
-            t,
-            cls.rule,
-            cls.message,
-            cls.help,
-        );
-        return emitRuntimeIssue(issues, allocator, cls.rule, cls.message, cls.help);
+        const spec = RuntimeIssueSpec{
+            .rule = cls.rule,
+            .message = cls.message,
+            .help = cls.help,
+        };
+        if (cls.located) return emitLocatedIssue(ctx, spec, t);
+        return emitRuntimeIssue(ctx, spec);
     }
 }
 
@@ -17597,58 +17594,26 @@ fn isPanicLine(t: []const u8) bool {
         mem.indexOf(u8, t, " panic:") != null;
 }
 
-fn emitTestIssue(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    t: []const u8,
-    rule: []const u8,
-    message: []const u8,
-    help: []const u8,
-) !void {
-    const loc = extractFileLocation(t);
-    try issues.append(allocator, .{
-        .file = loc.file,
-        .line = loc.line,
-        .col = 1,
-        .severity = .err,
-        .rule = rule,
-        .message = message,
-        .help = help,
-    });
-}
+const panic_issue_spec = RuntimeIssueSpec{
+    .rule = RULE_RUNTIME_PANIC,
+    .message = "panic detected during test execution",
+    .help = "runtime panic - check for integer overflow, null pointer, or unreachable",
+};
 
-fn handlePanicLine(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    t: []const u8,
-    verbose: bool,
-) !void {
+fn handlePanicLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
     if (verbose) std.debug.print("PANIC: {s}\n", .{t});
-    try emitTestIssue(
-        allocator,
-        issues,
-        t,
-        RULE_RUNTIME_PANIC,
-        "panic detected during test execution",
-        "runtime panic - check for integer overflow, null pointer, or unreachable",
-    );
+    try emitLocatedIssue(ctx, panic_issue_spec, t);
 }
 
-fn handleFailLine(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    t: []const u8,
-    verbose: bool,
-) !void {
+const fail_issue_spec = RuntimeIssueSpec{
+    .rule = RULE_RUNTIME_TEST_FAILURE,
+    .message = "test failed",
+    .help = "check test assertions and expected values",
+};
+
+fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
     if (verbose) std.debug.print("TEST FAIL: {s}\n", .{t});
-    try emitTestIssue(
-        allocator,
-        issues,
-        t,
-        RULE_RUNTIME_TEST_FAILURE,
-        "test failed",
-        "check test assertions and expected values",
-    );
+    try emitLocatedIssue(ctx, fail_issue_spec, t);
 }
 
 fn parseTestOutput(
@@ -17658,13 +17623,14 @@ fn parseTestOutput(
     verbose: bool,
 ) !void {
     var lines = mem.splitScalar(u8, stdout_output, '\n');
+    const ctx = RuntimeEmitCtx{ .issues = issues, .allocator = allocator };
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
         if (isPanicLine(t))
-            try handlePanicLine(allocator, issues, t, verbose);
+            try handlePanicLine(ctx, t, verbose);
         if (mem.startsWith(u8, t, "FAIL"))
-            try handleFailLine(allocator, issues, t, verbose);
+            try handleFailLine(ctx, t, verbose);
     }
 }
 
@@ -18249,14 +18215,18 @@ fn parseThresholdPair(content: []const u8, start: usize, th: *Thresholds) usize 
     return i;
 }
 
-/// Parse array of strings into appropriate config list
-fn parseConfigArray(
+/// Context for JSON config parsing: source text plus the config being built
+const ConfigParseCtx = struct {
     allocator: Allocator,
     content: []const u8,
-    start: usize,
-    key: []const u8,
     cfg: *Config,
-) !usize {
+};
+
+/// Parse array of strings into appropriate config list
+fn parseConfigArray(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
+    const allocator = ctx.allocator;
+    const content = ctx.content;
+    const cfg = ctx.cfg;
     var i = start + 1;
     while (i < content.len and content[i] != ']') {
         i = skipWhitespaceAndComments(content, i);
@@ -18294,13 +18264,10 @@ fn parseThresholdsObject(content: []const u8, start: usize, th: *Thresholds) usi
 }
 
 /// Handle a single config key-value pair
-fn handleConfigKey(
-    allocator: Allocator,
-    content: []const u8,
-    start: usize,
-    key: []const u8,
-    cfg: *Config,
-) !usize {
+fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
+    const allocator = ctx.allocator;
+    const content = ctx.content;
+    const cfg = ctx.cfg;
     const is_path_dir_key = mem.eql(u8, key, "path_dir") or
         mem.eql(u8, key, "code") or mem.eql(u8, key, "src") or mem.eql(u8, key, "root");
     if (is_path_dir_key and content[start] == '"') {
@@ -18311,24 +18278,21 @@ fn handleConfigKey(
         return result.end;
     }
     if (isArrayKey(key) and content[start] == '[') {
-        return try parseConfigArray(allocator, content, start, key, cfg);
+        return try parseConfigArray(ctx, start, key);
     }
     if (mem.eql(u8, key, "thresholds") and content[start] == '{') {
         return parseThresholdsObject(content, start, &cfg.thresholds);
     }
-    if (try parseFailOnConfigKey(content, start, key, cfg)) |end| return end;
+    if (try parseFailOnConfigKey(ctx, start, key)) |end| return end;
     return skipJsonValue(content, start);
 }
 
 /// Handle the "strict"/"fail_on" CI-gate config keys (null if not one of them).
 /// "fail_on" outranks "strict" via FailOnSource, so an explicit fail_on wins
 /// regardless of key order — including fail_on:"never".
-fn parseFailOnConfigKey(
-    content: []const u8,
-    start: usize,
-    key: []const u8,
-    cfg: *Config,
-) !?usize {
+fn parseFailOnConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?usize {
+    const content = ctx.content;
+    const cfg = ctx.cfg;
     if (mem.eql(u8, key, "strict") and mem.startsWith(u8, content[start..], "true")) {
         setFailOn(cfg, .warning, .strict_key);
         return start + 4;
@@ -18370,6 +18334,7 @@ fn skipWhitespaceAndComments(content: []const u8, start: usize) usize {
 }
 
 fn parseConfigJson(allocator: Allocator, content: []const u8, cfg: *Config) !void {
+    const ctx = ConfigParseCtx{ .allocator = allocator, .content = content, .cfg = cfg };
     var i: usize = 0;
     while (i < content.len and content[i] != '{') i += 1;
     if (i >= content.len) return;
@@ -18385,7 +18350,7 @@ fn parseConfigJson(allocator: Allocator, content: []const u8, cfg: *Config) !voi
         i = key_result.end;
         while (i < content.len and content[i] != ':') i += 1;
         i = skipWhitespace(content, i + 1, false);
-        i = try handleConfigKey(allocator, content, i, key_result.val, cfg);
+        i = try handleConfigKey(ctx, i, key_result.val);
     }
 }
 
@@ -19349,12 +19314,21 @@ fn scanBuildZigEntries(
 ) !void {
     const build_zig_path = try buildPathWithPrefix(allocator, cfg.path, "build.zig");
     defer allocator.free(build_zig_path);
-    try extractBuildZigEntriesFromPath(allocator, cfg, build_zig_path, cfg.path, added, 0);
+    var ctx = EntryScanCtx{
+        .allocator = allocator,
+        .cfg = cfg,
+        .added = added,
+        .prefix = cfg.path,
+        .build_path = build_zig_path,
+    };
+    try extractBuildZigEntriesFromPath(ctx);
 
     const parent = std.fs.path.dirname(mem.trimEnd(u8, cfg.path, "/")) orelse ".";
     const parent_build = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{parent});
     defer allocator.free(parent_build);
-    try extractBuildZigEntriesFromPath(allocator, cfg, parent_build, parent, added, 0);
+    ctx.prefix = parent;
+    ctx.build_path = parent_build;
+    try extractBuildZigEntriesFromPath(ctx);
 }
 
 fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
@@ -19380,10 +19354,16 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
         "clients",   "drivers", "apps",    "cmd",
         "bin",       "ci",      "user",
     };
+    const scan_ctx = EntryScanCtx{
+        .allocator = allocator,
+        .cfg = cfg,
+        .added = &added,
+        .check_access = true,
+    };
     for (multi_entry_dirs) |dir| {
         const dir_path = try buildPathWithPrefix(allocator, cfg.path, dir);
         defer allocator.free(dir_path);
-        try scanDirForEntriesWithPrefix(allocator, cfg, dir_path, cfg.path, &added, 0);
+        try scanDirForEntries(scan_ctx, dir_path);
     }
 }
 
@@ -19547,36 +19527,39 @@ fn addEntryIfValid(
     try added.put(duped, {});
 }
 
-/// Add entry with prefix if the file exists
-fn addEntryWithPrefix(
+/// Shared context for entry-point detection scans (build.zig parsing and
+/// directory walking): the entries list lives in cfg, `added` is the dedup
+/// set, and prefix/build_path/depth carry the path plumbing for nested
+/// build-module recursion. `check_access` gates the access() probe used by
+/// target-path directory scans (standard-entry scans skip it).
+const EntryScanCtx = struct {
     allocator: Allocator,
     cfg: *Config,
-    path: []const u8,
-    prefix: []const u8,
     added: *std.StringHashMap(void),
-) !void {
+    prefix: []const u8 = ".",
+    build_path: []const u8 = "",
+    depth: u8 = 0,
+    check_access: bool = false,
+};
+
+/// Add entry with prefix if the file exists
+fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
     // When prefix is ".", don't add it (avoid "./src/file.zig" paths)
-    const is_dot = prefix.len == 1 and prefix[0] == '.';
+    const is_dot = ctx.prefix.len == 1 and ctx.prefix[0] == '.';
     const full_path = if (is_dot)
-        try allocator.dupe(u8, path)
+        try ctx.allocator.dupe(u8, path)
     else
-        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, path });
-    defer allocator.free(full_path);
-    if (added.contains(full_path)) return;
+        try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.prefix, path });
+    defer ctx.allocator.free(full_path);
+    if (ctx.added.contains(full_path)) return;
     Fs.cwd().access(full_path, .{}) catch return;
-    const duped = try allocator.dupe(u8, full_path);
-    try cfg.entries.append(allocator, duped);
-    try added.put(duped, {});
+    const duped = try ctx.allocator.dupe(u8, full_path);
+    try ctx.cfg.entries.append(ctx.allocator, duped);
+    try ctx.added.put(duped, {});
 }
 
 /// Extract path-tag based entries from a build.zig line
-fn extractPathTagEntries(
-    allocator: Allocator,
-    cfg: *Config,
-    line: []const u8,
-    prefix: []const u8,
-    added: *std.StringHashMap(void),
-) !void {
+fn extractPathTagEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const path_tags = [_]struct { tag: []const u8, len: usize }{
         .{ .tag = ".path = \"", .len = 9 },
         .{ .tag = ".root_src = \"", .len = 13 },
@@ -19585,26 +19568,20 @@ fn extractPathTagEntries(
     for (path_tags) |pat| {
         const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
         if (extractQuotedPath(line, idx + pat.len)) |path|
-            try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+            try addEntryWithPrefix(ctx, path);
     }
 }
 
 /// Extract pathJoin(&.{ "dir", "file.zig" }) entries from a build.zig line
-fn extractPathJoinEntries(
-    allocator: Allocator,
-    cfg: *Config,
-    line: []const u8,
-    prefix: []const u8,
-    added: *std.StringHashMap(void),
-) !void {
+fn extractPathJoinEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const tag = "pathJoin(&.{";
     var pos: usize = 0;
     while (pos < line.len) {
         const idx = mem.indexOf(u8, line[pos..], tag) orelse break;
         const abs_pos = pos + idx + tag.len;
-        if (extractPathJoin(allocator, line, abs_pos - 1)) |joined| {
-            defer allocator.free(joined);
-            try addEntryWithPrefix(allocator, cfg, joined, prefix, added);
+        if (extractPathJoin(ctx.allocator, line, abs_pos - 1)) |joined| {
+            defer ctx.allocator.free(joined);
+            try addEntryWithPrefix(ctx, joined);
         }
         pos = abs_pos;
     }
@@ -19619,41 +19596,28 @@ fn isValidZigImport(imp_path: []const u8) bool {
 }
 
 /// Follow @import entries in a build.zig line and recurse into nested modules
-fn followImportsInLine(
-    allocator: Allocator,
-    cfg: *Config,
-    line: []const u8,
-    build_path: []const u8,
-    prefix: []const u8,
-    added: *std.StringHashMap(void),
-    depth: u8,
-) !void {
+fn followImportsInLine(ctx: EntryScanCtx, line: []const u8) !void {
     var imp_pos: usize = 0;
     while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
         const istart = imp_pos + rel + 9;
         defer imp_pos = istart;
         const imp_path = extractQuotedPath(line, istart) orelse continue;
         if (!isValidZigImport(imp_path)) continue;
-        try addEntryWithPrefix(allocator, cfg, imp_path, prefix, added);
-        try recurseNestedBuildModule(allocator, cfg, build_path, imp_path, prefix, added, depth);
+        try addEntryWithPrefix(ctx, imp_path);
+        try recurseNestedBuildModule(ctx, imp_path);
     }
 }
 
 /// Resolve and recurse into a nested build module
-fn recurseNestedBuildModule(
-    allocator: Allocator,
-    cfg: *Config,
-    build_path: []const u8,
-    imp_path: []const u8,
-    prefix: []const u8,
-    added: *std.StringHashMap(void),
-    depth: u8,
-) Allocator.Error!void {
-    const cur_dir = std.fs.path.dirname(build_path) orelse ".";
-    const nested = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cur_dir, imp_path });
-    defer allocator.free(nested);
-    extractBuildZigEntriesFromPath(allocator, cfg, nested, prefix, added, depth + 1) catch {
-        if (cfg.verbose) std.debug.print(
+fn recurseNestedBuildModule(ctx: EntryScanCtx, imp_path: []const u8) Allocator.Error!void {
+    const cur_dir = std.fs.path.dirname(ctx.build_path) orelse ".";
+    const nested = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ cur_dir, imp_path });
+    defer ctx.allocator.free(nested);
+    var child = ctx;
+    child.build_path = nested;
+    child.depth += 1;
+    extractBuildZigEntriesFromPath(child) catch {
+        if (ctx.cfg.verbose) std.debug.print(
             "note: could not parse nested build module {s}\n",
             .{nested},
         );
@@ -19661,30 +19625,24 @@ fn recurseNestedBuildModule(
 }
 
 /// Extract entry points from a build.zig file at a specific path
-fn extractBuildZigEntriesFromPath(
-    allocator: Allocator,
-    cfg: *Config,
-    build_path: []const u8,
-    prefix: []const u8,
-    added: *std.StringHashMap(void),
-    depth: u8,
-) !void {
+fn extractBuildZigEntriesFromPath(ctx: EntryScanCtx) !void {
     // Prevent stack overflow from circular @import chains (e.g., A imports B imports A)
-    if (depth > 4) return;
+    if (ctx.depth > 4) return;
 
-    const content = Fs.cwd().readFileAlloc(allocator, build_path, 1024 * 1024) catch return;
-    defer allocator.free(content);
+    const max_bytes = 1024 * 1024;
+    const content = Fs.cwd().readFileAlloc(ctx.allocator, ctx.build_path, max_bytes) catch return;
+    defer ctx.allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| {
         if (mem.indexOf(u8, line, ".path(\"")) |idx| {
             if (extractQuotedPath(line, idx + 7)) |path|
-                try addEntryWithPrefix(allocator, cfg, path, prefix, added);
+                try addEntryWithPrefix(ctx, path);
         }
         // Handle b.pathJoin(&.{ "dir", "file.zig" }) patterns
-        try extractPathJoinEntries(allocator, cfg, line, prefix, added);
-        try extractPathTagEntries(allocator, cfg, line, prefix, added);
-        try followImportsInLine(allocator, cfg, line, build_path, prefix, added, depth);
+        try extractPathJoinEntries(ctx, line);
+        try extractPathTagEntries(ctx, line);
+        try followImportsInLine(ctx, line);
     }
 }
 
@@ -19697,73 +19655,40 @@ fn isEntryPointFile(name: []const u8) bool {
 }
 
 /// Add an entry from a directory scan, checking access and dedup
-fn addDirEntry(
-    allocator: Allocator,
-    cfg: *Config,
-    dir_path: []const u8,
-    name: []const u8,
-    added: *std.StringHashMap(void),
-    check_access: bool,
-) !void {
-    const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
-    if (added.contains(full)) {
-        allocator.free(full);
+fn addDirEntry(ctx: EntryScanCtx, dir_path: []const u8, name: []const u8) !void {
+    const full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ dir_path, name });
+    if (ctx.added.contains(full)) {
+        ctx.allocator.free(full);
         return;
     }
-    if (check_access) {
+    if (ctx.check_access) {
         Fs.cwd().access(full, .{}) catch {
-            allocator.free(full);
+            ctx.allocator.free(full);
             return;
         };
     }
-    try cfg.entries.append(allocator, full);
-    try added.put(full, {});
+    try ctx.cfg.entries.append(ctx.allocator, full);
+    try ctx.added.put(full, {});
 }
 
-/// Scan directory with prefix for entry paths
-fn scanDirForEntriesWithPrefix(
-    allocator: Allocator,
-    cfg: *Config,
-    dir_path: []const u8,
-    prefix: []const u8,
-    added: *std.StringHashMap(void),
-    depth: u8,
-) !void {
-    if (depth > 16) return;
+/// Scan a directory tree for .zig entry points (main.zig, lib.zig, root.zig,
+/// *_test.zig), recursing up to depth 16. When ctx.check_access is set, each
+/// candidate is probed with access() before being added (target-path scans).
+fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
+    if (ctx.depth > 16) return;
     var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close(global_io.?);
     var iter = dir.iterate();
     while (try iter.next(global_io.?)) |entry| {
         if (entry.kind == .file and isEntryPointFile(entry.name)) {
-            addDirEntry(allocator, cfg, dir_path, entry.name, added, true) catch continue;
+            addDirEntry(ctx, dir_path, entry.name) catch continue;
         }
         if (entry.kind != .directory) continue;
-        const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-        defer allocator.free(subdir);
-        try scanDirForEntriesWithPrefix(allocator, cfg, subdir, prefix, added, depth + 1);
-    }
-}
-
-/// Scan a directory for .zig entry points (main.zig, lib.zig, root.zig)
-fn scanDirForEntries(
-    allocator: Allocator,
-    cfg: *Config,
-    dir_path: []const u8,
-    added: *std.StringHashMap(void),
-    depth: u8,
-) !void {
-    if (depth > 16) return;
-    var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close(global_io.?);
-    var iter = dir.iterate();
-    while (try iter.next(global_io.?)) |entry| {
-        if (entry.kind == .file and isEntryPointFile(entry.name)) {
-            addDirEntry(allocator, cfg, dir_path, entry.name, added, false) catch continue;
-        }
-        if (entry.kind != .directory) continue;
-        const subdir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-        defer allocator.free(subdir);
-        try scanDirForEntries(allocator, cfg, subdir, added, depth + 1);
+        const subdir = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ dir_path, entry.name });
+        defer ctx.allocator.free(subdir);
+        var child = ctx;
+        child.depth += 1;
+        try scanDirForEntries(child, subdir);
     }
 }
 
@@ -19784,9 +19709,7 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
     try extractBuildZigEntries(allocator, cfg);
 
     // Update added set with build.zig entries
-    for (cfg.entries.items) |e| {
-        try added.put(e, {});
-    }
+    for (cfg.entries.items) |e| try added.put(e, {});
 
     // Scan common multi-entry directories
     // Based on patterns found in community projects
@@ -19797,8 +19720,9 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
         "clients",   "drivers", "apps",    "cmd",
         "bin",       "ci",      "user",
     };
+    const scan_ctx = EntryScanCtx{ .allocator = allocator, .cfg = cfg, .added = &added };
     for (multi_entry_dirs) |dir| {
-        try scanDirForEntries(allocator, cfg, dir, &added, 0);
+        try scanDirForEntries(scan_ctx, dir);
     }
 
     // Auto-discover test files in src/
@@ -20320,12 +20244,20 @@ fn writeExportIssue(
     try output.print(allocator, "---\n\n", .{});
 }
 
+/// Shared output context for issue reporting (print/export): base_path is
+/// the display root for relative paths, cfg carries format/filters, and
+/// graph feeds shouldPrintIssue's inline-ignore lookups.
+const ReportOutCtx = struct {
+    base_path: []const u8,
+    cfg: *const Config,
+    graph: ?*const ImportGraph,
+};
+
 fn exportIssues(
     allocator: Allocator,
     export_path: []const u8,
     all_issues: []const Issue,
-    cfg: *const Config,
-    graph: ?*const ImportGraph,
+    out: ReportOutCtx,
 ) !usize {
     var file = try Fs.cwd().createFile(export_path, .{});
     defer file.close(global_io.?);
@@ -20349,13 +20281,13 @@ fn exportIssues(
     });
     var filtered_count: usize = 0;
     for (all_issues) |issue| {
-        if (shouldPrintIssue(issue, cfg, graph)) filtered_count += 1;
+        if (shouldPrintIssue(issue, out.cfg, out.graph)) filtered_count += 1;
     }
     try output.print(allocator, "# Total issues: {d}\n\n", .{filtered_count});
 
     for (all_issues) |issue| {
-        if (!shouldPrintIssue(issue, cfg, graph)) continue;
-        try writeExportIssue(allocator, &output, issue, cfg.path);
+        if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
+        try writeExportIssue(allocator, &output, issue, out.cfg.path);
     }
     try file.writeStreamingAll(global_io.?, output.items);
     return filtered_count;
@@ -20451,18 +20383,11 @@ fn applyStrictGate(total: PrintCounts, fail_on: FailOn, findings_fail: *bool) vo
     findings_fail.* = true;
 }
 
-fn printIssues(
-    issues: []const Issue,
-    base_path: []const u8,
-    format: OutputFormat,
-    title: []const u8,
-    cfg: *const Config,
-    graph: ?*const ImportGraph,
-) PrintCounts {
+fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) PrintCounts {
     var total_printable: usize = 0;
     var counts = PrintCounts{};
     for (issues) |issue| {
-        if (!shouldPrintIssue(issue, cfg, graph)) continue;
+        if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
         total_printable += 1;
         switch (issue.severity) {
             .note => counts.notes += 1,
@@ -20475,22 +20400,22 @@ fn printIssues(
             },
         }
     }
-    if (format == .json) {
+    if (out.cfg.format == .json) {
         std.debug.print(
             "{{\n  \"analyzer\": \"{s}\",\n  \"count\": {d},\n  \"issues\": [\n",
             .{ title, total_printable },
         );
         var printed: usize = 0;
         for (issues) |issue| {
-            if (!shouldPrintIssue(issue, cfg, graph)) continue;
+            if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
             printed += 1;
-            issue.printJson(base_path, printed == total_printable);
+            issue.printJson(out.base_path, printed == total_printable);
         }
         std.debug.print("  ]\n}}\n", .{});
     } else {
         for (issues) |issue| {
-            if (!shouldPrintIssue(issue, cfg, graph)) continue;
-            issue.printText(base_path);
+            if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
+            issue.printText(out.base_path);
         }
     }
     return counts;
@@ -20796,7 +20721,8 @@ pub fn main(init: std.process.Init) !void {
                 defer deinitIssues(&issues, alloc);
                 sortIssuesByFile(issues.items);
 
-                const c = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg, &g);
+                const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+                const c = printIssues(issues.items, "orphans", out);
                 applyStrictGate(c, cfg.fail_on, &strict_fail);
             }
         },
@@ -20813,7 +20739,8 @@ pub fn main(init: std.process.Init) !void {
             defer ast_issues.deinit(alloc);
             for (ast_issues.items) |ai| try issues.append(alloc, ai);
             ast_issues.items.len = 0; // ownership moved to issues
-            const c = printIssues(issues.items, base_path, cfg.format, "memory", &cfg, &g);
+            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const c = printIssues(issues.items, "memory", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
@@ -20833,7 +20760,8 @@ pub fn main(init: std.process.Init) !void {
             }
             // Clear ignored without deiniting items (now owned by issues)
             ignored.items.len = 0;
-            const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg, &g);
+            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const c = printIssues(issues.items, "errors", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
@@ -20844,7 +20772,8 @@ pub fn main(init: std.process.Init) !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "unused", &cfg, &g);
+            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const c = printIssues(issues.items, "unused", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
@@ -20855,14 +20784,16 @@ pub fn main(init: std.process.Init) !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg, &g);
+            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const c = printIssues(issues.items, "complexity", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .fmt_check => {
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg, null);
+            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = null };
+            const c = printIssues(issues.items, "format", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
@@ -20899,7 +20830,8 @@ pub fn main(init: std.process.Init) !void {
             }
             var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
-            const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg, null);
+            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = null };
+            const c = printIssues(issues.items, "runtime", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
@@ -21010,14 +20942,8 @@ pub fn main(init: std.process.Init) !void {
                 const stats = g.getStats();
 
                 // Print all issues (returns filtered count)
-                const orphan_count = printIssues(
-                    orphan_issues.items,
-                    base_path,
-                    cfg.format,
-                    "orphans",
-                    &cfg,
-                    &g,
-                );
+                const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+                const orphan_count = printIssues(orphan_issues.items, "orphans", out);
                 // Filter cfg_mem_issues by rule category
                 var mem_only_issues = std.ArrayListUnmanaged(Issue).empty;
                 defer mem_only_issues.deinit(alloc);
@@ -21039,102 +20965,18 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
 
-                const mem_count = printIssues(
-                    mem_only_issues.items,
-                    base_path,
-                    cfg.format,
-                    "memory",
-                    &cfg,
-                    &g,
-                );
-                const ignored_err_count = printIssues(
-                    ignored_err_issues.items,
-                    base_path,
-                    cfg.format,
-                    "errors",
-                    &cfg,
-                    &g,
-                );
-                const err_count = printIssues(
-                    err_issues.items,
-                    base_path,
-                    cfg.format,
-                    "errors",
-                    &cfg,
-                    &g,
-                );
-                const null_safety_count = printIssues(
-                    null_safety_issues.items,
-                    base_path,
-                    cfg.format,
-                    "null-safety",
-                    &cfg,
-                    &g,
-                );
-                const panic_count = printIssues(
-                    panic_issues.items,
-                    base_path,
-                    cfg.format,
-                    "panic",
-                    &cfg,
-                    &g,
-                );
-                const unused_count = printIssues(
-                    unused_issues.items,
-                    base_path,
-                    cfg.format,
-                    "unused",
-                    &cfg,
-                    &g,
-                );
-                const cx_count = printIssues(
-                    cx_issues.items,
-                    base_path,
-                    cfg.format,
-                    "complexity",
-                    &cfg,
-                    &g,
-                );
-                const fmt_count = printIssues(
-                    fmt_issues.items,
-                    base_path,
-                    cfg.format,
-                    "format",
-                    &cfg,
-                    &g,
-                );
-                const naming_count = printIssues(
-                    naming_issues.items,
-                    base_path,
-                    cfg.format,
-                    "naming",
-                    &cfg,
-                    &g,
-                );
-                const style_count = printIssues(
-                    style_issues.items,
-                    base_path,
-                    cfg.format,
-                    "style",
-                    &cfg,
-                    &g,
-                );
-                const test_count = printIssues(
-                    test_issues.items,
-                    base_path,
-                    cfg.format,
-                    "tests",
-                    &cfg,
-                    &g,
-                );
-                const conc_count = printIssues(
-                    conc_issues.items,
-                    base_path,
-                    cfg.format,
-                    "concurrency",
-                    &cfg,
-                    &g,
-                );
+                const mem_count = printIssues(mem_only_issues.items, "memory", out);
+                const ignored_err_count = printIssues(ignored_err_issues.items, "errors", out);
+                const err_count = printIssues(err_issues.items, "errors", out);
+                const null_safety_count = printIssues(null_safety_issues.items, "null-safety", out);
+                const panic_count = printIssues(panic_issues.items, "panic", out);
+                const unused_count = printIssues(unused_issues.items, "unused", out);
+                const cx_count = printIssues(cx_issues.items, "complexity", out);
+                const fmt_count = printIssues(fmt_issues.items, "format", out);
+                const naming_count = printIssues(naming_issues.items, "naming", out);
+                const style_count = printIssues(style_issues.items, "style", out);
+                const test_count = printIssues(test_issues.items, "tests", out);
+                const conc_count = printIssues(conc_issues.items, "concurrency", out);
 
                 // Accumulate totals
                 const total = orphan_count
@@ -21186,7 +21028,7 @@ pub fn main(init: std.process.Init) !void {
                     for (conc_issues.items) |i| try all_issues.append(alloc, i);
 
                     const slice = all_issues.items;
-                    if (exportIssues(alloc, export_path, slice, &cfg, &g)) |exported_count| {
+                    if (exportIssues(alloc, export_path, slice, out)) |exported_count| {
                         std.debug.print(
                             "exported {d} issues to {s}\n",
                             .{ exported_count, export_path },

@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.0.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.1.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.14.0",
+  "version": "0.14.1",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -283,7 +283,7 @@ with existing inline-ignores, and is reported under the Memory category in
 | **ZA702** | warning | OFF | File exceeds max size (requires `--enable=ZA702` or config `enable`; threshold via `max_file_bytes`, default 50000) |
 | **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
 
-ZA704 (`std.debug.print` left in non-test code) was removed in 0.14.0 —
+ZA704 (`std.debug.print` left in non-test code) was removed in 0.14.1 —
 intent-based, cannot be grounded in objective detection (see EPH-I0049).
 The ID is retired and will never be reused.
 

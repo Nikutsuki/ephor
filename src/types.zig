@@ -133,6 +133,36 @@ pub const OutputFormat = enum {
 };
 
 // ============================================================================
+// Strict CI Gating
+// ============================================================================
+
+/// Severity level at which findings fail the run (exit 1).
+/// --strict is exactly .warning; .never keeps findings informational.
+pub const FailOn = enum {
+    never, // findings never fail the run (default)
+    err, // fail only on error-severity findings
+    warning, // fail on warnings + errors (== --strict)
+    note, // fail on any finding, notes included
+
+    pub fn str(self: FailOn) []const u8 {
+        return switch (self) {
+            .never => "never",
+            .err => "error",
+            .warning => "warning",
+            .note => "note",
+        };
+    }
+
+    pub fn fromString(s: []const u8) ?FailOn {
+        if (std.mem.eql(u8, s, "never")) return .never;
+        if (std.mem.eql(u8, s, "error")) return .err;
+        if (std.mem.eql(u8, s, "warning")) return .warning;
+        if (std.mem.eql(u8, s, "note")) return .note;
+        return null;
+    }
+};
+
+// ============================================================================
 // Core Types
 // ============================================================================
 

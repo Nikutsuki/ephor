@@ -104,6 +104,23 @@ const Fs = struct {
 /// Global I/O handle for child process and file operations.
 var global_io: ?std.Io = null;
 
+/// Test hook: zig build test's runner surfaces any stderr output as a step
+/// failure, so tests that exercise error paths mute parse diagnostics and
+/// assert on the resulting state instead of on the printed text.
+var cli_diagnostics_enabled = true;
+
+/// Errno-style detail for error.invalid_fail_on_value out of config parsing:
+/// the parse layer cannot know which ephor.json it is reading, so it stashes
+/// the offending value here and the catch-site (which knows the path) prints.
+/// Slice into the config content — valid until that caller frees it.
+var last_bad_fail_on: ?[]const u8 = null;
+
+/// Print a CLI/config diagnostic unless tests have muted the channel.
+fn cliDiag(comptime fmt: []const u8, args: anytype) void {
+    if (!cli_diagnostics_enabled) return;
+    std.debug.print(fmt, args);
+}
+
 // Version compatibility layer
 pub const compat = @import("compat/compat.zig");
 
@@ -165,6 +182,7 @@ const RULE_UNLOCK_WITHOUT_LOCK = types.RULE_UNLOCK_WITHOUT_LOCK;
 const RULE_THREAD_NO_JOIN = types.RULE_THREAD_NO_JOIN;
 
 const Severity = types.Severity;
+const FailOn = types.FailOn;
 
 // Output format (not in types.zig - specific to CLI)
 const OutputFormat = types.OutputFormat;
@@ -17933,6 +17951,20 @@ const Command = enum {
     upgrade, // Update ephor to latest version
 };
 
+/// Who set the fail-on gate level. Higher-priority sources override lower
+/// ones; ties go to the LATER occurrence (last-wins within one source).
+const FailOnSource = enum { unset, strict_key, fail_on_key, cli };
+
+/// Set the fail-on level unless a higher-priority source already owns it.
+/// Prevents a second config load (target-dir ephor.json) from clobbering a
+/// CLI flag, and "strict" from overriding an explicit "fail_on" (including
+/// fail_on:"never") regardless of key order in the file.
+fn setFailOn(cfg: *Config, level: FailOn, source: FailOnSource) void {
+    if (@intFromEnum(source) < @intFromEnum(cfg.fail_on_source)) return;
+    cfg.fail_on = level;
+    cfg.fail_on_source = source;
+}
+
 const Config = struct {
     command: Command,
     path: []const u8,
@@ -17953,6 +17985,10 @@ const Config = struct {
     auto_approve: bool, // --yes: skip interactive confirmation prompts
     runtime_command: ?[]const u8, // --command=<cmd> for runtime analysis
     install_version: ?[]const u8, // --version=X.Y.Z for install/upgrade
+    // CI gate: exit 1 when findings reach this level. --strict ≡ .warning.
+    // Config "fail_on" is more specific than config "strict"; CLI always wins.
+    fail_on: FailOn = .never,
+    fail_on_source: FailOnSource = .unset,
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -18027,14 +18063,28 @@ const Config = struct {
 
 const CONFIG_FILENAME = "ephor.json";
 
-fn loadConfigFile(allocator: Allocator, cfg: *Config) void {
+/// Report a config parse failure. The CI-gate key error is hard (propagated
+/// to the caller as a usage error); every other parse error warns + continues.
+fn reportConfigParseError(err: anyerror, path: []const u8) !void {
+    if (err != error.invalid_fail_on_value) {
+        std.debug.print("warning: failed to parse {s}: {}\n", .{ path, err });
+        return;
+    }
+    cliDiag(
+        "error: {s}: invalid fail_on '{s}' (expected: error, warning, note, never)\n",
+        .{ path, last_bad_fail_on orelse "?" },
+    );
+    return err;
+}
+
+fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
     // Try to load ephor.json config file from current directory
     const content = Fs.cwd().readFileAlloc(allocator, CONFIG_FILENAME, 64 * 1024) catch return;
     defer allocator.free(content);
 
     // Simple JSON parsing for config format
     parseConfigJson(allocator, content, cfg) catch |err| {
-        std.debug.print("warning: failed to parse {s}: {}\n", .{ CONFIG_FILENAME, err });
+        try reportConfigParseError(err, CONFIG_FILENAME);
     };
 }
 
@@ -18061,7 +18111,9 @@ fn tryLoadConfigFromDir(
     defer allocator.free(content);
 
     parseConfigJson(allocator, content, cfg) catch |err| {
-        std.debug.print("warning: failed to parse {s}: {}\n", .{ config_path, err });
+        // The CI gate key must never fail open, no matter which config
+        // file carried it; other parse errors stay warn-and-continue.
+        try reportConfigParseError(err, config_path);
         return false;
     };
 
@@ -18233,7 +18285,34 @@ fn handleConfigKey(
     if (mem.eql(u8, key, "thresholds") and content[start] == '{') {
         return parseThresholdsObject(content, start, &cfg.thresholds);
     }
+    if (try parseFailOnConfigKey(content, start, key, cfg)) |end| return end;
     return skipJsonValue(content, start);
+}
+
+/// Handle the "strict"/"fail_on" CI-gate config keys (null if not one of them).
+/// "fail_on" outranks "strict" via FailOnSource, so an explicit fail_on wins
+/// regardless of key order — including fail_on:"never".
+fn parseFailOnConfigKey(
+    content: []const u8,
+    start: usize,
+    key: []const u8,
+    cfg: *Config,
+) !?usize {
+    if (mem.eql(u8, key, "strict") and mem.startsWith(u8, content[start..], "true")) {
+        setFailOn(cfg, .warning, .strict_key);
+        return start + 4;
+    }
+    if (!mem.eql(u8, key, "fail_on") or content[start] != '"') return null;
+    const result = parseJsonString(content, start);
+    const level = FailOn.fromString(result.val) orelse {
+        // Hard error, not warn-and-continue like other config keys: an
+        // unparseable CI gate must never fail open (same policy as a bad
+        // --fail-on CLI value). The catch-site prints path + value.
+        last_bad_fail_on = result.val;
+        return error.invalid_fail_on_value;
+    };
+    setFailOn(cfg, level, .fail_on_key);
+    return result.end;
 }
 
 /// Skip a // line comment, returning the index after the newline (or content.len)
@@ -18351,6 +18430,10 @@ fn writeDefaultConfig() !void {
         \\  // Rules to explicitly enable (overrides disable)
         \\  // Examples: "ZA305" (cyclomatic complexity), "ZA306" (cognitive complexity)
         \\  "enable": [],
+        \\
+        \\  // CI gating: exit 1 when findings reach the level (default: informational)
+        \\  // "strict": true        — fail on any warning or error
+        \\  // "fail_on": "warning"  — finer control: error, warning, note, never
         \\
         \\  // Configurable thresholds
         \\  "thresholds": {
@@ -19723,6 +19806,10 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         cfg.auto_approve = true;
         return true;
     }
+    if (mem.eql(u8, arg, "--strict")) {
+        setFailOn(cfg, .warning, .cli);
+        return true;
+    }
     return false;
 }
 
@@ -19788,14 +19875,25 @@ fn handleListArg(
     return false;
 }
 
-/// Set an optional path field, freeing the old value if present
+/// Replace cfg.path with an owned copy. Dupe BEFORE free: when the dupe
+/// fails (OOM) the old path must stay valid so deinit frees it exactly once.
+fn setOwnedPath(allocator: Allocator, cfg: *Config, path: []const u8) !void {
+    const duped = try allocator.dupe(u8, path);
+    if (cfg.path_owned) allocator.free(cfg.path);
+    cfg.path = duped;
+    cfg.path_owned = true;
+}
+
+/// Set an optional path field, freeing the old value if present.
+/// Dupe BEFORE free: on OOM the old value must stay valid for deinit.
 fn setOptionalPath(
     allocator: Allocator,
     field: *?[]const u8,
     value: []const u8,
 ) !bool {
+    const duped = try allocator.dupe(u8, value);
     if (field.*) |old| allocator.free(old);
-    field.* = try allocator.dupe(u8, value);
+    field.* = duped;
     return true;
 }
 
@@ -19816,23 +19914,36 @@ fn handleOptionalPathArg(
     return false;
 }
 
+/// Handle --fail-on=<level> (returns true if the arg matched).
+/// Fail closed on a typo: a silently ignored CI gate flag is worse
+/// than a hard usage error.
+fn parseFailOnArg(arg: []const u8, cfg: *Config) !bool {
+    if (!mem.startsWith(u8, arg, "--fail-on=")) return false;
+    const level = FailOn.fromString(arg[10..]) orelse {
+        cliDiag(
+            "error: invalid --fail-on value '{s}' (expected: error, warning, note, never)\n",
+            .{arg[10..]},
+        );
+        return error.invalid_fail_on_value;
+    };
+    setFailOn(cfg, level, .cli);
+    return true;
+}
+
 fn parseCliArg(
     allocator: Allocator,
     arg: []const u8,
     cfg: *Config,
     cli_entries: *bool,
 ) !void {
+    if (try parseFailOnArg(arg, cfg)) return;
     if (mem.startsWith(u8, arg, "--entry="))
         return handleEntryArg(allocator, arg, cfg, cli_entries);
     if (parseSimpleFlag(arg, cfg)) return;
     if (parseThresholdArg(arg, &cfg.thresholds)) return;
     if (try handleListArg(allocator, arg, cfg)) return;
     if (try handleOptionalPathArg(allocator, arg, cfg)) return;
-    if (arg[0] != '-') {
-        if (cfg.path_owned) allocator.free(cfg.path);
-        cfg.path = try allocator.dupe(u8, arg);
-        cfg.path_owned = true;
-    }
+    if (arg[0] != '-') try setOwnedPath(allocator, cfg, arg);
 }
 
 fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
@@ -19860,7 +19971,10 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
         .runtime_command = null,
         .install_version = null,
     };
-    loadConfigFile(allocator, &cfg);
+    // Free the partially built config when a parse error aborts midway
+    // (config-file allocations are already attached to cfg by then).
+    errdefer cfg.deinit(allocator);
+    try loadConfigFile(allocator, &cfg);
     var cli_entries = false;
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
@@ -19869,9 +19983,7 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
             // First argument is a flag, not a path — parse it
             try parseCliArg(allocator, cmd, &cfg, &cli_entries);
         } else {
-            if (cfg.path_owned) allocator.free(cfg.path);
-            cfg.path = try allocator.dupe(u8, cmd);
-            cfg.path_owned = true;
+            try setOwnedPath(allocator, &cfg, cmd);
             cfg.command = .check;
         }
     }
@@ -19946,6 +20058,9 @@ fn printHelp() void {
         \\  --max-file-bytes=N   Max file size in bytes (requires --enable=ZA702)
         \\  -V, --verbose        Verbose output
         \\  -s, --summary        Show summary at end
+        \\  --strict             Exit 1 when any warning/error is found (CI gate)
+        \\  --fail-on=<level>    Exit 1 on findings at level: error, warning,
+        \\                       note, never (warning == --strict; overrides config)
         \\  -b, --build          With 'init': also show build.zig integration
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
@@ -19978,6 +20093,8 @@ fn printHelp() void {
         \\    "exclude": ["test", "vendor"],
         \\    "disable": ["ZA305", "ZA306"],
         \\    "enable": ["ZA702"],
+        \\    "strict": true,
+        \\    "fail_on": "warning",
         \\    "thresholds": {
         \\      "max_lines": 50,
         \\      "max_nesting": 3,
@@ -20228,18 +20345,73 @@ fn shouldPrintIssue(issue: Issue, cfg: *const Config, graph: ?*const ImportGraph
 }
 
 /// Print issues and return count of actionable issues (warnings + errors only).
-/// Notes are printed but do NOT count toward the exit code.
+/// `warnings` lumps errors in (historical semantics for footer/summary);
+/// `errors` is the error-severity subset, tracked for --fail-on=error.
 const PrintCounts = struct {
     warnings: usize = 0,
     notes: usize = 0,
+    errors: usize = 0,
 
     fn add(self: PrintCounts, other: PrintCounts) PrintCounts {
         return .{
             .warnings = self.warnings + other.warnings,
             .notes = self.notes + other.notes,
+            .errors = self.errors + other.errors,
         };
     }
 };
+
+/// Decide the process exit code from analysis findings: 1 when findings
+/// meet the configured fail-on level, 0 otherwise (usage errors are handled
+/// separately by should_exit_error).
+fn computeExitCode(counts: PrintCounts, fail_on: FailOn) u8 {
+    const triggered = switch (fail_on) {
+        .never => false,
+        .err => counts.errors > 0,
+        .warning => counts.warnings > 0, // warnings count already includes errors
+        .note => counts.warnings + counts.notes > 0,
+    };
+    return if (triggered) 1 else 0;
+}
+
+/// Finding count that triggers the gate at this level (0 for .never).
+fn strictFailureCount(total: PrintCounts, fail_on: FailOn) usize {
+    return switch (fail_on) {
+        .never => 0,
+        .err => total.errors,
+        .warning => total.warnings,
+        .note => total.warnings + total.notes,
+    };
+}
+
+/// Severity noun used in the failure notice for this level.
+fn strictFailureNoun(fail_on: FailOn) []const u8 {
+    return switch (fail_on) {
+        .never => "",
+        .err => "error",
+        .warning => "warning",
+        .note => "finding",
+    };
+}
+
+/// Print the strict-gate failure notice shown when findings fail the run.
+fn printStrictFailure(total: PrintCounts, fail_on: FailOn) void {
+    const n = strictFailureCount(total, fail_on);
+    if (n == 0) return;
+    std.debug.print("ephor: strict mode: failing with {d} {s}{s} (exit 1)\n", .{
+        n,
+        strictFailureNoun(fail_on),
+        if (n == 1) "" else "s",
+    });
+}
+
+/// Apply the strict CI gate to one command's findings: print the failure
+/// notice and flag the exit when the fail-on level is met.
+fn applyStrictGate(total: PrintCounts, fail_on: FailOn, findings_fail: *bool) void {
+    if (computeExitCode(total, fail_on) == 0) return;
+    printStrictFailure(total, fail_on);
+    findings_fail.* = true;
+}
 
 fn printIssues(
     issues: []const Issue,
@@ -20254,7 +20426,16 @@ fn printIssues(
     for (issues) |issue| {
         if (!shouldPrintIssue(issue, cfg, graph)) continue;
         total_printable += 1;
-        if (issue.severity == .note) counts.notes += 1 else counts.warnings += 1;
+        switch (issue.severity) {
+            .note => counts.notes += 1,
+            .warning => counts.warnings += 1,
+            // Errors stay inside `warnings` (footer/summary semantics) and are
+            // also counted separately so --fail-on=error can see them.
+            .err => {
+                counts.warnings += 1;
+                counts.errors += 1;
+            },
+        }
     }
     if (format == .json) {
         std.debug.print(
@@ -20513,6 +20694,8 @@ pub fn main(init: std.process.Init) !void {
 
     // Track if we should exit with error (checked at end of main after defers)
     var should_exit_error = false;
+    // Strict CI gate: findings met the --strict/--fail-on level
+    var strict_fail = false;
 
     // Check for updates on analysis commands (not on help/version/init/install/upgrade)
     switch (cfg.command) {
@@ -20576,7 +20759,7 @@ pub fn main(init: std.process.Init) !void {
                 sortIssuesByFile(issues.items);
 
                 const c = printIssues(issues.items, base_path, cfg.format, "orphans", &cfg, &g);
-                _ = c;
+                applyStrictGate(c, cfg.fail_on, &strict_fail);
             }
         },
 
@@ -20588,7 +20771,7 @@ pub fn main(init: std.process.Init) !void {
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "memory", &cfg, &g);
-            _ = c;
+            applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .errors => {
@@ -20608,7 +20791,7 @@ pub fn main(init: std.process.Init) !void {
             // Clear ignored without deiniting items (now owned by issues)
             ignored.items.len = 0;
             const c = printIssues(issues.items, base_path, cfg.format, "errors", &cfg, &g);
-            _ = c;
+            applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .unused => {
@@ -20619,7 +20802,7 @@ pub fn main(init: std.process.Init) !void {
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "unused", &cfg, &g);
-            _ = c;
+            applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .complexity => {
@@ -20630,14 +20813,14 @@ pub fn main(init: std.process.Init) !void {
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "complexity", &cfg, &g);
-            _ = c;
+            applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .fmt_check => {
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "format", &cfg, null);
-            _ = c;
+            applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .stats => {
@@ -20674,7 +20857,7 @@ pub fn main(init: std.process.Init) !void {
             var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
             const c = printIssues(issues.items, base_path, cfg.format, "runtime", &cfg, null);
-            _ = c;
+            applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .check => {
@@ -20919,6 +21102,7 @@ pub fn main(init: std.process.Init) !void {
 
                 // Print summary footer
                 printResultFooter(total);
+                applyStrictGate(total, cfg.fail_on, &strict_fail);
 
                 // Export issues to file if requested
                 if (cfg.export_path) |export_path| {
@@ -20951,7 +21135,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
 
-                // Analysis results are informational - don't fail the build
+                // Findings are informational unless --strict/--fail-on gates them
             }
         },
     }
@@ -20966,7 +21150,7 @@ pub fn main(init: std.process.Init) !void {
     // Exit with error code AFTER all defers have run (cfg.deinit, gpa.deinit)
     // This is at the end of main() so defers execute first, then we exit
     // ephor:disable-next-line ZA206
-    if (should_exit_error) std.process.exit(1);
+    if (should_exit_error or strict_fail) std.process.exit(1);
 }
 
 // ============================================================================
@@ -33206,4 +33390,238 @@ test "ZA904: range-for index casts stay silent, item casts still fire" {
         countRuleIssues(run.issues.items, "app_forloop.zig", RULE_INTCAST_NO_BOUNDS),
     );
     try std.testing.expectEqual(@as(usize, 8), run.issues.items[0].line);
+}
+
+// ============================================================================
+// Strict CI gating (--strict / --fail-on / config strict/fail_on)
+// ============================================================================
+
+test "computeExitCode: default (never) passes with warnings" {
+    const counts = PrintCounts{ .warnings = 1 };
+    try std.testing.expectEqual(@as(u8, 0), computeExitCode(counts, .never));
+}
+
+test "computeExitCode: strict fails on a single warning" {
+    const counts = PrintCounts{ .warnings = 1 };
+    try std.testing.expectEqual(@as(u8, 1), computeExitCode(counts, .warning));
+}
+
+test "computeExitCode: notes-only does not fail strict" {
+    const counts = PrintCounts{ .notes = 3 };
+    try std.testing.expectEqual(@as(u8, 0), computeExitCode(counts, .warning));
+}
+
+test "computeExitCode: fail-on=note fails on notes only" {
+    const counts = PrintCounts{ .notes = 1 };
+    try std.testing.expectEqual(@as(u8, 1), computeExitCode(counts, .note));
+}
+
+test "computeExitCode: fail-on=error passes with warnings only" {
+    const counts = PrintCounts{ .warnings = 5, .notes = 2 };
+    try std.testing.expectEqual(@as(u8, 0), computeExitCode(counts, .err));
+}
+
+test "computeExitCode: fail-on=error fails on an error finding" {
+    // errors are a subset of warnings (lumped), so both fields are set
+    const counts = PrintCounts{ .warnings = 2, .errors = 1 };
+    try std.testing.expectEqual(@as(u8, 1), computeExitCode(counts, .err));
+}
+
+test "computeExitCode: error findings also fail the warning level" {
+    const counts = PrintCounts{ .warnings = 1, .errors = 1 };
+    try std.testing.expectEqual(@as(u8, 1), computeExitCode(counts, .warning));
+}
+
+test "computeExitCode: clean run passes at every level" {
+    const counts = PrintCounts{};
+    inline for (.{ .never, .err, .warning, .note }) |level| {
+        try std.testing.expectEqual(@as(u8, 0), computeExitCode(counts, level));
+    }
+}
+
+test "PrintCounts.add accumulates the error subset" {
+    const a = PrintCounts{ .warnings = 2, .notes = 1, .errors = 1 };
+    const b = PrintCounts{ .warnings = 3, .notes = 2, .errors = 2 };
+    const total = a.add(b);
+    try std.testing.expectEqual(@as(usize, 5), total.warnings);
+    try std.testing.expectEqual(@as(usize, 3), total.notes);
+    try std.testing.expectEqual(@as(usize, 3), total.errors);
+}
+
+test "FailOn.fromString round-trips and rejects garbage" {
+    try std.testing.expectEqual(FailOn.never, FailOn.fromString("never").?);
+    try std.testing.expectEqual(FailOn.err, FailOn.fromString("error").?);
+    try std.testing.expectEqual(FailOn.warning, FailOn.fromString("warning").?);
+    try std.testing.expectEqual(FailOn.note, FailOn.fromString("note").?);
+    try std.testing.expect(FailOn.fromString("warn") == null);
+    try std.testing.expect(FailOn.fromString("") == null);
+}
+
+test "config strict:true sets the warning gate" {
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
+}
+
+test "config strict:false leaves findings informational" {
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"strict\": false}", &cfg);
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+}
+
+test "config fail_on parses the level" {
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"fail_on\": \"note\"}", &cfg);
+    try std.testing.expectEqual(FailOn.note, cfg.fail_on);
+}
+
+test "config fail_on beats strict regardless of key order" {
+    var cfg_late = testConfig();
+    try parseConfigJson(
+        std.testing.allocator,
+        "{\"strict\": true, \"fail_on\": \"error\"}",
+        &cfg_late,
+    );
+    try std.testing.expectEqual(FailOn.err, cfg_late.fail_on);
+
+    var cfg_early = testConfig();
+    try parseConfigJson(
+        std.testing.allocator,
+        "{\"fail_on\": \"error\", \"strict\": true}",
+        &cfg_early,
+    );
+    try std.testing.expectEqual(FailOn.err, cfg_early.fail_on);
+}
+
+test "config invalid fail_on is a hard usage error" {
+    var cfg = testConfig();
+    try std.testing.expectError(
+        error.invalid_fail_on_value,
+        parseConfigJson(std.testing.allocator, "{\"fail_on\": \"warn\"}", &cfg),
+    );
+    // fail closed: the rejected key must not leave a gate half-configured
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+    // error detail stashed so the catch-site can name path + value
+    try std.testing.expectEqualStrings("warn", last_bad_fail_on.?);
+}
+
+test "CLI --strict sets the warning gate" {
+    var cfg = testConfig();
+    var cli_entries = false;
+    try parseCliArg(std.testing.allocator, "--strict", &cfg, &cli_entries);
+    try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
+}
+
+test "CLI --fail-on overrides config strict" {
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    var cli_entries = false;
+    try parseCliArg(std.testing.allocator, "--fail-on=error", &cfg, &cli_entries);
+    try std.testing.expectEqual(FailOn.err, cfg.fail_on);
+}
+
+test "CLI --fail-on=never can override config strict off" {
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    var cli_entries = false;
+    try parseCliArg(std.testing.allocator, "--fail-on=never", &cfg, &cli_entries);
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+}
+
+test "CLI invalid --fail-on value is a hard usage error" {
+    // Mute the error print: zig's test runner surfaces child stderr as failure
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    var cfg = testConfig();
+    var cli_entries = false;
+    try std.testing.expectError(
+        error.invalid_fail_on_value,
+        parseCliArg(std.testing.allocator, "--fail-on=warn", &cfg, &cli_entries),
+    );
+    // fail closed: the rejected flag must not leave a gate half-configured
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+}
+
+test "config fail_on:never beats strict in EITHER key order" {
+    // Regression: .never was both unset-sentinel and explicit level, so
+    // key order changed the outcome (EPH-I0024 review bug 1)
+    var cfg_a = testConfig();
+    try parseConfigJson(
+        std.testing.allocator,
+        "{\"strict\": true, \"fail_on\": \"never\"}",
+        &cfg_a,
+    );
+    try std.testing.expectEqual(FailOn.never, cfg_a.fail_on);
+
+    var cfg_b = testConfig();
+    try parseConfigJson(
+        std.testing.allocator,
+        "{\"fail_on\": \"never\", \"strict\": true}",
+        &cfg_b,
+    );
+    try std.testing.expectEqual(FailOn.never, cfg_b.fail_on);
+}
+
+test "second config load (target dir) cannot clobber the CLI" {
+    // Regression: parse order was config → CLI → target-dir config, so a
+    // target-dir "strict":true overrode CLI --fail-on=never (review bug 2)
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    var cli_entries = false;
+    try parseCliArg(std.testing.allocator, "--fail-on=never", &cfg, &cli_entries);
+    // Target-dir ephor.json loads AFTER CLI args in parseArgs
+    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+    try parseConfigJson(std.testing.allocator, "{\"fail_on\": \"error\"}", &cfg);
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+}
+
+test "target-dir config still applies when the CLI did not set the gate" {
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{}", &cfg);
+    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
+}
+
+test "same source resolves last-wins" {
+    var cfg = testConfig();
+    try parseConfigJson(
+        std.testing.allocator,
+        "{\"fail_on\": \"error\", \"fail_on\": \"note\"}",
+        &cfg,
+    );
+    try std.testing.expectEqual(FailOn.note, cfg.fail_on);
+
+    var cli_entries = false;
+    try parseCliArg(std.testing.allocator, "--strict", &cfg, &cli_entries);
+    try parseCliArg(std.testing.allocator, "--fail-on=error", &cfg, &cli_entries);
+    try std.testing.expectEqual(FailOn.err, cfg.fail_on);
+}
+
+test "setOwnedPath OOM keeps the old path freeable exactly once" {
+    const alloc = std.testing.allocator;
+    var cfg = testConfig();
+    cfg.path = try alloc.dupe(u8, "old");
+    cfg.path_owned = true;
+    defer cfg.deinit(alloc); // double-free here would trip the test allocator
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        setOwnedPath(failing.allocator(), &cfg, "new"),
+    );
+    try std.testing.expectEqualStrings("old", cfg.path);
+}
+
+test "setOptionalPath OOM keeps the old value freeable exactly once" {
+    const alloc = std.testing.allocator;
+    var field: ?[]const u8 = try alloc.dupe(u8, "old");
+    defer if (field) |f| alloc.free(f);
+
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        setOptionalPath(failing.allocator(), &field, "new"),
+    );
+    try std.testing.expectEqualStrings("old", field.?);
 }

@@ -187,6 +187,8 @@ Example config:
 | `orphan_exclude` | Patterns to exclude from orphan detection only |
 | `disable` | Rule IDs to disable (prefix matching: `ZA3` disables all) |
 | `enable` | Rule IDs to enable (overrides disable) |
+| `strict` | `true` to exit 1 when any warning/error is found (CI gate) |
+| `fail_on` | Finer CI gate: `error`, `warning`, `note`, `never` (overrides `strict`) |
 | `thresholds` | Complexity and style thresholds |
 
 ## Rule IDs
@@ -472,6 +474,9 @@ Options:
   --command=<cmd>      For runtime: custom command instead of 'zig build test'
   -V, --verbose        Verbose output
   -s, --summary        Show summary at end (off by default)
+  --strict             Exit 1 when any warning/error is found (CI gate)
+  --fail-on=<level>    Exit 1 on findings at level: error, warning,
+                       note, never (warning == --strict; overrides config)
 ```
 
 ## IDE Integration
@@ -663,10 +668,20 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 
 | Code | Meaning |
 |------|---------|
-| 0 | Analysis completed (regardless of findings) |
-| 1 | Usage error (no entry points, bad arguments, init/install failures) |
+| 0 | Analysis completed; no findings at the configured fail-on level |
+| 1 | Usage error (no entry points, bad arguments, init/install failures) **or** findings met the `--strict`/`--fail-on` level |
 
-All findings are informational: `ephor check` exits 0 whether or not issues are found. Gate CI on the output (or `--summary` counts) instead.
+Findings are informational by default: `ephor check` exits 0 whether or not issues are found. For CI gating, opt into strict mode:
+
+| Flag | Config key | Exit 1 when |
+|------|-----------|-------------|
+| `--strict` | `"strict": true` | any warning or error is found (notes never fail) |
+| `--fail-on=error` | `"fail_on": "error"` | any error-severity finding |
+| `--fail-on=warning` | `"fail_on": "warning"` | any warning or error (same as `--strict`) |
+| `--fail-on=note` | `"fail_on": "note"` | any finding, notes included |
+| `--fail-on=never` | `"fail_on": "never"` | never — lets the CLI override a strict config off |
+
+CLI flags override `ephor.json` — including a target-directory `ephor.json` loaded for the analyzed path. Inside one config file, `fail_on` is more specific than `strict` and wins regardless of key order. An invalid fail-on value — in the CLI flag or in any `ephor.json` — is a usage error (exit 1): a misspelled CI gate must never fail open. When the gate trips, the footer says so, e.g. `ephor: strict mode: failing with 12 warnings (exit 1)`.
 
 ## Examples
 

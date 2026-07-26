@@ -26,7 +26,7 @@ while read local_ref local_sha remote_ref remote_sha; do
 
     # 4. Personal dev files must never be pushed (additions only —
     # removal commits must pass)
-    bad_files=$(git diff --name-only --diff-filter=A "$range" 2>/dev/null | grep -E '^\.opencode/|^opencode\.json$' | head -5)
+    bad_files=$(git diff --name-only --diff-filter=A "$range" 2>/dev/null | grep -E '^\.opencode/|^opencode\.json$|^AGENTS\.md$' | head -5)
     if [ -n "$bad_files" ]; then
         echo "PUSH BLOCKED: personal dev files must not be tracked: $bad_files"
         fail=1

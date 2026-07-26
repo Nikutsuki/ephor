@@ -4902,31 +4902,35 @@ const ImportGraph = struct {
         return true;
     }
 
-    /// Try to extract a const import at position i, recording it in analysis.
-    fn tryRecordConstImport(
-        self: *ImportGraph,
+    /// Inputs for recording one const import: the file content and decl
+    /// position, plus the owning file path and the analysis to record into.
+    const ConstImportCtx = struct {
         content: []const u8,
         file_path: []const u8,
         analysis: *FileAnalysis,
         i: usize,
         line_num: usize,
         col: usize,
-    ) !void {
-        const is_pub = i >= 4 and mem.eql(u8, content[i - 4 .. i], "pub ");
-        const name_start = i + 6;
-        const var_name = extractVarName(content, name_start) orelse return;
+    };
+
+    /// Try to extract a const import at position i, recording it in analysis.
+    fn tryRecordConstImport(self: *ImportGraph, ctx: ConstImportCtx) !void {
+        const is_pub = ctx.i >= 4 and
+            mem.eql(u8, ctx.content[ctx.i - 4 .. ctx.i], "pub ");
+        const name_start = ctx.i + 6;
+        const var_name = extractVarName(ctx.content, name_start) orelse return;
         const path_start = name_start + var_name.len;
-        const import_path = findImportPath(content, path_start) orelse return;
+        const import_path = findImportPath(ctx.content, path_start) orelse return;
         if (mem.eql(u8, import_path, "std")) return;
         if (mem.eql(u8, import_path, "builtin")) return;
 
-        const resolved = try self.resolveImport(file_path, import_path);
-        try analysis.imports.append(self.allocator, .{
+        const resolved = try self.resolveImport(ctx.file_path, import_path);
+        try ctx.analysis.imports.append(self.allocator, .{
             .path = try self.allocator.dupe(u8, import_path),
             .resolved = resolved,
             .name = try self.allocator.dupe(u8, var_name),
-            .line = line_num,
-            .col = col,
+            .line = ctx.line_num,
+            .col = ctx.col,
             .is_pub = is_pub,
         });
     }
@@ -4965,14 +4969,14 @@ const ImportGraph = struct {
             if (not_const) continue;
             if (!isConstStatementStart(content, i)) continue;
 
-            try self.tryRecordConstImport(
-                content,
-                file_path,
-                analysis,
-                i,
-                line_num,
-                col,
-            );
+            try self.tryRecordConstImport(.{
+                .content = content,
+                .file_path = file_path,
+                .analysis = analysis,
+                .i = i,
+                .line_num = line_num,
+                .col = col,
+            });
         }
 
         try self.extractBareImports(content, file_path, analysis);
@@ -7134,33 +7138,38 @@ fn trackTestBlock(
     return .{ .in_test = in_block, .depth = brace_depth };
 }
 
-/// Check for silent catch patterns (ZA201)
-/// Skip the warning in defer/errdefer contexts (best-effort cleanup)
-fn checkSilentCatch(
+/// Line context for silent-catch detection (ZA201): the trimmed line, its
+/// position, the enclosing fn name, and the lookback/lookahead lines the
+/// multi-line suppression forms need.
+const SilentCatchCtx = struct {
     t: []const u8,
     path: []const u8,
     line: usize,
     func_name: []const u8,
-    preceding_lines: ?[]const []const u8,
-    next_line: ?[]const u8,
-) ?Issue {
-    if (mem.startsWith(u8, t, "defer ") or
-        mem.startsWith(u8, t, "errdefer ")) return null;
+    preceding_lines: ?[]const []const u8 = null,
+    next_line: ?[]const u8 = null,
+};
+
+/// Check for silent catch patterns (ZA201)
+/// Skip the warning in defer/errdefer contexts (best-effort cleanup)
+fn checkSilentCatch(ctx: SilentCatchCtx) ?Issue {
+    if (mem.startsWith(u8, ctx.t, "defer ") or
+        mem.startsWith(u8, ctx.t, "errdefer ")) return null;
     // Suppress in cleanup/shutdown functions — catch {} is intentional best-effort
-    if (isCleanupFunction(func_name)) return null;
+    if (isCleanupFunction(ctx.func_name)) return null;
     // Suppress when the called method is a cleanup/best-effort operation
-    if (isCleanupMethodCall(t)) return null;
+    if (isCleanupMethodCall(ctx.t)) return null;
     // Suppress explicit discard: `_ = expr catch {}` — caller intentionally
     // ignores both value and error
-    if (isDiscardedCatch(t)) return null;
+    if (isDiscardedCatch(ctx.t)) return null;
     // Suppress catch {} on continuation lines of multi-line defer expressions
-    if (isDeferCatchMultiline(t, preceding_lines)) return null;
+    if (isDeferCatchMultiline(ctx.t, ctx.preceding_lines)) return null;
     // Suppress writer/stream catch {} — uses paren-balanced lookback for multi-line
-    if (isStreamWriteCatchMultiline(t, preceding_lines)) return null;
-    const found = findSilentCatchCol(t, next_line) orelse return null;
+    if (isStreamWriteCatchMultiline(ctx.t, ctx.preceding_lines)) return null;
+    const found = findSilentCatchCol(ctx.t, ctx.next_line) orelse return null;
     return .{
-        .file = path,
-        .line = line,
+        .file = ctx.path,
+        .line = ctx.line,
         .col = found.col + 1,
         .severity = .warning,
         .rule = RULE_SILENT_CATCH,
@@ -8113,10 +8122,15 @@ fn isScopeEnd(t: []const u8) bool {
     return has_fn and has_paren;
 }
 
-/// Check pending struct fields and report unfilled ones
-fn checkPendingFields(
+/// Line inputs for the pending-struct-field scan (ZA204 undefined fields).
+const PendingFieldsCtx = struct {
     t: []const u8,
     path: []const u8,
+};
+
+/// Check pending struct fields and report unfilled ones
+fn checkPendingFields(
+    ctx: PendingFieldsCtx,
     state: *ErrorAnalysisState,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
@@ -8129,12 +8143,12 @@ fn checkPendingFields(
             i += 1;
             continue;
         }
-        if (isStructFieldFilled(t, pf.struct_name, pf.field_name)) {
+        if (isStructFieldFilled(ctx.t, pf.struct_name, pf.field_name)) {
             removePendingField(state, i);
             continue;
         }
-        if (isScopeEnd(t)) {
-            try reportUnfilledField(issues, allocator, path, pf);
+        if (isScopeEnd(ctx.t)) {
+            try reportUnfilledField(issues, allocator, ctx.path, pf);
             removePendingField(state, i);
             continue;
         }
@@ -8666,11 +8680,13 @@ fn checkUselessErrorReturns(
     }
 }
 
-/// Check all error patterns on a single line
-fn checkLineErrors(
+/// Per-line inputs for the error-pattern scan (ZA201-ZA210): the trimmed
+/// line and its position, the scan's context flags (test/defer state), the
+/// mutable pending-undefined set, and the issue sink.
+const ErrorLineCtx = struct {
     t: []const u8,
     path: []const u8,
-    ln: usize,
+    line: usize,
     skip_undefined: bool,
     in_defer: bool,
     in_test: bool,
@@ -8681,52 +8697,68 @@ fn checkLineErrors(
     func_name: []const u8,
     preceding_lines: ?[]const []const u8,
     next_line: ?[]const u8,
-) !void {
+
+    /// Bundle the fields checkSilentCatch needs for the ZA201 sub-check.
+    fn silentCatchCtx(self: ErrorLineCtx) SilentCatchCtx {
+        return .{
+            .t = self.t,
+            .path = self.path,
+            .line = self.line,
+            .func_name = self.func_name,
+            .preceding_lines = self.preceding_lines,
+            .next_line = self.next_line,
+        };
+    }
+};
+
+/// Check all error patterns on a single line
+fn checkLineErrors(ctx: ErrorLineCtx) !void {
     // ZA201 (silent catch) — suppressed in test context, where ZT104's
     // note is the replacement (same inversion as ZA202/ZA203 below): a
     // test gets exactly one report per catch, never two.
-    if (!in_defer and !in_test) {
-        if (checkSilentCatch(t, path, ln, func_name, preceding_lines, next_line)) |i| {
-            try issues.append(allocator, i);
+    if (!ctx.in_defer and !ctx.in_test) {
+        if (checkSilentCatch(ctx.silentCatchCtx())) |i| {
+            try ctx.issues.append(ctx.allocator, i);
         }
     }
     // ZA202: catch unreachable — suppress in test blocks (intentional assertions)
-    if (!in_test) {
-        if (checkCatchUnreachable(t, path, ln, preceding_lines)) |i| {
-            try issues.append(allocator, i);
+    if (!ctx.in_test) {
+        if (checkCatchUnreachable(ctx.t, ctx.path, ctx.line, ctx.preceding_lines)) |i| {
+            try ctx.issues.append(ctx.allocator, i);
         }
     }
     // ZA203: orelse unreachable — suppress in test blocks (intentional assertions)
-    if (!in_test) {
-        if (checkLineOrelseUnreachable(t, path, ln)) |i| {
-            try issues.append(allocator, i);
+    if (!ctx.in_test) {
+        if (checkLineOrelseUnreachable(ctx.t, ctx.path, ctx.line)) |i| {
+            try ctx.issues.append(ctx.allocator, i);
         }
     }
     // ZA207: catch undefined (dangerous — converts errors to UB)
-    if (checkCatchUndefined(t, path, ln)) |i| {
-        try issues.append(allocator, i);
+    if (checkCatchUndefined(ctx.t, ctx.path, ctx.line)) |i| {
+        try ctx.issues.append(ctx.allocator, i);
     }
     // Always resolve pending undefineds (even at module boundary) to avoid
     // losing ZA204 issues when skip_undefined transitions from false→true.
     // The update pass checks fill patterns and scope boundaries per var.
-    const undef_ctx: UndefinedLineCtx = .{ .t = t, .path = path, .line = ln };
-    try updatePendingUndefinedSet(undef_ctx, pending, issues, allocator);
+    const undef_ctx: UndefinedLineCtx = .{ .t = ctx.t, .path = ctx.path, .line = ctx.line };
+    try updatePendingUndefinedSet(undef_ctx, ctx.pending, ctx.issues, ctx.allocator);
     // Only track NEW undefineds when not in test/module-level context.
     // Multiple vars may be pending at once (the old single-slot tracker
     // dropped every decl after the first).
-    if (!skip_undefined) {
-        try trackNewUndefined(undef_ctx, pending, issues, allocator);
+    if (!ctx.skip_undefined) {
+        try trackNewUndefined(undef_ctx, ctx.pending, ctx.issues, ctx.allocator);
     }
-    if (checkDiscardedResult(t, path, ln, type_ctx)) |i| try issues.append(allocator, i);
+    const discarded = checkDiscardedResult(ctx.t, ctx.path, ctx.line, ctx.type_ctx);
+    if (discarded) |i| try ctx.issues.append(ctx.allocator, i);
     // ZA208: @panic() detection — suppress in test blocks and test files
-    if (!in_test and !isTestFilePath(path)) {
-        if (checkPanic(t, path, ln)) |i| {
-            try issues.append(allocator, i);
+    if (!ctx.in_test and !isTestFilePath(ctx.path)) {
+        if (checkPanic(ctx.t, ctx.path, ctx.line)) |i| {
+            try ctx.issues.append(ctx.allocator, i);
         }
     }
     // ZA210: catch |e| return e (note, off by default — print-time filtered)
-    if (checkNoCatchReturn(t, path, ln)) |i| {
-        try issues.append(allocator, i);
+    if (checkNoCatchReturn(ctx.t, ctx.path, ctx.line)) |i| {
+        try ctx.issues.append(ctx.allocator, i);
     }
 }
 
@@ -8760,28 +8792,31 @@ fn reportEndOfFileIssues(
     }
 }
 
-/// ZA206: Check for std.process.exit() bypassing defers
-fn checkExitBypassesDefer(
+/// Line context for exit-bypasses-defer detection (ZA206): the trimmed
+/// line, its position, and whether the enclosing fn holds a defer.
+const ExitDeferCtx = struct {
     t: []const u8,
-    _: []const u8,
     path: []const u8,
     line_num: usize,
     has_defer: bool,
     func_name: []const u8,
-) ?Issue {
-    if (!has_defer or func_name.len == 0) return null;
-    const has_exit = mem.indexOf(u8, t, "std.process.exit(") != null or
-        mem.indexOf(u8, t, "process.exit(") != null or
-        mem.indexOf(u8, t, "std.posix.exit(") != null or
-        mem.indexOf(u8, t, "posix.exit(") != null;
+};
+
+/// ZA206: Check for std.process.exit() bypassing defers
+fn checkExitBypassesDefer(ctx: ExitDeferCtx) ?Issue {
+    if (!ctx.has_defer or ctx.func_name.len == 0) return null;
+    const has_exit = mem.indexOf(u8, ctx.t, "std.process.exit(") != null or
+        mem.indexOf(u8, ctx.t, "process.exit(") != null or
+        mem.indexOf(u8, ctx.t, "std.posix.exit(") != null or
+        mem.indexOf(u8, ctx.t, "posix.exit(") != null;
     if (!has_exit) return null;
 
-    const exit_pos = mem.indexOf(u8, t, "exit(") orelse 0;
-    if (isInsideString(t, exit_pos)) return null;
+    const exit_pos = mem.indexOf(u8, ctx.t, "exit(") orelse 0;
+    if (isInsideString(ctx.t, exit_pos)) return null;
 
     return .{
-        .file = path,
-        .line = line_num,
+        .file = ctx.path,
+        .line = ctx.line_num,
         .col = exit_pos + 1,
         .severity = .warning,
         .rule = RULE_EXIT_BYPASSES_DEFER,
@@ -8845,10 +8880,11 @@ fn analyzeFileErrors(
 
         const s = updateErrorState(t, line, &state, a.path);
 
+        const pf_ctx: PendingFieldsCtx = .{ .t = t, .path = a.path };
         if (!s.skip_undefined) {
             trackStructLiteral(t, line_num, &state);
             activatePendingFields(&state);
-            try checkPendingFields(t, a.path, &state, issues, allocator);
+            try checkPendingFields(pf_ctx, &state, issues, allocator);
         }
         const preceding: ?[]const []const u8 = if (line_idx > 0) all_lines[0..line_idx] else null;
         // Needed for the bounded 2-line empty-catch form: `catch {` + `}` alone
@@ -8857,30 +8893,29 @@ fn analyzeFileErrors(
         else
             null;
         const in_test = isInTestContext(a.path, state.in_test_block);
-        try checkLineErrors(
-            t,
-            a.path,
-            line_num,
-            s.skip_undefined,
-            state.in_defer_block,
-            in_test,
-            &state.pending_undefined,
-            issues,
-            allocator,
-            &type_ctx,
-            state.current_func_name,
-            preceding,
-            next_line,
-        );
+        try checkLineErrors(.{
+            .t = t,
+            .path = a.path,
+            .line = line_num,
+            .skip_undefined = s.skip_undefined,
+            .in_defer = state.in_defer_block,
+            .in_test = in_test,
+            .pending = &state.pending_undefined,
+            .issues = issues,
+            .allocator = allocator,
+            .type_ctx = &type_ctx,
+            .func_name = state.current_func_name,
+            .preceding_lines = preceding,
+            .next_line = next_line,
+        });
 
-        if (checkExitBypassesDefer(
-            t,
-            a.content,
-            a.path,
-            line_num,
-            state.has_defer_in_func,
-            state.current_func_name,
-        )) |issue| {
+        if (checkExitBypassesDefer(.{
+            .t = t,
+            .path = a.path,
+            .line_num = line_num,
+            .has_defer = state.has_defer_in_func,
+            .func_name = state.current_func_name,
+        })) |issue| {
             try issues.append(allocator, issue);
         }
     }
@@ -11774,25 +11809,28 @@ fn extractUnusedDeclName(t: []const u8, is_const: bool) ?[]const u8 {
     return name;
 }
 
-/// Check a single import for usage (ZA401)
-fn checkUnusedImport(
-    allocator: Allocator,
+/// Shared sink + file context for unused checks (ZA401-ZA403): the issue
+/// list with its allocator, plus the scanned file's path and full content.
+const UnusedFileCtx = struct {
     issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
     path: []const u8,
     content: []const u8,
-    imp: ImportInfo,
-) !void {
+};
+
+/// Check a single import for usage (ZA401)
+fn checkUnusedImport(ctx: UnusedFileCtx, imp: ImportInfo) !void {
     if (imp.name.len > 0 and imp.name[0] == '_') return;
     // Skip public re-exports - they're intentional library API
     if (imp.is_pub) return;
-    if (countRealIdentUses(content, imp.name, imp.line) > 0) return;
+    if (countRealIdentUses(ctx.content, imp.name, imp.line) > 0) return;
     const msg = try std.fmt.allocPrint(
-        allocator,
+        ctx.allocator,
         "unused import '{s}'",
         .{imp.name},
     );
-    try issues.append(allocator, .{
-        .file = path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.path,
         .line = imp.line,
         .col = imp.col,
         .severity = .warning,
@@ -11804,14 +11842,7 @@ fn checkUnusedImport(
 }
 
 /// Check a single declaration line for usage (ZA402/ZA403)
-fn checkUnusedDecl(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    path: []const u8,
-    content: []const u8,
-    t: []const u8,
-    line_num: usize,
-) !void {
+fn checkUnusedDecl(ctx: UnusedFileCtx, t: []const u8, line_num: usize) !void {
     if (isCommentOrMultilineString(t)) return;
     if (mem.indexOf(u8, t, "@import(") != null) return;
     // Skip @This() pattern - common idiom for self-referential types
@@ -11820,16 +11851,16 @@ fn checkUnusedDecl(
     const is_var = mem.startsWith(u8, t, "var ");
     if (!is_const and !is_var) return;
     const name = extractUnusedDeclName(t, is_const) orelse return;
-    if (countRealIdentUses(content, name, line_num) > 0) return;
+    if (countRealIdentUses(ctx.content, name, line_num) > 0) return;
     const rule = if (is_const) RULE_UNUSED_CONST else RULE_UNUSED_VAR;
     const kind = if (is_const) "const" else "var";
     const msg = try std.fmt.allocPrint(
-        allocator,
+        ctx.allocator,
         "unused {s} '{s}'",
         .{ kind, name },
     );
-    try issues.append(allocator, .{
-        .file = path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.path,
         .line = line_num,
         .col = 1,
         .severity = .warning,
@@ -11850,15 +11881,21 @@ fn analyzeUnused(
         const a = entry.value_ptr.*;
         // Skip auto-generated C import/translation files (many false positives)
         if (isCImportFile(a.path, a.content)) continue;
+        const ctx: UnusedFileCtx = .{
+            .issues = &issues,
+            .allocator = allocator,
+            .path = a.path,
+            .content = a.content,
+        };
         for (a.imports.items) |imp| {
-            try checkUnusedImport(allocator, &issues, a.path, a.content, imp);
+            try checkUnusedImport(ctx, imp);
         }
         var line_num: usize = 1;
         var lines = mem.splitScalar(u8, a.content, '\n');
         while (lines.next()) |line| {
             defer line_num += 1;
             const t = mem.trim(u8, line, " \t\r");
-            try checkUnusedDecl(allocator, &issues, a.path, a.content, t, line_num);
+            try checkUnusedDecl(ctx, t, line_num);
         }
     }
     return issues;
@@ -12116,19 +12153,21 @@ fn isDataDispatchFunction(name: []const u8) bool {
     return false;
 }
 
-/// Report a single complexity issue
-fn reportSingleComplexity(
+/// Shared reporting context for report* helpers (ZA301-ZA306, ZA701-ZA702):
+/// the issue sink (list + allocator) and the file path being reported on.
+const ReportCtx = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
     path: []const u8,
+};
+
+/// Report a single complexity issue
+fn reportSingleComplexity(
+    ctx: ReportCtx,
     state: *const ComplexityState,
-    rule: []const u8,
-    actual: usize,
-    limit: usize,
-    metric: []const u8,
-    help: []const u8,
+    check_def: ComplexityCheck,
 ) !void {
-    if (actual <= limit) return;
+    if (check_def.actual <= check_def.limit) return;
     const suffix: []const u8 = if (state.is_type_factory)
         " [tf]"
     else if (state.is_data_dispatch)
@@ -12137,19 +12176,19 @@ fn reportSingleComplexity(
         "";
     const fmt = "function '{s}' has {d} {s} (max {d}){s}";
     const msg = try std.fmt.allocPrint(
-        allocator,
+        ctx.allocator,
         fmt,
-        .{ state.fn_name, actual, metric, limit, suffix },
+        .{ state.fn_name, check_def.actual, check_def.metric, check_def.limit, suffix },
     );
-    try issues.append(allocator, .{
-        .file = path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.path,
         .line = state.fn_start,
         .col = state.fn_col,
         .severity = .warning,
-        .rule = rule,
+        .rule = check_def.rule,
         .message = msg,
         .message_owned = true,
-        .help = help,
+        .help = check_def.help,
     });
 }
 
@@ -12216,25 +12255,13 @@ fn buildComplexityChecks(
 
 /// Report complexity issues for a completed function
 fn reportComplexityIssues(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
+    ctx: ReportCtx,
     state: *const ComplexityState,
     th: Thresholds,
 ) !void {
     const checks = buildComplexityChecks(state, th);
     for (checks) |c| {
-        try reportSingleComplexity(
-            issues,
-            allocator,
-            path,
-            state,
-            c.rule,
-            c.actual,
-            c.limit,
-            c.metric,
-            c.help,
-        );
+        try reportSingleComplexity(ctx, state, c);
     }
 }
 
@@ -12387,7 +12414,12 @@ const ComplexityReporter = struct {
     th: Thresholds,
 
     fn report(self: *const ComplexityReporter, state: *const ComplexityState) !void {
-        try reportComplexityIssues(self.issues, self.allocator, self.path, state, self.th);
+        const ctx: ReportCtx = .{
+            .issues = self.issues,
+            .allocator = self.allocator,
+            .path = self.path,
+        };
+        try reportComplexityIssues(ctx, state, self.th);
     }
 };
 
@@ -12574,20 +12606,14 @@ fn visibleLengthExcludingStrings(line: []const u8) usize {
 }
 
 /// Report file too long issue
-fn reportFileTooLong(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    actual: usize,
-    max: usize,
-) !void {
+fn reportFileTooLong(ctx: ReportCtx, actual: usize, max: usize) !void {
     const msg = try std.fmt.allocPrint(
-        allocator,
+        ctx.allocator,
         "file has {d} bytes (max {d})",
         .{ actual, max },
     );
-    try issues.append(allocator, .{
-        .file = path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.path,
         .line = 1,
         .col = 1,
         .severity = .warning,
@@ -12600,20 +12626,18 @@ fn reportFileTooLong(
 
 /// Report line too long issue
 fn reportLineTooLong(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
+    ctx: ReportCtx,
     line_num: usize,
     visible_len: usize,
     max_len: usize,
 ) !void {
     const msg = try std.fmt.allocPrint(
-        allocator,
+        ctx.allocator,
         "line has {d} columns (max {d})",
         .{ visible_len, max_len },
     );
-    try issues.append(allocator, .{
-        .file = path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.path,
         .line = line_num,
         .col = max_len + 1,
         .severity = .warning,
@@ -12633,9 +12657,11 @@ fn analyzeStyleFile(
     a: FileAnalysis,
     th: Thresholds,
 ) !void {
+    const ctx: ReportCtx = .{ .issues = issues, .allocator = allocator, .path = a.path };
+
     // ZA702: File too long (off by default, enable with --enable=ZA702)
     if (a.content.len > th.max_file_bytes)
-        try reportFileTooLong(issues, allocator, a.path, a.content.len, th.max_file_bytes);
+        try reportFileTooLong(ctx, a.content.len, th.max_file_bytes);
 
     var line_num: usize = 1;
     var lines = mem.splitScalar(u8, a.content, '\n');
@@ -12649,7 +12675,7 @@ fn analyzeStyleFile(
         const visible_len = calculateVisibleLength(line);
         if (visible_len <= th.max_line_length) continue;
         if (visibleLengthExcludingStrings(line) <= th.max_line_length) continue;
-        try reportLineTooLong(issues, allocator, a.path, line_num, visible_len, th.max_line_length);
+        try reportLineTooLong(ctx, line_num, visible_len, th.max_line_length);
     }
 }
 
@@ -12677,6 +12703,19 @@ const NamingContext = struct {
     kind: []const u8,
     name: []const u8,
     expected: []const u8,
+};
+
+/// Line-level context for the check*Naming fns (ZA703): the issue sink plus
+/// the trimmed line under inspection, its 1-based number, and its file path.
+/// `t`/`line_num` default so a per-file ctx is built once and re-bound per
+/// line by assignment — a struct literal inside the scan loop would read as
+/// extra nesting to ZA302's brace counter.
+const NamingLineCtx = struct {
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    path: []const u8,
+    t: []const u8 = "",
+    line_num: usize = 0,
 };
 
 fn reportNamingIssue(
@@ -12718,14 +12757,11 @@ fn isValidConstName(t: []const u8, name: []const u8) bool {
 }
 
 fn checkConstNaming(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
+    ctx: NamingLineCtx,
     content: []const u8,
     t_start: usize,
 ) !void {
+    const t = ctx.t;
     const plen: usize = if (mem.startsWith(u8, t, "pub const ")) 10 else 6;
     var end = plen;
     while (end < t.len and isIdent(t[end])) end += 1;
@@ -12742,9 +12778,9 @@ fn checkConstNaming(
         // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
         if (isClosureFunctionAlias(t, content, t_start)) {
             if (!isCamelCase(name))
-                try reportNamingIssue(issues, allocator, .{
-                    .path = path,
-                    .line = line_num,
+                try reportNamingIssue(ctx.issues, ctx.allocator, .{
+                    .path = ctx.path,
+                    .line = ctx.line_num,
                     .col = plen + 1,
                     .kind = "function",
                     .name = name,
@@ -12752,9 +12788,9 @@ fn checkConstNaming(
                 });
             return;
         }
-        try reportNamingIssue(issues, allocator, .{
-            .path = path,
-            .line = line_num,
+        try reportNamingIssue(ctx.issues, ctx.allocator, .{
+            .path = ctx.path,
+            .line = ctx.line_num,
             .col = plen + 1,
             .kind = "type",
             .name = name,
@@ -12763,9 +12799,9 @@ fn checkConstNaming(
         return;
     }
     if (!isValidConstName(t, name))
-        try reportNamingIssue(issues, allocator, .{
-            .path = path,
-            .line = line_num,
+        try reportNamingIssue(ctx.issues, ctx.allocator, .{
+            .path = ctx.path,
+            .line = ctx.line_num,
             .col = plen + 1,
             .kind = "constant",
             .name = name,
@@ -12773,13 +12809,8 @@ fn checkConstNaming(
         });
 }
 
-fn checkVarNaming(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
-) !void {
+fn checkVarNaming(ctx: NamingLineCtx) !void {
+    const t = ctx.t;
     const prefix: usize = if (mem.startsWith(u8, t, "pub var ")) 8 else 4;
     var end = prefix;
     while (end < t.len and isIdent(t[end])) end += 1;
@@ -12787,9 +12818,9 @@ fn checkVarNaming(
     const name = t[prefix..end];
     if (name.len > 0 and name[0] == '_') return;
     if (!isSnakeCase(name)) {
-        try reportNamingIssue(issues, allocator, .{
-            .path = path,
-            .line = line_num,
+        try reportNamingIssue(ctx.issues, ctx.allocator, .{
+            .path = ctx.path,
+            .line = ctx.line_num,
             .col = prefix + 1,
             .kind = "variable",
             .name = name,
@@ -12831,13 +12862,8 @@ fn fnReturnsType(t: []const u8, after_name: usize) bool {
     return false;
 }
 
-fn checkFnNaming(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
-) !void {
+fn checkFnNaming(ctx: NamingLineCtx) !void {
+    const t = ctx.t;
     // Extern declaration names are ABI-fixed and can never conform.
     // `export fn` is NOT exempt — those names are project-chosen identifiers.
     if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
@@ -12852,18 +12878,18 @@ fn checkFnNaming(
     if (name.len > 0 and name[0] == '_') return;
     const returns_type = fnReturnsType(t, end);
     if (returns_type and !isTitleCase(name)) {
-        try reportNamingIssue(issues, allocator, .{
-            .path = path,
-            .line = line_num,
+        try reportNamingIssue(ctx.issues, ctx.allocator, .{
+            .path = ctx.path,
+            .line = ctx.line_num,
             .col = start + 1,
             .kind = "type-returning fn",
             .name = name,
             .expected = "TitleCase",
         });
     } else if (!returns_type and !isCamelCase(name)) {
-        try reportNamingIssue(issues, allocator, .{
-            .path = path,
-            .line = line_num,
+        try reportNamingIssue(ctx.issues, ctx.allocator, .{
+            .path = ctx.path,
+            .line = ctx.line_num,
             .col = start + 1,
             .kind = "function",
             .name = name,
@@ -12874,14 +12900,8 @@ fn checkFnNaming(
 
 /// Check error value (`error.MyError`) and error set member naming.
 /// Error values are not types; the style guide says "Otherwise, x should be snake_case."
-fn checkErrorNaming(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
-    in_error_block: bool,
-) !void {
+fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
+    const t = ctx.t;
     // 1. Check error values: error.MyError
     var pos: usize = 0;
     while (pos < t.len) {
@@ -12914,9 +12934,9 @@ fn checkErrorNaming(
             continue;
         }
         if (!isSnakeCase(name)) {
-            try reportNamingIssue(issues, allocator, .{
-                .path = path,
-                .line = line_num,
+            try reportNamingIssue(ctx.issues, ctx.allocator, .{
+                .path = ctx.path,
+                .line = ctx.line_num,
                 .col = err_pos + 7,
                 .kind = "error value",
                 .name = name,
@@ -12997,9 +13017,9 @@ fn checkErrorNaming(
             continue;
         }
         if (!isSnakeCase(name)) {
-            try reportNamingIssue(issues, allocator, .{
-                .path = path,
-                .line = line_num,
+            try reportNamingIssue(ctx.issues, ctx.allocator, .{
+                .path = ctx.path,
+                .line = ctx.line_num,
                 .col = start + 1,
                 .kind = "error set member",
                 .name = name,
@@ -13092,43 +13112,60 @@ fn analyzeNaming(
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
-        const a = entry.value_ptr.*;
-        const content = a.content;
-        var line_num: usize = 1;
-        var line_start: usize = 0;
-        var error_block_depth: usize = 0;
-
-        while (line_start <= content.len) {
-            const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
-            const line = content[line_start..newline];
-            // Compute trimmed slice's offset within content (for multi-line lookahead).
-            const lead = skipLeadingWhitespace(line);
-            const t = mem.trim(u8, line, " \t\r");
-            const t_start = line_start + lead;
-
-            // Determine if this line is inside an error block.
-            // We are inside if we were already inside one, OR if this line opens one.
-            const is_trivia = isCommentOrMultilineString(t);
-            const has_error_open = !is_trivia and lineOpensErrorBlock(t);
-            const in_error_block = error_block_depth > 0 or has_error_open;
-
-            if (!is_trivia) {
-                if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
-                    try checkConstNaming(&issues, allocator, a.path, t, line_num, content, t_start);
-                if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var "))
-                    try checkVarNaming(&issues, allocator, a.path, t, line_num);
-                if (mem.indexOf(u8, t, "fn ") != null)
-                    try checkFnNaming(&issues, allocator, a.path, t, line_num);
-                try checkErrorNaming(&issues, allocator, a.path, t, line_num, in_error_block);
-                trackErrorBlockDepth(t, &error_block_depth);
-            }
-
-            if (newline == content.len) break;
-            line_start = newline + 1;
-            line_num += 1;
-        }
+        try analyzeNamingFile(&issues, allocator, entry.value_ptr.*);
     }
     return issues;
+}
+
+/// Per-file naming scan (ZA703). `naming_ctx` is built once per file and its
+/// line fields re-bound per line by assignment — a struct literal inside the
+/// scan loop would read as extra nesting to ZA302's brace counter.
+fn analyzeNamingFile(
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    a: FileAnalysis,
+) !void {
+    const content = a.content;
+    var line_num: usize = 1;
+    var line_start: usize = 0;
+    var error_block_depth: usize = 0;
+    var naming_ctx: NamingLineCtx = .{
+        .issues = issues,
+        .allocator = allocator,
+        .path = a.path,
+    };
+
+    while (line_start <= content.len) {
+        const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
+        const line = content[line_start..newline];
+        // Compute trimmed slice's offset within content (for multi-line lookahead).
+        const lead = skipLeadingWhitespace(line);
+        const t = mem.trim(u8, line, " \t\r");
+        const t_start = line_start + lead;
+        naming_ctx.t = t;
+        naming_ctx.line_num = line_num;
+
+        // Determine if this line is inside an error block.
+        // We are inside if we were already inside one, OR if this line opens one.
+        const is_trivia = isCommentOrMultilineString(t);
+        const has_error_open = !is_trivia and lineOpensErrorBlock(t);
+        const in_error_block = error_block_depth > 0 or has_error_open;
+
+        if (!is_trivia) {
+            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
+                try checkConstNaming(naming_ctx, content, t_start);
+            if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var "))
+                try checkVarNaming(naming_ctx);
+            if (mem.indexOf(u8, t, "fn ") != null)
+                try checkFnNaming(naming_ctx);
+            try checkErrorNaming(naming_ctx, in_error_block);
+            trackErrorBlockDepth(t, &error_block_depth);
+        }
+
+        if (newline == content.len) break;
+        line_start = newline + 1;
+        line_num += 1;
+    }
 }
 
 /// Check if name is TitleCase (PascalCase): starts with uppercase, no underscores
@@ -23788,14 +23825,24 @@ test "ephor:ignore before non-scope line suppresses just next line" {
 
 test "checkSilentCatch detects catch {}" {
     // Basic catch {} should be detected
-    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null, null);
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+    });
     try std.testing.expect(issue != null);
     try std.testing.expectEqualStrings("ZA201", issue.?.rule);
 }
 
 test "checkSilentCatch skips defer context" {
     // Same-line defer should not be detected
-    const issue = checkSilentCatch("defer foo() catch {}", "test.zig", 1, "init", null, null);
+    const issue = checkSilentCatch(.{
+        .t = "defer foo() catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "init",
+    });
     try std.testing.expect(issue == null);
 }
 
@@ -24230,8 +24277,20 @@ test "checkVarNaming: fn-valued vars are still snake_case (declaration kind rule
 
     // Field access / method reference RHS is ambiguous — var kind decides.
     const mutex_line = "pub var group_storage_mutex = compat.Mutex.init;";
-    try checkVarNaming(&issues, a, "test.zig", mutex_line, 1);
-    try checkVarNaming(&issues, a, "test.zig", "var current_key = snapshot.key;", 2);
+    try checkVarNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = mutex_line,
+        .line_num = 1,
+    });
+    try checkVarNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "var current_key = snapshot.key;",
+        .line_num = 2,
+    });
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -24243,7 +24302,13 @@ test "checkVarNaming: non-snake_case var is flagged" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkVarNaming(&issues, a, "test.zig", "var myBadVar = 5;", 1);
+    try checkVarNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "var myBadVar = 5;",
+        .line_num = 1,
+    });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "variable 'myBadVar' should be snake_case",
@@ -24450,8 +24515,20 @@ test "checkErrorNaming: snake_case error values pass" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkErrorNaming(&issues, a, "test.zig", "return error.file_not_found;", 1, false);
-    try checkErrorNaming(&issues, a, "test.zig", "return error.out_of_memory;", 1, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.file_not_found;",
+        .line_num = 1,
+    }, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.out_of_memory;",
+        .line_num = 1,
+    }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -24463,7 +24540,13 @@ test "checkErrorNaming: CamelCase error values are flagged" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkErrorNaming(&issues, a, "test.zig", "return error.MyCustomFailure;", 1, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.MyCustomFailure;",
+        .line_num = 1,
+    }, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error value 'MyCustomFailure' should be snake_case",
@@ -24480,7 +24563,13 @@ test "checkErrorNaming: error set members must be snake_case" {
     defer deinitIssues(&issues, a);
 
     // Single-line error set
-    try checkErrorNaming(&issues, a, "test.zig", "error{ NotSnakeCase, access_denied }", 1, true);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error{ NotSnakeCase, access_denied }",
+        .line_num = 1,
+    }, true);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'NotSnakeCase' should be snake_case",
@@ -24497,11 +24586,41 @@ test "checkErrorNaming: std-lib error names are exempt" {
     defer deinitIssues(&issues, a);
 
     const oom_line = "    if (err == error.OutOfMemory) return error.OutOfMemory;";
-    try checkErrorNaming(&issues, a, "test.zig", oom_line, 1, false);
-    try checkErrorNaming(&issues, a, "test.zig", "error.OutOfMemory => continue,", 2, false);
-    try checkErrorNaming(&issues, a, "test.zig", "    OutOfMemory,", 3, true);
-    try checkErrorNaming(&issues, a, "test.zig", "return error.FileNotFound;", 4, false);
-    try checkErrorNaming(&issues, a, "test.zig", "return error.my_project_error;", 5, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = oom_line,
+        .line_num = 1,
+    }, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error.OutOfMemory => continue,",
+        .line_num = 2,
+    }, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "    OutOfMemory,",
+        .line_num = 3,
+    }, true);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.FileNotFound;",
+        .line_num = 4,
+    }, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.my_project_error;",
+        .line_num = 5,
+    }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -24513,7 +24632,13 @@ test "checkErrorNaming: non-std TitleCase error values are still flagged" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkErrorNaming(&issues, a, "test.zig", "return error.TotallyMadeUp;", 1, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.TotallyMadeUp;",
+        .line_num = 1,
+    }, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error value 'TotallyMadeUp' should be snake_case",
@@ -24530,8 +24655,20 @@ test "checkErrorNaming: error set composition stops at ||" {
     defer deinitIssues(&issues, a);
 
     const composed = "pub const Error = error{ key_too_long } || rlp.Error || Allocator.Error;";
-    try checkErrorNaming(&issues, a, "test.zig", composed, 1, true);
-    try checkErrorNaming(&issues, a, "test.zig", "} || rlp.Error || Allocator.Error;", 2, true);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = composed,
+        .line_num = 1,
+    }, true);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "} || rlp.Error || Allocator.Error;",
+        .line_num = 2,
+    }, true);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -24544,8 +24681,20 @@ test "checkFnNaming: extern declarations are exempt" {
     defer deinitIssues(&issues, a);
 
     const extern_line = "pub extern fn secp256k1_context_create(flags: c_uint) ?*anyopaque;";
-    try checkFnNaming(&issues, a, "test.zig", extern_line, 1);
-    try checkFnNaming(&issues, a, "test.zig", "extern \"c\" fn some_c_symbol(x: c_int) c_int;", 2);
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = extern_line,
+        .line_num = 1,
+    });
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "extern \"c\" fn some_c_symbol(x: c_int) c_int;",
+        .line_num = 2,
+    });
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -24557,7 +24706,13 @@ test "checkFnNaming: non-camelCase fn is still flagged" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkFnNaming(&issues, a, "test.zig", "fn Bad_Name() void {}", 1);
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "fn Bad_Name() void {}",
+        .line_num = 1,
+    });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
 }
 
@@ -24569,7 +24724,13 @@ test "checkErrorNaming: underscore-prefixed error names are exempt" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkErrorNaming(&issues, a, "test.zig", "error{ _FileNotFound, _internal }", 1, true);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error{ _FileNotFound, _internal }",
+        .line_num = 1,
+    }, true);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -24581,7 +24742,13 @@ test "checkErrorNaming: does not flag someerror.foo as error value" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkErrorNaming(&issues, a, "test.zig", "const x = someerror.foo;", 1, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const x = someerror.foo;",
+        .line_num = 1,
+    }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -24593,7 +24760,13 @@ test "checkErrorNaming: does not flag error. inside string literal" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    try checkErrorNaming(&issues, a, "test.zig", "const msg = \"error.FileNotFound\";", 1, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const msg = \"error.FileNotFound\";",
+        .line_num = 1,
+    }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -26987,46 +27160,62 @@ test "ZA202 NOT suppressed for non-bufPrint multi-line" {
 // ============================================================================
 
 test "ZA201 suppressed in deinit function" {
-    const issue = checkSilentCatch("resource.revoke() catch {}", "test.zig", 1, "deinit", null, null);
+    const issue = checkSilentCatch(.{
+        .t = "resource.revoke() catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "deinit",
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed in shutdown function" {
-    const issue = checkSilentCatch("lease.revoke() catch {}", "test.zig", 1, "shutdown", null, null);
+    const issue = checkSilentCatch(.{
+        .t = "lease.revoke() catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "shutdown",
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed in cleanup function" {
-    const issue = checkSilentCatch("conn.close() catch {}", "test.zig", 1, "cleanup", null, null);
+    const issue = checkSilentCatch(.{
+        .t = "conn.close() catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "cleanup",
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed for writer.print catch {}" {
-    const issue = checkSilentCatch(
-        "writer.print(\"{{\\\"key\\\":\\\"{s}\\\"}}\", .{val}) catch {}",
-        "test.zig",
-        1,
-        "handleRequest",
-        null,
-        null,
-    );
+    const issue = checkSilentCatch(.{
+        .t = "writer.print(\"{{\\\"key\\\":\\\"{s}\\\"}}\", .{val}) catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "handleRequest",
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed for writer.writeAll catch {}" {
-    const issue = checkSilentCatch(
-        "writer.writeAll(data) catch {}",
-        "test.zig",
-        1,
-        "streamResponse",
-        null,
-        null,
-    );
+    const issue = checkSilentCatch(.{
+        .t = "writer.writeAll(data) catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "streamResponse",
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 NOT suppressed in regular function" {
-    const issue = checkSilentCatch("foo() catch {}", "test.zig", 1, "processData", null, null);
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {}",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+    });
     try std.testing.expect(issue != null);
 }
 
@@ -27132,39 +27321,33 @@ test "ZA202 still fires outside test block" {
 
 test "ZA201 suppressed for while condition catch {}" {
     // while (iter.next() catch {}) |val| — catch converts error to optional
-    const issue = checkSilentCatch(
-        "while (iter.next() catch {}) |val| {",
-        "test.zig",
-        1,
-        "process",
-        null,
-        null,
-    );
+    const issue = checkSilentCatch(.{
+        .t = "while (iter.next() catch {}) |val| {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "process",
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 suppressed for if condition catch {}" {
-    const issue = checkSilentCatch(
-        "if (getData() catch {}) |data| {",
-        "test.zig",
-        1,
-        "process",
-        null,
-        null,
-    );
+    const issue = checkSilentCatch(.{
+        .t = "if (getData() catch {}) |data| {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "process",
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA201 NOT suppressed for catch {} outside condition" {
     // Regular statement — should still fire
-    const issue = checkSilentCatch(
-        "const x = foo() catch {};",
-        "test.zig",
-        1,
-        "process",
-        null,
-        null,
-    );
+    const issue = checkSilentCatch(.{
+        .t = "const x = foo() catch {};",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "process",
+    });
     try std.testing.expect(issue != null);
 }
 
@@ -27177,14 +27360,13 @@ test "ZA201 suppressed for multi-line defer catch {}" {
         "defer std.fs.cwd()",
         "    .openFile(\"x\", .{})",
     };
-    const issue = checkSilentCatch(
-        ".close() catch {}",
-        "test.zig",
-        3,
-        "init",
-        &prev,
-        null,
-    );
+    const issue = checkSilentCatch(.{
+        .t = ".close() catch {}",
+        .path = "test.zig",
+        .line = 3,
+        .func_name = "init",
+        .preceding_lines = &prev,
+    });
     // .close() is a cleanup method — already suppressed by isCleanupMethodCall
     try std.testing.expect(issue == null);
 }
@@ -27194,14 +27376,13 @@ test "ZA201 suppressed for multi-line defer non-cleanup catch {}" {
         "defer obj",
         "    .flush()",
     };
-    const issue = checkSilentCatch(
-        "    .finalize() catch {}",
-        "test.zig",
-        3,
-        "init",
-        &prev,
-        null,
-    );
+    const issue = checkSilentCatch(.{
+        .t = "    .finalize() catch {}",
+        .path = "test.zig",
+        .line = 3,
+        .func_name = "init",
+        .preceding_lines = &prev,
+    });
     // Not a recognized cleanup method, but continuation of defer expression
     try std.testing.expect(issue == null);
 }

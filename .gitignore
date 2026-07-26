@@ -44,3 +44,4 @@ __pycache__/
 # OpenCode personal dev files (SDD context, specs, local config)
 .opencode/
 opencode.json
+AGENTS.md

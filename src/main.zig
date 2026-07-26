@@ -14264,13 +14264,10 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
 fn runCFGSafetyAnalyses(run: CFGRunCtx) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
-    const fl = run.func.lines;
-    const fstart = run.func.start;
-    const fp = run.file.file_path;
     var r1 = try analyzeCFGNullSafety(run);
     defer r1.deinit(a);
     try out.appendSlice(a, r1.items);
-    var r2 = try analyzeCFGPanicPatterns(a, run.cfg, fl, fstart, fp);
+    var r2 = try analyzeCFGPanicPatterns(run);
     defer r2.deinit(a);
     try out.appendSlice(a, r2.items);
     var r3 = try analyzeCFGErrors(run);
@@ -15126,14 +15123,7 @@ fn analyzeCFGErrors(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
             const preceding: ?[]const []const u8 = if (idx > 0) run.func.lines[0..idx] else null;
             if (checkCatchUnreachable(t, run.file.file_path, line_num, preceding)) |issue|
                 try issues.append(allocator, issue);
-            if (checkOrelseUnreachable(
-                t,
-                run.file.file_path,
-                line_num,
-                run.func.lines,
-                idx,
-                run.func.start,
-            )) |issue|
+            if (checkOrelseUnreachable(run, t, line_num, idx)) |issue|
                 try issues.append(allocator, issue);
         }
     }
@@ -15336,22 +15326,22 @@ fn isStreamWriteCall(t: []const u8) bool {
 }
 
 /// ZA203: orelse unreachable will panic on null
+/// Lines/func_line/file_path come from the CFG run context; t is the
+/// caller-trimmed line at idx (line_num is its 1-based source line).
 fn checkOrelseUnreachable(
+    run: CFGRunCtx,
     t: []const u8,
-    file_path: []const u8,
     line_num: usize,
-    lines: []const []const u8,
     idx: usize,
-    func_line: usize,
 ) ?Issue {
     const col = mem.indexOf(u8, t, "orelse unreachable") orelse return null;
     if (isInsideString(t, col)) return null;
 
     if (extractOrelseVar(t, col)) |name| {
-        if (hasNullGuard(lines, idx, func_line, name)) return null;
+        if (hasNullGuard(run.func.lines, idx, run.func.start, name)) return null;
     }
     return .{
-        .file = file_path,
+        .file = run.file.file_path,
         .line = line_num,
         .col = col + 1,
         .severity = .warning,
@@ -15582,42 +15572,41 @@ fn extractDerefVar(t: []const u8, dot_star_pos: usize) ?[]const u8 {
 }
 
 /// Phase 1: Identify guard patterns in each CFG block
-/// Scan a range of lines for guard patterns, adding to the given map
-fn scanLinesForGuards(
+/// Shared context for the guard-collection pass: the function's lines and
+/// the per-block guard sets the pass fills in.
+const GuardScanCtx = struct {
     allocator: Allocator,
     lines: []const []const u8,
     func_line: usize,
+    guarded_per_block: []std.StringHashMapUnmanaged(void),
+};
+
+/// Scan a range of lines for guard patterns, adding to the given map
+fn scanLinesForGuards(
+    ctx: GuardScanCtx,
     start: usize,
     end: usize,
     guards: *std.StringHashMapUnmanaged(void),
 ) !void {
     for (start..end + 1) |line_num| {
-        if (line_num < func_line) continue;
-        const idx = line_num - func_line;
-        if (idx >= lines.len) continue;
-        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (line_num < ctx.func_line) continue;
+        const idx = line_num - ctx.func_line;
+        if (idx >= ctx.lines.len) continue;
+        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         const var_name = extractGuardedVar(t) orelse continue;
-        try guards.put(allocator, var_name, {});
+        try guards.put(ctx.allocator, var_name, {});
     }
 }
 
-fn collectBlockGuards(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    guarded_per_block: []std.StringHashMapUnmanaged(void),
-) !void {
+fn collectBlockGuards(ctx: GuardScanCtx, cfg: *ControlFlowGraph) !void {
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
         try scanLinesForGuards(
-            allocator,
-            lines,
-            func_line,
+            ctx,
             block.start_line,
             block.end_line,
-            &guarded_per_block[bid],
+            &ctx.guarded_per_block[bid],
         );
     }
 }
@@ -15637,38 +15626,42 @@ fn hasBothBranches(cfg: *ControlFlowGraph, pred: usize) bool {
 
 const PredInfo = struct { block: usize, via_true_branch: bool };
 
-/// Intersect first predecessor's guards into the intersection set
-fn initIntersectionFromPred(
+/// Context for the guard-intersection ops: the intersection accumulator
+/// being built and the per-block guard sets it is narrowed against.
+const GuardIntersectCtx = struct {
     allocator: Allocator,
     intersection: *std.StringHashMapUnmanaged(void),
     guarded_per_block: []std.StringHashMapUnmanaged(void),
+};
+
+/// Intersect first predecessor's guards into the intersection set
+fn initIntersectionFromPred(
+    ctx: GuardIntersectCtx,
     pred_info: PredInfo,
     pred_has_both: bool,
 ) !void {
-    var iter = guarded_per_block[pred_info.block].iterator();
+    var iter = ctx.guarded_per_block[pred_info.block].iterator();
     while (iter.next()) |entry| {
         if (pred_has_both and !pred_info.via_true_branch) continue;
-        try intersection.put(allocator, entry.key_ptr.*, {});
+        try ctx.intersection.put(ctx.allocator, entry.key_ptr.*, {});
     }
 }
 
 /// Remove guards from intersection not in a subsequent predecessor
 fn narrowIntersection(
-    allocator: Allocator,
-    intersection: *std.StringHashMapUnmanaged(void),
-    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    ctx: GuardIntersectCtx,
     pred_info: PredInfo,
     pred_has_both: bool,
 ) !void {
     var to_remove = std.ArrayListUnmanaged([]const u8).empty;
-    defer to_remove.deinit(allocator);
-    var iter = intersection.iterator();
+    defer to_remove.deinit(ctx.allocator);
+    var iter = ctx.intersection.iterator();
     while (iter.next()) |entry| {
-        var has = guarded_per_block[pred_info.block].contains(entry.key_ptr.*);
+        var has = ctx.guarded_per_block[pred_info.block].contains(entry.key_ptr.*);
         if (pred_has_both and !pred_info.via_true_branch) has = false;
-        if (!has) try to_remove.append(allocator, entry.key_ptr.*);
+        if (!has) try to_remove.append(ctx.allocator, entry.key_ptr.*);
     }
-    for (to_remove.items) |key| _ = intersection.remove(key);
+    for (to_remove.items) |key| _ = ctx.intersection.remove(key);
 }
 
 /// Collect predecessor block info for a given block ID
@@ -15696,24 +15689,17 @@ fn computePredIntersection(
     preds: []const PredInfo,
 ) !std.StringHashMapUnmanaged(void) {
     var intersection: std.StringHashMapUnmanaged(void) = .empty;
+    const ix: GuardIntersectCtx = .{
+        .allocator = allocator,
+        .intersection = &intersection,
+        .guarded_per_block = guarded_per_block,
+    };
     for (preds, 0..) |pi, i| {
         const both = hasBothBranches(cfg, pi.block);
         if (i == 0) {
-            try initIntersectionFromPred(
-                allocator,
-                &intersection,
-                guarded_per_block,
-                pi,
-                both,
-            );
+            try initIntersectionFromPred(ix, pi, both);
         } else {
-            try narrowIntersection(
-                allocator,
-                &intersection,
-                guarded_per_block,
-                pi,
-                both,
-            );
+            try narrowIntersection(ix, pi, both);
         }
     }
     return intersection;
@@ -15767,23 +15753,26 @@ fn propagateGuardsThroughCFG(
     }
 }
 
-/// Check if a decrement is guarded by various patterns
-fn isDecrementGuarded(
+/// Per-line guard-query context: the trimmed line, the function's lines
+/// for lookback, and the CFG-propagated guard set for its block.
+const GuardLineCtx = struct {
     t: []const u8,
     lines: []const []const u8,
     idx: usize,
-    var_name: []const u8,
     guarded: *const std.StringHashMapUnmanaged(void),
-) bool {
-    if (guarded.contains(var_name)) return true;
-    if (hasGuardOnLine(t, var_name)) return true;
-    if (hasBreakGuardOnPriorLines(lines, idx, var_name)) return true;
-    if (isSignedVarInContext(lines, idx, var_name)) return true;
-    if (hasPairedIncrementInLines(lines[0..idx], var_name)) return true;
-    if (isInComptimeBlock(lines, idx)) return true;
-    if (hasAssertGeGuard(lines, idx, var_name)) return true;
-    if (hasEnclosingVarGuard(lines, idx, var_name)) return true;
-    if (hasElseBranchGuard(lines, idx)) return true;
+};
+
+/// Check if a decrement is guarded by various patterns
+fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8) bool {
+    if (ctx.guarded.contains(var_name)) return true;
+    if (hasGuardOnLine(ctx.t, var_name)) return true;
+    if (hasBreakGuardOnPriorLines(ctx.lines, ctx.idx, var_name)) return true;
+    if (isSignedVarInContext(ctx.lines, ctx.idx, var_name)) return true;
+    if (hasPairedIncrementInLines(ctx.lines[0..ctx.idx], var_name)) return true;
+    if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
+    if (hasAssertGeGuard(ctx.lines, ctx.idx, var_name)) return true;
+    if (hasEnclosingVarGuard(ctx.lines, ctx.idx, var_name)) return true;
+    if (hasElseBranchGuard(ctx.lines, ctx.idx)) return true;
     return false;
 }
 
@@ -15801,22 +15790,17 @@ fn isArrayLenCFGGuarded(
 }
 
 /// Check if array index arithmetic is guarded by various patterns
-fn isArrayIndexGuarded(
-    t: []const u8,
-    lines: []const []const u8,
-    idx: usize,
-    guarded: *const std.StringHashMapUnmanaged(void),
-) bool {
-    if (mem.indexOf(u8, t, "-|") != null) return true;
-    if (hasIndexGuardOnLine(t)) return true;
-    if (hasShortCircuitGuardOnPriorLines(lines, idx)) return true;
-    if (isArrayLenCFGGuarded(t, guarded)) return true;
-    if (hasEndsWithStartsWithGuard(lines, idx)) return true;
-    if (hasElseBranchGuard(lines, idx)) return true;
-    if (isInComptimeBlock(lines, idx)) return true;
-    if (hasEarlyReturnLengthGuard(lines, idx, t)) return true;
-    if (hasLoopInitGuard(lines, idx, t)) return true;
-    if (hasEnclosingBlockGuard(lines, idx, t)) return true;
+fn isArrayIndexGuarded(ctx: GuardLineCtx) bool {
+    if (mem.indexOf(u8, ctx.t, "-|") != null) return true;
+    if (hasIndexGuardOnLine(ctx.t)) return true;
+    if (hasShortCircuitGuardOnPriorLines(ctx.lines, ctx.idx)) return true;
+    if (isArrayLenCFGGuarded(ctx.t, ctx.guarded)) return true;
+    if (hasEndsWithStartsWithGuard(ctx.lines, ctx.idx)) return true;
+    if (hasElseBranchGuard(ctx.lines, ctx.idx)) return true;
+    if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
+    if (hasEarlyReturnLengthGuard(ctx.lines, ctx.idx, ctx.t)) return true;
+    if (hasLoopInitGuard(ctx.lines, ctx.idx, ctx.t)) return true;
+    if (hasEnclosingBlockGuard(ctx.lines, ctx.idx, ctx.t)) return true;
     return false;
 }
 
@@ -15841,23 +15825,37 @@ fn findDecrementOp(t: []const u8) ?usize {
     return null;
 }
 
-/// ZA901: Check for unguarded decrement on a single line
-fn checkDecrementOverflow(
+/// Shared context for the CFG-based panic-pattern checks: the run-wide
+/// plumbing (sink, source lines, path) plus the current block's
+/// propagated guard set and the dedup map of already-reported lines.
+const CFGPanicCtx = struct {
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
-    t: []const u8,
     lines: []const []const u8,
-    idx: usize,
-    line_num: usize,
+    func_line: usize,
     file_path: []const u8,
     guarded: *const std.StringHashMapUnmanaged(void),
     reported: *std.AutoHashMap(usize, void),
+};
+
+/// ZA901: Check for unguarded decrement on a single line
+fn checkDecrementOverflow(
+    ctx: CFGPanicCtx,
+    t: []const u8,
+    idx: usize,
+    line_num: usize,
 ) !void {
     const col = findDecrementOp(t) orelse return;
     const var_name = extractDecrementVar(t, col) orelse return;
-    if (isDecrementGuarded(t, lines, idx, var_name, guarded)) return;
-    try issues.append(allocator, .{
-        .file = file_path,
+    const gctx: GuardLineCtx = .{
+        .t = t,
+        .lines = ctx.lines,
+        .idx = idx,
+        .guarded = ctx.guarded,
+    };
+    if (isDecrementGuarded(gctx, var_name)) return;
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
         .line = line_num,
         .col = col + 1,
         .severity = .warning,
@@ -15866,28 +15864,29 @@ fn checkDecrementOverflow(
         .help = "add guard (if/while/assert x > 0) " ++
             "or use saturating arithmetic (-|)",
     });
-    try reported.put(line_num, {});
+    try ctx.reported.put(line_num, {});
 }
 
 /// ZA903: Check for unguarded array index arithmetic
 fn checkArrayIndexOverflow(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
+    ctx: CFGPanicCtx,
     t: []const u8,
-    lines: []const []const u8,
     idx: usize,
     line_num: usize,
-    file_path: []const u8,
-    guarded: *const std.StringHashMapUnmanaged(void),
-    reported: *std.AutoHashMap(usize, void),
 ) !void {
     const col = hasArrayIndexSubtraction(t) orelse return;
     if (isInsideString(t, col)) return;
     // A bracket expression mentioned in a trailing comment is prose, not code.
     if (isInTrailingComment(t, col)) return;
-    if (isArrayIndexGuarded(t, lines, idx, guarded)) return;
-    try issues.append(allocator, .{
-        .file = file_path,
+    const gctx: GuardLineCtx = .{
+        .t = t,
+        .lines = ctx.lines,
+        .idx = idx,
+        .guarded = ctx.guarded,
+    };
+    if (isArrayIndexGuarded(gctx)) return;
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
         .line = line_num,
         .col = col + 1,
         .severity = .warning,
@@ -15896,78 +15895,51 @@ fn checkArrayIndexOverflow(
         .help = "ensure index arithmetic cannot underflow" ++
             ", or use saturating subtraction -|",
     });
-    try reported.put(line_num, {});
+    try ctx.reported.put(line_num, {});
 }
 
 /// Phase 3: Check for unguarded panic patterns in a single block
 fn checkPanicPatternsInBlock(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
+    ctx: CFGPanicCtx,
     block_start: usize,
     block_end: usize,
-    guarded: *const std.StringHashMapUnmanaged(void),
-    reported: *std.AutoHashMap(usize, void),
 ) !void {
     for (block_start..block_end + 1) |line_num| {
-        if (line_num < func_line or reported.contains(line_num)) continue;
-        const idx = line_num - func_line;
-        if (idx >= lines.len) continue;
-        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (line_num < ctx.func_line or ctx.reported.contains(line_num)) continue;
+        const idx = line_num - ctx.func_line;
+        if (idx >= ctx.lines.len) continue;
+        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (mem.indexOf(u8, t, "testing.expect") != null) continue;
-        try checkDecrementOverflow(
-            allocator,
-            issues,
-            t,
-            lines,
-            idx,
-            line_num,
-            file_path,
-            guarded,
-            reported,
-        );
-        try checkArrayIndexOverflow(
-            allocator,
-            issues,
-            t,
-            lines,
-            idx,
-            line_num,
-            file_path,
-            guarded,
-            reported,
-        );
+        try checkDecrementOverflow(ctx, t, idx, line_num);
+        try checkArrayIndexOverflow(ctx, t, idx, line_num);
     }
 }
 
 /// CFG-based panic/overflow pattern analysis (ZA901/ZA902/ZA903)
 /// Uses control flow graph to track guards across paths
-fn analyzeCFGPanicPatterns(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-) !std.ArrayListUnmanaged(Issue) {
+fn analyzeCFGPanicPatterns(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
+    const allocator = run.file.allocator;
+    const cfg = run.cfg;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
 
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    var guarded_per_block = try allocator.alloc(
-        std.StringHashMapUnmanaged(void),
-        num_blocks,
-    );
+    var guarded_per_block = try allocator.alloc(std.StringHashMapUnmanaged(void), num_blocks);
     defer {
         for (guarded_per_block) |*m| m.deinit(allocator);
         allocator.free(guarded_per_block);
     }
     for (guarded_per_block) |*m| m.* = .empty;
 
-    try collectBlockGuards(allocator, cfg, lines, func_line, guarded_per_block);
+    const scan_ctx: GuardScanCtx = .{
+        .allocator = allocator,
+        .lines = run.func.lines,
+        .func_line = run.func.start,
+        .guarded_per_block = guarded_per_block,
+    };
+    try collectBlockGuards(scan_ctx, cfg);
     try propagateGuardsThroughCFG(allocator, cfg, guarded_per_block);
 
     var reported_lines = std.AutoHashMap(usize, void).init(allocator);
@@ -15975,17 +15947,16 @@ fn analyzeCFGPanicPatterns(
 
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
-        try checkPanicPatternsInBlock(
-            allocator,
-            &issues,
-            lines,
-            func_line,
-            file_path,
-            block.start_line,
-            block.end_line,
-            &guarded_per_block[bid],
-            &reported_lines,
-        );
+        const pctx: CFGPanicCtx = .{
+            .allocator = allocator,
+            .issues = &issues,
+            .lines = run.func.lines,
+            .func_line = run.func.start,
+            .file_path = run.file.file_path,
+            .guarded = &guarded_per_block[bid],
+            .reported = &reported_lines,
+        };
+        try checkPanicPatternsInBlock(pctx, block.start_line, block.end_line);
     }
 
     return issues;
@@ -16247,18 +16218,22 @@ fn trackBraceDepthBackward(ctx: []const u8, depth: i32) i32 {
     return d;
 }
 
-fn isZeroCheckGuard(
-    ctx: []const u8,
+/// Context for the zero-check guard query: the candidate line, the
+/// variable it must mention, and the lookback window for the exit search.
+const ZeroGuardCtx = struct {
+    t: []const u8,
     var_name: []const u8,
     lines: []const []const u8,
     line_idx: usize,
     current_idx: usize,
-) bool {
-    if (mem.indexOf(u8, ctx, var_name) == null) return false;
-    if (mem.indexOf(u8, ctx, "== 0)") == null) return false;
-    if (hasExitStatement(ctx)) return true;
-    const block_end = if (line_idx + 6 < current_idx) line_idx + 6 else current_idx;
-    return hasExitInFollowingBlock(lines, line_idx + 1, block_end);
+};
+
+fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
+    if (mem.indexOf(u8, ctx.t, ctx.var_name) == null) return false;
+    if (mem.indexOf(u8, ctx.t, "== 0)") == null) return false;
+    if (hasExitStatement(ctx.t)) return true;
+    const block_end = if (ctx.line_idx + 6 < ctx.current_idx) ctx.line_idx + 6 else ctx.current_idx;
+    return hasExitInFollowingBlock(ctx.lines, ctx.line_idx + 1, block_end);
 }
 
 fn hasBreakGuardOnPriorLines(
@@ -16276,7 +16251,14 @@ fn hasBreakGuardOnPriorLines(
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
         if (isFuncBoundary(ctx)) return false;
         if (brace_depth >= 0 and isLoopBoundary(ctx)) return false;
-        if (isZeroCheckGuard(ctx, var_name, lines, i, current_idx)) return true;
+        const zctx: ZeroGuardCtx = .{
+            .t = ctx,
+            .var_name = var_name,
+            .lines = lines,
+            .line_idx = i,
+            .current_idx = current_idx,
+        };
+        if (isZeroCheckGuard(zctx)) return true;
     }
     return false;
 }
@@ -16805,27 +16787,31 @@ fn isDecrementSafe(
     return false;
 }
 
-fn checkDecrementWithoutGuard(
-    issues: *std.ArrayListUnmanaged(Issue),
+/// Shared context for the legacy line-based panic checks (ZA901/ZA902):
+/// the issue sink and the current line within its file-wide line buffer.
+const PanicScanCtx = struct {
     allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
     path: []const u8,
     t: []const u8,
     line_num: usize,
     context_lines: []const []const u8,
     current_idx: usize,
-) !void {
+};
+
+fn checkDecrementWithoutGuard(ctx: PanicScanCtx) !void {
     const decrement_patterns = [_][]const u8{ "-= 1", " -= 1" };
     for (decrement_patterns) |pattern| {
-        const col = mem.indexOf(u8, t, pattern) orelse continue;
-        if (isInsideString(t, col)) continue;
-        const var_name = extractDecrementVar(t, col) orelse continue;
+        const col = mem.indexOf(u8, ctx.t, pattern) orelse continue;
+        if (isInsideString(ctx.t, col)) continue;
+        const var_name = extractDecrementVar(ctx.t, col) orelse continue;
 
-        if (hasGuardInContext(t, context_lines, current_idx, var_name)) continue;
-        if (isDecrementSafe(context_lines, current_idx, var_name)) continue;
+        if (hasGuardInContext(ctx.t, ctx.context_lines, ctx.current_idx, var_name)) continue;
+        if (isDecrementSafe(ctx.context_lines, ctx.current_idx, var_name)) continue;
 
-        try issues.append(allocator, .{
-            .file = path,
-            .line = line_num,
+        try ctx.issues.append(ctx.allocator, .{
+            .file = ctx.path,
+            .line = ctx.line_num,
             .col = col + 1,
             .severity = .warning,
             .rule = RULE_DECREMENT_WITHOUT_CHECK,
@@ -16952,27 +16938,21 @@ fn hasBoundsGuardInContext(context_lines: []const []const u8, current_idx: usize
 
 /// Check a bracket expression for unguarded subtraction
 fn checkBracketSubtraction(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
-    context_lines: []const []const u8,
-    current_idx: usize,
+    ctx: PanicScanCtx,
     bracket_start: usize,
     bracket_end: usize,
 ) !bool {
-    const inside = t[bracket_start + 1 .. bracket_end];
+    const inside = ctx.t[bracket_start + 1 .. bracket_end];
     const sub_pos = mem.indexOf(u8, inside, " - ") orelse return false;
     if (mem.trim(u8, inside[0..sub_pos], " ").len == 0) return false;
     if (mem.indexOf(u8, inside, "-|") != null) return false;
 
-    if (hasInlineSubtractionGuard(t)) return false;
-    if (hasBoundsGuardInContext(context_lines, current_idx)) return false;
+    if (hasInlineSubtractionGuard(ctx.t)) return false;
+    if (hasBoundsGuardInContext(ctx.context_lines, ctx.current_idx)) return false;
 
-    try issues.append(allocator, .{
-        .file = path,
-        .line = line_num,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.path,
+        .line = ctx.line_num,
         .col = bracket_start + sub_pos + 2,
         .severity = .warning,
         .rule = RULE_INDEX_ARITHMETIC,
@@ -16983,33 +16963,25 @@ fn checkBracketSubtraction(
 }
 
 /// Check for range subtraction: for (a..b - 1)
-fn checkRangeSubtraction(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
-    context_lines: []const []const u8,
-    current_idx: usize,
-) !void {
-    const range_pos = mem.indexOf(u8, t, "..") orelse return;
-    const after_range = t[range_pos + 2 ..];
+fn checkRangeSubtraction(ctx: PanicScanCtx) !void {
+    const range_pos = mem.indexOf(u8, ctx.t, "..") orelse return;
+    const after_range = ctx.t[range_pos + 2 ..];
     const sub_in_range = mem.indexOf(u8, after_range, " - ") orelse return;
     if (mem.indexOf(u8, after_range[0..sub_in_range], ")") != null) return;
 
-    const check_start = if (current_idx > 5) current_idx - 5 else 0;
+    const check_start = if (ctx.current_idx > 5) ctx.current_idx - 5 else 0;
     const range_guard_pats = [_][]const u8{ ">=", "> 0", "endsWith", "startsWith" };
-    for (context_lines[check_start..current_idx]) |ctx_line| {
-        const ctx = mem.trim(u8, ctx_line, " \t\r");
+    for (ctx.context_lines[check_start..ctx.current_idx]) |ctx_line| {
+        const t = mem.trim(u8, ctx_line, " \t\r");
         for (range_guard_pats) |pat| {
-            if (mem.indexOf(u8, ctx, pat) != null) return;
+            if (mem.indexOf(u8, t, pat) != null) return;
         }
-        if (mem.indexOf(u8, ctx, "== 0") != null and mem.indexOf(u8, ctx, "return") != null) return;
+        if (mem.indexOf(u8, t, "== 0") != null and mem.indexOf(u8, t, "return") != null) return;
     }
 
-    try issues.append(allocator, .{
-        .file = path,
-        .line = line_num,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.path,
+        .line = ctx.line_num,
         .col = range_pos + 2 + sub_in_range + 1,
         .severity = .warning,
         .rule = RULE_SUBTRACTION_OVERFLOW,
@@ -17019,34 +16991,58 @@ fn checkRangeSubtraction(
 }
 
 /// Check for subtraction that may overflow (ZA902)
-fn checkSubtractionOverflow(
-    issues: *std.ArrayListUnmanaged(Issue),
-    allocator: Allocator,
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
-    context_lines: []const []const u8,
-    current_idx: usize,
-) !void {
+fn checkSubtractionOverflow(ctx: PanicScanCtx) !void {
     var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        if (t[i] != '[') continue;
-        const end = findMatchingBracket(t, i) orelse continue;
-        const found = try checkBracketSubtraction(
-            issues,
-            allocator,
-            path,
-            t,
-            line_num,
-            context_lines,
-            current_idx,
-            i,
-            end,
-        );
+    while (i < ctx.t.len) : (i += 1) {
+        if (ctx.t[i] != '[') continue;
+        const end = findMatchingBracket(ctx.t, i) orelse continue;
+        const found = try checkBracketSubtraction(ctx, i, end);
         if (found) return;
         i = end;
     }
-    try checkRangeSubtraction(issues, allocator, path, t, line_num, context_lines, current_idx);
+    try checkRangeSubtraction(ctx);
+}
+
+/// Scan one file's lines for panic-pattern violations (ZA901/ZA902)
+fn scanFilePanicPatterns(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+    content: []const u8,
+) !void {
+    var line_num: usize = 1;
+    var lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines_list.deinit(allocator);
+
+    // Collect all lines for context
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        try lines_list.append(allocator, line);
+    }
+
+    const context_lines = lines_list.items;
+    for (context_lines, 0..) |line, idx| {
+        defer line_num += 1;
+        const t = mem.trim(u8, line, " \t\r");
+
+        // Skip comments
+        if (isCommentOrMultilineString(t)) continue;
+
+        // Skip test blocks (intentional panic testing is common)
+        if (mem.indexOf(u8, t, "testing.expect") != null) continue;
+
+        const pctx: PanicScanCtx = .{
+            .allocator = allocator,
+            .issues = issues,
+            .path = file_path,
+            .t = t,
+            .line_num = line_num,
+            .context_lines = context_lines,
+            .current_idx = idx,
+        };
+        try checkDecrementWithoutGuard(pctx);
+        try checkSubtractionOverflow(pctx);
+    }
 }
 
 /// ZA9xx: Detect potential panic/overflow patterns
@@ -17058,47 +17054,7 @@ fn analyzePanicPatterns(
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
-        const file_path = entry.key_ptr.*;
-        var line_num: usize = 1;
-        var lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer lines_list.deinit(allocator);
-
-        // Collect all lines for context
-        var lines = mem.splitScalar(u8, entry.value_ptr.content, '\n');
-        while (lines.next()) |line| {
-            try lines_list.append(allocator, line);
-        }
-
-        const context_lines = lines_list.items;
-        for (context_lines, 0..) |line, idx| {
-            defer line_num += 1;
-            const t = mem.trim(u8, line, " \t\r");
-
-            // Skip comments
-            if (isCommentOrMultilineString(t)) continue;
-
-            // Skip test blocks (intentional panic testing is common)
-            if (mem.indexOf(u8, t, "testing.expect") != null) continue;
-
-            try checkDecrementWithoutGuard(
-                &issues,
-                allocator,
-                file_path,
-                t,
-                line_num,
-                context_lines,
-                idx,
-            );
-            try checkSubtractionOverflow(
-                &issues,
-                allocator,
-                file_path,
-                t,
-                line_num,
-                context_lines,
-                idx,
-            );
-        }
+        try scanFilePanicPatterns(allocator, &issues, entry.key_ptr.*, entry.value_ptr.content);
     }
 
     return issues;

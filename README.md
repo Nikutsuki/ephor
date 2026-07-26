@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.13.5.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.0.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.13.5",
+  "version": "0.14.0",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],

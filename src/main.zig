@@ -18657,7 +18657,8 @@ fn writeDefaultConfig() !void {
         \\  //   ZA1xx Memory:     ZA101 alloc-no-defer, ZA102 create-no-defer,
         \\  //                     ZA103 alloc-no-errdefer,
         \\  //                     ZA105 use-after-free, ZA106 double-free,
-        \\  //                     ZA110 must-return-ref
+        \\  //                     ZA110 must-return-ref,
+        \\  //                     ZA111 returned-stack-ref (error, AST tier)
         \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (warning), ZA202 catch-unreachable (warning),
         \\  //                     ZA203 orelse-unreachable (warning), ZA204 undefined (warning),
         \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer,
@@ -18707,7 +18708,13 @@ fn writeDefaultConfig() !void {
         \\
     ;
 
-    Fs.cwd().writeFile(CONFIG_FILENAME, default_config, .{ .exclusive = true }) catch |err|
+    var buf: [default_config.len + 64]u8 = undefined;
+    const content = try std.fmt.bufPrint(
+        &buf,
+        "{{\n  \"version\": \"{s}\",{s}",
+        .{ EPHOR_VERSION, default_config[1..] },
+    );
+    Fs.cwd().writeFile(CONFIG_FILENAME, content, .{ .exclusive = true }) catch |err|
         return handleConfigCreateError(err);
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
 }
@@ -19360,7 +19367,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.13.5";
+const EPHOR_VERSION = "0.14.0";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -20328,9 +20335,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.13.5   # Install specific version
+        \\  ephor install --version=0.14.0   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.13.5   # Upgrade to specific version
+        \\  ephor upgrade --version=0.14.0   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -20345,7 +20352,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.13.5",
+        \\    "version": "0.14.0",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],

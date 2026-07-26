@@ -1734,21 +1734,26 @@ fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
         // Must NOT be an assignment target (var_name[i] = ...),
         // which is a write, not a read-via-slice-pass.
         // We specifically want var_name[...] passed as a function argument.
-        // Check if the enclosing context is a function call argument.
-        // Look backwards for a '(' that indicates we're inside a function call.
-        if (vpos > 0) {
-            var depth: usize = 0;
-            var j = vpos;
-            while (j > 0) {
-                j -= 1;
-                if (t[j] == ')') depth += 1;
-                if (t[j] == '(') {
-                    if (depth == 0) return true;
-                    depth -= 1;
-                }
-            }
-        }
+        // Check if the enclosing context is a function call argument
+        // (var_name[...] passed as a slice, not an assignment target).
+        if (isInsideCallArg(t, vpos)) return true;
         pos = end;
+    }
+    return false;
+}
+
+/// Look backwards for a '(' at paren depth 0 — true when vpos is inside a
+/// function-call argument list.
+fn isInsideCallArg(t: []const u8, vpos: usize) bool {
+    var depth: usize = 0;
+    var j = vpos;
+    while (j > 0) {
+        j -= 1;
+        if (t[j] == ')') depth += 1;
+        if (t[j] == '(') {
+            if (depth == 0) return true;
+            depth -= 1;
+        }
     }
     return false;
 }
@@ -2063,13 +2068,13 @@ fn extractIfCondition(t: []const u8) ?[]const u8 {
     // Find matching close paren
     var paren_depth: usize = 0;
     for (rest, 0..) |c, ci| {
-        if (c == '(') paren_depth += 1;
-        if (c == ')') {
-            paren_depth -= 1;
-            if (paren_depth == 0) {
-                return mem.trim(u8, rest[1..ci], " \t");
-            }
+        if (c == '(') {
+            paren_depth += 1;
+            continue;
         }
+        if (c != ')') continue;
+        paren_depth -= 1;
+        if (paren_depth == 0) return mem.trim(u8, rest[1..ci], " \t");
     }
     return null;
 }
@@ -3850,60 +3855,61 @@ fn checkOwnershipInLine(
         // Labeled break transfers ownership out of a block
         if (mem.startsWith(u8, t, "break :")) return true;
 
-        // Container ownership transfer: .append(data), .put(key, data)
-        // Owner var must appear as an ARGUMENT (after the method pattern),
-        // not as the LHS of a declaration receiving the return value.
-        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) {
-            for (compat.getContainerOwnershipMethods()) |pattern| {
-                if (mem.indexOf(u8, t, pattern)) |pat_pos| {
-                    // Check that owner var appears after the method call opening paren
-                    const after_method = pat_pos + pattern.len;
-                    if (after_method < t.len) {
-                        if (containsIdentifier(t[after_method..], ov.name)) return true;
-                    }
-                }
-            }
-        }
-
-        // Realloc consumes the old pointer: .realloc(old, new_size)
-        // Owner var must be an argument to realloc, not the result
-        if (mem.indexOf(u8, t, ".realloc(")) |realloc_pos| {
-            const after_paren = realloc_pos + ".realloc(".len;
-            if (after_paren < t.len and
-                containsIdentifier(t[after_paren..], ov.name))
-                return true;
-        }
-
-        // Pointer deref assignment: out.* = data (transfers to caller)
-        if (mem.indexOf(u8, t, ".* = ") != null) {
-            if (mem.indexOf(u8, t, " = ")) |eq_pos| {
-                const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-                // Only if the owner var is on the RHS (being transferred)
-                if (!mem.startsWith(u8, lhs, "const ") and
-                    !mem.startsWith(u8, lhs, "var ") and
-                    mem.endsWith(u8, lhs, ".*") and
-                    !containsIdentifier(lhs, ov.name))
-                    return true;
-            }
-        }
-
-        // Stored in any struct field (identifier.field = value)
-        if (mem.indexOf(u8, t, " = ")) |eq_pos| {
-            const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-            // Skip const/var declarations (those are local)
-            if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) {
-                // Pointer dereference init: name.* = .{...} writes TO allocated memory
-                if (mem.endsWith(u8, lhs, ".*") and containsIdentifier(lhs, ov.name)) continue;
-                // LHS with a dot = struct field storage (e.g., self.x, ctx.y, result.z, node.data)
-                if (mem.indexOf(u8, lhs, ".") != null) return true;
-                // Skip discard patterns: _ = value
-                if (mem.eql(u8, lhs, "_")) continue;
-                // Simple identifier = module-level variable assignment
-                if (lhs.len > 0) return true;
-            }
-        }
+        if (isContainerTransfer(t, ov.name)) return true;
+        if (isReallocConsume(t, ov.name)) return true;
+        if (isDerefTransfer(t, ov.name)) return true;
+        if (isFieldOrGlobalStore(t, ov.name)) return true;
     }
     return false;
+}
+
+/// Container ownership transfer: .append(data), .put(key, data)
+/// Owner var must appear as an ARGUMENT (after the method pattern),
+/// not as the LHS of a declaration receiving the return value.
+fn isContainerTransfer(t: []const u8, name: []const u8) bool {
+    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return false;
+    for (compat.getContainerOwnershipMethods()) |pattern| {
+        const pat_pos = mem.indexOf(u8, t, pattern) orelse continue;
+        const after_method = pat_pos + pattern.len;
+        if (after_method < t.len and containsIdentifier(t[after_method..], name)) return true;
+    }
+    return false;
+}
+
+/// Realloc consumes the old pointer: .realloc(old, new_size)
+/// Owner var must be an argument to realloc, not the result
+fn isReallocConsume(t: []const u8, name: []const u8) bool {
+    const realloc_pos = mem.indexOf(u8, t, ".realloc(") orelse return false;
+    const after_paren = realloc_pos + ".realloc(".len;
+    return after_paren < t.len and containsIdentifier(t[after_paren..], name);
+}
+
+/// Pointer deref assignment: out.* = data (transfers to caller)
+fn isDerefTransfer(t: []const u8, name: []const u8) bool {
+    if (mem.indexOf(u8, t, ".* = ") == null) return false;
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
+    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+    // Only if the owner var is on the RHS (being transferred)
+    return !mem.startsWith(u8, lhs, "const ") and
+        !mem.startsWith(u8, lhs, "var ") and
+        mem.endsWith(u8, lhs, ".*") and
+        !containsIdentifier(lhs, name);
+}
+
+/// Stored in any struct field (identifier.field = value) or module-level var
+fn isFieldOrGlobalStore(t: []const u8, name: []const u8) bool {
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
+    // Skip const/var declarations (those are local)
+    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return false;
+    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+    // Pointer dereference init: name.* = .{...} writes TO allocated memory
+    if (mem.endsWith(u8, lhs, ".*") and containsIdentifier(lhs, name)) return false;
+    // LHS with a dot = struct field storage (e.g., self.x, ctx.y, result.z, node.data)
+    if (mem.indexOf(u8, lhs, ".") != null) return true;
+    // Skip discard patterns: _ = value
+    if (mem.eql(u8, lhs, "_")) return false;
+    // Simple identifier = module-level variable assignment
+    return lhs.len > 0;
 }
 
 /// CFG-based defer coverage analysis (ZA101/ZA102)
@@ -4611,6 +4617,27 @@ const ErrdeferScanState = struct {
 };
 
 /// Scan lines for try-allocations and errdefer statements
+const NoFreeAllocCtx = struct {
+    joined: []const u8,
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+};
+
+/// True when the try-alloc line allocates through a no-free allocator:
+/// standalone or multiline first arg is in the no-free set or an arena name.
+fn isNoFreeAllocLine(ctx: NoFreeAllocCtx) bool {
+    if (extractStandaloneAllocator(ctx.joined)) |sa| {
+        if (ctx.no_free_names.contains(sa)) return true;
+        if (isArenaName(sa)) return true;
+    } else if (extractMultilineFirstArg(ctx.t, ctx.lines, ctx.idx)) |ml| {
+        if (ctx.no_free_names.contains(ml)) return true;
+        if (isArenaName(ml)) return true;
+    }
+    // Dotted first-arg arena heuristic
+    return isFirstArgArena(ctx.joined);
+}
 fn scanErrdeferLines(
     allocator: Allocator,
     lines: []const []const u8,
@@ -4670,24 +4697,17 @@ fn scanErrdeferLines(
         if (hasRealKeyword(t, "return error."))
             try state.error_returns.append(allocator, actual_line);
         if (has_try and isTryAllocation(joined)) {
-            // Check standalone first-arg allocator (single-line and multiline)
-            const standalone_skip = blk: {
-                if (extractStandaloneAllocator(joined)) |sa| {
-                    if (no_free_names.contains(sa)) break :blk true;
-                    if (isArenaName(sa)) break :blk true;
-                } else if (extractMultilineFirstArg(t, lines, idx)) |ml| {
-                    if (no_free_names.contains(ml)) break :blk true;
-                    if (isArenaName(ml)) break :blk true;
-                }
-                // Dotted first-arg arena heuristic
-                if (isFirstArgArena(joined)) break :blk true;
-                break :blk false;
+            // Standalone/multiline first-arg allocator checks (no-free set or arena)
+            const skip_ctx: NoFreeAllocCtx = .{
+                .joined = joined,
+                .t = t,
+                .lines = lines,
+                .idx = idx,
+                .no_free_names = &no_free_names,
             };
-            if (!standalone_skip) {
-                try collectTryAllocFromLine(joined, t, site, &collect_ctx);
-            } else {
-                try state.try_lines_list.append(allocator, actual_line);
-            }
+            const no_free = isNoFreeAllocLine(skip_ctx);
+            if (no_free) try state.try_lines_list.append(allocator, actual_line);
+            if (!no_free) try collectTryAllocFromLine(joined, t, site, &collect_ctx);
         }
         try collectDeferFromLine(t, site, &cleanup_ctx);
         if (has_try) try state.try_lines_list.append(allocator, actual_line);

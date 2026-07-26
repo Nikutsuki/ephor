@@ -1,0 +1,70 @@
+#!/bin/sh
+# Pre-push hook for ephor (open-source-bound).
+# 1. Secret pattern scan of pushed commits
+# 2. Quality gate on main pushes (fmt, build, test)
+# 3. Version consistency on tag pushes
+# 4. Block personal dev files (.opencode/, opencode.json)
+
+fail=0
+
+while read local_ref local_sha remote_ref remote_sha; do
+    # Determine the commit range being pushed
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        range="$local_sha"
+    else
+        range="${remote_sha}..${local_sha}"
+    fi
+
+    # 1. Secret pattern scan (added lines only)
+    secrets=$(git diff "$range" 2>/dev/null | grep '^+' | grep -iE \
+        'BEGIN (RSA|EC|OPENSSH|PGP|DSA) PRIVATE KEY|api[_-]?key["\x27]?\s*[:=]\s*["\x27][A-Za-z0-9_/-]{16,}|secret["\x27]?\s*[:=]\s*["\x27][A-Za-z0-9_/-]{16,}|password["\x27]?\s*[:=]\s*["\x27][^"\x27]{8,}|ghp_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|sk-[A-Za-z0-9]{32,}' | head -5)
+    if [ -n "$secrets" ]; then
+        echo "PUSH BLOCKED: possible secret in pushed changes:"
+        echo "$secrets"
+        fail=1
+    fi
+
+    # 4. Personal dev files must never be pushed (additions only —
+    # removal commits must pass)
+    bad_files=$(git diff --name-only --diff-filter=A "$range" 2>/dev/null | grep -E '^\.opencode/|^opencode\.json$' | head -5)
+    if [ -n "$bad_files" ]; then
+        echo "PUSH BLOCKED: personal dev files must not be tracked: $bad_files"
+        fail=1
+    fi
+
+    # 2. Quality gate on pushes to main (fmt + build + test)
+    case "$local_ref" in
+        refs/heads/main)
+            echo "Running pre-push quality gate..."
+            if ! zig fmt --check src/ 2>/dev/null; then
+                echo "PUSH BLOCKED: zig fmt --check failed (run zig fmt src/)"
+                fail=1
+            fi
+            if ! zig build -Doptimize=ReleaseSafe 2>/dev/null; then
+                echo "PUSH BLOCKED: build failed"
+                fail=1
+            fi
+            if ! zig build test 2>/dev/null; then
+                echo "PUSH BLOCKED: zig build test failed"
+                fail=1
+            fi
+            ;;
+    esac
+
+    # 3. Version consistency on tag pushes
+    case "$local_ref" in
+        refs/tags/v*)
+            TAG_VERSION=$(echo "$local_ref" | sed 's|refs/tags/v||')
+            echo "Checking version consistency for tag v${TAG_VERSION}..."
+            if [ -f scripts/check-version.sh ]; then
+                if ! ./scripts/check-version.sh "$TAG_VERSION"; then
+                    echo "PUSH BLOCKED: version mismatch"
+                    fail=1
+                fi
+            fi
+            ;;
+    esac
+done
+
+[ $fail -ne 0 ] && exit 1
+exit 0

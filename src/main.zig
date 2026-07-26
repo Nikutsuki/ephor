@@ -924,30 +924,31 @@ fn isDirectFreeOfVar(t: []const u8, var_name: []const u8) bool {
         if (var_pos > 0 and t[var_pos - 1] == '.') continue; // struct field
 
         const after_var = var_pos + var_name.len;
-
-        // Pattern 1: varname.free( or varname.destroy( (direct free)
+        // varname.field — intermediate access: never a direct free of varname,
+        // and pattern 2 must not see it either (allocator.free(buf.field) frees
+        // the field, not buf).
         if (after_var < t.len and t[after_var] == '.') {
-            const rest = t[after_var + 1 ..];
-            if (mem.startsWith(u8, rest, "free(") or mem.startsWith(u8, rest, "destroy(") or
-                mem.startsWith(u8, rest, "deinit("))
-            {
-                return true;
-            }
-            // varname.field.something - intermediate field access, not a direct free
+            if (isFreeMethodCall(t, after_var)) return true;
             continue;
         }
-
-        // Pattern 2: allocator.free(varname) or allocator.destroy(varname)
-        if (var_pos >= 1 and t[var_pos - 1] == '(') {
-            const before_paren = mem.trimEnd(u8, t[0 .. var_pos - 1], " ");
-            if (mem.endsWith(u8, before_paren, ".free") or
-                mem.endsWith(u8, before_paren, ".destroy"))
-            {
-                return true;
-            }
-        }
+        if (isFreeFnArg(t, var_pos)) return true;
     }
     return false;
+}
+
+/// Pattern 1: varname.free( / varname.destroy( / varname.deinit(
+fn isFreeMethodCall(t: []const u8, after_var: usize) bool {
+    const rest = t[after_var + 1 ..];
+    return mem.startsWith(u8, rest, "free(") or mem.startsWith(u8, rest, "destroy(") or
+        mem.startsWith(u8, rest, "deinit(");
+}
+
+/// Pattern 2: allocator.free(varname) or allocator.destroy(varname)
+fn isFreeFnArg(t: []const u8, var_pos: usize) bool {
+    if (var_pos < 1 or t[var_pos - 1] != '(') return false;
+    const before_paren = mem.trimEnd(u8, t[0 .. var_pos - 1], " ");
+    return mem.endsWith(u8, before_paren, ".free") or
+        mem.endsWith(u8, before_paren, ".destroy");
 }
 
 /// Check if a line directly frees var_name OR any alias of var_name.
@@ -1056,20 +1057,38 @@ fn isAssignmentOp(text: []const u8) bool {
 fn hasAssignmentAfterBracket(text: []const u8) ?bool {
     var depth: usize = 0;
     for (text, 0..) |c, i| {
-        if (c == '[') depth += 1 else if (c == ']') {
-            if (depth > 0) depth -= 1;
-            if (depth == 0) {
-                const after = mem.trimStart(u8, text[i + 1 ..], " \t");
-                if (isAssignmentOp(after)) return true;
-                // Continue through chained field.index access
-                // e.g., [col].v[row] = sum
-                if (after.len > 0 and (after[0] == '.' or after[0] == '['))
-                    return hasAssignmentAfterChain(after);
-                return false;
-            }
+        if (c == '[') {
+            depth += 1;
+            continue;
         }
+        if (c != ']') continue;
+        if (depth > 0) depth -= 1;
+        if (depth != 0) continue;
+        const after = mem.trimStart(u8, text[i + 1 ..], " \t");
+        if (isAssignmentOp(after)) return true;
+        // Continue through chained field.index access
+        // e.g., [col].v[row] = sum
+        if (after.len > 0 and (after[0] == '.' or after[0] == '['))
+            return hasAssignmentAfterChain(after);
+        return false;
     }
     return null; // No closing bracket found
+}
+
+/// Skip a `[...]` group starting at text[start] == '['.
+/// Returns the index just past the matching ']', or null if unclosed.
+fn skipBracketed(text: []const u8, start: usize) ?usize {
+    var depth: usize = 0;
+    for (text[start..], 0..) |c, i| {
+        if (c == '[') {
+            depth += 1;
+            continue;
+        }
+        if (c != ']') continue;
+        if (depth > 0) depth -= 1;
+        if (depth == 0) return start + i + 1;
+    }
+    return null;
 }
 
 /// Follow chained .field and [index] access to find assignment
@@ -1079,21 +1098,14 @@ fn hasAssignmentAfterChain(text: []const u8) ?bool {
         if (text[pos] == '.') {
             pos += 1;
             while (pos < text.len and isIdent(text[pos])) pos += 1;
-        } else if (text[pos] == '[') {
-            var depth: usize = 0;
-            for (text[pos..], 0..) |c, i| {
-                if (c == '[') depth += 1 else if (c == ']') {
-                    if (depth > 0) depth -= 1;
-                    if (depth == 0) {
-                        pos += i + 1;
-                        break;
-                    }
-                }
-            } else return null;
-        } else {
-            const after = mem.trimStart(u8, text[pos..], " \t");
-            return isAssignmentOp(after);
+            continue;
         }
+        if (text[pos] == '[') {
+            pos = skipBracketed(text, pos) orelse return null;
+            continue;
+        }
+        const after = mem.trimStart(u8, text[pos..], " \t");
+        return isAssignmentOp(after);
     }
     return null;
 }

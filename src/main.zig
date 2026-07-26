@@ -6397,11 +6397,98 @@ fn extractVarTypeName(t: []const u8) ?[]const u8 {
 /// Build TypeContext from file content. Parses struct method signatures,
 /// variable type declarations, and top-level function signatures.
 /// Also builds stdlib_vars (same as collectStdlibVarNames).
+const InitPatterns = struct {
+    container_inits: []const []const u8,
+    allocator_inits: []const []const u8,
+};
+
+/// Detect struct/enum/union scope opens (`const X = struct {`).
+fn detectTypeScope(
+    t: []const u8,
+    brace_depth: usize,
+    current_type: *?[]const u8,
+    type_brace_depth: *usize,
+) void {
+    const is_container = mem.indexOf(u8, t, "= struct {") != null or
+        mem.indexOf(u8, t, "= struct{") != null or
+        mem.indexOf(u8, t, "= packed struct {") != null or
+        mem.indexOf(u8, t, "= extern struct {") != null or
+        mem.indexOf(u8, t, "= enum {") != null or
+        mem.indexOf(u8, t, "= enum(") != null or
+        mem.indexOf(u8, t, "= union(") != null or
+        mem.indexOf(u8, t, "= union {") != null or
+        mem.indexOf(u8, t, "= packed union {") != null or
+        mem.indexOf(u8, t, "= extern union {") != null;
+    if (!is_container) return;
+    if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "pub const ")) return;
+    const name_start: usize = if (mem.startsWith(u8, t, "pub const ")) 10 else 6;
+    var name_end = name_start;
+    while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
+    if (name_end == name_start) return;
+    current_type.* = t[name_start..name_end];
+    type_brace_depth.* = brace_depth;
+}
+
+/// Parse a function/method signature line into ctx returns tables.
+/// Returns true when the line was consumed (matches the fn guard).
+fn registerFnSignature(
+    a: Allocator,
+    t: []const u8,
+    current_type: ?[]const u8,
+    ctx: *TypeContext,
+) !bool {
+    if (mem.indexOf(u8, t, "fn ") == null or mem.indexOf(u8, t, "(") == null) return false;
+    const ret_text = extractFnReturnType(t) orelse return true;
+    const rk = classifyReturnType(ret_text);
+    const fn_name = extractFnName(t) orelse return true;
+    if (current_type) |type_name| {
+        if (extractSelfTypeName(t) != null) {
+            // Register as type method
+            const gop = try ctx.struct_methods.getOrPut(a, type_name);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.put(a, fn_name, rk);
+            return true;
+        }
+    }
+    // Top-level function
+    try ctx.function_returns.put(a, fn_name, rk);
+    return true;
+}
+
+/// Parse a var/const declaration into ctx type tables (shared by the
+/// content-based and line-based TypeContext builders).
+fn registerVarDecl(
+    a: Allocator,
+    t: []const u8,
+    pats: InitPatterns,
+    ctx: *TypeContext,
+) !void {
+    if (!mem.startsWith(u8, t, "var ") and !mem.startsWith(u8, t, "const ")) return;
+    const var_name = extractVarDeclName(t) orelse return;
+    if (extractVarTypeName(t)) |type_name| try ctx.var_types.put(a, var_name, type_name);
+    var matched = false;
+    for (pats.container_inits) |init_pat| {
+        if (mem.indexOf(u8, t, init_pat) == null) continue;
+        matched = true;
+        break;
+    }
+    if (!matched) {
+        for (pats.allocator_inits) |init_pat| {
+            if (mem.indexOf(u8, t, init_pat) == null) continue;
+            matched = true;
+            break;
+        }
+    }
+    if (matched) try ctx.stdlib_vars.put(a, var_name, {});
+}
+
 fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
     var ctx = TypeContext.init();
 
-    const container_inits = compat.getStdlibContainerInitPatterns();
-    const allocator_inits = compat.getAllInitPatterns();
+    const pats: InitPatterns = .{
+        .container_inits = compat.getStdlibContainerInitPatterns(),
+        .allocator_inits = compat.getAllInitPatterns(),
+    };
 
     // Track type scope (struct/enum/union) via brace depth
     var current_type: ?[]const u8 = null;
@@ -6411,95 +6498,18 @@ fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) {
-            // Still track braces in comments? No — skip entirely
-            continue;
-        }
+        if (isCommentOrMultilineString(t)) continue;
 
-        // Track brace depth
-        for (t) |c| {
-            if (c == '{') brace_depth += 1;
-            if (c == '}') {
-                if (brace_depth > 0) brace_depth -= 1;
-            }
-        }
+        brace_depth += countChar(t, '{');
+        brace_depth -|= countChar(t, '}');
 
-        // Detect type scope: struct, enum, union — all can have methods in Zig
-        if (mem.indexOf(u8, t, "= struct {") != null or
-            mem.indexOf(u8, t, "= struct{") != null or
-            mem.indexOf(u8, t, "= packed struct {") != null or
-            mem.indexOf(u8, t, "= extern struct {") != null or
-            mem.indexOf(u8, t, "= enum {") != null or
-            mem.indexOf(u8, t, "= enum(") != null or
-            mem.indexOf(u8, t, "= union(") != null or
-            mem.indexOf(u8, t, "= union {") != null or
-            mem.indexOf(u8, t, "= packed union {") != null or
-            mem.indexOf(u8, t, "= extern union {") != null)
-        {
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const ")) {
-                const name_start = if (mem.startsWith(u8, t, "pub const ")) @as(usize, 10) else 6;
-                var name_end = name_start;
-                while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
-                if (name_end > name_start) {
-                    current_type = t[name_start..name_end];
-                    type_brace_depth = brace_depth;
-                }
-            }
-        }
+        detectTypeScope(t, brace_depth, &current_type, &type_brace_depth);
 
         // Exit type scope when braces close
-        if (current_type != null and brace_depth < type_brace_depth) {
-            current_type = null;
-        }
+        if (current_type != null and brace_depth < type_brace_depth) current_type = null;
 
-        // Parse function/method signatures
-        if (mem.indexOf(u8, t, "fn ") != null and mem.indexOf(u8, t, "(") != null) {
-            const ret_text = extractFnReturnType(t) orelse continue;
-            const rk = classifyReturnType(ret_text);
-            const fn_name = extractFnName(t) orelse continue;
-
-            if (current_type) |type_name| {
-                // Check if this is a method (has self parameter)
-                if (extractSelfTypeName(t) != null) {
-                    // Register as type method
-                    const gop = try ctx.struct_methods.getOrPut(a, type_name);
-                    if (!gop.found_existing) {
-                        gop.value_ptr.* = .empty;
-                    }
-                    try gop.value_ptr.put(a, fn_name, rk);
-                }
-            } else {
-                // Top-level function
-                try ctx.function_returns.put(a, fn_name, rk);
-            }
-            // Don't try to also parse as a var decl
-            continue;
-        }
-
-        // Parse variable declarations for type info
-        if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "const ")) {
-            const var_name = extractVarDeclName(t) orelse continue;
-
-            // Check for type name
-            if (extractVarTypeName(t)) |type_name| {
-                try ctx.var_types.put(a, var_name, type_name);
-            }
-
-            // Also build stdlib_vars (same logic as checkStdlibVarLine)
-            for (container_inits) |init_pat| {
-                if (mem.indexOf(u8, t, init_pat) != null) {
-                    try ctx.stdlib_vars.put(a, var_name, {});
-                    break;
-                }
-            } else {
-                for (allocator_inits) |init_pat| {
-                    if (mem.indexOf(u8, t, init_pat) != null) {
-                        try ctx.stdlib_vars.put(a, var_name, {});
-                        break;
-                    }
-                }
-            }
-        }
+        if (try registerFnSignature(a, t, current_type, &ctx)) continue;
+        try registerVarDecl(a, t, pats, &ctx);
     }
     return ctx;
 }
@@ -6508,36 +6518,15 @@ fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
 fn parseFileTypeContextFromLines(a: Allocator, lines: []const []const u8) !TypeContext {
     var ctx = TypeContext.init();
 
-    const container_inits = compat.getStdlibContainerInitPatterns();
-    const allocator_inits = compat.getAllInitPatterns();
+    const pats: InitPatterns = .{
+        .container_inits = compat.getStdlibContainerInitPatterns(),
+        .allocator_inits = compat.getAllInitPatterns(),
+    };
 
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-
-        // Parse variable declarations
-        if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "const ")) {
-            const var_name = extractVarDeclName(t) orelse continue;
-
-            if (extractVarTypeName(t)) |type_name| {
-                try ctx.var_types.put(a, var_name, type_name);
-            }
-
-            // Build stdlib_vars
-            for (container_inits) |init_pat| {
-                if (mem.indexOf(u8, t, init_pat) != null) {
-                    try ctx.stdlib_vars.put(a, var_name, {});
-                    break;
-                }
-            } else {
-                for (allocator_inits) |init_pat| {
-                    if (mem.indexOf(u8, t, init_pat) != null) {
-                        try ctx.stdlib_vars.put(a, var_name, {});
-                        break;
-                    }
-                }
-            }
-        }
+        try registerVarDecl(a, t, pats, &ctx);
     }
     return ctx;
 }

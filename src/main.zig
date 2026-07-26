@@ -149,6 +149,9 @@ const RULE_TEST_TRIVIAL_ASSERT = types.RULE_TEST_TRIVIAL_ASSERT;
 const RULE_TEST_SWALLOWED_ERROR = types.RULE_TEST_SWALLOWED_ERROR;
 const RULE_TEST_UNTESTED_PUBLIC_FN = types.RULE_TEST_UNTESTED_PUBLIC_FN;
 const RULE_LOCK_NO_DEFER_UNLOCK = types.RULE_LOCK_NO_DEFER_UNLOCK;
+const RULE_DOUBLE_LOCK = types.RULE_DOUBLE_LOCK;
+const RULE_UNLOCK_WITHOUT_LOCK = types.RULE_UNLOCK_WITHOUT_LOCK;
+const RULE_THREAD_NO_JOIN = types.RULE_THREAD_NO_JOIN;
 
 const Severity = types.Severity;
 
@@ -10035,23 +10038,56 @@ const LockAcquire = struct {
 /// acquire/release-API failure-branch form). For a deferred release it is
 /// the defer STATEMENT's depth (the opener line for a `defer { }` block),
 /// which is what determines on which paths the defer registers.
+/// `line`/`col` locate the release call itself (ZC102 event ordering,
+/// ZC103 preceding-acquire checks and diagnostic positions).
 const LockRelease = struct {
+    line: usize,
+    col: usize,
     receiver: []const u8,
     method: []const u8,
     depth: usize,
 };
 
-/// Per-fn lock facts accumulated while scanning (ZC101).
+/// A located block close (ZC102): a `}` dropped the running depth to
+/// `depth` at this (line, col). `opens_arm` is true when the close is
+/// followed on the same line by `else` or a `,` — the next block at the
+/// same depth is then a DISJOINT path (if/else arm, switch prong), not a
+/// sequential block. (`zig fmt` normalizes `else` onto the `}` line, so
+/// single-line detection covers formatted code.)
+const BlockClose = struct {
+    line: usize,
+    col: usize,
+    depth: usize,
+    opens_arm: bool,
+};
+
+/// Per-fn lock facts accumulated while scanning (ZC101, ZC102, ZC103).
 const FnLockRecord = struct {
     acquires: std.ArrayListUnmanaged(LockAcquire) = .empty,
+    /// Acquires excluded from ZC101/ZC102 evaluation — defer-context
+    /// (zls diagnostics cleanup blocks) or discarded-result (hold-till-
+    /// close file locks). They still ACQUIRE the lock at runtime, so
+    /// ZC103 consults them as evidence: an unlock paired with a deferred
+    /// re-lock (ghostty mailbox) or a discarded tryLock (ghostty
+    /// DiskCache) is scoped ownership, not unlock-of-unheld.
+    other_acquires: std.ArrayListUnmanaged(LockAcquire) = .empty,
     defer_releases: std.ArrayListUnmanaged(LockRelease) = .empty,
     plain_releases: std.ArrayListUnmanaged(LockRelease) = .empty,
+    closes: std.ArrayListUnmanaged(BlockClose) = .empty,
+    /// Nested fn-definition lines inside this fn's span (ZC102). Nested
+    /// fns (type-factory methods, local struct methods) roll up into the
+    /// outer fn's record for ZC101's coverage math, but their bodies are
+    /// independent flows: a lock is never held across a fn boundary.
+    fn_boundaries: std.ArrayListUnmanaged(BlockClose) = .empty,
     stmt_count: usize = 0,
 
     fn deinit(self: *FnLockRecord, allocator: Allocator) void {
         self.acquires.deinit(allocator);
+        self.other_acquires.deinit(allocator);
         self.defer_releases.deinit(allocator);
         self.plain_releases.deinit(allocator);
+        self.closes.deinit(allocator);
+        self.fn_boundaries.deinit(allocator);
     }
 };
 
@@ -10239,10 +10275,12 @@ const ResolvedCall = struct {
 };
 
 /// Record one classified lock-family call into the open fn record (ZC101).
-/// Acquires inside defer context or with discarded results are skipped;
-/// releases are split deferred vs plain for the coverage cascade. Deferred
-/// releases are attributed the defer STATEMENT's depth; plain releases
-/// keep their call-site depth.
+/// Acquires inside defer context or with discarded results are set aside
+/// into `other_acquires` — they are not scoped ownership for ZC101/ZC102,
+/// but they still take the lock at runtime, so ZC103 uses them as
+/// evidence. Releases are split deferred vs plain for the coverage
+/// cascade. Deferred releases are attributed the defer STATEMENT's depth;
+/// plain releases keep their call-site depth.
 fn recordLockCall(
     state: *ConcurrencyScanState,
     lc: ConcLineCtx,
@@ -10252,20 +10290,26 @@ fn recordLockCall(
     const rec = state.current();
     switch (kind) {
         .acquire => {
-            if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) return;
-            try rec.acquires.append(state.allocator, .{
+            const acq: LockAcquire = .{
                 .line = lc.line_num,
                 .col = call.start + 1,
                 .receiver = call.receiver,
                 .method = call.seg,
                 .depth = call.depth,
                 .cond_position = mem.indexOfScalar(u8, lc.blanked[call.start..], '{') != null,
-            });
+            };
+            if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) {
+                try rec.other_acquires.append(state.allocator, acq);
+                return;
+            }
+            try rec.acquires.append(state.allocator, acq);
         },
         .release => {
             const list = if (lc.defer_ctx) &rec.defer_releases else &rec.plain_releases;
             const depth = if (lc.defer_ctx) lc.defer_attr_depth else call.depth;
             try list.append(state.allocator, .{
+                .line = lc.line_num,
+                .col = call.start + 1,
                 .receiver = call.receiver,
                 .method = call.seg,
                 .depth = depth,
@@ -10294,6 +10338,41 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
     }
 }
 
+/// Record block closes on one literal-blanked line (ZC102): each `}`
+/// that drops the running depth ends the block of any acquire nested
+/// deeper than the resulting depth. The close is an ARM close (the next
+/// same-depth block is a disjoint path) when the remainder of the line
+/// holds `else` (if/else arm) or starts with `,` (switch prong / list
+/// element). Blanked input keeps string-literal braces and the word
+/// "else" inside a string from corrupting either fact.
+fn recordBlockCloses(
+    state: *ConcurrencyScanState,
+    blanked: []const u8,
+    line_num: usize,
+) !void {
+    var depth = state.fn_depth;
+    for (blanked, 0..) |c, i| {
+        if (c == '{') depth += 1;
+        if (c != '}' or depth == 0) continue;
+        depth -= 1;
+        try state.current().closes.append(state.allocator, .{
+            .line = line_num,
+            .col = i + 1,
+            .depth = depth,
+            .opens_arm = closeOpensArm(blanked[i + 1 ..]),
+        });
+    }
+}
+
+/// True when the text after a `}` opens a sibling arm on this line:
+/// a leading `,` (switch prong / list element) or the word `else`.
+fn closeOpensArm(rest: []const u8) bool {
+    const t = mem.trimStart(u8, rest, " \t");
+    if (mem.startsWith(u8, t, ",")) return true;
+    return mem.startsWith(u8, t, "else") and
+        (t.len == 4 or !isIdent(t[4]));
+}
+
 /// Scan one line of a file for concurrency facts, updating `state`.
 fn scanConcurrencyLine(
     state: *ConcurrencyScanState,
@@ -10305,11 +10384,24 @@ fn scanConcurrencyLine(
     const code_end = findCommentStart(line) orelse line.len;
     const code = line[0..code_end];
     const blanked = blankLiteralContents(code, &state.blank_buf);
+    const was_in_fn = state.in_fn;
     if (!state.in_fn) {
         const tc = mem.trim(u8, code, " \t\r");
         try updateConcurrencySpan(state, tc, blanked);
     }
     if (!state.in_fn) return;
+    // A fn definition inside an already-open fn span is a nested fn
+    // (type-factory method, local struct method): mark the boundary so
+    // ZC102's walk starts each nested body with no held state. The fn's
+    // OWN opening line (was_in_fn false) is not a boundary.
+    if (was_in_fn and extractFnDef(t) != null) {
+        try state.current().fn_boundaries.append(state.allocator, .{
+            .line = line_num,
+            .col = 1,
+            .depth = state.fn_depth,
+            .opens_arm = false,
+        });
+    }
     const defer_line = isDeferOrErrdefer(t);
     const defer_ctx = defer_line or state.in_defer;
     // Depth attributed to defer-context releases: the defer STATEMENT's
@@ -10326,6 +10418,7 @@ fn scanConcurrencyLine(
         .defer_attr_depth = defer_attr_depth,
     });
     state.current().stmt_count += mem.count(u8, blanked, ";");
+    try recordBlockCloses(state, blanked, line_num);
     state.fn_depth = braceDelta(state.fn_depth, blanked);
     if (state.fn_depth == 0) state.in_fn = false;
 }
@@ -10469,8 +10562,413 @@ fn evaluateAcquire(
     });
 }
 
-/// Evaluate every fn record's acquires once the file scan is complete —
-/// cross-fn evidence needs the whole file first.
+/// tryLock-family acquire names (ZC102/ZC103): non-blocking — a second
+/// acquire that cannot block is not a deadlock, and a fn-scope defer
+/// after a conditional try acquire is the ZC103 warning shape.
+fn isTryAcquire(seg: []const u8) bool {
+    return mem.startsWith(u8, seg, "tryLock");
+}
+
+/// Shared (read) acquire names (ZC102): lockShared/tryLockShared and
+/// their Uncancelable variants all carry the `Shared` marker.
+fn isSharedAcquire(seg: []const u8) bool {
+    return mem.indexOf(u8, seg, "Shared") != null;
+}
+
+/// One ordered event in a fn's lock flow (ZC102): an acquire, a plain or
+/// deferred release, a block close, or a nested-fn boundary. All payloads
+/// carry line/col, so events sort into source order with one comparator.
+const LockEvent = union(enum) {
+    acquire: LockAcquire,
+    plain_rel: LockRelease,
+    defer_rel: LockRelease,
+    close: BlockClose,
+    boundary: BlockClose,
+
+    fn line(self: LockEvent) usize {
+        return switch (self) {
+            inline else => |payload| payload.line,
+        };
+    }
+
+    fn col(self: LockEvent) usize {
+        return switch (self) {
+            inline else => |payload| payload.col,
+        };
+    }
+};
+
+/// Source-order comparator for lock events (ZC102). A `}` close and a
+/// call can share a line (`} else { mu.lock(); }`) but never a column.
+fn lockEventLessThan(_: void, a: LockEvent, b: LockEvent) bool {
+    if (a.line() != b.line()) return a.line() < b.line();
+    return a.col() < b.col();
+}
+
+/// Merge one fn record's acquires, releases, and block closes into a
+/// source-ordered event list (ZC102).
+fn buildLockEvents(
+    allocator: Allocator,
+    rec: *const FnLockRecord,
+) !std.ArrayListUnmanaged(LockEvent) {
+    var events: std.ArrayListUnmanaged(LockEvent) = .empty;
+    errdefer events.deinit(allocator);
+    for (rec.acquires.items) |acq| {
+        try events.append(allocator, .{ .acquire = acq });
+    }
+    for (rec.plain_releases.items) |rel| {
+        try events.append(allocator, .{ .plain_rel = rel });
+    }
+    for (rec.defer_releases.items) |rel| {
+        try events.append(allocator, .{ .defer_rel = rel });
+    }
+    for (rec.closes.items) |c| {
+        try events.append(allocator, .{ .close = c });
+    }
+    for (rec.fn_boundaries.items) |b| {
+        try events.append(allocator, .{ .boundary = b });
+    }
+    std.mem.sort(LockEvent, events.items, {}, lockEventLessThan);
+    return events;
+}
+
+/// Held-lock state for one receiver during the ZC102 walk. `closed`
+/// marks the hold as PATH-CONDITIONAL — the acquire's block ended, or a
+/// branch-scoped (deferred) release fired on only some held paths.
+/// `arm` records sibling-chain membership: after an arm-opening close
+/// (`} else {` or `},`) a later same-depth acquire is a DISJOINT path,
+/// never a re-lock; the flag survives only while each subsequent close
+/// opens another arm — a plain close ends the chain and later blocks are
+/// sequential (their paths overlap).
+const HeldLock = struct {
+    acq: LockAcquire,
+    closed: bool = false,
+    arm: bool = false,
+};
+
+/// Mutable state for the ZC102 double-lock walk.
+const DoubleLockWalk = struct {
+    sink: *const ConcurrencyIssueSink,
+    held: std.StringHashMapUnmanaged(HeldLock) = .empty,
+    /// Deferred releases registered but not yet fired: a defer runs at
+    /// its scope's EXIT, not at its statement — the hold may clear only
+    /// when a close event ends the defer's scope.
+    pending_defers: std.ArrayListUnmanaged(LockRelease) = .empty,
+
+    fn deinit(self: *DoubleLockWalk, allocator: Allocator) void {
+        self.held.deinit(allocator);
+        self.pending_defers.deinit(allocator);
+    }
+};
+
+/// ZC102 verdict for an acquire whose receiver is already held: a
+/// warning for any exclusive-mode re-acquire (certain deadlock on
+/// non-recursive std locks), a note when both acquires are shared —
+/// recursive read locking deadlocks under std's writer-preference
+/// RwLock only when a writer queues between the two acquires, so the
+/// lower severity reflects the conditional outcome.
+fn emitDoubleLock(
+    sink: *const ConcurrencyIssueSink,
+    acq: LockAcquire,
+    h: HeldLock,
+) !void {
+    const shared = isSharedAcquire(acq.method) and isSharedAcquire(h.acq.method);
+    const msg = if (shared)
+        try std.fmt.allocPrint(sink.allocator, "recursive read lock of " ++
+            "'{s}' — deadlocks if a writer queues between the acquires", .{acq.receiver})
+    else
+        try std.fmt.allocPrint(sink.allocator, "double lock of " ++
+            "'{s}' — already held, deadlock", .{acq.receiver});
+    const help: []const u8 = if (shared)
+        "std.Io.RwLock blocks new readers once a writer waits — " ++
+            "re-entrant read locking is unsafe"
+    else
+        "release the lock before re-acquiring it";
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = acq.line,
+        .col = acq.col,
+        .severity = if (shared) .note else .warning,
+        .rule = RULE_DOUBLE_LOCK,
+        .message = msg,
+        .help = help,
+        .message_owned = true,
+    });
+}
+
+/// Acquire transition for the ZC102 walk. Semaphore waits are exempt (a
+/// counting semaphore may wait twice legally); a tryLock-family second
+/// acquire cannot block (the try simply fails), so it never deadlocks.
+fn onWalkAcquire(walk: *DoubleLockWalk, acq: LockAcquire) !void {
+    if (isSemaphoreAcquire(acq.method)) return;
+    const gop = try walk.held.getOrPut(walk.sink.allocator, acq.receiver);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .acq = acq };
+        return;
+    }
+    const h = gop.value_ptr.*;
+    // Sibling-arm merge: the new acquire opens the NEXT disjoint block,
+    // so it starts a fresh (unclosed) hold on its own path.
+    if (h.closed and h.arm) {
+        gop.value_ptr.* = .{ .acq = acq };
+        return;
+    }
+    // Same linear path (block still open) or overlapping paths (hold is
+    // path-conditional): a blocking re-acquire while held. The ORIGINAL
+    // acquire stays the held record — a later release pairs with it.
+    if (!isTryAcquire(acq.method)) try emitDoubleLock(walk.sink, acq, h);
+}
+
+/// Plain-release transition. A release at the acquire's own depth or
+/// shallower runs on every held path and clears the hold; a BRANCH-
+/// scoped release (deeper than the acquire) runs only on the branch's
+/// paths, so the hold is downgraded to path-conditional (F4) — a later
+/// re-acquire still warns on the non-releasing paths.
+fn onWalkPlainRelease(walk: *DoubleLockWalk, rel: LockRelease) void {
+    const hp = walk.held.getPtr(rel.receiver) orelse return;
+    if (!releaseMatchesAcquire(hp.acq.method, rel.method)) return;
+    if (rel.depth > hp.acq.depth) {
+        hp.closed = true;
+        hp.arm = false;
+        return;
+    }
+    _ = walk.held.remove(rel.receiver);
+}
+
+/// Deferred releases do nothing at their statement (F1): a defer runs
+/// at its scope's exit — register it pending until the scope closes.
+fn onWalkDeferRelease(walk: *DoubleLockWalk, rel: LockRelease) !void {
+    try walk.pending_defers.append(walk.sink.allocator, rel);
+}
+
+/// Fire the pending deferred releases whose scope this close ends (F1):
+/// a defer at depth D runs when its depth-D block exits (the close drops
+/// to D-1; braces decrement one level at a time, so every scope's close
+/// is observed). A release covering the held acquire (ZC101's
+/// deferCovers, including the tryLock guard-block exception) fires on
+/// every held path and clears the hold; any other matching defer fired
+/// on a subset of paths — downgrade the hold to path-conditional.
+fn fireScopedDefers(walk: *DoubleLockWalk, c: BlockClose) void {
+    var i: usize = 0;
+    while (i < walk.pending_defers.items.len) {
+        const rel = walk.pending_defers.items[i];
+        if (rel.depth != c.depth + 1) {
+            i += 1;
+            continue;
+        }
+        deferFireOne(walk, rel);
+        _ = walk.pending_defers.swapRemove(i);
+    }
+}
+
+/// Apply one fired deferred release to the held map (F1).
+fn deferFireOne(walk: *DoubleLockWalk, rel: LockRelease) void {
+    const hp = walk.held.getPtr(rel.receiver) orelse return;
+    if (!releaseMatchesAcquire(hp.acq.method, rel.method)) return;
+    if (deferCovers(hp.acq, rel)) {
+        _ = walk.held.remove(rel.receiver);
+        return;
+    }
+    hp.closed = true;
+    hp.arm = false;
+}
+
+/// Close transition: fire scoped defers first (they execute at this
+/// scope's exit), then update held records. A non-arm close at or below
+/// an arm-close's depth ends the sibling chain (F2) — later blocks are
+/// sequential; an arm-opening close keeps the chain alive (the next
+/// prong or else-if is still a sibling).
+fn onWalkClose(walk: *DoubleLockWalk, c: BlockClose) void {
+    fireScopedDefers(walk, c);
+    var it = walk.held.valueIterator();
+    while (it.next()) |h| {
+        if (h.closed and h.arm and c.depth < h.acq.depth and !c.opens_arm) {
+            h.arm = false;
+        }
+        if (h.closed or h.acq.depth <= c.depth) continue;
+        h.closed = true;
+        h.arm = c.opens_arm;
+    }
+}
+
+/// ZC102: walk one fn's lock events in source order, tracking per-receiver
+/// held state. A blocking acquire while the receiver is held on the same
+/// linear path (or on overlapping paths once the hold is path-
+/// conditional) is a double lock; acquires in sibling if/else arms or
+/// switch prongs are disjoint paths and never flagged.
+fn evaluateDoubleLock(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord) !void {
+    var events = try buildLockEvents(sink.allocator, rec);
+    defer events.deinit(sink.allocator);
+    var walk: DoubleLockWalk = .{ .sink = sink };
+    defer walk.deinit(sink.allocator);
+    for (events.items) |ev| {
+        switch (ev) {
+            .acquire => |acq| try onWalkAcquire(&walk, acq),
+            .plain_rel => |rel| onWalkPlainRelease(&walk, rel),
+            .defer_rel => |rel| try onWalkDeferRelease(&walk, rel),
+            .close => |c| onWalkClose(&walk, c),
+            // Nested-fn boundary: the body that follows is an independent
+            // flow — a lock is never held across a fn boundary (mach
+            // Objects type factory: tryLock/lock/unlock wrapper methods).
+            // An outer-fn hold suspended through the nested region is not
+            // restored — accepted FN, documented in EPH-I0036.
+            .boundary => walk.held.clearRetainingCapacity(),
+        }
+    }
+}
+
+/// True when the fn holds ANY acquire of this receiver (ZC103). Source
+/// order is not checked: a release followed by a re-acquire is the
+/// borrow idiom — the caller holds the lock, the fn releases it for a
+/// slow operation, and re-acquires before returning (ghostty mailbox:
+/// `m.unlock(); defer m.lock();`). A fn that releases AND re-acquires is
+/// managing a borrowed lock; a fn that releases without EVER acquiring
+/// is the unlock-of-unheld defect. Pairing is not checked either: a
+/// mis-paired acquire/release is ZC101's report, and counting it here
+/// would double-report. Set-aside acquires (defer-context, discarded
+/// result) count — they take the lock at runtime.
+fn hasSatisfyingAcquire(rec: *const FnLockRecord, rel: LockRelease) bool {
+    for ([_][]const LockAcquire{ rec.acquires.items, rec.other_acquires.items }) |list| {
+        for (list) |acq| {
+            if (mem.eql(u8, acq.receiver, rel.receiver)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when any OTHER fn record in the file acquires this receiver — the
+/// cross-function acquire/release idiom (mirror of ZC101's cross-fn
+/// release suppression: zls string_pool locks in one fn, unlocks in
+/// another). Matching is textual by receiver field-chain, so an acquire
+/// in a different FILE — or spelled differently across the fn boundary
+/// (ghostty blocking_queue: `self.mutex` vs `self.queue.mutex`) — is
+/// invisible; note severity bounds the cost.
+fn hasCrossFnAcquire(
+    records: []const FnLockRecord,
+    self_idx: usize,
+    receiver: []const u8,
+) bool {
+    for (records, 0..) |rec, idx| {
+        if (idx == self_idx) continue;
+        for (rec.acquires.items) |acq| {
+            if (mem.eql(u8, acq.receiver, receiver)) return true;
+        }
+        for (rec.other_acquires.items) |acq| {
+            if (mem.eql(u8, acq.receiver, receiver)) return true;
+        }
+    }
+    return false;
+}
+
+/// ZC103 note for a release whose receiver has no acquire in the fn and
+/// no cross-fn acquire evidence in the file. `post` is exempt: signaling
+/// a semaphore without an in-fn wait is the normal producer shape, never
+/// unlock-of-unheld.
+fn checkOneRelease(
+    sink: *const ConcurrencyIssueSink,
+    records: []const FnLockRecord,
+    rec_idx: usize,
+    rel: LockRelease,
+) !void {
+    if (mem.eql(u8, rel.method, "post")) return;
+    const rec = &records[rec_idx];
+    if (hasSatisfyingAcquire(rec, rel)) return;
+    if (hasCrossFnAcquire(records, rec_idx, rel.receiver)) return;
+    const msg = try std.fmt.allocPrint(
+        sink.allocator,
+        "unlock of '{s}' without acquire in this function",
+        .{rel.receiver},
+    );
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = rel.line,
+        .col = rel.col,
+        .severity = .note,
+        .rule = RULE_UNLOCK_WITHOUT_LOCK,
+        .message = msg,
+        .help = "releasing an unheld lock is UB (debug builds assert); " ++
+            "acquire it earlier in this function",
+        .message_owned = true,
+    });
+}
+
+/// The conditional try-acquire matching this release, if any (ZC103):
+/// tryLock/tryLockShared in condition position (`if (mu.tryLock()) {`).
+fn findCondTryAcquire(rec: *const FnLockRecord, rel: LockRelease) ?LockAcquire {
+    for (rec.acquires.items) |acq| {
+        if (!acq.cond_position or !isTryAcquire(acq.method)) continue;
+        if (!mem.eql(u8, acq.receiver, rel.receiver)) continue;
+        if (releaseMatchesAcquire(acq.method, rel.method)) return acq;
+    }
+    return null;
+}
+
+/// True when the fn acquires this receiver through a non-try (blocking)
+/// acquire — the lock is then held regardless of the tryLock outcome.
+fn hasNonTryAcquire(rec: *const FnLockRecord, receiver: []const u8) bool {
+    for (rec.acquires.items) |acq| {
+        if (!mem.eql(u8, acq.receiver, receiver)) continue;
+        if (!isTryAcquire(acq.method)) return true;
+    }
+    return false;
+}
+
+/// ZC103 warning for the conditional-tryLock false-path shape (EPH-I0033
+/// item 8): `if (mu.tryLock()) { work(); } defer mu.unlock();` runs the
+/// defer on the tryLock==false path too, unlocking an unheld lock.
+fn emitTryLockDeferUnlock(sink: *const ConcurrencyIssueSink, rel: LockRelease) !void {
+    const msg = try std.fmt.allocPrint(
+        sink.allocator,
+        "defer unlock of '{s}' executes even when tryLock fails",
+        .{rel.receiver},
+    );
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = rel.line,
+        .col = rel.col,
+        .severity = .warning,
+        .rule = RULE_UNLOCK_WITHOUT_LOCK,
+        .message = msg,
+        .help = "move the defer inside the if-block so it runs only " ++
+            "on the acquired path",
+        .message_owned = true,
+    });
+}
+
+/// The fn-scope-defer half of ZC103: a defer release paired ONLY with a
+/// conditional try-acquire, registered at the tryLock's own depth or
+/// shallower, fires on the false path. A defer inside the guard block
+/// (depth = acquire + 1) runs only on the acquired path — covered.
+fn checkTryLockDefer(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord) !void {
+    for (rec.defer_releases.items) |rel| {
+        const acq = findCondTryAcquire(rec, rel) orelse continue;
+        if (rel.depth > acq.depth) continue;
+        if (hasNonTryAcquire(rec, rel.receiver)) continue;
+        try emitTryLockDeferUnlock(sink, rel);
+    }
+}
+
+/// ZC103: releases with no acquire evidence (note), plus the
+/// conditional-tryLock fn-scope-defer false-path shape (warning).
+fn evaluateUnlockWithoutLock(
+    sink: *const ConcurrencyIssueSink,
+    records: []const FnLockRecord,
+    rec_idx: usize,
+) !void {
+    const rec = &records[rec_idx];
+    for (rec.plain_releases.items) |rel| {
+        try checkOneRelease(sink, records, rec_idx, rel);
+    }
+    for (rec.defer_releases.items) |rel| {
+        try checkOneRelease(sink, records, rec_idx, rel);
+    }
+    try checkTryLockDefer(sink, rec);
+}
+
+/// Evaluate every fn record once the file scan is complete — cross-fn
+/// evidence needs the whole file first. ZC101 judges each acquire's
+/// coverage; ZC102 walks the ordered lock flow for re-acquires; ZC103
+/// judges each release's acquire evidence.
 fn evaluateLockRecords(
     sink: *const ConcurrencyIssueSink,
     records: []const FnLockRecord,
@@ -10479,10 +10977,230 @@ fn evaluateLockRecords(
         for (rec.acquires.items) |acq| {
             try evaluateAcquire(sink, records, rec_idx, acq);
         }
+        try evaluateDoubleLock(sink, rec);
+        try evaluateUnlockWithoutLock(sink, records, rec_idx);
     }
 }
 
-/// Analyze a single file for lock/unlock pairing defects (ZC101).
+/// A std.Thread.spawn call whose result is bound to a searchable name
+/// (ZC104): a local (`t`) or a field chain (`self.t`).
+const BoundSpawn = struct {
+    line: usize,
+    col: usize,
+    name: []const u8,
+};
+
+/// Bundled scan context for ZC104 line passes (param counts).
+const SpawnScanCtx = struct {
+    lines: []const []const u8,
+    blank_buf: []u8,
+    needle_buf: []u8,
+};
+
+/// True for `std.Thread.spawn` and alias forms (`Thread.spawn` when
+/// std.Thread is imported by name) — but NOT `MyThread.spawn` (the dot
+/// boundary rejects it), `child.spawn`, or `exe.spawn` (process spawning
+/// has no join/detach contract; std.process.Child is reaped by wait()).
+fn isThreadSpawnTarget(target: []const u8) bool {
+    if (mem.eql(u8, target, "Thread.spawn")) return true;
+    return mem.endsWith(u8, target, ".Thread.spawn");
+}
+
+/// Classify what happens to a std.Thread.spawn result from the text
+/// before the call (ZC104). Returns the bound name to search join/detach
+/// evidence for, or null when the handle escapes by transfer (call
+/// argument, return, container store, struct-literal field init) or the
+/// shape is unsearchable (bare statement, `_ =` discard, `ptr.* =` deref
+/// store — the ownership move is real but textual search cannot follow
+/// it, so flagging would guess).
+fn classifySpawnBinding(prefix_raw: []const u8) ?[]const u8 {
+    var prefix = mem.trimEnd(u8, prefix_raw, " \t");
+    if (mem.endsWith(u8, prefix, "try")) {
+        prefix = mem.trimEnd(u8, prefix[0 .. prefix.len - 3], " \t");
+    }
+    if (prefix.len == 0) return null;
+    const ret = "return";
+    if (mem.endsWith(u8, prefix, ret) and
+        (prefix.len == ret.len or !isIdent(prefix[prefix.len - ret.len - 1])))
+    {
+        return null;
+    }
+    const last = prefix[prefix.len - 1];
+    if (last == '(' or last == ',') return null;
+    if (last != '=') return null;
+    var lhs = mem.trim(u8, prefix[0 .. prefix.len - 1], " \t");
+    // Anonymous struct-literal field init (`.thread = ...` — mach
+    // alsa.zig): the constructed value owns the handle — a field store.
+    if (mem.startsWith(u8, lhs, ".")) return null;
+    if (mem.startsWith(u8, lhs, "const ")) lhs = lhs[6..];
+    if (mem.startsWith(u8, lhs, "var ")) lhs = lhs[4..];
+    lhs = mem.trim(u8, lhs, " \t");
+    var end: usize = 0;
+    while (end < lhs.len and (isIdent(lhs[end]) or lhs[end] == '.')) end += 1;
+    if (end == 0 or lhs[end - 1] == '.') return null;
+    const name = lhs[0..end];
+    if (mem.eql(u8, name, "_")) return null;
+    return name;
+}
+
+/// True when `<name>.join(` or `<name>.detach(` appears with a clean left
+/// boundary (ZC104), including the optional-unwrap form `<name>.?.join(`
+/// (messenger: `worker.thread.?.join()` on a `?std.Thread` field).
+/// `it.join(` and `event.t.join(` name a DIFFERENT handle and must not
+/// satisfy the search.
+fn hasJoinOrDetach(code: []const u8, name: []const u8, buf: []u8) bool {
+    const suffixes = [_][]const u8{ ".join(", ".detach(", ".?.join(", ".?.detach(" };
+    for (suffixes) |suffix| {
+        if (name.len + suffix.len > buf.len) continue;
+        @memcpy(buf[0..name.len], name);
+        @memcpy(buf[name.len..][0..suffix.len], suffix);
+        const needle = buf[0 .. name.len + suffix.len];
+        var from: usize = 0;
+        while (mem.indexOfPos(u8, code, from, needle)) |pos| {
+            from = pos + 1;
+            if (pos == 0) return true;
+            if (!isIdent(code[pos - 1]) and code[pos - 1] != '.') return true;
+        }
+    }
+    return false;
+}
+
+/// True when `return <name>` appears as a statement (ZC104): the handle
+/// escapes to the caller, who owns the join/detach obligation.
+fn hasReturnOf(code: []const u8, name: []const u8) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, code, from, "return ")) |pos| {
+        from = pos + 7;
+        if (pos > 0 and isIdent(code[pos - 1])) continue;
+        const rest = mem.trimStart(u8, code[pos + 7 ..], " \t");
+        if (!mem.startsWith(u8, rest, name)) continue;
+        if (rest.len > name.len and isIdent(rest[name.len])) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Search every line's code form for evidence the spawned handle's
+/// obligation is resolved (ZC104): a join/detach call on the bound name,
+/// a return to the caller, a store into a struct field, or a hand-off as
+/// a call argument (container puts included). String literals and
+/// comments are never evidence — a "t.join()" in a format string joins
+/// nothing.
+fn findSpawnResolution(
+    lines: []const []const u8,
+    name: []const u8,
+    blank_buf: []u8,
+    needle_buf: []u8,
+) bool {
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(line) orelse line.len;
+        const blanked = blankLiteralContents(line[0..code_end], blank_buf);
+        if (hasJoinOrDetach(blanked, name, needle_buf)) return true;
+        if (hasReturnOf(blanked, name)) return true;
+        if (isStructFieldStorage(blanked, name)) return true;
+        if (isFunctionArgTransfer(blanked, name)) return true;
+    }
+    return false;
+}
+
+/// ZC104 warning: the spawned thread's handle is never joined or
+/// detached — std.Thread.spawn's contract ("the caller must eventually
+/// either call join() ... or call detach()") makes the leak certain.
+fn emitThreadNoJoin(sink: *const ConcurrencyIssueSink, spawn: BoundSpawn) !void {
+    const msg = try std.fmt.allocPrint(
+        sink.allocator,
+        "spawned thread '{s}' never joined or detached",
+        .{spawn.name},
+    );
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.path,
+        .line = spawn.line,
+        .col = spawn.col,
+        .severity = .warning,
+        .rule = RULE_THREAD_NO_JOIN,
+        .message = msg,
+        .help = "call the handle's join() or detach() — std.Thread.spawn " ++
+            "requires one of them to free its resources",
+        .message_owned = true,
+    });
+}
+
+/// Check one comment-stripped line for bound std.Thread.spawn calls
+/// whose handle has no join/detach evidence anywhere in the file (ZC104).
+fn checkLineSpawns(
+    sink: *const ConcurrencyIssueSink,
+    ctx: SpawnScanCtx,
+    code: []const u8,
+    line_num: usize,
+) !void {
+    var pos: usize = 0;
+    while (nextCallSite(code, pos)) |site| {
+        pos = site.open_paren + 1;
+        const target = code[site.start..site.open_paren];
+        if (!isThreadSpawnTarget(target)) continue;
+        const name = classifySpawnBinding(code[0..site.start]) orelse continue;
+        if (spawnResolved(ctx, name)) continue;
+        try emitThreadNoJoin(sink, .{
+            .line = line_num,
+            .col = site.start + 1,
+            .name = name,
+        });
+    }
+}
+
+/// True when the bound handle's obligation is resolved somewhere in the
+/// file (ZC104). Field-bound handles (`context.thread`) are also searched
+/// by their LAST segment: the copy idiom (`const thread = self.thread;
+/// defer thread.join();` — tigerbeetle tb_client) joins through an alias
+/// whose receiver spelling the direct search cannot follow. The fallback
+/// only ever suppresses — the safe direction — and skips short segments
+/// whose genericity would mask real leaks.
+fn spawnResolved(ctx: SpawnScanCtx, name: []const u8) bool {
+    if (findSpawnResolution(ctx.lines, name, ctx.blank_buf, ctx.needle_buf)) {
+        return true;
+    }
+    const dot = mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const segment = name[dot + 1 ..];
+    if (segment.len < 3) return false;
+    return findSpawnResolution(ctx.lines, segment, ctx.blank_buf, ctx.needle_buf);
+}
+
+/// Analyze a single file for spawned-thread handle leaks (ZC104). Test
+/// blocks are not attributed (thread hygiene in tests is the ZT band's
+/// domain, matching ZC101's test-block exclusion).
+fn analyzeFileSpawns(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(sink.allocator);
+    var split = mem.splitScalar(u8, a.content, '\n');
+    while (split.next()) |line| try lines.append(sink.allocator, line);
+
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var needle_buf: [256]u8 = undefined;
+    var in_test = false;
+    var test_depth: usize = 0;
+    var line_num: usize = 0;
+    for (lines.items) |line| {
+        line_num += 1;
+        const t = mem.trim(u8, line, " \t\r");
+        const ts = trackTestBlock(t, in_test, test_depth);
+        in_test = ts.in_test;
+        test_depth = ts.depth;
+        if (in_test or isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(line) orelse line.len;
+        const ctx: SpawnScanCtx = .{
+            .lines = lines.items,
+            .blank_buf = &blank_buf,
+            .needle_buf = &needle_buf,
+        };
+        try checkLineSpawns(sink, ctx, line[0..code_end], line_num);
+    }
+}
+
+/// Analyze a single file for concurrency defects (ZC1xx): lock/unlock
+/// pairing (ZC101), double lock (ZC102), unlock-of-unheld (ZC103), and
+/// spawned-thread handle leaks (ZC104).
 fn analyzeFileConcurrency(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
     var state = ConcurrencyScanState{ .allocator = sink.allocator };
     defer state.deinit();
@@ -10493,6 +11211,7 @@ fn analyzeFileConcurrency(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !v
         try scanConcurrencyLine(&state, line, line_num);
     }
     try evaluateLockRecords(sink, state.records.items);
+    try analyzeFileSpawns(sink, a);
 }
 
 fn analyzeConcurrency(
@@ -16726,7 +17445,8 @@ fn writeDefaultConfig() !void {
         \\  //                     ZT102 no-assertions (note for try-only smoke tests),
         \\  //                     ZT103 trivially-true-assert, ZT104 swallowed-error,
         \\  //                     ZT105 untested-pub-fn (note)
-        \\  //   ZC1xx Concurrency: ZC101 lock-no-defer-unlock (ZC102/ZC103 planned)
+        \\  //   ZC1xx Concurrency: ZC101 lock-no-defer-unlock, ZC102 double-lock,
+        \\  //                     ZC103 unlock-without-lock, ZC104 thread-no-join
         \\  "disable": ["ZA305", "ZA306"],
         \\
         \\  // Rules to explicitly enable (overrides disable)
@@ -18403,8 +19123,8 @@ fn printHelp() void {
         \\  ZT1xx  Tests      (ZT101: lie-test, ZT102: no-assertions (note for
         \\                     try-only smoke tests), ZT103: trivially-true-assert,
         \\                     ZT104: swallowed-error, ZT105: untested-pub-fn (note))
-        \\  ZC1xx  Concurrency (ZC101: lock-no-defer-unlock;
-        \\                     ZC102/ZC103 planned)
+        \\  ZC1xx  Concurrency (ZC101: lock-no-defer-unlock, ZC102: double-lock,
+        \\                     ZC103: unlock-without-lock, ZC104: thread-no-join)
         \\
         \\RUNTIME ANALYSIS (ephor runtime):
         \\  Runs 'zig build test' with GeneralPurposeAllocator diagnostics enabled.
@@ -29514,4 +30234,995 @@ test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
     // Unrelated prefixes do not touch it.
     try cfg.disabled_rules.append(allocator, try allocator.dupe(u8, "ZT"));
     try std.testing.expect(cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
+}
+
+// ============================================================================
+// Concurrency Analysis Tests (ZC102 double lock)
+// ============================================================================
+
+/// Assert the exact ZC102 warning/note counts (both — a silent analyzer
+/// passes a warnings==0 check vacuously, so every silent test has a
+/// firing sibling in this section).
+fn expectZC102Counts(
+    issues: []const Issue,
+    warnings: usize,
+    notes: usize,
+) !void {
+    try std.testing.expectEqual(
+        warnings,
+        countBySeverity(issues, RULE_DOUBLE_LOCK, .warning),
+    );
+    try std.testing.expectEqual(
+        notes,
+        countBySeverity(issues, RULE_DOUBLE_LOCK, .note),
+    );
+}
+
+test "ZC102: lock twice on the same receiver is a warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    doWork();
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_warn.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: lock;unlock;lock is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn f() void {
+        \\    mu.lock();
+        \\    mu.unlock();
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_relock.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: acquires in sibling if/else arms are disjoint paths" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // One acquire per arm, one shared unlock after — never both on a path.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    if (c) {
+        \\        mu.lock();
+        \\        doWork();
+        \\    } else {
+        \\        mu.lock();
+        \\        doWork();
+        \\    }
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_arms.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: switch prong blocks are disjoint paths" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `},` close marks a list element: the next same-depth block is a
+    // sibling prong, not a sequential block.
+    const content =
+        \\fn f(x: u8) void {
+        \\    switch (x) {
+        \\        0 => {
+        \\            mu.lock();
+        \\        },
+        \\        else => {
+        \\            mu.lock();
+        \\        },
+        \\    }
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_switch.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: lock;defer unlock;lock warns — the defer runs at scope exit" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The second lock EXECUTES while the lock is still held — the defer
+    // fires only when the fn returns. Certain deadlock on every path.
+    const content =
+        \\fn f() void {
+        \\    mu.lock();
+        \\    defer mu.unlock();
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: loop-body defer releases at each iteration's scope exit" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Canonical per-iteration pairing: the defer fires at the loop body's
+    // close, so the next iteration's acquire sees a released lock.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    while (c) {
+        \\        mu.lock();
+        \\        defer mu.unlock();
+        \\        doWork();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_loopdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: tryLock guard-block defer covers the acquired paths" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // On the success path the guard-block defer releases at the block's
+    // exit; on the failure path nothing was held. The later lock is free
+    // on both.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    if (mu.tryLock()) {
+        \\        defer mu.unlock();
+        \\        doWork();
+        \\    }
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_guarddefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: branch-scoped defer leaves the non-branch path held" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer fires at the if-block's exit on the c path only; on the
+    // !c path the lock is still held when the second lock executes.
+    const content =
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    if (c) {
+        \\        defer mu.unlock();
+        \\    }
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_branchdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: sequential if-blocks holding the lock warn (paths overlap)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Unlike if/else arms, sequential ifs can BOTH execute: the c-and-d
+    // path locks mu twice. The plain `}` close is not a sibling arm.
+    const content =
+        \\fn f(c: bool, d: bool) void {
+        \\    if (c) {
+        \\        mu.lock();
+        \\    }
+        \\    if (d) {
+        \\        mu.lock();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_seqif.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: arm ends when the else chain ends — later if warns (F2)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else arm's plain close ends the sibling chain: the lock taken
+    // on the c path is still held when the d-guarded lock executes, so
+    // the c-and-d path double-locks.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(c: bool, d: bool) void {
+        \\    if (c) {
+        \\        mu.lock();
+        \\    } else {
+        \\        doWork();
+        \\    }
+        \\    if (d) {
+        \\        mu.lock();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_armend.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: arm ends after the last switch prong — later if warns (F2)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Prong acquires are disjoint from each other but not from what
+    // follows the switch: the .a path still holds mu at the d-guarded
+    // lock.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(x: u8, d: bool) void {
+        \\    switch (x) {
+        \\        0 => {
+        \\            mu.lock();
+        \\        },
+        \\        else => {
+        \\            doWork();
+        \\        },
+        \\    }
+        \\    if (d) {
+        \\        mu.lock();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_prongend.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: acquire-less middle prong does not break the arm chain (F2)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Prongs 0 and else are disjoint paths even with prong 1 between
+    // them: every prong close opens another arm, so the chain survives.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(x: u8) void {
+        \\    switch (x) {
+        \\        0 => {
+        \\            mu.lock();
+        \\        },
+        \\        1 => {
+        \\            doWork();
+        \\        },
+        \\        else => {
+        \\            mu.lock();
+        \\        },
+        \\    }
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_midprong.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: branch-scoped plain release leaves the non-branch path held (F4)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The unlock runs on the c path only; on the !c path the second lock
+    // executes while still held. The release downgrades the hold to
+    // path-conditional instead of clearing it.
+    const content =
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    if (c) {
+        \\        mu.unlock();
+        \\    }
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_branchrel.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: different receivers never interact" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn f() void {
+        \\    a.lock();
+        \\    b.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_diff.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: double lockShared is a note (recursive read lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // std.Io.RwLock is writer-preferring: a queued writer between the two
+    // read acquires deadlocks the second — conditional, so note severity.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    rw.lockShared();
+        \\    doWork();
+        \\    rw.lockShared();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_shared.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 1);
+}
+
+test "ZC102: tryLock as second acquire cannot block — silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A tryLock while held just returns false; only a BLOCKING second
+    // acquire deadlocks.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    if (mu.tryLock()) {
+        \\        doWork();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_try.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: semaphore wait twice is legal (counting semaphore)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // wait is not a lock — a semaphore with count >= 2 waits twice
+    // legally. The post in g gives ZC101 its semaphore evidence.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    sem.wait();
+        \\    doWork();
+        \\    sem.wait();
+        \\}
+        \\fn g() void {
+        \\    sem.post();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_sem.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: lock() text in strings and comments is not an acquire" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // One real acquire; the string and comment carry two more lock()
+    // texts — if they leaked into the event stream, a double-lock warning
+    // would fire.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    // mu.lock();
+        \\    const s = "mu.lock(); mu.lock();";
+        \\    _ = s;
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_strings.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: type-factory method wrappers are independent fns (mach Objects)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tryLock/lock/unlock methods of a struct built inside a type factory
+    // roll up into the factory's ZC101 record, but each nested fn body is
+    // an independent flow — the lock is never held across fn boundaries.
+    // Without the boundary events the tryLock and lock acquires pair as a
+    // false double lock.
+    const content =
+        \\pub fn Factory() type {
+        \\    return struct {
+        \\        pub fn tryLock(objs: *@This()) bool {
+        \\            return objs.internal.mu.tryLock();
+        \\        }
+        \\        pub fn lock(objs: *@This()) void {
+        \\            objs.internal.mu.lock();
+        \\        }
+        \\        pub fn unlock(objs: *@This()) void {
+        \\            objs.internal.mu.unlock();
+        \\        }
+        \\    };
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_factory.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC102: double lock inside one nested method still warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Control for the boundary reset: two acquires inside ONE nested
+    // method body are the same flow and must still warn.
+    const content =
+        \\pub fn Factory() type {
+        \\    return struct {
+        \\        pub fn lockTwice(objs: *@This()) void {
+        \\            objs.internal.mu.lock();
+        \\            objs.internal.mu.lock();
+        \\        }
+        \\    };
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc102_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+// ============================================================================
+// Concurrency Analysis Tests (ZC103 unlock without acquire)
+// ============================================================================
+
+/// Assert the exact ZC103 warning/note counts (non-vacuous pairing: every
+/// silent test here has firing siblings above and below).
+fn expectZC103Counts(
+    issues: []const Issue,
+    warnings: usize,
+    notes: usize,
+) !void {
+    try std.testing.expectEqual(
+        warnings,
+        countBySeverity(issues, RULE_UNLOCK_WITHOUT_LOCK, .warning),
+    );
+    try std.testing.expectEqual(
+        notes,
+        countBySeverity(issues, RULE_UNLOCK_WITHOUT_LOCK, .note),
+    );
+}
+
+test "ZC103: bare unlock with no acquire anywhere is a note" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn f() void {
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_note.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 1);
+}
+
+test "ZC103: cross-fn acquire/release idiom is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zls string_pool shape: the acquire lives in a sibling fn of the
+    // same file (mirror of ZC101's cross-fn release suppression).
+    const content =
+        \\fn lockIt() void {
+        \\    mu.lock();
+        \\}
+        \\fn unlockIt() void {
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_crossfn.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: fn-scope defer unlock after conditional tryLock is a warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0033 item 8: the defer registers on every path, so the
+    // tryLock==false path unlocks a lock that was never acquired.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    if (mu.tryLock()) {
+        \\        doWork();
+        \\    }
+        \\    defer mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_trydefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 1, 0);
+}
+
+test "ZC103: defer inside the tryLock guard block is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer one level deeper than the condition-position acquire runs
+    // only on the acquired path — the correct shape.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    if (mu.tryLock()) {
+        \\        defer mu.unlock();
+        \\        doWork();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_tryguard.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: normal lock with defer unlock is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    defer mu.unlock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_normal.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: defer registered before the acquire is silent (fires at exit)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Weird but legal: the defer fires at scope exit, after the acquire
+    // ran — a fn that releases AND acquires the receiver is managing the
+    // lock, not releasing an unheld one.
+    const content =
+        \\fn f() void {
+        \\    defer mu.unlock();
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_deferfirst.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: semaphore post without in-fn wait is the producer shape" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Producers post semaphores they never wait on — post is exempt from
+    // unlock-of-unheld (signaling is always legal, never UB).
+    const content =
+        \\fn produce() void {
+        \\    sem.post();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_producer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: unlock with deferred re-lock is the borrow idiom (ghostty mailbox)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The fn received the lock held, releases it for a slow operation,
+    // and re-locks at scope exit. The deferred re-lock is set-aside
+    // ZC101 evidence but still acquires at runtime — without it counting,
+    // the unlock reads as unlock-of-unheld.
+    const content =
+        \\fn slowPush() void {}
+        \\fn f() void {
+        \\    mu.unlock();
+        \\    defer mu.lock();
+        \\    slowPush();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_relock.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: discarded tryLock satisfies the deferred unlock (ghostty DiskCache)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `_ = file.tryLock(...) catch return` is the hold-till-close file
+    // lock: ZC101 ignores the discarded acquire, but it still takes the
+    // lock on success, so the deferred unlock is paired — not unheld.
+    const content =
+        \\fn f(file: std.fs.File) !void {
+        \\    _ = file.tryLock(.exclusive) catch return error.Locked;
+        \\    defer file.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc103_discard.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+// ============================================================================
+// Concurrency Analysis Tests (ZC104 spawn without join/detach)
+// ============================================================================
+
+/// Assert the exact ZC104 warning count (notes are unused by the rule;
+/// every silent test has firing siblings in this section).
+fn expectZC104Counts(
+    issues: []const Issue,
+    warnings: usize,
+    notes: usize,
+) !void {
+    try std.testing.expectEqual(
+        warnings,
+        countBySeverity(issues, RULE_THREAD_NO_JOIN, .warning),
+    );
+    try std.testing.expectEqual(
+        notes,
+        countBySeverity(issues, RULE_THREAD_NO_JOIN, .note),
+    );
+}
+
+test "ZC104: spawn with no join or detach is a warning" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `_ = t;` silences the unused-const compile error without resolving
+    // the handle — the realistic leak shape.
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_warn.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: immediate detach is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The ghostty os/open.zig shape: spawn, then detach on the next line.
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    const thread = try std.Thread.spawn(.{}, work, .{});
+        \\    thread.detach();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_detach.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: join later in the function is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn work() void {}
+        \\fn nap() void {}
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    nap();
+        \\    t.join();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_join.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: field-stored handle joined elsewhere in the file is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle context.zig shape: context.thread = spawn(...) with the
+    // join in a sibling method.
+    const content =
+        \\fn work() void {}
+        \\fn start(self: *S) !void {
+        \\    self.t = try std.Thread.spawn(.{}, work, .{});
+        \\}
+        \\fn stop(self: *S) void {
+        \\    self.t.join();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_field.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: returned handle is silent (caller owns the obligation)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle stdx/shell.zig shape: return try std.Thread.spawn(...).
+    const content =
+        \\fn work() void {}
+        \\fn f() !std.Thread {
+        \\    return try std.Thread.spawn(.{}, work, .{});
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_return.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: spawn passed as a call argument is silent (ownership transfer)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Container-put shape: the handle escapes into the pool, which owns
+    // the join/detach obligation.
+    const content =
+        \\fn work() void {}
+        \\fn f(pool: *Pool) !void {
+        \\    try pool.put(try std.Thread.spawn(.{}, work, .{}));
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_arg.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: process spawn is not a thread spawn (child.spawn)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ghostty os/open.zig: exe.spawn() spawns a PROCESS — reaped by
+    // wait(), not join/detach. A wrong target match would warn on `h`.
+    const content =
+        \\fn work() void {}
+        \\fn f(exe: *std.process.Child) !void {
+        \\    const h = try exe.spawn();
+        \\    _ = h;
+        \\    const thread = try std.Thread.spawn(.{}, work, .{});
+        \\    thread.detach();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_proc.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: spawns inside test blocks are not attributed" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Parity with ZC101: thread hygiene in tests is the ZT band's domain.
+    const content =
+        \\fn work() void {}
+        \\test "leaky spawn" {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_test.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: join text in strings and comments is not evidence" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The comment and string both carry t.join() text — if they counted,
+    // the warning would be suppressed vacuously.
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    // t.join();
+        \\    const s = "t.join(); t.detach();";
+        \\    _ = s;
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_strings.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: field handle joined through an alias copy is silent (tigerbeetle)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tb_client context.zig: `context.thread = spawn(...)` in init, then
+    // `const thread = self.thread; defer thread.join();` in the deinit
+    // vtable. The last-segment fallback follows the copy.
+    const content =
+        \\fn work() void {}
+        \\fn init(context: *Context) !void {
+        \\    context.thread = try std.Thread.spawn(.{}, work, .{context});
+        \\}
+        \\fn deinit(self: *Context) void {
+        \\    const thread = self.thread;
+        \\    defer thread.join();
+        \\    self.signal.stop();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_alias.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: field-stored handle never joined still warns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Control for the alias fallback: `self.thread` with no join anywhere
+    // must NOT be vacuously suppressed by the last-segment search.
+    const content =
+        \\fn work() void {}
+        \\fn start(self: *S) !void {
+        \\    self.thread = try std.Thread.spawn(.{}, work, .{});
+        \\}
+        \\fn stop(self: *S) void {
+        \\    self.running = false;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_fieldwarn.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: optional handle joined with .?.join() is silent (messenger)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // messenger dht_kademlia_ops: `worker.thread = spawn(...) catch ...`
+    // with the join as `worker.thread.?.join()` on the ?std.Thread field.
+    const content =
+        \\fn work() void {}
+        \\fn spawnIt(worker: *W) void {
+        \\    worker.thread = std.Thread.spawn(.{}, work, .{worker}) catch return;
+        \\    worker.spawned = true;
+        \\}
+        \\fn joinIt(worker: *W) void {
+        \\    if (worker.spawned) worker.thread.?.join();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_optjoin.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `.thread = std.Thread.spawn(...)` inside an anonymous struct
+    // literal: the constructed value owns the handle (the join lives on
+    // the receiver: watcher.thread.join()).
+    const content =
+        \\fn work() void {}
+        \\fn f() !S {
+        \\    return .{
+        \\        .thread = try std.Thread.spawn(.{}, work, .{}),
+        \\    };
+        \\}
+    ;
+    var run = try runConcurrencyCheck(allocator, "zc104_litfield.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
 }

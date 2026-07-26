@@ -1019,18 +1019,23 @@ fn hasDirectReassignment(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
+/// Half-open line range (from_line, to_line) within a function body.
+const LineRange = struct {
+    from_line: usize,
+    to_line: usize,
+};
+
 /// Check if var_name is reassigned on any line between from_line and to_line (exclusive).
 /// Used by cross-block UAF detection to suppress false positives when a freed variable
 /// is reassigned to new memory before the next use.
 fn hasReassignmentBetween(
     lines: []const []const u8,
     func_line: usize,
-    from_line: usize,
-    to_line: usize,
+    range: LineRange,
     var_name: []const u8,
 ) bool {
-    if (from_line == 0 or from_line >= to_line) return false;
-    for (from_line + 1..to_line) |ln| {
+    if (range.from_line == 0 or range.from_line >= range.to_line) return false;
+    for (range.from_line + 1..range.to_line) |ln| {
         if (ln < func_line) continue;
         const idx = ln - func_line;
         if (idx >= lines.len) continue;
@@ -1136,21 +1141,27 @@ fn trackAssignments(
     }
 }
 
+/// Mutable state for line-based undefined-read tracking: the vars declared
+/// `= undefined`, the vars since assigned, and the first-read findings.
+const UndefReadCtx = struct {
+    undef_vars: *std.StringHashMap(usize),
+    def_vars: *std.StringHashMap(void),
+    issues: *std.StringHashMap(usize),
+};
+
 /// Check for reads of undefined vars
 fn checkUndefinedReads(
     t: []const u8,
     line: usize,
-    undef_vars: *std.StringHashMap(usize),
-    def_vars: *std.StringHashMap(void),
-    issues: *std.StringHashMap(usize),
+    ctx: UndefReadCtx,
 ) !void {
-    var iter = undef_vars.iterator();
+    var iter = ctx.undef_vars.iterator();
     while (iter.next()) |entry| {
         const name = entry.key_ptr.*;
-        if (def_vars.contains(name)) continue;
+        if (ctx.def_vars.contains(name)) continue;
         const pos = mem.indexOf(u8, t, name) orelse continue;
         if (isAssignmentTarget(t, name, pos)) continue;
-        try issues.put(name, line);
+        try ctx.issues.put(name, line);
     }
 }
 
@@ -1283,31 +1294,37 @@ const ForLoopTracker = struct {
     }
 };
 
-fn computeGenSetForVar(
+/// Context for definite-assignment data-flow analysis of one function body:
+/// the CFG, the body's source lines and start line, and the block count.
+const DefAssignCtx = struct {
     allocator: Allocator,
     cfg: *ControlFlowGraph,
     lines: []const []const u8,
     func_line: usize,
-    var_name: []const u8,
     num_blocks: usize,
+};
+
+fn computeGenSetForVar(
+    ctx: *const DefAssignCtx,
+    var_name: []const u8,
 ) ![]bool {
-    const gen = try allocator.alloc(bool, num_blocks);
-    errdefer allocator.free(gen);
+    const gen = try ctx.allocator.alloc(bool, ctx.num_blocks);
+    errdefer ctx.allocator.free(gen);
     @memset(gen, false);
 
     var tracker = ForLoopTracker{};
-    for (lines, 0..) |line, idx| {
-        const actual_line = func_line + idx;
+    for (ctx.lines, 0..) |line, idx| {
+        const actual_line = ctx.func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
-        tracker.checkForStart(t, cfg, actual_line);
+        tracker.checkForStart(t, ctx.cfg, actual_line);
         tracker.checkIndexedAssign(t, var_name, gen);
         tracker.checkLoopEnd(t);
 
         if (isAssignmentTarget(t, var_name, 0) or isFillPattern(t, var_name)) {
-            if (findBlockForLine(cfg, actual_line)) |bid| gen[bid] = true;
+            if (findBlockForLine(ctx.cfg, actual_line)) |bid| gen[bid] = true;
         }
         if (hasAddressOfVar(t, var_name)) {
-            if (findBlockForLine(cfg, actual_line)) |bid| gen[bid] = true;
+            if (findBlockForLine(ctx.cfg, actual_line)) |bid| gen[bid] = true;
         }
     }
     return gen;
@@ -1553,20 +1570,18 @@ fn analyzeDefiniteAssignment(
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
+    const da_ctx: DefAssignCtx = .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .lines = lines,
+        .func_line = func_line,
+        .num_blocks = num_blocks,
+    };
     var var_iter = undef_vars.iterator();
     while (var_iter.next()) |entry| {
         const var_name = entry.key_ptr.*;
         const var_line = entry.value_ptr.*;
-        try checkVarDefiniteAssignment(
-            allocator,
-            cfg,
-            lines,
-            func_line,
-            var_name,
-            var_line,
-            num_blocks,
-            &issues,
-        );
+        try checkVarDefiniteAssignment(&da_ctx, var_name, var_line, &issues);
     }
 
     return issues;
@@ -1753,64 +1768,61 @@ fn isInlineForAssignment(
     return false;
 }
 
+/// Per-block flow sets for the definite-assignment worklist: gen (blocks that
+/// assign the var), plus the entry/exit bits the worklist iterates to a fixpoint.
+const DefFlowSets = struct {
+    gen: []const bool,
+    def_entry: []bool,
+    def_exit: []bool,
+    num_blocks: usize,
+};
+
 /// Run data flow analysis for one variable.
 fn checkVarDefiniteAssignment(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
+    ctx: *const DefAssignCtx,
     var_name: []const u8,
     var_line: usize,
-    num_blocks: usize,
     issues: *std.StringHashMap(usize),
 ) !void {
-    const def_entry = try allocator.alloc(bool, num_blocks);
-    defer allocator.free(def_entry);
-    const def_exit = try allocator.alloc(bool, num_blocks);
-    defer allocator.free(def_exit);
+    const def_entry = try ctx.allocator.alloc(bool, ctx.num_blocks);
+    defer ctx.allocator.free(def_entry);
+    const def_exit = try ctx.allocator.alloc(bool, ctx.num_blocks);
+    defer ctx.allocator.free(def_exit);
     @memset(def_entry, false);
     @memset(def_exit, false);
 
-    const gen = try computeGenSetForVar(
-        allocator,
-        cfg,
-        lines,
-        func_line,
-        var_name,
-        num_blocks,
-    );
-    defer allocator.free(gen);
+    const gen = try computeGenSetForVar(ctx, var_name);
+    defer ctx.allocator.free(gen);
 
-    runDefiniteAssignmentWorklist(
-        cfg,
-        gen,
-        def_entry,
-        def_exit,
-        num_blocks,
-    );
+    runDefiniteAssignmentWorklist(ctx.cfg, .{
+        .gen = gen,
+        .def_entry = def_entry,
+        .def_exit = def_exit,
+        .num_blocks = ctx.num_blocks,
+    });
 
-    for (lines, 0..) |line, idx| {
-        const al = func_line + idx;
+    for (ctx.lines, 0..) |line, idx| {
+        const al = ctx.func_line + idx;
         if (al <= var_line) continue;
         const t = mem.trim(u8, line, " \t\r");
-        const bid = findBlockForLine(cfg, al) orelse continue;
+        const bid = findBlockForLine(ctx.cfg, al) orelse continue;
         if (def_entry[bid] or gen[bid]) continue;
         if (!hasVarRead(t, var_name)) continue;
         // Check if the read is inside a correlated guard: the same if-condition
         // that gates the read also gates an earlier assignment of the variable.
-        if (isCorrelatedGuardRead(lines, idx, var_name)) continue;
+        if (isCorrelatedGuardRead(ctx.lines, idx, var_name)) continue;
         // Check if the read is inside a null-guard on a variable that is only
         // set non-null in blocks that also assign the flagged variable.
-        if (isNullGuardCorrelatedRead(lines, idx, var_name)) continue;
+        if (isNullGuardCorrelatedRead(ctx.lines, idx, var_name)) continue;
         // Check if all paths that don't assign the variable have early returns.
         // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
-        if (hasEarlyReturnOnUnassignedPaths(lines, var_name, idx)) continue;
+        if (hasEarlyReturnOnUnassignedPaths(ctx.lines, var_name, idx)) continue;
         // Check if the read is on the RHS of an `or` short-circuit in a
         // condition where the LHS guards against the variable being
         // uninitialized.
         // e.g., if (param_group_t == null or i > param_group_end) {
         //            param_group_end = ...; }
-        if (isOrShortCircuitSafe(lines, idx, var_name)) continue;
+        if (isOrShortCircuitSafe(ctx.lines, idx, var_name)) continue;
         try issues.put(var_name, al);
         break;
     }
@@ -2433,22 +2445,19 @@ fn isOrShortCircuitSafe(
 
 fn runDefiniteAssignmentWorklist(
     cfg: *ControlFlowGraph,
-    gen: []const bool,
-    def_entry: []bool,
-    def_exit: []bool,
-    num_blocks: usize,
+    flow: DefFlowSets,
 ) void {
-    const max = @min(num_blocks, std.math.maxInt(usize) / 2 - 1) *| 2 +| 1;
+    const max = @min(flow.num_blocks, std.math.maxInt(usize) / 2 - 1) *| 2 +| 1;
     var changed = true;
     var iters: usize = 0;
     while (changed and iters < max) : (iters += 1) {
         changed = false;
-        for (0..num_blocks) |bid| {
-            const new_in = computeBlockEntry(cfg, def_exit, bid);
-            const new_out = gen[bid] or new_in;
-            if (def_entry[bid] == new_in and def_exit[bid] == new_out) continue;
-            def_entry[bid] = new_in;
-            def_exit[bid] = new_out;
+        for (0..flow.num_blocks) |bid| {
+            const new_in = computeBlockEntry(cfg, flow.def_exit, bid);
+            const new_out = flow.gen[bid] or new_in;
+            if (flow.def_entry[bid] == new_in and flow.def_exit[bid] == new_out) continue;
+            flow.def_entry[bid] = new_in;
+            flow.def_exit[bid] = new_out;
             changed = true;
         }
     }
@@ -2529,24 +2538,32 @@ fn trackBlockDepth(t: []const u8, depth: usize) usize {
     return d;
 }
 
-/// Process one line for errdefer/defer block tracking.
-fn markDeferLine(
-    t: []const u8,
-    idx: usize,
+/// Per-keyword defer-block marking state: the per-line inside-block markers,
+/// the current open-brace depth, and the two keyword prefixes that open a block.
+const DeferMarkCtx = struct {
     markers: []bool,
     depth: *usize,
     start_prefix1: []const u8,
     start_prefix2: []const u8,
+};
+
+/// Process one line for errdefer/defer block tracking.
+fn markDeferLine(
+    t: []const u8,
+    idx: usize,
+    ctx: DeferMarkCtx,
 ) void {
-    if (mem.startsWith(u8, t, start_prefix1) or mem.startsWith(u8, t, start_prefix2)) {
-        depth.* += 1;
-        depth.* = trackBlockDepth(t, depth.*);
-        markers[idx] = true;
+    const starts_block = mem.startsWith(u8, t, ctx.start_prefix1) or
+        mem.startsWith(u8, t, ctx.start_prefix2);
+    if (starts_block) {
+        ctx.depth.* += 1;
+        ctx.depth.* = trackBlockDepth(t, ctx.depth.*);
+        ctx.markers[idx] = true;
         return;
     }
-    if (depth.* > 0) {
-        markers[idx] = true;
-        depth.* = trackBlockDepth(t, depth.*);
+    if (ctx.depth.* > 0) {
+        ctx.markers[idx] = true;
+        ctx.depth.* = trackBlockDepth(t, ctx.depth.*);
     }
 }
 
@@ -2561,116 +2578,99 @@ fn markDeferAndErrdeferBlocks(allocator: Allocator, lines: []const []const u8) !
     var defer_depth: usize = 0;
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
-        markDeferLine(t, idx, in_errdefer, &errdefer_depth, "errdefer ", "errdefer{");
+        markDeferLine(t, idx, .{
+            .markers = in_errdefer,
+            .depth = &errdefer_depth,
+            .start_prefix1 = "errdefer ",
+            .start_prefix2 = "errdefer{",
+        });
         if (!in_errdefer[idx])
-            markDeferLine(t, idx, in_defer, &defer_depth, "defer {", "defer{");
+            markDeferLine(t, idx, .{
+                .markers = in_defer,
+                .depth = &defer_depth,
+                .start_prefix1 = "defer {",
+                .start_prefix2 = "defer{",
+            });
     }
     return .{ .in_defer = in_defer, .in_errdefer = in_errdefer };
 }
+
+/// Context for path-sensitive memory-safety scanning of one function body:
+/// the CFG, source lines, file identity, defer/errdefer block markers, block
+/// count, and the alias map shared by the UAF and double-free detectors.
+const AllocSafetyCtx = struct {
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+    file_path: []const u8,
+    in_defer: []const bool,
+    in_errdefer: []const bool,
+    num_blocks: usize,
+    aliases: *const std.StringHashMapUnmanaged([]const u8),
+};
 
 /// Analyze memory states through CFG for path-sensitive use-after-free and double-free
 /// This properly handles patterns like: catch { free(x); return; }
 /// where the free only occurs on the early-return path, not the main path
 fn analyzeOneAllocSafety(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
+    ctx: *const AllocSafetyCtx,
     alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    num_blocks: usize,
     issues: *std.ArrayListUnmanaged(Issue),
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !void {
-    var bstate = try initAndScanFreeState(
-        allocator,
-        cfg,
-        lines,
-        func_line,
-        alloc_info,
-        in_defer,
-        in_errdefer,
-        num_blocks,
-        aliases,
-    );
-    defer bstate.deinit(allocator);
-    try detectUseAfterFree(
-        allocator,
-        cfg,
-        lines,
-        func_line,
-        file_path,
-        alloc_info.name,
-        alloc_info,
-        in_errdefer,
-        in_defer,
-        &bstate,
-        issues,
-        aliases,
-    );
-    try detectDoubleFree(
-        allocator,
-        cfg,
-        lines,
-        func_line,
-        file_path,
-        alloc_info.name,
-        alloc_info,
-        in_defer,
-        in_errdefer,
-        &bstate,
-        issues,
-        aliases,
-    );
-    try detectDeferDoubleFree(allocator, &.{
-        .lines = lines,
-        .func_line = func_line,
-        .file_path = file_path,
+    var bstate = try initBlockFreeState(ctx.allocator, ctx.num_blocks);
+    defer bstate.deinit(ctx.allocator);
+    const scan_ctx: FreeScanCtx = .{
+        .allocator = ctx.allocator,
+        .cfg = ctx.cfg,
+        .scan = .{
+            .lines = ctx.lines,
+            .func_line = ctx.func_line,
+            .var_name = alloc_info.name,
+            .alloc_info = alloc_info,
+            .in_defer = ctx.in_defer,
+            .in_errdefer = ctx.in_errdefer,
+            .aliases = ctx.aliases,
+        },
+        .file_path = ctx.file_path,
+        .bstate = &bstate,
+        .issues = issues,
+    };
+    scanBlocksForFreeOps(&scan_ctx);
+    try detectUseAfterFree(&scan_ctx);
+    try detectDoubleFree(&scan_ctx);
+    try detectDeferDoubleFree(ctx.allocator, &.{
+        .lines = ctx.lines,
+        .func_line = ctx.func_line,
+        .file_path = ctx.file_path,
         .var_name = alloc_info.name,
-        .in_defer = in_defer,
-        .in_errdefer = in_errdefer,
-        .aliases = aliases,
+        .in_defer = ctx.in_defer,
+        .in_errdefer = ctx.in_errdefer,
+        .aliases = ctx.aliases,
     }, issues);
 }
 
-fn initAndScanFreeState(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
+/// Source identity of one function body under analysis: its lines, the file
+/// line the body starts on, and the file path used in reported issues.
+const FuncBodyCtx = struct {
     lines: []const []const u8,
     func_line: usize,
-    alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    num_blocks: usize,
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
-) !BlockFreeState {
-    var bstate = try initBlockFreeState(allocator, num_blocks);
-    scanBlocksForFreeOps(
-        cfg,
-        lines,
-        func_line,
-        alloc_info.name,
-        in_defer,
-        in_errdefer,
-        alloc_info,
-        &bstate,
-        aliases,
-    );
-    return bstate;
-}
+    file_path: []const u8,
+};
 
 fn analyzeCFGMemorySafety(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
+    body: FuncBodyCtx,
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    var allocs = try collectMemSafetyAllocs(allocator, lines, func_line, file_no_free_fields);
+    var allocs = try collectMemSafetyAllocs(
+        allocator,
+        body.lines,
+        body.func_line,
+        file_no_free_fields,
+    );
     defer allocs.deinit();
     if (allocs.count() == 0) return issues;
     const num_blocks = cfg.blocks.items.len;
@@ -2678,28 +2678,27 @@ fn analyzeCFGMemorySafety(
 
     // Build alias map: alias_name -> original_alloc_name
     // Tracks patterns like `const alias = data;` where `data` is a tracked allocation
-    var aliases = try collectAliases(allocator, lines, &allocs);
+    var aliases = try collectAliases(allocator, body.lines, &allocs);
     defer aliases.deinit(allocator);
 
-    const markers = try markDeferAndErrdeferBlocks(allocator, lines);
+    const markers = try markDeferAndErrdeferBlocks(allocator, body.lines);
     defer allocator.free(markers.in_defer);
     defer allocator.free(markers.in_errdefer);
 
+    const safety_ctx: AllocSafetyCtx = .{
+        .allocator = allocator,
+        .cfg = cfg,
+        .lines = body.lines,
+        .func_line = body.func_line,
+        .file_path = body.file_path,
+        .in_defer = markers.in_defer,
+        .in_errdefer = markers.in_errdefer,
+        .num_blocks = num_blocks,
+        .aliases = &aliases,
+    };
     var alloc_iter = allocs.iterator();
     while (alloc_iter.next()) |entry| {
-        try analyzeOneAllocSafety(
-            allocator,
-            cfg,
-            lines,
-            func_line,
-            file_path,
-            entry.value_ptr,
-            markers.in_defer,
-            markers.in_errdefer,
-            num_blocks,
-            &issues,
-            &aliases,
-        );
+        try analyzeOneAllocSafety(&safety_ctx, entry.value_ptr, &issues);
     }
     return issues;
 }
@@ -2871,24 +2870,42 @@ const BlockScanResult = struct {
     free_line: usize = 0,
 };
 
-fn scanBlockForFreeOp(
-    block: BasicBlock,
+/// Source-level scan state for one tracked allocation: the body lines, the
+/// variable and its allocation record, defer/errdefer markers, and the alias
+/// map. Shared by the same-block free checks of both the UAF and double-free
+/// detectors.
+const VarFreeCtx = struct {
     lines: []const []const u8,
     func_line: usize,
     var_name: []const u8,
+    alloc_info: *CFGAllocation,
     in_defer: []const bool,
     in_errdefer: []const bool,
     aliases: *const std.StringHashMapUnmanaged([]const u8),
-) BlockScanResult {
+};
+
+/// Full per-allocation scan state for the free-pattern detectors
+/// (use-after-free and double-free): the variable scan context plus the CFG,
+/// per-block free state, and the issue sink.
+const FreeScanCtx = struct {
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    scan: VarFreeCtx,
+    file_path: []const u8,
+    bstate: *BlockFreeState,
+    issues: *std.ArrayListUnmanaged(Issue),
+};
+
+fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
     var r = BlockScanResult{};
     for (block.start_line..block.end_line + 1) |ln| {
-        if (ln < func_line) continue;
-        const idx = ln - func_line;
-        if (idx >= lines.len) continue;
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (shouldSkipForFreeAnalysis(t, idx, in_defer, in_errdefer))
+        if (ln < scan.func_line) continue;
+        const idx = ln - scan.func_line;
+        if (idx >= scan.lines.len) continue;
+        const t = mem.trim(u8, scan.lines[idx], " \t\r");
+        if (shouldSkipForFreeAnalysis(t, idx, scan.in_defer, scan.in_errdefer))
             continue;
-        if (hasRealFreePattern(t) and isDirectFreeOfVarOrAlias(t, var_name, aliases)) {
+        if (hasRealFreePattern(t) and isDirectFreeOfVarOrAlias(t, scan.var_name, scan.aliases)) {
             r.free_seen = true;
             r.free_line = ln;
         }
@@ -2898,34 +2915,16 @@ fn scanBlockForFreeOp(
     return r;
 }
 
-fn scanBlocksForFreeOps(
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    var_name: []const u8,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    alloc_info: *CFGAllocation,
-    bstate: *BlockFreeState,
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
-) void {
-    for (cfg.blocks.items, 0..) |block, bid| {
+fn scanBlocksForFreeOps(ctx: *const FreeScanCtx) void {
+    for (ctx.cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or
             block.start_line > block.end_line) continue;
-        const r = scanBlockForFreeOp(
-            block,
-            lines,
-            func_line,
-            var_name,
-            in_defer,
-            in_errdefer,
-            aliases,
-        );
-        bstate.freed_in_block[bid] = r.free_seen;
-        bstate.freed_line_in_block[bid] = r.free_line;
-        bstate.block_returns_after_free[bid] = r.return_after;
-        if (r.free_seen and alloc_info.freed_line == 0)
-            alloc_info.freed_line = r.free_line;
+        const r = scanBlockForFreeOp(&ctx.scan, block);
+        ctx.bstate.freed_in_block[bid] = r.free_seen;
+        ctx.bstate.freed_line_in_block[bid] = r.free_line;
+        ctx.bstate.block_returns_after_free[bid] = r.return_after;
+        if (r.free_seen and ctx.scan.alloc_info.freed_line == 0)
+            ctx.scan.alloc_info.freed_line = r.free_line;
     }
 }
 
@@ -2991,32 +2990,26 @@ const SameBlockFreeResult = struct {
 };
 
 fn checkSameBlockFree(
-    lines: []const []const u8,
-    func_line: usize,
+    scan: *const VarFreeCtx,
     block_start: usize,
     actual_line: usize,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) SameBlockFreeResult {
     var freed = false;
     var ret = false;
     for (block_start..actual_line) |cl| {
-        if (cl < func_line) continue;
-        const ci = cl - func_line;
-        if (ci >= lines.len) continue;
-        const ct = mem.trim(u8, lines[ci], " \t\r");
-        if (shouldSkipForFreeAnalysis(ct, ci, in_defer, in_errdefer))
+        if (cl < scan.func_line) continue;
+        const ci = cl - scan.func_line;
+        if (ci >= scan.lines.len) continue;
+        const ct = mem.trim(u8, scan.lines[ci], " \t\r");
+        if (shouldSkipForFreeAnalysis(ct, ci, scan.in_defer, scan.in_errdefer))
             continue;
-        if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(ct, var_name, aliases)) {
+        if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(ct, scan.var_name, scan.aliases)) {
             freed = true;
-            alloc_info.freed_line = cl;
+            scan.alloc_info.freed_line = cl;
         }
         // Reassignment after free: `var_name = ...` resets freed state
         // (the variable now points to new memory, not the freed allocation)
-        if (freed and hasDirectReassignment(ct, var_name)) {
+        if (freed and hasDirectReassignment(ct, scan.var_name)) {
             freed = false;
         }
         if (freed and mem.startsWith(u8, ct, "return")) ret = true;
@@ -3024,22 +3017,16 @@ fn checkSameBlockFree(
     return .{ .freed = freed, .intervening_return = ret };
 }
 
-fn appendUAFIssue(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    file_path: []const u8,
-    line: usize,
-    col: usize,
-    var_name: []const u8,
-    freed_line: usize,
-) !void {
+/// freed_line always comes from the allocation record: every call site
+/// reports against the free recorded in alloc_info.
+fn appendUAFIssue(ctx: *const FreeScanCtx, var_name: []const u8, line: usize, col: usize) !void {
     const msg = try std.fmt.allocPrint(
-        allocator,
+        ctx.allocator,
         "use-after-free: '{s}' freed on {d}",
-        .{ var_name, freed_line },
+        .{ var_name, ctx.scan.alloc_info.freed_line },
     );
-    try issues.append(allocator, .{
-        .file = file_path,
+    try ctx.issues.append(ctx.allocator, .{
+        .file = ctx.file_path,
         .line = line,
         .col = col + 1,
         .severity = .err,
@@ -3092,204 +3079,122 @@ fn isUAFSkipLine(
     return false;
 }
 
-fn checkLineForUAF(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    bstate: *const BlockFreeState,
-    issues: *std.ArrayListUnmanaged(Issue),
-    t: []const u8,
-    actual_line: usize,
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
-) !void {
-    const use_col = findVarUseOnLine(t, var_name) orelse return;
-    const bid = findBlockForLine(cfg, actual_line) orelse return;
-    const bs = cfg.blocks.items[bid].start_line;
+fn checkLineForUAF(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !void {
+    const use_col = findVarUseOnLine(t, ctx.scan.var_name) orelse return;
+    const bid = findBlockForLine(ctx.cfg, actual_line) orelse return;
+    const bs = ctx.cfg.blocks.items[bid].start_line;
     if (bs == 0 or bs > actual_line) return;
-    if (try checkSameBlockUAF(
-        allocator,
-        lines,
-        func_line,
-        bs,
-        actual_line,
-        var_name,
-        alloc_info,
-        in_defer,
-        in_errdefer,
-        use_col,
-        file_path,
-        issues,
-        aliases,
-    )) return;
-    const preds_freed = try checkPredecessorsFreed(allocator, cfg, bid, bstate);
-    if (preds_freed and alloc_info.freed_line > 0) {
-        // Check for reassignment between the free and this use
-        if (hasReassignmentBetween(lines, func_line, alloc_info.freed_line, actual_line, var_name))
-            return;
-        try appendUAFIssue(
-            allocator,
-            issues,
-            file_path,
-            actual_line,
-            use_col,
-            var_name,
-            alloc_info.freed_line,
-        );
-    }
+    if (try checkSameBlockUAF(ctx, bs, actual_line, use_col)) return;
+    const preds_freed = try checkPredecessorsFreed(ctx.allocator, ctx.cfg, bid, ctx.bstate);
+    if (!preds_freed or ctx.scan.alloc_info.freed_line == 0) return;
+    // Check for reassignment between the free and this use
+    const freed = ctx.scan.alloc_info.freed_line;
+    const range: LineRange = .{ .from_line = freed, .to_line = actual_line };
+    const lines = ctx.scan.lines;
+    if (hasReassignmentBetween(lines, ctx.scan.func_line, range, ctx.scan.var_name))
+        return;
+    try appendUAFIssue(ctx, ctx.scan.var_name, actual_line, use_col);
 }
 
 /// Check if a variable was freed in the same block; emit UAF if so.
 fn checkSameBlockUAF(
-    allocator: Allocator,
-    lines: []const []const u8,
-    func_line: usize,
+    ctx: *const FreeScanCtx,
     block_start: usize,
     actual_line: usize,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
     use_col: usize,
-    file_path: []const u8,
-    issues: *std.ArrayListUnmanaged(Issue),
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
 ) !bool {
-    const sbf = checkSameBlockFree(
-        lines,
-        func_line,
-        block_start,
-        actual_line,
-        var_name,
-        alloc_info,
-        in_defer,
-        in_errdefer,
-        aliases,
-    );
+    const sbf = checkSameBlockFree(&ctx.scan, block_start, actual_line);
     if (!sbf.freed or sbf.intervening_return) return false;
-    try appendUAFIssue(
-        allocator,
-        issues,
-        file_path,
-        actual_line,
-        use_col,
-        var_name,
-        alloc_info.freed_line,
-    );
+    try appendUAFIssue(ctx, ctx.scan.var_name, actual_line, use_col);
     return true;
 }
 
-fn detectUseAfterFree(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    in_errdefer: []const bool,
-    in_defer: []const bool,
-    bstate: *const BlockFreeState,
-    issues: *std.ArrayListUnmanaged(Issue),
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
-) !void {
+fn detectUseAfterFree(ctx: *const FreeScanCtx) !void {
     // Check direct uses of the freed variable
-    for (lines, 0..) |line, idx| {
-        if (in_errdefer[idx]) continue;
+    for (ctx.scan.lines, 0..) |line, idx| {
+        if (ctx.scan.in_errdefer[idx]) continue;
         const t = mem.trim(u8, line, " \t\r");
-        if (isUAFSkipLine(t, var_name, aliases)) continue;
-        try checkLineForUAF(
-            allocator,
-            cfg,
-            lines,
-            func_line,
-            file_path,
-            var_name,
-            alloc_info,
-            in_defer,
-            in_errdefer,
-            bstate,
-            issues,
-            t,
-            func_line + idx,
-            aliases,
-        );
+        if (isUAFSkipLine(t, ctx.scan.var_name, ctx.scan.aliases)) continue;
+        try checkLineForUAF(ctx, t, ctx.scan.func_line + idx);
     }
+    try detectAliasUseAfterFree(ctx);
+}
 
-    // Check uses of aliases after the original is freed.
-    // The free was on the ORIGINAL variable, not the alias. So we can't reuse
-    // checkLineForUAF (which scans for free of the passed var_name).
-    // Instead: if original was freed, any use of an alias after the free line is UAF.
-    if (alloc_info.freed_line == 0) return; // Original not freed, no alias UAF possible
-    var alias_iter = aliases.iterator();
+/// Check uses of aliases after the original is freed.
+/// The free was on the ORIGINAL variable, not the alias. So we can't reuse
+/// checkLineForUAF (which scans for free of the passed var_name).
+/// Instead: if original was freed, any use of an alias after the free line is UAF.
+fn detectAliasUseAfterFree(ctx: *const FreeScanCtx) !void {
+    const freed_line = ctx.scan.alloc_info.freed_line;
+    if (freed_line == 0) return; // Original not freed, no alias UAF possible
+    var alias_iter = ctx.scan.aliases.iterator();
     while (alias_iter.next()) |entry| {
         const alias_name = entry.key_ptr.*;
-        const original = entry.value_ptr.*;
-        if (!mem.eql(u8, original, var_name)) continue;
-
-        for (lines, 0..) |line, idx| {
-            const actual_line = func_line + idx;
-            if (actual_line <= alloc_info.freed_line) continue;
-            if (in_errdefer[idx]) continue;
-            if (in_defer[idx]) continue;
-            const t = mem.trim(u8, line, " \t\r");
-            // Alias's own declaration line is skipped by isUAFSkipLine
-            if (isUAFSkipLine(t, alias_name, aliases)) continue;
-
-            const use_col = findVarUseOnLine(t, alias_name) orelse continue;
-            try appendUAFIssue(
-                allocator,
-                issues,
-                file_path,
-                actual_line,
-                use_col,
-                alias_name,
-                alloc_info.freed_line,
-            );
-            break; // One UAF per alias is sufficient
-        }
+        if (!mem.eql(u8, entry.value_ptr.*, ctx.scan.var_name)) continue;
+        try reportAliasUAF(ctx, alias_name, freed_line);
     }
 }
 
-fn appendDoubleFreeIssue(
+/// Report the first use of one alias past the free line, if any.
+fn reportAliasUAF(ctx: *const FreeScanCtx, alias_name: []const u8, freed_line: usize) !void {
+    for (ctx.scan.lines, 0..) |line, idx| {
+        const actual_line = ctx.scan.func_line + idx;
+        if (actual_line <= freed_line) continue;
+        if (ctx.scan.in_errdefer[idx]) continue;
+        if (ctx.scan.in_defer[idx]) continue;
+        const t = mem.trim(u8, line, " \t\r");
+        // Alias's own declaration line is skipped by isUAFSkipLine
+        if (isUAFSkipLine(t, alias_name, ctx.scan.aliases)) continue;
+        const use_col = findVarUseOnLine(t, alias_name) orelse continue;
+        try appendUAFIssue(ctx, alias_name, actual_line, use_col);
+        break; // One UAF per alias is sufficient
+    }
+}
+
+/// Emission sink for double-free issues: allocator, output list, and the
+/// file/variable identity stamped on every report. Constructed at emission
+/// points from the scan context.
+const FreeIssueSink = struct {
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
     file_path: []const u8,
+    var_name: []const u8,
+};
+
+/// One observed second free: the source text (for the free-call column),
+/// its line, the first free's line, and the severity/help pair to report.
+const DoubleFreeSite = struct {
     t: []const u8,
     line: usize,
-    var_name: []const u8,
     freed_line: usize,
     severity: Severity,
     help: []const u8,
-) !void {
+};
+
+fn appendDoubleFreeIssue(sink: *const FreeIssueSink, site: DoubleFreeSite) !void {
     var col: usize = 0;
     for (compat.getCleanupPatterns()) |pat| {
         if (mem.eql(u8, pat, ".deinit(")) continue;
-        if (mem.indexOf(u8, t, pat)) |pos| {
+        if (mem.indexOf(u8, site.t, pat)) |pos| {
             col = pos;
             break;
         }
     }
-    const pfx = if (severity == .warning) "conditional " else "";
+    const pfx = if (site.severity == .warning) "conditional " else "";
     const msg = try std.fmt.allocPrint(
-        allocator,
+        sink.allocator,
         "{s}double-free: '{s}' freed on {d}",
-        .{ pfx, var_name, freed_line },
+        .{ pfx, sink.var_name, site.freed_line },
     );
-    try issues.append(allocator, .{
-        .file = file_path,
-        .line = line,
+    try sink.issues.append(sink.allocator, .{
+        .file = sink.file_path,
+        .line = site.line,
         .col = col + 1,
-        .severity = severity,
+        .severity = site.severity,
         .rule = RULE_DOUBLE_FREE,
         .message = msg,
         .message_owned = true,
-        .help = help,
+        .help = site.help,
     });
 }
 
@@ -3298,136 +3203,49 @@ fn isDoubleFreeSkipLine(t: []const u8) bool {
     return isCommentOrMultilineString(t);
 }
 
-fn checkLineForDoubleFree(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    bstate: *const BlockFreeState,
-    issues: *std.ArrayListUnmanaged(Issue),
-    t: []const u8,
-    actual_line: usize,
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
-) !void {
-    const bid = findBlockForLine(cfg, actual_line) orelse return;
-    const bs = cfg.blocks.items[bid].start_line;
+fn checkLineForDoubleFree(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !void {
+    const bid = findBlockForLine(ctx.cfg, actual_line) orelse return;
+    const bs = ctx.cfg.blocks.items[bid].start_line;
     if (bs == 0 or bs > actual_line) return;
-    if (try checkSameBlockDoubleFree(
-        allocator,
-        lines,
-        func_line,
-        bs,
-        actual_line,
-        var_name,
-        alloc_info,
-        in_defer,
-        in_errdefer,
-        file_path,
-        t,
-        issues,
-        aliases,
-    )) return;
-    try detectCrossBlockDoubleFree(
-        allocator,
-        cfg,
-        lines,
-        func_line,
-        file_path,
-        t,
-        actual_line,
-        bid,
-        var_name,
-        alloc_info,
-        bstate,
-        issues,
-    );
+    if (try checkSameBlockDoubleFree(ctx, bs, t, actual_line)) return;
+    try detectCrossBlockDoubleFree(ctx, t, actual_line, bid);
 }
 
 /// Check same-block double free and emit issue if found; returns true if freed.
 fn checkSameBlockDoubleFree(
-    allocator: Allocator,
-    lines: []const []const u8,
-    func_line: usize,
+    ctx: *const FreeScanCtx,
     block_start: usize,
-    actual_line: usize,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    file_path: []const u8,
     t: []const u8,
-    issues: *std.ArrayListUnmanaged(Issue),
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
+    actual_line: usize,
 ) !bool {
-    const sbf = checkSameBlockFree(
-        lines,
-        func_line,
-        block_start,
-        actual_line,
-        var_name,
-        alloc_info,
-        in_defer,
-        in_errdefer,
-        aliases,
-    );
+    const sbf = checkSameBlockFree(&ctx.scan, block_start, actual_line);
     if (!sbf.freed) return false;
-    const freed = alloc_info.freed_line;
-    if (!hasExclusiveBranchBetween(lines, freed, actual_line, func_line)) {
-        try appendDoubleFreeIssue(
-            allocator,
-            issues,
-            file_path,
-            t,
-            actual_line,
-            var_name,
-            freed,
-            .err,
-            "remove duplicate free",
-        );
+    const freed = ctx.scan.alloc_info.freed_line;
+    const lines = ctx.scan.lines;
+    if (!hasExclusiveBranchBetween(lines, freed, actual_line, ctx.scan.func_line)) {
+        try appendDoubleFreeIssue(&.{
+            .allocator = ctx.allocator,
+            .issues = ctx.issues,
+            .file_path = ctx.file_path,
+            .var_name = ctx.scan.var_name,
+        }, .{
+            .t = t,
+            .line = actual_line,
+            .freed_line = freed,
+            .severity = .err,
+            .help = "remove duplicate free",
+        });
     }
     return true;
 }
 
-fn detectDoubleFree(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    in_defer: []const bool,
-    in_errdefer: []const bool,
-    bstate: *const BlockFreeState,
-    issues: *std.ArrayListUnmanaged(Issue),
-    aliases: *const std.StringHashMapUnmanaged([]const u8),
-) !void {
-    for (lines, 0..) |line, idx| {
+fn detectDoubleFree(ctx: *const FreeScanCtx) !void {
+    for (ctx.scan.lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
         if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(t, var_name, aliases)) continue;
-        try checkLineForDoubleFree(
-            allocator,
-            cfg,
-            lines,
-            func_line,
-            file_path,
-            var_name,
-            alloc_info,
-            in_defer,
-            in_errdefer,
-            bstate,
-            issues,
-            t,
-            func_line + idx,
-            aliases,
-        );
+        if (!isDirectFreeOfVarOrAlias(t, ctx.scan.var_name, ctx.scan.aliases)) continue;
+        try checkLineForDoubleFree(ctx, t, ctx.scan.func_line + idx);
     }
 }
 
@@ -3615,6 +3433,12 @@ fn pairDirectFreeWithDefers(
     site: DirectFreeSite,
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
+    const sink: FreeIssueSink = .{
+        .allocator = allocator,
+        .issues = issues,
+        .file_path = ctx.file_path,
+        .var_name = ctx.var_name,
+    };
     for (site.frees) |df| {
         const first = @min(df.line, site.free_line);
         // Reassignment after the first free: safe only when the direct free
@@ -3631,17 +3455,13 @@ fn pairDirectFreeWithDefers(
             .min_indent = @min(df.indent, site.free_indent),
         })) continue;
         const severity: Severity = if (df.is_conditional) .warning else .err;
-        try appendDoubleFreeIssue(
-            allocator,
-            issues,
-            ctx.file_path,
-            site.t,
-            site.free_line,
-            ctx.var_name,
-            df.line,
-            severity,
-            "defer frees at scope exit — remove the duplicate free",
-        );
+        try appendDoubleFreeIssue(&sink, .{
+            .t = site.t,
+            .line = site.free_line,
+            .freed_line = df.line,
+            .severity = severity,
+            .help = "defer frees at scope exit — remove the duplicate free",
+        });
     }
 }
 
@@ -3671,80 +3491,62 @@ fn analyzePredFreeState(
 }
 
 fn detectCrossBlockDoubleFree(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
+    ctx: *const FreeScanCtx,
     t: []const u8,
     actual_line: usize,
     bid: usize,
-    var_name: []const u8,
-    alloc_info: *CFGAllocation,
-    bstate: *const BlockFreeState,
-    issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
-    var preds = try getBlockPredecessors(cfg, bid, allocator);
-    defer preds.deinit(allocator);
+    var preds = try getBlockPredecessors(ctx.cfg, bid, ctx.allocator);
+    defer preds.deinit(ctx.allocator);
     if (preds.items.len == 0) return;
 
-    const pa = analyzePredFreeState(preds.items, bstate);
+    const pa = analyzePredFreeState(preds.items, ctx.bstate);
     if (!pa.any_freed or !pa.any_normal) return;
 
     const ref = if (pa.freed_pred_line > 0)
         pa.freed_pred_line
     else
-        alloc_info.freed_line;
-    if (hasExclusiveBranchBetween(lines, ref, actual_line, func_line))
+        ctx.scan.alloc_info.freed_line;
+    if (hasExclusiveBranchBetween(ctx.scan.lines, ref, actual_line, ctx.scan.func_line))
         return;
 
-    try emitCrossBlockDoubleFree(
-        allocator,
-        issues,
-        file_path,
-        t,
-        actual_line,
-        var_name,
-        ref,
-        pa,
-    );
+    try emitCrossBlockDoubleFree(ctx, .{
+        .t = t,
+        .line = actual_line,
+        .freed_line = ref,
+        .pa = pa,
+    });
 }
 
-fn emitCrossBlockDoubleFree(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    file_path: []const u8,
+/// One cross-block double-free candidate: the observed second free, the
+/// reference first-free line, and the predecessor analysis that decides
+/// severity and whether the pair is reportable.
+const CrossFreeCandidate = struct {
     t: []const u8,
-    actual_line: usize,
-    var_name: []const u8,
-    ref: usize,
+    line: usize,
+    freed_line: usize,
     pa: PredFreeAnalysis,
-) !void {
-    if (pa.def_freed) {
-        try appendDoubleFreeIssue(
-            allocator,
-            issues,
-            file_path,
-            t,
-            actual_line,
-            var_name,
-            ref,
-            .err,
-            "remove duplicate free",
-        );
-    } else if (pa.any_freed) {
-        try appendDoubleFreeIssue(
-            allocator,
-            issues,
-            file_path,
-            t,
-            actual_line,
-            var_name,
-            ref,
-            .warning,
+};
+
+fn emitCrossBlockDoubleFree(ctx: *const FreeScanCtx, c: CrossFreeCandidate) !void {
+    const sink: FreeIssueSink = .{
+        .allocator = ctx.allocator,
+        .issues = ctx.issues,
+        .file_path = ctx.file_path,
+        .var_name = ctx.scan.var_name,
+    };
+    const site: DoubleFreeSite = .{
+        .t = c.t,
+        .line = c.line,
+        .freed_line = c.freed_line,
+        .severity = if (c.pa.def_freed) .err else .warning,
+        .help = if (c.pa.def_freed)
+            "remove duplicate free"
+        else
             "move free outside conditional",
-        );
-    }
+    };
+    if (!c.pa.def_freed and !c.pa.any_freed) return;
+    try appendDoubleFreeIssue(&sink, site);
 }
 
 // ============================================================================
@@ -3758,6 +3560,16 @@ const CFGAlloc = struct {
     col: usize,
     block: usize,
     is_create: bool,
+};
+
+/// Shared context for the CFG defer-coverage family (ZA101/ZA102): the
+/// allocator and CFG plus the function body under analysis and the
+/// file-level no-free field set used for arena/no-free suppression.
+const DeferCoverageCtx = struct {
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    body: FuncBodyCtx,
+    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 };
 
 /// Check if function has arena parameter (first few lines)
@@ -3781,27 +3593,27 @@ fn hasNoFreeAllocatorParameter(lines: []const []const u8) bool {
 
 /// Collect allocations from function lines for CFG analysis
 fn collectCFGAllocations(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+    ctx: *const DeferCoverageCtx,
 ) !std.ArrayListUnmanaged(CFGAlloc) {
     var allocs = std.ArrayListUnmanaged(CFGAlloc).empty;
 
     // Pre-scan: build type-tracked allocator sets
-    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
-    defer local_no_free_fields.deinit(allocator);
-    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines, file_no_free_fields);
-    defer no_free_names.deinit(allocator);
-    var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
-    defer all_alloc_names.deinit(allocator);
+    var local_no_free_fields = try collectNoFreeFieldNames(ctx.allocator, ctx.body.lines);
+    defer local_no_free_fields.deinit(ctx.allocator);
+    var no_free_names = try collectNoFreeAllocatorNames(
+        ctx.allocator,
+        ctx.body.lines,
+        ctx.file_no_free_fields,
+    );
+    defer no_free_names.deinit(ctx.allocator);
+    var all_alloc_names = try collectAllAllocatorNames(ctx.allocator, ctx.body.lines);
+    defer all_alloc_names.deinit(ctx.allocator);
 
     // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
     var join_buf: [max_join_bytes]u8 = undefined;
-    for (lines, 0..) |_, idx| {
-        const actual_line = func_line + idx;
-        const t = joinParenContinuation(lines, idx, &join_buf);
+    for (ctx.body.lines, 0..) |_, idx| {
+        const actual_line = ctx.body.func_line + idx;
+        const t = joinParenContinuation(ctx.body.lines, idx, &join_buf);
 
         // Detect allocations using type-based detection for .create()
         const alloc_info = findAllocCall(t, &all_alloc_names) orelse continue;
@@ -3812,7 +3624,7 @@ fn collectCFGAllocations(
         if (isNoFreeCallChainFull(t, &no_free_names, &local_no_free_fields)) continue;
         if (isNoFreeFieldChain(t, &local_no_free_fields)) continue;
         // Check file-level no-free fields (struct definitions outside this function)
-        if (file_no_free_fields) |fields| {
+        if (ctx.file_no_free_fields) |fields| {
             if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
             if (isNoFreeFieldChain(t, fields)) continue;
         }
@@ -3821,7 +3633,7 @@ fn collectCFGAllocations(
         if (extractStandaloneAllocator(t)) |standalone_alloc| {
             if (no_free_names.contains(standalone_alloc)) continue;
             if (isArenaName(standalone_alloc)) continue;
-        } else if (extractMultilineFirstArg(t, lines, idx)) |ml_alloc| {
+        } else if (extractMultilineFirstArg(t, ctx.body.lines, idx)) |ml_alloc| {
             // Multiline: allocPrint(\n    arena, ...) — first arg on next line
             if (no_free_names.contains(ml_alloc)) continue;
             if (isArenaName(ml_alloc)) continue;
@@ -3831,11 +3643,11 @@ fn collectCFGAllocations(
 
         // Name comes from the physical line — slices into join_buf dangle
         // (the buffer is reused on the next iteration and dies with this frame).
-        const phys = mem.trim(u8, lines[idx], " \t\r");
+        const phys = mem.trim(u8, ctx.body.lines[idx], " \t\r");
         const name = extractVarDeclName(phys) orelse continue;
-        const block = findBlockForLine(cfg, actual_line) orelse continue;
+        const block = findBlockForLine(ctx.cfg, actual_line) orelse continue;
 
-        try allocs.append(allocator, .{
+        try allocs.append(ctx.allocator, .{
             .name = name,
             .line = actual_line,
             .col = alloc_info.col + 1,
@@ -3989,27 +3801,24 @@ fn extractDerefOwnerName(t: []const u8) ?[]const u8 {
 }
 
 fn trackOwnerVariables(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
+    ctx: *const DeferCoverageCtx,
     alloc_name: []const u8,
 ) !std.ArrayListUnmanaged(OwnerVar) {
     var owner_vars = std.ArrayListUnmanaged(OwnerVar).empty;
-    try owner_vars.append(allocator, .{ .name = alloc_name });
+    try owner_vars.append(ctx.allocator, .{ .name = alloc_name });
 
-    for (cfg.blocks.items) |block| {
+    for (ctx.cfg.blocks.items) |block| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
         for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < func_line) continue;
-            const idx = line_num - func_line;
-            if (idx >= lines.len) continue;
-            const t = mem.trim(u8, lines[idx], " \t\r");
+            if (line_num < ctx.body.func_line) continue;
+            const idx = line_num - ctx.body.func_line;
+            if (idx >= ctx.body.lines.len) continue;
+            const t = mem.trim(u8, ctx.body.lines[idx], " \t\r");
             if (!hasOwnerAppearance(owner_vars.items, t)) continue;
             if (extractConstOwnerName(t)) |name|
-                try tryAddOwner(allocator, &owner_vars, name);
+                try tryAddOwner(ctx.allocator, &owner_vars, name);
             if (extractDerefOwnerName(t)) |name|
-                try tryAddOwner(allocator, &owner_vars, name);
+                try tryAddOwner(ctx.allocator, &owner_vars, name);
         }
     }
     return owner_vars;
@@ -4088,41 +3897,29 @@ fn checkOwnershipInLine(
 /// CFG-based defer coverage analysis (ZA101/ZA102)
 /// Detects allocations where defer only exists on some paths
 fn analyzeCFGDeferCoverage(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
-    file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+    ctx: DeferCoverageCtx,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    const allocator = ctx.allocator;
 
     // Skip functions that take a no-free allocator by TYPE (e.g., *ArenaAllocator parameter)
-    if (hasNoFreeAllocatorParameter(lines)) return issues;
+    if (hasNoFreeAllocatorParameter(ctx.body.lines)) return issues;
 
     // Phase 1: Collect allocations
-    var allocs = try collectCFGAllocations(allocator, cfg, lines, func_line, file_no_free_fields);
+    var allocs = try collectCFGAllocations(&ctx);
     defer allocs.deinit(allocator);
     if (allocs.items.len == 0) return issues;
 
     // Pre-pass: Remove allocations with immediate defer
-    removeImmediateDeferAllocs(&allocs, lines, func_line);
+    removeImmediateDeferAllocs(&allocs, ctx.body.lines, ctx.body.func_line);
     if (allocs.items.len == 0) return issues;
 
-    const num_blocks = cfg.blocks.items.len;
+    const num_blocks = ctx.cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
     // Phase 2-3: Check defer coverage for each allocation
     for (allocs.items) |alloc| {
-        const issue = try checkDeferCoverageForAlloc(
-            allocator,
-            cfg,
-            lines,
-            func_line,
-            file_path,
-            alloc,
-            num_blocks,
-        );
+        const issue = try checkDeferCoverageForAlloc(&ctx, alloc);
         if (issue) |iss| {
             try issues.append(allocator, iss);
         }
@@ -4165,14 +3962,20 @@ const BlockCoverageState = struct {
     }
 };
 
-/// Scan CFG blocks for defer, free, and ownership patterns
-fn scanBlocksForPatterns(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
+/// Per-allocation inputs for the defer-coverage block scan: the function
+/// lines, the allocation name being matched, and its tracked owner vars.
+const DeferScanCtx = struct {
     lines: []const []const u8,
     func_line: usize,
     alloc_name: []const u8,
     owner_vars: []const OwnerVar,
+};
+
+/// Scan CFG blocks for defer, free, and ownership patterns
+fn scanBlocksForPatterns(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    scan: DeferScanCtx,
     num_blocks: usize,
 ) !BlockCoverageState {
     var state = BlockCoverageState{
@@ -4188,7 +3991,7 @@ fn scanBlocksForPatterns(
 
     for (cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
-        scanSingleBlock(&state, block, bid, lines, func_line, alloc_name, owner_vars);
+        scanSingleBlock(&state, block, bid, scan);
     }
     return state;
 }
@@ -4198,22 +4001,19 @@ fn scanSingleBlock(
     state: *BlockCoverageState,
     block: anytype,
     bid: usize,
-    lines: []const []const u8,
-    func_line: usize,
-    alloc_name: []const u8,
-    owner_vars: []const OwnerVar,
+    scan: DeferScanCtx,
 ) void {
     var freed = false;
     var return_after = false;
     var defer_depth: usize = 0;
 
     for (block.start_line..block.end_line + 1) |line_num| {
-        if (line_num < func_line) continue;
-        const idx = line_num - func_line;
-        if (idx >= lines.len) continue;
-        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (line_num < scan.func_line) continue;
+        const idx = line_num - scan.func_line;
+        if (idx >= scan.lines.len) continue;
+        const t = mem.trim(u8, scan.lines[idx], " \t\r");
         const is_defer = isDeferOrErrdefer(t);
-        const has_free = hasRealFreePattern(t) and containsIdentifier(t, alloc_name);
+        const has_free = hasRealFreePattern(t) and containsIdentifier(t, scan.alloc_name);
 
         // Track multi-line defer/errdefer blocks: defer { ... } / errdefer { ... }
         if (is_defer and (mem.indexOf(u8, t, "{") != null)) {
@@ -4229,7 +4029,7 @@ fn scanSingleBlock(
             state.has_direct_free[bid] = true;
         }
         if (freed and mem.startsWith(u8, t, "return")) return_after = true;
-        if (checkOwnershipInLine(t, owner_vars)) state.ownership_transferred[bid] = true;
+        if (checkOwnershipInLine(t, scan.owner_vars)) state.ownership_transferred[bid] = true;
     }
     if (freed and return_after) state.free_and_return[bid] = true;
 }
@@ -4308,29 +4108,23 @@ fn buildPartialCoverageIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
 }
 
 fn checkDeferCoverageForAlloc(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
+    ctx: *const DeferCoverageCtx,
     alloc: CFGAlloc,
-    num_blocks: usize,
 ) !?Issue {
-    var owner_vars = try trackOwnerVariables(allocator, cfg, lines, func_line, alloc.name);
+    const allocator = ctx.allocator;
+    var owner_vars = try trackOwnerVariables(ctx, alloc.name);
     defer owner_vars.deinit(allocator);
 
-    var state = try scanBlocksForPatterns(
-        allocator,
-        cfg,
-        lines,
-        func_line,
-        alloc.name,
-        owner_vars.items,
-        num_blocks,
-    );
+    const num_blocks = ctx.cfg.blocks.items.len;
+    var state = try scanBlocksForPatterns(allocator, ctx.cfg, .{
+        .lines = ctx.body.lines,
+        .func_line = ctx.body.func_line,
+        .alloc_name = alloc.name,
+        .owner_vars = owner_vars.items,
+    }, num_blocks);
     defer state.deinit(allocator);
 
-    const covered = try propagateCoverageBackward(allocator, cfg, state, num_blocks);
+    const covered = try propagateCoverageBackward(allocator, ctx.cfg, state, num_blocks);
     defer allocator.free(covered);
 
     const alloc_block_covered = covered[alloc.block];
@@ -4342,10 +4136,10 @@ fn checkDeferCoverageForAlloc(
 
     // Fallback: linear scan for defer free anywhere in the function.
     // The CFG block analysis can miss multi-line defers that span block boundaries.
-    if (hasDeferFreeInFunction(lines, alloc.name))
+    if (hasDeferFreeInFunction(ctx.body.lines, alloc.name))
         return null;
 
-    return buildPartialCoverageIssue(file_path, alloc);
+    return buildPartialCoverageIssue(ctx.body.file_path, alloc);
 }
 
 /// Find the indent level of an allocation line by name
@@ -4360,29 +4154,35 @@ fn findAllocIndent(lines: []const []const u8, alloc_name: []const u8) usize {
     return 0;
 }
 
-/// Process a single line during defer-free scan, returns true if free found in valid defer
-fn checkDeferFreeLine(
-    line: []const u8,
-    t: []const u8,
+/// Scan state for the linear defer-free fallback: the allocation being
+/// matched (name + indent) plus the running multi-line defer/skip depths.
+const DeferFreeScanCtx = struct {
     alloc_name: []const u8,
     alloc_indent: usize,
     defer_depth: *usize,
     skip_depth: *usize,
+};
+
+/// Process a single line during defer-free scan, returns true if free found in valid defer
+fn checkDeferFreeLine(
+    line: []const u8,
+    t: []const u8,
+    ctx: *const DeferFreeScanCtx,
 ) bool {
     // Skip mode: inside a defer block at deeper scope than alloc
-    if (skip_depth.* > 0) {
-        skip_depth.* = countBraceDepth(t, skip_depth.*);
+    if (ctx.skip_depth.* > 0) {
+        ctx.skip_depth.* = countBraceDepth(t, ctx.skip_depth.*);
         return false;
     }
 
     const is_defer_start = isDeferOrErrdefer(t);
     if (is_defer_start)
-        return handleDeferStart(line, t, alloc_name, alloc_indent, defer_depth, skip_depth);
+        return handleDeferStart(line, t, ctx);
 
-    if (defer_depth.* > 0) {
-        if (hasRealFreePattern(t) and containsIdentifier(t, alloc_name))
+    if (ctx.defer_depth.* > 0) {
+        if (hasRealFreePattern(t) and containsIdentifier(t, ctx.alloc_name))
             return true;
-        defer_depth.* = countBraceDepth(t, defer_depth.*);
+        ctx.defer_depth.* = countBraceDepth(t, ctx.defer_depth.*);
     }
     return false;
 }
@@ -4391,23 +4191,20 @@ fn checkDeferFreeLine(
 fn handleDeferStart(
     line: []const u8,
     t: []const u8,
-    alloc_name: []const u8,
-    alloc_indent: usize,
-    defer_depth: *usize,
-    skip_depth: *usize,
+    ctx: *const DeferFreeScanCtx,
 ) bool {
     // Only consider defers at same or outer scope as the allocation
-    if (countIndent(line) > alloc_indent) {
+    if (countIndent(line) > ctx.alloc_indent) {
         if (mem.indexOf(u8, t, "{") != null)
-            skip_depth.* = countBraceDepth(t, 0);
+            ctx.skip_depth.* = countBraceDepth(t, 0);
         return false;
     }
     // Single-line defer with free
-    if (hasRealFreePattern(t) and containsIdentifier(t, alloc_name))
+    if (hasRealFreePattern(t) and containsIdentifier(t, ctx.alloc_name))
         return true;
     // Multi-line defer block start at same/outer scope
     if (mem.indexOf(u8, t, "{") != null)
-        defer_depth.* = countBraceDepth(t, 0);
+        ctx.defer_depth.* = countBraceDepth(t, 0);
     return false;
 }
 
@@ -4420,11 +4217,17 @@ fn hasDeferFreeInFunction(
     const alloc_indent = findAllocIndent(lines, alloc_name);
     var defer_depth: usize = 0;
     var skip_depth: usize = 0;
+    const ctx: DeferFreeScanCtx = .{
+        .alloc_name = alloc_name,
+        .alloc_indent = alloc_indent,
+        .defer_depth = &defer_depth,
+        .skip_depth = &skip_depth,
+    };
 
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (checkDeferFreeLine(line, t, alloc_name, alloc_indent, &defer_depth, &skip_depth))
+        if (checkDeferFreeLine(line, t, &ctx))
             return true;
     }
     return false;
@@ -4550,47 +4353,53 @@ fn continueBlockCollection(
     return true;
 }
 
+/// Output sinks and no-free filter sets for try-allocation collection:
+/// the allocation list and the raw try-line list being built, plus the
+/// type-tracked no-free name/field sets used for suppression.
+const TryAllocCollectCtx = struct {
+    try_allocs: *std.ArrayListUnmanaged(TryAlloc),
+    try_lines: *std.ArrayListUnmanaged(usize),
+    allocator: Allocator,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+    no_free_fields: *const std.StringHashMapUnmanaged(void),
+};
+
 /// Collect a try allocation from a line, skipping arena/no-free.
 /// `phys` is the trimmed physical line: the recorded name must slice into
 /// file content, not into a join buffer reused by the caller's loop.
 fn collectTryAllocFromLine(
     t: []const u8,
     phys: []const u8,
-    actual_line: usize,
-    indent: usize,
-    try_allocs: *std.ArrayListUnmanaged(TryAlloc),
-    try_lines: *std.ArrayListUnmanaged(usize),
-    allocator: Allocator,
-    no_free_names: *const std.StringHashMapUnmanaged(void),
-    no_free_fields: *const std.StringHashMapUnmanaged(void),
+    site: StmtSite,
+    ctx: *const TryAllocCollectCtx,
 ) !void {
     // Skip allocations from type-tracked no-free allocators (stdlib types only)
     const aname_e = extractAllocatorName(t) orelse "";
-    if (aname_e.len > 0 and no_free_names.contains(aname_e)) {
-        try try_lines.append(allocator, actual_line);
+    if (aname_e.len > 0 and ctx.no_free_names.contains(aname_e)) {
+        try ctx.try_lines.append(ctx.allocator, site.line);
         return;
     }
-    if (isNoFreeCallChainFull(t, no_free_names, no_free_fields)) {
-        try try_lines.append(allocator, actual_line);
+    if (isNoFreeCallChainFull(t, ctx.no_free_names, ctx.no_free_fields)) {
+        try ctx.try_lines.append(ctx.allocator, site.line);
         return;
     }
-    if (isNoFreeFieldChain(t, no_free_fields)) {
-        try try_lines.append(allocator, actual_line);
+    if (isNoFreeFieldChain(t, ctx.no_free_fields)) {
+        try ctx.try_lines.append(ctx.allocator, site.line);
         return;
     }
     if (extractVarDeclName(phys)) |name| {
         const alloc_info = findAllocCall(t, null) orelse return;
-        try try_allocs.append(allocator, .{
+        try ctx.try_allocs.append(ctx.allocator, .{
             .name = name,
-            .line = actual_line,
+            .line = site.line,
             .col = alloc_info.col + 1,
-            .indent = indent,
+            .indent = site.indent,
             .is_create = alloc_info.is_create,
         });
     }
 }
 
-/// Source position of a defer/errdefer statement (param bundling).
+/// Source position of a statement (param bundling: file line + indent).
 const StmtSite = struct {
     line: usize,
     indent: usize,
@@ -4611,13 +4420,18 @@ fn tryAppendCleanupInfo(
     });
 }
 
-fn collectDeferFromLine(
-    t: []const u8,
-    actual_line: usize,
-    indent: usize,
+/// Sink for defer/errdefer cleanup collection: the multi-line block
+/// collection state plus the output list being appended to.
+const CleanupCollectCtx = struct {
     bs: *BlockCollectState,
     errdefers: *std.ArrayListUnmanaged(ErrdeferInfo),
     allocator: Allocator,
+};
+
+fn collectDeferFromLine(
+    t: []const u8,
+    site: StmtSite,
+    ctx: *const CleanupCollectCtx,
 ) !void {
     const is_errdefer = mem.startsWith(u8, t, "errdefer ");
     const is_defer = mem.startsWith(u8, t, "defer ");
@@ -4625,25 +4439,24 @@ fn collectDeferFromLine(
 
     const prefix_len: usize = if (is_errdefer) 9 else 6;
     const content = if (prefix_len < t.len) t[prefix_len..] else "";
-    const site: StmtSite = .{ .line = actual_line, .indent = indent };
 
     if (!mem.startsWith(u8, content, "{")) {
-        try tryAppendCleanupInfo(t, site, errdefers, allocator);
+        try tryAppendCleanupInfo(t, site, ctx.errdefers, ctx.allocator);
         return;
     }
-    bs.start = actual_line;
-    bs.indent = indent;
-    bs.depth = 1;
-    bs.content.clearRetainingCapacity();
-    try bs.content.appendSlice(allocator, content);
-    try bs.content.append(allocator, ' ');
+    ctx.bs.start = site.line;
+    ctx.bs.indent = site.indent;
+    ctx.bs.depth = 1;
+    ctx.bs.content.clearRetainingCapacity();
+    try ctx.bs.content.appendSlice(ctx.allocator, content);
+    try ctx.bs.content.append(ctx.allocator, ' ');
     for (content[1..]) |c| {
-        if (c == '{') bs.depth += 1;
-        if (c == '}' and bs.depth > 0) bs.depth -= 1;
+        if (c == '{') ctx.bs.depth += 1;
+        if (c == '}' and ctx.bs.depth > 0) ctx.bs.depth -= 1;
     }
-    if (bs.depth == 0) {
-        try tryAppendCleanupInfo(bs.content.items, site, errdefers, allocator);
-        bs.content.clearRetainingCapacity();
+    if (ctx.bs.depth == 0) {
+        try tryAppendCleanupInfo(ctx.bs.content.items, site, ctx.errdefers, ctx.allocator);
+        ctx.bs.content.clearRetainingCapacity();
     }
 }
 
@@ -4808,6 +4621,18 @@ fn scanErrdeferLines(
     defer no_free_names.deinit(allocator);
     // Merge file-level fields: use file-level if available, else local only
     const effective_fields = file_no_free_fields orelse &local_no_free_fields;
+    const collect_ctx: TryAllocCollectCtx = .{
+        .try_allocs = &state.try_allocs,
+        .try_lines = &state.try_lines_list,
+        .allocator = allocator,
+        .no_free_names = &no_free_names,
+        .no_free_fields = effective_fields,
+    };
+    const cleanup_ctx: CleanupCollectCtx = .{
+        .bs = &state.bs,
+        .errdefers = &state.errdefers,
+        .allocator = allocator,
+    };
 
     // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
     var join_buf: [max_join_bytes]u8 = undefined;
@@ -4826,6 +4651,7 @@ fn scanErrdeferLines(
         // detection (defer blocks, try presence) stays on the physical line.
         const joined = joinParenContinuation(lines, idx, &join_buf);
         const indent = countIndent(line);
+        const site: StmtSite = .{ .line = actual_line, .indent = indent };
         // Keyword matches must skip string literals/word fragments:
         // @panic("Retry transaction not found") is not a gap trigger.
         const has_try = hasRealKeyword(t, "try ");
@@ -4846,29 +4672,12 @@ fn scanErrdeferLines(
                 break :blk false;
             };
             if (!standalone_skip) {
-                try collectTryAllocFromLine(
-                    joined,
-                    t,
-                    actual_line,
-                    indent,
-                    &state.try_allocs,
-                    &state.try_lines_list,
-                    allocator,
-                    &no_free_names,
-                    effective_fields,
-                );
+                try collectTryAllocFromLine(joined, t, site, &collect_ctx);
             } else {
                 try state.try_lines_list.append(allocator, actual_line);
             }
         }
-        try collectDeferFromLine(
-            t,
-            actual_line,
-            indent,
-            &state.bs,
-            &state.errdefers,
-            allocator,
-        );
+        try collectDeferFromLine(t, site, &cleanup_ctx);
         if (has_try) try state.try_lines_list.append(allocator, actual_line);
     }
     return state;
@@ -4877,30 +4686,33 @@ fn scanErrdeferLines(
 /// CFG-based errdefer coverage analysis (ZA103)
 fn analyzeCFGErrdeferCoverage(
     allocator: Allocator,
-    lines: []const []const u8,
-    func_line: usize,
-    file_path: []const u8,
+    body: FuncBodyCtx,
     fn_returns_error: bool,
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     if (!fn_returns_error) return issues;
-    if (hasNoFreeAllocatorType(lines)) return issues;
+    if (hasNoFreeAllocatorType(body.lines)) return issues;
 
-    var state = try scanErrdeferLines(allocator, lines, func_line, file_no_free_fields);
+    var state = try scanErrdeferLines(
+        allocator,
+        body.lines,
+        body.func_line,
+        file_no_free_fields,
+    );
     defer state.deinit(allocator);
 
     if (state.try_allocs.items.len == 0) return issues;
     for (state.try_allocs.items) |*alloc| {
-        checkErrdeferOwnershipTransfer(alloc, lines, func_line);
+        checkErrdeferOwnershipTransfer(alloc, body.lines, body.func_line);
     }
     try checkErrdeferGaps(allocator, state.try_allocs.items, &.{
         .errdefers = state.errdefers.items,
         .try_lines = state.try_lines_list.items,
         .error_returns = state.error_returns.items,
-        .lines = lines,
-        .func_line = func_line,
-        .file_path = file_path,
+        .lines = body.lines,
+        .func_line = body.func_line,
+        .file_path = body.file_path,
     }, &issues);
     return issues;
 }
@@ -14090,19 +13902,25 @@ fn runCFGMemoryAnalyses(
     is_no_free_recipient: bool,
     no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !void {
-    var r1 = try analyzeCFGMemorySafety(a, cfg, fl, fstart, fp, no_free_fields);
+    const body: FuncBodyCtx = .{ .lines = fl, .func_line = fstart, .file_path = fp };
+    var r1 = try analyzeCFGMemorySafety(a, cfg, body, no_free_fields);
     defer r1.deinit(a);
     try out.appendSlice(a, r1.items);
     var r2 = if (is_no_free_recipient)
         std.ArrayListUnmanaged(Issue).empty
     else
-        try analyzeCFGDeferCoverage(a, cfg, fl, fstart, fp, no_free_fields);
+        try analyzeCFGDeferCoverage(.{
+            .allocator = a,
+            .cfg = cfg,
+            .body = body,
+            .file_no_free_fields = no_free_fields,
+        });
     defer r2.deinit(a);
     try out.appendSlice(a, r2.items);
     var r3 = if (in_test or is_no_free_recipient)
         std.ArrayListUnmanaged(Issue).empty
     else
-        try analyzeCFGErrdeferCoverage(a, fl, fstart, fp, fn_ret_err, no_free_fields);
+        try analyzeCFGErrdeferCoverage(a, body, fn_ret_err, no_free_fields);
     defer r3.deinit(a);
     try out.appendSlice(a, r3.items);
     try checkMustReturnRef(.{ .a = a, .out = out, .fl = fl, .fstart = fstart, .fp = fp });
@@ -24043,14 +23861,16 @@ test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
     var cfg = try buildCFG(allocator, "bad_conditional_defer", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_conditional.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_conditional.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     // Should detect that defer is not on all paths
@@ -24089,14 +23909,16 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
     var cfg = try buildCFG(allocator, "good_defer", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_good.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_good.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     // Should NOT report issues for properly deferred allocation
@@ -24131,14 +23953,16 @@ test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
     var cfg_graph = try buildCFG(allocator, "leaky", 1, lines_list.items);
     defer cfg_graph.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg_graph,
-        lines_list.items,
-        1,
-        "test_no_defer.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg_graph,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_no_defer.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     // Should detect that allocation has no defer at all
@@ -25194,14 +25018,16 @@ test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
     var cfg = try buildCFG(allocator, "leaky_dupe", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_dupe_no_defer.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_dupe_no_defer.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     var found_issue = false;
@@ -25237,14 +25063,16 @@ test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
     var cfg = try buildCFG(allocator, "leaky_print", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_allocPrint_no_defer.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_allocPrint_no_defer.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     var found_issue = false;
@@ -25281,14 +25109,16 @@ test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
     var cfg = try buildCFG(allocator, "good_dupe", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_dupe_good.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_dupe_good.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
@@ -25322,14 +25152,16 @@ test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101
     var cfg = try buildCFG(allocator, "good_print", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_allocPrint_good.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_allocPrint_good.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
@@ -25470,14 +25302,16 @@ test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
     var cfg = try buildCFG(allocator, "leaky_concat", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_concat_no_defer.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_concat_no_defer.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     var found_issue = false;
@@ -25516,14 +25350,16 @@ test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
     var cfg = try buildCFG(allocator, "leaky_owned", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_owned_no_defer.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_owned_no_defer.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     var found_issue = false;
@@ -25591,14 +25427,16 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
     var cfg = try buildCFG(allocator, "factory", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_return_transfer.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_return_transfer.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
@@ -25773,14 +25611,16 @@ test "analyzeCFGDeferCoverage no false positive for create with ownership transf
     var cfg = try buildCFG(allocator, "create_factory", 1, lines_list.items);
     defer cfg.deinit();
 
-    var issues = try analyzeCFGDeferCoverage(
-        allocator,
-        &cfg,
-        lines_list.items,
-        1,
-        "test_create_return.zig",
-        null,
-    );
+    var issues = try analyzeCFGDeferCoverage(.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .body = .{
+            .lines = lines_list.items,
+            .func_line = 1,
+            .file_path = "test_create_return.zig",
+        },
+        .file_no_free_fields = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {

@@ -279,6 +279,16 @@ with existing inline-ignores, and is reported under the Memory category in
 | **ZA701** | warning | ON | Line exceeds max length (default: 100 columns; lines over-length solely due to unbreakable string-literal content are exempt) |
 | **ZA702** | warning | OFF | File exceeds max size (requires `--enable=ZA702` or config `enable`; threshold via `max_file_bytes`, default 50000) |
 | **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
+| **ZA704** | warning | ON | `std.debug.print` left in non-test code (pre-merge hygiene; test blocks, `*_test.zig` files, and `/test` paths are exempt — see note below) |
+
+**ZA704 and CLI apps:** the rule exists to catch debug prints forgotten before
+a merge. Applications whose output channel *is* `std.debug.print` (CLI tools
+writing to stderr) should disable it — `"disable": ["ZA704"]` in `ephor.json`,
+`// ephor:ignore-file ZA704` per file, or route output through `std.log` with a
+custom log function. **Known limitation:** prints in helper *functions* that
+are only ever called from tests still fire (the rule tracks test blocks, not
+the call graph) — suppress per file or disable the rule for test-helper
+modules.
 
 #### ZA703 Naming Rules
 
@@ -317,6 +327,23 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | **ZA901** | warning | OFF | Decrement without overflow guard may panic (use `--enable=ZA9`) |
 | **ZA902** | warning | OFF | Subtraction in range may cause overflow (use `--enable=ZA9`) |
 | **ZA903** | warning | OFF | Arithmetic in array index may overflow (use `--enable=ZA9`) |
+| **ZA904** | note | OFF | `@intCast`/`@truncate` without a bounds proof in the preceding lines (use `--enable=ZA904`) |
+
+**ZA904 guard classes** (any one suppresses the note, scanning the same-line
+prefix and up to 10 preceding lines, stopping at function boundaries): a
+comparison against the target type's limit (`x < N`, `x <= N`,
+`std.math.maxInt`/`minInt`), an exit guard on the over-limit path
+(`if (x >= N) return/break/continue`), `@min`/`@max` clamping of the casted
+variable, a `std.math.cast` checked conversion of the same variable, or a
+`const x = <literal>` declaration (comptime-known value cannot fail the
+cast), or a range-for index capture over a bounded range (`for (0..N) |i|` —
+last capture only, and the range expression must be present; iterating a
+slice with `for (items) |x|` is not a proof). `testing.expect` lines are
+skipped entirely (assertions construct fixtures, they don't need guards).
+Only plain-identifier arguments are analyzed — literals (already
+comptime-known), expressions, field accesses, and multi-line calls are
+skipped silently. Note that `@truncate` can never panic (it is defined to
+discard high bits); its message names the real defect — silent data loss.
 
 **When to enable ZA9xx:** Before switching from `Debug` to `ReleaseFast` builds — in debug mode, integer overflow panics helpfully; in `ReleaseFast` it becomes undefined behavior. Also useful for security-sensitive or financial code where overflow = vulnerability.
 

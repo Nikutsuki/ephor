@@ -3,6 +3,10 @@
 // Copyright (C) 2025 Rhyos Labs LLC
 // SPDX-License-Identifier: MIT
 
+// ephor:ignore-file ZA704 — Issue.printText/printJson are the CLI's
+// user-facing output channel (stderr). See src/main.zig for the full
+// justification; std.log would corrupt the GCC-style output format.
+
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -56,6 +60,7 @@ pub const RULE_DEFINITE_ASSIGNMENT = "ZA607";
 pub const RULE_LINE_TOO_LONG = "ZA701";
 pub const RULE_FILE_TOO_LONG = "ZA702";
 pub const RULE_NAMING_CONVENTION = "ZA703";
+pub const RULE_DEBUG_PRINT = "ZA704";
 
 // ZA8xx - Null Safety
 pub const RULE_OPTIONAL_UNWRAP_UNSAFE = "ZA801";
@@ -65,6 +70,7 @@ pub const RULE_ORELSE_QUESTION_UNSAFE = "ZA802";
 pub const RULE_DECREMENT_WITHOUT_CHECK = "ZA901";
 pub const RULE_SUBTRACTION_OVERFLOW = "ZA902";
 pub const RULE_INDEX_ARITHMETIC = "ZA903";
+pub const RULE_INTCAST_NO_BOUNDS = "ZA904";
 
 // ZR1xx - Runtime Analysis (dynamic analysis via test execution)
 pub const RULE_RUNTIME_MEMORY_LEAK = "ZR101";

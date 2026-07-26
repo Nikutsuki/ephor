@@ -3,6 +3,12 @@
 // Copyright (C) 2025 Rhyos Labs LLC
 // SPDX-License-Identifier: MIT
 
+// ephor:ignore-file ZA704 — ephor is a CLI: std.debug.print on stderr IS its
+// user-facing output channel (issues, help, summaries, errors). std.log is
+// not a drop-in replacement: its default impl itself calls std.debug.print
+// and adds level prefixes that would break the GCC-style output format that
+// IDEs parse. Audited 2026-07-26: every print site is user-facing output.
+
 //! Ephor: The overseer of your Zig code - Static + Dynamic analysis
 //!
 //! Output format: path:line:col: severity[rule-id]: message
@@ -136,11 +142,13 @@ const RULE_DEFINITE_ASSIGNMENT = types.RULE_DEFINITE_ASSIGNMENT;
 const RULE_LINE_TOO_LONG = types.RULE_LINE_TOO_LONG;
 const RULE_FILE_TOO_LONG = types.RULE_FILE_TOO_LONG;
 const RULE_NAMING_CONVENTION = types.RULE_NAMING_CONVENTION;
+const RULE_DEBUG_PRINT = types.RULE_DEBUG_PRINT;
 const RULE_OPTIONAL_UNWRAP_UNSAFE = types.RULE_OPTIONAL_UNWRAP_UNSAFE;
 const RULE_ORELSE_QUESTION_UNSAFE = types.RULE_ORELSE_QUESTION_UNSAFE;
 const RULE_DECREMENT_WITHOUT_CHECK = types.RULE_DECREMENT_WITHOUT_CHECK;
 const RULE_SUBTRACTION_OVERFLOW = types.RULE_SUBTRACTION_OVERFLOW;
 const RULE_INDEX_ARITHMETIC = types.RULE_INDEX_ARITHMETIC;
+const RULE_INTCAST_NO_BOUNDS = types.RULE_INTCAST_NO_BOUNDS;
 const RULE_RUNTIME_MEMORY_LEAK = types.RULE_RUNTIME_MEMORY_LEAK;
 const RULE_RUNTIME_DOUBLE_FREE = types.RULE_RUNTIME_DOUBLE_FREE;
 const RULE_RUNTIME_USE_AFTER_FREE = types.RULE_RUNTIME_USE_AFTER_FREE;
@@ -12473,6 +12481,90 @@ fn reportLineTooLong(
     });
 }
 
+/// Per-file sink for the style line checks (keeps arity ≤ 4, ZA303).
+const StyleSink = struct {
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    path: []const u8,
+};
+
+/// ZA704: std.debug.print left in non-test code (pre-merge hygiene).
+/// Every match is iterated with a leading word-boundary check — a bare
+/// indexOf would also fire on `xstd.debug.print(` (patterns.md F2) — and
+/// gets the uniform string/comment treatment (patterns.md F1).
+fn checkDebugPrints(sink: StyleSink, line: []const u8, line_num: usize) !void {
+    const needle = "std.debug.print(";
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, line, pos, needle)) |idx| {
+        pos = idx + needle.len;
+        // Boundary: `xstd.debug.print(` is a different receiver.
+        if (idx > 0 and isIdent(line[idx - 1])) continue;
+        if (isInsideString(line, idx)) continue;
+        if (isInTrailingComment(line, idx)) continue;
+        try sink.issues.append(sink.allocator, .{
+            .file = sink.path,
+            .line = line_num,
+            .col = idx + 1,
+            .severity = .warning,
+            .rule = RULE_DEBUG_PRINT,
+            .message = "std.debug.print left in non-test code",
+            .help = "remove before merge, route through std.log, " ++
+                "or disable ZA704 for CLI apps",
+        });
+    }
+}
+
+/// Update test-block state for one line and run the ZA704 check when the
+/// line is outside test context (tests print freely; CLI apps config-disable
+/// — see README). Comment-only / multiline-string lines are skipped: a call
+/// cannot live in prose.
+fn checkDebugPrintsUnlessTest(
+    sink: StyleSink,
+    line: []const u8,
+    line_num: usize,
+    state: *TestBlockState,
+) !void {
+    const t = mem.trim(u8, line, " \t\r");
+    if (isCommentOrMultilineString(t)) return;
+    const ts = trackTestBlock(t, state.in_test, state.depth);
+    state.in_test = ts.in_test;
+    state.depth = ts.depth;
+    if (isInTestContext(sink.path, state.in_test)) return;
+    try checkDebugPrints(sink, line, line_num);
+}
+
+/// Per-file style scan: ZA701 line length, ZA702 file size, ZA704 debug
+/// prints. ZA701 keeps its own narrower line skip (only multiline strings)
+/// so long comment lines still count toward line length.
+fn analyzeStyleFile(
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    a: FileAnalysis,
+    th: Thresholds,
+) !void {
+    // ZA702: File too long (off by default, enable with --enable=ZA702)
+    if (a.content.len > th.max_file_bytes)
+        try reportFileTooLong(issues, allocator, a.path, a.content.len, th.max_file_bytes);
+
+    var line_num: usize = 1;
+    var lines = mem.splitScalar(u8, a.content, '\n');
+    var ts_state = TestBlockState{ .in_test = false, .depth = 0 };
+    const sink = StyleSink{ .issues = issues, .allocator = allocator, .path = a.path };
+    while (lines.next()) |line| {
+        defer line_num += 1;
+        try checkDebugPrintsUnlessTest(sink, line, line_num, &ts_state);
+
+        // ZA701: Line too long
+        const trimmed = mem.trimStart(u8, line, " \t");
+        if (mem.startsWith(u8, trimmed, "\\\\")) continue;
+
+        const visible_len = calculateVisibleLength(line);
+        if (visible_len <= th.max_line_length) continue;
+        if (visibleLengthExcludingStrings(line) <= th.max_line_length) continue;
+        try reportLineTooLong(issues, allocator, a.path, line_num, visible_len, th.max_line_length);
+    }
+}
+
 fn analyzeStyle(
     allocator: Allocator,
     graph: *ImportGraph,
@@ -12480,40 +12572,8 @@ fn analyzeStyle(
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
-
     while (iter.next()) |entry| {
-        const a = entry.value_ptr.*;
-
-        // ZA702: File too long (off by default, enable with --enable=ZA702)
-        if (a.content.len > th.max_file_bytes)
-            try reportFileTooLong(
-                &issues,
-                allocator,
-                a.path,
-                a.content.len,
-                th.max_file_bytes,
-            );
-
-        // ZA701: Line too long
-        var line_num: usize = 1;
-        var lines = mem.splitScalar(u8, a.content, '\n');
-        while (lines.next()) |line| {
-            defer line_num += 1;
-            const trimmed = mem.trimStart(u8, line, " \t");
-            if (mem.startsWith(u8, trimmed, "\\\\")) continue;
-
-            const visible_len = calculateVisibleLength(line);
-            if (visible_len <= th.max_line_length) continue;
-            if (visibleLengthExcludingStrings(line) <= th.max_line_length) continue;
-            try reportLineTooLong(
-                &issues,
-                allocator,
-                a.path,
-                line_num,
-                visible_len,
-                th.max_line_length,
-            );
-        }
+        try analyzeStyleFile(&issues, allocator, entry.value_ptr.*, th);
     }
     return issues;
 }
@@ -16951,6 +17011,229 @@ fn analyzePanicPatterns(
     return issues;
 }
 
+// ============================================================================
+// ZA904 - @intCast/@truncate without bounds proof (opt-in, note)
+// ============================================================================
+
+/// Extract the casted identifier from the first argument of the builtin call
+/// whose `(` is at `lparen`. Returns null for anything but a plain
+/// identifier: literals (comptime-known, cannot fail), expressions, field
+/// accesses, and nested/multi-line calls are skipped silently — text
+/// analysis has no dataflow for them (documented limitation).
+fn extractCastIdent(line: []const u8, lparen: usize) ?[]const u8 {
+    var i = lparen + 1;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+    if (i >= line.len) return null;
+    if (!std.ascii.isAlphabetic(line[i]) and line[i] != '_') return null;
+    const start = i;
+    while (i < line.len and isIdent(line[i])) i += 1;
+    var j = i;
+    while (j < line.len and (line[j] == ' ' or line[j] == '\t')) j += 1;
+    // One-arg builtins: the ident must close the call, otherwise the arg is
+    // a wider expression we do not model.
+    if (j >= line.len or line[j] != ')') return null;
+    return line[start..i];
+}
+
+/// Boundary-checked identifier presence (patterns.md F2: a substring search
+/// for `x` must not match `max_x`).
+fn mentionsIdent(t: []const u8, ident: []const u8) bool {
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, t, pos, ident)) |idx| {
+        pos = idx + ident.len;
+        const left_ok = idx == 0 or !isIdent(t[idx - 1]);
+        const right_ok = idx + ident.len >= t.len or !isIdent(t[idx + ident.len]);
+        if (left_ok and right_ok) return true;
+    }
+    return false;
+}
+
+/// Comparison operator presence, skipping shifts — `x << 2` is not a bound.
+fn hasComparisonOp(t: []const u8, op: u8) bool {
+    var pos: usize = 0;
+    while (mem.indexOfScalarPos(u8, t, pos, op)) |idx| {
+        pos = idx + 1;
+        if (idx + 1 < t.len and t[idx + 1] == op) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Exit keyword on the over-limit path: `if (x >= N) return/break/continue`.
+fn hasExitKeyword(t: []const u8) bool {
+    if (mem.indexOf(u8, t, "return") != null) return true;
+    if (mem.indexOf(u8, t, "break") != null) return true;
+    if (mem.indexOf(u8, t, "continue") != null) return true;
+    if (mem.indexOf(u8, t, "unreachable") != null) return true;
+    if (mem.indexOf(u8, t, "orelse") != null) return true;
+    return false;
+}
+
+/// `const x = 5;` / `comptime x = 5;` — a comptime-known value can never
+/// fail a cast, so its declaration line is itself the bounds proof.
+fn isConstLiteralInit(t: []const u8, ident: []const u8) bool {
+    var rest = t;
+    if (mem.startsWith(u8, rest, "comptime ")) rest = rest["comptime ".len..];
+    if (!mem.startsWith(u8, rest, "const ")) return false;
+    rest = rest["const ".len..];
+    if (!mem.startsWith(u8, rest, ident)) return false;
+    if (rest.len > ident.len and isIdent(rest[ident.len])) return false;
+    const eq = mem.indexOfScalar(u8, rest, '=') orelse return false;
+    var i = eq + 1;
+    while (i < rest.len and (rest[i] == ' ' or rest[i] == '\t')) i += 1;
+    if (i >= rest.len) return false;
+    return std.ascii.isDigit(rest[i]);
+}
+
+/// `for (0..N) |i|` — a range-for bounds its INDEX capture to [0, N).
+/// Only the last capture name is the index, and only when the for-expression
+/// is a range: `for (items) |item|` bounds nothing about the item's value
+/// (abi ans.zig: an element cast there is a real overflow risk).
+fn isForRangeIndex(t: []const u8, ident: []const u8) bool {
+    const for_pos = mem.indexOf(u8, t, "for (") orelse return false;
+    const first = mem.indexOfScalarPos(u8, t, for_pos, '|') orelse return false;
+    const rest = t[first + 1 ..];
+    const close = mem.indexOfScalar(u8, rest, '|') orelse return false;
+    const expr = t[for_pos..first];
+    if (mem.indexOf(u8, expr, "..") == null) return false;
+    var last = mem.trim(u8, rest[0..close], " ");
+    if (mem.lastIndexOfScalar(u8, last, ',')) |comma| {
+        last = mem.trim(u8, last[comma + 1 ..], " ");
+    }
+    return mem.eql(u8, last, ident);
+}
+
+/// Does this line bound the casted value? Any one guard class suffices:
+/// comparison against an upper limit (`x < N`, `x <= N`), an exit guard on
+/// the over-limit path (`if (x >= N) return`), a maxInt/minInt comparison,
+/// @min/@max clamping, a std.math.cast checked conversion, a range-for
+/// index capture (`for (0..N) |i|`), or a const-from-literal declaration
+/// (comptime-known value).
+fn lineBoundsCastValue(t: []const u8, ident: []const u8) bool {
+    if (!mentionsIdent(t, ident)) return false;
+    if (mem.indexOf(u8, t, "std.math.cast(") != null) return true;
+    if (mem.indexOf(u8, t, "@min(") != null) return true;
+    if (mem.indexOf(u8, t, "@max(") != null) return true;
+    if (mem.indexOf(u8, t, "maxInt") != null) return true;
+    if (mem.indexOf(u8, t, "minInt") != null) return true;
+    if (hasComparisonOp(t, '<')) return true;
+    if (hasComparisonOp(t, '>') and hasExitKeyword(t)) return true;
+    if (isConstLiteralInit(t, ident)) return true;
+    if (isForRangeIndex(t, ident)) return true;
+    return false;
+}
+
+/// Bounded lookback (10 lines) over the current line's prefix and the
+/// enclosing block's preceding lines for a bounds proof on `ident`.
+/// Stops at function boundaries — a guard in another function proves
+/// nothing. Comment/multiline-string lines are skipped with the same
+/// discipline as the detection pass (patterns.md F1).
+fn hasCastBoundsProof(
+    lines: []const []const u8,
+    idx: usize,
+    cast_col: usize,
+    ident: []const u8,
+) bool {
+    const prefix = mem.trim(u8, lines[idx][0..cast_col], " \t\r");
+    if (lineBoundsCastValue(prefix, ident)) return true;
+    const lookback = 10;
+    const start = if (idx > lookback) idx - lookback else 0;
+    var i = idx;
+    while (i > start) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (isFuncBoundary(t)) return false;
+        if (lineBoundsCastValue(t, ident)) return true;
+    }
+    return false;
+}
+
+/// Per-file sink shared by the ZA904 line checks (keeps arity ≤ 4).
+const CastSink = struct {
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    path: []const u8,
+};
+
+const CastNeedle = struct {
+    needle: []const u8,
+    msg: []const u8,
+};
+
+/// @truncate cannot panic — it is defined to discard high bits — so its
+/// message names the real defect (silent data loss), not a panic.
+const cast_needles = [_]CastNeedle{
+    .{
+        .needle = "@intCast(",
+        .msg = "@intCast without bounds proof may panic in safe builds",
+    },
+    .{
+        .needle = "@truncate(",
+        .msg = "@truncate silently drops high bits without bounds proof",
+    },
+};
+
+/// ZA904: scan one line for one builtin's call sites; report when unguarded.
+fn checkCastNeedleOnLine(
+    sink: CastSink,
+    lines: []const []const u8,
+    idx: usize,
+    n: CastNeedle,
+) !void {
+    const line = lines[idx];
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, line, pos, n.needle)) |col| {
+        pos = col + n.needle.len;
+        if (isInsideString(line, col)) continue;
+        if (isInTrailingComment(line, col)) continue;
+        const ident = extractCastIdent(line, col + n.needle.len - 1) orelse continue;
+        if (hasCastBoundsProof(lines, idx, col, ident)) continue;
+        try sink.issues.append(sink.allocator, .{
+            .file = sink.path,
+            .line = idx + 1,
+            .col = col + 1,
+            .severity = .note,
+            .rule = RULE_INTCAST_NO_BOUNDS,
+            .message = n.msg,
+            .help = "guard against the target type's limit, " ++
+                "clamp with @min/@max, or use std.math.cast",
+        });
+    }
+}
+
+/// ZA904: check one line for unguarded @intCast/@truncate call sites.
+fn checkIntCastGuards(sink: CastSink, lines: []const []const u8, idx: usize) !void {
+    for (cast_needles) |n| try checkCastNeedleOnLine(sink, lines, idx, n);
+}
+
+/// ZA904 (opt-in note): @intCast/@truncate without a textual bounds proof.
+/// Off by default via the ZA9 prefix in Config.off_by_default_prefixes.
+fn analyzeIntCastGuards(
+    allocator: Allocator,
+    graph: *ImportGraph,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    var iter = graph.files.iterator();
+    while (iter.next()) |entry| {
+        const a = entry.value_ptr.*;
+        var lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer lines_list.deinit(allocator);
+        var split = mem.splitScalar(u8, a.content, '\n');
+        while (split.next()) |line| try lines_list.append(allocator, line);
+        const lines = lines_list.items;
+        const sink = CastSink{ .issues = &issues, .allocator = allocator, .path = a.path };
+        for (lines, 0..) |line, idx| {
+            const t = mem.trim(u8, line, " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            // ZA9xx family convention: assertion lines construct fixtures.
+            if (mem.indexOf(u8, t, "testing.expect") != null) continue;
+            try checkIntCastGuards(sink, lines, idx);
+        }
+    }
+    return issues;
+}
+
 fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
 
@@ -18051,10 +18334,12 @@ fn writeDefaultConfig() !void {
         \\  //   ZA5xx Structure:  ZA501 orphan-file
         \\  //   ZA6xx Format:     ZA601 needs-format,
         \\  //                     ZA607 read-before-assign (semantic, not formatting)
-        \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long, ZA703 naming
+        \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long,
+        \\  //                     ZA703 naming, ZA704 debug-print
         \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
         \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
-        \\  //                     ZA903 index-arithmetic
+        \\  //                     ZA903 index-arithmetic,
+        \\  //                     ZA904 intcast-no-bounds (note, OFF by default)
         \\  //   ZT1xx Tests:      ZT101 lie-test (name promises fn body never calls),
         \\  //                     ZT102 no-assertions (note for try-only smoke tests),
         \\  //                     ZT103 trivially-true-assert, ZT104 swallowed-error,
@@ -19724,7 +20009,8 @@ fn printHelp() void {
         \\                     ZA210: no-catch-return (note, off by default))
         \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap, ZA802: unsafe-deref)
         \\  ZA9xx  Panic      (ZA901: decrement-no-guard, ZA902: subtraction-overflow,
-        \\                     ZA903: index-arithmetic)
+        \\                     ZA903: index-arithmetic,
+        \\                     ZA904: intcast-no-bounds (note, off by default))
         \\  ZA3xx  Complexity (ZA301: func-too-long, ZA302: nesting-too-deep,
         \\                     ZA303: too-many-params, ZA304: too-many-branches,
         \\                     ZA305: cyclomatic (off by default), ZA306: cognitive (off by default))
@@ -19733,7 +20019,8 @@ fn printHelp() void {
         \\  ZA5xx  Structure  (ZA501: orphan-file)
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
-        \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long, ZA703: naming)
+        \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long,
+        \\                     ZA703: naming, ZA704: debug-print)
         \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
         \\                     ZR103: use-after-free, ZR104: test-failure,
         \\                     ZR105: panic)
@@ -20435,6 +20722,13 @@ pub fn main(init: std.process.Init) !void {
                 // Covers: alloc/create without defer, errdefer gaps, leaks, UAF, double-free
                 var cfg_mem_issues = try analyzeCFGMemory(alloc, &g);
                 defer deinitIssues(&cfg_mem_issues, alloc);
+
+                // ZA904 (opt-in note): appended into the CFG list so it flows
+                // through the ZA9 → panic category filter and the export list.
+                // Messages are static (not owned), so both lists deinit safely.
+                var cast_issues = try analyzeIntCastGuards(alloc, &g);
+                defer cast_issues.deinit(alloc);
+                for (cast_issues.items) |ci| try cfg_mem_issues.append(alloc, ci);
 
                 var err_issues = try analyzeErrors(alloc, &g);
                 defer deinitIssues(&err_issues, alloc);
@@ -32526,4 +32820,390 @@ test "ZA210: off by default; explicit enable turns it on" {
 
     try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_NO_CATCH_RETURN));
     try std.testing.expect(cfg.isRuleEnabled(RULE_NO_CATCH_RETURN));
+}
+
+// ============================================================================
+// ZA704 / ZA904 tests
+// ============================================================================
+
+/// Default-config builder for rule-gating tests (no allocations to free).
+fn testConfig() Config {
+    return .{
+        .command = .check,
+        .path = "src",
+        .path_owned = false,
+        .entries = .empty,
+        .exclude = .empty,
+        .orphan_exclude = .empty,
+        .disabled_rules = .empty,
+        .enabled_rules = .empty,
+        .verbose = false,
+        .show_summary = false,
+        .format = .text,
+        .thresholds = .{},
+        .init_build = false,
+        .export_path = null,
+        .known_issues_path = null,
+        .known_issues = .empty,
+        .auto_approve = false,
+        .runtime_command = null,
+        .install_version = null,
+    };
+}
+
+/// Test helper: build a one-file graph and run analyzeStyle (ZA701-ZA704).
+fn runStyleTest(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !CFGTestRun {
+    var graph = ImportGraph.init(allocator);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var issues = try analyzeStyle(allocator, &graph, .{});
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
+/// Test helper: build a one-file graph and run analyzeIntCastGuards (ZA904).
+fn runIntCastTest(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !CFGTestRun {
+    var graph = ImportGraph.init(allocator);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var issues = try analyzeIntCastGuards(allocator, &graph);
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
+test "ZA704: std.debug.print fires outside test blocks" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn diag() void {
+        \\    std.debug.print("x", .{});
+        \\}
+        \\fn two() void { std.debug.print("a", .{}); std.debug.print("b", .{}); }
+    ;
+    var run = try runStyleTest(allocator, "app_widget.zig", content);
+    defer run.deinit(allocator);
+
+    const n = countRuleIssues(run.issues.items, "app_widget.zig", RULE_DEBUG_PRINT);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    // Exact sites: line 2 col 5, and two hits on line 4 (multi-occurrence).
+    try std.testing.expectEqual(@as(usize, 2), run.issues.items[0].line);
+    try std.testing.expectEqual(@as(usize, 5), run.issues.items[0].col);
+    try std.testing.expectEqual(@as(usize, 4), run.issues.items[1].line);
+    try std.testing.expectEqual(@as(usize, 4), run.issues.items[2].line);
+}
+
+test "ZA704: silent inside test blocks and test file paths" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\test "prints freely" {
+        \\    std.debug.print("x", .{});
+        \\}
+        \\fn helper() void {
+        \\    std.debug.print("still a test file", .{});
+        \\}
+    ;
+    // Inside a test block: suppressed by block tracking.
+    var run = try runStyleTest(allocator, "app_widget.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_widget.zig", RULE_DEBUG_PRINT),
+    );
+
+    // Same content in a _test.zig path: everything suppressed by path.
+    var run2 = try runStyleTest(allocator, "widget_test.zig", content);
+    defer run2.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run2.issues.items, "widget_test.zig", RULE_DEBUG_PRINT),
+    );
+}
+
+test "ZA704: string and comment forms stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn f() void {
+        \\    const s = "std.debug.print(";
+        \\    _ = s;
+        \\}
+        \\// std.debug.print("x", .{});
+        \\fn g() void {
+        \\    var n: u32 = 1; // std.debug.print("y", .{});
+        \\    _ = n;
+        \\}
+    ;
+    var run = try runStyleTest(allocator, "app_strings.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_strings.zig", RULE_DEBUG_PRINT),
+    );
+}
+
+test "ZA704: different receiver and glued prefix stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `myapp.debug.print(` is a different receiver; `xstd.debug.print(` only
+    // contains the needle as a substring — the boundary check must reject it.
+    const content =
+        \\fn f() void {
+        \\    myapp.debug.print("x", .{});
+        \\    xstd.debug.print("y", .{});
+        \\}
+    ;
+    var run = try runStyleTest(allocator, "app_receivers.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_receivers.zig", RULE_DEBUG_PRINT),
+    );
+}
+
+test "ZA704: on by default, ZA904: off by default via ZA9 prefix" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+
+    try std.testing.expect(cfg.isRuleEnabled(RULE_DEBUG_PRINT));
+    try std.testing.expect(cfg.isRuleDisabled(RULE_INTCAST_NO_BOUNDS));
+
+    try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, RULE_INTCAST_NO_BOUNDS));
+    try std.testing.expect(cfg.isRuleEnabled(RULE_INTCAST_NO_BOUNDS));
+}
+
+test "ZA904: unguarded @intCast fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn shrink(x: u32) u8 {
+        \\    return @as(u8, @intCast(x));
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_cast.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_cast.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+    const issue = run.issues.items[0];
+    try std.testing.expectEqual(@as(usize, 2), issue.line);
+    try std.testing.expectEqual(@as(usize, 20), issue.col);
+    try std.testing.expectEqual(Severity.note, issue.severity);
+    try std.testing.expect(mem.indexOf(u8, issue.message, "@intCast") != null);
+}
+
+test "ZA904: comparison guards stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same-line guard (x < 256) and preceding exit guard (x >= 256 return).
+    const content =
+        \\fn same_line(x: u32) u8 {
+        \\    var y: u8 = 0;
+        \\    if (x < 256) y = @intCast(x);
+        \\    return y;
+        \\}
+        \\fn block_form(x: u32) u8 {
+        \\    if (x >= 256) return 0;
+        \\    return @as(u8, @intCast(x));
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_guarded.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_guarded.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: @min clamp and std.math.cast stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn clamped(x: u32) u8 {
+        \\    const c = @min(x, 255);
+        \\    return @as(u8, @intCast(c));
+        \\}
+        \\fn checked(x: u32) u8 {
+        \\    const v = std.math.cast(u8, x) orelse return 0;
+        \\    return @as(u8, @intCast(x));
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_clamp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_clamp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: comptime-known literals stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Direct literal arg (not an identifier — skipped) and const-from-literal
+    // declaration (value comptime-known — the decl line is the proof).
+    const content =
+        \\fn direct() u8 {
+        \\    return @as(u8, @intCast(5));
+        \\}
+        \\fn from_const() u8 {
+        \\    const x = 5;
+        \\    return @as(u8, @intCast(x));
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_literal.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_literal.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: @truncate without proof fires with data-loss message" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn trunc(x: u32) u8 {
+        \\    return @as(u8, @truncate(x));
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_trunc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_trunc.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+    // @truncate cannot panic — the message must name the real defect.
+    try std.testing.expect(mem.indexOf(u8, run.issues.items[0].message, "drops high bits") != null);
+}
+
+test "ZA904: string, comment, and expression forms stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `@intCast(x + 1)` — non-identifier arg, skipped silently (documented).
+    const content =
+        \\fn forms(x: u32) u8 {
+        \\    const s = "@intCast(x)";
+        \\    _ = s;
+        \\    // @intCast(x)
+        \\    return @as(u8, @intCast(x + 1));
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_forms.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_forms.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: guard for a different variable does not suppress" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The guard bounds z, not the casted x — must still fire (proves the
+    // suppression is ident-scoped, not vacuous).
+    const content =
+        \\fn other_var(x: u32, z: u32) u8 {
+        \\    if (z < 256) return @as(u8, @intCast(x));
+        \\    return 0;
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_other.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_other.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: maxInt guard and testing.expect lines stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn capped(x: u32) u8 {
+        \\    if (x <= std.math.maxInt(u8)) return @as(u8, @intCast(x));
+        \\    return 0;
+        \\}
+        \\test "fixtures" {
+        \\    const x: u32 = 3;
+        \\    try testing.expectEqual(@as(u8, 3), @intCast(x));
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_maxint.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_maxint.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: range-for index casts stay silent, item casts still fire" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `for (0..N) |i|` bounds i to [0, N) — a textual proof. `for (freq) |f|`
+    // bounds nothing about the element value (abi ans.zig real-risk class).
+    const content =
+        \\fn range_index(n: usize) void {
+        \\    for (0..n) |i| {
+        \\        use(@intCast(i));
+        \\    }
+        \\}
+        \\fn item_cast(freq: []const u32) void {
+        \\    for (freq) |f| {
+        \\        use16(@intCast(f));
+        \\    }
+        \\}
+    ;
+    var run = try runIntCastTest(allocator, "app_forloop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_forloop.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+    try std.testing.expectEqual(@as(usize, 8), run.issues.items[0].line);
 }

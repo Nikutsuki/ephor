@@ -650,6 +650,21 @@ const CFGBuildCtx = struct {
         self.current_block = catch_block;
         self.setStartLine(line);
     }
+
+    fn dispatchPattern(self: *CFGBuildCtx, pattern: CFPattern, t: []const u8, line: usize) !void {
+        switch (pattern) {
+            .if_start => try self.handleBranch(.if_block, line),
+            .while_start => try self.handleBranch(.while_block, line),
+            .for_start => try self.handleBranch(.for_block, line),
+            .switch_start => try self.handleSwitchStart(),
+            .switch_arm => try self.handleSwitchArm(line),
+            .else_start, .else_if => try self.handleElse(t, line),
+            .return_stmt => try self.handleReturn(),
+            .block_end => try self.handleBlockEnd(line),
+            .catch_start => try self.handleCatchStart(line),
+            else => {},
+        }
+    }
 };
 
 fn hasInlineElseReturn(t: []const u8) bool {
@@ -685,19 +700,7 @@ fn buildCFG(
         if (isCommentOrMultilineString(t)) continue;
         const pattern = detectCFPattern(t);
         cfg.blocks.items[ctx.current_block].end_line = func_line + idx;
-        const al = func_line + idx;
-        switch (pattern) {
-            .if_start => try ctx.handleBranch(.if_block, al),
-            .while_start => try ctx.handleBranch(.while_block, al),
-            .for_start => try ctx.handleBranch(.for_block, al),
-            .switch_start => try ctx.handleSwitchStart(),
-            .switch_arm => try ctx.handleSwitchArm(al),
-            .else_start, .else_if => try ctx.handleElse(t, al),
-            .return_stmt => try ctx.handleReturn(),
-            .block_end => try ctx.handleBlockEnd(al),
-            .catch_start => try ctx.handleCatchStart(al),
-            else => {},
-        }
+        try ctx.dispatchPattern(pattern, t, func_line + idx);
     }
 
     if (cfg.exit_blocks.items.len == 0)

@@ -6448,52 +6448,54 @@ fn extractFnName(t: []const u8) ?[]const u8 {
     return after_fn[0..end];
 }
 
+/// Strategy A: explicit annotation — extract the type from `var x: TypeName = ...`.
+/// `after_name` is the trimmed slice following the declared name.
+fn explicitAnnotTypeName(after_name: []const u8) ?[]const u8 {
+    if (after_name.len == 0 or after_name[0] != ':') return null;
+    const type_start = mem.trim(u8, after_name[1..], " \t");
+    var ts: usize = 0;
+    // Exactly one pointer marker, then one optional marker — order matters.
+    if (ts < type_start.len and type_start[ts] == '*') ts += 1;
+    if (ts < type_start.len and type_start[ts] == '?') ts += 1;
+    var te: usize = ts;
+    while (te < type_start.len and isIdent(type_start[te])) te += 1;
+    if (te == ts) return null;
+    return type_start[ts..te];
+}
+
+/// Strategy B: RHS inference — extract the type from `var x = TypeName.init(...)`,
+/// `var x = TypeName{...}`, or a generic `var x = TypeName(...)`.
+fn rhsInferTypeName(t: []const u8) ?[]const u8 {
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
+    const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+    if (rhs.len == 0) return null;
+    // Type names are PascalCase in Zig.
+    if (rhs[0] < 'A' or rhs[0] > 'Z') return null;
+    var rhs_end: usize = 0;
+    while (rhs_end < rhs.len and isIdent(rhs[rhs_end])) rhs_end += 1;
+    if (rhs_end == 0) return null;
+    // Follower must be .method(, {, or generic (.
+    if (rhs_end >= rhs.len) return null;
+    const next_char = rhs[rhs_end];
+    if (next_char == '{' or next_char == '(') return rhs[0..rhs_end];
+    if (next_char == '.') return rhs[0..rhs_end];
+    return null;
+}
+
 /// Extract the type name from a variable declaration's right-hand side.
 /// Handles: `var x: TypeName = ...`, `var x = TypeName.init(...)`, `var x = TypeName{...}`
 fn extractVarTypeName(t: []const u8) ?[]const u8 {
-    // Must be a var/const declaration
     const is_var = mem.startsWith(u8, t, "var ");
     const is_const = mem.startsWith(u8, t, "const ");
     if (!is_var and !is_const) return null;
 
-    // Check for explicit type annotation: var x: TypeName = ...
     const prefix_len: usize = if (is_var) 4 else 6;
     var name_end = prefix_len;
     while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
     if (name_end <= prefix_len) return null;
     const after_name = mem.trim(u8, t[name_end..], " \t");
-    if (after_name.len > 0 and after_name[0] == ':') {
-        // Explicit type annotation
-        const type_start_raw = after_name[1..];
-        const type_start = mem.trim(u8, type_start_raw, " \t");
-        // Skip pointer/optional markers for the type name
-        var ts: usize = 0;
-        if (ts < type_start.len and type_start[ts] == '*') ts += 1;
-        if (ts < type_start.len and type_start[ts] == '?') ts += 1;
-        var te: usize = ts;
-        while (te < type_start.len and isIdent(type_start[te])) te += 1;
-        if (te > ts) return type_start[ts..te];
-    }
-
-    // Check for TypeName.init( or TypeName{ patterns
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
-    const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
-    if (rhs.len == 0) return null;
-    // Must start with uppercase (type names are PascalCase in Zig)
-    if (rhs[0] < 'A' or rhs[0] > 'Z') return null;
-    // Extract the type identifier
-    var rhs_end: usize = 0;
-    while (rhs_end < rhs.len and isIdent(rhs[rhs_end])) rhs_end += 1;
-    if (rhs_end == 0) return null;
-    // Must be followed by .init(, {, or ( (generic type)
-    if (rhs_end >= rhs.len) return null;
-    const next_char = rhs[rhs_end];
-    if (next_char == '{' or next_char == '(') return rhs[0..rhs_end];
-    if (next_char == '.') {
-        // TypeName.init( or TypeName.method(
-        return rhs[0..rhs_end];
-    }
-    return null;
+    if (explicitAnnotTypeName(after_name)) |name| return name;
+    return rhsInferTypeName(t);
 }
 
 /// Build TypeContext from file content. Parses struct method signatures,
@@ -24416,6 +24418,18 @@ test "extractVarTypeName extracts struct literal patterns" {
 test "extractVarTypeName returns null for non-type RHS" {
     try std.testing.expect(extractVarTypeName("var x = some_func();") == null);
     try std.testing.expect(extractVarTypeName("var x = 42;") == null);
+}
+
+test "extractVarTypeName falls through to RHS when annotation yields no ident" {
+    const t1 = extractVarTypeName("var x: * = Foo.init();");
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("Foo", t1.?);
+}
+
+test "extractVarTypeName skips pointer then optional markers" {
+    const t1 = extractVarTypeName("var p: *?Widget = undefined;");
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("Widget", t1.?);
 }
 
 test "extractMethodCall extracts receiver and method" {

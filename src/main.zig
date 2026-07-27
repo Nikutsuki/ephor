@@ -13706,12 +13706,7 @@ fn isClosureWrappingType(content: []const u8, kw_end: usize) bool {
             continue;
         }
         if (c == '(') {
-            var pdepth: usize = 1;
-            i += 1;
-            while (i < content.len and pdepth > 0) : (i += 1) {
-                const cc = content[i];
-                if (cc == '(') pdepth += 1 else if (cc == ')') pdepth -= 1;
-            }
+            i = skipParenGroup(content, i);
             continue;
         }
         break;
@@ -13774,16 +13769,31 @@ fn isClosureWrappingType(content: []const u8, kw_end: usize) bool {
         if (c == '}') {
             if (depth == 0) return false;
             depth -= 1;
-            if (depth == 0) {
-                var j = i + 1;
-                while (j < content.len) : (j += 1) {
-                    const cc = content[j];
-                    if (cc == ' ' or cc == '\t' or cc == '\r' or cc == '\n') continue;
-                    return cc == '.';
-                }
-                return false;
-            }
+            if (depth == 0) return nextNonWsIsDot(content, i + 1);
         }
+    }
+    return false;
+}
+
+/// Skip a `(...)` group starting at content[start] == '('.
+fn skipParenGroup(content: []const u8, start: usize) usize {
+    var pdepth: usize = 1;
+    var i = start + 1;
+    while (i < content.len and pdepth > 0) : (i += 1) {
+        const cc = content[i];
+        if (cc == '(') pdepth += 1 else if (cc == ')') pdepth -= 1;
+    }
+    return i;
+}
+
+/// After a type body closes at content[start-1], the next non-ws char must
+/// be '.' for a closure-wrapping alias (`}.call;`).
+fn nextNonWsIsDot(content: []const u8, start: usize) bool {
+    var j = start;
+    while (j < content.len) : (j += 1) {
+        const cc = content[j];
+        if (cc == ' ' or cc == '\t' or cc == '\r' or cc == '\n') continue;
+        return cc == '.';
     }
     return false;
 }
@@ -15221,14 +15231,12 @@ fn isSafeStdlibLiteralCall(t: []const u8, preceding_lines: ?[]const []const u8) 
         "parseInt(", "parseUnsigned(",
     };
     for (safe_fns) |fn_name| {
-        if (mem.indexOf(u8, call_line, fn_name)) |pos| {
-            if (!isInsideString(call_line, pos)) {
-                // Verify first argument is a string literal
-                const after = call_line[pos + fn_name.len ..];
-                const trimmed = mem.trim(u8, after, " \t");
-                if (mem.startsWith(u8, trimmed, "\"")) return true;
-            }
-        }
+        const pos = mem.indexOf(u8, call_line, fn_name) orelse continue;
+        if (isInsideString(call_line, pos)) continue;
+        // Verify first argument is a string literal
+        const after = call_line[pos + fn_name.len ..];
+        const trimmed = mem.trim(u8, after, " \t");
+        if (mem.startsWith(u8, trimmed, "\"")) return true;
     }
     return false;
 }
@@ -15941,84 +15949,67 @@ fn extractGuardedVar(t: []const u8) ?[]const u8 {
     // Pattern: x > 0 or x >= 1 or x != 0
     const guard_patterns = [_][]const u8{ "> 0", ">0", ">= 1", ">=1", "!= 0", "!=0" };
     for (guard_patterns) |pattern| {
-        if (mem.indexOf(u8, t, pattern)) |pos| {
-            // Look backwards for identifier
-            var end = pos;
-            while (end > 0 and t[end - 1] == ' ') end -= 1;
-            var start = end;
-            while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-                start -= 1;
-            }
-            if (start < end) return t[start..end];
-        }
+        const pos = mem.indexOf(u8, t, pattern) orelse continue;
+        const start = identStartBefore(t, pos) orelse continue;
+        var end = pos;
+        while (end > 0 and t[end - 1] == ' ') end -= 1;
+        return t[start..end];
     }
 
     // Pattern: x.len > N (any positive number) - length guards
-    // Find patterns like "x.len > " or "x.len >= " followed by digit
-    if (mem.indexOf(u8, t, ".len >")) |pos| {
-        // Check if followed by a digit (any threshold)
-        const after = pos + ".len >".len;
-        if (after < t.len) {
-            var check_pos = after;
-            // Skip optional '=' for >=
-            if (check_pos < t.len and t[check_pos] == '=') check_pos += 1;
-            // Skip space
-            while (check_pos < t.len and t[check_pos] == ' ') check_pos += 1;
-            // Must be followed by a digit
-            if (check_pos < t.len and t[check_pos] >= '0' and t[check_pos] <= '9') {
-                // Extract the variable before .len
-                var end = pos;
-                while (end > 0 and t[end - 1] == ' ') end -= 1;
-                var start = end;
-                while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-                    start -= 1;
-                }
-                if (start < end) {
-                    // Return "x.len" as the guarded variable
-                    const base = t[start..end];
-                    _ = base; // We want to return x.len, not just x
-                    return t[start .. pos + ".len".len];
-                }
-            }
-        }
-    }
+    if (extractLenGuard(t)) |len_name| return len_name;
 
     // Pattern: x > variable or x >= variable (not just literal 0)
     // Handles: while (i > check_start), if (x > min_val)
     const var_guard_patterns = [_][]const u8{ "> ", ">= " };
     for (var_guard_patterns) |pattern| {
-        if (mem.indexOf(u8, t, pattern)) |pos| {
-            // Check that RHS is an identifier (not a literal 0 - already handled above)
-            const rhs_start = pos + pattern.len;
-            if (rhs_start < t.len and isIdent(t[rhs_start])) {
-                // Extract LHS variable
-                var end = pos;
-                while (end > 0 and t[end - 1] == ' ') end -= 1;
-                var start = end;
-                while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-                    start -= 1;
-                }
-                if (start < end) return t[start..end];
-            }
-        }
+        const pos = mem.indexOf(u8, t, pattern) orelse continue;
+        // Check that RHS is an identifier (not a literal 0 - already handled above)
+        const rhs_start = pos + pattern.len;
+        if (rhs_start >= t.len or !isIdent(t[rhs_start])) continue;
+        // Extract LHS variable
+        const start = identStartBefore(t, pos) orelse continue;
+        var end = pos;
+        while (end > 0 and t[end - 1] == ' ') end -= 1;
+        return t[start..end];
     }
 
     // Pattern: if (x == 0) return/break/continue - early exit guard (inverted check)
     // After this line, x != 0 is true
     const early_exit_patterns = [_][]const u8{ "== 0) return", "== 0) break", "== 0) continue" };
     for (early_exit_patterns) |pattern| {
-        if (mem.indexOf(u8, t, pattern)) |pos| {
-            // Find opening paren
-            if (mem.lastIndexOf(u8, t[0..pos], "(")) |paren_pos| {
-                const var_part = mem.trim(u8, t[paren_pos + 1 .. pos], " \t");
-                if (var_part.len > 0 and isIdent(var_part[0])) {
-                    return var_part;
-                }
-            }
-        }
+        const pos = mem.indexOf(u8, t, pattern) orelse continue;
+        // Find opening paren
+        const paren_pos = mem.lastIndexOf(u8, t[0..pos], "(") orelse continue;
+        const var_part = mem.trim(u8, t[paren_pos + 1 .. pos], " \t");
+        if (var_part.len > 0 and isIdent(var_part[0])) return var_part;
     }
 
     return null;
+}
+
+/// Start index of the identifier (incl. dots) immediately before `end`, or
+/// null when there is none. Spaces between the identifier and `end` are skipped.
+fn identStartBefore(t: []const u8, end: usize) ?usize {
+    var e = end;
+    while (e > 0 and t[e - 1] == ' ') e -= 1;
+    var start = e;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) start -= 1;
+    if (start >= e) return null;
+    return start;
+}
+
+/// "x.len > N" / "x.len >= N" length guard → "x.len".
+fn extractLenGuard(t: []const u8) ?[]const u8 {
+    const pos = mem.indexOf(u8, t, ".len >") orelse return null;
+    var check_pos = pos + ".len >".len;
+    // Skip optional '=' for >=
+    if (check_pos < t.len and t[check_pos] == '=') check_pos += 1;
+    while (check_pos < t.len and t[check_pos] == ' ') check_pos += 1;
+    // Must be followed by a digit
+    if (check_pos >= t.len or t[check_pos] < '0' or t[check_pos] > '9') return null;
+    const start = identStartBefore(t, pos) orelse return null;
+    return t[start .. pos + ".len".len];
 }
 
 /// Extract variable being decremented

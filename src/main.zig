@@ -13721,9 +13721,47 @@ fn isClosureFunctionAlias(line: []const u8, content: []const u8, line_offset: us
 /// after its matching `}` — the closure-wrapper pattern used for function aliases.
 fn isClosureWrappingType(content: []const u8, kw_end: usize) bool {
     if (kw_end >= content.len) return false;
+    const body_start = findTypeBodyBrace(content, kw_end);
+    if (body_start >= content.len or content[body_start] != '{') return false;
+    var scan: ClosureBodyScan = .{};
+    var i = body_start;
+    while (i < content.len) : (i += 1) {
+        if (scanSwallowComment(&scan, content[i])) continue;
+        if (scanSkipQuoted(&scan, content, i)) |extra| {
+            i += extra;
+            continue;
+        }
+        if (scanStartComment(&scan, content, i)) |extra| {
+            i += extra;
+            continue;
+        }
+        const c = content[i];
+        if (c == '{') {
+            scan.depth += 1;
+            continue;
+        }
+        if (c != '}') continue;
+        if (scan.depth == 0) return false;
+        scan.depth -= 1;
+        if (scan.depth == 0) return nextNonWsIsDot(content, i + 1);
+    }
+    return false;
+}
+
+/// Mutable state for the type-body brace trace: quote/comment modes are
+/// mutually exclusive, so each scan step consults at most one mode.
+const ClosureBodyScan = struct {
+    depth: usize = 0,
+    in_str: bool = false,
+    in_char: bool = false,
+    in_line_comment: bool = false,
+    in_ml_str: bool = false,
+};
+
+/// Skip whitespace and optional `(...)` groups after the keyword (e.g.
+/// `enum(u8)`, `packed struct(u32)`) up to the type body's opening `{`.
+fn findTypeBodyBrace(content: []const u8, kw_end: usize) usize {
     var i = kw_end;
-    // Skip optional `(...)` after the keyword (e.g. `enum(u8)`, `packed struct(u32)`)
-    // and any whitespace, until we land on the type body's opening `{`.
     while (i < content.len) {
         const c = content[i];
         if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
@@ -13736,68 +13774,56 @@ fn isClosureWrappingType(content: []const u8, kw_end: usize) bool {
         }
         break;
     }
-    if (i >= content.len or content[i] != '{') return false;
+    return i;
+}
 
-    // Trace matching `}` with rudimentary string/char/comment/multiline-string skipping.
-    var depth: usize = 0;
-    var in_str = false;
-    var in_char = false;
-    var in_line_comment = false;
-    var in_ml_str = false;
-    while (i < content.len) : (i += 1) {
-        const c = content[i];
-        if (in_line_comment or in_ml_str) {
-            if (c == '\n') {
-                in_line_comment = false;
-                in_ml_str = false;
-            }
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\' and i + 1 < content.len) {
-                i += 1;
-                continue;
-            }
-            if (c == '"') in_str = false;
-            continue;
-        }
-        if (in_char) {
-            if (c == '\\' and i + 1 < content.len) {
-                i += 1;
-                continue;
-            }
-            if (c == '\'') in_char = false;
-            continue;
-        }
-        if (c == '/' and i + 1 < content.len and content[i + 1] == '/') {
-            in_line_comment = true;
-            i += 1;
-            continue;
-        }
-        if (c == '\\' and i + 1 < content.len and content[i + 1] == '\\') {
-            in_ml_str = true;
-            i += 1;
-            continue;
-        }
-        if (c == '"') {
-            in_str = true;
-            continue;
-        }
-        if (c == '\'') {
-            in_char = true;
-            continue;
-        }
-        if (c == '{') {
-            depth += 1;
-            continue;
-        }
-        if (c == '}') {
-            if (depth == 0) return false;
-            depth -= 1;
-            if (depth == 0) return nextNonWsIsDot(content, i + 1);
-        }
+/// Swallow one char inside a `//` or `\\\\` run; both end at newline.
+fn scanSwallowComment(scan: *ClosureBodyScan, c: u8) bool {
+    if (!scan.in_line_comment and !scan.in_ml_str) return false;
+    if (c == '\n') {
+        scan.in_line_comment = false;
+        scan.in_ml_str = false;
     }
-    return false;
+    return true;
+}
+
+/// Swallow one char inside a string/char literal (returns chars consumed
+/// beyond the caller's own +1), or enter one on its opening quote. Returns
+/// null when the char is outside any quote and not a quote opener.
+fn scanSkipQuoted(scan: *ClosureBodyScan, content: []const u8, i: usize) ?usize {
+    const c = content[i];
+    if (scan.in_str) {
+        if (c == '\\' and i + 1 < content.len) return 1;
+        if (c == '"') scan.in_str = false;
+        return 0;
+    }
+    if (scan.in_char) {
+        if (c == '\\' and i + 1 < content.len) return 1;
+        if (c == '\'') scan.in_char = false;
+        return 0;
+    }
+    if (c == '"') {
+        scan.in_str = true;
+        return 0;
+    }
+    if (c == '\'') {
+        scan.in_char = true;
+        return 0;
+    }
+    return null;
+}
+
+/// Enter a `//` or `\\\\` run (consuming its second char); null otherwise.
+fn scanStartComment(scan: *ClosureBodyScan, content: []const u8, i: usize) ?usize {
+    if (content[i] == '/' and i + 1 < content.len and content[i + 1] == '/') {
+        scan.in_line_comment = true;
+        return 1;
+    }
+    if (content[i] == '\\' and i + 1 < content.len and content[i + 1] == '\\') {
+        scan.in_ml_str = true;
+        return 1;
+    }
+    return null;
 }
 
 /// Skip a `(...)` group starting at content[start] == '('.

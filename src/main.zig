@@ -6961,6 +6961,15 @@ fn hasAmpBeforeChain(t: []const u8, i: usize) bool {
     return j < t.len and t[j] == '&';
 }
 
+/// Scan for `&var_name` anywhere in the line (pointer-to-buffer fills).
+fn hasAmpVar(t: []const u8, var_name: []const u8) bool {
+    var j: usize = 0;
+    while (j + var_name.len + 1 <= t.len) : (j += 1) {
+        if (t[j] == '&' and mem.eql(u8, t[j + 1 .. j + 1 + var_name.len], var_name)) return true;
+    }
+    return false;
+}
+
 /// Detect module-level variable assignment (singleton/global pattern)
 /// Pattern: identifier = alloc_name (no const/var keyword, not field assignment)
 fn isModuleLevelAssignment(t: []const u8, alloc_name: []const u8) bool {
@@ -7385,12 +7394,7 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
         mem.indexOf(u8, t, var_name) != null)
     {
         // Check if &var_name appears (pointer to buffer being filled)
-        var j: usize = 0;
-        while (j + var_name.len + 1 <= t.len) : (j += 1) {
-            if (t[j] == '&' and mem.eql(u8, t[j + 1 .. j + 1 + var_name.len], var_name)) {
-                return true;
-            }
-        }
+        if (hasAmpVar(t, var_name)) return true;
     }
 
     // Pattern 7: Crypto operations that fill output buffers
@@ -7404,12 +7408,7 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
         mem.indexOf(u8, t, var_name) != null)
     {
         // Check if &var_name appears
-        var j: usize = 0;
-        while (j + var_name.len + 1 <= t.len) : (j += 1) {
-            if (t[j] == '&' and mem.eql(u8, t[j + 1 .. j + 1 + var_name.len], var_name)) {
-                return true;
-            }
-        }
+        if (hasAmpVar(t, var_name)) return true;
     }
 
     // Pattern 8: Common init functions that fill via pointer
@@ -12713,6 +12712,16 @@ fn reportNamingIssue(
     });
 }
 
+/// Advance past a string literal starting at t[start] == '"'.
+fn skipStringLiteral(t: []const u8, start: usize) usize {
+    var i = start + 1;
+    while (i < t.len and t[i] != '"') {
+        if (t[i] == '\\' and i + 1 < t.len) i += 1;
+        i += 1;
+    }
+    return if (i < t.len) i + 1 else i;
+}
+
 /// Emit a naming-convention issue from a NamingLineCtx (keeps call sites
 /// brace-less so the struct literal doesn't inflate nesting).
 fn reportNaming(
@@ -12963,12 +12972,7 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
 
         // Skip string literals (simplified: anything starting with ")
         if (t[i] == '"') {
-            i += 1;
-            while (i < t.len and t[i] != '"') {
-                if (t[i] == '\\' and i + 1 < t.len) i += 1;
-                i += 1;
-            }
-            if (i < t.len) i += 1;
+            i = skipStringLiteral(t, i);
             continue;
         }
 

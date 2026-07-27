@@ -353,19 +353,18 @@ pub fn isInsideString(line: []const u8, col: usize) bool {
     var in_string = false;
     var i: usize = 0;
     while (i < col and i < line.len) : (i += 1) {
-        if (line[i] == '"') {
-            // Count consecutive backslashes before this quote
-            var backslash_count: usize = 0;
-            var j = i;
-            while (j > 0 and line[j - 1] == '\\') {
-                backslash_count += 1;
-                j -= 1;
-            }
-            // Quote is escaped only if odd number of backslashes
-            // Even backslashes = pairs of escaped backslashes, quote is real
-            if (backslash_count % 2 == 0) {
-                in_string = !in_string;
-            }
+        if (line[i] != '"') continue;
+        // Count consecutive backslashes before this quote
+        var backslash_count: usize = 0;
+        var j = i;
+        while (j > 0 and line[j - 1] == '\\') {
+            backslash_count += 1;
+            j -= 1;
+        }
+        // Quote is escaped only if odd number of backslashes
+        // Even backslashes = pairs of escaped backslashes, quote is real
+        if (backslash_count % 2 == 0) {
+            in_string = !in_string;
         }
     }
     return in_string;

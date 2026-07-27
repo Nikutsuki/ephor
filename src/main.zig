@@ -18831,13 +18831,11 @@ fn findBuildZigInsertionPoint(line_items: []const []const u8) ?usize {
 fn updateBuildFnScanBraces(scan: *BuildFnScan, trimmed: []const u8, idx: usize) void {
     for (trimmed) |c| {
         if (c == '{') scan.brace_depth += 1;
-        if (c == '}') {
-            scan.brace_depth -= 1;
-            if (scan.brace_depth == 0) {
-                scan.build_fn_end = idx;
-                scan.in_build_fn = false;
-            }
-        }
+        if (c != '}') continue;
+        scan.brace_depth -= 1;
+        if (scan.brace_depth != 0) continue;
+        scan.build_fn_end = idx;
+        scan.in_build_fn = false;
     }
 }
 
@@ -19176,14 +19174,12 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
     var block_end: ?usize = null;
 
     for (markers) |m| {
-        if (mem.indexOf(u8, content, m.start)) |sp| {
-            const end_search_start = sp + m.start.len;
-            if (mem.indexOf(u8, content[end_search_start..], m.end)) |ep| {
-                start_pos = sp;
-                block_end = end_search_start + ep + m.end.len;
-                break;
-            }
-        }
+        const sp = mem.indexOf(u8, content, m.start) orelse continue;
+        const end_search_start = sp + m.start.len;
+        const ep = mem.indexOf(u8, content[end_search_start..], m.end) orelse continue;
+        start_pos = sp;
+        block_end = end_search_start + ep + m.end.len;
+        break;
     }
 
     const sp = start_pos orelse return;

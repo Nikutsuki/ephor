@@ -17836,6 +17836,61 @@ fn findCommentStart(line: []const u8) ?usize {
     return null;
 }
 
+/// State for a scope-aware ignore: the directive's suppression lasts while
+/// the brace scope opened after it remains unclosed.
+const ScopeIgnore = struct {
+    depth: usize = 0,
+    active: bool = false,
+};
+
+/// File-level ignore-file directives apply anywhere in the file, so every
+/// line's comment is checked before per-line suppression runs.
+fn hasFileLevelIgnore(content: []const u8, rule: []const u8) bool {
+    var file_lines = mem.splitScalar(u8, content, '\n');
+    while (file_lines.next()) |line| {
+        const comment_start = findCommentStart(line) orelse continue;
+        const comment = line[comment_start..];
+        if (mem.indexOf(u8, comment, "ephor:ignore-file") != null and
+            checkFileIgnoreRule(comment, rule)) return true;
+    }
+    return false;
+}
+
+/// True when `line` is a comment-only line carrying an ignore/disable
+/// directive for `rule` — the form that suppresses the following line/scope.
+fn isIgnoreCommentLine(line: []const u8, rule: []const u8) bool {
+    const trimmed = mem.trimStart(u8, line, " \t");
+    return mem.startsWith(u8, trimmed, "//") and checkLineIgnore(line, rule);
+}
+
+/// `{` braces left unmatched at end of line; a `}` at depth 0 is ignored,
+/// matching the scope tracker's floor-at-zero counting.
+fn unmatchedOpenBraces(line: []const u8) usize {
+    var depth: usize = 0;
+    for (line) |ch| {
+        if (ch == '{') depth += 1;
+        if (ch == '}' and depth > 0) depth -= 1;
+    }
+    return depth;
+}
+
+/// Advance scope tracking across one line. True when the target line is
+/// inside the still-open scope or is the line that closes it. Scanning stops
+/// at the closing brace, so trailing text is not treated as scope content.
+fn consumeIgnoredScopeLine(scope: *ScopeIgnore, line: []const u8, is_target: bool) bool {
+    for (line) |ch| {
+        if (ch == '{') scope.depth += 1;
+        if (ch != '}') continue;
+        if (scope.depth == 0) continue;
+        scope.depth -= 1;
+        if (scope.depth == 0) {
+            scope.active = false;
+            return is_target;
+        }
+    }
+    return is_target;
+}
+
 /// Check if a line/block/file has an inline ignore directive for the given rule.
 ///
 /// Supports three forms:
@@ -17845,86 +17900,37 @@ fn findCommentStart(line: []const u8) ?usize {
 ///      If the next line doesn't open a scope, suppresses just the next line.
 ///   3. File-level: `// ephor:ignore-file ZA201` — suppresses entire file
 fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool {
-    // First pass: check for file-level ignores (can appear anywhere in file)
-    var file_lines = mem.splitScalar(u8, content, '\n');
-    while (file_lines.next()) |line| {
-        const comment_start = findCommentStart(line) orelse continue;
-        const comment = line[comment_start..];
-        if (mem.indexOf(u8, comment, "ephor:ignore-file") != null) {
-            if (checkFileIgnoreRule(comment, rule)) return true;
-        }
-    }
+    if (hasFileLevelIgnore(content, rule)) return true;
 
-    // Second pass: check same-line, previous-line, and scope-aware ignores
+    var scope: ScopeIgnore = .{};
     var current_line: usize = 1;
-    var lines = mem.splitScalar(u8, content, '\n');
     var prev_line: ?[]const u8 = null;
-    // Track scope-aware ignore blocks: when a comment-only ignore line precedes
-    // a line that opens a brace scope, we track depth until the scope closes.
-    var scope_ignore_depth: usize = 0;
-    var in_scope_ignore = false;
+    var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         defer {
             prev_line = line;
             current_line += 1;
         }
+        const is_target = current_line == line_num;
+        const prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false;
 
-        // Track brace depth for scope-aware ignores
-        if (in_scope_ignore) {
-            for (line) |ch| {
-                if (ch == '{') scope_ignore_depth += 1;
-                if (ch == '}') {
-                    if (scope_ignore_depth > 0) {
-                        scope_ignore_depth -= 1;
-                        if (scope_ignore_depth == 0) {
-                            // Scope closed — this line is the last suppressed line
-                            if (current_line == line_num) return true;
-                            in_scope_ignore = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (in_scope_ignore and current_line == line_num) return true;
-            // Check if prev_line was a comment-only ignore that starts a new scope
-            // (don't re-check, the scope tracking handles it)
+        if (scope.active) {
+            if (consumeIgnoredScopeLine(&scope, line, is_target)) return true;
             continue;
         }
 
-        // Check if this is a comment-only ignore line that starts scope tracking
-        if (prev_line) |pl| {
-            const prev_trimmed = mem.trimStart(u8, pl, " \t");
-            if (mem.startsWith(u8, prev_trimmed, "//") and checkLineIgnore(pl, rule)) {
-                // Previous line has an ignore directive — check if THIS line opens a scope
-                if (mem.indexOf(u8, line, "{") != null) {
-                    // Count net brace depth on this line
-                    scope_ignore_depth = 0;
-                    for (line) |bch| {
-                        if (bch == '{') scope_ignore_depth += 1;
-                        if (bch == '}') {
-                            if (scope_ignore_depth > 0) scope_ignore_depth -= 1;
-                        }
-                    }
-                    if (scope_ignore_depth > 0) {
-                        in_scope_ignore = true;
-                    }
-                    // This line is suppressed (it's the first line of the ignored scope)
-                    if (current_line == line_num) return true;
-                    continue;
-                }
-            }
+        // A comment-only ignore line suppresses the next line; when that line
+        // opens a brace scope the suppression extends over the whole scope.
+        if (prev_ignores and mem.indexOf(u8, line, "{") != null) {
+            scope.depth = unmatchedOpenBraces(line);
+            scope.active = scope.depth > 0;
+            if (is_target) return true;
+            continue;
         }
 
-        if (current_line != line_num) continue;
-
-        // Same-line: // ephor:ignore ZA201
+        if (!is_target) continue;
         if (checkLineIgnore(line, rule)) return true;
-
-        // Previous-line without scope: suppresses just this one line
-        if (prev_line) |pl| {
-            const prev_trimmed = mem.trimStart(u8, pl, " \t");
-            if (mem.startsWith(u8, prev_trimmed, "//") and checkLineIgnore(pl, rule)) return true;
-        }
+        if (prev_ignores) return true;
         break;
     }
     return false;

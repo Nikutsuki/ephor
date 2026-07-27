@@ -15348,11 +15348,7 @@ fn checkCatchUnreachable(
 /// the function call, or null if no match within the expression.
 fn findCallSiteLine(t: []const u8, preceding_lines: ?[]const []const u8) ?[]const u8 {
     // Count unmatched parens on current line (left of "catch")
-    var depth: isize = 0;
-    for (t) |c| {
-        if (c == '(') depth += 1;
-        if (c == ')') depth -= 1;
-    }
+    var depth: isize = parenBalance(t);
     // If balanced or more opens than closes, call site is this line
     if (depth >= 0) return t;
     // Unmatched closes → call started on a preceding line. Walk back.
@@ -15362,10 +15358,7 @@ fn findCallSiteLine(t: []const u8, preceding_lines: ?[]const []const u8) ?[]cons
         idx -= 1;
         const pl = mem.trim(u8, prev[idx], " \t\r");
         if (isCommentOrMultilineString(pl)) continue;
-        for (pl) |c| {
-            if (c == '(') depth += 1;
-            if (c == ')') depth -= 1;
-        }
+        depth += parenBalance(pl);
         if (depth >= 0) return pl;
     }
     return null;
@@ -15386,20 +15379,13 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
     // Multi-line: accumulate paren depth from current line backwards.
     // If we find @TypeOf( on a line where depth > 0, we're nested inside it.
     const prev = preceding_lines orelse return false;
-    var depth: isize = 0;
-    for (t) |c| {
-        if (c == '(') depth += 1;
-        if (c == ')') depth -= 1;
-    }
+    var depth: isize = parenBalance(t);
     var idx = prev.len;
     while (idx > 0) {
         idx -= 1;
         const pl = mem.trim(u8, prev[idx], " \t\r");
         if (isCommentOrMultilineString(pl)) continue;
-        for (pl) |c| {
-            if (c == '(') depth += 1;
-            if (c == ')') depth -= 1;
-        }
+        depth += parenBalance(pl);
         if (depth > 0 and (mem.indexOf(u8, pl, "@TypeOf(") != null or
             mem.indexOf(u8, pl, "@typeOf(") != null)) return true;
         // Stop at statement boundaries (no paren nesting left to resolve)

@@ -2833,6 +2833,11 @@ fn collectMemSafetyAllocs(
     defer no_free_names.deinit(allocator);
     var all_alloc_names = try collectAllAllocatorNames(allocator, lines);
     defer all_alloc_names.deinit(allocator);
+    const no_free_sets: CFGNoFreeSets = .{
+        .names = &no_free_names,
+        .local_fields = &local_no_free_fields,
+        .file_fields = file_no_free_fields,
+    };
 
     var allocs = std.StringHashMap(CFGAllocation).init(allocator);
     // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
@@ -2842,27 +2847,8 @@ fn collectMemSafetyAllocs(
         const t = joinParenContinuation(lines, idx, &join_buf);
         // Type-based allocation detection: .alloc() or .create() on tracked allocators
         const alloc_call = findAllocCall(t, &all_alloc_names) orelse continue;
-        // Skip allocations from type-tracked no-free allocators (stdlib types only)
-        const alloc_name = extractAllocatorName(t) orelse "";
-        if (alloc_name.len > 0 and no_free_names.contains(alloc_name)) continue;
-        if (isNoFreeCallChainFull(t, &no_free_names, &local_no_free_fields)) continue;
-        if (isNoFreeFieldChain(t, &local_no_free_fields)) continue;
-        // Check file-level no-free fields (struct definitions outside this function)
-        if (file_no_free_fields) |fields| {
-            if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
-            if (isNoFreeFieldChain(t, fields)) continue;
-        }
-        // For standalone/method-style calls where allocator is an argument (not receiver),
-        // check the first-arg allocator for no-free suppression
-        if (extractStandaloneAllocator(t)) |standalone_alloc| {
-            if (no_free_names.contains(standalone_alloc)) continue;
-            if (isArenaName(standalone_alloc)) continue;
-        } else if (extractMultilineFirstArg(t, lines, idx)) |ml_alloc| {
-            if (no_free_names.contains(ml_alloc)) continue;
-            if (isArenaName(ml_alloc)) continue;
-        }
-        // Dotted first-arg arena heuristic: allocPrint(cg.module.arena, ...)
-        if (isFirstArgArena(t)) continue;
+        // Skip allocations backed by no-free allocators (type-tracked or arena)
+        if (isNoFreeAllocCall(t, lines, idx, &no_free_sets)) continue;
         // Name comes from the physical line — slices into join_buf dangle
         // (the buffer is reused on the next iteration and dies with this frame).
         const phys = mem.trim(u8, lines[idx], " \t\r");

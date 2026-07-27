@@ -17895,10 +17895,10 @@ fn consumeIgnoredScopeLine(scope: *ScopeIgnore, line: []const u8, is_target: boo
 ///
 /// Supports three forms:
 ///   1. Same-line:  `code(); // ephor:ignore ZA201` — suppresses that line only
-///   2. Scope-aware: `// ephor:ignore ZA201` on a comment-only line before a function
+///   2. Scope-aware: an ignore directive on a comment-only line before a function
 ///      or block — automatically suppresses the entire scope (tracks braces)
 ///      If the next line doesn't open a scope, suppresses just the next line.
-///   3. File-level: `// ephor:ignore-file ZA201` — suppresses entire file
+///   3. File-level: an ignore-file directive with a rule — suppresses entire file
 fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool {
     if (hasFileLevelIgnore(content, rule)) return true;
 

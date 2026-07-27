@@ -8962,6 +8962,66 @@ fn updateErrorState(
     return .{ .skip_undefined = skip };
 }
 
+/// Per-file error-scan inputs bundled into one struct so the per-line
+/// helper stays within the parameter limit.
+const FileErrorScanCtx = struct {
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    path: []const u8,
+    all_lines: []const []const u8,
+    state: *ErrorAnalysisState,
+    type_ctx: *const TypeContext,
+};
+
+/// Analyze one line for error issues within the per-file scan. Returns
+/// early on comment and multiline-string lines.
+fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: usize) !void {
+    const line_num = line_idx + 1;
+    const t = mem.trim(u8, line, " \t\r");
+    if (isCommentOrMultilineString(t)) return;
+
+    const s = updateErrorState(t, line, ctx.state, ctx.path);
+
+    const pf_ctx: PendingFieldsCtx = .{ .t = t, .path = ctx.path };
+    if (!s.skip_undefined) {
+        trackStructLiteral(t, line_num, ctx.state);
+        activatePendingFields(ctx.state);
+        try checkPendingFields(pf_ctx, ctx.state, ctx.issues, ctx.allocator);
+    }
+    const preceding: ?[]const []const u8 = if (line_idx > 0) ctx.all_lines[0..line_idx] else null;
+    // Needed for the bounded 2-line empty-catch form: `catch {` + `}` alone
+    const next_line: ?[]const u8 = if (line_idx + 1 < ctx.all_lines.len)
+        ctx.all_lines[line_idx + 1]
+    else
+        null;
+    const in_test = isInTestContext(ctx.path, ctx.state.in_test_block);
+    try checkLineErrors(.{
+        .t = t,
+        .path = ctx.path,
+        .line = line_num,
+        .skip_undefined = s.skip_undefined,
+        .in_defer = ctx.state.in_defer_block,
+        .in_test = in_test,
+        .pending = &ctx.state.pending_undefined,
+        .issues = ctx.issues,
+        .allocator = ctx.allocator,
+        .type_ctx = ctx.type_ctx,
+        .func_name = ctx.state.current_func_name,
+        .preceding_lines = preceding,
+        .next_line = next_line,
+    });
+
+    if (checkExitBypassesDefer(.{
+        .t = t,
+        .path = ctx.path,
+        .line_num = line_num,
+        .has_defer = ctx.state.has_defer_in_func,
+        .func_name = ctx.state.current_func_name,
+    })) |issue| {
+        try ctx.issues.append(ctx.allocator, issue);
+    }
+}
+
 /// Analyze a single file for error issues
 fn analyzeFileErrors(
     allocator: Allocator,
@@ -8982,52 +9042,16 @@ fn analyzeFileErrors(
     const all_lines = all_lines_list.items;
 
     var state = ErrorAnalysisState{};
-
+    const ctx: FileErrorScanCtx = .{
+        .allocator = allocator,
+        .issues = issues,
+        .path = a.path,
+        .all_lines = all_lines,
+        .state = &state,
+        .type_ctx = &type_ctx,
+    };
     for (all_lines, 0..) |line, line_idx| {
-        const line_num = line_idx + 1;
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-
-        const s = updateErrorState(t, line, &state, a.path);
-
-        const pf_ctx: PendingFieldsCtx = .{ .t = t, .path = a.path };
-        if (!s.skip_undefined) {
-            trackStructLiteral(t, line_num, &state);
-            activatePendingFields(&state);
-            try checkPendingFields(pf_ctx, &state, issues, allocator);
-        }
-        const preceding: ?[]const []const u8 = if (line_idx > 0) all_lines[0..line_idx] else null;
-        // Needed for the bounded 2-line empty-catch form: `catch {` + `}` alone
-        const next_line: ?[]const u8 = if (line_idx + 1 < all_lines.len)
-            all_lines[line_idx + 1]
-        else
-            null;
-        const in_test = isInTestContext(a.path, state.in_test_block);
-        try checkLineErrors(.{
-            .t = t,
-            .path = a.path,
-            .line = line_num,
-            .skip_undefined = s.skip_undefined,
-            .in_defer = state.in_defer_block,
-            .in_test = in_test,
-            .pending = &state.pending_undefined,
-            .issues = issues,
-            .allocator = allocator,
-            .type_ctx = &type_ctx,
-            .func_name = state.current_func_name,
-            .preceding_lines = preceding,
-            .next_line = next_line,
-        });
-
-        if (checkExitBypassesDefer(.{
-            .t = t,
-            .path = a.path,
-            .line_num = line_num,
-            .has_defer = state.has_defer_in_func,
-            .func_name = state.current_func_name,
-        })) |issue| {
-            try issues.append(allocator, issue);
-        }
+        try scanFileErrorLine(&ctx, line, line_idx);
     }
     // ZA209: error-union fns with no error path (whole-body scan, own walk)
     try checkUselessErrorReturns(allocator, issues, a.path, all_lines);

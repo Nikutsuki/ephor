@@ -5713,7 +5713,12 @@ fn collectNoFreeAllocatorNames(
         if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
         const name = extractVarDeclName(t) orelse continue;
 
-        try trackNoFreeTypeInit(a, t, name, no_free_inits, &names);
+        const init_ctx: NoFreeInitCtx = .{
+            .name = name,
+            .no_free_inits = no_free_inits,
+            .names = &names,
+        };
+        try trackNoFreeTypeInit(a, t, init_ctx);
 
         // Track local variables named "arena" as no-free allocators:
         // `const arena = session.arena;`, `const arena = b.allocator;` etc.
@@ -5761,24 +5766,29 @@ fn collectSigArenaParams(
     }
 }
 
+/// Bundle for trackNoFreeTypeInit (keeps param count legal).
+const NoFreeInitCtx = struct {
+    name: []const u8,
+    no_free_inits: []const []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+};
+
 /// Track variables initialized with known no-free allocator types, including
 /// the anonymous-init form `var fba: std.heap.FixedBufferAllocator = .init(`.
 fn trackNoFreeTypeInit(
     a: Allocator,
     t: []const u8,
-    name: []const u8,
-    no_free_inits: []const []const u8,
-    names: *std.StringHashMapUnmanaged(void),
+    ctx: NoFreeInitCtx,
 ) !void {
     var matched = false;
-    for (no_free_inits) |init_pat| {
+    for (ctx.no_free_inits) |init_pat| {
         if (mem.indexOf(u8, t, init_pat) == null) continue;
         matched = true;
         break;
     }
-    if (matched) try names.put(a, name, {});
+    if (matched) try ctx.names.put(a, ctx.name, {});
     if (matched) return;
-    if (names.contains(name)) return;
+    if (ctx.names.contains(ctx.name)) return;
     if (mem.indexOf(u8, t, "= .init(") == null and mem.indexOf(u8, t, "= .{") == null) return;
     const colon_pos = mem.indexOf(u8, t, ": ") orelse return;
     const after_colon = mem.trim(u8, t[colon_pos + 2 ..], " \t");
@@ -5789,7 +5799,7 @@ fn trackNoFreeTypeInit(
         type_match = true;
         break;
     }
-    if (type_match) try names.put(a, name, {});
+    if (type_match) try ctx.names.put(a, ctx.name, {});
 }
 
 /// Track .allocator() aliases: const X = Y.allocator() where Y (or the last
@@ -12720,22 +12730,24 @@ fn skipStringLiteral(t: []const u8, start: usize) usize {
     return if (i < t.len) i + 1 else i;
 }
 
-/// Emit a naming-convention issue from a NamingLineCtx (keeps call sites
-/// brace-less so the struct literal doesn't inflate nesting).
-fn reportNaming(
-    ctx: NamingLineCtx,
+/// A naming violation to report (bundled to keep param counts legal).
+const NameViolation = struct {
     col: usize,
     kind: []const u8,
     name: []const u8,
     expected: []const u8,
-) !void {
+};
+
+/// Emit a naming-convention issue from a NamingLineCtx (keeps call sites
+/// brace-less so the struct literal doesn't inflate nesting).
+fn reportNaming(ctx: NamingLineCtx, v: NameViolation) !void {
     try reportNamingIssue(ctx.issues, ctx.allocator, .{
         .path = ctx.path,
         .line = ctx.line_num,
-        .col = col,
-        .kind = kind,
-        .name = name,
-        .expected = expected,
+        .col = v.col,
+        .kind = v.kind,
+        .name = v.name,
+        .expected = v.expected,
     });
 }
 
@@ -12775,11 +12787,14 @@ fn checkConstNaming(
         if (isTitleCase(name)) return;
         // Non-TitleCase name on a type-looking line — check if it's actually a
         // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
-        if (isClosureFunctionAlias(t, content, t_start)) {
-            if (!isCamelCase(name))
-                try reportNaming(ctx, plen + 1, "function", name, "camelCase");
-            return;
-        }
+        if (isClosureFunctionAlias(t, content, t_start) and isCamelCase(name)) return;
+        if (isClosureFunctionAlias(t, content, t_start)) try reportNaming(ctx, .{
+            .col = plen + 1,
+            .kind = "function",
+            .name = name,
+            .expected = "camelCase",
+        });
+        if (isClosureFunctionAlias(t, content, t_start)) return;
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
             .line = ctx.line_num,
@@ -12925,7 +12940,12 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
             pos = end;
             continue;
         }
-        if (!isSnakeCase(name)) try reportNaming(ctx, err_pos + 7, "error value", name, "snake_case");
+        if (!isSnakeCase(name)) try reportNaming(ctx, .{
+            .col = err_pos + 7,
+            .kind = "error value",
+            .name = name,
+            .expected = "snake_case",
+        });
         pos = end;
     }
 
@@ -12997,7 +13017,12 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
             continue;
         }
         if (!isSnakeCase(name))
-            try reportNaming(ctx, start + 1, "error set member", name, "snake_case");
+            try reportNaming(ctx, .{
+                .col = start + 1,
+                .kind = "error set member",
+                .name = name,
+                .expected = "snake_case",
+            });
         i = skipOptionalComma(t, i);
     }
 }
@@ -17608,36 +17633,32 @@ fn extractFileLocation(text: []const u8) FileLocation {
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
         // Find .zig extension
-        if (i + 4 < text.len and mem.eql(u8, text[i .. i + 4], ".zig")) {
-            // Find start of filename (backtrack to last space or start)
-            var start = i;
-            while (start > 0 and text[start - 1] != ' ' and text[start - 1] != '\t') {
-                start -= 1;
-            }
-
-            // Find end (colon followed by digit for line number)
-            const file_end = i + 4;
-            const has_colon = file_end < text.len and text[file_end] == ':';
-            var line_end = file_end + 1;
-            if (has_colon) {
-                // Parse line number
-                while (line_end < text.len and text[line_end] >= '0' and text[line_end] <= '9')
-                    line_end += 1;
-            }
-            if (has_colon and line_end > file_end + 1) {
-                const line_num = std.fmt.parseInt(usize, text[file_end + 1 .. line_end], 10) catch 0;
-                return .{ .file = text[start..file_end], .line = line_num };
-            }
-
-            // No line number, just return file
-            return .{ .file = text[start..file_end], .line = 0 };
-        }
+        const is_zig = i + 4 < text.len and mem.eql(u8, text[i .. i + 4], ".zig");
+        if (!is_zig) continue;
+        // Find start of filename (backtrack to last space or start)
+        var start = i;
+        while (start > 0 and text[start - 1] != ' ' and text[start - 1] != '\t')
+            start -= 1;
+        const file_end = i + 4;
+        if (parseLocationLine(text, file_end)) |line_num|
+            return .{ .file = text[start..file_end], .line = line_num };
+        return .{ .file = text[start..file_end], .line = 0 };
     }
 
     return .{
         .file = "unknown",
         .line = 0,
     };
+}
+
+/// Parse ":123" at text[file_end] — returns the line number or null.
+fn parseLocationLine(text: []const u8, file_end: usize) ?usize {
+    if (file_end >= text.len or text[file_end] != ':') return null;
+    var line_end = file_end + 1;
+    while (line_end < text.len and text[line_end] >= '0' and text[line_end] <= '9')
+        line_end += 1;
+    if (line_end == file_end + 1) return null;
+    return std.fmt.parseInt(usize, text[file_end + 1 .. line_end], 10) catch 0;
 }
 
 // ============================================================================

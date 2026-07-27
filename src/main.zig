@@ -7419,12 +7419,10 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // Stdlib container mutation methods from compat vocab
     const modifying_methods = compat.getModifyingMethodPatterns();
     for (modifying_methods) |method| {
-        if (mem.indexOf(u8, t, var_name)) |var_pos| {
-            const after_var = var_pos + var_name.len;
-            if (after_var + method.len <= t.len) {
-                if (mem.startsWith(u8, t[after_var..], method)) return true;
-            }
-        }
+        const var_pos = mem.indexOf(u8, t, var_name) orelse continue;
+        const after_var = var_pos + var_name.len;
+        if (after_var + method.len > t.len) continue;
+        if (mem.startsWith(u8, t[after_var..], method)) return true;
     }
 
     return false;

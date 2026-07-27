@@ -13,7 +13,7 @@
 | **errors** | Silent `catch {}`, `catch unreachable`, `orelse unreachable`, `catch undefined`, `exit()` bypassing defers, `@panic()`, discarded errors |
 | **unused** | Unused imports, const, and var declarations |
 | **complexity** | Long functions, deep nesting, too many params/branches |
-| **style** | Lines too long, files too large |
+| **style** | Lines too long, files too large, naming conventions |
 | **fmt-check** | Files that need `zig fmt` |
 
 ## Installation
@@ -71,7 +71,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.1.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +158,7 @@ Example config:
 
 ```json
 {
-  "version": "0.14.1",
+  "version": "0.14.2",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -171,7 +171,7 @@ Example config:
     "max_params": 4,
     "max_branches": 12,
     "max_line_length": 100,
-    "max_file_bytes": 25000
+    "max_file_bytes": 50000
   }
 }
 ```
@@ -201,7 +201,7 @@ Example config:
 | **ZA102** | warning | ON | `create()` without `defer destroy()` |
 | **ZA103** | warning | ON | Stdlib allocation without `errdefer` in error-returning function |
 | **ZA105** | error | ON | Use-after-free: accessing memory after free |
-| **ZA106** | error | ON | Double-free: calling free twice on same pointer |
+| **ZA106** | error / warning (conditional double-free) | ON | Double-free: calling free twice on same pointer |
 | **ZA110** | warning | ON | Managed container local returned by value while a `defer x.deinit()` is still armed — the returned copy's backing is freed (the plain `var x = ...; return x;` ownership-transfer idiom is correct and stays silent) |
 | **ZA111** | error | ON | Returned-stack-reference (AST tier): returned pointer/slice provably refers to a stack local or by-value parameter (`return &s.field;`, `return &param;`, `const p = &x; return p;`, `return arr[0..n];`). Covers the forms Zig's Sema misses; the bare `return &var;` form is a hard compile error and is never echoed. Chains through pointer/slice bindings or fields are safe and stay silent, as do `comptime var`s and unresolvable types |
 
@@ -236,6 +236,8 @@ Example config:
 | **ZA306** | warning | OFF | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
 
 **Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they're metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they're compile-time unrolled.
+
+**Data-dispatch functions** (parse/deserialize/serialize/config loaders — one branch per field) get an 8x limit on ZA304, ZA305, and ZA306. **Flat-chain functions** (routers/dispatchers where cognitive <= cyclomatic x 1.5 and max nesting <= 2) get a 2x limit on ZA305 and ZA306.
 
 ### Cyclomatic Complexity (ZA305)
 
@@ -283,7 +285,7 @@ with existing inline-ignores, and is reported under the Memory category in
 | **ZA702** | warning | OFF | File exceeds max size (requires `--enable=ZA702` or config `enable`; threshold via `max_file_bytes`, default 50000) |
 | **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
 
-ZA704 (`std.debug.print` left in non-test code) was removed in 0.14.1 —
+ZA704 (`std.debug.print` left in non-test code) was removed in 0.14.0 —
 intent-based, cannot be grounded in objective detection (see EPH-I0049).
 The ID is retired and will never be reused.
 
@@ -312,8 +314,8 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA801** | warning | OFF | Chained optional unwrap (`.?` immediately followed by field/index/call) may panic if null; bare `.?;` unwraps are not flagged today (use `--enable=ZA8`) |
-| **ZA802** | warning | OFF | Dereferencing optional pointer may panic if null (use `--enable=ZA8`) |
+| **ZA801** | warning | OFF | Optional unwrap (`.?`) may panic if null — fires on any continuation except `;`, `,`, `)`; suppressed in if/while/orelse/expect/`testing.` contexts (use `--enable=ZA8`) |
+| **ZA802** | warning | OFF | Dereferencing optional pointer may panic if null (use `--enable=ZA8`). Only fires on `.*` derefs of variables named `maybe_*`/`opt_*`. |
 
 **When to enable ZA8xx:** Pre-release audits for safety-critical code (servers, databases) where a null panic means downtime. Off by default because `.?` is extremely common in Zig and usually intentionally guarded.
 
@@ -472,6 +474,19 @@ Options:
   --strict             Exit 1 when any warning/error is found (CI gate)
   --fail-on=<level>    Exit 1 on findings at level: error, warning,
                        note, never (warning == --strict; overrides config)
+  -b, --build          With 'init': also show build.zig integration
+  --export=<file>      Export issues to file with code snippets
+  --known-issues=<file> Filter out known true positives (file:line format)
+```
+
+The `--known-issues` file lists known true positives to filter out — one issue
+per line in `file:line` format; lines starting with `#` are comments:
+
+```
+# One issue per line, format: file:line
+# Lines starting with # are comments
+src/main.zig:123
+src/util.zig:456
 ```
 
 ## IDE Integration
@@ -698,6 +713,11 @@ Issues:
   Unused:     4
   Complexity: 404
   Format:     0
+  Style:      0
+  NullSafety: 0
+  Panic:      0
+  Tests:      0
+  Concurrency: 0
   TOTAL:      754
 
 STATUS: ISSUES FOUND
@@ -737,7 +757,7 @@ src/memory.zig:45:1: error[ZR101]: memory leak detected at runtime
 **Supported Zig Versions:**
 - Zig 0.16.x (current) — **required minimum**
 
-Ephor v0.13.4+ requires Zig 0.16.0 or later. Earlier ephor versions (v0.11.x) support Zig 0.15.x.
+Ephor v0.12.3+ requires Zig 0.16.0 or later. Earlier ephor versions (v0.11.x) support Zig 0.15.x.
 
 ### Version Compatibility System
 
@@ -764,13 +784,14 @@ This section documents the internal detection architecture. Understanding these 
 
 ### Architecture Overview
 
-Ephor has three analysis entry points:
+Ephor has four analysis entry points:
 
 | Entry Point | Scope | Rules | Context |
 |-------------|-------|-------|---------|
 | `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA208, ZA210 (in `checkLineErrors`), ZA209 (whole-body scan) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
-| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA8xx, ZA9xx | `CFGState` with file-level `no_free_fields` |
+| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA110, ZA607, ZA8xx, ZA9xx | `CFGState` with file-level `no_free_fields` |
+| `analyzeAstTier` | Project import graph, per-file AST | ZA111 | `std.Ast` parse per file (`src/ast_tier.zig`); files with parse errors are skipped |
 
 Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression.
 
@@ -1008,10 +1029,29 @@ Ephor uses three testing layers:
 - `examples/error_handling_demo.zig` — Error handling patterns (ZA201-ZA210)
 
 **4. Corpus validation** (3000+ community Zig projects):
-- Dogfood: `ephor check src/` → zero issues
+- Dogfood: `ephor check src/` → zero warnings (11 ZT105 notes: statically-invisible integration coverage, see ZT105)
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.14.2 — Dogfood Complexity Debt Cleared (2026-07-27)
+
+**Fixed:** Dogfood complexity debt cleared — `ephor check src/` 173 → 0 warnings (EPH-I0002). README accuracy pass.
+
+### v0.14.1 — .gitignore Fix (2026-07-26)
+
+**Fixed:** `.gitignore` patch.
+
+### v0.14.0 — Test-Quality + Concurrency Bands, AST Tier (2026-07-26)
+
+**Added:**
+- ZT1xx test-quality band (ZT101-ZT105)
+- ZC1xx concurrency band (ZC101-ZC104)
+- AST analysis tier + ZA111 (returned-stack-ref)
+- ZA110 (must-return-ref), ZA209/ZA210 (error-handling notes), ZA904 (intCast without bounds proof)
+- Strict CI mode (`--strict` / `--fail-on`)
+
+**Removed:** ZA704 (`std.debug.print` left in non-test code) — intent-based, cannot be grounded in objective detection (EPH-I0049). The ID is retired and will never be reused.
 
 ### v0.12.3 — Error Naming Enforcement (ZA703)
 
@@ -1052,17 +1092,17 @@ Before this fix, the install script always fetched the latest ephor version rega
 
 ## Testing Methodology
 
-Every ephor release is validated against four scenarios before tagging:
+Every ephor release is validated against five scenarios before tagging:
 
 ### Test Matrix
 
 | Scenario | Zig Version | Starting State | Expected Result |
 |----------|-------------|----------------|-----------------|
-| Fresh install | 0.16.0 | No ephor | Installs v0.12.x, `zig build ephor` passes |
+| Fresh install | 0.16.0 | No ephor | Installs v0.14.x, `zig build ephor` passes |
 | Fresh install | 0.15.2 | No ephor | Installs v0.11.13, `zig build ephor` passes |
-| Upgrade | 0.16.0 | v0.11.x snippet | Upgrades to v0.12.x, old snippet replaced with canonical block |
+| Upgrade | 0.16.0 | v0.11.x snippet | Upgrades to v0.14.x, old snippet replaced with canonical block |
 | Upgrade | 0.15.2 | v0.11.x snippet | Upgrades to v0.11.13, old snippet replaced with canonical block |
-| Re-run | 0.16.0 | v0.12.x canonical | Idempotent — "up-to-date", no changes |
+| Re-run | 0.16.0 | v0.14.2 canonical | Idempotent — block replaced with identical content, zon pin unchanged |
 
 ### Running the Tests Locally
 

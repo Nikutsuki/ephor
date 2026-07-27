@@ -45,9 +45,9 @@ ZIG_VERSION=$(zig version 2>/dev/null || echo "")
 if [ -n "$ZIG_VERSION" ]; then
     ZIG_MAJOR=$(echo "$ZIG_VERSION" | cut -d. -f1)
     ZIG_MINOR=$(echo "$ZIG_VERSION" | cut -d. -f2)
-    # Zig 0.16.0+ → ephor 0.13.x; Zig 0.15.x → ephor 0.11.13
+    # Zig 0.16.0+ → ephor 0.14.x; Zig 0.15.x → ephor 0.11.13
     if [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
-        EPHOR_TAG="v0.14.1"
+        EPHOR_TAG="v0.14.2"
     else
         EPHOR_TAG="v0.11.13"
     fi
@@ -101,7 +101,19 @@ if grep -q '// Ephor static analysis' build.zig; then
     END_LINE=$(grep -n 'ephor_upgrade_step\.dependOn' build.zig | head -1 | cut -d: -f1)
 
     if [ -n "$START_LINE" ] && [ -n "$END_LINE" ]; then
-        head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
+        # Absorb a pre-existing blank line above the block: EPHOR_BLOCK's
+        # leading newline re-creates exactly one, so keeping one here too
+        # would grow build.zig by one blank line per re-run.
+        if [ "$START_LINE" -gt 1 ] && [ -z "$(sed -n "$((START_LINE - 1))p" build.zig)" ]; then
+            START_LINE=$((START_LINE - 1))
+        fi
+        # head -n 0 is fatal on BSD ("illegal line count") — a line-1 block
+        # has nothing above it to keep.
+        if [ "$START_LINE" -gt 1 ]; then
+            head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
+        else
+            : > build.zig.tmp
+        fi
         echo "$EPHOR_BLOCK" >> build.zig.tmp
         tail -n +"$((END_LINE + 1))" build.zig >> build.zig.tmp
         mv build.zig.tmp build.zig
@@ -113,7 +125,19 @@ elif grep -q '=== Ephor Static Analysis ===' build.zig; then
     END_LINE=$(grep -n 'ephor_step\.dependOn(&b.addRunArtifact(ephor_exe).step);' build.zig | head -1 | cut -d: -f1)
 
     if [ -n "$START_LINE" ] && [ -n "$END_LINE" ]; then
-        head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
+        # Absorb a pre-existing blank line above the block (same leak as the
+        # canonical branch: the v0.11.x snippet was also inserted with a
+        # leading blank line).
+        if [ "$START_LINE" -gt 1 ] && [ -z "$(sed -n "$((START_LINE - 1))p" build.zig)" ]; then
+            START_LINE=$((START_LINE - 1))
+        fi
+        # head -n 0 is fatal on BSD ("illegal line count") — a line-1 block
+        # has nothing above it to keep.
+        if [ "$START_LINE" -gt 1 ]; then
+            head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
+        else
+            : > build.zig.tmp
+        fi
         echo "$EPHOR_BLOCK" >> build.zig.tmp
         tail -n +"$((END_LINE + 1))" build.zig >> build.zig.tmp
         mv build.zig.tmp build.zig

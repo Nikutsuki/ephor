@@ -19273,7 +19273,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.14.1";
+const EPHOR_VERSION = "0.14.2";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -20175,7 +20175,7 @@ fn printHelp() void {
         \\  runtime     Run tests with memory diagnostics (dynamic analysis)
         \\  orphans     Files not imported from entry points
         \\  memory      Alloc without defer patterns
-        \\  errors      Error handling patterns (ZA201-ZA208)
+        \\  errors      Error handling patterns (ZA201-ZA210)
         \\  unused      Unused imports/declarations
         \\  complexity  Function complexity metrics
         \\  fmt-check   Files needing zig fmt (runs zig fmt --check)
@@ -20206,9 +20206,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.14.1   # Install specific version
+        \\  ephor install --version=0.14.2   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.14.1   # Upgrade to specific version
+        \\  ephor upgrade --version=0.14.2   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
@@ -20223,7 +20223,7 @@ fn printHelp() void {
         \\
         \\CONFIG FILE (ephor.json):
         \\  {
-        \\    "version": "0.14.1",
+        \\    "version": "0.14.2",
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],

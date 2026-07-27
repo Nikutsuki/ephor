@@ -6639,10 +6639,7 @@ fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
         // When alloc_name is on the LHS (e.g., node.* = .{...}), it's
         // initialization of allocated memory, not a transfer.
         if (mem.eql(u8, pattern, ".* = ")) {
-            if (mem.indexOf(u8, t, " = ")) |eq_pos| {
-                const rhs = t[eq_pos + 3 ..];
-                if (mem.indexOf(u8, rhs, alloc_name) != null) return true;
-            }
+            if (isAllocOnRhs(t, alloc_name)) return true;
             continue;
         }
         return true;
@@ -6652,6 +6649,14 @@ fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
         if (mem.indexOf(u8, t, pattern) != null) return true;
     }
     return false;
+}
+
+/// ".* = " is only an ownership transfer when alloc_name is on the RHS.
+/// When alloc_name is on the LHS (e.g., node.* = .{...}), it's
+/// initialization of allocated memory, not a transfer.
+fn isAllocOnRhs(t: []const u8, alloc_name: []const u8) bool {
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
+    return mem.indexOf(u8, t[eq_pos + 3 ..], alloc_name) != null;
 }
 
 /// Check if allocation is stored in a struct field (ownership transferred to struct)
@@ -6947,6 +6952,13 @@ fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
         if (isInsideFunctionCallArg(t, pos)) return true;
     }
     return false;
+}
+
+/// Look back over a dotted ident chain for a leading '&' (&Struct.var_name).
+fn hasAmpBeforeChain(t: []const u8, i: usize) bool {
+    var j: usize = i - 2;
+    while (j > 0 and (isIdent(t[j]) or t[j] == '.')) : (j -= 1) {}
+    return j < t.len and t[j] == '&';
 }
 
 /// Detect module-level variable assignment (singleton/global pattern)
@@ -7337,12 +7349,7 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
 
         // Pattern 1: &var_name or &Struct.var_name
         if (i > 0 and t[i - 1] == '&') return true;
-        if (i > 1 and t[i - 1] == '.') {
-            // Check for &Struct.var_name pattern - look back for &
-            var j: usize = i - 2;
-            while (j > 0 and (isIdent(t[j]) or t[j] == '.')) : (j -= 1) {}
-            if (j < t.len and t[j] == '&') return true;
-        }
+        if (i > 1 and t[i - 1] == '.' and hasAmpBeforeChain(t, i)) return true;
 
         // Pattern 2: var_name[...] = (slice assignment)
         if (end_i < t.len and t[end_i] == '[') return true;
@@ -12926,13 +12933,15 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
     while (epos < t.len) {
         const found = mem.indexOfPos(u8, t, epos, "error") orelse break;
         const at_start = found == 0 or !isIdent(t[found - 1]);
-        if (at_start) {
-            var after = found + 5;
-            while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
-            if (after < t.len and t[after] == '{') {
-                scan_start = after + 1;
-                break;
-            }
+        if (!at_start) {
+            epos = found + 5;
+            continue;
+        }
+        var after = found + 5;
+        while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+        if (after < t.len and t[after] == '{') {
+            scan_start = after + 1;
+            break;
         }
         epos = found + 5;
     }

@@ -839,20 +839,11 @@ fn hasTypeFirstArg(t: []const u8, open_paren_end: usize) bool {
 
     const c = t[pos];
 
-    // Pointer/slice/array type constructors: [], [*], *
-    if (c == '[' or c == '*') return true;
+    // Type constructors and builtins: [], [*], *, ?Type, @import/@Type/@Vector
+    if (c == '[' or c == '*' or c == '?' or c == '@') return true;
 
-    // Optional type: ?Type
-    if (c == '?') return true;
-
-    // Builtin type: @import, @Type, @Vector, etc.
-    if (c == '@') return true;
-
-    // Close paren = no args = not std.mem.Allocator.alloc
-    if (c == ')') return false;
-
-    // Numeric literal or null = runtime value, not a type
-    if (c >= '0' and c <= '9') return false;
+    // Close paren (no args) or numeric literal = runtime value, not a type
+    if (c == ')' or (c >= '0' and c <= '9')) return false;
     if (mem.startsWith(u8, t[pos..], "null")) return false;
 
     // Extract the identifier
@@ -864,6 +855,15 @@ fn hasTypeFirstArg(t: []const u8, open_paren_end: usize) bool {
     // Uppercase first char = user-defined type (MyStruct, Allocator, etc.)
     if (c >= 'A' and c <= 'Z') return true;
 
+    if (isPrimitiveTypeName(c, first_arg)) return true;
+
+    // If we got here with a lowercase identifier that's not a primitive,
+    // it's likely a runtime variable (e.g. object_ty_id, result, count)
+    return false;
+}
+
+/// Digit-pattern checks (not a fixed name table) match arbitrary bit widths: u7, i13, f80.
+fn isPrimitiveTypeName(c: u8, first_arg: []const u8) bool {
     // Primitive numeric types: u8, u16, u32, u64, usize, i8, i16, i32, i64, isize
     if ((c == 'u' or c == 'i') and first_arg.len >= 2) {
         if (mem.eql(u8, first_arg, "usize") or mem.eql(u8, first_arg, "isize")) return true;
@@ -885,8 +885,6 @@ fn hasTypeFirstArg(t: []const u8, open_paren_end: usize) bool {
     if (c == 'f' and first_arg.len >= 2 and
         first_arg[1] >= '0' and first_arg[1] <= '9') return true;
 
-    // If we got here with a lowercase identifier that's not a primitive,
-    // it's likely a runtime variable (e.g. object_ty_id, result, count)
     return false;
 }
 

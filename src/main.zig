@@ -17617,27 +17617,20 @@ fn extractFileLocation(text: []const u8) FileLocation {
 
             // Find end (colon followed by digit for line number)
             const file_end = i + 4;
-            if (file_end < text.len and text[file_end] == ':') {
+            const has_colon = file_end < text.len and text[file_end] == ':';
+            var line_end = file_end + 1;
+            if (has_colon) {
                 // Parse line number
-                var line_end = file_end + 1;
-                while (line_end < text.len and text[line_end] >= '0' and text[line_end] <= '9') {
+                while (line_end < text.len and text[line_end] >= '0' and text[line_end] <= '9')
                     line_end += 1;
-                }
-                if (line_end > file_end + 1) {
-                    const line_slice = text[file_end + 1 .. line_end];
-                    const line_num = std.fmt.parseInt(usize, line_slice, 10) catch 0;
-                    return .{
-                        .file = text[start..file_end],
-                        .line = line_num,
-                    };
-                }
+            }
+            if (has_colon and line_end > file_end + 1) {
+                const line_num = std.fmt.parseInt(usize, text[file_end + 1 .. line_end], 10) catch 0;
+                return .{ .file = text[start..file_end], .line = line_num };
             }
 
             // No line number, just return file
-            return .{
-                .file = text[start..file_end],
-                .line = 0,
-            };
+            return .{ .file = text[start..file_end], .line = 0 };
         }
     }
 

@@ -7402,8 +7402,9 @@ fn hasPointerToVar(t: []const u8, pos: usize, var_name: []const u8) bool {
     return end_pos >= t.len or !isIdent(t[end_pos]);
 }
 
-/// Check if line fills a variable (pointer passed to function or direct assignment)
-fn isFillPattern(t: []const u8, var_name: []const u8) bool {
+/// Check if any occurrence of var_name is directly filled on this line:
+/// &var, &Struct.var, var[...] =, or var as an assignment target.
+fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
     // Check all occurrences of var_name (handles Struct.var_name patterns)
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
@@ -7423,57 +7424,40 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
         // Pattern 3: var_name = or .var_name = (direct assignment)
         if (isAssignmentTarget(t, var_name, i)) return true;
     }
+    return false;
+}
 
-    // Pattern 4: @memcpy/@memset where var_name is the DESTINATION (first arg)
-    // @memcpy(dest, src) - dest is filled, src is read
-    // @memset(dest, value) - dest is filled
-    if (isBuiltinDest(t, var_name, "@memcpy(")) return true;
-    if (isBuiltinDest(t, var_name, "@memset(")) return true;
+/// Check if a same-line for loop assigns to var_name[...] (indexed fill).
+fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
+    // Heuristic only: full analysis requires tracking loop scope, so any
+    // same-line loop header plus var_name[...] counts as a fill.
+    if (mem.indexOf(u8, t, "for ") == null and mem.indexOf(u8, t, "for(") == null)
+        return false;
+    const pos = mem.indexOf(u8, t, var_name) orelse return false;
+    const end = pos + var_name.len;
+    return end < t.len and t[end] == '[';
+}
 
-    // Pattern 5: Loop with indexed assignment to var_name
-    // Only count as fill if we see var_name[...] = inside the loop
-    // Note: This is a heuristic - full analysis requires tracking loop scope
-    if (mem.indexOf(u8, t, "for ") != null or mem.indexOf(u8, t, "for(") != null) {
-        // For loop on same line - check if it assigns to var_name
-        if (mem.indexOf(u8, t, var_name)) |pos| {
-            const end = pos + var_name.len;
-            if (end < t.len and t[end] == '[') return true; // var_name[...] inside for
-        }
-    }
-
-    // Pattern 6: Read/decode/bufPrint fills buffer (only if var_name is destination)
-    // These functions typically take output buffer as first arg or via pointer
-    if ((mem.indexOf(u8, t, ".read(") != null or
-        mem.indexOf(u8, t, ".recv(") != null or
-        mem.indexOf(u8, t, ".readAll(") != null or
-        mem.indexOf(u8, t, ".decode(") != null or
-        mem.indexOf(u8, t, "bufPrint(") != null) and
-        mem.indexOf(u8, t, var_name) != null)
-    {
-        // Check if &var_name appears (pointer to buffer being filled)
+/// Check if &var_name is passed to a call that fills its output buffer.
+fn hasFillCall(t: []const u8, var_name: []const u8) bool {
+    // read/recv/decode/bufPrint take the output buffer as first arg or via
+    // pointer; random.bytes/.final/.encrypt/.decrypt/.hash fill an output
+    // buffer, while siblings like .update(input) only read theirs.
+    const markers = [_][]const u8{
+        ".read(",        ".recv(",  ".readAll(", ".decode(",  "bufPrint(",
+        "random.bytes(", ".final(", ".encrypt(", ".decrypt(", ".hash(",
+    };
+    if (mem.indexOf(u8, t, var_name) == null) return false;
+    for (markers) |marker| {
+        if (mem.indexOf(u8, t, marker) == null) continue;
         if (hasAmpVar(t, var_name)) return true;
     }
+    return false;
+}
 
-    // Pattern 7: Crypto operations that fill output buffers
-    // .final(&output) fills output, but .update(input) reads input
-    // Only .final, .encrypt, .decrypt, .hash fill output buffers
-    if ((mem.indexOf(u8, t, "random.bytes(") != null or
-        mem.indexOf(u8, t, ".final(") != null or
-        mem.indexOf(u8, t, ".encrypt(") != null or
-        mem.indexOf(u8, t, ".decrypt(") != null or
-        mem.indexOf(u8, t, ".hash(") != null) and
-        mem.indexOf(u8, t, var_name) != null)
-    {
-        // Check if &var_name appears
-        if (hasAmpVar(t, var_name)) return true;
-    }
-
-    // Pattern 8: Common init functions that fill via pointer
-    if (mem.indexOf(u8, t, ".init(") != null and mem.indexOf(u8, t, var_name) != null)
-        return true;
-
-    // Pattern 9: Method calls on var that may modify receiver (self parameter)
-    // Stdlib container mutation methods from compat vocab
+/// Check if var_name.method() matches a stdlib container mutation method
+/// (the self receiver is modified).
+fn hasModifyingMethodCall(t: []const u8, var_name: []const u8) bool {
     const modifying_methods = compat.getModifyingMethodPatterns();
     for (modifying_methods) |method| {
         const var_pos = mem.indexOf(u8, t, var_name) orelse continue;
@@ -7481,6 +7465,31 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
         if (after_var + method.len > t.len) continue;
         if (mem.startsWith(u8, t[after_var..], method)) return true;
     }
+    return false;
+}
+
+/// Check if line fills a variable (pointer passed to function or direct assignment)
+fn isFillPattern(t: []const u8, var_name: []const u8) bool {
+    // &var / &Struct.var / var[...] = / direct assignment, at any occurrence
+    if (hasDirectFill(t, var_name)) return true;
+
+    // @memcpy(dest, src) fills dest and reads src; @memset(dest, value) fills
+    // dest — only the first-arg destination counts
+    if (isBuiltinDest(t, var_name, "@memcpy(")) return true;
+    if (isBuiltinDest(t, var_name, "@memset(")) return true;
+
+    // Same-line loop with indexed assignment to var_name
+    if (hasForLoopIndexedFill(t, var_name)) return true;
+
+    // Buffer-filling calls (read/decode/bufPrint/crypto) taking &var_name
+    if (hasFillCall(t, var_name)) return true;
+
+    // Common init functions that fill via pointer
+    if (mem.indexOf(u8, t, ".init(") != null and mem.indexOf(u8, t, var_name) != null)
+        return true;
+
+    // Stdlib container mutation methods modify the self receiver
+    if (hasModifyingMethodCall(t, var_name)) return true;
 
     return false;
 }

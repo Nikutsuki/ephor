@@ -13777,7 +13777,7 @@ fn findTypeBodyBrace(content: []const u8, kw_end: usize) usize {
     return i;
 }
 
-/// Swallow one char inside a `//` or `\\\\` run; both end at newline.
+/// Swallow one char inside a `//` or `\\` run; both end at newline.
 fn scanSwallowComment(scan: *ClosureBodyScan, c: u8) bool {
     if (!scan.in_line_comment and !scan.in_ml_str) return false;
     if (c == '\n') {
@@ -13813,7 +13813,7 @@ fn scanSkipQuoted(scan: *ClosureBodyScan, content: []const u8, i: usize) ?usize 
     return null;
 }
 
-/// Enter a `//` or `\\\\` run (consuming its second char); null otherwise.
+/// Enter a `//` or `\\` run (consuming its second char); null otherwise.
 fn scanStartComment(scan: *ClosureBodyScan, content: []const u8, i: usize) ?usize {
     if (content[i] == '/' and i + 1 < content.len and content[i + 1] == '/') {
         scan.in_line_comment = true;

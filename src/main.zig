@@ -12908,23 +12908,28 @@ fn checkFnNaming(ctx: NamingLineCtx) !void {
 /// Check error value (`error.MyError`) and error set member naming.
 /// Error values are not types; the style guide says "Otherwise, x should be snake_case."
 fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
+    try checkErrorValueNames(ctx);
+    if (!in_error_block) return;
+    try checkErrorSetMemberNames(ctx);
+}
+
+/// Scan one line's `error.Name` value references, reporting non-snake_case
+/// names. Std-lib and `_`-prefixed names are exempt by convention.
+fn checkErrorValueNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
-    // 1. Check error values: error.MyError
     var pos: usize = 0;
     while (pos < t.len) {
         const err_pos = mem.indexOfPos(u8, t, pos, "error.") orelse break;
-        // Ensure 'error.' is a standalone keyword, not part of a larger identifier
-        const at_start = err_pos == 0 or !isIdent(t[err_pos - 1]);
-        if (!at_start) {
+        // `error.` must be a standalone keyword, not part of a larger identifier.
+        if (err_pos > 0 and isIdent(t[err_pos - 1])) {
             pos = err_pos + 6;
             continue;
         }
-        // Skip if inside a string literal
+        // `error.` inside a string literal is data (fixture text), not a reference.
         if (isInsideString(t, err_pos)) {
             pos = err_pos + 6;
             continue;
         }
-        // Extract identifier after 'error.'
         var end = err_pos + 6;
         while (end < t.len and isIdent(t[end])) end += 1;
         if (end <= err_pos + 6) {
@@ -12932,11 +12937,7 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
             continue;
         }
         const name = t[err_pos + 6 .. end];
-        if (name.len > 0 and name[0] == '_') {
-            pos = end;
-            continue;
-        }
-        if (isStdErrorName(name)) {
+        if (name[0] == '_' or isStdErrorName(name)) {
             pos = end;
             continue;
         }
@@ -12948,82 +12949,72 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
         });
         pos = end;
     }
+}
 
-    // 2. Check error set members inside error { ... }
-    if (!in_error_block) return;
-
-    // Find where the error set body starts on this line.
-    // For lines like `const E = error{ Foo, Bar }`, only check after `error{`.
-    // For continuation lines (no `error` keyword), check the whole line.
-    var scan_start: usize = 0;
+/// Find where the error set body starts on this line: just past `error{...}`.
+/// For lines like `const E = error{ Foo, Bar }`, only the body is checked.
+/// Continuation lines (no `error` keyword) return 0 — the whole line is checked.
+fn errorSetBodyStart(t: []const u8) usize {
     var epos: usize = 0;
     while (epos < t.len) {
         const found = mem.indexOfPos(u8, t, epos, "error") orelse break;
-        const at_start = found == 0 or !isIdent(t[found - 1]);
-        if (!at_start) {
-            epos = found + 5;
-            continue;
-        }
-        var after = found + 5;
-        while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
-        if (after < t.len and t[after] == '{') {
-            scan_start = after + 1;
-            break;
-        }
+        if (matchesErrorSetOpen(t, found)) |start| return start;
         epos = found + 5;
     }
+    return 0;
+}
 
-    var i: usize = scan_start;
+/// Advance past trivia between error-set members (whitespace, braces, string
+/// literals). Returns the next member candidate index, or null when the walk
+/// must stop: at a line comment, at end of line, or at `||` — error-set
+/// composition identifiers reference other error sets, not members of this
+/// one. Accepted trade-off: also stops before a second inline error set on
+/// the same line (`error{ a } || error{ BadMember }`), a near-nonexistent idiom.
+fn skipErrorSetTrivia(t: []const u8, start: usize) ?usize {
+    var i = start;
     while (i < t.len) {
-        // Skip whitespace
         while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
-        if (i >= t.len) break;
-
-        // Skip braces (opening/closing)
-        if (t[i] == '{' or t[i] == '}') {
-            i += 1;
-            continue;
-        }
-
-        // Skip comments
-        if (t[i] == '/' and i + 1 < t.len and t[i + 1] == '/') break;
-
-        // Skip string literals (simplified: anything starting with ")
+        if (i >= t.len) return null;
+        if (t[i] == '/' and i + 1 < t.len and t[i + 1] == '/') return null;
+        if (t[i] == '|' and i + 1 < t.len and t[i + 1] == '|') return null;
         if (t[i] == '"') {
             i = skipStringLiteral(t, i);
             continue;
         }
-
-        // Error-set composition (`error{...} || other.Error`) — identifiers
-        // after `||` reference other error sets, not members of this one.
-        // Accepted trade-off: also skips a second inline error set on the same
-        // line (`error{ a } || error{ BadMember }`) — a near-nonexistent idiom.
-        if (t[i] == '|' and i + 1 < t.len and t[i + 1] == '|') break;
-
-        // Extract identifier
-        const start = i;
-        while (i < t.len and isIdent(t[i])) i += 1;
-        if (i <= start) {
+        if (t[i] == '{' or t[i] == '}') {
             i += 1;
             continue;
         }
-        const name = t[start..i];
-        if (name.len > 0 and name[0] == '_') {
-            i = skipOptionalComma(t, i);
+        return i;
+    }
+    return null;
+}
+
+/// Check error set members on this line for snake_case (caller guarantees the
+/// line is inside an error block). Std-lib and `_`-prefixed names are exempt.
+fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
+    const t = ctx.t;
+    var i: usize = errorSetBodyStart(t);
+    while (i < t.len) {
+        const member_start = skipErrorSetTrivia(t, i) orelse break;
+        var end = member_start;
+        while (end < t.len and isIdent(t[end])) end += 1;
+        if (end <= member_start) {
+            i = member_start + 1;
             continue;
         }
-        if (isStdErrorName(name)) {
-            i = skipOptionalComma(t, i);
+        const name = t[member_start..end];
+        if (name[0] == '_' or isStdErrorName(name)) {
+            i = skipOptionalComma(t, end);
             continue;
         }
-        if (!isSnakeCase(name))
-            try reportNaming(ctx, .{
-                .col = start + 1,
-                .kind = "error set member",
-                .name = name,
-                .expected = "snake_case",
-            });
-        i = skipOptionalComma(t, i);
+        if (!isSnakeCase(name)) try reportNaming(ctx, .{
+            .col = member_start + 1,
+            .kind = "error set member",
+            .name = name,
+            .expected = "snake_case",
+        });
+        i = skipOptionalComma(t, end);
     }
 }
 

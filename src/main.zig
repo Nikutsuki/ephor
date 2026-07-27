@@ -20101,31 +20101,62 @@ fn parseCliArg(
     if (arg[0] != '-') try setOwnedPath(allocator, cfg, arg);
 }
 
+/// CLI-default config: command=check, borrowed path "src", all lists empty.
+/// fail_on fields keep their struct defaults. Copied per parseArgs call;
+/// path_owned=false means deinit never frees the static "src" string.
+const cli_default_config = Config{
+    .command = .check,
+    .path = "src",
+    .path_owned = false,
+    .entries = .empty,
+    .exclude = .empty,
+    .orphan_exclude = .empty,
+    .disabled_rules = .empty,
+    .enabled_rules = .empty,
+    .verbose = false,
+    .show_summary = false,
+    .format = .text,
+    .thresholds = .{},
+    .init_build = false,
+    .export_path = null,
+    .known_issues_path = null,
+    .known_issues = .empty,
+    .auto_approve = false,
+    .runtime_command = null,
+    .install_version = null,
+};
+
+/// Strip trailing slashes from an owned path to prevent double-slash in output
+/// (e.g., "src/" + "/main.zig" would produce "src//main.zig").
+fn stripTrailingSlashes(allocator: Allocator, cfg: *Config) !void {
+    if (!cfg.path_owned) return;
+    var path = cfg.path;
+    while (path.len > 1 and path[path.len - 1] == '/') {
+        path = path[0 .. path.len - 1];
+    }
+    if (path.len == cfg.path.len) return;
+    const trimmed = try allocator.dupe(u8, path);
+    allocator.free(cfg.path);
+    cfg.path = trimmed;
+}
+
+/// Auto-detect path from build.zig when neither config nor CLI set one
+/// (only for commands that analyze code, not install/upgrade/help/version).
+fn autoDetectPath(allocator: Allocator, cfg: *Config) void {
+    const needs_path = switch (cfg.command) {
+        .install, .upgrade, .help, .version => false,
+        else => true,
+    };
+    if (!needs_path or cfg.path_owned) return;
+    cfg.path = detectPathDirFromBuildZig(allocator);
+    cfg.path_owned = true;
+}
+
 fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
     var args = try proc_args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next();
-    var cfg = Config{
-        .command = .check,
-        .path = "src",
-        .path_owned = false,
-        .entries = .empty,
-        .exclude = .empty,
-        .orphan_exclude = .empty,
-        .disabled_rules = .empty,
-        .enabled_rules = .empty,
-        .verbose = false,
-        .show_summary = false,
-        .format = .text,
-        .thresholds = .{},
-        .init_build = false,
-        .export_path = null,
-        .known_issues_path = null,
-        .known_issues = .empty,
-        .auto_approve = false,
-        .runtime_command = null,
-        .install_version = null,
-    };
+    var cfg = cli_default_config;
     // Free the partially built config when a parse error aborts midway
     // (config-file allocations are already attached to cfg by then).
     errdefer cfg.deinit(allocator);
@@ -20143,33 +20174,8 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
         }
     }
     while (args.next()) |arg| try parseCliArg(allocator, arg, &cfg, &cli_entries);
-
-    // Strip trailing slashes from path to prevent double-slash in output
-    // (e.g., "src/" + "/main.zig" would produce "src//main.zig")
-    if (cfg.path_owned) {
-        var path = cfg.path;
-        while (path.len > 1 and path[path.len - 1] == '/') {
-            path = path[0 .. path.len - 1];
-        }
-        if (path.len != cfg.path.len) {
-            const trimmed = try allocator.dupe(u8, path);
-            allocator.free(cfg.path);
-            cfg.path = trimmed;
-        }
-    }
-
-    // If path wasn't set by config or CLI, auto-detect from build.zig
-    // (only for commands that analyze code, not install/upgrade/help/version)
-    const needs_path = switch (cfg.command) {
-        .install, .upgrade, .help, .version => false,
-        else => true,
-    };
-    if (needs_path and !cfg.path_owned) {
-        const detected = detectPathDirFromBuildZig(allocator);
-        cfg.path = detected;
-        cfg.path_owned = true;
-    }
-
+    try stripTrailingSlashes(allocator, &cfg);
+    autoDetectPath(allocator, &cfg);
     if (cfg.path_owned and !mem.eql(u8, cfg.path, "src")) try detectTargetEntries(allocator, &cfg);
     if (cfg.entries.items.len == 0) try detectStandardEntries(allocator, &cfg);
     return cfg;

@@ -434,6 +434,15 @@ fn legacy_handler() void {
 
 Omit the rule to suppress all rules: `// ephor:ignore`
 
+Directives are anchored: the keyword must be the first token of a plain `//`
+comment — keywords mentioned inside prose or in `///` doc comments are
+ignored. List multiple rules separated by whitespace, e.g.
+`// ephor:ignore ZA201 ZA305`. The rule list ends at the first non-rule word,
+so trailing prose is fine, but a rule id following other words is not part
+of the list. Rule ids must be whole tokens: `ZA201,` (trailing comma) is not
+a rule id and ends the list — comma-joined lists do not work, use
+space-separated ids.
+
 ## CLI Reference
 
 Full command reference for the standalone `ephor` binary:

@@ -17904,37 +17904,88 @@ fn isCImportFile(file_path: []const u8, content: []const u8) bool {
     return false;
 }
 
-/// Check if a line has an ignore/disable directive for rule
-/// Supports: // ephor:ignore ZA201, // ephor:disable ZA201
-/// Check if a single line contains an ephor:ignore or ephor:disable directive
-/// that matches the given rule.
-fn checkLineIgnore(line: []const u8, rule: []const u8) bool {
-    const ignore_pos = mem.indexOf(u8, line, "// ephor:ignore");
-    const disable_pos = mem.indexOf(u8, line, "// ephor:disable");
-    const pos = ignore_pos orelse disable_pos orelse return false;
-    _ = pos;
-    // If the rule is mentioned, it's disabled
-    if (mem.indexOf(u8, line, rule) != null) return true;
-    // If no specific rule after directive, it disables all rules on this line
-    // But not if it's a variant like "disable-next-line" or "ignore-file"
-    const has_specific_ignore = mem.indexOf(u8, line, "ephor:ignore ") != null;
-    const has_specific_disable = mem.indexOf(u8, line, "ephor:disable ") != null;
-    const has_variant = mem.indexOf(u8, line, "ephor:disable-") != null;
-    const has_file_ignore = mem.indexOf(u8, line, "ephor:ignore-file") != null;
-    if (has_file_ignore) return false;
-    if (has_specific_ignore or has_specific_disable or has_variant) return false;
+/// A directive parsed from the start of a comment: its kind plus the text
+/// following the keyword token (leading whitespace trimmed).
+const Directive = struct {
+    kind: Kind,
+    rest: []const u8,
+
+    const Kind = enum { none, ignore, disable, disable_variant, ignore_file };
+};
+
+/// Parse an ephor directive anchored at the start of a comment. `comment`
+/// must begin at the comment's first `/` (see findCommentStart). Doc comments
+/// (`///`) never carry directives, and neither do comments whose first token
+/// is prose — the keyword must be the comment's first token.
+fn parseDirective(comment: []const u8) Directive {
+    const none: Directive = .{ .kind = .none, .rest = "" };
+    if (!mem.startsWith(u8, comment, "//")) return none;
+    if (mem.startsWith(u8, comment, "///")) return none;
+    const body = mem.trimStart(u8, comment[2..], " \t\r");
+    const tok_end = mem.indexOfAny(u8, body, " \t\r") orelse body.len;
+    const rest = mem.trimStart(u8, body[tok_end..], " \t\r");
+    return .{ .kind = directiveKind(body[0..tok_end]), .rest = rest };
+}
+
+/// Classify a comment's first token as a directive keyword. The legacy
+/// `disable-*` forms (e.g. disable-next-line) are line directives that never
+/// fall back to bare all-rule suppression.
+fn directiveKind(tok: []const u8) Directive.Kind {
+    if (mem.eql(u8, tok, "ephor:ignore")) return .ignore;
+    if (mem.eql(u8, tok, "ephor:disable")) return .disable;
+    if (mem.eql(u8, tok, "ephor:ignore-file")) return .ignore_file;
+    if (mem.startsWith(u8, tok, "ephor:disable-")) return .disable_variant;
+    return .none;
+}
+
+/// Rule-id shape: 'Z' + category letter + digits (e.g. ZA201, ZC101).
+fn isRuleToken(tok: []const u8) bool {
+    if (tok.len < 3) return false;
+    if (tok[0] != 'Z') return false;
+    if (tok[1] < 'A' or tok[1] > 'Z') return false;
+    for (tok[2..]) |c| {
+        if (c < '0' or c > '9') return false;
+    }
     return true;
 }
 
-/// Check if a file-level ignore directive matches a rule.
-fn checkFileIgnoreRule(line: []const u8, rule: []const u8) bool {
-    if (mem.indexOf(u8, line, rule) != null) return true;
-    if (mem.indexOf(u8, line, "ephor:ignore-file ")) |start_pos| {
-        const after = line[start_pos + "ephor:ignore-file ".len ..];
-        const trimmed = mem.trimStart(u8, after, " \t");
-        if (trimmed.len > 0) return false;
+/// True when `rule` appears among the leading rule-id tokens of `rest`.
+/// The rule list ends at the first token that is not rule-shaped, so a rule
+/// id buried in trailing prose does not count.
+fn ruleListMatches(rest: []const u8, rule: []const u8) bool {
+    var tokens = mem.tokenizeAny(u8, rest, " \t\r");
+    while (tokens.next()) |tok| {
+        if (!isRuleToken(tok)) return false;
+        if (mem.eql(u8, tok, rule)) return true;
     }
-    return true;
+    return false;
+}
+
+/// True when a directive's post-keyword text covers `rule`: empty text is a
+/// bare directive (suppresses all rules); otherwise the rule must appear in
+/// the leading rule-id list.
+fn directiveRestMatches(rest: []const u8, rule: []const u8) bool {
+    if (rest.len == 0) return true;
+    return ruleListMatches(rest, rule);
+}
+
+/// Check if a single line carries an ignore/disable directive that matches
+/// the given rule. The keyword must anchor a plain `//` comment as its first
+/// token; keywords inside prose, strings, or `///` doc comments are inert.
+fn checkLineIgnore(line: []const u8, rule: []const u8) bool {
+    const comment_start = findCommentStart(line) orelse return false;
+    const dir = parseDirective(line[comment_start..]);
+    return switch (dir.kind) {
+        .none, .ignore_file => false,
+        .disable_variant => ruleListMatches(dir.rest, rule),
+        .ignore, .disable => directiveRestMatches(dir.rest, rule),
+    };
+}
+
+/// Check if a parsed directive is a file-level ignore covering rule.
+fn checkFileIgnoreRule(dir: Directive, rule: []const u8) bool {
+    if (dir.kind != .ignore_file) return false;
+    return directiveRestMatches(dir.rest, rule);
 }
 
 /// Find the start of a `//` comment that is real code, not inside a string
@@ -17966,9 +18017,8 @@ fn hasFileLevelIgnore(content: []const u8, rule: []const u8) bool {
     var file_lines = mem.splitScalar(u8, content, '\n');
     while (file_lines.next()) |line| {
         const comment_start = findCommentStart(line) orelse continue;
-        const comment = line[comment_start..];
-        if (mem.indexOf(u8, comment, "ephor:ignore-file") != null and
-            checkFileIgnoreRule(comment, rule)) return true;
+        const dir = parseDirective(line[comment_start..]);
+        if (checkFileIgnoreRule(dir, rule)) return true;
     }
     return false;
 }
@@ -18011,7 +18061,7 @@ fn consumeIgnoredScopeLine(scope: *ScopeIgnore, line: []const u8, is_target: boo
 /// Check if a line/block/file has an inline ignore directive for the given rule.
 ///
 /// Supports three forms:
-///   1. Same-line:  `code(); // ephor:ignore ZA201` — suppresses that line only
+///   1. Same-line: a directive trailing the code — suppresses that line only
 ///   2. Scope-aware: an ignore directive on a comment-only line before a function
 ///      or block — automatically suppresses the entire scope (tracks braces)
 ///      If the next line doesn't open a scope, suppresses just the next line.
@@ -23755,6 +23805,111 @@ test "ephor:ignore before non-scope line suppresses just next line" {
     try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
     // Line 3: not covered
     try std.testing.expect(!isInlineDisabled(content, 3, "ZA201"));
+}
+
+test "directive in doc comment does not suppress (EPH-I0051)" {
+    // A /// doc comment is documentation, never a directive carrier — even
+    // when its whole content is the directive token.
+    const content =
+        \\/// ephor:ignore ZA201
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+}
+
+test "directive keyword in prose comment does not suppress (EPH-I0051)" {
+    const content =
+        \\// NOTE: ephor:ignore ZA201
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+}
+
+test "directive token after prose in comment does not suppress (EPH-I0051)" {
+    const content =
+        \\// NOTE: // ephor:ignore ZA201
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+}
+
+test "same-line prose mention of directive does not suppress (EPH-I0051)" {
+    const content =
+        \\const x = foo() catch {}; // see ephor:ignore ZA201 docs
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 1, "ZA201"));
+}
+
+test "same-line directive token after prose does not suppress (EPH-I0051)" {
+    const content =
+        \\const x = foo() catch {}; // see // ephor:ignore ZA201 docs
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 1, "ZA201"));
+}
+
+test "rule id after prose word in directive does not suppress (EPH-I0051)" {
+    // The rule list ends at the first non-rule token; a rule id buried in
+    // trailing prose does not count.
+    const content =
+        \\// ephor:ignore because ZA201 is noisy
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+}
+
+test "trailing prose after rule list still suppresses" {
+    const content =
+        \\// ephor:ignore ZA201 because the callback is pre-checked
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+}
+
+test "ignore-file in doc comment does not suppress file-wide (EPH-I0051)" {
+    const content =
+        \\/// ephor:ignore-file ZA201
+        \\const a = foo() catch {};
+        \\fn f() void {
+        \\    bar() catch {};
+        \\}
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(content, 4, "ZA201"));
+}
+
+test "ephor:ignore with multiple rules suppresses each listed rule" {
+    const content =
+        \\// ephor:ignore ZA201 ZA305
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA305"));
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA202"));
+}
+
+test "directive token inside string literal does not suppress same line" {
+    const content =
+        \\const s = "// ephor:ignore ZA201";
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 1, "ZA201"));
+}
+
+test "directive matching tolerates CRLF line endings" {
+    const content = "// ephor:ignore ZA201\r\nconst x = foo() catch {};\r\n";
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    const bare = "// ephor:ignore\r\nconst x = foo() catch {};\r\n";
+    try std.testing.expect(isInlineDisabled(bare, 2, "ZA202"));
+}
+
+test "ephor:ignore with trailing whitespace and no rule suppresses all rules" {
+    // Any-whitespace-then-empty rest is a bare directive (old code was inert
+    // on trailing space yet bare on trailing tab — now consistent).
+    const space = "const x = foo() catch {}; // ephor:ignore \n";
+    try std.testing.expect(isInlineDisabled(space, 1, "ZA201"));
+    try std.testing.expect(isInlineDisabled(space, 1, "ZA101"));
+    const tab = "const x = foo() catch {}; // ephor:ignore\t\n";
+    try std.testing.expect(isInlineDisabled(tab, 1, "ZA201"));
+    try std.testing.expect(isInlineDisabled(tab, 1, "ZA202"));
 }
 
 test "checkSilentCatch detects catch {}" {

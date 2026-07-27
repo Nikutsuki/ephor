@@ -3614,6 +3614,60 @@ fn hasNoFreeAllocatorParameter(lines: []const []const u8) bool {
     return false;
 }
 
+/// Type-tracked no-free allocator sets collected for one function body:
+/// allocator names plus field-name sets (function-local and file-level).
+const CFGNoFreeSets = struct {
+    names: *const std.StringHashMapUnmanaged(void),
+    local_fields: *const std.StringHashMapUnmanaged(void),
+    file_fields: ?*const std.StringHashMapUnmanaged(void),
+};
+
+/// True when `t` allocates through a no-free field from the given set:
+/// an `.allocator().` call chain or a direct field access.
+fn isNoFreeFieldAlloc(
+    t: []const u8,
+    names: *const std.StringHashMapUnmanaged(void),
+    fields: *const std.StringHashMapUnmanaged(void),
+) bool {
+    if (isNoFreeCallChainFull(t, names, fields)) return true;
+    return isNoFreeFieldChain(t, fields);
+}
+
+/// True when the first allocator argument of the allocation on `t` names a
+/// no-free allocator: standalone or multiline first arg in the name set or
+/// arena-named, or the dotted first-arg arena heuristic.
+fn isNoFreeFirstArg(
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    names: *const std.StringHashMapUnmanaged(void),
+) bool {
+    const first_arg = extractStandaloneAllocator(t) orelse
+        extractMultilineFirstArg(t, lines, idx);
+    if (first_arg) |arg| {
+        if (names.contains(arg)) return true;
+        if (isArenaName(arg)) return true;
+    }
+    return isFirstArgArena(t);
+}
+
+/// True when the allocation on `t` is backed by a no-free allocator and must
+/// be skipped: type-tracked names, field chains, or first-arg arena checks.
+fn isNoFreeAllocCall(
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    sets: *const CFGNoFreeSets,
+) bool {
+    const aname = extractAllocatorName(t) orelse "";
+    if (aname.len > 0 and sets.names.contains(aname)) return true;
+    if (isNoFreeFieldAlloc(t, sets.names, sets.local_fields)) return true;
+    if (sets.file_fields) |fields| {
+        if (isNoFreeFieldAlloc(t, sets.names, fields)) return true;
+    }
+    return isNoFreeFirstArg(t, lines, idx, sets.names);
+}
+
 /// Collect allocations from function lines for CFG analysis
 fn collectCFGAllocations(
     ctx: *const DeferCoverageCtx,
@@ -3631,6 +3685,11 @@ fn collectCFGAllocations(
     defer no_free_names.deinit(ctx.allocator);
     var all_alloc_names = try collectAllAllocatorNames(ctx.allocator, ctx.body.lines);
     defer all_alloc_names.deinit(ctx.allocator);
+    const no_free_sets: CFGNoFreeSets = .{
+        .names = &no_free_names,
+        .local_fields = &local_no_free_fields,
+        .file_fields = ctx.file_no_free_fields,
+    };
 
     // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
     var join_buf: [max_join_bytes]u8 = undefined;
@@ -3641,28 +3700,8 @@ fn collectCFGAllocations(
         // Detect allocations using type-based detection for .create()
         const alloc_info = findAllocCall(t, &all_alloc_names) orelse continue;
 
-        // Skip allocations from type-tracked no-free allocators (stdlib types only)
-        const aname = extractAllocatorName(t) orelse "";
-        if (aname.len > 0 and no_free_names.contains(aname)) continue;
-        if (isNoFreeCallChainFull(t, &no_free_names, &local_no_free_fields)) continue;
-        if (isNoFreeFieldChain(t, &local_no_free_fields)) continue;
-        // Check file-level no-free fields (struct definitions outside this function)
-        if (ctx.file_no_free_fields) |fields| {
-            if (isNoFreeCallChainFull(t, &no_free_names, fields)) continue;
-            if (isNoFreeFieldChain(t, fields)) continue;
-        }
-        // For standalone/method-style calls where allocator is an argument (not receiver),
-        // check the first-arg allocator for no-free suppression
-        if (extractStandaloneAllocator(t)) |standalone_alloc| {
-            if (no_free_names.contains(standalone_alloc)) continue;
-            if (isArenaName(standalone_alloc)) continue;
-        } else if (extractMultilineFirstArg(t, ctx.body.lines, idx)) |ml_alloc| {
-            // Multiline: allocPrint(\n    arena, ...) — first arg on next line
-            if (no_free_names.contains(ml_alloc)) continue;
-            if (isArenaName(ml_alloc)) continue;
-        }
-        // Dotted first-arg arena heuristic: allocPrint(cg.module.arena, ...)
-        if (isFirstArgArena(t)) continue;
+        // Skip allocations backed by no-free allocators (type-tracked or arena)
+        if (isNoFreeAllocCall(t, ctx.body.lines, idx, &no_free_sets)) continue;
 
         // Name comes from the physical line — slices into join_buf dangle
         // (the buffer is reused on the next iteration and dies with this frame).

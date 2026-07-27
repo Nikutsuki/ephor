@@ -6062,92 +6062,139 @@ fn trackAllocatorParams(
 /// This fixes false positives where arena is passed as std.mem.Allocator interface.
 fn buildNoFreeParamFunctions(a: Allocator, content: []const u8) !std.StringHashMapUnmanaged(void) {
     var result = std.StringHashMapUnmanaged(void){};
+    errdefer result.deinit(a);
 
-    // Step 1: Collect all no-free allocator variable names at file scope
-    var no_free_vars = std.StringHashMapUnmanaged(void){};
+    var no_free_vars = try collectNoFreeVars(a, content);
     defer no_free_vars.deinit(a);
+    if (no_free_vars.count() == 0) return result;
+
+    try scanNoFreeCallArgs(a, content, &no_free_vars, &result);
+    return result;
+}
+
+/// Step 1: collect all no-free allocator variable names at file scope.
+fn collectNoFreeVars(a: Allocator, content: []const u8) !std.StringHashMapUnmanaged(void) {
+    var vars = std.StringHashMapUnmanaged(void){};
+    errdefer vars.deinit(a);
 
     const no_free_inits = compat.getNoFreeInitPatterns();
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
+        if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
         const name = extractVarDeclName(t) orelse continue;
-
-        var init_match = false;
-        for (no_free_inits) |pat| {
-            if (mem.indexOf(u8, t, pat) == null) continue;
-            init_match = true;
-            break;
-        }
-        if (init_match) try no_free_vars.put(a, name, {});
-
-        // Track .allocator() aliases of tracked no-free vars
-        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
-        var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
-        if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
-        const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse continue;
-        const source = rhs[0..dot_alloc];
-        if (source.len > 0 and isAllIdent(source) and no_free_vars.contains(source))
-            try no_free_vars.put(a, name, {});
+        if (hasNoFreeInit(t, no_free_inits)) try vars.put(a, name, {});
+        try trackNoFreeAllocAlias(a, t, name, &vars);
     }
+    return vars;
+}
 
-    if (no_free_vars.count() == 0) return result;
+/// True when the declaration line matches a known no-free allocator init pattern.
+fn hasNoFreeInit(t: []const u8, no_free_inits: []const []const u8) bool {
+    for (no_free_inits) |pat| {
+        if (mem.indexOf(u8, t, pat) != null) return true;
+    }
+    return false;
+}
 
-    // Step 2: Content-based scan for function calls with no-free var arguments
-    // Handles multi-line function calls (common in Zig code)
+/// Track `.allocator()` aliases of tracked no-free vars: `const X = Y.allocator()`.
+fn trackNoFreeAllocAlias(
+    a: Allocator,
+    t: []const u8,
+    name: []const u8,
+    vars: *std.StringHashMapUnmanaged(void),
+) !void {
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return;
+    var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+    if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
+    const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse return;
+    const source = rhs[0..dot_alloc];
+    if (source.len == 0 or !isAllIdent(source) or !vars.contains(source)) return;
+    try vars.put(a, name, {});
+}
+
+/// Step 2: content-based scan for calls whose args reference a no-free var.
+/// Handles multi-line function calls (common in Zig code).
+fn scanNoFreeCallArgs(
+    a: Allocator,
+    content: []const u8,
+    no_free_vars: *const std.StringHashMapUnmanaged(void),
+    result: *std.StringHashMapUnmanaged(void),
+) !void {
     var cpos: usize = 0;
     while (cpos < content.len) {
         const paren_pos = mem.indexOfScalarPos(u8, content, cpos, '(') orelse break;
         cpos = paren_pos + 1;
 
-        // Extract function name before the paren
-        if (paren_pos == 0) continue;
-        var fn_start: usize = paren_pos;
-        while (fn_start > 0 and isIdent(content[fn_start - 1])) fn_start -= 1;
-        if (fn_start == paren_pos) continue;
-
-        const func_name = content[fn_start..paren_pos];
-        // Skip method calls (preceded by dot)
-        if (fn_start > 0 and content[fn_start - 1] == '.') continue;
-        // Skip type constructors (uppercase first letter)
-        if (func_name[0] >= 'A' and func_name[0] <= 'Z') continue;
-        // Skip keywords
-        if (mem.eql(u8, func_name, "try") or mem.eql(u8, func_name, "if") or
-            mem.eql(u8, func_name, "while") or mem.eql(u8, func_name, "for") or
-            mem.eql(u8, func_name, "catch") or mem.eql(u8, func_name, "switch") or
-            mem.eql(u8, func_name, "return") or mem.eql(u8, func_name, "fn") or
-            mem.eql(u8, func_name, "test")) continue;
-        // Skip function definitions: check for "fn " or "pub fn " before name
-        if (fn_start >= 3 and mem.eql(u8, content[fn_start - 3 .. fn_start], "fn ")) continue;
-        if (fn_start >= 7 and mem.eql(u8, content[fn_start - 7 .. fn_start], "pub fn ")) continue;
-
-        // Find matching closing paren (handles multi-line calls)
-        var close: usize = paren_pos + 1;
-        var depth: usize = 0;
-        const max_scan = @min(content.len, paren_pos + 2000); // Limit scan range
-        while (close < max_scan) : (close += 1) {
-            if (content[close] == '(') depth += 1;
-            if (content[close] == ')' and depth == 0) break;
-            if (content[close] == ')') depth -= 1;
-        }
-        if (close >= max_scan) continue;
-
-        const args = content[paren_pos + 1 .. close];
-
-        // Check if any no-free var is referenced in the arguments
-        var references_no_free = false;
-        var nfi = no_free_vars.iterator();
-        while (nfi.next()) |nf_entry| {
-            if (!argsContainIdent(args, nf_entry.key_ptr.*)) continue;
-            references_no_free = true;
-            break;
-        }
-        if (references_no_free) try result.put(a, func_name, {});
+        const call = extractCallName(content, paren_pos) orelse continue;
+        if (!isPlainCallName(content, call.start, call.name)) continue;
+        const close = findMatchingCloseParen(content, paren_pos) orelse continue;
+        if (!argsReferenceNoFreeVar(content[paren_pos + 1 .. close], no_free_vars)) continue;
+        try result.put(a, call.name, {});
     }
+}
 
-    return result;
+/// Call-site candidate: identifier immediately before a `(`.
+const CallName = struct {
+    start: usize,
+    name: []const u8,
+};
+
+/// Extract the identifier immediately before `paren_pos`, if any.
+fn extractCallName(content: []const u8, paren_pos: usize) ?CallName {
+    if (paren_pos == 0) return null;
+    var fn_start: usize = paren_pos;
+    while (fn_start > 0 and isIdent(content[fn_start - 1])) fn_start -= 1;
+    if (fn_start == paren_pos) return null;
+    return .{ .start = fn_start, .name = content[fn_start..paren_pos] };
+}
+
+/// Filter out candidates that cannot be plain function calls receiving a
+/// no-free allocator: method calls, type constructors, keywords, fn defs.
+fn isPlainCallName(content: []const u8, fn_start: usize, func_name: []const u8) bool {
+    if (fn_start > 0 and content[fn_start - 1] == '.') return false;
+    if (func_name[0] >= 'A' and func_name[0] <= 'Z') return false;
+    if (isCallKeyword(func_name)) return false;
+    if (fn_start >= 3 and mem.eql(u8, content[fn_start - 3 .. fn_start], "fn ")) return false;
+    if (fn_start >= 7 and mem.eql(u8, content[fn_start - 7 .. fn_start], "pub fn ")) return false;
+    return true;
+}
+
+/// Keywords whose trailing `(` is control flow, not a function call.
+fn isCallKeyword(name: []const u8) bool {
+    const keywords = [_][]const u8{
+        "try", "if", "while", "for", "catch", "switch", "return", "fn", "test",
+    };
+    for (keywords) |kw| {
+        if (mem.eql(u8, name, kw)) return true;
+    }
+    return false;
+}
+
+/// Find the `)` matching the `(` at paren_pos, scanning at most 2000 bytes.
+fn findMatchingCloseParen(content: []const u8, paren_pos: usize) ?usize {
+    const max_scan = @min(content.len, paren_pos + 2000); // Limit scan range
+    var close: usize = paren_pos + 1;
+    var depth: usize = 0;
+    while (close < max_scan) : (close += 1) {
+        if (content[close] == '(') depth += 1;
+        if (content[close] == ')' and depth == 0) return close;
+        if (content[close] == ')') depth -= 1;
+    }
+    return null;
+}
+
+/// True when any tracked no-free var name appears as a word in `args`.
+fn argsReferenceNoFreeVar(
+    args: []const u8,
+    no_free_vars: *const std.StringHashMapUnmanaged(void),
+) bool {
+    var nfi = no_free_vars.iterator();
+    while (nfi.next()) |entry| {
+        if (argsContainIdent(args, entry.key_ptr.*)) return true;
+    }
+    return false;
 }
 
 /// Word-boundary scan for `name` inside an argument list.

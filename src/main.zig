@@ -18933,72 +18933,118 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
     , .{ver});
 }
 
-/// Ensure the "thresholds" object has max_cyclomatic and max_cognitive keys.
-/// Only adds missing keys — never modifies existing values or the "disable" array.
-/// Returns new content if migration was needed, null otherwise.
-fn migrateThresholds(allocator: Allocator, content: []const u8) ?[]const u8 {
+const ThresholdsSpan = struct {
+    brace_start: usize,
+    brace_end: usize,
+};
+
+/// Locate the flat "thresholds" object's braces; null when absent or malformed.
+fn findThresholdsSpan(content: []const u8) ?ThresholdsSpan {
     const thresholds_key = "\"thresholds\"";
     const key_pos = mem.indexOf(u8, content, thresholds_key) orelse return null;
 
-    // Find the opening '{' of the thresholds object
     var brace_start = key_pos + thresholds_key.len;
     while (brace_start < content.len and content[brace_start] != '{') brace_start += 1;
     if (brace_start >= content.len) return null;
 
-    // Find the matching closing '}' (thresholds object is flat, no nesting)
+    // Flat object, so the next '}' is the matching close
     var brace_end = brace_start + 1;
     while (brace_end < content.len and content[brace_end] != '}') brace_end += 1;
     if (brace_end >= content.len) return null;
 
-    const thresholds_body = content[brace_start + 1 .. brace_end];
+    return .{ .brace_start = brace_start, .brace_end = brace_end };
+}
 
-    // Check which keys are missing
-    const has_cyclo = mem.indexOf(u8, thresholds_body, "\"max_cyclomatic\"") != null;
-    const has_cog = mem.indexOf(u8, thresholds_body, "\"max_cognitive\"") != null;
+const BracePadding = struct {
+    close_indent: []const u8,
+    last_end: usize,
+};
 
+/// Measure whitespace around the closing brace so inserted keys match the
+/// file's existing indentation.
+fn bracePadding(content: []const u8, span: ThresholdsSpan) BracePadding {
+    var indent_end = span.brace_end;
+    while (indent_end > 0 and content[indent_end - 1] == ' ') indent_end -= 1;
+
+    var last_end = indent_end;
+    while (last_end > span.brace_start + 1 and
+        std.ascii.isWhitespace(content[last_end - 1])) last_end -= 1;
+
+    return .{
+        .close_indent = content[indent_end..span.brace_end],
+        .last_end = last_end,
+    };
+}
+
+const MissingThresholdKeys = struct {
+    entry_indent: []const u8,
+    needs_comma: bool,
+    has_cyclo: bool,
+    has_cog: bool,
+};
+
+const ThresholdKeyEntry = struct {
+    present: bool,
+    text: []const u8,
+};
+
+/// Serialize missing keys as indented JSON entries, one per line; leading
+/// comma when the existing body does not end with one.
+fn buildMissingKeysJson(allocator: Allocator, mig: MissingThresholdKeys) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    if (mig.needs_comma) try buf.append(allocator, ',');
+    try buf.append(allocator, '\n');
+
+    const entries = [_]ThresholdKeyEntry{
+        .{ .present = mig.has_cyclo, .text = "\"max_cyclomatic\": 15" },
+        .{ .present = mig.has_cog, .text = "\"max_cognitive\": 15" },
+    };
+    var emitted_any = false;
+    for (entries) |entry| {
+        if (entry.present) continue;
+        if (emitted_any) try buf.appendSlice(allocator, ",\n");
+        emitted_any = true;
+        try buf.appendSlice(allocator, mig.entry_indent);
+        try buf.appendSlice(allocator, entry.text);
+    }
+
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Ensure the "thresholds" object has max_cyclomatic and max_cognitive keys.
+/// Only adds missing keys — never modifies existing values or the "disable" array.
+/// Returns new content if migration was needed, null otherwise.
+fn migrateThresholds(allocator: Allocator, content: []const u8) ?[]const u8 {
+    const span = findThresholdsSpan(content) orelse return null;
+    const body = content[span.brace_start + 1 .. span.brace_end];
+
+    const has_cyclo = mem.indexOf(u8, body, "\"max_cyclomatic\"") != null;
+    const has_cog = mem.indexOf(u8, body, "\"max_cognitive\"") != null;
     if (has_cyclo and has_cog) return null;
 
-    // Determine indentation used for the closing brace
-    var indent_end = brace_end;
-    while (indent_end > 0 and content[indent_end - 1] == ' ') indent_end -= 1;
-    const close_indent = content[indent_end..brace_end];
+    const pad = bracePadding(content, span);
+    const close_indent = pad.close_indent;
     const entry_indent = std.fmt.allocPrint(allocator, "{s}  ", .{close_indent}) catch return null;
     defer allocator.free(entry_indent);
 
-    // Find the last non-whitespace character before the closing brace
-    var last_end = indent_end;
-    while (last_end > brace_start + 1 and
-        std.ascii.isWhitespace(content[last_end - 1])) last_end -= 1;
-
-    const needs_comma = last_end > brace_start + 1 and content[last_end - 1] != ',';
-
-    // Build insertion string for missing keys
-    var insert_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer insert_buf.deinit(allocator);
-
-    if (needs_comma) insert_buf.append(allocator, ',') catch return null;
-    insert_buf.append(allocator, '\n') catch return null;
-
-    if (!has_cyclo) {
-        insert_buf.appendSlice(allocator, entry_indent) catch return null;
-        insert_buf.appendSlice(allocator, "\"max_cyclomatic\": 15") catch return null;
-        if (!has_cog) {
-            insert_buf.append(allocator, ',') catch return null;
-            insert_buf.append(allocator, '\n') catch return null;
-        }
-    }
-
-    if (!has_cog) {
-        insert_buf.appendSlice(allocator, entry_indent) catch return null;
-        insert_buf.appendSlice(allocator, "\"max_cognitive\": 15") catch return null;
-    }
+    const mig: MissingThresholdKeys = .{
+        .entry_indent = entry_indent,
+        .needs_comma = pad.last_end > span.brace_start + 1 and
+            content[pad.last_end - 1] != ',',
+        .has_cyclo = has_cyclo,
+        .has_cog = has_cog,
+    };
+    const insert = buildMissingKeysJson(allocator, mig) catch return null;
+    defer allocator.free(insert);
 
     // Insert after the last existing entry, then restore closing brace indentation
     return std.fmt.allocPrint(allocator, "{s}{s}\n{s}{s}", .{
-        content[0..last_end],
-        insert_buf.items,
+        content[0..pad.last_end],
+        insert,
         close_indent,
-        content[brace_end..],
+        content[span.brace_end..],
     }) catch null;
 }
 

@@ -4661,7 +4661,8 @@ const ErrdeferScanState = struct {
     }
 };
 
-/// Scan lines for try-allocations and errdefer statements
+/// Inputs for the no-free check on one try-alloc line: the joined logical
+/// line, its trimmed physical line, and the type-tracked no-free name set.
 const NoFreeAllocCtx = struct {
     joined: []const u8,
     t: []const u8,
@@ -4683,6 +4684,62 @@ fn isNoFreeAllocLine(ctx: NoFreeAllocCtx) bool {
     // Dotted first-arg arena heuristic
     return isFirstArgArena(ctx.joined);
 }
+
+/// Loop-invariant inputs for scanning one function-body line: bundles the
+/// two collection sinks with the join buffer and error-return list so the
+/// per-line helper stays within the parameter limit.
+const ErrdeferLineCtx = struct {
+    allocator: Allocator,
+    lines: []const []const u8,
+    func_line: usize,
+    join_buf: *[max_join_bytes]u8,
+    error_returns: *std.ArrayListUnmanaged(usize),
+    collect_ctx: *const TryAllocCollectCtx,
+    cleanup_ctx: *const CleanupCollectCtx,
+};
+
+/// Scan one physical line for try-allocations, error returns, and cleanup
+/// blocks, appending into the ctx lists. Returns early on comment lines and
+/// lines consumed by an in-flight multi-line cleanup block.
+fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !void {
+    const actual_line = ctx.func_line + idx;
+    const t = mem.trim(u8, line, " \t\r");
+    if (isCommentOrMultilineString(t)) return;
+    if (try continueBlockCollection(
+        t,
+        ctx.cleanup_ctx.bs,
+        ctx.cleanup_ctx.errdefers,
+        ctx.allocator,
+    )) return;
+    // Alloc detection runs on the joined logical line so wrapped calls
+    // (type first-arg on the next line) are visible; line-structure
+    // detection (defer blocks, try presence) stays on the physical line.
+    const joined = joinParenContinuation(ctx.lines, idx, ctx.join_buf);
+    const skip_ctx: NoFreeAllocCtx = .{
+        .joined = joined,
+        .t = t,
+        .lines = ctx.lines,
+        .idx = idx,
+        .no_free_names = ctx.collect_ctx.no_free_names,
+    };
+    const site: StmtSite = .{ .line = actual_line, .indent = countIndent(line) };
+    // Keyword matches must skip string literals/word fragments:
+    // @panic("Retry transaction not found") is not a gap trigger.
+    const has_try = hasRealKeyword(t, "try ");
+    if (hasRealKeyword(t, "return error."))
+        try ctx.error_returns.append(ctx.allocator, actual_line);
+    if (has_try and isTryAllocation(joined)) {
+        // Standalone/multiline first-arg allocator checks (no-free set or arena)
+        const no_free = isNoFreeAllocLine(skip_ctx);
+        if (no_free) try ctx.collect_ctx.try_lines.append(ctx.allocator, actual_line);
+        if (!no_free) try collectTryAllocFromLine(joined, t, site, ctx.collect_ctx);
+    }
+    try collectDeferFromLine(t, site, ctx.cleanup_ctx);
+    if (has_try) try ctx.collect_ctx.try_lines.append(ctx.allocator, actual_line);
+}
+
+/// Scan function-body lines for try-allocations, error returns, and
+/// errdefer/defer blocks into a fresh ErrdeferScanState.
 fn scanErrdeferLines(
     allocator: Allocator,
     lines: []const []const u8,
@@ -4720,42 +4777,17 @@ fn scanErrdeferLines(
 
     // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
     var join_buf: [max_join_bytes]u8 = undefined;
+    const line_ctx: ErrdeferLineCtx = .{
+        .allocator = allocator,
+        .lines = lines,
+        .func_line = func_line,
+        .join_buf = &join_buf,
+        .error_returns = &state.error_returns,
+        .collect_ctx = &collect_ctx,
+        .cleanup_ctx = &cleanup_ctx,
+    };
     for (lines, 0..) |line, idx| {
-        const actual_line = func_line + idx;
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        if (try continueBlockCollection(
-            t,
-            &state.bs,
-            &state.errdefers,
-            allocator,
-        )) continue;
-        // Alloc detection runs on the joined logical line so wrapped calls
-        // (type first-arg on the next line) are visible; line-structure
-        // detection (defer blocks, try presence) stays on the physical line.
-        const joined = joinParenContinuation(lines, idx, &join_buf);
-        const skip_ctx: NoFreeAllocCtx = .{
-            .joined = joined,
-            .t = t,
-            .lines = lines,
-            .idx = idx,
-            .no_free_names = &no_free_names,
-        };
-        const indent = countIndent(line);
-        const site: StmtSite = .{ .line = actual_line, .indent = indent };
-        // Keyword matches must skip string literals/word fragments:
-        // @panic("Retry transaction not found") is not a gap trigger.
-        const has_try = hasRealKeyword(t, "try ");
-        if (hasRealKeyword(t, "return error."))
-            try state.error_returns.append(allocator, actual_line);
-        if (has_try and isTryAllocation(joined)) {
-            // Standalone/multiline first-arg allocator checks (no-free set or arena)
-            const no_free = isNoFreeAllocLine(skip_ctx);
-            if (no_free) try state.try_lines_list.append(allocator, actual_line);
-            if (!no_free) try collectTryAllocFromLine(joined, t, site, &collect_ctx);
-        }
-        try collectDeferFromLine(t, site, &cleanup_ctx);
-        if (has_try) try state.try_lines_list.append(allocator, actual_line);
+        try scanErrdeferLine(&line_ctx, line, idx);
     }
     return state;
 }

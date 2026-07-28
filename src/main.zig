@@ -4391,6 +4391,7 @@ fn checkErrdeferOwnershipTransfer(
     // on the alloc line would falsely match container_ownership_methods)
     const start = alloc_idx + 1;
     if (start >= lines.len) return;
+    var tuple_scan: ReturnTupleScan = .{};
     for (lines[start..]) |line| {
         const lt = mem.trim(u8, line, " \t\r");
         // Check for break :label ownership transfer
@@ -4405,6 +4406,16 @@ fn checkErrdeferOwnershipTransfer(
         }
         // Check for struct field storage (self.field = alloc_name)
         if (isStructFieldStorage(lt, alloc.name)) {
+            alloc.has_errdefer = true;
+            return;
+        }
+        // Check for ownership transfer via return (plain + single-line tuple)
+        if (isReturnTransfer(lt, alloc.name)) {
+            alloc.has_errdefer = true;
+            return;
+        }
+        // Check inside a multi-line `return .{ ... };` tuple (bounded scan)
+        if (checkReturnTupleLine(lt, alloc.name, &tuple_scan)) {
             alloc.has_errdefer = true;
             return;
         }
@@ -6838,6 +6849,142 @@ fn isStructFieldStorage(t: []const u8, alloc_name: []const u8) bool {
         if (containsIdentifier(t[eq_pos + 3 ..], alloc_name)) return true;
     }
     return false;
+}
+
+/// Ownership transfer via RETURN (ZA103 suppression). Matches:
+///   return name;               — plain return of the allocation
+///   return .{ name, 0 };       — positional tuple/anon-struct element
+///   return .{ .field = name }; — named anon-struct element
+/// NOT matched (no transfer / ownership unclear): `return name != null;`
+/// (comparison), `return foo(name);` (call), `return name.field;` (read),
+/// and name occurrences inside string literals.
+fn isReturnTransfer(t: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    const expr = afterReturnKeyword(t) orelse return false;
+    if (!mem.startsWith(u8, expr, ".{")) return isPlainReturnTransfer(expr, name);
+    // Tuple literal: a transfer only when it closes on this line; unclosed
+    // openers are tracked across lines by checkReturnTupleLine.
+    const open = mem.indexOf(u8, t, ".{") orelse return false;
+    const close = mem.indexOfPos(u8, t, open + 2, "};") orelse return false;
+    return isReturnTupleElement(t, name, .{ .from = open + 2, .to = close });
+}
+
+/// A trimmed line of exactly `return <expr>` yields `<expr>`; anything else
+/// (including identifiers like `returning`) yields null.
+fn afterReturnKeyword(t: []const u8) ?[]const u8 {
+    if (!mem.startsWith(u8, t, "return")) return null;
+    if (t.len > 6 and isIdent(t[6])) return null;
+    return mem.trimStart(u8, t[6..], " \t");
+}
+
+/// `return name;` — the whole expression is exactly the alloc name. The
+/// follower after optional spaces must be `;`: an operator (`!=`), call
+/// (`(`), field (`.`), or subscript (`[`) follower is a read, not a transfer.
+fn isPlainReturnTransfer(expr: []const u8, name: []const u8) bool {
+    if (!mem.startsWith(u8, expr, name)) return false;
+    var end = name.len;
+    if (end < expr.len and isIdent(expr[end])) return false;
+    while (end < expr.len and (expr[end] == ' ' or expr[end] == '\t')) end += 1;
+    return end < expr.len and expr[end] == ';';
+}
+
+/// Scan region for tuple-element matching: the line slice to search plus the
+/// paren depth carried into it (nonzero only for continuation lines of a
+/// multi-line `return .{` whose earlier lines opened a call/paren group).
+const TupleElementRegion = struct {
+    from: usize,
+    to: usize,
+    base_depth: usize = 0,
+};
+
+/// `name` used as a tuple ELEMENT within the region. A match must be:
+///   - word-bounded, where a leading `.` is NOT a boundary — `x.buf` and
+///     `.buf` are field/enum access on another value, never the local
+///   - outside string literals
+///   - at the region's own paren level — a name inside a call (`wrap(buf, 0)`)
+///     is a call arg, not an element (single- and multi-line alike)
+///   - followed (after spaces) by `,`, `}`, or end-of-line — field reads
+///     (`buf.len`), subscripts (`buf[0]`), operators (`buf != null`) and
+///     single-arg call closers (`foo(buf)`) have other followers
+/// Transparent parens around a bare name (`.{ (buf), 0 }`) are conservatively
+/// NOT a match: distinguishing them from call args costs more than the shape
+/// occurs in practice (disclosed residual).
+fn isReturnTupleElement(t: []const u8, name: []const u8, region: TupleElementRegion) bool {
+    var s = region.from;
+    while (s < region.to) {
+        const rel = mem.indexOf(u8, t[s..region.to], name) orelse return false;
+        const pos = s + rel;
+        s = pos + name.len;
+        if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) continue;
+        if (isInsideString(t, pos)) continue;
+        if (parenDepthAt(t, region.from, pos, region.base_depth) != 0) continue;
+        if (hasElementFollower(t, pos + name.len)) return true;
+    }
+    return false;
+}
+
+/// The character after a tuple element candidate (skipping spaces) must be
+/// `,`, `}`, or end-of-line (multi-line element); an identifier continuation
+/// (`buffer`), field/subscript/call follower (`.`, `[`, `(`), or operator is
+/// a read of the name, not an element transfer.
+fn hasElementFollower(t: []const u8, end0: usize) bool {
+    if (end0 < t.len and isIdent(t[end0])) return false;
+    var end = end0;
+    while (end < t.len and (t[end] == ' ' or t[end] == '\t')) end += 1;
+    if (end >= t.len) return true;
+    return t[end] == ',' or t[end] == '}';
+}
+
+/// Paren nesting depth at `pos`, counting t[from..pos] on top of `base`
+/// (the depth carried from previous lines) and ignoring parens inside
+/// string literals.
+fn parenDepthAt(t: []const u8, from: usize, pos: usize, base: usize) usize {
+    var depth = base;
+    var i = from;
+    while (i < pos and i < t.len) : (i += 1) {
+        if (isInsideString(t, i)) continue;
+        if (t[i] == '(') depth += 1;
+        if (t[i] == ')') depth -|= 1;
+    }
+    return depth;
+}
+
+/// Bound on how many lines a multi-line `return .{` tuple may span.
+const max_return_tuple_scan: u8 = 40;
+
+/// Multi-line `return .{` scan state: remaining continuation lines plus the
+/// paren depth carried across them (so call args inside the tuple are not
+/// mistaken for elements).
+const ReturnTupleScan = struct {
+    remaining: u8 = 0,
+    paren_depth: usize = 0,
+};
+
+/// Track a multi-line `return .{ ... };` tuple across lines (bounded). While
+/// armed (`scan.remaining > 0`) each line is checked for the alloc name as a
+/// tuple element at the carried paren depth until the `};` closer; otherwise
+/// an unclosed `return .{` opener arms the scan (the opener line itself may
+/// carry the first element).
+fn checkReturnTupleLine(t: []const u8, name: []const u8, scan: *ReturnTupleScan) bool {
+    if (scan.remaining > 0) {
+        scan.remaining -= 1;
+        if (mem.indexOf(u8, t, "};") != null) scan.remaining = 0;
+        const hit = isReturnTupleElement(t, name, .{
+            .from = 0,
+            .to = t.len,
+            .base_depth = scan.paren_depth,
+        });
+        scan.paren_depth = parenDepthAt(t, 0, t.len, scan.paren_depth);
+        return hit;
+    }
+    const expr = afterReturnKeyword(t) orelse return false;
+    if (!mem.startsWith(u8, expr, ".{")) return false;
+    // Closed on this line — isReturnTransfer's single-line job.
+    if (mem.indexOf(u8, t, "};") != null) return false;
+    const open = mem.indexOf(u8, t, ".{") orelse return false;
+    scan.remaining = max_return_tuple_scan;
+    scan.paren_depth = parenDepthAt(t, open + 2, t.len, 0);
+    return isReturnTupleElement(t, name, .{ .from = open + 2, .to = t.len });
 }
 
 /// Extract identifier before .create( position
@@ -22160,6 +22307,283 @@ test "ZA103: struct field storage with colliding name transfers ownership" {
         "test_field_storage.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
+}
+
+test "ZA103: plain return of the alloc transfers ownership" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle multiversion.zig shape: alloc + plain return inside a
+    // branch, later try in the same function. The return moves ownership to
+    // the caller — no errdefer gap.
+    const content =
+        \\fn self_path(allocator: std.mem.Allocator, fallback: bool) ![]u8 {
+        \\    if (fallback) {
+        \\        const path = try allocator.dupe(u8, "x");
+        \\        return path;
+        \\    }
+        \\    const other = try allocator.dupe(u8, "y");
+        \\    return other;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_plain_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_plain_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: single-line tuple return transfers ownership" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle transaction_pool shape: `return .{ buf, 0 };`
+    const content =
+        \\fn get_pair(allocator: std.mem.Allocator, use_buf: bool) !struct { []u8, usize } {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        return .{ buf, 0 };
+        \\    }
+        \\    const other = try allocator.alloc(u8, 8);
+        \\    return .{ other, 1 };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_tuple_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_tuple_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: multi-line tuple return transfers ownership" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn get_pair_ml(allocator: std.mem.Allocator, use_buf: bool) !struct { []u8, usize } {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        return .{
+        \\            buf,
+        \\            0,
+        \\        };
+        \\    }
+        \\    const other = try allocator.alloc(u8, 8);
+        \\    return .{ other, 1 };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_tuple_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_ml_tuple_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: named-field anon-struct return transfers ownership" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const Pair = struct { ptr: []u8, n: usize };
+        \\fn named_pair(allocator: std.mem.Allocator, use_buf: bool) !Pair {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        return .{ .ptr = buf, .n = 0 };
+        \\    }
+        \\    const other = try allocator.alloc(u8, 8);
+        \\    return .{ .ptr = other, .n = 1 };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_named_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_named_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: alloc never returned or stored still fires (TP lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Manual free on the success path only — the error path through the
+    // later try leaks, so the gap must still be reported.
+    const content =
+        \\fn no_transfer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    try ping();
+        \\    allocator.free(buf);
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_no_transfer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_no_transfer.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: return of a call result does not transfer (TP lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `return wrap(buf);` — ownership passed through a call is unclear; the
+    // return-transfer suppression must NOT apply.
+    const content =
+        \\fn call_return(allocator: std.mem.Allocator, use_buf: bool) ![]u8 {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        return wrap(buf);
+        \\    }
+        \\    const other = try allocator.dupe(u8, "y");
+        \\    return other;
+        \\}
+        \\fn wrap(d: []u8) []u8 {
+        \\    return d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_call_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_call_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: comparison return does not transfer (TP lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `return buf != null;` — first token is the name but followed by an
+    // operator, not `;` — a read, not a transfer.
+    const content =
+        \\fn cmp_return(allocator: std.mem.Allocator, use_buf: bool) !bool {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        return buf != null;
+        \\    }
+        \\    const other = try allocator.dupe(u8, "y");
+        \\    return other.len != 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_cmp_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_cmp_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: field access on another object inside tuple does not transfer (TP lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `return .{ x.buf, 0 };` — `x.buf` is a field of another object; the
+    // leading dot is NOT a word boundary for the local buf, which is never
+    // transferred and must still be reported.
+    const content =
+        \\const Holder = struct { buf: []u8 };
+        \\fn field_mention(allocator: std.mem.Allocator, use_buf: bool, x: *Holder) !struct { []u8, usize } {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        _ = buf;
+        \\        return .{ x.buf, 0 };
+        \\    }
+        \\    const other = try allocator.alloc(u8, 8);
+        \\    return .{ other, 1 };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_field_mention.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_field_mention.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: enum literal inside tuple does not transfer (TP lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `return .{ .buf, 0 };` — `.buf` is an enum literal, not the local buf;
+    // the local is never transferred and must still be reported.
+    const content =
+        \\const Kind = enum { buf, other };
+        \\fn enum_mention(allocator: std.mem.Allocator, use_buf: bool) !struct { Kind, usize } {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        _ = buf;
+        \\        return .{ .buf, 0 };
+        \\    }
+        \\    const other = try allocator.alloc(u8, 8);
+        \\    return .{ .other, 1 };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_enum_mention.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_enum_mention.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: string mention inside tuple does not transfer (TP lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `return .{ "buf", 0 };` — the alloc name appears only inside a string
+    // literal in the tuple; the real buf is never transferred.
+    const content =
+        \\fn str_mention(allocator: std.mem.Allocator, use_buf: bool) !struct { []const u8, usize } {
+        \\    if (use_buf) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        _ = buf;
+        \\        return .{ "buf", 0 };
+        \\    }
+        \\    const other = try allocator.dupe(u8, "y");
+        \\    return .{ other, 1 };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_str_mention.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_str_mention.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
 }
 
 test "ZA106: plain defer with no direct free stays silent" {

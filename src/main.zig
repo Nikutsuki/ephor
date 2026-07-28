@@ -6568,13 +6568,71 @@ fn explicitAnnotTypeName(after_name: []const u8) ?[]const u8 {
     if (after_name.len == 0 or after_name[0] != ':') return null;
     const type_start = mem.trim(u8, after_name[1..], " \t");
     var ts: usize = 0;
-    // Exactly one pointer marker, then one optional marker — order matters.
-    if (ts < type_start.len and type_start[ts] == '*') ts += 1;
-    if (ts < type_start.len and type_start[ts] == '?') ts += 1;
+    while (skipTypePrefix(type_start, &ts)) {}
     var te: usize = ts;
     while (te < type_start.len and isIdent(type_start[te])) te += 1;
     if (te == ts) return null;
     return type_start[ts..te];
+}
+
+/// Skip one compound-type prefix item at `ts`: `*`/`?` markers, `const`/
+/// `volatile` qualifiers, slice/array heads, `align(N)` specs, error-union
+/// heads. Returns true when the cursor advanced; each advance is at least
+/// one byte, so the caller's prefix loop is bounded by the slice length.
+fn skipTypePrefix(type_start: []const u8, ts: *usize) bool {
+    if (ts.* >= type_start.len) return false;
+    const rest = type_start[ts.*..];
+    const c = rest[0];
+    if (c == '*' or c == '?') {
+        ts.* += 1;
+        return true;
+    }
+    if (c == '[') {
+        // Slice/array/many-item heads never nest brackets in real code.
+        const close = mem.indexOfScalar(u8, rest, ']') orelse return false;
+        ts.* += close + 1;
+        return true;
+    }
+    if (skipQualifier(rest, "const ", ts)) return true;
+    if (skipQualifier(rest, "volatile ", ts)) return true;
+    if (skipAlignSpec(rest, ts)) return true;
+    return skipErrorHead(rest, ts);
+}
+
+/// Advance `ts` past a qualifier keyword. `kw` includes a trailing space,
+/// which word-bounds the match so `constant` is not consumed as `const`.
+fn skipQualifier(rest: []const u8, kw: []const u8, ts: *usize) bool {
+    if (!mem.startsWith(u8, rest, kw)) return false;
+    ts.* += kw.len;
+    return true;
+}
+
+/// Skip `align(N)` plus trailing whitespace (zig fmt separates the spec from
+/// the qualifier/pointee that follows it).
+fn skipAlignSpec(rest: []const u8, ts: *usize) bool {
+    if (!mem.startsWith(u8, rest, "align(")) return false;
+    const close = mem.indexOfScalar(u8, rest, ')') orelse return false;
+    var end = close + 1;
+    while (end < rest.len and (rest[end] == ' ' or rest[end] == '\t')) end += 1;
+    ts.* += end;
+    return true;
+}
+
+/// Skip an error-union head: bare `!`, `anyerror!`, or `error{...}!`.
+fn skipErrorHead(rest: []const u8, ts: *usize) bool {
+    if (rest[0] == '!') {
+        ts.* += 1;
+        return true;
+    }
+    if (mem.startsWith(u8, rest, "anyerror!")) {
+        ts.* += "anyerror!".len;
+        return true;
+    }
+    if (!mem.startsWith(u8, rest, "error{")) return false;
+    const close = mem.indexOfScalar(u8, rest, '}') orelse return false;
+    if (close + 1 >= rest.len or rest[close + 1] != '!') return false;
+    ts.* += close + 2;
+    return true;
 }
 
 /// Strategy B: RHS inference — extract the type from `var x = TypeName.init(...)`,
@@ -26209,6 +26267,42 @@ test "extractVarTypeName skips pointer then optional markers" {
     const t1 = extractVarTypeName("var p: *?Widget = undefined;");
     try std.testing.expect(t1 != null);
     try std.testing.expectEqualStrings("Widget", t1.?);
+}
+
+test "extractVarTypeName skips pointer qualifiers in annotations" {
+    try std.testing.expectEqualStrings("Q", extractVarTypeName("var z: *const Q = undefined;").?);
+    try std.testing.expectEqualStrings("T", extractVarTypeName("var t: *volatile T = undefined;").?);
+    try std.testing.expectEqualStrings("Q", extractVarTypeName("var q: ?*const Q = undefined;").?);
+}
+
+test "extractVarTypeName skips slice and array prefixes" {
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var s: []u8 = undefined;").?);
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var a: [4]u8 = undefined;").?);
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var m: [*c]u8 = undefined;").?);
+}
+
+test "extractVarTypeName skips align specs and compound qualifier chains" {
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var p: *align(4) u8 = undefined;").?);
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var p: *align(4) const u8 = undefined;").?);
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var p: [*c]const u8 = undefined;").?);
+    // Pathological nested parens: simple )-scan must fall to A-null, not mis-skip
+    try std.testing.expect(extractVarTypeName("var p: *align(@alignOf(u8)) u8 = undefined;") == null);
+}
+
+test "extractVarTypeName skips error-union prefixes" {
+    try std.testing.expectEqualStrings("Foo", extractVarTypeName("var e: error{X}!Foo = undefined;").?);
+    try std.testing.expectEqualStrings("Foo", extractVarTypeName("var e: anyerror!Foo = undefined;").?);
+    try std.testing.expectEqualStrings("Foo", extractVarTypeName("var e: !Foo = undefined;").?);
+}
+
+test "extractVarTypeName qualified annotation does not block RHS inference" {
+    const t1 = extractVarTypeName("var z: *const Q = Q.init();");
+    try std.testing.expect(t1 != null);
+    try std.testing.expectEqualStrings("Q", t1.?);
+}
+
+test "extractVarTypeName returns null for qualifier-only annotation" {
+    try std.testing.expect(extractVarTypeName("var q: *const = undefined;") == null);
 }
 
 test "extractMethodCall extracts receiver and method" {

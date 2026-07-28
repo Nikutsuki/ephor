@@ -7036,6 +7036,11 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
 /// Patterns where allocator is the first function argument (not the receiver).
 /// Used to extract the allocator name for no-free suppression on stdlib functions
 /// like `std.fmt.allocPrint(allocator, ...)` or `list.toOwnedSlice(allocator)`.
+/// `.dupe(`/`.dupeZ(` are safe here: for real allocator-receiver calls
+/// (`allocator.dupe(u8, str)`) extraction returns the type param `u8`, which
+/// matches neither no-free names nor arena names, so nothing is suppressed.
+/// Only custom-receiver calls with a non-type allocator first arg
+/// (`tuple_info.types.dupe(arena, ip)`) gain suppression.
 const first_arg_alloc_patterns = [_][]const u8{
     ".allocPrint(",
     ".allocPrintSentinel(",
@@ -7050,10 +7055,78 @@ const first_arg_alloc_patterns = [_][]const u8{
     ".selfExePathAlloc(",
     ".selfExeDirPathAlloc(",
     ".realpathAlloc(",
-    ".replaceOwned(",
     ".concatWithSentinel(",
     ".stringifyAlloc(",
+    ".dupe(",
+    ".dupeZ(",
 };
+
+/// Patterns whose FIRST argument is a comptime type parameter, with the
+/// allocator as the SECOND argument: `std.mem.replaceOwned(u8, arena, ...)`.
+/// Verified against the 0.15.2 and 0.16.0 stdlib signatures:
+///   replaceOwned(comptime T: type, allocator: Allocator, ...)
+/// `std.mem.concatWithSentinel` is NOT here — its signature is
+/// (allocator, comptime T, ...), allocator-first, so it stays in
+/// first_arg_alloc_patterns.
+const type_first_arg_alloc_patterns = [_][]const u8{
+    ".replaceOwned(",
+};
+
+/// Return the position just after the first comma at bracket depth zero
+/// following `start`, or null when the call closes first. Nested parens,
+/// brackets, and braces inside the skipped argument (array dims, tuple
+/// types) do not count; the call's own closing paren ends the search.
+fn skipPastTopLevelComma(t: []const u8, start: usize) ?usize {
+    var depth: i32 = 0;
+    var s = start;
+    while (s < t.len) : (s += 1) {
+        const c = t[s];
+        switch (c) {
+            '(', '[', '{' => depth += 1,
+            ')' => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            ']', '}' => depth -= 1,
+            ',' => {
+                if (depth == 0) return s + 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Argument start for type-first allocating calls (`std.mem.replaceOwned`).
+/// When the first argument looks like a comptime type (hasTypeFirstArg),
+/// skip it and return the second argument's start; otherwise keep first-arg
+/// semantics so custom `.replaceOwned(a, b)` methods behave as before.
+fn typeFirstAllocArgStart(t: []const u8, start: usize) ?usize {
+    if (!hasTypeFirstArg(t, start)) return start;
+    return skipPastTopLevelComma(t, start);
+}
+
+/// Whether the matched allocating call takes the allocator as its first
+/// argument or as the argument after a leading comptime type parameter.
+const AllocArgKind = enum { first_arg, type_first };
+
+const AllocArgMatch = struct { start: usize, kind: AllocArgKind };
+
+/// Match the first allocating-call pattern present in the line, checking
+/// qualified, first-arg, then type-param-first patterns in order. Null when
+/// the line has no allocating pattern.
+fn matchAllocArgPattern(t: []const u8) ?AllocArgMatch {
+    for (compat.getQualifiedAllocFnPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .first_arg };
+    }
+    for (first_arg_alloc_patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .first_arg };
+    }
+    for (type_first_arg_alloc_patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .type_first };
+    }
+    return null;
+}
 
 /// Extract the allocator name from the first argument of a standalone or
 /// method-style allocating function call where the allocator is an argument,
@@ -7062,20 +7135,13 @@ const first_arg_alloc_patterns = [_][]const u8{
 ///   list.toOwnedSlice(allocator)
 ///   std.mem.concat(allocator, u8, ...)
 ///   mem.join(allocator, ...)
+///   tuple_info.types.dupe(arena, ip)
+///   std.mem.replaceOwned(u8, builder.arena, ...)
 fn extractStandaloneAllocator(t: []const u8) ?[]const u8 {
-    // Check qualified patterns (allocator is the first arg for all)
-    for (compat.getQualifiedAllocFnPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            return extractFirstArgIdent(t, pos + pat.len);
-        }
-    }
-    // Check method patterns where allocator is the first arg
-    for (first_arg_alloc_patterns) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            return extractFirstArgIdent(t, pos + pat.len);
-        }
-    }
-    return null;
+    const m = matchAllocArgPattern(t) orelse return null;
+    if (m.kind == .first_arg) return extractFirstArgIdent(t, m.start);
+    const arg_start = typeFirstAllocArgStart(t, m.start) orelse return null;
+    return extractFirstArgIdent(t, arg_start);
 }
 
 /// Extract a simple identifier starting at `start` (first arg before comma/paren).
@@ -7121,39 +7187,25 @@ fn isFirstArgArena(t: []const u8) bool {
     return false;
 }
 
-/// Find the position after an allocating-call pattern (standalone or qualified),
-/// in pattern-list order. Null when the line has no allocating pattern.
+/// Find the position after an allocating-call pattern (standalone or qualified).
+/// For type-param-first patterns the position is the SECOND argument's start.
+/// Null when the line has no allocating pattern.
 fn findAllocArgStart(t: []const u8) ?usize {
-    for (compat.getQualifiedAllocFnPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| return pos + pat.len;
-    }
-    for (first_arg_alloc_patterns) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| return pos + pat.len;
-    }
-    return null;
+    const m = matchAllocArgPattern(t) orelse return null;
+    if (m.kind == .first_arg) return m.start;
+    return typeFirstAllocArgStart(t, m.start);
 }
 
 /// Extract the first argument of a multiline allocating call.
 /// When a line ends with an allocating pattern like `allocPrint(` and the first
 /// argument is on the next line, extract that identifier from the next line.
 /// Handles: `std.fmt.allocPrint(\n    arena,` and similar patterns.
+/// For type-param-first patterns the next line holds `Type, allocator` and the
+/// type param is skipped the same way as the single-line path.
 fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize) ?[]const u8 {
-    // Check if the line contains an allocating pattern that ends at the line boundary
-    // (i.e., extractStandaloneAllocator returned null because the arg is on the next line)
-    var has_alloc_pattern = false;
-    for (compat.getQualifiedAllocFnPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat) == null) continue;
-        has_alloc_pattern = true;
-        break;
-    }
-    if (!has_alloc_pattern) {
-        for (first_arg_alloc_patterns) |pat| {
-            if (mem.indexOf(u8, t, pat) == null) continue;
-            has_alloc_pattern = true;
-            break;
-        }
-    }
-    if (!has_alloc_pattern) return null;
+    // A match means extractStandaloneAllocator returned null because the arg
+    // is on the next line; verified below by the trailing open paren.
+    const m = matchAllocArgPattern(t) orelse return null;
 
     // Check that the line ends with an open paren (possibly with trailing whitespace)
     const trimmed = mem.trimEnd(u8, t, " \t\r");
@@ -7162,7 +7214,9 @@ fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize
     // Look at the next line for the first argument
     if (idx + 1 >= lines.len) return null;
     const next_line = mem.trim(u8, lines[idx + 1], " \t\r");
-    return extractFirstArgIdent(next_line, 0);
+    if (m.kind == .first_arg) return extractFirstArgIdent(next_line, 0);
+    const arg_start = typeFirstAllocArgStart(next_line, 0) orelse return null;
+    return extractFirstArgIdent(next_line, arg_start);
 }
 
 // ============================================================================
@@ -27961,6 +28015,385 @@ test "no FP for local arena alias from struct field access (ZA101)" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
         }
     }
+}
+
+test "no FP for custom-receiver dupe with arena first arg (ZA101)" {
+    // zls analyser/completions.zig shape: `tuple_info.types.dupe(arena, ip)`
+    // — a custom receiver whose dupe takes the allocator as first arg.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn dotCompletions(arena: std.mem.Allocator, ip: *u8) !void {
+        \\    const tuple_types = try tuple_info.types.dupe(arena, ip);
+        \\    process(tuple_types);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_custom_receiver_dupe_arena.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_custom_receiver_dupe_arena.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_custom_receiver_dupe_arena.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for multiline custom-receiver dupe with arena first arg (ZA101)" {
+    // Multiline variant: the allocator first arg sits on the next line.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn dotCompletions(arena: std.mem.Allocator, ip: *u8) !void {
+        \\    const tuple_types = try tuple_info.types.dupe(
+        \\        arena,
+        \\        ip,
+        \\    );
+        \\    process(tuple_types);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_multiline_receiver_dupe_arena.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multiline_receiver_dupe_arena.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_multiline_receiver_dupe_arena.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for replaceOwned with arena-named second arg (ZA101)" {
+    // std.mem.replaceOwned(comptime T, allocator, ...) is type-param-first;
+    // the allocator is the second argument (verified against 0.15/0.16 stdlib).
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn gen(arena: std.mem.Allocator, parsed: []const u8) !void {
+        \\    const with_slashes = try std.mem.replaceOwned(u8, arena, parsed, "\n", "x");
+        \\    process(with_slashes);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_arena_second.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_arena_second.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_replace_owned_arena_second.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for replaceOwned with dotted arena field second arg (ZA101)" {
+    // zls features/code_actions.zig:163 shape:
+    // `std.mem.replaceOwned(u8, builder.arena, parsed, ...)`.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Builder = struct { arena: std.mem.Allocator };
+        \\fn gen(builder: *Builder, parsed: []const u8) !void {
+        \\    const with_slashes = try std.mem.replaceOwned(u8, builder.arena, parsed, "\n", "x");
+        \\    process(with_slashes);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_dotted_arena.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_dotted_arena.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_replace_owned_dotted_arena.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "ZA101 fires for allocator-receiver dupe with arena-named source (lock)" {
+    // `allocator.dupe(u8, arena_str)` — the receiver is the allocator and the
+    // arena-named value is the SOURCE string, not the allocator. Extraction
+    // sees the type param `u8`, which must never suppress (EPH-I0008 FN lock).
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn leak(allocator_arg: std.mem.Allocator, arena_str: []const u8) !void {
+        \\    const data = try allocator_arg.dupe(u8, arena_str);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dupe_arena_source_lock.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_arena_source_lock.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_dupe_arena_source_lock.zig") and
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA101 fires for allocator-receiver dupe with plain source (lock)" {
+    // `allocator.dupe(u8, str)` — first-arg extraction returns the type param
+    // `u8`, matching neither no-free names nor arena names: nothing suppressed.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn leak(allocator_arg: std.mem.Allocator, str: []const u8) !void {
+        \\    const data = try allocator_arg.dupe(u8, str);
+        \\    process(data);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dupe_plain_source_lock.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_plain_source_lock.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_dupe_plain_source_lock.zig") and
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA101 fires for replaceOwned with real allocator second arg (lock)" {
+    // Type-first extraction must not over-suppress: a real (non-arena)
+    // allocator as the second arg still requires a defer.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn leak(alloc: std.mem.Allocator, input: []const u8) !void {
+        \\    const out = try std.mem.replaceOwned(u8, alloc, input, "a", "b");
+        \\    process(out);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_real_alloc_lock.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_real_alloc_lock.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_replace_owned_real_alloc_lock.zig") and
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA101 fires for custom-receiver dupe with non-arena first arg (lock)" {
+    // ghostty PageList.zig shape: `src_link.dupe(src_page, self.page)` — a
+    // custom receiver whose first arg is neither no-free nor arena-named.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\const Page = struct { memory: []u8 };
+        \\fn writeCell(self: *Page, src_page: *const Page, src_link: *const u8) !void {
+        \\    const dst_link = src_link.dupe(
+        \\        src_page,
+        \\        self,
+        \\    ) catch |err| {
+        \\        return err;
+        \\    };
+        \\    process(dst_link);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_custom_receiver_dupe_lock.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_custom_receiver_dupe_lock.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_custom_receiver_dupe_lock.zig") and
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "no FP for multiline replaceOwned with arena second arg (ZA101)" {
+    // zig-fmt split form: `std.mem.replaceOwned(\n    u8, arena, ...)` —
+    // suppression must survive the call being split across lines.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn gen(arena: std.mem.Allocator, parsed: []const u8) !void {
+        \\    const with_slashes = try std.mem.replaceOwned(
+        \\        u8, arena, parsed, "\n", "x");
+        \\    process(with_slashes);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_multiline_replace_owned.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multiline_replace_owned.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_multiline_replace_owned.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "no FP for replaceOwned with comma-bearing fn-pointer type param (ZA101)" {
+    // `*const fn (u8, u8) void` contains commas inside parens — the type-param
+    // skip must be bracket-depth-aware. A naive comma-skip stops inside the fn
+    // type, extracts `u8`, and regresses this to a false positive.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\const std = @import("std");
+        \\fn gen(arena: std.mem.Allocator, a: []const u8, b: []const u8) !void {
+        \\    const out = try std.mem.replaceOwned(*const fn (u8, u8) void, arena, a, b);
+        \\    process(out);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_fn_type.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_fn_type.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_replace_owned_fn_type.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        }
+    }
+}
+
+test "extractMultilineFirstArg skips type param for type-first patterns" {
+    // Direct unit lock for the type-first multiline branch. End-to-end flows
+    // join continuation lines first (joinParenContinuation), so this branch is
+    // only reachable when extraction on the joined line yields nothing.
+    const type_first_lines = [_][]const u8{
+        "    const out = try std.mem.replaceOwned(",
+        "        u8, arena, input, \"a\", \"b\");",
+    };
+    const type_first_arg = extractMultilineFirstArg(type_first_lines[0], &type_first_lines, 0);
+    try std.testing.expectEqualStrings("arena", type_first_arg.?);
+
+    const first_arg_lines = [_][]const u8{
+        "    const dst = try tuple_info.types.dupe(",
+        "        arena,",
+        "        ip,",
+        "    );",
+    };
+    const first_arg = extractMultilineFirstArg(first_arg_lines[0], &first_arg_lines, 0);
+    try std.testing.expectEqualStrings("arena", first_arg.?);
 }
 
 test "no FP for non-memory alloc method (ZA103)" {

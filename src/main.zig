@@ -14359,6 +14359,14 @@ const CFGState = struct {
     in_func: bool = false,
     fn_returns_error: bool = false,
     fn_is_noreturn: bool = false,
+    // Signature/body boundary (EPH-I0012): until the body-opening `{` is
+    // seen, parens and signature containers (anonymous enum/struct param
+    // types, error sets, default-value literals) are tracked separately so a
+    // container's `}` on its own line cannot truncate extraction.
+    // isize: a stray `)` must not underflow-panic; negative depth degrades to next-fn recovery.
+    paren_depth: isize = 0,
+    sig_container_depth: usize = 0,
+    body_started: bool = false,
     // Test block context tracking
     in_test_block: bool = false,
     test_brace_depth: usize = 0,
@@ -14432,6 +14440,9 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     state.func_start = line_num;
     state.in_func = true;
     state.brace_depth = 0;
+    state.paren_depth = 0;
+    state.sig_container_depth = 0;
+    state.body_started = false;
     // Detect if function returns errors: ) ! or !void, !bool, etc.
     state.fn_returns_error = mem.indexOf(u8, t, ") !") != null or
         mem.indexOf(u8, t, "!void") != null or
@@ -14447,20 +14458,65 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
 }
 
 /// Track braces and return true when function ends.
-/// Evaluated at END of line: a signature with a balanced anonymous container
-/// (`fn f(x: enum { a, b }) !void {`) dips to depth 0 mid-line before the
-/// body brace reopens — ending there would truncate the function to its
-/// signature line. The function ends only when a `}` closed the depth AND
-/// the line still ends at depth 0.
+/// A function has two regions: the signature (up to the body-opening `{`)
+/// and the body. While in the signature, parens and signature containers
+/// (anonymous `enum {}/struct {}` param types, `error{}` sets, default-value
+/// literals) are tracked separately so a container's `}` on its own
+/// signature line cannot dip brace_depth to 0 and truncate extraction to the
+/// signature (EPH-I0012). In the body, evaluated at END of line: a balanced
+/// container on one line dips to depth 0 mid-line before reopening — the
+/// function ends only when a `}` closed the depth AND the line still ends at
+/// depth 0. The function can only END once its body has started.
 fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
+    var body_offset: usize = 0;
+    if (!state.body_started) {
+        body_offset = scanCFGSignatureLine(t, state);
+        if (!state.body_started) return false;
+    }
     var closed = false;
-    for (t) |c| {
+    for (t[body_offset..]) |c| {
         if (c == '{') state.brace_depth += 1;
         if (c != '}') continue;
         if (state.brace_depth > 0) state.brace_depth -= 1;
         if (state.brace_depth == 0) closed = true;
     }
     return closed and state.brace_depth == 0;
+}
+
+/// Scan one pre-body signature line, tracking paren depth and signature
+/// containers. The body opens at the first `{` at paren depth 0 that does
+/// not immediately follow the word `error` (`error{...}` sets are signature
+/// containers, not bodies): sets body_started + brace_depth = 1 and returns
+/// the index just past the body brace. Returns t.len while still in the
+/// signature.
+fn scanCFGSignatureLine(t: []const u8, state: *CFGState) usize {
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == '(') state.paren_depth += 1;
+        if (c == ')') state.paren_depth -= 1;
+        if (c == '}' and state.sig_container_depth > 0) {
+            state.sig_container_depth -= 1;
+        }
+        if (c != '{') continue;
+        if (state.paren_depth != 0 or isErrorSetOpen(t, i)) {
+            state.sig_container_depth += 1;
+            continue;
+        }
+        state.body_started = true;
+        state.brace_depth = 1;
+        return i + 1;
+    }
+    return t.len;
+}
+
+/// True when the `{` at index i opens an error set (`error{...}`) rather
+/// than a function body. Same-line lookback only: an `error` keyword split
+/// from its `{` across lines (Allman error set) is not recognized.
+fn isErrorSetOpen(t: []const u8, i: usize) bool {
+    const error_keyword_len = "error".len;
+    return i >= error_keyword_len and
+        mem.eql(u8, t[i - error_keyword_len .. i], "error");
 }
 
 /// Convert definite assignment issues to ZA607 warnings
@@ -21949,6 +22005,171 @@ test "ZA101: wrapped alloc with proper defer stays silent" {
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 0);
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+}
+
+// ============================================================================
+// EPH-I0012: signature/body boundary — a container closing on a multi-line
+// signature line must not truncate the function body (trackCFGBraces)
+// ============================================================================
+
+test "ZA101: multi-line enum param does not truncate body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0012 issue shape: the `},` closing the enum container returns
+    // brace_depth to 0 mid-signature; the body below must still be analyzed.
+    const content =
+        \\fn leaky(
+        \\    alloc: std.mem.Allocator,
+        \\    kind: enum {
+        \\        a,
+        \\        b,
+        \\    },
+        \\) !void {
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    _ = data;
+        \\    _ = kind;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_enum.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_enum.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: multi-line struct param does not truncate body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn leaky(
+        \\    alloc: std.mem.Allocator,
+        \\    opts: struct {
+        \\        x: u8,
+        \\        y: u8,
+        \\    },
+        \\) !void {
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    _ = data;
+        \\    _ = opts;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_struct.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_struct.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: error-set return on own line does not truncate body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Edge of the error-set exclusion: `error{...}` at paren depth 0 is a
+    // signature container, NOT the body brace — the body starts at the `{`
+    // on the following line.
+    const content =
+        \\fn leaky(
+        \\    alloc: std.mem.Allocator,
+        \\)
+        \\    error{OutOfMemory}!void
+        \\{
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    _ = data;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_errset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_errset.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: default-param container on own line does not truncate body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0012 shape: the `.{}` default value closes on its own signature
+    // line, returning brace_depth to 0 mid-signature; the body below must
+    // still be analyzed (RED-verified at HEAD 762e462 via .tmp/probe5.zig).
+    const content =
+        \\const Foo = struct { x: u8 = 0 };
+        \\fn leaky(
+        \\    alloc: std.mem.Allocator,
+        \\    foo: Foo = .{},
+        \\) void {
+        \\    const data = alloc.alloc(u8, 32) catch return;
+        \\    _ = data;
+        \\    _ = foo;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_default.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_default.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: single-line container signature detection unchanged" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Parity lock: end-of-line evaluation already saved this shape; the
+    // signature/body boundary rework must not regress it.
+    const content =
+        \\fn leaky(alloc: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const data = try alloc.alloc(u8, 100);
+        \\    _ = data;
+        \\    _ = kind;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_sl_container.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_sl_container.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: nested fn-type param does not break body extraction" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Parity lock: the `fn () void` param contributes parens but no braces;
+    // neither the old nor the new scanner may truncate on it.
+    const content =
+        \\fn leaky(
+        \\    alloc: std.mem.Allocator,
+        \\    g: fn () void,
+        \\) void {
+        \\    const data = alloc.alloc(u8, 100) catch return;
+        \\    _ = data;
+        \\    g();
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_fntype.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_fntype.zig", RULE_ALLOC_NO_DEFER),
+    );
 }
 
 test "ZA105: free through alias then use root" {

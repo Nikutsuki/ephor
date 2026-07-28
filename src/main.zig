@@ -24758,6 +24758,279 @@ test "parseVersionFromZon returns null for missing version" {
     try std.testing.expect(parseVersionFromZon(allocator, bad_content) == null);
 }
 
+// ============================================================================
+// Config Migration Tests (migrateThresholds / buildMissingKeysJson)
+// ============================================================================
+
+const MigrateInsertCase = struct {
+    name: []const u8,
+    input: []const u8,
+    expected: []const u8,
+};
+
+const MigrateNullCase = struct {
+    name: []const u8,
+    input: []const u8,
+};
+
+const MissingKeysCase = struct {
+    name: []const u8,
+    mig: MissingThresholdKeys,
+    expected: []const u8,
+};
+
+/// Characterization pins: byte-exact migration output per case.
+const migrate_insert_cases = [_]MigrateInsertCase{
+    .{
+        .name = "only max_cyclomatic missing inserts only cyclo",
+        .input =
+        \\{
+        \\  "thresholds": {
+        \\    "max_cognitive": 12
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "thresholds": {
+        \\    "max_cognitive": 12,
+        \\    "max_cyclomatic": 15
+        \\  }
+        \\}
+        ,
+    },
+    .{
+        .name = "only max_cognitive missing inserts only cog, value 99 preserved",
+        .input =
+        \\{
+        \\  "thresholds": {
+        \\    "max_cyclomatic": 99
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "thresholds": {
+        \\    "max_cyclomatic": 99,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
+    .{
+        .name = "neither key present inserts both, cyclo then cog",
+        .input =
+        \\{
+        \\  "thresholds": {
+        \\    "max_function_lines": 50
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "thresholds": {
+        \\    "max_function_lines": 50,
+        \\    "max_cyclomatic": 15,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
+    .{
+        .name = "trailing comma in body gets no leading comma on insert",
+        .input =
+        \\{
+        \\  "thresholds": {
+        \\    "max_function_lines": 50,
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "thresholds": {
+        \\    "max_function_lines": 50,
+        \\    "max_cyclomatic": 15,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
+    .{
+        .name = "empty thresholds object fills at derived indent",
+        .input =
+        \\{
+        \\  "thresholds": {}
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "thresholds": {
+        \\  "max_cyclomatic": 15,
+        \\  "max_cognitive": 15
+        \\}
+        \\}
+        ,
+    },
+    .{
+        .name = "nested thresholds uses close_indent + 2 as entry indent",
+        .input =
+        \\{
+        \\    "outer": {
+        \\        "thresholds": {
+        \\            "max_cyclomatic": 15
+        \\        }
+        \\    }
+        \\}
+        ,
+        // Inserted entry lands at close_indent(8)+2=10 spaces, NOT aligned
+        // with the sibling key at 12 — the algorithm derives indent from the
+        // closing brace only. Valid JSON; cosmetic misalignment is the pin.
+        .expected =
+        \\{
+        \\    "outer": {
+        \\        "thresholds": {
+        \\            "max_cyclomatic": 15,
+        \\          "max_cognitive": 15
+        \\        }
+        \\    }
+        \\}
+        ,
+    },
+    .{
+        .name = "disable array and content outside thresholds stay byte-identical",
+        .input =
+        \\{
+        \\  "version": "0.13.0",
+        \\  "disable": ["ZA305", "ZA306"],
+        \\  "thresholds": {
+        \\    "max_cyclomatic": 99
+        \\  },
+        \\  "strict": true
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "version": "0.13.0",
+        \\  "disable": ["ZA305", "ZA306"],
+        \\  "thresholds": {
+        \\    "max_cyclomatic": 99,
+        \\    "max_cognitive": 15
+        \\  },
+        \\  "strict": true
+        \\}
+        ,
+    },
+};
+
+const migrate_null_cases = [_]MigrateNullCase{
+    .{
+        .name = "both keys present is a no-op",
+        .input =
+        \\{
+        \\  "thresholds": {
+        \\    "max_cyclomatic": 15,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
+    .{
+        .name = "no thresholds key at all",
+        .input =
+        \\{
+        \\  "version": "0.14.0"
+        \\}
+        ,
+    },
+    .{
+        .name = "thresholds is not an object",
+        .input = "{\"thresholds\": 5}",
+    },
+    .{
+        .name = "empty content",
+        .input = "",
+    },
+};
+
+const missing_keys_cases = [_]MissingKeysCase{
+    .{
+        .name = "both missing with leading comma keeps entries order",
+        .mig = .{
+            .entry_indent = "    ",
+            .needs_comma = true,
+            .has_cyclo = false,
+            .has_cog = false,
+        },
+        .expected =
+        \\,
+        \\    "max_cyclomatic": 15,
+        \\    "max_cognitive": 15
+        ,
+    },
+    .{
+        .name = "only cognitive missing without comma emits single entry",
+        .mig = .{
+            .entry_indent = "    ",
+            .needs_comma = false,
+            .has_cyclo = true,
+            .has_cog = false,
+        },
+        .expected =
+        \\
+        \\    "max_cognitive": 15
+        ,
+    },
+    .{
+        .name = "only cyclomatic missing without comma uses given indent",
+        .mig = .{
+            .entry_indent = "  ",
+            .needs_comma = false,
+            .has_cyclo = false,
+            .has_cog = true,
+        },
+        .expected =
+        \\
+        \\  "max_cyclomatic": 15
+        ,
+    },
+};
+
+test "migrateThresholds inserts missing keys byte-exactly" {
+    for (&migrate_insert_cases) |*case| {
+        const maybe_actual = migrateThresholds(std.testing.allocator, case.input);
+        if (maybe_actual == null) {
+            std.debug.print("case '{s}': expected migration, got null\n", .{case.name});
+        }
+        try std.testing.expect(maybe_actual != null);
+        defer std.testing.allocator.free(maybe_actual.?);
+        std.testing.expectEqualStrings(case.expected, maybe_actual.?) catch {
+            std.debug.print("case '{s}' failed\n", .{case.name});
+            try std.testing.expect(false);
+        };
+    }
+}
+
+test "migrateThresholds returns null when nothing needs migration" {
+    for (&migrate_null_cases) |*case| {
+        if (migrateThresholds(std.testing.allocator, case.input)) |actual| {
+            std.debug.print("case '{s}': expected null, got:\n{s}\n", .{ case.name, actual });
+            std.testing.allocator.free(actual);
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "buildMissingKeysJson serializes missing entries in order" {
+    for (&missing_keys_cases) |*case| {
+        const actual = try buildMissingKeysJson(std.testing.allocator, case.mig);
+        defer std.testing.allocator.free(actual);
+        std.testing.expectEqualStrings(case.expected, actual) catch {
+            std.debug.print("case '{s}' failed\n", .{case.name});
+            try std.testing.expect(false);
+        };
+    }
+}
+
 test "fnReturnsType detects literal type return" {
     // Returns type → TitleCase required
     try std.testing.expect(fnReturnsType("fn Point(T: type) type {", 8));

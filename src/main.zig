@@ -2844,6 +2844,8 @@ fn collectMemSafetyAllocs(
         const t = joinParenContinuation(lines, idx, &join_buf);
         // Type-based allocation detection: .alloc() or .create() on tracked allocators
         const alloc_call = findAllocCall(t, &all_alloc_names) orelse continue;
+        // orelse-return RHS allocs escape to the caller — never bound to the var
+        if (isOrelseReturnAlloc(t, alloc_call.col)) continue;
         // Skip allocations backed by no-free allocators (type-tracked or arena)
         if (isNoFreeAllocCall(t, lines, idx, &no_free_sets)) continue;
         // Name comes from the physical line — slices into join_buf dangle
@@ -3732,6 +3734,9 @@ fn collectCFGAllocations(
         // Detect allocations using type-based detection for .create()
         const alloc_info = findAllocCall(t, &all_alloc_names) orelse continue;
 
+        // orelse-return RHS allocs escape to the caller — never bound to the var
+        if (isOrelseReturnAlloc(t, alloc_info.col)) continue;
+
         // Skip allocations backed by no-free allocators (type-tracked or arena)
         if (isNoFreeAllocCall(t, ctx.body.lines, idx, &no_free_sets)) continue;
 
@@ -4495,6 +4500,8 @@ fn collectTryAllocFromLine(
     }
     if (extractVarDeclName(phys)) |name| {
         const alloc_info = findAllocCall(t, null) orelse return;
+        // orelse-return RHS allocs escape to the caller — never bound to the var
+        if (isOrelseReturnAlloc(t, alloc_info.col)) return;
         try ctx.try_allocs.append(ctx.allocator, .{
             .name = name,
             .line = site.line,
@@ -14920,6 +14927,46 @@ fn findAllocCall(
     return null;
 }
 
+/// True when the allocation at `alloc_col` sits in the RHS of an
+/// `orelse return` on the same logical line: `var x = opt orelse return
+/// try allocator.dupe(...)` hands the alloc result to the caller, so the
+/// declared var never holds it and no defer/errdefer coverage is due
+/// (EPH-I0009). Positional — the caller passes the alloc column from
+/// findAllocCall in the same (possibly joined) text.
+fn isOrelseReturnAlloc(t: []const u8, alloc_col: usize) bool {
+    const pos = findOrelseReturn(t) orelse return false;
+    return pos < alloc_col;
+}
+
+/// Find the first real `orelse return` token pair on the line (its `orelse`
+/// position), skipping word fragments and string literals. Iterates ALL
+/// occurrences — an early `orelse` may be inside a string or paired with a
+/// non-return RHS while a later one is the escape.
+fn findOrelseReturn(t: []const u8) ?usize {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], "orelse")) |rel| {
+        const pos = s + rel;
+        s = pos + 1;
+        if (!isRealOrelseReturn(t, pos)) continue;
+        return pos;
+    }
+    return null;
+}
+
+/// Word-bounded, string-aware check that the `orelse` at `pos` is followed
+/// (across whitespace) by a `return` keyword.
+fn isRealOrelseReturn(t: []const u8, pos: usize) bool {
+    if (pos > 0 and isIdent(t[pos - 1])) return false;
+    const after = pos + "orelse".len;
+    if (after < t.len and isIdent(t[after])) return false;
+    if (isInsideString(t, pos)) return false;
+    var r = after;
+    while (r < t.len and (t[r] == ' ' or t[r] == '\t')) r += 1;
+    if (!mem.startsWith(u8, t[r..], "return")) return false;
+    const rend = r + "return".len;
+    return rend >= t.len or !isIdent(t[rend]);
+}
+
 /// Determine if .create() at the given position is called on an allocator.
 /// Type-based: checks if receiver is in tracked allocator variable set or is uppercase (factory).
 fn isAllocatorCreateTypeBased(
@@ -22467,6 +22514,157 @@ test "ZA103: string mention inside tuple does not transfer (TP lock)" {
     ) == 1);
 }
 
+test "ZA101/ZA103: orelse-return try-alloc escapes to caller (EPH-I0009)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zls analysis.zig trimCommonIndentation shape: the dupe result is
+    // RETURNED in the orelse branch; the var only ever holds the unwrapped
+    // value. Ownership went to the caller — no defer/errdefer is due.
+    const content =
+        \\fn trim(allocator: std.mem.Allocator, str: []const u8, preserved: usize) ![]u8 {
+        \\    var min_indentation: ?usize = null;
+        \\    min_indentation = str.len;
+        \\    var common_indent = min_indentation orelse return try allocator.dupe(u8, str);
+        \\    common_indent -|= preserved;
+        \\    if (common_indent == 0) return try allocator.dupe(u8, str);
+        \\    return str;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_orelse_return_alloc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_orelse_return_alloc.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_orelse_return_alloc.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA101/ZA103: orelse-return try-alloc skips zig-fmt wrapped call" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same escape shape with the call args wrapped by zig-fmt: the orelse
+    // is on the physical line, the alloc pattern completes on the joined
+    // continuation. findAllocCall's col and the orelse scan share the
+    // joined-text coordinate space, so the positional rule still holds.
+    const content =
+        \\fn wrapped(allocator: std.mem.Allocator, opt: ?usize, str: []const u8) ![]u8 {
+        \\    var x = opt orelse return try allocator.dupe(
+        \\        u8,
+        \\        str,
+        \\    );
+        \\    x -|= 1;
+        \\    if (x == 0) return try allocator.dupe(u8, str);
+        \\    return str;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_orelse_wrapped.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_orelse_wrapped.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_orelse_wrapped.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA101/ZA103: plain try-alloc still fires (orelse positional lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // No orelse before the alloc: x holds the dupe result, cleanup due.
+    const content =
+        \\fn lock_plain(allocator: std.mem.Allocator, s: []const u8) !void {
+        \\    var x = try allocator.dupe(u8, s);
+        \\    try ping();
+        \\    _ = x;
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_lock_plain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_lock_plain.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_lock_plain.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA102: try-create still fires (orelse positional lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn lock_create(allocator: std.mem.Allocator) !void {
+        \\    const y = try allocator.create(u64);
+        \\    try ping();
+        \\    y.* = 0;
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_lock_create.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_lock_create.zig",
+        RULE_CREATE_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101/ZA103: orelse-return inside string literal does not skip" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `orelse return` text appears only inside a string literal BEFORE
+    // the alloc — the orelse scan must be string-aware; y still fires.
+    const content =
+        \\fn str_shape(allocator: std.mem.Allocator, s: []const u8) !void {
+        \\    var x = "a orelse return b"; var y = try allocator.dupe(u8, s);
+        \\    try ping();
+        \\    _ = x;
+        \\    _ = y;
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_orelse_in_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_orelse_in_string.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_orelse_in_string.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
 test "ZA106: plain defer with no direct free stays silent" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -26344,6 +26542,58 @@ test "findAllocCall does NOT detect .clone(" {
 test "findAllocCall does NOT detect .append(" {
     const result = findAllocCall("    try list.append(allocator, item);", null);
     try std.testing.expect(result == null);
+}
+
+// isOrelseReturnAlloc positional tests (EPH-I0009)
+
+test "isOrelseReturnAlloc skips alloc after orelse return" {
+    const t = "    var x = opt orelse return try allocator.dupe(u8, str);";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(isOrelseReturnAlloc(t, alloc.col));
+}
+
+test "isOrelseReturnAlloc keeps alloc with no orelse" {
+    const t = "    var x = try allocator.dupe(u8, str);";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!isOrelseReturnAlloc(t, alloc.col));
+}
+
+test "isOrelseReturnAlloc keeps alloc when orelse return comes after" {
+    // Alloc bound to the var before any orelse — position rule must not skip.
+    const t = "    var x = try allocator.dupe(u8, str) orelse return str;";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!isOrelseReturnAlloc(t, alloc.col));
+}
+
+test "isOrelseReturnAlloc ignores orelse inside identifiers" {
+    const t = "    var x = sorelse return try allocator.dupe(u8, str);";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!isOrelseReturnAlloc(t, alloc.col));
+}
+
+test "isOrelseReturnAlloc ignores orelse returned (no word boundary)" {
+    const t = "    var x = opt orelse returned try allocator.dupe(u8, str);";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!isOrelseReturnAlloc(t, alloc.col));
+}
+
+test "isOrelseReturnAlloc ignores orelse return inside string literal" {
+    const t = "    var x = \"a orelse return b\"; var y = try allocator.dupe(u8, x);";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!isOrelseReturnAlloc(t, alloc.col));
+}
+
+test "isOrelseReturnAlloc skips across extra whitespace" {
+    const t = "    var x = opt orelse  return try allocator.dupe(u8, str);";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(isOrelseReturnAlloc(t, alloc.col));
+}
+
+test "isOrelseReturnAlloc keeps plain orelse value binding" {
+    // `orelse try ...` (no return): the var DOES receive the alloc result.
+    const t = "    var x = opt orelse try allocator.dupe(u8, str);";
+    const alloc = findAllocCall(t, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!isOrelseReturnAlloc(t, alloc.col));
 }
 
 // ============================================================================

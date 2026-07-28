@@ -1846,6 +1846,10 @@ fn checkVarDefiniteAssignment(
         // e.g., if (param_group_t == null or i > param_group_end) {
         //            param_group_end = ...; }
         if (isOrShortCircuitSafe(ctx.lines, idx, var_name)) continue;
+        // Check if a same-scope plain assignment textually dominates the
+        // read; the CFG mis-models brace-less guard ifs (`if (x) continue;`)
+        // and would otherwise blame reads the assignment always precedes.
+        if (hasDominatingScopeAssignment(ctx.lines, idx, var_name)) continue;
         try issues.put(var_name, al);
         break;
     }
@@ -2004,6 +2008,37 @@ fn isVarAssignedNearby(
     return false;
 }
 
+/// Result of backward brace accounting for one line while walking upward
+/// from a read: the updated depth, and whether the line opens a block that
+/// contains the read (a '{' encountered at depth 0).
+const BackwardBraceResult = struct {
+    depth: usize,
+    opens_enclosing_block: bool,
+};
+
+/// Scan a line in reverse for backward brace matching. Walking upward from a
+/// read, '}' enters a completed sibling block (depth +1) and '{' closes it
+/// (depth -1). A '{' seen at depth 0 opens the block containing the read —
+/// only an if on such a line genuinely encloses the read. Checking depth
+/// after scanning forward cannot distinguish that enclosing '{' from one
+/// that merely closes a skipped sibling block above the read.
+fn trackBackwardBraces(t: []const u8, initial_depth: usize) BackwardBraceResult {
+    var depth = initial_depth;
+    var opens = false;
+    var i = t.len;
+    while (i > 0) {
+        i -= 1;
+        if (t[i] == '}') depth += 1;
+        if (t[i] != '{') continue;
+        if (depth > 0) {
+            depth -= 1;
+        } else {
+            opens = true;
+        }
+    }
+    return .{ .depth = depth, .opens_enclosing_block = opens };
+}
+
 /// Extract the condition from an enclosing if-statement by walking backwards.
 /// Returns the condition string (e.g., "big" from "if (big) {") or null.
 fn findEnclosingIfCondition(
@@ -2018,16 +2053,10 @@ fn findEnclosingIfCondition(
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
 
-        // Count braces backwards: } increases depth, { decreases
-        for (t) |c| {
-            if (c == '}') depth += 1;
-            if (c == '{' and depth > 0) depth -= 1;
-        }
-
-        // At depth 0, look for if-statement
-        if (depth == 0) {
-            if (extractIfCondition(t)) |cond| return cond;
-        }
+        const braces = trackBackwardBraces(t, depth);
+        depth = braces.depth;
+        if (!braces.opens_enclosing_block) continue;
+        if (extractIfCondition(t)) |cond| return cond;
     }
     return null;
 }
@@ -2045,14 +2074,10 @@ fn findEnclosingIfLine(
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
 
-        for (t) |c| {
-            if (c == '}') depth += 1;
-            if (c == '{' and depth > 0) depth -= 1;
-        }
-
-        if (depth == 0) {
-            if (extractIfCondition(t) != null) return i;
-        }
+        const braces = trackBackwardBraces(t, depth);
+        depth = braces.depth;
+        if (!braces.opens_enclosing_block) continue;
+        if (extractIfCondition(t) != null) return i;
     }
     return null;
 }
@@ -2464,6 +2489,46 @@ fn isOrShortCircuitSafe(
         );
     }
     return false;
+}
+
+/// Check whether a plain `var_name = ...` statement unconditionally executes
+/// before the read on every path that reaches it: the assignment line starts
+/// with the bare name (so it cannot hide behind an `if` guard — assignments
+/// are statements, never expressions), it is nested no deeper than the read
+/// (the read may sit deeper inside the assignment's scope), and no
+/// intervening line closes the assignment's scope (a close would mean the
+/// assignment sat in a sibling conditional block).
+///
+/// Needed because the line-based CFG cannot model brace-less guard ifs such
+/// as `if (x) continue;`: it invents edges that bypass same-scope
+/// assignments, so the dataflow verdict alone cannot prove dominance there.
+fn hasDominatingScopeAssignment(
+    lines: []const []const u8,
+    read_idx: usize,
+    var_name: []const u8,
+) bool {
+    var depth: usize = 0;
+    var assign_depth: usize = 0;
+    var min_since: usize = 0;
+    var found = false;
+    for (0..read_idx) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        // isDirectAssignment does not verify the name at pos 0, so the
+        // caller must establish it (with a word boundary) first.
+        if (mem.startsWith(u8, t, var_name) and
+            (t.len == var_name.len or !isIdent(t[var_name.len])) and
+            isDirectAssignment(t, var_name, 0))
+        {
+            assign_depth = depth;
+            min_since = depth;
+            found = true;
+        }
+        depth = computeBraceDepth(t, depth);
+        if (depth < min_since) min_since = depth;
+    }
+    if (!found) return false;
+    return assign_depth <= depth and min_since >= assign_depth;
 }
 
 fn runDefiniteAssignmentWorklist(
@@ -26206,6 +26271,254 @@ test "integration: undefined variable read" {
 
     // Should detect 'x' is read before assignment
     try std.testing.expect(def_issues.count() > 0);
+}
+
+// ============================================================================
+// ZA607: Definite Assignment Tests
+// ============================================================================
+
+test "ZA607: never-assigned undefined var is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn neverAssigned() u32 {
+        \\    var y: u32 = undefined;
+        \\    return y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_never.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_never.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: single-branch if assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The skip path through `if (cond)` never assigns x, so the read on
+    // line 6 is a potential undefined read and must be reported.
+    const content =
+        \\fn singleBranch(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        x = 1;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_single.zig", content);
+    defer run.deinit(allocator);
+
+    var found = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, "da_single.zig")) continue;
+        if (!mem.eql(u8, issue.rule, RULE_DEFINITE_ASSIGNMENT)) continue;
+        try std.testing.expectEqual(@as(usize, 6), issue.line);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "'x'") != null);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA607: nested single-branch if assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn nestedSingle(cond: bool, other: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (other) {
+        \\        if (cond) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nested.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: both-branches if/else is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn bothBranches(cond: bool) u32 {
+        \\    var z: u32 = undefined;
+        \\    if (cond) {
+        \\        z = 1;
+        \\    } else {
+        \\        z = 2;
+        \\    }
+        \\    return z;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_both.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_both.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: unconditional assignment before read is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn unconditionalBefore() u32 {
+        \\    var u: u32 = undefined;
+        \\    u = 5;
+        \\    return u;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_uncond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_uncond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: early return on unassigned paths is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every path either assigns k or returns before the read.
+    const content =
+        \\fn earlyReturnElse(a: bool, b: bool) u32 {
+        \\    var k: u32 = undefined;
+        \\    if (a) {
+        \\        k = 1;
+        \\    } else if (b) {
+        \\        k = 2;
+        \\    } else {
+        \\        return 0;
+        \\    }
+        \\    return k;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_early.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_early.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: correlated guard read is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The read is inside `if (cond)` and the same condition guards an
+    // earlier assignment, so v is defined whenever the read executes.
+    const content =
+        \\fn correlatedGuard(cond: bool) u32 {
+        \\    var v: u32 = undefined;
+        \\    if (cond) {
+        \\        v = 1;
+        \\    }
+        \\    if (cond) {
+        \\        return v;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_corr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_corr.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop guard-continue before same-scope assignment is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every path reaching the reads passed the unconditional `x = create(...)`
+    // in the same iteration; the brace-less guard `continue` skips both.
+    const content =
+        \\const Cfg = struct { a: u32 };
+        \\fn create(c: Cfg) u32 {
+        \\    return c.a;
+        \\}
+        \\fn guardContinue(opt: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    const items = [_]u32{ 1, 2 };
+        \\    for (items) |it| {
+        \\        if (it == 0 and !opt) continue;
+        \\        x = create(
+        \\            .{
+        \\                .a = it,
+        \\            },
+        \\        );
+        \\        if (x > 0) {
+        \\            return x;
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: sibling ifs with assignment only in first is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Assigning x under `if (a)` must not silence the read under `if (b)`:
+    // the scope-dominance suppressor requires the assignment's scope to stay
+    // open through the read.
+    const content =
+        \\fn twoIfs(a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) {
+        \\        x = 1;
+        \\    }
+        \\    if (b) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_twoifs.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_twoifs.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
 }
 
 test "integration: no false positive for valid catch-free-return" {

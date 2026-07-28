@@ -3063,6 +3063,7 @@ fn appendUAFIssue(ctx: *const FreeScanCtx, var_name: []const u8, line: usize, co
         "use-after-free: '{s}' freed on {d}",
         .{ var_name, ctx.scan.alloc_info.freed_line },
     );
+    errdefer ctx.allocator.free(msg);
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.file_path,
         .line = line,
@@ -3243,6 +3244,7 @@ fn appendDoubleFreeIssue(sink: *const FreeIssueSink, site: DoubleFreeSite) !void
         "{s}double-free: '{s}' freed on {d}",
         .{ pfx, sink.var_name, site.freed_line },
     );
+    errdefer sink.allocator.free(msg);
     try sink.issues.append(sink.allocator, .{
         .file = sink.file_path,
         .line = site.line,
@@ -4381,6 +4383,51 @@ fn isTryAllocation(t: []const u8) bool {
     return findAllocCall(t, null) != null;
 }
 
+/// The expression of a bare `return <identifier>;` — exactly one identifier
+/// followed by `;`. A leading digit excludes literals (`return 0;`); a `.`,
+/// `(`, or `[` follower excludes field/call/subscript expressions.
+fn isBareIdentReturnExpr(expr: []const u8) bool {
+    if (expr.len == 0) return false;
+    if (!std.ascii.isAlphabetic(expr[0]) and expr[0] != '_') return false;
+    var end: usize = 0;
+    while (end < expr.len and isIdent(expr[end])) end += 1;
+    while (end < expr.len and (expr[end] == ' ' or expr[end] == '\t')) end += 1;
+    return end < expr.len and expr[end] == ';';
+}
+
+/// `return <bare-identifier>;` anywhere in the line (word-bounded, outside
+/// strings) — `return err;`, `if (bad) return err;`. In an error-returning
+/// function a bare-identifier return is either the captured error variable
+/// or a success value abandoning the alloc; both leave the alloc
+/// untransferred on that path, so either way a LATER transfer cannot cover it.
+fn hasBareIdentReturn(t: []const u8) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], "return ")) |rel| {
+        const pos = s + rel;
+        s = pos + "return ".len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (isInsideString(t, pos)) continue;
+        if (isBareIdentReturnExpr(t[pos + "return ".len ..])) return true;
+    }
+    return false;
+}
+
+/// True when a post-alloc line is an error-path exit that a LATER ownership
+/// transfer cannot cover: a `try` (the error propagates before ownership
+/// moves), `return error.X;`, or a bare `return ident;`. The alloc's own
+/// `return name;` is a transfer — transfer checks run before this. Comment
+/// and multiline-string lines are excluded, as are defer/errdefer statement
+/// lines (`try` is a compile error inside defer bodies — verified — so a
+/// `try` there can only appear in non-compiling code).
+fn isUncoveredErrorExit(t: []const u8) bool {
+    if (isCommentOrMultilineString(t)) return false;
+    if (mem.startsWith(u8, t, "defer ")) return false;
+    if (mem.startsWith(u8, t, "errdefer ")) return false;
+    if (hasRealKeyword(t, "try ")) return true;
+    if (hasRealKeyword(t, "return error.")) return true;
+    return hasBareIdentReturn(t);
+}
+
 /// Check ownership transfer for errdefer analysis
 fn checkErrdeferOwnershipTransfer(
     alloc: *TryAlloc,
@@ -4423,6 +4470,10 @@ fn checkErrdeferOwnershipTransfer(
             alloc.has_errdefer = true;
             return;
         }
+        // Error-path exit BEFORE any transfer: ownership has not moved on
+        // this path, so a later transfer cannot cover it. Stop without
+        // marking coverage — ZA103 emission decides from real triggers.
+        if (isUncoveredErrorExit(lt)) return;
     }
 }
 
@@ -10236,6 +10287,7 @@ fn reportLieTest(ctx: *const TestScanCtx, state: *const TestFileScanState) !void
         "test '{s}' never calls function '{s}'",
         .{ lie.name, lie.candidates[0] },
     );
+    errdefer ctx.sink.allocator.free(msg);
     try ctx.sink.issues.append(ctx.sink.allocator, .{
         .file = ctx.sink.path,
         .line = state.counters.start_line,
@@ -11821,6 +11873,7 @@ fn emitTryLockDeferUnlock(sink: *const ConcurrencyIssueSink, rel: LockRelease) !
         "defer unlock of '{s}' executes even when tryLock fails",
         .{rel.receiver},
     );
+    errdefer sink.allocator.free(msg);
     try sink.issues.append(sink.allocator, .{
         .file = sink.path,
         .line = rel.line,
@@ -12013,6 +12066,7 @@ fn emitThreadNoJoin(sink: *const ConcurrencyIssueSink, spawn: BoundSpawn) !void 
         "spawned thread '{s}' never joined or detached",
         .{spawn.name},
     );
+    errdefer sink.allocator.free(msg);
     try sink.issues.append(sink.allocator, .{
         .file = sink.path,
         .line = spawn.line,
@@ -12205,6 +12259,7 @@ fn checkUnusedImport(ctx: UnusedFileCtx, imp: ImportInfo) !void {
         "unused import '{s}'",
         .{imp.name},
     );
+    errdefer ctx.allocator.free(msg);
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.path,
         .line = imp.line,
@@ -12235,6 +12290,7 @@ fn checkUnusedDecl(ctx: UnusedFileCtx, t: []const u8, line_num: usize) !void {
         "unused {s} '{s}'",
         .{ kind, name },
     );
+    errdefer ctx.allocator.free(msg);
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.path,
         .line = line_num,
@@ -12985,6 +13041,7 @@ fn reportFileTooLong(ctx: ReportCtx, actual: usize, max: usize) !void {
         "file has {d} bytes (max {d})",
         .{ actual, max },
     );
+    errdefer ctx.allocator.free(msg);
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.path,
         .line = 1,
@@ -22765,6 +22822,240 @@ test "ZA103: return error after alloc without errdefer is a gap" {
         "test_return_error.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 1);
+}
+
+test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zignal png.zig shape: the field store transfers ownership on the
+    // success path, but the earlier `return error.X` exit leaks — a later
+    // transfer must not silence the alloc.
+    const content =
+        \\fn parsePalette(allocator: std.mem.Allocator, state: *State, len: usize) !void {
+        \\    const palette = try allocator.alloc(u8, len);
+        \\    if (len == 0) return error.InvalidPaletteLength;
+        \\    state.palette = palette;
+        \\}
+        \\const State = struct { palette: []u8 = &.{} };
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_gap_before_transfer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_gap_before_transfer.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: try before return-transfer is a gap (EPH-I0005)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `try validate` error path runs before `return buf` transfers
+    // ownership — the alloc is uncovered on that path.
+    const content =
+        \\fn fill(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+        \\    const buf = try allocator.alloc(u8, src.len);
+        \\    try validate(src);
+        \\    return buf;
+        \\}
+        \\fn validate(s: []const u8) !void {
+        \\    if (s.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_try_before_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_try_before_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: immediate return-transfer stays silent (EPH-I0005 lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // No error exit between alloc and transfer — I0004 behavior intact.
+    const content =
+        \\fn dupeIt(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    return buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_immediate_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_immediate_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A real errdefer between the alloc and the try covers the error path;
+    // the later field store is irrelevant.
+    const content =
+        \\fn covered(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(buf);
+        \\    try validate(s);
+        \\    state.field = buf;
+        \\}
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn validate(s: []const u8) !void {
+        \\    if (s.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_errdefer_covers.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_covers.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: transfer before later try stays silent (EPH-I0005 lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The field store comes first: ownership moved before the try, so the
+    // try's error path is the new owner's problem — no gap.
+    const content =
+        \\fn storeThenWork(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    state.field = buf;
+        \\    try validate(s);
+        \\}
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn validate(s: []const u8) !void {
+        \\    if (s.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_transfer_then_try.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_transfer_then_try.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: try inside a string literal is not an exit (EPH-I0005)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The string line must not stop the ownership scan: the real transfer
+    // on the next line still covers the later try trigger.
+    const content =
+        \\fn stringTry(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    state.help = "try foo(); return error.X";
+        \\    state.field = buf;
+        \\    try validate(s);
+        \\}
+        \\const State = struct { field: []u8 = &.{}, help: []const u8 = "" };
+        \\fn validate(s: []const u8) !void {
+        \\    if (s.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_string_try_exit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_string_try_exit.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: bare error return before field-store transfer is a gap (EPH-I0005)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (isFatal(err)) return err;` is an uncovered error exit. Ordering is
+    // load-bearing: the field store sits BETWEEN the bare-ident exit and the
+    // `try validate` trigger, so only the bare-ident branch can stop the scan
+    // (a try-first order would stop via the try branch and not discriminate
+    // it). Three-way verified: current=1, bare-ident-neutralized=0, HEAD=0.
+    const content =
+        \\fn bareErr(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    normalize(s) catch |err| { if (isFatal(err)) return err; };
+        \\    state.field = buf;
+        \\    try validate(s);
+        \\}
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn normalize(s: []const u8) !void {
+        \\    if (s.len == 0) return error.Empty;
+        \\}
+        \\fn isFatal(err: anyerror) bool {
+        \\    return err == error.Empty;
+        \\}
+        \\fn validate(s: []const u8) !void {
+        \\    if (s.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_bare_err_gap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_bare_err_gap.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: bare error return without a trigger stays silent (EPH-I0005 lock)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same shape minus the `try validate` line: the bare `return err;` stops
+    // the ownership scan, but emission still requires a real trigger (try or
+    // `return error.`) — a bare-err return is not itself a trigger (that
+    // expansion is EPH-I0069's scope). The exit-stop only un-suppresses.
+    const content =
+        \\fn bareErrLock(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    normalize(s) catch |err| {
+        \\        if (isFatal(err)) return err;
+        \\    };
+        \\    state.field = buf;
+        \\}
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn normalize(s: []const u8) !void {
+        \\    if (s.len == 0) return error.Empty;
+        \\}
+        \\fn isFatal(err: anyerror) bool {
+        \\    return err == error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_bare_err_lock.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_bare_err_lock.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
 }
 
 test "ZA103: errdefer before the alloc does not cover it" {

@@ -47,7 +47,7 @@ if [ -n "$ZIG_VERSION" ]; then
     ZIG_MINOR=$(echo "$ZIG_VERSION" | cut -d. -f2)
     # Zig 0.16.0+ → ephor 0.14.x; Zig 0.15.x → ephor 0.11.13
     if [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
-        EPHOR_TAG="v0.14.2"
+        EPHOR_TAG="v0.14.3"
     else
         EPHOR_TAG="v0.11.13"
     fi

@@ -59,6 +59,22 @@ If you already have the `ephor-upgrade` step in `build.zig`:
 zig build ephor-upgrade
 ```
 
+### Update Check
+
+Analysis commands (everything except `help`, `version`, `init`, `install`,
+`upgrade`) perform a best-effort check for a newer ephor release and print a
+notification after the analysis output. The check never blocks analysis on
+failure:
+
+- The latest version is cached for 24h at `~/.ephor_update_check`. A fresh
+  cache skips the network fetch entirely; a stale, missing, or corrupt cache
+  is refetched and rewritten after a successful fetch, and left untouched
+  when the fetch fails.
+- Set `EPHOR_NO_UPDATE_CHECK` (any value, including empty) to skip the check
+  entirely — no fetch, no cache read, no warning. Recommended for
+  deterministic CI.
+- Without `HOME`, the cache is skipped and every run fetches live.
+
 ### Version Management
 
 Ephor pins the installed version in `ephor.json` so your team always runs the same version. The pinned version is stored under the `"version"` key. When you run `ephor install`, it auto-detects your source directory, entry points from `build.zig`, and writes a config file.
@@ -71,7 +87,7 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 Add the dependency:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.3.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -158,7 +174,7 @@ Example config:
 
 ```json
 {
-  "version": "0.14.2",
+  "version": "0.14.3",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1042,6 +1058,49 @@ Ephor uses three testing layers:
 
 ## Changelog
 
+### v0.14.3 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (2026-07-28)
+
+**Changed (migration required):** Inline-ignore directives are now anchored —
+only plain `//` comments whose first token is `ephor:ignore` /
+`ephor:disable` / `ephor:ignore-file` are directives. Migration:
+
+- `///` doc-comment directives → change to `//`
+- comma-joined rule lists → space-separated (`ZA201,` ends the rule list)
+- `ephor:ignore-next-line` → plain `ephor:ignore` (a directive-only line
+  already suppresses the next line)
+- rule ids in prose no longer count — previously hidden issues may surface
+  (fail-closed)
+- `//ephor:ignore` (no space) now works
+- a trailing-space bare directive now suppresses (was inert)
+
+**Removed:** ZA902 — its only emitter was dead code; it never emitted.
+`disable`/`enable` entries naming ZA902 become inert no-ops.
+
+**Added (new detections — genuine leaks, expect new warnings):**
+
+- ZA103 on multi-line-signature error-returning fns and on error exits
+  preceding an ownership transfer (+15 across the
+  zls/ghostty/sig/tigerbeetle validation corpus). Disclosed FP classes:
+  arena alias via method call, `try` inside call args, negation substrings
+  on signature lines.
+- ZA101 inside fns with container-typed parameters (enum/struct/union/
+  default `.{}` params no longer truncate the body).
+
+**Fixed (false positives):** ZA103 return-transfers; ZA101/ZA103
+orelse-return allocs; ZA101 allocator-first-arg shapes; ZA102 `.prepend`
+ownership; ZA105 sibling-switch-arm UAF.
+
+**Performance:** print path 16x on issue-bound projects (libqt6zig 50-60
+min → 3:10) via a per-(file, rule) suppression cache.
+
+**Operations:** the update check now honors the documented 24h cache
+(`~/.ephor_update_check`); set `EPHOR_NO_UPDATE_CHECK` (any value) to skip
+it entirely (deterministic CI). See [Update Check](#update-check).
+
+**Internal:** dead legacy panic-analyzer cluster removed (272 lines); 16
+self-leaks fixed (allocPrint → try-append OOM); ZA205 compound-annotation
+resolution corrected; tests 635 → 734.
+
 ### v0.14.2 — Dogfood Complexity Debt Cleared (2026-07-27)
 
 **Fixed:** Dogfood complexity debt cleared — `ephor check src/` 173 → 0 warnings (EPH-I0002). README accuracy pass.
@@ -1110,7 +1169,7 @@ Every ephor release is validated against five scenarios before tagging:
 | Fresh install | 0.15.2 | No ephor | Installs v0.11.13, `zig build ephor` passes |
 | Upgrade | 0.16.0 | v0.11.x snippet | Upgrades to v0.14.x, old snippet replaced with canonical block |
 | Upgrade | 0.15.2 | v0.11.x snippet | Upgrades to v0.11.13, old snippet replaced with canonical block |
-| Re-run | 0.16.0 | v0.14.2 canonical | Idempotent — block replaced with identical content, zon pin unchanged |
+| Re-run | 0.16.0 | v0.14.3 canonical | Idempotent — block replaced with identical content, zon pin unchanged |
 
 ### Running the Tests Locally
 

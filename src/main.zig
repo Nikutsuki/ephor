@@ -283,6 +283,9 @@ const StackEntry = struct {
     block_type: BlockType,
     merge_block: usize, // Block to merge back to (or continuation for catch)
     catch_origin_block: usize, // For catch: the block before catch started (0 if N/A)
+    // Control `{` has not been seen yet (Allman style / multi-line condition);
+    // the next `{` at paren-depth 0 on a non-opener line belongs to this entry.
+    pending_brace: bool = false,
 };
 
 /// Control Flow Graph for a single function
@@ -518,6 +521,122 @@ fn detectCFPattern(t: []const u8) CFPattern {
     return .none;
 }
 
+/// Quote state for line scanners: string and char literals are mutually
+/// exclusive; comments and code live outside both.
+const QuoteMode = enum { none, str, char };
+
+/// Advance quote state for one char. Returns chars to skip beyond the
+/// caller's own +1 (escape sequences), or null when the char is code
+/// outside any quote literal.
+fn scanQuoteStep(mode: *QuoteMode, c: u8) ?usize {
+    switch (mode.*) {
+        .str => {
+            if (c == '\\') return 1;
+            if (c == '"') mode.* = .none;
+            return 0;
+        },
+        .char => {
+            if (c == '\\') return 1;
+            if (c == '\'') mode.* = .none;
+            return 0;
+        },
+        .none => {
+            if (c == '"') {
+                mode.* = .str;
+                return 0;
+            }
+            if (c == '\'') {
+                mode.* = .char;
+                return 0;
+            }
+            return null;
+        },
+    }
+}
+
+/// Return the line with any trailing `//` comment removed (quote-aware:
+/// `//` inside string/char literals is kept).
+fn stripLineComment(t: []const u8) []const u8 {
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
+    }
+    return mem.trimEnd(u8, t[0..i], " \t\r");
+}
+
+/// Patterns whose line owns a control brace (pushes a stack entry).
+/// switch_arm is excluded: arms create blocks but push no stack entry.
+fn isControlOpener(pattern: CFPattern) bool {
+    return switch (pattern) {
+        .if_start, .while_start, .for_start, .switch_start => true,
+        .catch_start, .else_start, .else_if => true,
+        else => false,
+    };
+}
+
+/// Patterns whose dispatch pops a block-stack entry (handleBlockEnd, or
+/// handleElse popping the if before pushing the else).
+fn isPopDispatch(pattern: CFPattern) bool {
+    return switch (pattern) {
+        .block_end, .else_start, .else_if => true,
+        else => false,
+    };
+}
+
+/// True when the `{` at index i opens a signature container (`error{...}`
+/// set or an anonymous `struct`/`union`/`enum` return type) rather than a
+/// function body or control block. Same-line backward lookback, generalized
+/// from isErrorSetOpen (EPH-I0012): also catches spaced keywords and
+/// parenthesized containers like `union(enum) {`. The paren-group skip is
+/// not quote-aware; a mis-skip degrades to "not a container", which is the
+/// safe direction (fn-body/expression classification still applies).
+fn sigContainerOpen(code: []const u8, i: usize) bool {
+    var j = i;
+    while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+    if (j > 0 and code[j - 1] == ')') {
+        var depth: usize = 0;
+        while (j > 0) {
+            j -= 1;
+            if (code[j] == ')') depth += 1;
+            if (code[j] == '(') depth -= 1;
+            if (depth == 0) break;
+        }
+        while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+    }
+    const word_end = j;
+    while (j > 0 and isIdent(code[j - 1])) j -= 1;
+    const word = code[j..word_end];
+    inline for (.{ "error", "struct", "union", "enum" }) |kw| {
+        if (mem.eql(u8, word, kw)) return true;
+    }
+    return false;
+}
+
+/// Brace kinds on the CFG build brace stack. Only `.control` braces have a
+/// matching block-stack entry; every other kind is invisible to dispatch.
+const BraceKind = enum { fn_body, sig_container, control, expr };
+
+/// Per-line output of the CFG brace scan.
+const BraceScanOut = struct {
+    saw_control_close: bool = false, // `}` closed a control block, not an expression
+    saw_control_open: bool = false, // `{` was claimed as a control brace
+};
+
+/// Mutable per-line state threaded through the CFG brace scan.
+const LineScanCtx = struct {
+    code: []const u8, // comment-stripped line being scanned
+    opener: bool, // line matched a control-opener pattern
+    dispatch_pop: bool, // line's dispatch pops a block-stack entry
+    claimed: bool = false, // this line's control `{` has been claimed
+    out: BraceScanOut = .{},
+};
+
 /// Build CFG from function lines
 /// State passed through CFG building for each line
 const CFGBuildCtx = struct {
@@ -526,9 +645,133 @@ const CFGBuildCtx = struct {
     allocator: Allocator,
     current_block: usize,
     func_line: usize,
+    // Kind-tagged stack of unmatched braces; a `}` is a control-block end
+    // iff it pops a `.control` brace. Owned by buildCFG (same pattern as
+    // block_stack).
+    brace_stack: *std.ArrayListUnmanaged(BraceKind),
+    paren_depth: usize, // carried across lines for multi-line conditions
+    seen_fn_body: bool, // the fn body's own `{` is the scan baseline, never counted
 
     fn setStartLine(self: *CFGBuildCtx, line: usize) void {
         self.cfg.blocks.items[self.current_block].start_line = line;
+    }
+
+    /// Clear the top entry's pending control brace; returns true when a
+    /// pending claim was consumed (the `{` belongs to that entry).
+    fn clearTopPending(self: *CFGBuildCtx) bool {
+        const items = self.block_stack.items;
+        if (items.len == 0) return false;
+        const top = &items[items.len - 1];
+        if (!top.pending_brace) return false;
+        top.pending_brace = false;
+        return true;
+    }
+
+    /// Mark the top entry as waiting for its control `{` on a later line.
+    fn markTopPending(self: *CFGBuildCtx) void {
+        const items = self.block_stack.items;
+        if (items.len == 0) return;
+        items[items.len - 1].pending_brace = true;
+    }
+
+    /// True when the top block-stack entry is still waiting for its `{`.
+    fn topIsPending(self: *CFGBuildCtx) bool {
+        const items = self.block_stack.items;
+        if (items.len == 0) return false;
+        return items[items.len - 1].pending_brace;
+    }
+
+    /// Classify one `{` at index i and push its kind onto the brace stack.
+    /// Precedence: inside parens is always expression; signature containers
+    /// (`error{`, `struct {`, ...) are not bodies; the first remaining
+    /// paren-depth-0 `{` is the fn body; an opener's first `{` and pending
+    /// claims are control; everything else (switch arms, bare blocks,
+    /// literals) is expression.
+    fn classifyOpenBrace(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
+        if (self.paren_depth > 0) {
+            try self.brace_stack.append(self.allocator, .expr);
+            return;
+        }
+        if (sigContainerOpen(line_scan.code, i)) {
+            try self.brace_stack.append(self.allocator, .sig_container);
+            return;
+        }
+        if (!self.seen_fn_body) {
+            self.seen_fn_body = true;
+            try self.brace_stack.append(self.allocator, .fn_body);
+            return;
+        }
+        const own_claim = line_scan.opener and !line_scan.claimed;
+        if (own_claim or (!line_scan.opener and self.clearTopPending())) {
+            line_scan.claimed = true;
+            line_scan.out.saw_control_open = true;
+            try self.brace_stack.append(self.allocator, .control);
+            return;
+        }
+        try self.brace_stack.append(self.allocator, .expr);
+    }
+
+    /// Classify one `}`: pop the brace stack; it is a control-block end iff
+    /// it pops a `.control` brace on a pop-dispatching line.
+    fn classifyCloseBrace(self: *CFGBuildCtx, line_scan: *LineScanCtx) void {
+        // An entry still waiting for its `{` (brace-less body) is closed by
+        // the next close event, matching pre-guard pop-on-`}` semantics.
+        if (line_scan.dispatch_pop and self.topIsPending()) {
+            line_scan.out.saw_control_close = true;
+            return;
+        }
+        const items = self.brace_stack.items;
+        if (items.len == 0) {
+            line_scan.out.saw_control_close = true;
+            return;
+        }
+        const kind = items[items.len - 1];
+        // A `.control` brace closed on a non-popping line (same-line
+        // `if (a) { f(); }`) stays open so a later block_end line pops the
+        // entry — pre-guard lingering semantics, unchanged.
+        if (kind == .control and !line_scan.dispatch_pop) return;
+        _ = self.brace_stack.pop();
+        if (kind == .control) line_scan.out.saw_control_close = true;
+    }
+
+    /// Handle one code char (outside quotes/comments) for the brace scan.
+    fn scanCodeChar(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
+        const c = line_scan.code[i];
+        if (c == '(') {
+            self.paren_depth += 1;
+            return;
+        }
+        if (c == ')') {
+            self.paren_depth -|= 1;
+            return;
+        }
+        if (c == '{') {
+            try self.classifyOpenBrace(i, line_scan);
+            return;
+        }
+        if (c == '}') self.classifyCloseBrace(line_scan);
+    }
+
+    /// Scan one comment-stripped line, updating carried brace/paren state and
+    /// reporting whether the line opened or closed a control block.
+    fn scanLineBraces(self: *CFGBuildCtx, code: []const u8, pattern: CFPattern) !BraceScanOut {
+        var line_scan: LineScanCtx = .{
+            .code = code,
+            .opener = isControlOpener(pattern),
+            .dispatch_pop = isPopDispatch(pattern),
+        };
+        var mode: QuoteMode = .none;
+        var i: usize = 0;
+        while (i < code.len) : (i += 1) {
+            const c = code[i];
+            if (scanQuoteStep(&mode, c)) |skip| {
+                i += skip;
+                continue;
+            }
+            if (c == '/' and i + 1 < code.len and code[i + 1] == '/') break;
+            try self.scanCodeChar(i, &line_scan);
+        }
+        return line_scan.out;
     }
 
     fn handleBranch(self: *CFGBuildCtx, bt: BlockType, line: usize) !void {
@@ -685,6 +928,8 @@ fn buildCFG(
 
     var block_stack = std.ArrayListUnmanaged(StackEntry).empty;
     defer block_stack.deinit(allocator);
+    var brace_stack = std.ArrayListUnmanaged(BraceKind).empty;
+    defer brace_stack.deinit(allocator);
 
     var ctx = CFGBuildCtx{
         .cfg = &cfg,
@@ -692,14 +937,25 @@ fn buildCFG(
         .allocator = allocator,
         .current_block = current_block,
         .func_line = func_line,
+        .brace_stack = &brace_stack,
+        .paren_depth = 0,
+        .seen_fn_body = false,
     };
 
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        const pattern = detectCFPattern(t);
+        const code = stripLineComment(t);
+        const pattern = detectCFPattern(code);
+        const scan = try ctx.scanLineBraces(code, pattern);
         cfg.blocks.items[ctx.current_block].end_line = func_line + idx;
-        try ctx.dispatchPattern(pattern, t, func_line + idx);
+        // `}`/`};`/`},` closing an expression brace is not a block end.
+        if (pattern == .block_end and !scan.saw_control_close) continue;
+        try ctx.dispatchPattern(pattern, code, func_line + idx);
+        // Opener whose control `{` is on a later line (Allman, multi-line
+        // condition); an inline-return else has no brace coming at all.
+        if (isControlOpener(pattern) and !scan.saw_control_open and
+            !hasInlineElseReturn(code)) ctx.markTopPending();
     }
 
     if (cfg.exit_blocks.items.len == 0)
@@ -26305,6 +26561,278 @@ test "integration: undefined variable read" {
 
     // Should detect 'x' is read before assignment
     try std.testing.expect(def_issues.count() > 0);
+}
+
+// ============================================================================
+// CFG expression-brace guard tests (EPH-I0079 A1)
+// ============================================================================
+
+fn cfgHasEdge(cfg: *const ControlFlowGraph, from: usize, to: usize, kind: EdgeKind) bool {
+    for (cfg.edges.items) |e| {
+        if (e.from == from and e.to == to and e.kind == kind) return true;
+    }
+    return false;
+}
+
+test "buildCFG: struct literal close does not pop if block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(cond: bool) void {", // 1
+        "    var x: u32 = 0;", // 2
+        "    if (cond) {", // 3
+        "        const cfg = C{", // 4
+        "            .a = 1,", // 5
+        "        };", // 6
+        "        x = 1;", // 7
+        "    }", // 8
+        "}", // 9
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // Line 7 must stay in the if-true block, not fall through to the merge
+    const if_block = findBlockForLine(&cfg, 4);
+    try std.testing.expect(if_block != null);
+    try std.testing.expectEqual(if_block, findBlockForLine(&cfg, 7));
+}
+
+test "buildCFG: call-arg close does not pop if block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(cond: bool) void {", // 1
+        "    var x: u32 = 0;", // 2
+        "    if (cond) {", // 3
+        "        foo(", // 4
+        "            .{", // 5
+        "                .a = 1,", // 6
+        "            },", // 7: exact `},` line — the expression-close bug trigger
+        "        );", // 8
+        "        x = 1;", // 9
+        "    }", // 10
+        "}", // 11
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const if_block = findBlockForLine(&cfg, 4);
+    try std.testing.expect(if_block != null);
+    try std.testing.expectEqual(if_block, findBlockForLine(&cfg, 9));
+}
+
+test "buildCFG: switch arm block close does not pop switch entry" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(x: u8) void {", // 1
+        "    switch (x) {", // 2
+        "        .a => {", // 3
+        "            g();", // 4
+        "        },", // 5
+        "        .b => {", // 6
+        "            h();", // 7
+        "        },", // 8
+        "    }", // 9
+        "}", // 10
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // Both arms must branch from the switch header block; the first arm's
+    // `},` close must not pop the switch entry before arm .b is wired up.
+    const header = findBlockForLine(&cfg, 2) orelse return error.TestUnexpectedResult;
+    const arm_a = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
+    const arm_b = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, header, arm_a, .branch_true));
+    try std.testing.expect(cfgHasEdge(&cfg, header, arm_b, .branch_true));
+}
+
+test "buildCFG: quoted braces do not corrupt depth; comment close counts" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(cond: bool) void {", // 1
+        "    var x: u32 = 0;", // 2
+        "    if (cond) {", // 3
+        "        const s = \"{\";", // 4
+        "        const c = '{';", // 5
+        "        x = 1;", // 6
+        "    } // trailing comment", // 7
+        "    x = 2;", // 8
+        "}", // 9
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const if_block = findBlockForLine(&cfg, 4);
+    try std.testing.expect(if_block != null);
+    try std.testing.expectEqual(if_block, findBlockForLine(&cfg, 6));
+    // `} // comment` is comment-aware now: it pops the if block.
+    const after = findBlockForLine(&cfg, 8);
+    try std.testing.expect(after != null);
+    try std.testing.expect(if_block.? != after.?);
+}
+
+test "buildCFG: Allman if brace on next line pops correctly" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a)", // 2
+        "    {", // 3
+        "        g();", // 4
+        "    }", // 5
+        "    h();", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const if_block = findBlockForLine(&cfg, 4);
+    const after = findBlockForLine(&cfg, 6);
+    try std.testing.expect(if_block != null);
+    try std.testing.expect(after != null);
+    try std.testing.expect(if_block.? != after.?);
+}
+
+test "buildCFG: multi-line condition brace claims pending opener" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a &&", // 2
+        "        b) {", // 3
+        "        g();", // 4
+        "    }", // 5
+        "    h();", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const if_block = findBlockForLine(&cfg, 4);
+    const after = findBlockForLine(&cfg, 6);
+    try std.testing.expect(if_block != null);
+    try std.testing.expect(after != null);
+    try std.testing.expect(if_block.? != after.?);
+}
+
+test "buildCFG: error-set return type does not corrupt body brace tracking" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(cond: bool) error{A}!void {", // 1: `error{` is a sig container, not the body
+        "    var x: u32 = 0;", // 2
+        "    if (cond) {", // 3
+        "        x = 1;", // 4
+        "    }", // 5
+        "    x += 1;", // 6: must be in the merge block, not the if-true block
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const if_block = findBlockForLine(&cfg, 4);
+    const after = findBlockForLine(&cfg, 6);
+    try std.testing.expect(if_block != null);
+    try std.testing.expect(after != null);
+    try std.testing.expect(if_block.? != after.?);
+}
+
+test "buildCFG: control block nested in switch arm pops on its own close" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(x: u8, cond: bool) void {", // 1
+        "    switch (x) {", // 2
+        "        .a => {", // 3
+        "            if (cond) {", // 4
+        "                v = 1;", // 5
+        "            }", // 6: closes the if, not the arm's expression brace
+        "            v += 1;", // 7: must be past the if (its merge), not if-true
+        "        },", // 8
+        "        else => {},", // 9
+        "    }", // 10
+        "}", // 11
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const if_block = findBlockForLine(&cfg, 5);
+    const after = findBlockForLine(&cfg, 7);
+    try std.testing.expect(if_block != null);
+    try std.testing.expect(after != null);
+    try std.testing.expect(if_block.? != after.?);
+}
+
+test "buildCFG: switch nested in switch arm keeps both switches on the stack" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(x: u8, y: u8, cond: bool) void {", // 1
+        "    switch (x) {", // 2
+        "        .a => {", // 3
+        "            switch (y) {", // 4
+        "                .b => {", // 5
+        "                    if (cond) {", // 6
+        "                        v = 1;", // 7
+        "                    }", // 8
+        "                    v += 1;", // 9: past the if, not if-true
+        "                },", // 10
+        "                else => {},", // 11
+        "            }", // 12: closes the inner switch
+        "        },", // 13: closes arm .a (expression brace)
+        "        else => {},", // 14: must still wire to the outer switch header
+        "    }", // 15
+        "}", // 16
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const if_block = findBlockForLine(&cfg, 7);
+    const after = findBlockForLine(&cfg, 9);
+    try std.testing.expect(if_block != null);
+    try std.testing.expect(after != null);
+    try std.testing.expect(if_block.? != after.?);
+    // The outer switch entry must survive the inner switch and the arm close:
+    // the outer `else` arm still branches from the switch header block.
+    // (findBlockForLine is ambiguous here — the inner merge's end_line
+    // overlaps line 14 — so identify the arm block by its start_line.)
+    const header = findBlockForLine(&cfg, 2) orelse return error.TestUnexpectedResult;
+    var else_arm: ?usize = null;
+    for (cfg.blocks.items, 0..) |block, i| {
+        if (block.start_line == 14) else_arm = i;
+    }
+    try std.testing.expect(else_arm != null);
+    try std.testing.expect(cfgHasEdge(&cfg, header, else_arm.?, .branch_true));
 }
 
 // ============================================================================

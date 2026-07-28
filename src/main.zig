@@ -9094,6 +9094,7 @@ fn finishErrRetFn(
         "error union return type '!' but '{s}' never fails",
         .{scan.fn_name},
     );
+    errdefer a.free(msg);
     try issues.append(a, .{
         .file = path,
         .line = scan.fn_line,
@@ -10917,6 +10918,7 @@ fn reportUntestedPubFns(
             "public function '{s}' is never called from any test",
             .{decl.name},
         );
+        errdefer allocator.free(msg);
         try issues.append(allocator, .{
             .file = decl.path,
             .line = decl.line,
@@ -11888,6 +11890,7 @@ fn checkOneRelease(
         "unlock of '{s}' without acquire in this function",
         .{rel.receiver},
     );
+    errdefer sink.allocator.free(msg);
     try sink.issues.append(sink.allocator, .{
         .file = sink.path,
         .line = rel.line,
@@ -12670,6 +12673,7 @@ fn reportSingleComplexity(
         fmt,
         .{ state.fn_name, check_def.actual, check_def.metric, check_def.limit, suffix },
     );
+    errdefer ctx.allocator.free(msg);
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.path,
         .line = state.fn_start,
@@ -13124,6 +13128,7 @@ fn reportLineTooLong(
         "line has {d} columns (max {d})",
         .{ visible_len, max_len },
     );
+    errdefer ctx.allocator.free(msg);
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.path,
         .line = line_num,
@@ -13216,6 +13221,7 @@ fn reportNamingIssue(
         "{s} '{s}' should be {s}",
         .{ ctx.kind, ctx.name, ctx.expected },
     );
+    errdefer allocator.free(msg);
     try issues.append(allocator, .{
         .file = ctx.path,
         .line = ctx.line,
@@ -14412,6 +14418,28 @@ const CFGScanCtx = struct {
     func_lines: *std.ArrayListUnmanaged([]const u8),
 };
 
+/// Error-return markers for signature lines (EPH-I0072): the pattern set
+/// historically checked on the fn-keyword line in detectCFGFuncStart, now
+/// shared with the multi-line signature scan in trackCFGBraces. Substring
+/// matches — `!bool` also matches value-position negation (`= !bool_val`);
+/// accepted parity trap, do not "fix" one site without the other.
+const error_return_markers = [_][]const u8{ ") !", "!void", "!bool", "!usize", "!*", "![" };
+
+/// True when a signature line carries an error-return marker.
+fn lineHasErrorReturnMarker(t: []const u8) bool {
+    for (error_return_markers) |marker| {
+        if (mem.indexOf(u8, t, marker) != null) return true;
+    }
+    return false;
+}
+
+/// True when a signature line declares a noreturn function. Same substring
+/// trap class as the error-return markers (matches identifiers containing
+/// "noreturn"); fn_is_noreturn is currently write-only (EPH-I0073).
+fn lineHasNoreturnMarker(t: []const u8) bool {
+    return mem.indexOf(u8, t, "noreturn") != null;
+}
+
 /// Detect function start and initialize state
 /// Returns true if a nested function was detected (caller should process current func first)
 fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
@@ -14444,15 +14472,12 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     state.sig_container_depth = 0;
     state.body_started = false;
     // Detect if function returns errors: ) ! or !void, !bool, etc.
-    state.fn_returns_error = mem.indexOf(u8, t, ") !") != null or
-        mem.indexOf(u8, t, "!void") != null or
-        mem.indexOf(u8, t, "!bool") != null or
-        mem.indexOf(u8, t, "!usize") != null or
-        mem.indexOf(u8, t, "!*") != null or
-        mem.indexOf(u8, t, "![") != null;
+    // (shared marker set — continuation signature lines are OR-ed in by
+    // trackCFGBraces while the body has not started, EPH-I0072)
+    state.fn_returns_error = lineHasErrorReturnMarker(t);
 
     // Detect noreturn functions - memory leaks don't matter in noreturn
-    state.fn_is_noreturn = mem.indexOf(u8, t, "noreturn") != null;
+    state.fn_is_noreturn = lineHasNoreturnMarker(t);
 
     return was_in_func; // True if we interrupted another function
 }
@@ -14470,6 +14495,11 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
 fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
     var body_offset: usize = 0;
     if (!state.body_started) {
+        // EPH-I0072: return-type markers may sit on any signature line, not
+        // just the fn-keyword line — OR each pre-body line into the flags so
+        // multi-line signatures reach ZA103's analyzeCFGErrdeferCoverage.
+        state.fn_returns_error = state.fn_returns_error or lineHasErrorReturnMarker(t);
+        state.fn_is_noreturn = state.fn_is_noreturn or lineHasNoreturnMarker(t);
         body_offset = scanCFGSignatureLine(t, state);
         if (!state.body_started) return false;
     }
@@ -14534,6 +14564,7 @@ fn emitDefiniteAssignmentIssues(
                 "before assignment",
             .{entry.key_ptr.*},
         );
+        errdefer allocator.free(msg);
         try issues.append(allocator, .{
             .file = file_path,
             .line = entry.value_ptr.*,
@@ -14783,6 +14814,7 @@ fn emitMustReturnRef(
             "the returned copy's backing is freed at scope exit",
         .{ident},
     );
+    errdefer ctx.a.free(msg);
     try ctx.out.append(ctx.a, .{
         .file = ctx.fp,
         .line = ctx.fstart + idx,
@@ -15039,18 +15071,6 @@ fn countBraceDepth(t: []const u8, depth: usize) usize {
         if (c == '}' and d > 0) d -= 1;
     }
     return d;
-}
-
-/// Detect if function can return errors
-fn detectErrorReturns(lines: []const []const u8) bool {
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (mem.indexOf(u8, t, ") !") != null) return true;
-        if (mem.indexOf(u8, t, "!void") != null) return true;
-        if (mem.indexOf(u8, t, "!bool") != null) return true;
-        if (mem.indexOf(u8, t, "!usize") != null) return true;
-    }
-    return false;
 }
 
 /// Signed paren balance of a line (`(` minus `)`). Naive by design — string
@@ -22170,6 +22190,206 @@ test "ZA101: nested fn-type param does not break body extraction" {
         @as(usize, 1),
         countRuleIssues(run.issues.items, "test_ml_fntype.zig", RULE_ALLOC_NO_DEFER),
     );
+}
+
+// ============================================================================
+// EPH-I0072: signature-line myopia — every pre-body signature line must
+// contribute to fn_returns_error/fn_is_noreturn, not just the fn-keyword
+// line (detectCFGFuncStart + trackCFGBraces). Before the fix, a multi-line
+// signature with the return type on a later line left fn_returns_error
+// false and analyzeCFGErrdeferCoverage early-returned: ZA103 was silently
+// disabled for ALL multi-line error-returning functions.
+// ============================================================================
+
+test "ZA103: multi-line signature with error return on own line is checked" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0072 issue shape: `) !void` on its own line — invisible to the
+    // fn-keyword-line scan, so ZA103 never fired (probe P1 at HEAD 1a3593f:
+    // ZA101 fired, ZA103 silent; the single-line twin fired both).
+    const content =
+        \\fn leaky(
+        \\    allocator: std.mem.Allocator,
+        \\    x: u8,
+        \\) !void {
+        \\    const buf = try allocator.alloc(u8, 100);
+        \\    _ = buf;
+        \\    if (x > 0) return error.bad;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_errret_103.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_errret_103.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+}
+
+test "ZA103: single-line error-return signature check unchanged" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Parity lock: the detect-line check already enabled ZA103 here; the
+    // signature-line scan must not regress it.
+    const content =
+        \\fn leaky(allocator: std.mem.Allocator, x: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 100);
+        \\    _ = buf;
+        \\    if (x > 0) return error.bad;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_sl_errret_103.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_sl_errret_103.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+}
+
+test "ZA103: multi-line plain-void signature stays unchecked" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Negative lock: no signature line carries an error-return marker, so
+    // fn_returns_error must stay false and ZA103 must not fire.
+    const content =
+        \\fn leaky(
+        \\    allocator: std.mem.Allocator,
+        \\    x: u8,
+        \\) void {
+        \\    const buf = try allocator.alloc(u8, 100);
+        \\    _ = buf;
+        \\    if (x > 0) return error.bad;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_plainvoid_103.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "test_ml_plainvoid_103.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+}
+
+test "ZA103: negation default on signature line does not fake error return" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Trap boundary lock: `!flag_default` is value-position negation and
+    // matches NONE of the error-return markers — the widened signature-line
+    // scan must not invent an error return from it.
+    const content =
+        \\fn leaky(
+        \\    allocator: std.mem.Allocator,
+        \\    flag: bool = !flag_default,
+        \\) void {
+        \\    const buf = try allocator.alloc(u8, 100);
+        \\    _ = buf;
+        \\    if (flag) return error.bad;
+        \\}
+        \\const flag_default = false;
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_negation_103.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "test_ml_negation_103.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+}
+
+test "ZA103: !bool negation on signature line trips the substring trap (pinned)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ACCEPTED TRAP (EPH-I0072, parity with the pre-existing detect-line
+    // trap): `!bool_flag` substring-matches the `!bool` marker, so the
+    // widened scan reads this plain-void fn as error-returning and ZA103
+    // fires. Pins current behavior; making the markers smarter is explicitly
+    // out of scope for this unit.
+    const content =
+        \\fn leaky(
+        \\    allocator: std.mem.Allocator,
+        \\    flag: bool = !bool_flag,
+        \\) void {
+        \\    const buf = try allocator.alloc(u8, 100);
+        \\    _ = buf;
+        \\    if (flag) return error.bad;
+        \\}
+        \\const bool_flag = false;
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_negtrap_103.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_negtrap_103.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+}
+
+test "ZA101: multi-line noreturn signature pins current no-gate behavior" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // PIN, not endorsement: fn_is_noreturn is vestigial (write-only — probed
+    // at HEAD 1a3593f: ZA101 fires on noreturn fns in every shape, single-
+    // and multi-line alike), so noreturn currently gets NO memory-check
+    // exemption and this ZA101 keeps firing. EPH-I0073 tracks wiring (or
+    // deleting) the gate; update this pin when that lands.
+    const content =
+        \\fn die(
+        \\    allocator: std.mem.Allocator,
+        \\) noreturn {
+        \\    const buf = allocator.alloc(u8, 100) catch unreachable;
+        \\    _ = buf;
+        \\    @panic("dead");
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_ml_noreturn_101.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_noreturn_101.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "signature return-marker helpers match the shared pattern set" {
+    // Branch probe for the EPH-I0072 shared helpers: every marker of the
+    // detect-line set is recognized, plain-void and non-matching negation
+    // lines are not, and noreturn is tracked by its own helper.
+    try std.testing.expect(lineHasErrorReturnMarker(") !void {"));
+    try std.testing.expect(lineHasErrorReturnMarker(") !bool {"));
+    try std.testing.expect(lineHasErrorReturnMarker(") !usize {"));
+    try std.testing.expect(lineHasErrorReturnMarker(") !*Node {"));
+    try std.testing.expect(lineHasErrorReturnMarker(") ![]u8 {"));
+    try std.testing.expect(lineHasErrorReturnMarker("    error{OutOfMemory}!void"));
+    try std.testing.expect(!lineHasErrorReturnMarker(") void {"));
+    try std.testing.expect(!lineHasErrorReturnMarker("    flag: bool = !flag_default,"));
+    try std.testing.expect(lineHasNoreturnMarker(") noreturn {"));
+    try std.testing.expect(!lineHasNoreturnMarker(") void {"));
+}
+
+test "signature return-marker helpers: own-line shapes pin each marker" {
+    // Review F2 (EPH-I0072): every ") !"-prefixed positive above also matches
+    // the ") !" marker, so deleting "!bool"/"!usize"/"!*"/"![" from
+    // error_return_markers passed the full suite — those markers were
+    // unpinned. No-prefix own-line shapes (the multi-line-signature myopia
+    // targets: return type on its own continuation line) pin each marker
+    // individually.
+    try std.testing.expect(lineHasErrorReturnMarker("    !bool {"));
+    try std.testing.expect(lineHasErrorReturnMarker("    !usize {"));
+    try std.testing.expect(lineHasErrorReturnMarker("    !*Node {"));
+    try std.testing.expect(lineHasErrorReturnMarker("    ![]u8 {"));
 }
 
 test "ZA105: free through alias then use root" {

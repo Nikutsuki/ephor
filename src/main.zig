@@ -1290,18 +1290,27 @@ const ForLoopTracker = struct {
         gen: []bool,
     ) void {
         if (!self.in_loop) return;
-        const pos = mem.indexOf(u8, t, var_name) orelse return;
-        const end_pos = pos + var_name.len;
-        if (end_pos >= t.len) return;
-        // Pattern: var_name[...] = (direct indexed assignment)
-        if (t[end_pos] == '[') {
-            if (self.start_bid) |bid| gen[bid] = true;
-            return;
-        }
-        // Pattern: var_name.field[...] = (field access + indexed)
-        // Handles: result.v[col].v[row] = sum
-        if (t[end_pos] == '.' and isAssignmentTarget(t, var_name, pos)) {
-            if (self.start_bid) |bid| gen[bid] = true;
+        var s: usize = 0;
+        while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+            const pos = s + rel;
+            s = pos + var_name.len;
+            // The match must be the variable itself: not mid-identifier
+            // (box[i] =) and not a field of another var (foo.x[i] =).
+            if (pos > 0 and isIdent(t[pos - 1])) continue;
+            if (pos > 0 and t[pos - 1] == '.') continue;
+            const end_pos = pos + var_name.len;
+            if (end_pos >= t.len) return;
+            // Pattern: var_name[...] = (direct indexed assignment)
+            if (t[end_pos] == '[') {
+                if (self.start_bid) |bid| gen[bid] = true;
+                return;
+            }
+            // Pattern: var_name.field[...] = (field access + indexed)
+            // Handles: result.v[col].v[row] = sum
+            if (t[end_pos] == '.' and isAssignmentTarget(t, var_name, pos)) {
+                if (self.start_bid) |bid| gen[bid] = true;
+                return;
+            }
         }
     }
 };
@@ -1332,7 +1341,12 @@ fn computeGenSetForVar(
         tracker.checkIndexedAssign(t, var_name, gen);
         tracker.checkLoopEnd(t);
 
-        if (isAssignmentTarget(t, var_name, 0) or isFillPattern(t, var_name)) {
+        // isAssignmentTarget slices at pos without verifying the name is
+        // there, so the caller must establish it (with a word boundary).
+        const is_direct_assign = mem.startsWith(u8, t, var_name) and
+            (t.len == var_name.len or !isIdent(t[var_name.len])) and
+            isAssignmentTarget(t, var_name, 0);
+        if (is_direct_assign or isFillPattern(t, var_name)) {
             if (findBlockForLine(ctx.cfg, actual_line)) |bid| gen[bid] = true;
         }
         if (hasAddressOfVar(t, var_name)) {
@@ -7509,7 +7523,11 @@ fn hasAmpBeforeChain(t: []const u8, i: usize) bool {
 fn hasAmpVar(t: []const u8, var_name: []const u8) bool {
     var j: usize = 0;
     while (j + var_name.len + 1 <= t.len) : (j += 1) {
-        if (t[j] == '&' and mem.eql(u8, t[j + 1 .. j + 1 + var_name.len], var_name)) return true;
+        if (t[j] != '&') continue;
+        if (!mem.eql(u8, t[j + 1 .. j + 1 + var_name.len], var_name)) continue;
+        // Word boundary: &xyz must not count as &x.
+        const end = j + 1 + var_name.len;
+        if (end >= t.len or !isIdent(t[end])) return true;
     }
     return false;
 }
@@ -7905,11 +7923,16 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         if (i > 0 and t[i - 1] == '&') return true;
         if (i > 1 and t[i - 1] == '.' and hasAmpBeforeChain(t, i)) return true;
 
-        // Pattern 2: var_name[...] = (slice assignment)
-        if (end_i < t.len and t[end_i] == '[') return true;
+        // Patterns 2/3 require the match to be the variable itself: not
+        // mid-identifier (box[...], box =) and not a field of another var
+        // (foo.x[...], foo.x =).
+        const self_match = i == 0 or (!isIdent(t[i - 1]) and t[i - 1] != '.');
 
-        // Pattern 3: var_name = or .var_name = (direct assignment)
-        if (isAssignmentTarget(t, var_name, i)) return true;
+        // Pattern 2: var_name[...] = (slice assignment)
+        if (self_match and end_i < t.len and t[end_i] == '[') return true;
+
+        // Pattern 3: var_name = ... (direct assignment)
+        if (self_match and isAssignmentTarget(t, var_name, i)) return true;
     }
     return false;
 }
@@ -7921,6 +7944,9 @@ fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
     if (mem.indexOf(u8, t, "for ") == null and mem.indexOf(u8, t, "for(") == null)
         return false;
     const pos = mem.indexOf(u8, t, var_name) orelse return false;
+    // The match must be the variable itself: not mid-identifier (box[i])
+    // and not a field of another var (foo.x[i]).
+    if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) return false;
     const end = pos + var_name.len;
     return end < t.len and t[end] == '[';
 }
@@ -7948,6 +7974,9 @@ fn hasModifyingMethodCall(t: []const u8, var_name: []const u8) bool {
     const modifying_methods = compat.getModifyingMethodPatterns();
     for (modifying_methods) |method| {
         const var_pos = mem.indexOf(u8, t, var_name) orelse continue;
+        // The receiver must be the variable itself: not mid-identifier
+        // (box.append) and not a field of another var (foo.x.append).
+        if (var_pos > 0 and (isIdent(t[var_pos - 1]) or t[var_pos - 1] == '.')) continue;
         const after_var = var_pos + var_name.len;
         if (after_var + method.len > t.len) continue;
         if (mem.startsWith(u8, t[after_var..], method)) return true;
@@ -7971,8 +8000,9 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // Buffer-filling calls (read/decode/bufPrint/crypto) taking &var_name
     if (hasFillCall(t, var_name)) return true;
 
-    // Common init functions that fill via pointer
-    if (mem.indexOf(u8, t, ".init(") != null and mem.indexOf(u8, t, var_name) != null)
+    // Common init functions that fill via pointer (bounded word, so
+    // `box.init()` does not count as filling a variable named x)
+    if (mem.indexOf(u8, t, ".init(") != null and containsIdentifier(t, var_name))
         return true;
 
     // Stdlib container mutation methods modify the self receiver
@@ -8415,7 +8445,11 @@ fn isBuiltinDest(t: []const u8, var_name: []const u8, builtin: []const u8) bool 
     const after_paren = pos + builtin.len;
     if (after_paren >= t.len) return false;
     const var_pos = mem.indexOf(u8, t[after_paren..], var_name) orelse return false;
-    return var_pos == 0 or (var_pos == 1 and t[after_paren] == '&');
+    const is_dest_pos = var_pos == 0 or (var_pos == 1 and t[after_paren] == '&');
+    if (!is_dest_pos) return false;
+    // Word boundary: @memcpy(xyz, ...) must not count as filling x.
+    const end = after_paren + var_pos + var_name.len;
+    return end >= t.len or !isIdent(t[end]);
 }
 
 /// Check for discarded error union results
@@ -26521,6 +26555,281 @@ test "ZA607: sibling ifs with assignment only in first is detected" {
     );
 }
 
+test "ZA607: equal-length different var assignment does not mask undefined read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0078: `x = 1;` must not mark z assigned — isAssignmentTarget was
+    // called with pos=0 without verifying the line starts with var_name.
+    const content =
+        \\fn equalLength() u32 {
+        \\    var x: u32 = undefined;
+        \\    var z: u32 = undefined;
+        \\    x = 1;
+        \\    return z;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_eqlen.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_eqlen.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-char name not poisoned by other var field assignment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0078: t[1..] of `y.field = 1;` is `.field = 1;`, which the
+    // field-chain path of isAssignmentTarget accepted for var "x".
+    const content =
+        \\fn fieldPoison() u32 {
+        \\    var x: u32 = undefined;
+        \\    y.field = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fieldpoison.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fieldpoison.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-char name not poisoned by other var subscript assignment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0078: t[1..] of `y[i] = 1;` is `[i] = 1;`, which the subscript
+    // path of isAssignmentTarget accepted for var "x".
+    const content =
+        \\fn subscriptPoison() u32 {
+        \\    var x: u32 = undefined;
+        \\    y[i] = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_subpoison.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_subpoison.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: direct assignment of tracked var stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard must keep accepting the genuine `x = 1` gen (no FP).
+    const content =
+        \\fn directAssign() u32 {
+        \\    var x: u32 = undefined;
+        \\    x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_direct.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_direct.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: field assignment of tracked var still counts as assignment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `x.field = 1` still gens x — the fix must not change that semantic.
+    const content =
+        \\fn fieldAssign() u32 {
+        \\    var x: u32 = undefined;
+        \\    x.field = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fieldgen.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fieldgen.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: longer-name prefix assignment does not count" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `xyz = 1;` is not an assignment to x; locks the boundary behavior.
+    const content =
+        \\fn prefixName() u32 {
+        \\    var x: u32 = undefined;
+        \\    xyz = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_prefix.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_prefix.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: indexed assignment to different var in loop does not mask read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Neighbor audit: checkIndexedAssign matched "x" inside "box" without a
+    // left word boundary, and hasDirectFill pattern 2 did the same.
+    const content =
+        \\fn loopIndexed() u32 {
+        \\    var x: u32 = undefined;
+        \\    for (items) |item| {
+        \\        box[item] = 1;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_loopidx.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_loopidx.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: field assignment on other var does not mask read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Neighbor audit: `foo.x = 1` assigns foo's field, not local x —
+    // hasDirectFill pattern 3 lacked a leading-dot boundary.
+    const content =
+        \\fn otherField() u32 {
+        \\    var x: u32 = undefined;
+        \\    foo.x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_otherfield.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_otherfield.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: mutating method call on other var does not mask read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Neighbor audit: hasModifyingMethodCall matched "x" inside "box".
+    const content =
+        \\fn otherMethod() u32 {
+        \\    var x: u32 = undefined;
+        \\    box.append(1);
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_othermethod.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_othermethod.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: builtin dest with longer prefix name does not mask read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Neighbor audit: @memcpy(xyz, ...) must not count as filling x —
+    // isBuiltinDest lacked a trailing word boundary.
+    const content =
+        \\fn builtinPrefix() u32 {
+        \\    var x: u32 = undefined;
+        \\    @memcpy(xyz, src);
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_builtinprefix.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_builtinprefix.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill call on longer prefix name does not mask read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Neighbor audit: f.read(&xyz) must not count as filling x —
+    // hasAmpVar lacked a trailing word boundary.
+    const content =
+        \\fn fillCallPrefix() u32 {
+        \\    var x: u32 = undefined;
+        \\    f.read(&xyz);
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fillcall.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fillcall.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: init call on other var does not mask read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Neighbor audit: box.init() must not fill x — the .init( heuristic
+    // matched var_name as a bare substring.
+    const content =
+        \\fn otherInit() u32 {
+        \\    var x: u32 = undefined;
+        \\    box.init();
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_otherinit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_otherinit.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "integration: no false positive for valid catch-free-return" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -30008,6 +30317,43 @@ test "ZA204 fires for unfilled var undefined" {
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
             mem.eql(u8, issue.file, "test_za204.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA204 fires when only a different longer var is assigned" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // `box = 1;` must not drop x from the pending-undefined set —
+    // hasDirectFill matched "x" inside "box" without a left word boundary.
+    const test_content =
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    var x: u32 = undefined;
+        \\    box = 1;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_box.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_box.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
+            mem.eql(u8, issue.file, "test_za204_box.zig"))
         {
             found = true;
             break;

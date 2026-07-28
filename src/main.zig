@@ -21477,6 +21477,27 @@ test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) >= 1);
 }
 
+test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn push_node(allocator: std.mem.Allocator) !void {
+        \\    const node = try allocator.create(Node);
+        \\    list.prepend(&node.link);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_prepend.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_prepend.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
 test "ZA101: single-line .alloc( detection unchanged by line joining" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();

@@ -907,6 +907,7 @@ pub const container_ownership_methods: []const []const u8 = &.{
     ".append(",
     ".appendSlice(",
     ".insert(",
+    ".prepend(",
     ".addOne(",
     ".toOwnedSlice(",
     ".fromOwnedSlice(",

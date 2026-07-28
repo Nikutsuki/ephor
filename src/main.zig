@@ -18245,6 +18245,145 @@ fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool
     return false;
 }
 
+/// Suppressed-line set for one (file, rule) pair.
+const SuppressedLines = std.AutoHashMapUnmanaged(usize, void);
+
+/// Cached suppression facts for one (file, rule) pair: whether a file-level
+/// ignore directive covers the rule, plus every line an inline directive
+/// suppresses.
+const RuleFacts = struct {
+    file_level: bool = false,
+    lines: SuppressedLines = .empty,
+
+    fn deinit(self: *RuleFacts, allocator: Allocator) void {
+        self.lines.deinit(allocator);
+    }
+};
+
+/// Build the suppression facts for one (file, rule) pair in a single O(lines)
+/// pass. WHY: mirrors isInlineDisabled's decision tree branch-for-branch —
+/// same isIgnoreCommentLine prev-line test, same unmatchedOpenBraces scope
+/// open, same consumeIgnoredScopeLine close semantics — so cached lookups
+/// reproduce the per-issue rescan verdict exactly. A line entered while a
+/// scope is active is suppressed (including the line that closes it); the
+/// scope-opening line itself is always suppressed.
+fn buildRuleFacts(allocator: Allocator, content: []const u8, rule: []const u8) !RuleFacts {
+    var facts: RuleFacts = .{};
+    errdefer facts.deinit(allocator);
+
+    if (hasFileLevelIgnore(content, rule)) {
+        facts.file_level = true;
+        return facts;
+    }
+
+    var scope: ScopeIgnore = .{};
+    var prev_line: ?[]const u8 = null;
+    var line_num: usize = 1;
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| : (line_num += 1) {
+        const prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false;
+        var suppressed = false;
+        if (scope.active) {
+            // consumeIgnoredScopeLine returns is_target, so true here means the
+            // line is suppressed; the call's purpose is the scope tracking.
+            _ = consumeIgnoredScopeLine(&scope, line, true);
+            suppressed = true;
+        } else if (prev_ignores and mem.indexOf(u8, line, "{") != null) {
+            scope.depth = unmatchedOpenBraces(line);
+            scope.active = scope.depth > 0;
+            suppressed = true;
+        } else if (checkLineIgnore(line, rule) or prev_ignores) {
+            suppressed = true;
+        }
+        // Brace-less if: a `{}` literal nested deeper would read as extra
+        // nesting depth to ZA302's brace counter.
+        if (suppressed) try facts.lines.put(allocator, line_num, {});
+        prev_line = line;
+    }
+    return facts;
+}
+
+/// Per-(file, rule) cache of directive suppression facts.
+/// WHY: shouldPrintIssue used to rescan the whole source file for every
+/// issue (O(issues × lines), with the directive parse cost per line); on
+/// issue-count-bound projects (libqt6zig: 2,803 files, ~50-60 min) that
+/// dominated the run. Facts for a (file, rule) pair are built once in a
+/// single pass and then looked up in O(1). Keys are duped into cache-owned
+/// memory so entries never dangle on caller-held slices; deinit frees all.
+const IgnoreCache = struct {
+    allocator: Allocator,
+    files: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(RuleFacts)),
+
+    fn init(allocator: Allocator) IgnoreCache {
+        return .{ .allocator = allocator, .files = .empty };
+    }
+
+    fn deinit(self: *IgnoreCache) void {
+        var file_it = self.files.iterator();
+        while (file_it.next()) |file_entry| {
+            self.allocator.free(file_entry.key_ptr.*);
+            var rule_it = file_entry.value_ptr.iterator();
+            while (rule_it.next()) |rule_entry| {
+                self.allocator.free(rule_entry.key_ptr.*);
+                rule_entry.value_ptr.deinit(self.allocator);
+            }
+            file_entry.value_ptr.deinit(self.allocator);
+        }
+        self.files.deinit(self.allocator);
+    }
+
+    /// True when (file, line_num) is suppressed for rule, building the
+    /// (file, rule) facts lazily on first query.
+    /// WHY the OOM fallback: under allocation pressure the cache degrades to
+    /// the reference rescan — identical verdict, only slower. Suppression
+    /// semantics must never depend on heap availability.
+    fn isSuppressed(
+        self: *IgnoreCache,
+        content: []const u8,
+        file: []const u8,
+        line_num: usize,
+        rule: []const u8,
+    ) bool {
+        const facts = self.getOrBuild(content, file, rule) catch {
+            return isInlineDisabled(content, line_num, rule);
+        };
+        if (facts.file_level) return true;
+        return facts.lines.contains(line_num);
+    }
+
+    /// Fetch the cached facts for (file, rule), building them on first use.
+    /// The returned pointer is valid only until the next cache mutation.
+    fn getOrBuild(
+        self: *IgnoreCache,
+        content: []const u8,
+        file: []const u8,
+        rule: []const u8,
+    ) !*const RuleFacts {
+        const file_entry = try self.files.getOrPut(self.allocator, file);
+        if (!file_entry.found_existing) {
+            // WHY: getOrPut stored the caller's slice; remove unwinds the slot
+            // if dupe fails so deinit never frees borrowed memory.
+            errdefer _ = self.files.remove(file);
+            file_entry.key_ptr.* = try self.allocator.dupe(u8, file);
+            file_entry.value_ptr.* = .empty;
+        }
+        if (file_entry.value_ptr.getPtr(rule)) |facts| return facts;
+
+        // WHY build-then-commit: unwinding a half-inserted slot requires
+        // remove() to probe with the very key bytes being freed — a UAF read
+        // in getIndex's eql, a slot left dangling under poisoned memory, and
+        // a deinit double-free. Facts are built fully into locals first, so
+        // the map only ever holds complete, owned entries and the unwind
+        // paths below are plain frees with no map removal at all.
+        const owned_rule = try self.allocator.dupe(u8, rule);
+        errdefer self.allocator.free(owned_rule);
+        var facts = try buildRuleFacts(self.allocator, content, rule);
+        errdefer facts.deinit(self.allocator);
+        try file_entry.value_ptr.putNoClobber(self.allocator, owned_rule, facts);
+        return file_entry.value_ptr.getPtr(rule).?;
+    }
+};
+
 // ============================================================================
 // CLI
 // ============================================================================
@@ -20734,12 +20873,14 @@ fn writeExportIssue(
 }
 
 /// Shared output context for issue reporting (print/export): base_path is
-/// the display root for relative paths, cfg carries format/filters, and
-/// graph feeds shouldPrintIssue's inline-ignore lookups.
+/// the display root for relative paths, cfg carries format/filters, graph
+/// feeds inline-ignore content lookups, and ignore_cache memoizes the
+/// per-(file, rule) directive scans behind shouldPrintIssue.
 const ReportOutCtx = struct {
     base_path: []const u8,
     cfg: *const Config,
     graph: ?*const ImportGraph,
+    ignore_cache: *IgnoreCache,
 };
 
 fn exportIssues(
@@ -20770,12 +20911,12 @@ fn exportIssues(
     });
     var filtered_count: usize = 0;
     for (all_issues) |issue| {
-        if (shouldPrintIssue(issue, out.cfg, out.graph)) filtered_count += 1;
+        if (shouldPrintIssue(issue, out)) filtered_count += 1;
     }
     try output.print(allocator, "# Total issues: {d}\n\n", .{filtered_count});
 
     for (all_issues) |issue| {
-        if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
+        if (!shouldPrintIssue(issue, out)) continue;
         try writeExportIssue(allocator, &output, issue, out.cfg.path);
     }
     try file.writeStreamingAll(global_io.?, output.items);
@@ -20787,17 +20928,23 @@ fn exportIssues(
 // ============================================================================
 
 /// Check if issue should be printed based on config filters
-fn shouldPrintIssue(issue: Issue, cfg: *const Config, graph: ?*const ImportGraph) bool {
+fn shouldPrintIssue(issue: Issue, out: ReportOutCtx) bool {
     // Runtime issues (ZR1xx) use absolute paths from stack traces - skip path filter
     const is_runtime_issue = std.mem.startsWith(u8, issue.rule, "ZR1");
-    if (!is_runtime_issue and !std.mem.startsWith(u8, issue.file, cfg.path)) return false;
-    if (cfg.isRuleDisabled(issue.rule)) return false;
-    if (!is_runtime_issue and cfg.isPathExcluded(issue.file)) return false;
-    if (isKnownIssue(issue, cfg)) return false;
-    // Check inline ignore/disable comments in source
-    if (graph) |g| {
+    if (!is_runtime_issue and !std.mem.startsWith(u8, issue.file, out.cfg.path)) return false;
+    if (out.cfg.isRuleDisabled(issue.rule)) return false;
+    if (!is_runtime_issue and out.cfg.isPathExcluded(issue.file)) return false;
+    if (isKnownIssue(issue, out.cfg)) return false;
+    // Check inline ignore/disable comments in source (cached per file+rule)
+    if (out.graph) |g| {
         if (g.files.get(issue.file)) |analysis| {
-            if (isInlineDisabled(analysis.content, issue.line, issue.rule)) return false;
+            const suppressed = out.ignore_cache.isSuppressed(
+                analysis.content,
+                issue.file,
+                issue.line,
+                issue.rule,
+            );
+            if (suppressed) return false;
         }
     }
     return true;
@@ -20876,7 +21023,7 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
     var total_printable: usize = 0;
     var counts = PrintCounts{};
     for (issues) |issue| {
-        if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
+        if (!shouldPrintIssue(issue, out)) continue;
         total_printable += 1;
         switch (issue.severity) {
             .note => counts.notes += 1,
@@ -20896,14 +21043,14 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
         );
         var printed: usize = 0;
         for (issues) |issue| {
-            if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
+            if (!shouldPrintIssue(issue, out)) continue;
             printed += 1;
             issue.printJson(out.base_path, printed == total_printable);
         }
         std.debug.print("  ]\n}}\n", .{});
     } else {
         for (issues) |issue| {
-            if (!shouldPrintIssue(issue, out.cfg, out.graph)) continue;
+            if (!shouldPrintIssue(issue, out)) continue;
             issue.printText(out.base_path);
         }
     }
@@ -21163,6 +21310,11 @@ pub fn main(init: std.process.Init) !void {
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
     const base_path = Fs.cwd().realpath(cfg.path, &base_buf) catch cfg.path;
 
+    // Suppression-fact cache shared by every printIssues/exportIssues call in
+    // this run; built lazily per (file, rule), freed at exit.
+    var ignore_cache = IgnoreCache.init(alloc);
+    defer ignore_cache.deinit();
+
     switch (cfg.command) {
         .help => printHelp(),
         .version => std.debug.print(
@@ -21214,7 +21366,12 @@ pub fn main(init: std.process.Init) !void {
                 defer deinitIssues(&issues, alloc);
                 sortIssuesByFile(issues.items);
 
-                const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+                const out = ReportOutCtx{
+                    .base_path = base_path,
+                    .cfg = &cfg,
+                    .graph = &g,
+                    .ignore_cache = &ignore_cache,
+                };
                 const c = printIssues(issues.items, "orphans", out);
                 applyStrictGate(c, cfg.fail_on, &strict_fail);
             }
@@ -21232,7 +21389,12 @@ pub fn main(init: std.process.Init) !void {
             defer ast_issues.deinit(alloc);
             for (ast_issues.items) |ai| try issues.append(alloc, ai);
             ast_issues.items.len = 0; // ownership moved to issues
-            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const out = ReportOutCtx{
+                .base_path = base_path,
+                .cfg = &cfg,
+                .graph = &g,
+                .ignore_cache = &ignore_cache,
+            };
             const c = printIssues(issues.items, "memory", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
@@ -21253,7 +21415,12 @@ pub fn main(init: std.process.Init) !void {
             }
             // Clear ignored without deiniting items (now owned by issues)
             ignored.items.len = 0;
-            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const out = ReportOutCtx{
+                .base_path = base_path,
+                .cfg = &cfg,
+                .graph = &g,
+                .ignore_cache = &ignore_cache,
+            };
             const c = printIssues(issues.items, "errors", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
@@ -21265,7 +21432,12 @@ pub fn main(init: std.process.Init) !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeUnused(alloc, &g);
             defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const out = ReportOutCtx{
+                .base_path = base_path,
+                .cfg = &cfg,
+                .graph = &g,
+                .ignore_cache = &ignore_cache,
+            };
             const c = printIssues(issues.items, "unused", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
@@ -21277,7 +21449,12 @@ pub fn main(init: std.process.Init) !void {
             try scanPath(&g, cfg.path);
             var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
             defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+            const out = ReportOutCtx{
+                .base_path = base_path,
+                .cfg = &cfg,
+                .graph = &g,
+                .ignore_cache = &ignore_cache,
+            };
             const c = printIssues(issues.items, "complexity", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
@@ -21285,7 +21462,12 @@ pub fn main(init: std.process.Init) !void {
         .fmt_check => {
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = null };
+            const out = ReportOutCtx{
+                .base_path = base_path,
+                .cfg = &cfg,
+                .graph = null,
+                .ignore_cache = &ignore_cache,
+            };
             const c = printIssues(issues.items, "format", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
@@ -21323,7 +21505,12 @@ pub fn main(init: std.process.Init) !void {
             }
             var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = null };
+            const out = ReportOutCtx{
+                .base_path = base_path,
+                .cfg = &cfg,
+                .graph = null,
+                .ignore_cache = &ignore_cache,
+            };
             const c = printIssues(issues.items, "runtime", out);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
@@ -21435,7 +21622,12 @@ pub fn main(init: std.process.Init) !void {
                 const stats = g.getStats();
 
                 // Print all issues (returns filtered count)
-                const out = ReportOutCtx{ .base_path = base_path, .cfg = &cfg, .graph = &g };
+                const out = ReportOutCtx{
+                    .base_path = base_path,
+                    .cfg = &cfg,
+                    .graph = &g,
+                    .ignore_cache = &ignore_cache,
+                };
                 const orphan_count = printIssues(orphan_issues.items, "orphans", out);
                 // Filter cfg_mem_issues by rule category
                 var mem_only_issues = std.ArrayListUnmanaged(Issue).empty;
@@ -25092,6 +25284,177 @@ test "ephor:ignore with trailing whitespace and no rule suppresses all rules" {
     const tab = "const x = foo() catch {}; // ephor:ignore\t\n";
     try std.testing.expect(isInlineDisabled(tab, 1, "ZA201"));
     try std.testing.expect(isInlineDisabled(tab, 1, "ZA202"));
+}
+
+// ============================================================================
+// IgnoreCache differential tests — cached verdicts must equal the reference
+// isInlineDisabled scan for every (line, rule) pair of every fixture.
+// ============================================================================
+
+/// Nasty-case fixtures for the IgnoreCache differential test. Every fixture
+/// is probed exhaustively: lines 0..EOF+2 crossed with the rule table.
+const ignore_cache_fixtures = [_][]const u8{
+    // same-line directive suppresses only that line/rule
+    \\const x = foo() catch {}; // ephor:ignore ZA201
+    \\const y = foo() catch {};
+    ,
+    // legacy same-line disable + disable-next-line variant (rule list only)
+    \\const a = foo() catch {}; // ephor:disable ZA202
+    \\// ephor:disable-next-line ZA203
+    \\const b = val orelse unreachable;
+    \\const c = val orelse unreachable;
+    ,
+    // scope directive over a fn with nested braces
+    \\const before = foo() catch {};
+    \\// ephor:ignore ZA201
+    \\fn outer() void {
+    \\    if (true) {
+    \\        foo() catch {};
+    \\    }
+    \\    bar() catch {};
+    \\}
+    \\const after = baz() catch {};
+    ,
+    // unclosed scope at EOF
+    \\// ephor:ignore ZA201
+    \\fn unterminated() void {
+    \\    foo() catch {};
+    ,
+    // comment-only directive as the last line (no following line)
+    \\const a = foo() catch {};
+    \\// ephor:ignore ZA201
+    ,
+    // file-level with rule at top of file
+    \\// ephor:ignore-file ZA201
+    \\const a = foo() catch {};
+    \\fn f() void {
+    \\    bar() catch {};
+    \\}
+    ,
+    // bare file-level in a trailing comment
+    \\const marker = 1; // ephor:ignore-file
+    \\const a = foo() catch {};
+    ,
+    // file-level mid-file also suppresses lines before the directive
+    \\const a = foo() catch {};
+    \\// ephor:ignore-file ZC101
+    \\const b = bar() catch {};
+    ,
+    // doc-comment and prose-comment non-directives
+    \\/// ephor:ignore ZA201
+    \\// NOTE: ephor:ignore ZA202
+    \\const x = foo() catch {};
+    ,
+    // string-literal and code-mention non-directives
+    \\const s = "// ephor:ignore ZA201";
+    \\const t = "ephor:ignore-file";
+    \\const has = mem.indexOf(u8, line, "ephor:ignore") != null;
+    \\const a = foo() catch {};
+    ,
+    // CRLF line endings (explicit escapes; raw literals cannot hold \r)
+    "// ephor:ignore ZA201\r\nfn f() void {\r\n    foo() catch {};\r\n}\r\nconst z = bar() catch {};\r\n",
+    // multi-rule list with trailing prose; rule id buried in prose is inert
+    \\// ephor:ignore ZA201 ZA305 because pre-checked
+    \\const x = foo() catch {};
+    \\// ephor:ignore because ZA202 is noisy
+    \\const y = foo() catch {};
+    ,
+    // multiline-string body is string data, not directives
+    \\const fixture =
+    \\    \\// ephor:ignore-file
+    \\    \\// ephor:ignore ZA201
+    \\;
+    \\const x = foo() catch {};
+    ,
+    // directive inside an active scope still self-suppresses for its rule
+    \\// ephor:ignore ZA201
+    \\fn f() void {
+    \\    // ephor:ignore ZA202
+    \\    foo() catch {};
+    \\}
+    \\bar() catch {};
+    ,
+    // balanced braces on the scope-open line: scope never activates
+    \\// ephor:ignore ZA201
+    \\const x = blk: { break :blk foo() catch {}; };
+    \\bar() catch {};
+    ,
+    // brace inside a string on the open line still opens a scope (frozen quirk)
+    \\// ephor:ignore ZA201
+    \\const s = "{";
+    \\foo() catch {};
+    \\}
+    \\bar() catch {};
+    ,
+    // bare directive with trailing whitespace suppresses all rules
+    "const x = foo() catch {}; // ephor:ignore \nconst y = foo() catch {};\n",
+};
+
+test "IgnoreCache matches isInlineDisabled on every (line, rule) pair" {
+    const allocator = std.testing.allocator;
+    const rules = [_][]const u8{ "ZA201", "ZA202", "ZA203", "ZA101", "ZA305", "ZC101" };
+    for (ignore_cache_fixtures, 0..) |content, fixture_idx| {
+        var cache = IgnoreCache.init(allocator);
+        defer cache.deinit();
+        // Probe line 0 and past EOF too: both implementations must agree there.
+        const max_line = countLines(content) + 2;
+        var line_num: usize = 0;
+        while (line_num <= max_line) : (line_num += 1) {
+            for (rules) |rule| {
+                const want = isInlineDisabled(content, line_num, rule);
+                const got = cache.isSuppressed(content, "fixture.zig", line_num, rule);
+                if (want == got) continue;
+                std.debug.print(
+                    "IgnoreCache mismatch: fixture {d} line {d} rule {s}: " ++
+                        "isInlineDisabled={} cache={}\n",
+                    .{ fixture_idx, line_num, rule, want, got },
+                );
+                return error.ignore_cache_mismatch;
+            }
+        }
+    }
+}
+
+test "IgnoreCache allocation-failure paths fall back without leaking" {
+    // WHY two fixtures: a file-level rule makes buildRuleFacts early-return
+    // with zero allocations (covers grow/dupe/put failure points); a
+    // line-level rule allocates in facts.lines.put — the only sweep that
+    // reaches the build-failure unwind. Alloc sequence per iteration (zig
+    // 0.16.0): outer grow, file dupe, rule dupe, inner put (query A); file
+    // dupe, rule dupe, lines.put == fail_index 6 (query B), inner put.
+    const file_level =
+        \\const a = foo() catch {}; // ephor:ignore ZA201
+        \\const b = bar() catch {};
+        \\// ephor:ignore-file ZC101
+        \\const c = baz() catch {};
+    ;
+    const line_level = "const a = foo() catch {}; // ephor:ignore ZA201\n" ++
+        "const b = bar() catch {};\n";
+
+    // Measure the cold-run allocation count so the sweep covers every induced
+    // failure point (plus one no-failure run) without hardcoding std internals.
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe_cache = IgnoreCache.init(probe.allocator());
+    _ = probe_cache.isSuppressed(file_level, "oom.zig", 4, "ZC101");
+    _ = probe_cache.isSuppressed(line_level, "oom2.zig", 1, "ZA201");
+    probe_cache.deinit();
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        var cache = IgnoreCache.init(failing.allocator());
+        const got_file = cache.isSuppressed(file_level, "oom.zig", 4, "ZC101");
+        const got_line = cache.isSuppressed(line_level, "oom2.zig", 1, "ZA201");
+        cache.deinit();
+        try std.testing.expectEqual(isInlineDisabled(file_level, 4, "ZC101"), got_file);
+        try std.testing.expectEqual(isInlineDisabled(line_level, 1, "ZA201"), got_line);
+        // Every successful allocation must be released by deinit at every
+        // failure point — byte balance is the leak proof.
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "checkSilentCatch detects catch {}" {

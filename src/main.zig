@@ -19257,11 +19257,47 @@ const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/
 /// Stored update notification (printed after analysis output)
 var update_notification: ?[]const u8 = null;
 
+/// Name of the update-check cache file inside $HOME.
+const UPDATE_CACHE_FILENAME = ".ephor_update_check";
+
+/// Cache entries this old or older are refetched (24h).
+const UPDATE_CACHE_MAX_AGE_S: i64 = 24 * 60 * 60;
+
+/// Future-dated cache epochs inside this skew window are tolerated (clock drift).
+const UPDATE_CACHE_FUTURE_SKEW_S: i64 = 5 * 60;
+
+/// Cache files larger than this are treated as corrupt (the format is ~30 bytes).
+const UPDATE_CACHE_MAX_BYTES = 4096;
+
+/// Parsed contents of the update-check cache file.
+/// `version` is caller-owned (free with the same allocator).
+const CachedCheck = struct {
+    epoch: i64,
+    version: []const u8,
+};
+
 /// Check for new version (best effort, never blocks on failure).
-/// Always fetches latest version from remote — no local cache.
-fn checkForUpdates(allocator: Allocator) void {
-    const latest = fetchLatestVersion(allocator) orelse {
-        std.debug.print("warning: could not fetch latest ephor version, continuing with v{s}\n", .{EPHOR_VERSION});
+/// The latest version is cached for 24h at ~/.ephor_update_check (two lines:
+/// unix epoch, then version). A fresh cache skips the network fetch entirely;
+/// a stale, missing, or corrupt cache is refreshed after a successful fetch
+/// and left untouched when the fetch fails. Without HOME the cache is skipped
+/// and every check fetches live. Setting EPHOR_NO_UPDATE_CHECK (any value,
+/// including empty) skips the whole check: no fetch, no cache read, no warning.
+fn checkForUpdates(allocator: Allocator, home: ?[]const u8, no_check_env: ?[]const u8) void {
+    if (updateCheckDisabled(no_check_env)) return;
+    const cache_path = resolveUpdateCachePath(allocator, home);
+    defer if (cache_path) |p| allocator.free(p);
+    const now = std.Io.Clock.Timestamp.now(global_io.?, .real).raw.toSeconds();
+    const latest = resolveLatestVersion(
+        allocator,
+        cache_path,
+        now,
+        fetchLatestVersion,
+    ) orelse {
+        std.debug.print(
+            "warning: could not fetch latest ephor version, continuing with v{s}\n",
+            .{EPHOR_VERSION},
+        );
         return;
     };
     defer allocator.free(latest);
@@ -19282,6 +19318,87 @@ fn checkForUpdates(allocator: Allocator) void {
         "\n{s}\n{s}\n{s}\n",
         .{ border, msg, border },
     ) catch null;
+}
+
+/// True when EPHOR_NO_UPDATE_CHECK is present. Presence-only: the value is
+/// irrelevant, so an empty `EPHOR_NO_UPDATE_CHECK=` also disables the check.
+fn updateCheckDisabled(env_val: ?[]const u8) bool {
+    return env_val != null;
+}
+
+/// True when a cache epoch is usable: not negative, not future-dated beyond
+/// the clock-skew window, and younger than UPDATE_CACHE_MAX_AGE_S. An entry
+/// exactly 24h old counts as stale.
+fn isCacheFresh(saved_epoch: i64, now: i64) bool {
+    if (saved_epoch < 0) return false;
+    if (saved_epoch > now + UPDATE_CACHE_FUTURE_SKEW_S) return false;
+    return now - saved_epoch < UPDATE_CACHE_MAX_AGE_S;
+}
+
+/// Build the default cache path ($HOME/.ephor_update_check). Returns null
+/// when HOME is unset or empty — callers then skip the cache entirely.
+fn resolveUpdateCachePath(allocator: Allocator, home: ?[]const u8) ?[]const u8 {
+    const h = home orelse return null;
+    if (h.len == 0) return null;
+    return std.fs.path.join(allocator, &.{ h, UPDATE_CACHE_FILENAME }) catch null;
+}
+
+/// Read and validate the cache file. Returns null on any defect (missing,
+/// unreadable, oversized, non-integer epoch, non-semver version) so callers
+/// fall through to a live fetch — fail-closed on weird input. On success the
+/// returned version is caller-owned.
+fn readUpdateCache(allocator: Allocator, path: []const u8) ?CachedCheck {
+    const content = Fs.cwd().readFileAlloc(allocator, path, UPDATE_CACHE_MAX_BYTES) catch
+        return null;
+    defer allocator.free(content);
+    var lines = mem.splitScalar(u8, content, '\n');
+    const epoch_line = lines.next() orelse return null;
+    const version_line = lines.next() orelse return null;
+    const epoch = std.fmt.parseInt(i64, epoch_line, 10) catch return null;
+    if (parseSemver(version_line) == null) return null;
+    const owned = allocator.dupe(u8, version_line) catch return null;
+    return .{ .epoch = epoch, .version = owned };
+}
+
+/// Persist the cache as "<epoch>\n<version>\n". Direct write: a crash
+/// mid-write leaves a corrupt file that readUpdateCache rejects, so the next
+/// run simply refetches — the format is self-healing.
+fn writeUpdateCache(
+    allocator: Allocator,
+    path: []const u8,
+    version: []const u8,
+    now: i64,
+) void {
+    const content = std.fmt.allocPrint(allocator, "{d}\n{s}\n", .{ now, version }) catch return;
+    defer allocator.free(content);
+    Fs.cwd().writeFile(path, content, .{}) catch return;
+}
+
+/// Return the cached version (ownership transferred to the caller) when a
+/// fresh cache exists at path; null when missing, corrupt, or stale.
+fn readFreshCachedVersion(allocator: Allocator, path: []const u8, now: i64) ?[]const u8 {
+    const cached = readUpdateCache(allocator, path) orelse return null;
+    if (isCacheFresh(cached.epoch, now)) return cached.version;
+    allocator.free(cached.version);
+    return null;
+}
+
+/// Resolve the latest ephor version. A fresh cache hit returns immediately
+/// without calling fetch_fn; otherwise fetch_fn is called once and a
+/// successful result rewrites the cache (stamped with `now`). A failed fetch
+/// returns null and leaves any existing cache file untouched.
+fn resolveLatestVersion(
+    allocator: Allocator,
+    cache_path: ?[]const u8,
+    now: i64,
+    fetch_fn: *const fn (Allocator) ?[]const u8,
+) ?[]const u8 {
+    if (cache_path) |path| {
+        if (readFreshCachedVersion(allocator, path, now)) |v| return v;
+    }
+    const latest = fetch_fn(allocator) orelse return null;
+    if (cache_path) |path| writeUpdateCache(allocator, path, latest, now);
+    return latest;
 }
 
 /// Fetch latest version from the Codeberg tags API (not cached raw files).
@@ -20180,6 +20297,12 @@ fn printHelp() void {
         \\  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
         \\  --version=<X.Y.Z>   For 'install'/'upgrade': pin a specific version
         \\
+        \\ENVIRONMENT VARIABLES:
+        \\  EPHOR_NO_UPDATE_CHECK   When set (any value, including empty), skip the
+        \\                          version update check entirely: no network fetch,
+        \\                          no cache read, no warning. Without it, the latest
+        \\                          version is cached for 24h at ~/.ephor_update_check.
+        \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
         \\  ephor install --version=0.14.2   # Install specific version
@@ -20813,7 +20936,11 @@ pub fn main(init: std.process.Init) !void {
     // Check for updates on analysis commands (not on help/version/init/install/upgrade)
     switch (cfg.command) {
         .help, .version, .init, .install, .upgrade => {},
-        else => checkForUpdates(alloc),
+        else => checkForUpdates(
+            alloc,
+            init.environ_map.get("HOME"),
+            init.environ_map.get("EPHOR_NO_UPDATE_CHECK"),
+        ),
     }
 
     // Get absolute base path for relative path calculation
@@ -24756,6 +24883,233 @@ test "parseVersionFromZon returns null for missing version" {
 
     const bad_content = ".{ .name = .ephor }";
     try std.testing.expect(parseVersionFromZon(allocator, bad_content) == null);
+}
+
+// --- Update cache test seam ---
+// resolveLatestVersion takes the fetcher as a function pointer so tests can
+// count calls and control the result without touching the network.
+var test_fetch_calls: usize = 0;
+var test_fetch_result: ?[]const u8 = null;
+
+fn testFetchFn(allocator: Allocator) ?[]const u8 {
+    test_fetch_calls += 1;
+    const v = test_fetch_result orelse return null;
+    return allocator.dupe(u8, v) catch null;
+}
+
+fn resetFetchSeam(result: ?[]const u8) void {
+    test_fetch_calls = 0;
+    test_fetch_result = result;
+}
+
+/// Absolute path of `name` inside the tmp dir (the cache fns are path-based).
+fn tmpFilePath(allocator: Allocator, tmp: *std.testing.TmpDir, name: []const u8) ![]const u8 {
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(dir_path);
+    return std.fs.path.join(allocator, &.{ dir_path, name });
+}
+
+test "updateCheckDisabled is presence-only" {
+    try std.testing.expect(!updateCheckDisabled(null));
+    try std.testing.expect(updateCheckDisabled(""));
+    try std.testing.expect(updateCheckDisabled("0"));
+    try std.testing.expect(updateCheckDisabled("1"));
+}
+
+test "isCacheFresh boundary and fail-closed cases" {
+    const now: i64 = 1_800_000_000;
+    try std.testing.expect(isCacheFresh(now, now));
+    try std.testing.expect(isCacheFresh(now - UPDATE_CACHE_MAX_AGE_S + 1, now));
+    // Exactly 24h old is stale (pinned boundary).
+    try std.testing.expect(!isCacheFresh(now - UPDATE_CACHE_MAX_AGE_S, now));
+    try std.testing.expect(!isCacheFresh(-1, now));
+    // Future epochs: tolerated inside the skew window, stale beyond it.
+    try std.testing.expect(isCacheFresh(now + UPDATE_CACHE_FUTURE_SKEW_S, now));
+    try std.testing.expect(!isCacheFresh(now + UPDATE_CACHE_FUTURE_SKEW_S + 1, now));
+}
+
+test "resolveUpdateCachePath requires HOME" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(resolveUpdateCachePath(allocator, null) == null);
+    try std.testing.expect(resolveUpdateCachePath(allocator, "") == null);
+    const path = resolveUpdateCachePath(allocator, "/home/dev") orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/home/dev/.ephor_update_check", path);
+}
+
+test "update cache write/read round-trip" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+
+    const now: i64 = 1_800_000_000;
+    writeUpdateCache(allocator, path, "1.2.3", now);
+
+    const cached = readUpdateCache(allocator, path) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(cached.version);
+    try std.testing.expectEqualStrings("1.2.3", cached.version);
+    try std.testing.expectEqual(now, cached.epoch);
+}
+
+test "resolveLatestVersion returns fresh cache without fetching" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    const now: i64 = 1_800_000_000;
+    writeUpdateCache(allocator, path, "1.2.3", now - 60);
+
+    resetFetchSeam("9.9.9");
+    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(latest);
+    try std.testing.expectEqualStrings("1.2.3", latest);
+    try std.testing.expectEqual(@as(usize, 0), test_fetch_calls);
+}
+
+test "resolveLatestVersion refetches stale cache and rewrites it" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    const now: i64 = 1_800_000_000;
+    writeUpdateCache(allocator, path, "1.2.3", now - UPDATE_CACHE_MAX_AGE_S);
+
+    resetFetchSeam("9.9.9");
+    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(latest);
+    try std.testing.expectEqualStrings("9.9.9", latest);
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+
+    // Cache rewritten with the fetched version, stamped with the injected now.
+    const cached = readUpdateCache(allocator, path) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(cached.version);
+    try std.testing.expectEqualStrings("9.9.9", cached.version);
+    try std.testing.expectEqual(now, cached.epoch);
+
+    // A second resolve now hits the fresh cache — no additional fetch.
+    const again = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(again);
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+}
+
+test "resolveLatestVersion treats future-dated cache as stale" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    const now: i64 = 1_800_000_000;
+    writeUpdateCache(allocator, path, "1.2.3", now + UPDATE_CACHE_FUTURE_SKEW_S + 1);
+
+    resetFetchSeam("9.9.9");
+    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(latest);
+    try std.testing.expectEqualStrings("9.9.9", latest);
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+}
+
+test "resolveLatestVersion refetches corrupt cache" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    const now: i64 = 1_800_000_000;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "cache",
+        .data = "garbage\nnotsemver\n",
+    });
+
+    resetFetchSeam("9.9.9");
+    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(latest);
+    try std.testing.expectEqualStrings("9.9.9", latest);
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+
+    // Corrupt content replaced by a valid cache entry.
+    const cached = readUpdateCache(allocator, path) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(cached.version);
+    try std.testing.expectEqualStrings("9.9.9", cached.version);
+}
+
+test "resolveLatestVersion fetches when cache file is missing" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    const now: i64 = 1_800_000_000;
+
+    resetFetchSeam("9.9.9");
+    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(latest);
+    try std.testing.expectEqualStrings("9.9.9", latest);
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+
+    // Fetch success creates the cache file.
+    const cached = readUpdateCache(allocator, path) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(cached.version);
+    try std.testing.expectEqualStrings("9.9.9", cached.version);
+}
+
+test "resolveLatestVersion leaves cache untouched on fetch failure" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    const now: i64 = 1_800_000_000;
+    const original = "123\n1.2.3\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cache", .data = original });
+
+    resetFetchSeam(null);
+    const result = resolveLatestVersion(allocator, path, now, testFetchFn);
+    try std.testing.expect(result == null);
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+
+    // Failed fetch must not rewrite the file — bytes identical to before.
+    const raw = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "cache",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(raw);
+    try std.testing.expectEqualStrings(original, raw);
+}
+
+test "resolveLatestVersion without cache path always fetches" {
+    const allocator = std.testing.allocator;
+    const now: i64 = 1_800_000_000;
+
+    resetFetchSeam("9.9.9");
+    const latest = resolveLatestVersion(allocator, null, now, testFetchFn) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(latest);
+    try std.testing.expectEqualStrings("9.9.9", latest);
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
 }
 
 // ============================================================================

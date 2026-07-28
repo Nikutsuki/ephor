@@ -66,7 +66,6 @@ pub const RULE_ORELSE_QUESTION_UNSAFE = "ZA802";
 
 // ZA9xx - Panic/Overflow Detection
 pub const RULE_DECREMENT_WITHOUT_CHECK = "ZA901";
-pub const RULE_SUBTRACTION_OVERFLOW = "ZA902";
 pub const RULE_INDEX_ARITHMETIC = "ZA903";
 pub const RULE_INTCAST_NO_BOUNDS = "ZA904";
 

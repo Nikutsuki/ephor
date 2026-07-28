@@ -324,7 +324,6 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA901** | warning | OFF | Decrement without overflow guard may panic (use `--enable=ZA9`) |
-| **ZA902** | warning | OFF | Subtraction in range may cause overflow (use `--enable=ZA9`) |
 | **ZA903** | warning | OFF | Arithmetic in array index may overflow (use `--enable=ZA9`) |
 | **ZA904** | note | OFF | `@intCast`/`@truncate` without a bounds proof in the preceding lines (use `--enable=ZA904`) |
 

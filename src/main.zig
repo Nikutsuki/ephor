@@ -159,7 +159,6 @@ const RULE_NAMING_CONVENTION = types.RULE_NAMING_CONVENTION;
 const RULE_OPTIONAL_UNWRAP_UNSAFE = types.RULE_OPTIONAL_UNWRAP_UNSAFE;
 const RULE_ORELSE_QUESTION_UNSAFE = types.RULE_ORELSE_QUESTION_UNSAFE;
 const RULE_DECREMENT_WITHOUT_CHECK = types.RULE_DECREMENT_WITHOUT_CHECK;
-const RULE_SUBTRACTION_OVERFLOW = types.RULE_SUBTRACTION_OVERFLOW;
 const RULE_INDEX_ARITHMETIC = types.RULE_INDEX_ARITHMETIC;
 const RULE_INTCAST_NO_BOUNDS = types.RULE_INTCAST_NO_BOUNDS;
 const RULE_RUNTIME_MEMORY_LEAK = types.RULE_RUNTIME_MEMORY_LEAK;
@@ -16257,7 +16256,7 @@ fn checkPanicPatternsInBlock(
     }
 }
 
-/// CFG-based panic/overflow pattern analysis (ZA901/ZA902/ZA903)
+/// CFG-based panic/overflow pattern analysis (ZA901/ZA903)
 /// Uses control flow graph to track guards across paths
 fn analyzeCFGPanicPatterns(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const allocator = run.file.allocator;
@@ -17077,128 +17076,6 @@ fn analyzeNullSafety(
 // ZA9xx - Panic/Overflow Detection
 // ============================================================================
 
-/// Check for decrement without guard (ZA901)
-/// Detects patterns like `x -= 1` without a prior `x > 0` check
-/// Check if there's a guard on surrounding lines for a variable
-fn hasGuardInContext(
-    t: []const u8,
-    context_lines: []const []const u8,
-    current_idx: usize,
-    var_name: []const u8,
-) bool {
-    if (hasGuardOnLine(t, var_name)) return true;
-    const check_start = if (current_idx > 5) current_idx - 5 else 0;
-    for (context_lines[check_start..current_idx]) |ctx_line| {
-        const ctx = mem.trim(u8, ctx_line, " \t\r");
-        if (hasGuardOnLine(ctx, var_name)) return true;
-    }
-    return false;
-}
-
-/// Check if decrement is safe due to type, pairing, comptime, or enclosing guards
-fn isDecrementSafe(
-    context_lines: []const []const u8,
-    current_idx: usize,
-    var_name: []const u8,
-) bool {
-    const cs = if (current_idx > 10) current_idx - 10 else 0;
-    if (isSignedTypeDecl(context_lines[cs .. current_idx + 1], var_name)) return true;
-    if (hasPairedIncrement(context_lines[0..current_idx], var_name)) return true;
-    if (isInComptimeBlock(context_lines, current_idx)) return true;
-    if (hasAssertGeGuard(context_lines, current_idx, var_name)) return true;
-    if (hasEnclosingVarGuard(context_lines, current_idx, var_name)) return true;
-    if (hasElseBranchGuard(context_lines, current_idx)) return true;
-    return false;
-}
-
-/// Shared context for the legacy line-based panic checks (ZA901/ZA902):
-/// the issue sink and the current line within its file-wide line buffer.
-const PanicScanCtx = struct {
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    path: []const u8,
-    t: []const u8,
-    line_num: usize,
-    context_lines: []const []const u8,
-    current_idx: usize,
-};
-
-fn checkDecrementWithoutGuard(ctx: PanicScanCtx) !void {
-    const decrement_patterns = [_][]const u8{ "-= 1", " -= 1" };
-    for (decrement_patterns) |pattern| {
-        const col = mem.indexOf(u8, ctx.t, pattern) orelse continue;
-        if (isInsideString(ctx.t, col)) continue;
-        const var_name = extractDecrementVar(ctx.t, col) orelse continue;
-
-        if (hasGuardInContext(ctx.t, ctx.context_lines, ctx.current_idx, var_name)) continue;
-        if (isDecrementSafe(ctx.context_lines, ctx.current_idx, var_name)) continue;
-
-        try ctx.issues.append(ctx.allocator, .{
-            .file = ctx.path,
-            .line = ctx.line_num,
-            .col = col + 1,
-            .severity = .warning,
-            .rule = RULE_DECREMENT_WITHOUT_CHECK,
-            .message = "decrement without overflow guard may panic",
-            .help = "add guard (if/while/assert x > 0), " ++
-                "use saturating arithmetic (-|), " ++
-                "or document caller contract",
-        });
-        return;
-    }
-}
-
-/// Check if there's a paired increment for a variable (x += 1 before x -= 1)
-/// or if the variable was initialized to a positive value (x = 1, x = N > 0)
-/// Check if after_var text matches an increment pattern (x += 1, x = ... + 1)
-fn isIncrementPattern(after_var: []const u8) bool {
-    return mem.startsWith(u8, after_var, " += 1") or
-        mem.startsWith(u8, after_var, "+=1") or
-        mem.startsWith(u8, after_var, " += 1;") or
-        (mem.startsWith(u8, after_var, " = ") and
-            mem.indexOf(u8, after_var, "+ 1") != null);
-}
-
-/// Check if a var/const declaration has a positive initial value
-fn isPositiveInit(ctx: []const u8, after_var: []const u8) bool {
-    if (!mem.startsWith(u8, ctx, "var ") and !mem.startsWith(u8, ctx, "const "))
-        return false;
-    return mem.indexOf(u8, after_var, "= 1") != null or
-        mem.indexOf(u8, after_var, "= 2") != null or
-        mem.indexOf(u8, after_var, "= 3") != null or
-        mem.indexOf(u8, after_var, ": usize = 1") != null or
-        mem.indexOf(u8, after_var, ":usize = 1") != null;
-}
-
-fn hasPairedIncrement(context_lines: []const []const u8, var_name: []const u8) bool {
-    var i = context_lines.len;
-    while (i > 0) {
-        i -= 1;
-        const ctx = mem.trim(u8, context_lines[i], " \t\r");
-        if (isFuncBoundary(ctx)) return false;
-        const var_pos = mem.indexOf(u8, ctx, var_name) orelse continue;
-        const after_var = ctx[var_pos + var_name.len ..];
-        if (isIncrementPattern(after_var)) return true;
-        if (isPositiveInit(ctx, after_var)) return true;
-    }
-    return false;
-}
-
-/// Check if variable is declared as a signed integer type in context
-fn isSignedTypeDecl(context_lines: []const []const u8, var_name: []const u8) bool {
-    const signed_types = [_][]const u8{ ": i8", ": i16", ": i32", ": i64", ": i128", ": isize" };
-    for (context_lines) |ctx_line| {
-        const ctx = mem.trim(u8, ctx_line, " \t\r");
-        // Look for "var varname: iXX" or "const varname: iXX"
-        const var_pos = mem.indexOf(u8, ctx, var_name) orelse continue;
-        const after_var = ctx[var_pos + var_name.len ..];
-        for (signed_types) |stype| {
-            if (mem.startsWith(u8, after_var, stype)) return true;
-        }
-    }
-    return false;
-}
-
 /// Common comparison patterns that guard against underflow
 const guard_comparison_pats = [_][]const u8{
     "> 0", ">0", "> 1", ">1", ">= 1", ">=1", "!= 0", "!=0",
@@ -17238,150 +17115,6 @@ fn findMatchingBracket(t: []const u8, start: usize) ?usize {
         }
     }
     return null;
-}
-
-/// Check if current line has an inline subtraction guard (while/short-circuit)
-fn hasInlineSubtractionGuard(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "while") != null and mem.indexOf(u8, t, "> 0") != null) return true;
-    if (mem.indexOf(u8, t, "== 0 or") != null) return true;
-    return false;
-}
-
-/// Check if context lines have a bounds-checking guard for subtraction
-fn hasBoundsGuardInContext(context_lines: []const []const u8, current_idx: usize) bool {
-    const check_start = if (current_idx > 5) current_idx - 5 else 0;
-    const guard_pats = [_][]const u8{ ">=", "> ", ".len", "endsWith", "startsWith" };
-    for (context_lines[check_start..current_idx]) |ctx_line| {
-        const ctx = mem.trim(u8, ctx_line, " \t\r");
-        for (guard_pats) |pat| {
-            if (mem.indexOf(u8, ctx, pat) != null) return true;
-        }
-    }
-    return false;
-}
-
-/// Check a bracket expression for unguarded subtraction
-fn checkBracketSubtraction(
-    ctx: PanicScanCtx,
-    bracket_start: usize,
-    bracket_end: usize,
-) !bool {
-    const inside = ctx.t[bracket_start + 1 .. bracket_end];
-    const sub_pos = mem.indexOf(u8, inside, " - ") orelse return false;
-    if (mem.trim(u8, inside[0..sub_pos], " ").len == 0) return false;
-    if (mem.indexOf(u8, inside, "-|") != null) return false;
-
-    if (hasInlineSubtractionGuard(ctx.t)) return false;
-    if (hasBoundsGuardInContext(ctx.context_lines, ctx.current_idx)) return false;
-
-    try ctx.issues.append(ctx.allocator, .{
-        .file = ctx.path,
-        .line = ctx.line_num,
-        .col = bracket_start + sub_pos + 2,
-        .severity = .warning,
-        .rule = RULE_INDEX_ARITHMETIC,
-        .message = "arithmetic in array index may overflow",
-        .help = "ensure index arithmetic cannot underflow, or use saturating subtraction -|",
-    });
-    return true;
-}
-
-/// Check for range subtraction: for (a..b - 1)
-fn checkRangeSubtraction(ctx: PanicScanCtx) !void {
-    const range_pos = mem.indexOf(u8, ctx.t, "..") orelse return;
-    const after_range = ctx.t[range_pos + 2 ..];
-    const sub_in_range = mem.indexOf(u8, after_range, " - ") orelse return;
-    if (mem.indexOf(u8, after_range[0..sub_in_range], ")") != null) return;
-
-    const check_start = if (ctx.current_idx > 5) ctx.current_idx - 5 else 0;
-    const range_guard_pats = [_][]const u8{ ">=", "> 0", "endsWith", "startsWith" };
-    for (ctx.context_lines[check_start..ctx.current_idx]) |ctx_line| {
-        const t = mem.trim(u8, ctx_line, " \t\r");
-        for (range_guard_pats) |pat| {
-            if (mem.indexOf(u8, t, pat) != null) return;
-        }
-        if (mem.indexOf(u8, t, "== 0") != null and mem.indexOf(u8, t, "return") != null) return;
-    }
-
-    try ctx.issues.append(ctx.allocator, .{
-        .file = ctx.path,
-        .line = ctx.line_num,
-        .col = range_pos + 2 + sub_in_range + 1,
-        .severity = .warning,
-        .rule = RULE_SUBTRACTION_OVERFLOW,
-        .message = "subtraction in range may cause overflow if minuend < subtrahend",
-        .help = "ensure range bounds are valid, or add bounds checking",
-    });
-}
-
-/// Check for subtraction that may overflow (ZA902)
-fn checkSubtractionOverflow(ctx: PanicScanCtx) !void {
-    var i: usize = 0;
-    while (i < ctx.t.len) : (i += 1) {
-        if (ctx.t[i] != '[') continue;
-        const end = findMatchingBracket(ctx.t, i) orelse continue;
-        const found = try checkBracketSubtraction(ctx, i, end);
-        if (found) return;
-        i = end;
-    }
-    try checkRangeSubtraction(ctx);
-}
-
-/// Scan one file's lines for panic-pattern violations (ZA901/ZA902)
-fn scanFilePanicPatterns(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    file_path: []const u8,
-    content: []const u8,
-) !void {
-    var line_num: usize = 1;
-    var lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer lines_list.deinit(allocator);
-
-    // Collect all lines for context
-    var lines = mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        try lines_list.append(allocator, line);
-    }
-
-    const context_lines = lines_list.items;
-    for (context_lines, 0..) |line, idx| {
-        defer line_num += 1;
-        const t = mem.trim(u8, line, " \t\r");
-
-        // Skip comments
-        if (isCommentOrMultilineString(t)) continue;
-
-        // Skip test blocks (intentional panic testing is common)
-        if (mem.indexOf(u8, t, "testing.expect") != null) continue;
-
-        const pctx: PanicScanCtx = .{
-            .allocator = allocator,
-            .issues = issues,
-            .path = file_path,
-            .t = t,
-            .line_num = line_num,
-            .context_lines = context_lines,
-            .current_idx = idx,
-        };
-        try checkDecrementWithoutGuard(pctx);
-        try checkSubtractionOverflow(pctx);
-    }
-}
-
-/// ZA9xx: Detect potential panic/overflow patterns
-fn analyzePanicPatterns(
-    allocator: Allocator,
-    graph: *ImportGraph,
-) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    var iter = graph.files.iterator();
-
-    while (iter.next()) |entry| {
-        try scanFilePanicPatterns(allocator, &issues, entry.key_ptr.*, entry.value_ptr.content);
-    }
-
-    return issues;
 }
 
 // ============================================================================
@@ -18782,7 +18515,7 @@ fn writeDefaultConfig() !void {
         \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long,
         \\  //                     ZA703 naming
         \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
-        \\  //   ZA9xx Panic:      ZA901 decrement-overflow, ZA902 subtraction-overflow,
+        \\  //   ZA9xx Panic:      ZA901 decrement-overflow,
         \\  //                     ZA903 index-arithmetic,
         \\  //                     ZA904 intcast-no-bounds (note, OFF by default)
         \\  //   ZT1xx Tests:      ZT101 lie-test (name promises fn body never calls),
@@ -20504,7 +20237,7 @@ fn printHelp() void {
         \\                     ZA209: useless-error-return (note),
         \\                     ZA210: no-catch-return (note, off by default))
         \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap, ZA802: unsafe-deref)
-        \\  ZA9xx  Panic      (ZA901: decrement-no-guard, ZA902: subtraction-overflow,
+        \\  ZA9xx  Panic      (ZA901: decrement-no-guard,
         \\                     ZA903: index-arithmetic,
         \\                     ZA904: intcast-no-bounds (note, off by default))
         \\  ZA3xx  Complexity (ZA301: func-too-long, ZA302: nesting-too-deep,

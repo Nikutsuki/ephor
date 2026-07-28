@@ -2976,6 +2976,33 @@ fn hasExclusiveBranchBetween(
     return false;
 }
 
+/// Indent-aware exclusivity guard for use-after-free (EPH-I0010): true when a
+/// `=>` arm header in the free..use span sits at an indent no deeper than
+/// both statements — i.e. the two sit in mutually exclusive switch arms.
+/// Mirror of ZA106's hasSwitchArmBetween discipline. Arm headers nested
+/// DEEPER than either statement do not separate them: switch-expression arms
+/// (F1) and a switch whose join precedes the use (F2) are not exclusive
+/// regions. Textual and fail-open toward reporting: a switch that merely
+/// sits between free and use at a shallow-enough indent also suppresses
+/// (accepted FN — same class as hasSwitchArmBetween's documented hole).
+fn hasExclusiveArmBetween(
+    lines: []const []const u8,
+    func_line: usize,
+    free_line: usize,
+    use_line: usize,
+) bool {
+    if (free_line < func_line or use_line <= free_line) return false;
+    const free_idx = free_line - func_line;
+    const use_idx = use_line - func_line;
+    if (free_idx >= lines.len or use_idx >= lines.len) return false;
+    const min_indent = @min(countIndent(lines[free_idx]), countIndent(lines[use_idx]));
+    return hasSwitchArmBetween(lines, func_line, .{
+        .first = free_line,
+        .second = use_line,
+        .min_indent = min_indent,
+    });
+}
+
 fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], vn)) |rel| {
@@ -3103,6 +3130,11 @@ fn checkLineForUAF(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !
     const lines = ctx.scan.lines;
     if (hasReassignmentBetween(lines, ctx.scan.func_line, range, ctx.scan.var_name))
         return;
+    // Sibling switch arms are mutually exclusive: a free in one arm never
+    // executed on the path through another (indent-aware mirror of ZA106's
+    // hasSwitchArmBetween discipline — EPH-I0010 F1/F2).
+    if (hasExclusiveArmBetween(lines, ctx.scan.func_line, freed, actual_line))
+        return;
     try appendUAFIssue(ctx, ctx.scan.var_name, actual_line, use_col);
 }
 
@@ -3115,7 +3147,16 @@ fn checkSameBlockUAF(
 ) !bool {
     const sbf = checkSameBlockFree(&ctx.scan, block_start, actual_line);
     if (!sbf.freed or sbf.intervening_return) return false;
-    try appendUAFIssue(ctx, ctx.scan.var_name, actual_line, use_col);
+    // Inline switch arms share one CFG block: a free in a sibling arm never
+    // executed on the use's path (indent-aware per hasExclusiveArmBetween).
+    if (!hasExclusiveArmBetween(
+        ctx.scan.lines,
+        ctx.scan.func_line,
+        ctx.scan.alloc_info.freed_line,
+        actual_line,
+    )) {
+        try appendUAFIssue(ctx, ctx.scan.var_name, actual_line, use_col);
+    }
     return true;
 }
 
@@ -3156,6 +3197,11 @@ fn reportAliasUAF(ctx: *const FreeScanCtx, alias_name: []const u8, freed_line: u
         // Alias's own declaration line is skipped by isUAFSkipLine
         if (isUAFSkipLine(t, alias_name, ctx.scan.aliases)) continue;
         const use_col = findVarUseOnLine(t, alias_name) orelse continue;
+        // Use in an arm mutually exclusive with the free's arm is not
+        // reachable after the free — keep scanning for a genuine later use.
+        // Indent-aware: a use after the switch join is in no arm (F2).
+        if (hasExclusiveArmBetween(ctx.scan.lines, ctx.scan.func_line, freed_line, actual_line))
+            continue;
         try appendUAFIssue(ctx, alias_name, actual_line, use_col);
         break; // One UAF per alias is sufficient
     }
@@ -21616,6 +21662,236 @@ test "ZA105: free then reassign then use stays silent" {
         "test_free_reassign.zig",
         RULE_USE_AFTER_FREE,
     ) == 0);
+}
+
+test "ZA105: free and use in different switch arms stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Sibling switch arms are mutually exclusive: on the .b path the free
+    // in .a never executed (mirror of the ZA106 switch-arm guard).
+    const content =
+        \\fn switch_sibling(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (kind) {
+        \\        .a => allocator.free(buf),
+        \\        .b => use(buf),
+        \\    }
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_switch_arms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_switch_arms.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: free and use in different braced switch arms stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn switch_braced(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (kind) {
+        \\        .a => {
+        \\            allocator.free(buf);
+        \\        },
+        \\        .b => {
+        \\            _ = buf[0];
+        \\        },
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_braced_arms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_braced_arms.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: use after free in the same switch arm fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Free and use inside one arm: genuinely reachable, must stay loud.
+    const content =
+        \\fn same_arm(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (kind) {
+        \\        .a => {
+        \\            allocator.free(buf);
+        \\            _ = buf.len;
+        \\        },
+        \\        .b => {},
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_same_arm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_same_arm.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: free then use in a later sequential block fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Unconditional free dominates the use: no exclusive branch between
+    // them, so the exclusivity guard must not over-suppress.
+    const content =
+        \\fn sequential_use(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\            _ = buf.len;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_sequential.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_sequential.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: free root in one switch arm then use alias in sibling arm stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Alias path has the same FP class: the alias use sits in an arm
+    // mutually exclusive with the arm that freed the root.
+    const content =
+        \\fn alias_switch(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    switch (kind) {
+        \\        .a => allocator.free(buf),
+        \\        .b => use(a),
+        \\    }
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_alias_arm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_alias_arm.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: switch expression between free and use still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A switch EXPRESSION creates no branch exclusivity: its `=>` tokens sit
+    // on continuation lines deeper than the free/use statements and must not
+    // suppress a genuine UAF (EPH-I0010 F1).
+    const content =
+        \\fn switch_expr_use(allocator: std.mem.Allocator, x: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    const y = switch (x) {
+        \\        1 => 10,
+        \\        else => 20,
+        \\    };
+        \\    _ = y;
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_switch_expr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_switch_expr.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: alias use after a switch that frees on one arm still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free runs on the .a path only; the alias use sits AFTER the switch
+    // join, not in a sibling arm — genuine UAF on the .a path (EPH-I0010 F2).
+    const content =
+        \\fn alias_post_switch(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    switch (kind) {
+        \\        .a => allocator.free(buf),
+        \\        .b => {},
+        \\    }
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_alias_post.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_alias_post.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: free on both if and else arms then use still fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every path frees, so the post-join use is UAF: `} else` is not an arm
+    // header and must not suppress (locks the indent-aware guard's TP).
+    const content =
+        \\fn both_arms_free(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_both_arms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_both_arms.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
 }
 
 test "ZA106: defer free plus direct free is a double-free" {

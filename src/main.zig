@@ -1794,7 +1794,32 @@ fn isConditionalStart(check_line: []const u8) bool {
         mem.startsWith(u8, check_line, "else{");
 }
 
+/// Column just past the declaration `=` on a `var`/`const` line, or null
+/// when the line has no initializer. The declaration `=` is the first
+/// standalone `=` at bracket depth 0: type annotations carry `=` only
+/// inside brackets/parens, so a depth count plus `==` guards suffice.
+fn declInitializerStart(t: []const u8) ?usize {
+    var depth: usize = 0;
+    for (t, 0..) |c, i| {
+        if (c == '(' or c == '[' or c == '{') depth += 1;
+        if (c == ')' or c == ']' or c == '}') depth -|= 1;
+        if (c != '=' or depth != 0) continue;
+        if (i > 0 and t[i - 1] == '=') continue; // second char of ==
+        if (i + 1 < t.len and t[i + 1] == '=') continue; // first char of ==
+        return i + 1;
+    }
+    return null;
+}
+
 fn isRealUseOfVar(check_line: []const u8, name: []const u8) bool {
+    // Decl lines: the LHS name is the declaration, not a read — only RHS
+    // occurrences after the `=` read the var (EPH-I0101).
+    if (mem.startsWith(u8, check_line, "var ") or
+        mem.startsWith(u8, check_line, "const "))
+    {
+        const rhs = declInitializerStart(check_line) orelse return false;
+        return firstVarReadPos(check_line[rhs..], name) != null;
+    }
     const pos = mem.indexOf(u8, check_line, name) orelse return false;
     const end_pos = pos + name.len;
     const is_word = (pos == 0 or !isIdent(check_line[pos - 1])) and
@@ -1804,8 +1829,6 @@ fn isRealUseOfVar(check_line: []const u8, name: []const u8) bool {
         mem.eql(u8, check_line[end_pos .. end_pos + 4], ".len")) return false;
     if (isFillPattern(check_line, name)) return false;
     if (isAssignmentTarget(check_line, name, pos)) return false;
-    if (mem.startsWith(u8, check_line, "var ")) return false;
-    if (mem.startsWith(u8, check_line, "const ")) return false;
     return true;
 }
 
@@ -1837,21 +1860,80 @@ fn classifyFillLine(check_line: []const u8, name: []const u8) FillVerdict {
     return if (is_self_read) .self_read_use else .fill;
 }
 
+/// Pending state for a multi-line fill statement: the fill must not win
+/// before its statement completes — a continuation line can still read the
+/// var before the terminating `;` (EPH-I0103).
+const FillScan = struct {
+    depth: usize = 0,
+    mode: QuoteMode = .none,
+    active: bool = false,
+
+    /// Handle a `.fill` verdict's first line: true when the fill wins
+    /// immediately (the statement terminates on this line, or the line is
+    /// a loop header — loop fills stay header-granular). Otherwise the
+    /// scan goes pending and `step` classifies the continuation lines.
+    fn start(self: *FillScan, check_line: []const u8) bool {
+        if (isLoopStart(check_line)) return true;
+        self.depth = 0;
+        self.mode = .none;
+        if (scanLineForStatementEnd(check_line, 0, &self.depth, &self.mode) != null)
+            return true;
+        self.active = true;
+        return false;
+    }
+
+    /// Verdict for one continuation line of a pending fill, or null while
+    /// the statement continues: false when a genuine read of the var
+    /// precedes the terminating `;` (the read observes the pre-fill
+    /// value), true when the `;` is reached with no read inside.
+    fn step(self: *FillScan, check_line: []const u8, name: []const u8) ?bool {
+        if (isCommentOrMultilineString(check_line)) return null;
+        const read_col = firstVarReadPos(check_line, name);
+        const end_col = scanLineForStatementEnd(check_line, 0, &self.depth, &self.mode);
+        if (end_col) |ec| {
+            if (read_col) |rc| {
+                if (rc < ec) return false;
+            }
+            return true;
+        }
+        if (read_col != null) return false;
+        return null;
+    }
+
+    /// Fill verdict for a line outside any pending fill: null when the
+    /// line decides nothing, false on a top-level self-read use, true on
+    /// an unconditional fill whose statement completes on this line.
+    fn classifyLine(
+        self: *FillScan,
+        check_line: []const u8,
+        name: []const u8,
+        nesting_depth: usize,
+    ) ?bool {
+        if (nesting_depth != 0 and !isLoopStart(check_line)) return null;
+        return switch (classifyFillLine(check_line, name)) {
+            .not_fill => null,
+            .self_read_use => if (nesting_depth == 0) false else null,
+            .fill => if (self.start(check_line)) true else null,
+        };
+    }
+};
+
 fn hasUnconditionalFillBeforeUse(
     lines: []const []const u8,
     start_idx: usize,
     name: []const u8,
 ) bool {
     var nesting_depth: usize = 0;
+    var scan: FillScan = .{};
     for (start_idx..lines.len) |check_idx| {
         const check_line = mem.trim(u8, lines[check_idx], " \t\r");
+        if (scan.active) {
+            if (scan.step(check_line, name)) |verdict| return verdict;
+            continue;
+        }
         if (isConditionalStart(check_line)) nesting_depth += 1;
         nesting_depth = countCloseBraces(check_line, nesting_depth);
-        if (nesting_depth == 0 or isLoopStart(check_line)) {
-            const verdict = classifyFillLine(check_line, name);
-            if (verdict == .fill) return true;
-            if (verdict == .self_read_use and nesting_depth == 0) return false;
-        }
+        if (scan.classifyLine(check_line, name, nesting_depth)) |verdict| return verdict;
         if (isRealUseOfVar(check_line, name) and nesting_depth == 0) return false;
         if (mem.startsWith(u8, check_line, "return ")) break;
         if (mem.eql(u8, check_line, "}")) break;
@@ -3277,10 +3359,12 @@ fn isOrShortCircuitSafe(
 
 /// Check whether a plain `var_name = ...` statement unconditionally executes
 /// before the read on every path that reaches it: the assignment line starts
-/// with the bare name, it is nested no deeper than the read (the read may
-/// sit deeper inside the assignment's scope), and no intervening line
-/// closes the assignment's scope (a close would mean the assignment sat in
-/// a sibling conditional block).
+/// with the bare name, its statement terminates before the read line (a
+/// continuation-line read inside a multi-line assignment observes the
+/// pre-assignment value — EPH-I0103), it is nested no deeper than the read
+/// (the read may sit deeper inside the assignment's scope), and no
+/// intervening line closes the assignment's scope (a close would mean the
+/// assignment sat in a sibling conditional block).
 ///
 /// The pos-0 bare-name shortcut predates the B-series CFG work: same-line
 /// guard ifs (`if (x) y = 1;`) keep the assignment mid-line, but a
@@ -3303,10 +3387,14 @@ fn hasDominatingScopeAssignment(
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         // isDirectAssignment does not verify the name at pos 0, so the
-        // caller must establish it (with a word boundary) first.
+        // caller must establish it (with a word boundary) first. The
+        // statement must also terminate before the read line — a read on a
+        // continuation line of the assignment itself is not covered
+        // (EPH-I0103).
         if (mem.startsWith(u8, t, var_name) and
             (t.len == var_name.len or !isIdent(t[var_name.len])) and
-            isDirectAssignment(t, var_name, 0))
+            isDirectAssignment(t, var_name, 0) and
+            statementEffectPos(lines, i, 0).line < read_idx)
         {
             assign_depth = depth;
             min_since = depth;
@@ -29312,6 +29400,246 @@ test "ZA607: same-line read before assignment is detected" {
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_sameline_bad.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: var-decl RHS read of undefined var is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0101: isRealUseOfVar bailed on var/const lines, so the RHS read
+    // in `var y: u32 = x;` never counted as a use and the later `x = 1;`
+    // dropped x from tracking before the read side ran.
+    const content =
+        \\fn declRhsRead() u32 {
+        \\    var x: u32 = undefined;
+        \\    var y: u32 = x;
+        \\    x = 1;
+        \\    _ = y;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_decl_rhs.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_decl_rhs.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: undefined decl without reads is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The LHS name on a decl line is the declaration, not a read — a bare
+    // `= undefined` decl must not count as a use of itself (EPH-I0101).
+    const content =
+        \\fn declOnly() u32 {
+        \\    var x: u32 = undefined;
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_decl_alone.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_decl_alone.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: initialized var read on decl RHS is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // x is definitely assigned at declaration, so the decl-RHS read in
+    // `var y: u32 = x;` is covered (EPH-I0101).
+    const content =
+        \\fn declRhsInitialized() u32 {
+        \\    var x: u32 = 0;
+        \\    var y: u32 = x;
+        \\    _ = y;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_decl_init.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_decl_init.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: field read on decl RHS does not count as local read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `foo.x` reads foo's field, not the local x — the decl-RHS use check
+    // must keep the leading-dot boundary guard (EPH-I0101).
+    const content =
+        \\fn declRhsField(foo: anytype) u32 {
+        \\    var x: u32 = undefined;
+        \\    var y = foo.x;
+        \\    x = 1;
+        \\    _ = y;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_decl_field.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_decl_field.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line assignment continuation self-read is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0103: the first line of a multi-line fill won immediately, so x
+    // left tracking before the read side saw the continuation-line read.
+    const content =
+        \\fn compute(v: u32) u32 {
+        \\    return v + 1;
+        \\}
+        \\fn continuationSelfRead() u32 {
+        \\    var x: u32 = undefined;
+        \\    x = compute(
+        \\        x,
+        \\    );
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_ml_cont.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ml_cont.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: conditional multi-line self-read is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0103 lock: the conditional variant fires on the path that skips
+    // the branch (block splitting) and must keep firing.
+    const content =
+        \\fn compute(v: u32) u32 {
+        \\    return v + 1;
+        \\}
+        \\fn conditionalContinuation(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = compute(
+        \\            x,
+        \\        );
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_ml_cond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ml_cond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: first-line self-read of multi-line assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0103 lock: the first-line self-read fires via the EPH-I0080
+    // classifyFillLine fix and must keep firing.
+    const content =
+        \\fn compute(v: u32) u32 {
+        \\    return v + 1;
+        \\}
+        \\fn firstLineSelfRead() u32 {
+        \\    var x: u32 = undefined;
+        \\    x = compute(x,
+        \\        1,
+        \\    );
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_ml_first.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ml_first.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line fill without self-read is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The continuation reads only the DEFINED y — the fill of x completes
+    // with no read of x inside and must still win (EPH-I0103).
+    const content =
+        \\fn compute(v: u32) u32 {
+        \\    return v + 1;
+        \\}
+        \\fn noContinuationRead() u32 {
+        \\    var x: u32 = undefined;
+        \\    var y: u32 = 1;
+        \\    x = compute(
+        \\        y,
+        \\    );
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_ml_noread.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_ml_noread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: read after multi-line fill completes is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The read in `use(x)` follows the statement-terminating `;`, so it
+    // observes the assigned value — the fill still wins (EPH-I0103).
+    const content =
+        \\fn compute(v: u32) u32 {
+        \\    return v + 1;
+        \\}
+        \\fn readAfterStatement() u32 {
+        \\    var x: u32 = undefined;
+        \\    x = compute(
+        \\        1,
+        \\    ); use(x);
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_ml_after.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_ml_after.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

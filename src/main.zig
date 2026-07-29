@@ -1822,6 +1822,21 @@ fn isLoopStart(check_line: []const u8) bool {
         mem.startsWith(u8, check_line, "for ");
 }
 
+/// What a candidate fill line means for fill-before-use: a direct
+/// assignment that also reads the var (`x = x + 1;`) uses the old value
+/// before the write completes — a use, not a fill (EPH-I0080).
+/// Builtin/method fills (whose destination occurrences look like reads)
+/// keep the historical fill-wins behavior, and so do slice reads
+/// (`const d = buf[0..n];`), which hasDirectFill counts as fills.
+const FillVerdict = enum { not_fill, fill, self_read_use };
+
+fn classifyFillLine(check_line: []const u8, name: []const u8) FillVerdict {
+    if (!isFillPattern(check_line, name)) return .not_fill;
+    const is_self_read = findAssignmentOccurrence(check_line, name) != null and
+        firstVarReadPos(check_line, name) != null;
+    return if (is_self_read) .self_read_use else .fill;
+}
+
 fn hasUnconditionalFillBeforeUse(
     lines: []const []const u8,
     start_idx: usize,
@@ -1833,7 +1848,9 @@ fn hasUnconditionalFillBeforeUse(
         if (isConditionalStart(check_line)) nesting_depth += 1;
         nesting_depth = countCloseBraces(check_line, nesting_depth);
         if (nesting_depth == 0 or isLoopStart(check_line)) {
-            if (isFillPattern(check_line, name)) return true;
+            const verdict = classifyFillLine(check_line, name);
+            if (verdict == .fill) return true;
+            if (verdict == .self_read_use and nesting_depth == 0) return false;
         }
         if (isRealUseOfVar(check_line, name) and nesting_depth == 0) return false;
         if (mem.startsWith(u8, check_line, "return ")) break;
@@ -1842,21 +1859,135 @@ fn hasUnconditionalFillBeforeUse(
     return false;
 }
 
+/// Point where an assignment takes effect: the character just past the
+/// statement-terminating `;`. A read before this point observes the value
+/// from BEFORE the assignment; a read at or after it observes the new value.
+const AssignEffect = struct {
+    line: usize, // index into the function-body lines
+    col: usize, // column within the trimmed line
+};
+
+/// Sentinel for "no assignment in this block" — never covers a read.
+const no_assign_effect: AssignEffect = .{
+    .line = std.math.maxInt(usize),
+    .col = 0,
+};
+
+/// Earliest of two assignment-effect points (line-major order).
+fn minAssignEffect(a: AssignEffect, b: AssignEffect) AssignEffect {
+    if (b.line != a.line) return if (b.line < a.line) b else a;
+    return if (b.col < a.col) b else a;
+}
+
+/// True when an assignment taking effect at `effect` completes at or before
+/// the read at (idx, col) — i.e. the read observes the assigned value.
+fn effectCoversRead(effect: AssignEffect, idx: usize, col: usize) bool {
+    if (effect.line != idx) return effect.line < idx;
+    return effect.col <= col;
+}
+
+/// Scan one trimmed line for the statement-terminating `;`, starting at
+/// column `start`. Returns the column just past a depth-0 `;`, or null when
+/// the statement continues past this line. Bracket depth and quote mode
+/// carry across lines through the pointers.
+fn scanLineForStatementEnd(
+    t: []const u8,
+    start: usize,
+    depth: *usize,
+    mode: *QuoteMode,
+) ?usize {
+    var i: usize = start;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (mode.* != .none) continue;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
+        if (c == '(' or c == '[' or c == '{') depth.* += 1;
+        if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
+        if (c == ';' and depth.* == 0) return i + 1;
+    }
+    return null;
+}
+
+/// Scan forward from (start_idx, start_col) for the `;` that terminates the
+/// statement. Multi-line statements (`x = create(\n ... \n);`) end at the
+/// `;` on the LAST line, so a read inside the statement's own span is not
+/// covered. Falls back to the no-assignment sentinel when no `;` is found;
+/// effectCoversRead then reports uncovered rather than guessing.
+fn statementEffectPos(
+    lines: []const []const u8,
+    start_idx: usize,
+    start_col: usize,
+) AssignEffect {
+    var depth: usize = 0;
+    var mode: QuoteMode = .none;
+    var idx = start_idx;
+    while (idx < lines.len) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const start: usize = if (idx == start_idx) start_col else 0;
+        const col = scanLineForStatementEnd(t, start, &depth, &mode) orelse continue;
+        return .{ .line = idx, .col = col };
+    }
+    return no_assign_effect;
+}
+
+/// Column of the first occurrence of var_name that is a direct assignment
+/// target (`x = ...`, `x.field = ...`, `x[i] = ...`), or null. Word
+/// boundaries and a leading-dot guard keep `box =` and `foo.x =` from
+/// matching. Fill-style writes (x.init(), @memset(&x, ...), fill(&x)) are
+/// not targets — callers fall back to the statement start for those.
+fn findAssignmentOccurrence(t: []const u8, var_name: []const u8) ?usize {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        // The match must be the variable itself: not mid-identifier
+        // (box =) and not a field of another var (foo.x =).
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos > 0 and t[pos - 1] == '.') continue;
+        if (pos + var_name.len < t.len and
+            isIdent(t[pos + var_name.len])) continue;
+        if (isAssignmentTarget(t, var_name, pos)) return pos;
+    }
+    return null;
+}
+
+/// Record a loop-carried fill: the loop-header block gens the var, covered
+/// from the header's first line — the fill replays every iteration, so the
+/// whole header block observes the assigned value.
+fn genLoopFill(
+    gen: []bool,
+    first_effect: []AssignEffect,
+    bid: usize,
+    start_idx: usize,
+) void {
+    gen[bid] = true;
+    const header_effect: AssignEffect = .{ .line = start_idx, .col = 0 };
+    first_effect[bid] = minAssignEffect(first_effect[bid], header_effect);
+}
+
 /// Compute gen set: which blocks assign a variable (includes loop fill patterns)
 /// State for tracking for-loop scope during gen-set computation
 const ForLoopTracker = struct {
     in_loop: bool = false,
     start_bid: ?usize = null,
+    start_idx: usize = 0,
 
     fn checkForStart(
         self: *ForLoopTracker,
         t: []const u8,
         cfg: *ControlFlowGraph,
         line: usize,
+        idx: usize,
     ) void {
         if (mem.startsWith(u8, t, "for ") or mem.startsWith(u8, t, "for(")) {
             self.in_loop = true;
             self.start_bid = findBlockForLine(cfg, line);
+            self.start_idx = idx;
         }
     }
 
@@ -1875,6 +2006,7 @@ const ForLoopTracker = struct {
         t: []const u8,
         var_name: []const u8,
         gen: []bool,
+        first_effect: []AssignEffect,
     ) void {
         if (!self.in_loop) return;
         var s: usize = 0;
@@ -1889,13 +2021,13 @@ const ForLoopTracker = struct {
             if (end_pos >= t.len) return;
             // Pattern: var_name[...] = (direct indexed assignment)
             if (t[end_pos] == '[') {
-                if (self.start_bid) |bid| gen[bid] = true;
+                if (self.start_bid) |bid| genLoopFill(gen, first_effect, bid, self.start_idx);
                 return;
             }
             // Pattern: var_name.field[...] = (field access + indexed)
             // Handles: result.v[col].v[row] = sum
             if (t[end_pos] == '.' and isAssignmentTarget(t, var_name, pos)) {
-                if (self.start_bid) |bid| gen[bid] = true;
+                if (self.start_bid) |bid| genLoopFill(gen, first_effect, bid, self.start_idx);
                 return;
             }
         }
@@ -1912,20 +2044,40 @@ const DefAssignCtx = struct {
     num_blocks: usize,
 };
 
+/// Per-block assignment facts for one variable: the block-granular gen bits
+/// the worklist transfer needs (a block assigning the var anywhere has it
+/// assigned at exit), plus the earliest point per block where an assignment
+/// takes effect. The read side uses the effect point so a same-block read
+/// textually BEFORE the assignment (`x = x + 1`, `y = x; x = 1;`) is not
+/// covered (EPH-I0080).
+const GenSets = struct {
+    gen: []bool,
+    first_effect: []AssignEffect,
+
+    fn deinit(self: *GenSets, allocator: Allocator) void {
+        allocator.free(self.gen);
+        allocator.free(self.first_effect);
+    }
+};
+
+/// Compute gen set: which blocks assign a variable (includes loop fill patterns)
 fn computeGenSetForVar(
     ctx: *const DefAssignCtx,
     var_name: []const u8,
-) ![]bool {
+) !GenSets {
     const gen = try ctx.allocator.alloc(bool, ctx.num_blocks);
     errdefer ctx.allocator.free(gen);
     @memset(gen, false);
+    const first_effect = try ctx.allocator.alloc(AssignEffect, ctx.num_blocks);
+    errdefer ctx.allocator.free(first_effect);
+    @memset(first_effect, no_assign_effect);
 
     var tracker = ForLoopTracker{};
     for (ctx.lines, 0..) |line, idx| {
         const actual_line = ctx.func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
-        tracker.checkForStart(t, ctx.cfg, actual_line);
-        tracker.checkIndexedAssign(t, var_name, gen);
+        tracker.checkForStart(t, ctx.cfg, actual_line, idx);
+        tracker.checkIndexedAssign(t, var_name, gen, first_effect);
         tracker.checkLoopEnd(t);
 
         // isAssignmentTarget slices at pos without verifying the name is
@@ -1933,14 +2085,25 @@ fn computeGenSetForVar(
         const is_direct_assign = mem.startsWith(u8, t, var_name) and
             (t.len == var_name.len or !isIdent(t[var_name.len])) and
             isAssignmentTarget(t, var_name, 0);
-        if (is_direct_assign or isFillPattern(t, var_name)) {
-            if (findBlockForLine(ctx.cfg, actual_line)) |bid| gen[bid] = true;
-        }
-        if (hasAddressOfVar(t, var_name)) {
-            if (findBlockForLine(ctx.cfg, actual_line)) |bid| gen[bid] = true;
-        }
+        const assigns_var = is_direct_assign or
+            isFillPattern(t, var_name) or
+            hasAddressOfVar(t, var_name);
+        if (!assigns_var) continue;
+        const bid = findBlockForLine(ctx.cfg, actual_line) orelse continue;
+        gen[bid] = true;
+        // Direct assignments take effect at their own `;` — a same-block
+        // read before that point is not covered (EPH-I0080). Fill-style
+        // patterns (@memset, x.init, fill(&x)) and `x[...]` slice
+        // occurrences — which hasDirectFill counts as fills even when they
+        // are reads — keep the historical whole-line coverage; tightening
+        // those is a separate detection change.
+        const effect = if (findAssignmentOccurrence(t, var_name)) |occ_col|
+            statementEffectPos(ctx.lines, idx, occ_col)
+        else
+            AssignEffect{ .line = idx, .col = 0 };
+        first_effect[bid] = minAssignEffect(first_effect[bid], effect);
     }
-    return gen;
+    return .{ .gen = gen, .first_effect = first_effect };
 }
 
 /// Check if a line takes the address of a variable (&var_name)
@@ -2415,11 +2578,11 @@ fn checkVarDefiniteAssignment(
     @memset(def_entry, false);
     @memset(def_exit, false);
 
-    const gen = try computeGenSetForVar(ctx, var_name);
-    defer ctx.allocator.free(gen);
+    var gen_sets = try computeGenSetForVar(ctx, var_name);
+    defer gen_sets.deinit(ctx.allocator);
 
     runDefiniteAssignmentWorklist(ctx.cfg, .{
-        .gen = gen,
+        .gen = gen_sets.gen,
         .def_entry = def_entry,
         .def_exit = def_exit,
         .num_blocks = ctx.num_blocks,
@@ -2430,8 +2593,12 @@ fn checkVarDefiniteAssignment(
         if (al <= var_line) continue;
         const t = mem.trim(u8, line, " \t\r");
         const bid = findBlockForLine(ctx.cfg, al) orelse continue;
-        if (def_entry[bid] or gen[bid]) continue;
-        if (!hasVarRead(t, var_name)) continue;
+        if (def_entry[bid]) continue;
+        const read_col = firstVarReadPos(t, var_name) orelse continue;
+        // A same-block assignment covers this read only when it takes effect
+        // at or before the read position — block-granular gen hid reads that
+        // precede the assignment (`x = x + 1`, `y = x; x = 1;`) (EPH-I0080).
+        if (effectCoversRead(gen_sets.first_effect[bid], idx, read_col)) continue;
         // Check if the read is inside a correlated guard: the same if-condition
         // that gates the read also gates an earlier assignment of the variable.
         if (isCorrelatedGuardRead(ctx.lines, idx, var_name)) continue;
@@ -3193,10 +3360,12 @@ fn computeBlockEntry(
     return if (has_pred) result else false;
 }
 
-/// Check if line reads a variable (not just assigns)
-fn hasVarRead(t: []const u8, var_name: []const u8) bool {
+/// Column of the first genuine read of var_name on the line, or null when
+/// every occurrence is an assignment target, a `.`-field access, a `.len`
+/// compile-time property, inside a string, or inside a comment.
+fn firstVarReadPos(t: []const u8, var_name: []const u8) ?usize {
     // Skip comment and multiline string lines entirely
-    if (isCommentOrMultilineString(t)) return false;
+    if (isCommentOrMultilineString(t)) return null;
 
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
@@ -3220,9 +3389,14 @@ fn hasVarRead(t: []const u8, var_name: []const u8) bool {
         if (end_i + 4 <= t.len and mem.eql(u8, t[end_i .. end_i + 4], ".len")) continue;
 
         // Check it's not an assignment target
-        if (!isAssignmentTarget(t, var_name, i)) return true;
+        if (!isAssignmentTarget(t, var_name, i)) return i;
     }
-    return false;
+    return null;
+}
+
+/// Check if line reads a variable (not just assigns)
+fn hasVarRead(t: []const u8, var_name: []const u8) bool {
+    return firstVarReadPos(t, var_name) != null;
 }
 
 // ============================================================================
@@ -28866,15 +29040,23 @@ test "ZA607: null-guard correlation keeps same-line second-occurrence assignment
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // EPH-I0098: the first same-line occurrence of x is a call arg; the
-    // genuine assignment follows it, so the correlation must still suppress.
+    // EPH-I0098: the correlation's assignment search must scan every
+    // same-line occurrence — the leading-dot `foo.x` is a field of another
+    // var (neither a read nor an assignment of local x), and the genuine
+    // `x = 2` follows it on the same line.
+    // EPH-I0080: the original first occurrence `use(x)` was itself a genuine
+    // read of x BEFORE the same-line assignment — line-order-aware gen now
+    // reports that shape (see "same-line read before assignment"), so this
+    // test uses a non-read first occurrence instead. The call-arg
+    // occurrence-loop case stays covered by the isVarAssignedNearby unit
+    // test above.
     const content =
         \\fn nullGuardSecondOccurrence(cond: bool) u32 {
         \\    var guard: ?u32 = null;
         \\    var x: u32 = undefined;
         \\    if (cond) {
         \\        guard = 1;
-        \\        use(x); x = 1;
+        \\        foo.x = 1; x = 2;
         \\    }
         \\    if (guard) |_| {
         \\        return x;
@@ -28977,6 +29159,159 @@ test "ZA607: switch prong read of assigned var stays silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_prong_neg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: self-assignment RHS read of undefined var is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0080: gen was block-granular, so the assignment on `x = x + 1;`
+    // covered its own RHS read. The assignment takes effect at its `;` —
+    // the RHS read happens before that and must be reported.
+    const content =
+        \\fn selfReadUndefined() u32 {
+        \\    var x: u32 = undefined;
+        \\    x = x + 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_self_rhs.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_self_rhs.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-block assignment before read is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Line-order-aware gen must keep covering reads that come AFTER an
+    // assignment in the same block (no over-firing, EPH-I0080).
+    const content =
+        \\fn assignThenReadSameBlock(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    var y: u32 = 0;
+        \\    if (c) {
+        \\        x = 1;
+        \\        y = x;
+        \\    }
+        \\    return y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_block_order_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_block_order_ok.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-block read before assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `y = x;` read precedes the `x = 1;` assignment in the same block;
+    // block-granular gen masked it (EPH-I0080).
+    const content =
+        \\fn readThenAssignSameBlock(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    var y: u32 = 0;
+        \\    if (c) {
+        \\        y = x;
+        \\        x = 1;
+        \\    }
+        \\    return y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_block_order_bad.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_block_order_bad.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: initialized var self-assignment is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `var x: u32 = 0;` is definitely assigned at declaration, so the
+    // self-read on `x = x + 1;` must not be reported (EPH-I0080).
+    const content =
+        \\fn selfReadInitialized() u32 {
+        \\    var x: u32 = 0;
+        \\    x = x + 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_self_init.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_self_init.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line assignment before read is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The assignment takes effect at its `;`, so the later same-line read
+    // in `use(x)` IS covered — line-granular strict ordering would
+    // false-positive here (EPH-I0080).
+    const content =
+        \\fn sameLineAssignThenRead(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1; use(x);
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_sameline_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_sameline_ok.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line read before assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `use(x)` reads x before the same-line `x = 1;` takes effect — the
+    // shape the old null-guard second-occurrence test silently relied on
+    // (EPH-I0080 surfaces it as the genuine read-before-write it is).
+    const content =
+        \\fn sameLineReadThenAssign(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        use(x); x = 1;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_sameline_bad.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_sameline_bad.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

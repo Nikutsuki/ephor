@@ -103,7 +103,7 @@ var global_io: ?std.Io = null;
 /// assert on the resulting state instead of on the printed text.
 var cli_diagnostics_enabled = true;
 
-/// Errno-style detail for error.invalid_fail_on_value out of config parsing:
+/// Errno-style detail for error.InvalidFailOnValue out of config parsing:
 /// the parse layer cannot know which ephor.json it is reading, so it stashes
 /// the offending value here and the catch-site (which knows the path) prints.
 /// Slice into the config content — valid until that caller frees it.
@@ -178,6 +178,7 @@ const RULE_THREAD_NO_JOIN = types.RULE_THREAD_NO_JOIN;
 
 const Severity = types.Severity;
 const FailOn = types.FailOn;
+const ErrorNaming = types.ErrorNaming;
 
 // Output format (not in types.zig - specific to CLI)
 const OutputFormat = types.OutputFormat;
@@ -13917,6 +13918,9 @@ const NamingLineCtx = struct {
     path: []const u8,
     t: []const u8 = "",
     line_num: usize = 0,
+    // ZA703 error-name convention for this run. Defaults to TitleCase so
+    // non-error naming checks (const/var/fn) need not set it.
+    error_naming: ErrorNaming = .title_case,
 };
 
 fn reportNamingIssue(
@@ -13950,6 +13954,19 @@ fn skipStringLiteral(t: []const u8, start: usize) usize {
         i += 1;
     }
     return if (i < t.len) i + 1 else i;
+}
+
+/// Index where a `//` line comment begins (outside string literals), or
+/// t.len when the line has none. `error.` text at or past it is prose,
+/// not a reference — same data-not-syntax rule as string literals.
+fn lineCommentStart(t: []const u8) usize {
+    var in_str = false;
+    var i: usize = 0;
+    while (i + 1 < t.len) : (i += 1) {
+        if (t[i] == '"' and !isEscapedQuote(t, i)) in_str = !in_str;
+        if (!in_str and t[i] == '/' and t[i + 1] == '/') return i;
+    }
+    return t.len;
 }
 
 /// A naming violation to report (bundled to keep param counts legal).
@@ -14127,21 +14144,25 @@ fn checkFnNaming(ctx: NamingLineCtx) !void {
     }
 }
 
-/// Check error value (`error.MyError`) and error set member naming.
-/// Error values are not types; the style guide says "Otherwise, x should be snake_case."
+/// Check error value (`error.MyError`) and error set member naming against
+/// the configured convention (ZA703; default TitleCase, the community
+/// standard — the stdlib itself declares TitleCase error names).
 fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
     try checkErrorValueNames(ctx);
     if (!in_error_block) return;
     try checkErrorSetMemberNames(ctx);
 }
 
-/// Scan one line's `error.Name` value references, reporting non-snake_case
-/// names. Std-lib and `_`-prefixed names are exempt by convention.
+/// Scan one line's `error.Name` value references, reporting names that
+/// violate the configured convention. Std-lib and `_`-prefixed names are
+/// exempt by convention.
 fn checkErrorValueNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
+    // Trailing-comment text is prose, not a reference (same rule as strings).
+    const limit = lineCommentStart(t);
     var pos: usize = 0;
     while (pos < t.len) {
-        const err_pos = mem.indexOfPos(u8, t, pos, "error.") orelse break;
+        const err_pos = mem.indexOfPos(u8, t[0..limit], pos, "error.") orelse break;
         // `error.` must be a standalone keyword, not part of a larger identifier.
         if (err_pos > 0 and isIdent(t[err_pos - 1])) {
             pos = err_pos + 6;
@@ -14163,11 +14184,11 @@ fn checkErrorValueNames(ctx: NamingLineCtx) !void {
             pos = end;
             continue;
         }
-        if (!isSnakeCase(name)) try reportNaming(ctx, .{
+        if (!errorNameMatchesMode(ctx.error_naming, name)) try reportNaming(ctx, .{
             .col = err_pos + 7,
             .kind = "error value",
             .name = name,
-            .expected = "snake_case",
+            .expected = ctx.error_naming.str(),
         });
         pos = end;
     }
@@ -14186,13 +14207,16 @@ fn errorSetBodyStart(t: []const u8) usize {
     return 0;
 }
 
-/// Advance past trivia between error-set members (whitespace, braces, string
-/// literals). Returns the next member candidate index, or null when the walk
-/// must stop: at a line comment, at end of line, or at `||` — error-set
-/// composition identifiers reference other error sets, not members of this
-/// one. Accepted trade-off: also stops before a second inline error set on
-/// the same line (`error{ a } || error{ BadMember }`), a near-nonexistent idiom.
-fn skipErrorSetTrivia(t: []const u8, start: usize) ?usize {
+/// Advance past trivia between error-set members (whitespace, string
+/// literals). Tracks set depth via `depth` (caller's scan starts one set
+/// deep): a `}` that closes the set returns null — anything past it
+/// (return types, function bodies) is not a member. Also returns null when
+/// the walk must stop: at a line comment, at end of line, or at `||` —
+/// error-set composition identifiers reference other error sets, not
+/// members of this one. Accepted trade-off: also stops before a second
+/// inline error set on the same line (`error{ a } || error{ BadMember }`),
+/// a near-nonexistent idiom.
+fn skipErrorSetTrivia(t: []const u8, start: usize, depth: *usize) ?usize {
     var i = start;
     while (i < t.len) {
         while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
@@ -14203,8 +14227,15 @@ fn skipErrorSetTrivia(t: []const u8, start: usize) ?usize {
             i = skipStringLiteral(t, i);
             continue;
         }
-        if (t[i] == '{' or t[i] == '}') {
+        if (t[i] == '{') {
+            depth.* += 1;
             i += 1;
+            continue;
+        }
+        if (t[i] == '}') {
+            depth.* -= 1;
+            i += 1;
+            if (depth.* == 0) return null;
             continue;
         }
         return i;
@@ -14212,13 +14243,19 @@ fn skipErrorSetTrivia(t: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Check error set members on this line for snake_case (caller guarantees the
-/// line is inside an error block). Std-lib and `_`-prefixed names are exempt.
+/// Check error set members on this line against the configured convention
+/// (caller guarantees the line is inside an error block). Std-lib and
+/// `_`-prefixed names are exempt.
 fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     var i: usize = errorSetBodyStart(t);
+    // errorSetBodyStart lands just past the opening `error{` (or at 0 on a
+    // continuation line) — either way the scan starts one set deep. The walk
+    // stops at the `}` that closes the set so trailing return types and
+    // bodies (`error{ A }!void`) are never mistaken for members.
+    var depth: usize = 1;
     while (i < t.len) {
-        const member_start = skipErrorSetTrivia(t, i) orelse break;
+        const member_start = skipErrorSetTrivia(t, i, &depth) orelse break;
         var end = member_start;
         while (end < t.len and isIdent(t[end])) end += 1;
         if (end <= member_start) {
@@ -14230,11 +14267,11 @@ fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
             i = skipOptionalComma(t, end);
             continue;
         }
-        if (!isSnakeCase(name)) try reportNaming(ctx, .{
+        if (!errorNameMatchesMode(ctx.error_naming, name)) try reportNaming(ctx, .{
             .col = member_start + 1,
             .kind = "error set member",
             .name = name,
-            .expected = "snake_case",
+            .expected = ctx.error_naming.str(),
         });
         i = skipOptionalComma(t, end);
     }
@@ -14317,12 +14354,13 @@ fn trackErrorBlockDepth(t: []const u8, depth: *usize) void {
 fn analyzeNaming(
     allocator: Allocator,
     graph: *ImportGraph,
+    error_naming: ErrorNaming,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
-        try analyzeNamingFile(&issues, allocator, entry.value_ptr.*);
+        try analyzeNamingFile(&issues, allocator, entry.value_ptr.*, error_naming);
     }
     return issues;
 }
@@ -14334,6 +14372,7 @@ fn analyzeNamingFile(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
     a: FileAnalysis,
+    error_naming: ErrorNaming,
 ) !void {
     const content = a.content;
     var line_num: usize = 1;
@@ -14343,6 +14382,7 @@ fn analyzeNamingFile(
         .issues = issues,
         .allocator = allocator,
         .path = a.path,
+        .error_naming = error_naming,
     };
 
     while (line_start <= content.len) {
@@ -14412,6 +14452,14 @@ fn isSnakeCase(name: []const u8) bool {
         }
     }
     return true;
+}
+
+/// Does `name` satisfy the configured error-naming convention (ZA703)?
+fn errorNameMatchesMode(mode: ErrorNaming, name: []const u8) bool {
+    return switch (mode) {
+        .title_case => isTitleCase(name),
+        .snake_case => isSnakeCase(name),
+    };
 }
 
 /// Check if name is SCREAMING_CASE: all uppercase with underscores
@@ -19227,6 +19275,9 @@ const Config = struct {
     // Config "fail_on" is more specific than config "strict"; CLI always wins.
     fail_on: FailOn = .never,
     fail_on_source: FailOnSource = .unset,
+    // ZA703 error-name convention. Absent config key = TitleCase (the
+    // community standard); "snake_case" restores the pre-flip behavior.
+    error_naming: ErrorNaming = .title_case,
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -19304,7 +19355,7 @@ const CONFIG_FILENAME = "ephor.json";
 /// Report a config parse failure. The CI-gate key error is hard (propagated
 /// to the caller as a usage error); every other parse error warns + continues.
 fn reportConfigParseError(err: anyerror, path: []const u8) !void {
-    if (err != error.invalid_fail_on_value) {
+    if (err != error.InvalidFailOnValue) {
         std.debug.print("warning: failed to parse {s}: {}\n", .{ path, err });
         return;
     }
@@ -19525,7 +19576,28 @@ fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
         return parseThresholdsObject(content, start, &cfg.thresholds);
     }
     if (try parseFailOnConfigKey(ctx, start, key)) |end| return end;
+    if (parseErrorNamingConfigKey(ctx, start, key)) |end| return end;
     return skipJsonValue(content, start);
+}
+
+/// Handle the "error_naming" config key (null if not that key). Unlike
+/// fail_on, an unknown value is warn-and-default, not a hard error: a
+/// misspelled style preference must not abort the run (same policy as
+/// reportConfigParseError for non-gate keys).
+fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) ?usize {
+    const content = ctx.content;
+    if (!mem.eql(u8, key, "error_naming") or content[start] != '"') return null;
+    const result = parseJsonString(content, start);
+    const mode = ErrorNaming.fromString(result.val) orelse {
+        cliDiag(
+            "warning: {s}: unknown error_naming '{s}' " ++
+                "(expected: TitleCase, PascalCase, snake_case) — using TitleCase\n",
+            .{ CONFIG_FILENAME, result.val },
+        );
+        return result.end;
+    };
+    ctx.cfg.error_naming = mode;
+    return result.end;
 }
 
 /// Handle the "strict"/"fail_on" CI-gate config keys (null if not one of them).
@@ -19545,7 +19617,7 @@ fn parseFailOnConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?us
         // unparseable CI gate must never fail open (same policy as a bad
         // --fail-on CLI value). The catch-site prints path + value.
         last_bad_fail_on = result.val;
-        return error.invalid_fail_on_value;
+        return error.InvalidFailOnValue;
     };
     setFailOn(cfg, level, .fail_on_key);
     return result.end;
@@ -19672,6 +19744,10 @@ fn writeDefaultConfig() !void {
         \\  // CI gating: exit 1 when findings reach the level (default: informational)
         \\  // "strict": true        — fail on any warning or error
         \\  // "fail_on": "warning"  — finer control: error, warning, note, never
+        \\
+        \\  // Error naming convention for ZA703 (default: TitleCase, the
+        \\  // community standard — error.FileNotFound; "PascalCase" is an alias)
+        \\  // "error_naming": "snake_case"  — pre-flip behavior (error.file_not_found)
         \\
         \\  // Configurable thresholds
         \\  "thresholds": {
@@ -20042,7 +20118,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
 
     const insert_after = findBuildZigInsertionPoint(line_list.items) orelse {
         std.debug.print("Could not find insertion point in build.zig\n", .{});
-        return error.no_insertion_point;
+        return error.NoInsertionPoint;
     };
 
     var new_content: std.ArrayListUnmanaged(u8) = .empty;
@@ -21286,7 +21362,7 @@ fn parseFailOnArg(arg: []const u8, cfg: *Config) !bool {
             "error: invalid --fail-on value '{s}' (expected: error, warning, note, never)\n",
             .{arg[10..]},
         );
-        return error.invalid_fail_on_value;
+        return error.InvalidFailOnValue;
     };
     setFailOn(cfg, level, .cli);
     return true;
@@ -21469,6 +21545,7 @@ fn printHelp() void {
         \\    "enable": ["ZA702"],
         \\    "strict": true,
         \\    "fail_on": "warning",
+        \\    "error_naming": "TitleCase",
         \\    "thresholds": {
         \\      "max_lines": 50,
         \\      "max_nesting": 3,
@@ -22367,7 +22444,7 @@ pub fn main(init: std.process.Init) !void {
                 var style_issues = try analyzeStyle(alloc, &g, cfg.thresholds);
                 defer deinitIssues(&style_issues, alloc);
 
-                var naming_issues = try analyzeNaming(alloc, &g);
+                var naming_issues = try analyzeNaming(alloc, &g, cfg.error_naming);
                 defer deinitIssues(&naming_issues, alloc);
 
                 // Test quality (ZT1xx): vacuous tests, trivially-true assertions
@@ -26307,7 +26384,7 @@ test "analyzeNaming: error{ in comments and strings does not open an error block
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_errblock.zig"), {});
 
-    var issues = try analyzeNaming(allocator, &graph);
+    var issues = try analyzeNaming(allocator, &graph, .snake_case);
     defer deinitIssues(&issues, allocator);
 
     // Only the genuine member of the real error set is flagged.
@@ -26558,7 +26635,7 @@ test "IgnoreCache matches isInlineDisabled on every (line, rule) pair" {
                         "isInlineDisabled={} cache={}\n",
                     .{ fixture_idx, line_num, rule, want, got },
                 );
-                return error.ignore_cache_mismatch;
+                return error.IgnoreCacheMismatch;
             }
         }
     }
@@ -29756,6 +29833,7 @@ test "checkErrorNaming: snake_case error values pass" {
         .path = "test.zig",
         .t = "return error.file_not_found;",
         .line_num = 1,
+        .error_naming = .snake_case,
     }, false);
     try checkErrorNaming(.{
         .issues = &issues,
@@ -29763,6 +29841,7 @@ test "checkErrorNaming: snake_case error values pass" {
         .path = "test.zig",
         .t = "return error.out_of_memory;",
         .line_num = 1,
+        .error_naming = .snake_case,
     }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
@@ -29781,6 +29860,7 @@ test "checkErrorNaming: CamelCase error values are flagged" {
         .path = "test.zig",
         .t = "return error.MyCustomFailure;",
         .line_num = 1,
+        .error_naming = .snake_case,
     }, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
@@ -29804,6 +29884,7 @@ test "checkErrorNaming: error set members must be snake_case" {
         .path = "test.zig",
         .t = "error{ NotSnakeCase, access_denied }",
         .line_num = 1,
+        .error_naming = .snake_case,
     }, true);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
@@ -29827,6 +29908,7 @@ test "checkErrorNaming: std-lib error names are exempt" {
         .path = "test.zig",
         .t = oom_line,
         .line_num = 1,
+        .error_naming = .snake_case,
     }, false);
     try checkErrorNaming(.{
         .issues = &issues,
@@ -29834,6 +29916,7 @@ test "checkErrorNaming: std-lib error names are exempt" {
         .path = "test.zig",
         .t = "error.OutOfMemory => continue,",
         .line_num = 2,
+        .error_naming = .snake_case,
     }, false);
     try checkErrorNaming(.{
         .issues = &issues,
@@ -29841,6 +29924,7 @@ test "checkErrorNaming: std-lib error names are exempt" {
         .path = "test.zig",
         .t = "    OutOfMemory,",
         .line_num = 3,
+        .error_naming = .snake_case,
     }, true);
     try checkErrorNaming(.{
         .issues = &issues,
@@ -29848,6 +29932,7 @@ test "checkErrorNaming: std-lib error names are exempt" {
         .path = "test.zig",
         .t = "return error.FileNotFound;",
         .line_num = 4,
+        .error_naming = .snake_case,
     }, false);
     try checkErrorNaming(.{
         .issues = &issues,
@@ -29855,6 +29940,7 @@ test "checkErrorNaming: std-lib error names are exempt" {
         .path = "test.zig",
         .t = "return error.my_project_error;",
         .line_num = 5,
+        .error_naming = .snake_case,
     }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
@@ -29873,6 +29959,7 @@ test "checkErrorNaming: non-std TitleCase error values are still flagged" {
         .path = "test.zig",
         .t = "return error.TotallyMadeUp;",
         .line_num = 1,
+        .error_naming = .snake_case,
     }, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
@@ -29896,6 +29983,7 @@ test "checkErrorNaming: error set composition stops at ||" {
         .path = "test.zig",
         .t = composed,
         .line_num = 1,
+        .error_naming = .snake_case,
     }, true);
     try checkErrorNaming(.{
         .issues = &issues,
@@ -29903,8 +29991,173 @@ test "checkErrorNaming: error set composition stops at ||" {
         .path = "test.zig",
         .t = "} || rlp.Error || Allocator.Error;",
         .line_num = 2,
+        .error_naming = .snake_case,
     }, true);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkErrorNaming: TitleCase mode flags snake_case error values" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.my_project_error;",
+        .line_num = 1,
+        .error_naming = .title_case,
+    }, false);
+    // TitleCase names pass in TitleCase mode.
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.MyProjectError;",
+        .line_num = 2,
+        .error_naming = .title_case,
+    }, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "error value 'my_project_error' should be TitleCase",
+        issues.items[0].message,
+    );
+}
+
+test "checkErrorNaming: TitleCase mode flags snake_case error set members" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error{ my_member, also_bad, WellFormed }",
+        .line_num = 1,
+        .error_naming = .title_case,
+    }, true);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "error set member 'my_member' should be TitleCase",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "error set member 'also_bad' should be TitleCase",
+        issues.items[1].message,
+    );
+}
+
+test "checkErrorNaming: member scan stops at the set's closing brace" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // Return-type tokens after `}` are not members (zls signature style).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = ") error{ Canceled, OutOfMemory }!?struct { std.Io.File, []const u8 } {",
+        .line_num = 1,
+        .error_naming = .title_case,
+    }, true);
+    // snake_case mode: post-close TitleCase type tokens must not fire either.
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const f = error{ foo }!std.Io.File;",
+        .line_num = 2,
+        .error_naming = .snake_case,
+    }, true);
+    // Multi-line sets: the closing line's `}!void` carries no members.
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "}!void;",
+        .line_num = 3,
+        .error_naming = .title_case,
+    }, true);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkErrorNaming: TitleCase mode exempts std-lib and underscore names" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    const lines = [_][]const u8{
+        "return error.OutOfMemory;",
+        "return error.FileNotFound;",
+        "return error._private_failure;",
+    };
+    for (lines, 1..) |line, n| {
+        try checkErrorNaming(.{
+            .issues = &issues,
+            .allocator = a,
+            .path = "test.zig",
+            .t = line,
+            .line_num = n,
+            .error_naming = .title_case,
+        }, false);
+    }
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error{ OutOfMemory, _internal, WellFormed }",
+        .line_num = 4,
+        .error_naming = .title_case,
+    }, true);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: TitleCase default flags snake_case error names in files" {
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const code =
+        \\const ProjectError = error{ bad_member, GoodMember };
+        \\fn fail() ProjectError!void {
+        \\    return error.bad_member;
+        \\}
+        \\fn ok() ProjectError!void {
+        \\    return error.GoodMember;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_title.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_title.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    // Exactly the two snake_case names fire: the member and the value.
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "error set member 'bad_member' should be TitleCase",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "error value 'bad_member' should be TitleCase",
+        issues.items[1].message,
+    );
 }
 
 test "checkFnNaming: extern declarations are exempt" {
@@ -30003,6 +30256,48 @@ test "checkErrorNaming: does not flag error. inside string literal" {
         .line_num = 1,
     }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkErrorNaming: does not flag error. in a trailing line comment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // Comment prose is data in BOTH modes (title_case would flag the
+    // snake_case mention without comment-awareness).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const x = 1; // returns error.not_a_reference",
+        .line_num = 1,
+        .error_naming = .title_case,
+    }, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const x = 1; // returns error.AlsoNotAReference",
+        .line_num = 2,
+        .error_naming = .snake_case,
+    }, false);
+    // A `//` inside a string is not a comment: real code after it is checked.
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const u = \"http://a//b\"; return error.real_bad;",
+        .line_num = 3,
+        .error_naming = .title_case,
+    }, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "error value 'real_bad' should be TitleCase",
+        issues.items[0].message,
+    );
 }
 
 test "resolveReturnKind resolves struct method returns" {
@@ -39975,6 +40270,36 @@ test "config fail_on parses the level" {
     try std.testing.expectEqual(FailOn.note, cfg.fail_on);
 }
 
+test "config error_naming defaults to TitleCase when absent" {
+    const cfg = testConfig();
+    try std.testing.expectEqual(ErrorNaming.title_case, cfg.error_naming);
+}
+
+test "config error_naming parses snake_case" {
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"snake_case\"}", &cfg);
+    try std.testing.expectEqual(ErrorNaming.snake_case, cfg.error_naming);
+}
+
+test "config error_naming parses TitleCase and the PascalCase alias" {
+    var cfg_title = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"TitleCase\"}", &cfg_title);
+    try std.testing.expectEqual(ErrorNaming.title_case, cfg_title.error_naming);
+
+    var cfg_pascal = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"PascalCase\"}", &cfg_pascal);
+    try std.testing.expectEqual(ErrorNaming.title_case, cfg_pascal.error_naming);
+}
+
+test "config error_naming unknown value warns and keeps the default" {
+    // Mute the warning print: zig's test runner surfaces stderr as failure.
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    var cfg = testConfig();
+    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"kebab-case\"}", &cfg);
+    try std.testing.expectEqual(ErrorNaming.title_case, cfg.error_naming);
+}
+
 test "config fail_on beats strict regardless of key order" {
     var cfg_late = testConfig();
     try parseConfigJson(
@@ -39996,7 +40321,7 @@ test "config fail_on beats strict regardless of key order" {
 test "config invalid fail_on is a hard usage error" {
     var cfg = testConfig();
     try std.testing.expectError(
-        error.invalid_fail_on_value,
+        error.InvalidFailOnValue,
         parseConfigJson(std.testing.allocator, "{\"fail_on\": \"warn\"}", &cfg),
     );
     // fail closed: the rejected key must not leave a gate half-configured
@@ -40035,7 +40360,7 @@ test "CLI invalid --fail-on value is a hard usage error" {
     var cfg = testConfig();
     var cli_entries = false;
     try std.testing.expectError(
-        error.invalid_fail_on_value,
+        error.InvalidFailOnValue,
         parseCliArg(std.testing.allocator, "--fail-on=warn", &cfg, &cli_entries),
     );
     // fail closed: the rejected flag must not leave a gate half-configured

@@ -181,6 +181,7 @@ Example config:
   "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
   "disable": ["ZA301"],
   "enable": ["ZA702"],
+  "error_naming": "TitleCase",
   "thresholds": {
     "max_lines": 50,
     "max_nesting": 3,
@@ -205,6 +206,7 @@ Example config:
 | `enable` | Rule IDs to enable (overrides disable) |
 | `strict` | `true` to exit 1 when any warning/error is found (CI gate) |
 | `fail_on` | Finer CI gate: `error`, `warning`, `note`, `never` (overrides `strict`) |
+| `error_naming` | ZA703 convention for error values and error set members: `TitleCase` (default; `PascalCase` accepted as an alias) or `snake_case` |
 | `thresholds` | Complexity and style thresholds |
 
 ## Rule IDs
@@ -319,10 +321,12 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | Constants (`const`) | `snake_case` | `const max_size = 1024;` |
 | Type aliases (`const`) | `TitleCase` | `const Allocator = std.mem.Allocator;` |
 | Function aliases (`const`) | `camelCase` | `const eql = std.mem.eql;` |
-| Error values (`error.foo`) | `snake_case` | `return error.file_not_found;` |
-| Error set members | `snake_case` | `error{ file_not_found }` |
+| Error values (`error.Foo`) | `TitleCase` | `return error.FileNotFound;` |
+| Error set members | `TitleCase` | `error{ FileNotFound }` |
 | Imports | (not checked) | `const std = @import("std");` |
 | Names starting with `_` | (exempt) | `fn _helper() void {}` |
+
+**Error naming:** `TitleCase` is the default because the stdlib and virtually all community code declare TitleCase error names (the pre-0.14.4 ZA703 default of `snake_case` produced false positives on idiomatic Zig). Set `"error_naming": "snake_case"` in `ephor.json` to keep the old behavior.
 
 **ZA703 exemptions:** std-lib error names (`error.OutOfMemory`, `error.FileNotFound`, …) are exempt — project code cannot rename them. `extern fn` declarations are exempt — their names are ABI-fixed (`export fn` names are NOT exempt — they are project-chosen identifiers). Identifiers on the right-hand side of error-set composition (`error{ a, b } || other.Error`) are references to other error sets, not members, and are not checked. Variables are judged by declaration kind: `var` is always `snake_case`, even when its value is a function reference.
 
@@ -1059,6 +1063,15 @@ Ephor uses three testing layers:
 ## Changelog
 
 ### v0.14.3 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (2026-07-28)
+
+**Changed (ZA703 default flip):** Error values and error set members now
+default to `TitleCase` (`error.FileNotFound`), matching the stdlib and
+virtually all community code — the old `snake_case` default false-positived
+on idiomatic Zig (Codeberg issue #1, EPH-I0092). Set
+`"error_naming": "snake_case"` in `ephor.json` to keep the old behavior;
+`"PascalCase"` is accepted as an alias for `TitleCase`. Unknown values warn
+and fall back to the default. `error.Name` text inside trailing `//`
+comments is no longer scanned (prose, not a reference).
 
 **Changed (migration required):** Inline-ignore directives are now anchored —
 only plain `//` comments whose first token is `ephor:ignore` /

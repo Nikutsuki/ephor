@@ -160,6 +160,34 @@ pub const FailOn = enum {
 };
 
 // ============================================================================
+// Error Naming Convention (ZA703)
+// ============================================================================
+
+/// Which convention ZA703 enforces for error values and error set members.
+/// The stdlib and virtually all community code use TitleCase error names, so
+/// that is the default; snake_case preserves the pre-flip ZA703 behavior for
+/// projects that adopted it.
+pub const ErrorNaming = enum {
+    title_case, // error.FileNotFound (default, community standard)
+    snake_case, // error.file_not_found (pre-flip ZA703 default)
+
+    pub fn str(self: ErrorNaming) []const u8 {
+        return switch (self) {
+            .title_case => "TitleCase",
+            .snake_case => "snake_case",
+        };
+    }
+
+    /// "PascalCase" is accepted as an alias for TitleCase (common spelling).
+    pub fn fromString(s: []const u8) ?ErrorNaming {
+        if (std.mem.eql(u8, s, "TitleCase")) return .title_case;
+        if (std.mem.eql(u8, s, "PascalCase")) return .title_case;
+        if (std.mem.eql(u8, s, "snake_case")) return .snake_case;
+        return null;
+    }
+};
+
+// ============================================================================
 // Core Types
 // ============================================================================
 

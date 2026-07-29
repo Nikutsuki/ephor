@@ -2609,10 +2609,17 @@ fn isVarAssignedNearby(
     for (start..end) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (mem.indexOf(u8, t, var_name)) |vpos| {
-            if (vpos > 0 and isIdent(t[vpos - 1])) continue;
-            if (vpos + var_name.len < t.len and isIdent(t[vpos + var_name.len])) continue;
-            if (isAssignmentTarget(t, var_name, vpos)) return true;
+        var s: usize = 0;
+        while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+            const pos = s + rel;
+            s = pos + var_name.len;
+            // The match must be the variable itself: not mid-identifier
+            // (box =) and not a field of another var (foo.x =).
+            if (pos > 0 and isIdent(t[pos - 1])) continue;
+            if (pos > 0 and t[pos - 1] == '.') continue;
+            if (pos + var_name.len < t.len and
+                isIdent(t[pos + var_name.len])) continue;
+            if (isAssignmentTarget(t, var_name, pos)) return true;
         }
     }
     return false;
@@ -28805,6 +28812,82 @@ test "ZA607: correlated guard with genuine assignment stays silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_corr_neg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "isVarAssignedNearby scans every occurrence with word boundaries" {
+    // EPH-I0098: the first same-line occurrence may be a call arg (foo(x))
+    // while the genuine assignment follows it; `foo.x =` is a field of
+    // another var and `box =` a longer identifier — neither assigns x.
+    const second = [_][]const u8{"foo(x); x = 1;"};
+    try std.testing.expect(isVarAssignedNearby(&second, 0, "x", 10));
+    const plain = [_][]const u8{"x = 1;"};
+    try std.testing.expect(isVarAssignedNearby(&plain, 0, "x", 10));
+    const field = [_][]const u8{"foo.x = 1;"};
+    try std.testing.expect(!isVarAssignedNearby(&field, 0, "x", 10));
+    const longer = [_][]const u8{"box = 1;"};
+    try std.testing.expect(!isVarAssignedNearby(&longer, 0, "x", 10));
+    const cmp = [_][]const u8{"if (x == 1)"};
+    try std.testing.expect(!isVarAssignedNearby(&cmp, 0, "x", 10));
+}
+
+test "ZA607: null-guard correlation not suppressed by other-var field assignment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0098: `foo.x = 1` assigns a field of foo, not local x — the
+    // null-guard correlation must not count it as an x assignment.
+    const content =
+        \\fn nullGuardFieldAssign(cond: bool) u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        guard = 1;
+        \\        foo.x = 1;
+        \\    }
+        \\    if (guard) |_| {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_nullguard_field.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nullguard_field.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: null-guard correlation keeps same-line second-occurrence assignment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0098: the first same-line occurrence of x is a call arg; the
+    // genuine assignment follows it, so the correlation must still suppress.
+    const content =
+        \\fn nullGuardSecondOccurrence(cond: bool) u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        guard = 1;
+        \\        use(x); x = 1;
+        \\    }
+        \\    if (guard) |_| {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_nullguard_second.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_nullguard_second.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

@@ -289,6 +289,13 @@ const StackEntry = struct {
     pending_brace: bool = false,
 };
 
+/// True for loop stack entries (`while`/`for`): their `else` runs from the
+/// condition-false exit and their close wires a loop-back edge, both unlike
+/// the if/else merge fall-through (EPH-I0086).
+fn isLoopBlock(bt: BlockType) bool {
+    return bt == .while_block or bt == .for_block;
+}
+
 /// Control Flow Graph for a single function
 const ControlFlowGraph = struct {
     allocator: Allocator,
@@ -769,9 +776,9 @@ const CFGBuildCtx = struct {
     // consumed by walkLineEvents before the next. Owned by buildCFG (same
     // pattern as brace_stack).
     event_scratch: *std.ArrayListUnmanaged(ControlEvent),
-    // Deferred if_block/else_block close: the entry popped by a `}` whose
-    // else has not arrived yet. The next non-comment line either claims it
-    // (handleElse) or finishPendingElse wires the no-else merge.
+    // Deferred if/else/loop close: the entry popped by a `}` whose else
+    // has not arrived yet. The next non-comment line either claims it
+    // (handleElse) or finishPendingElse wires the no-else close.
     pending_else: ?StackEntry = null,
     // Set by scanLineBraces when the line's virtual body is a `return`;
     // consumed by the walk at the matching close_virtual.
@@ -1074,7 +1081,8 @@ const CFGBuildCtx = struct {
     /// Entry for handleElse: a deferred close (lone `}` on an earlier line)
     /// claims its saved entry; a same-line `} else` pops the entry directly
     /// (pending_else is null there by construction — a close event precedes
-    /// the else keyword).
+    /// the else keyword). The entry may be a loop entry in both cases
+    /// (EPH-I0086).
     fn takeElseEntry(self: *CFGBuildCtx) ?StackEntry {
         if (self.pending_else) |entry| {
             self.pending_else = null;
@@ -1088,7 +1096,16 @@ const CFGBuildCtx = struct {
         const entry = self.takeElseEntry() orelse return;
         const else_block = entry.merge_block;
         const merge_block = try self.cfg.addBlock();
-        try self.cfg.addEdge(self.current_block, merge_block, .sequential);
+        if (isLoopBlock(entry.block_type)) {
+            // A loop's else runs when the condition goes false, so the else
+            // body IS the loop's false exit and the body loops back — it
+            // never falls through to the post-else merge. The close was
+            // skipped or deferred, so the loop-back is wired here
+            // (EPH-I0086). break/continue stay unmodeled (EPH-I0094).
+            try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
+        } else {
+            try self.cfg.addEdge(self.current_block, merge_block, .sequential);
+        }
         if (hasInlineElseReturn(t)) {
             self.cfg.blocks.items[else_block].start_line = line;
             self.cfg.blocks.items[else_block].end_line = line;
@@ -1136,15 +1153,17 @@ const CFGBuildCtx = struct {
         }
     }
 
-    /// Close the top entry; an if_block/else_block close defers its merge
-    /// wiring into pending_else so a next-line else can still claim the
-    /// entry (the double-pop fix; else_if chains defer every link).
-    /// Everything else closes immediately.
+    /// Close the top entry; an if/else close defers its merge wiring into
+    /// pending_else so a next-line else can still claim the entry (the
+    /// double-pop fix; else_if chains defer every link). A loop close
+    /// defers the same way so the loop's own else claims the loop entry
+    /// instead of popping the outer one (EPH-I0086). Everything else
+    /// closes immediately.
     fn handleBlockEndOrDefer(self: *CFGBuildCtx, line: usize) !void {
         const items = self.block_stack.items;
         if (items.len > 0) {
             const bt = items[items.len - 1].block_type;
-            if (bt == .if_block or bt == .else_block) {
+            if (bt == .if_block or bt == .else_block or isLoopBlock(bt)) {
                 self.pending_else = self.block_stack.pop();
                 return;
             }
@@ -1152,13 +1171,17 @@ const CFGBuildCtx = struct {
         try self.handleBlockEnd(line);
     }
 
-    /// Wire a deferred if/else close that no else claimed: the body falls
+    /// Wire a deferred close that no else claimed: an if/else body falls
     /// through to the entry's merge, mirroring handleBlockEnd's generic
-    /// branch.
+    /// branch; a loop close mirrors its loop branch (EPH-I0086).
     fn finishPendingElse(self: *CFGBuildCtx, line: usize) !void {
         const entry = self.pending_else orelse return;
         self.pending_else = null;
-        try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
+        if (isLoopBlock(entry.block_type)) {
+            try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
+        } else {
+            try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
+        }
         self.current_block = entry.merge_block;
         self.setStartLine(line);
     }
@@ -1325,6 +1348,13 @@ fn buildCFG(
         if (isCommentOrMultilineString(t)) continue;
         try ctx.processCFGLine(stripLineComment(t), func_line + idx);
     }
+
+    // A close deferred on the fn's last line has no next line to claim or
+    // finish it (a lingering brace-less loop entry popped by the fn close,
+    // pre-B2 shape) — finish it here exactly as the next line would, so
+    // the loop-back and merge wiring survive (EPH-I0086).
+    if (ctx.pending_else != null)
+        try ctx.finishPendingElse(func_line + lines.len);
 
     if (cfg.exit_blocks.items.len == 0)
         try cfg.exit_blocks.append(allocator, ctx.current_block);
@@ -27986,6 +28016,148 @@ test "buildCFG: blank line between close and else keeps the pairing" {
     try std.testing.expect(cfgHasEdge(&cfg, else_block, i_block, .sequential));
 }
 
+test "buildCFG: same-line while-else wires loop-back and claims the loop entry" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0086: the close on `} else {` is skipped for the else, so the
+    // else must wire the loop-back itself and take the LOOP entry (the
+    // else body is the condition-false exit, never the body fall-through).
+    const lines = [_][]const u8{
+        "fn f() void {", // 1
+        "    while (a) {", // 2
+        "        while (b) {", // 3
+        "            g();", // 4
+        "        } else {", // 5
+        "            h();", // 6
+        "        }", // 7
+        "        i();", // 8
+        "    }", // 9
+        "}", // 10
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const inner_header = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const inner_body = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
+    const else_body = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    const post_else = findBlockForLine(&cfg, 8) orelse return error.TestUnexpectedResult;
+    // The else body IS the inner loop's condition-false exit block.
+    try std.testing.expectEqual(
+        cfgSucc(&cfg, inner_header, .branch_false) orelse return error.TestUnexpectedResult,
+        else_body,
+    );
+    // The skipped close still loops the body back to its own header.
+    try std.testing.expect(cfgHasEdge(&cfg, inner_body, inner_header, .loop_back));
+    // The body never falls through to the post-else merge (no-break model).
+    try std.testing.expect(!cfgHasEdge(&cfg, inner_body, post_else, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_body, post_else, .sequential));
+}
+
+test "buildCFG: multi-line while-else defers the loop close for its else" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0086: a lone `}` closing a loop defers like the if form, so a
+    // next-line else claims the loop entry instead of popping the OUTER
+    // one (the bug attributed this else body to the outer loop's false
+    // block).
+    const lines = [_][]const u8{
+        "fn f() void {", // 1
+        "    while (a) {", // 2
+        "        while (b) {", // 3
+        "            g();", // 4
+        "        }", // 5
+        "        else {", // 6
+        "            h();", // 7
+        "        }", // 8
+        "        i();", // 9
+        "    }", // 10
+        "}", // 11
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const outer_header = cfg.entry_block;
+    const inner_header = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const inner_body = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
+    const else_body = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    const post_else = findBlockForLine(&cfg, 9) orelse return error.TestUnexpectedResult;
+    // The else body belongs to the INNER loop's false exit, not the outer's.
+    try std.testing.expectEqual(
+        cfgSucc(&cfg, inner_header, .branch_false) orelse return error.TestUnexpectedResult,
+        else_body,
+    );
+    try std.testing.expect(else_body !=
+        (cfgSucc(&cfg, outer_header, .branch_false) orelse return error.TestUnexpectedResult));
+    try std.testing.expect(cfgHasEdge(&cfg, inner_body, inner_header, .loop_back));
+    try std.testing.expect(cfgHasEdge(&cfg, else_body, post_else, .sequential));
+}
+
+test "buildCFG: same-line for-else claims the loop entry like while-else" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0086: for-else shares the while-else wiring.
+    const lines = [_][]const u8{
+        "fn f() void {", // 1
+        "    for (items) |it| {", // 2
+        "        g();", // 3
+        "    } else {", // 4
+        "        h();", // 5
+        "    }", // 6
+        "    i();", // 7
+        "}", // 8
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const body = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const else_body = findBlockForLine(&cfg, 5) orelse return error.TestUnexpectedResult;
+    const post_else = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        cfgSucc(&cfg, cfg.entry_block, .branch_false) orelse return error.TestUnexpectedResult,
+        else_body,
+    );
+    try std.testing.expect(cfgHasEdge(&cfg, body, cfg.entry_block, .loop_back));
+    try std.testing.expect(!cfgHasEdge(&cfg, body, post_else, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_body, post_else, .sequential));
+}
+
+test "buildCFG: while without else keeps the immediate loop close wiring" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard: the deferred loop close with no else claiming it finishes
+    // exactly like the pre-deferral immediate close (EPH-I0086).
+    const lines = [_][]const u8{
+        "fn f() void {", // 1
+        "    while (a) {", // 2
+        "        g();", // 3
+        "    }", // 4
+        "    h();", // 5
+        "}", // 6
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const body = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const merge = findBlockForLine(&cfg, 5) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        cfgSucc(&cfg, cfg.entry_block, .branch_false) orelse return error.TestUnexpectedResult,
+        merge,
+    );
+    try std.testing.expect(cfgHasEdge(&cfg, body, cfg.entry_block, .loop_back));
+}
+
 test "buildCFG: bare else-identifier line wires as a virtual else body" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -30000,6 +30172,113 @@ test "ZA607: struct literal in if branch with else fill stays silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_lit_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested while-else fill reaches the post-loop read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0086: a multi-line while-else inside an outer loop stole the
+    // outer stack entry, leaving the post-else merge reachable from the
+    // unfilled path — a false positive. With no break the else always
+    // runs, so x is definitely assigned at the read.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn nestedWhileElse(d: bool) void {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    var j: u32 = 0;
+        \\    while (j < 2) : (j += 1) {
+        \\        while (i < 3) : (i += 1) {
+        \\            if (d) {
+        \\                x = 1;
+        \\            }
+        \\        }
+        \\        else {
+        \\            x = 2;
+        \\        }
+        \\        use(x);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_while_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_while_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: while-else without else fill still flags the unfilled path" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard (EPH-I0086): the else runs but assigns nothing, so the 0-trip
+    // path leaves x unfilled — this true positive must survive the fix.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn whileElseNoFill(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < 3) : (i += 1) {
+        \\        if (c) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\    else {
+        \\        use(0);
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_while_else_nofill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_while_else_nofill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: top-level while-else fill stays silent at the read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard (EPH-I0086): the top-level shape was already silent; the fixed
+    // CFG keeps it silent (else body feeds the post-loop merge directly).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn topWhileElse(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < 3) : (i += 1) {
+        \\        if (c) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\    else {
+        \\        x = 2;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_while_else_top.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_while_else_top.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

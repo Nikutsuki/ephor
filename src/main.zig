@@ -1832,14 +1832,6 @@ fn isRealUseOfVar(check_line: []const u8, name: []const u8) bool {
     return true;
 }
 
-fn countCloseBraces(check_line: []const u8, depth: usize) usize {
-    var d = depth;
-    for (check_line) |c| {
-        if (c == '}' and d > 0) d -= 1;
-    }
-    return d;
-}
-
 fn isLoopStart(check_line: []const u8) bool {
     return mem.startsWith(u8, check_line, "while ") or
         mem.startsWith(u8, check_line, "for ");
@@ -1918,12 +1910,90 @@ const FillScan = struct {
     }
 };
 
+/// Tracks if/else nesting depth during the fill-before-use scan. A `}`
+/// closes a conditional block only when no expression brace is pending:
+/// braces in struct literals, call args, strings, and comments never move
+/// the depth (EPH-I0083, EPH-I0085).
+const CondNesting = struct {
+    depth: usize = 0, // open if/else blocks
+    pending_expr: usize = 0, // unmatched expression-position `{`
+    paren_depth: usize = 0, // unmatched ( or [ — call args span lines
+    mode: QuoteMode = .none,
+
+    /// Advance the state across one trimmed source line.
+    fn update(self: *CondNesting, check_line: []const u8) void {
+        if (isCommentOrMultilineString(check_line)) return;
+        // An if/else keyword inside a pending expression is an if-EXPRESSION
+        // (or junk): its body never contains scanned statements.
+        if (self.paren_depth == 0 and self.pending_expr == 0 and
+            isConditionalStart(check_line)) self.depth += 1;
+        const code = stripLineComment(check_line);
+        var i: usize = 0;
+        while (i < code.len) : (i += 1) {
+            if (scanQuoteStep(&self.mode, code[i])) |skip| {
+                i += skip;
+                continue;
+            }
+            if (self.mode != .none) continue;
+            self.scanChar(code, i);
+        }
+    }
+
+    /// Fold one quote-free, comment-free char into the nesting state.
+    fn scanChar(self: *CondNesting, code: []const u8, i: usize) void {
+        switch (code[i]) {
+            '(', '[' => self.paren_depth += 1,
+            ')', ']' => self.paren_depth -|= 1,
+            '{' => if (self.isExprBraceOpen(code, i)) {
+                self.pending_expr += 1;
+            },
+            '}' => self.closeBrace(),
+            else => {},
+        }
+    }
+
+    /// Close one `}`: pay off a pending expression brace first; only a
+    /// remainder closes a conditional block.
+    fn closeBrace(self: *CondNesting) void {
+        if (self.pending_expr > 0) {
+            self.pending_expr -= 1;
+            return;
+        }
+        self.depth -|= 1;
+    }
+
+    /// True when the `{` at code[i] opens an expression (struct literal,
+    /// call arg, block expression) rather than a control block. Inside
+    /// parens or a pending expression every brace is an expression brace;
+    /// otherwise the preceding non-space char decides: `.`, `=`, `,` and
+    /// friends open expressions, `)` and `|` end a control keyword's
+    /// condition or payload, and an identifier opens an expression unless
+    /// it is the `else` keyword.
+    fn isExprBraceOpen(self: *const CondNesting, code: []const u8, i: usize) bool {
+        if (self.paren_depth > 0) return true;
+        if (self.pending_expr > 0) return true;
+        var j = i;
+        while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+        if (j == 0) return false;
+        const prev = code[j - 1];
+        switch (prev) {
+            '.', '=', '(', '[', ',', '>', ':' => return true,
+            ')', '|' => return false,
+            else => {},
+        }
+        if (!isIdent(prev)) return false;
+        var start = j - 1;
+        while (start > 0 and isIdent(code[start - 1])) start -= 1;
+        return !mem.eql(u8, code[start..j], "else");
+    }
+};
+
 fn hasUnconditionalFillBeforeUse(
     lines: []const []const u8,
     start_idx: usize,
     name: []const u8,
 ) bool {
-    var nesting_depth: usize = 0;
+    var nesting: CondNesting = .{};
     var scan: FillScan = .{};
     for (start_idx..lines.len) |check_idx| {
         const check_line = mem.trim(u8, lines[check_idx], " \t\r");
@@ -1931,10 +2001,9 @@ fn hasUnconditionalFillBeforeUse(
             if (scan.step(check_line, name)) |verdict| return verdict;
             continue;
         }
-        if (isConditionalStart(check_line)) nesting_depth += 1;
-        nesting_depth = countCloseBraces(check_line, nesting_depth);
-        if (scan.classifyLine(check_line, name, nesting_depth)) |verdict| return verdict;
-        if (isRealUseOfVar(check_line, name) and nesting_depth == 0) return false;
+        nesting.update(check_line);
+        if (scan.classifyLine(check_line, name, nesting.depth)) |verdict| return verdict;
+        if (isRealUseOfVar(check_line, name) and nesting.depth == 0) return false;
         if (mem.startsWith(u8, check_line, "return ")) break;
         if (mem.eql(u8, check_line, "}")) break;
     }
@@ -15528,10 +15597,20 @@ fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
         body_offset = scanCFGSignatureLine(t, state);
         if (!state.body_started) return false;
     }
+    // String/char content and trailing comments carry no braces: a `}` in
+    // `"}"` or `// }` must not end the body early and truncate extraction.
+    const code = stripLineComment(t[body_offset..]);
+    var mode: QuoteMode = .none;
     var closed = false;
-    for (t[body_offset..]) |c| {
-        if (c == '{') state.brace_depth += 1;
-        if (c != '}') continue;
+    var i: usize = 0;
+    while (i < code.len) : (i += 1) {
+        if (scanQuoteStep(&mode, code[i])) |skip| {
+            i += skip;
+            continue;
+        }
+        if (mode != .none) continue;
+        if (code[i] == '{') state.brace_depth += 1;
+        if (code[i] != '}') continue;
         if (state.brace_depth > 0) state.brace_depth -= 1;
         if (state.brace_depth == 0) closed = true;
     }
@@ -29640,6 +29719,287 @@ test "ZA607: read after multi-line fill completes is silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_ml_after.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line struct literal in if body keeps conditional fill detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The literal's closing `};` is an expression brace: it must not pop
+    // the if block's nesting, or the conditional fill looks unconditional
+    // (EPH-I0083, EPH-I0085).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn structInIf(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        const cfg = .{
+        \\            .a = 1,
+        \\            .b = 2,
+        \\        };
+        \\        _ = cfg;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_ml.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_lit_ml.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: single-line struct literal in if body keeps conditional fill detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same FN on one line: the literal's `}` must not pop the if nesting
+    // (EPH-I0083, EPH-I0085).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn singleLineLit(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        const cfg = .{ .a = 1, .b = 2 };
+        \\        _ = cfg;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_sl.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_lit_sl.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested struct literal in if body keeps conditional fill detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every nested literal brace is an expression brace, at any depth
+    // (EPH-I0085).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn nestedLit(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        const cfg = .{
+        \\            .a = .{ .b = 1 },
+        \\        };
+        \\        _ = cfg;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_nest.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_lit_nest.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: struct literal in call args in if body keeps conditional fill detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A literal inside unclosed call parens is expression depth: its `}`
+    // must not pop the if nesting (EPH-I0085).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn take(cfg: anytype) void {
+        \\    _ = cfg;
+        \\}
+        \\fn litInArgs(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        take(.{
+        \\            .a = 1,
+        \\        });
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_args.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_lit_args.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: brace in string literal does not close conditional block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A `}` inside a string literal is content, not a block close
+    // (EPH-I0085).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn braceInString(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        const s = "}";
+        \\        _ = s;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_str.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_lit_str.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: brace in comment does not close conditional block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A `}` inside a comment is not a block close (EPH-I0085).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn braceInComment(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        // } closes nothing
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_com.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_lit_com.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: struct literal before if block keeps conditional fill detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard: the literal sits OUTSIDE the if, so it never touched the
+    // nesting — this fired before the fix and must keep firing.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn litBeforeIf(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    const cfg = .{ .a = 1, .b = 2 };
+        \\    _ = cfg;
+        \\    if (cond) {
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_before.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_lit_before.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: scalar const in if body keeps conditional fill detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard: no braces in the if body at all — fired before the fix and
+    // must keep firing.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn scalarInIf(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        const cfg: u32 = 5;
+        \\        _ = cfg;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_scalar_if.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_scalar_if.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: struct literal in if branch with else fill stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard: both branches assign, so the read is definite-assigned — the
+    // literal brace fix must not over-correct into a false positive.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn litIfElse(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        const cfg = .{
+        \\            .a = 1,
+        \\        };
+        \\        x = 1;
+        \\    } else {
+        \\        x = 2;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_lit_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_lit_else.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

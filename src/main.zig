@@ -273,6 +273,10 @@ const CFGEdge = struct {
 const BlockType = enum {
     if_block, // if-statement true branch
     else_block, // else branch
+    // else-if arm: merge_block is the chain merge and catch_origin_block is
+    // the condition-false block; an unclaimed close wires BOTH to the merge
+    // (always deferred, so handleBlockEnd never sees this type) (EPH-I0087)
+    else_if_block,
     while_block, // while loop
     for_block, // for loop
     catch_block, // catch block (error path)
@@ -478,6 +482,8 @@ const cf_patterns = [_]CFPatternEntry{
     .{ .prefix = "else if ", .exact = false, .result = .else_if },
     .{ .prefix = "else if(", .exact = false, .result = .else_if },
     .{ .prefix = "else {", .exact = true, .result = .else_start },
+    // Allman else: the body `{` sits on the next line (EPH-I0087)
+    .{ .prefix = "else", .exact = true, .result = .else_start },
     .{ .prefix = "if ", .exact = false, .result = .if_start },
     .{ .prefix = "if(", .exact = false, .result = .if_start },
     .{ .prefix = "while ", .exact = false, .result = .while_start },
@@ -824,7 +830,8 @@ const CFGBuildCtx = struct {
         if (items.len == 0) return false;
         const top = items[items.len - 1];
         if (!top.pending_brace) return false;
-        return top.block_type == .if_block or top.block_type == .else_block;
+        return top.block_type == .if_block or top.block_type == .else_block or
+            top.block_type == .else_if_block;
     }
 
     /// Classify one `{` at index i and push its kind onto the brace stack.
@@ -1094,8 +1101,12 @@ const CFGBuildCtx = struct {
 
     fn handleElse(self: *CFGBuildCtx, t: []const u8, line: usize) !void {
         const entry = self.takeElseEntry() orelse return;
-        const else_block = entry.merge_block;
-        const merge_block = try self.cfg.addBlock();
+        // An else-if entry carries the chain merge in merge_block and the
+        // condition-false block in catch_origin_block; every other entry
+        // reserves merge_block as the else body and gets a fresh merge.
+        const chained = entry.block_type == .else_if_block;
+        const else_body = if (chained) entry.catch_origin_block else entry.merge_block;
+        const merge_block = if (chained) entry.merge_block else try self.cfg.addBlock();
         if (isLoopBlock(entry.block_type)) {
             // A loop's else runs when the condition goes false, so the else
             // body IS the loop's false exit and the body loops back — it
@@ -1107,21 +1118,46 @@ const CFGBuildCtx = struct {
             try self.cfg.addEdge(self.current_block, merge_block, .sequential);
         }
         if (hasInlineElseReturn(t)) {
-            self.cfg.blocks.items[else_block].start_line = line;
-            self.cfg.blocks.items[else_block].end_line = line;
-            self.cfg.blocks.items[else_block].is_return = true;
-            try self.cfg.exit_blocks.append(self.allocator, else_block);
+            self.cfg.blocks.items[else_body].start_line = line;
+            self.cfg.blocks.items[else_body].end_line = line;
+            self.cfg.blocks.items[else_body].is_return = true;
+            try self.cfg.exit_blocks.append(self.allocator, else_body);
             self.current_block = merge_block;
             self.cfg.blocks.items[self.current_block].start_line = line + 1;
+        } else if (elseChainsIntoIf(t)) {
+            try self.openElseIfBranch(else_body, merge_block, line);
         } else {
             try self.block_stack.append(self.allocator, .{
                 .block_type = .else_block,
                 .merge_block = merge_block,
                 .catch_origin_block = 0,
             });
-            self.current_block = else_block;
+            self.current_block = else_body;
             self.setStartLine(line);
         }
+    }
+
+    /// Open an `else if (d) {` arm: the else body is the new condition's
+    /// header and branches into the arm block and the chain fallthrough, so
+    /// a fill inside the arm never counts on the fallthrough path
+    /// (EPH-I0087, EPH-I0108).
+    fn openElseIfBranch(
+        self: *CFGBuildCtx,
+        else_body: usize,
+        merge_block: usize,
+        line: usize,
+    ) !void {
+        const arm_block = try self.cfg.addBlock();
+        const fallthrough = try self.cfg.addBlock();
+        try self.cfg.addEdge(else_body, arm_block, .branch_true);
+        try self.cfg.addEdge(else_body, fallthrough, .branch_false);
+        try self.block_stack.append(self.allocator, .{
+            .block_type = .else_if_block,
+            .merge_block = merge_block,
+            .catch_origin_block = fallthrough,
+        });
+        self.current_block = arm_block;
+        self.setStartLine(line);
     }
 
     fn handleBlockEnd(self: *CFGBuildCtx, line: usize) !void {
@@ -1163,7 +1199,9 @@ const CFGBuildCtx = struct {
         const items = self.block_stack.items;
         if (items.len > 0) {
             const bt = items[items.len - 1].block_type;
-            if (bt == .if_block or bt == .else_block or isLoopBlock(bt)) {
+            if (bt == .if_block or bt == .else_block or bt == .else_if_block or
+                isLoopBlock(bt))
+            {
                 self.pending_else = self.block_stack.pop();
                 return;
             }
@@ -1173,7 +1211,9 @@ const CFGBuildCtx = struct {
 
     /// Wire a deferred close that no else claimed: an if/else body falls
     /// through to the entry's merge, mirroring handleBlockEnd's generic
-    /// branch; a loop close mirrors its loop branch (EPH-I0086).
+    /// branch; a loop close mirrors its loop branch (EPH-I0086). An else-if
+    /// close also wires the chain fallthrough: the condition-false path
+    /// reaches the merge without touching the arm (EPH-I0087).
     fn finishPendingElse(self: *CFGBuildCtx, line: usize) !void {
         const entry = self.pending_else orelse return;
         self.pending_else = null;
@@ -1181,6 +1221,9 @@ const CFGBuildCtx = struct {
             try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
         } else {
             try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
+            if (entry.block_type == .else_if_block) {
+                try self.cfg.addEdge(entry.catch_origin_block, entry.merge_block, .sequential);
+            }
         }
         self.current_block = entry.merge_block;
         self.setStartLine(line);
@@ -1311,6 +1354,18 @@ fn hasInlineElseReturn(t: []const u8) bool {
     const after_else = mem.trimStart(u8, t[else_pos + 4 ..], " \t");
     return mem.startsWith(u8, after_else, "return ") or
         mem.startsWith(u8, after_else, "return;");
+}
+
+/// True when the else on this line chains into another condition
+/// (`else if (d) {`): the else body is a new branch header, not the plain
+/// final-else block (EPH-I0087). An `else` word inside a leading string
+/// literal can hide the keyword; the line then degrades to the plain-else
+/// model, which is the safe (FN-never-FP) direction.
+fn elseChainsIntoIf(t: []const u8) bool {
+    const else_pos = mem.indexOf(u8, t, "else") orelse return false;
+    const after_else = mem.trimStart(u8, t[else_pos + 4 ..], " \t");
+    if (!mem.startsWith(u8, after_else, "if")) return false;
+    return after_else.len == 2 or !isIdent(after_else[2]);
 }
 
 fn buildCFG(
@@ -1824,6 +1879,32 @@ fn isConditionalStart(check_line: []const u8) bool {
         mem.startsWith(u8, check_line, "else{");
 }
 
+/// True when a line (or a `}`-stripped remainder) starts an `else` arm:
+/// `else`, `else {`, `else if (d) {`. An identifier char after `else`
+/// means an ordinary identifier (`elsewhere = 1;`), not the keyword.
+fn isElseBodyStart(t: []const u8) bool {
+    if (!mem.startsWith(u8, t, "else")) return false;
+    if (t.len == "else".len) return true;
+    return !isIdent(t["else".len]);
+}
+
+/// True when a line opens a conditional body for the fill-before-use scan:
+/// an `if`/`else` at line start, or an `else`/`if` after leading
+/// block-closing `}` chars. The leading `}` chars pay the depth down during
+/// the char scan; this increment re-opens it for the new arm's body, so a
+/// fill inside an else arm stays conditional instead of looking like a
+/// top-level statement (EPH-I0087, EPH-I0108).
+fn opensConditionalBody(check_line: []const u8) bool {
+    if (isConditionalStart(check_line)) return true;
+    var rest = check_line;
+    while (rest.len > 0 and rest[0] == '}') {
+        rest = mem.trimStart(u8, rest[1..], " \t");
+    }
+    if (isElseBodyStart(rest)) return true;
+    if (rest.len == check_line.len) return false;
+    return isConditionalStart(rest);
+}
+
 /// Column just past the declaration `=` on a `var`/`const` line, or null
 /// when the line has no initializer. The declaration `=` is the first
 /// standalone `=` at bracket depth 0: type annotations carry `=` only
@@ -1943,7 +2024,8 @@ const FillScan = struct {
 /// Tracks if/else nesting depth during the fill-before-use scan. A `}`
 /// closes a conditional block only when no expression brace is pending:
 /// braces in struct literals, call args, strings, and comments never move
-/// the depth (EPH-I0083, EPH-I0085).
+/// the depth (EPH-I0083, EPH-I0085). An `else` after the closing `}` of
+/// the previous arm re-opens the depth for the next arm (EPH-I0087).
 const CondNesting = struct {
     depth: usize = 0, // open if/else blocks
     pending_expr: usize = 0, // unmatched expression-position `{`
@@ -1956,7 +2038,7 @@ const CondNesting = struct {
         // An if/else keyword inside a pending expression is an if-EXPRESSION
         // (or junk): its body never contains scanned statements.
         if (self.paren_depth == 0 and self.pending_expr == 0 and
-            isConditionalStart(check_line)) self.depth += 1;
+            opensConditionalBody(check_line)) self.depth += 1;
         const code = stripLineComment(check_line);
         var i: usize = 0;
         while (i < code.len) : (i += 1) {
@@ -27969,10 +28051,16 @@ test "buildCFG: multi-line else-if chain pairs each close with its else" {
     try std.testing.expect(g_block != h_block);
     try std.testing.expect(h_block != j_block);
     try std.testing.expect(g_block != j_block);
-    // The chain branches from the entry: true body, then the else-if body.
+    // The chain branches from the entry: true body, then the else-if header.
     try std.testing.expectEqual(g_block, cfgSucc(&cfg, entry, .branch_true) orelse
         return error.TestUnexpectedResult);
-    try std.testing.expectEqual(h_block, cfgSucc(&cfg, entry, .branch_false) orelse
+    // The else-if condition is a real branch (EPH-I0087): the arm body sits
+    // on the header's true edge, the final else body on its false edge.
+    const elseif_header = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(h_block, cfgSucc(&cfg, elseif_header, .branch_true) orelse
+        return error.TestUnexpectedResult);
+    try std.testing.expectEqual(j_block, cfgSucc(&cfg, elseif_header, .branch_false) orelse
         return error.TestUnexpectedResult);
     // One shared merge past the chain.
     const i_block = findBlockForLine(&cfg, 11) orelse return error.TestUnexpectedResult;
@@ -28762,6 +28850,337 @@ test "ZA607: both-branches if/else is silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_both.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: else-arm-only assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The cond-true path never assigns x, so the read on line 7 is a
+    // potential undefined read (EPH-I0087).
+    const content =
+        \\fn elseArmOnly(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\    } else {
+        \\        x = 2;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_else_only.zig", content);
+    defer run.deinit(allocator);
+
+    var found = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, "da_else_only.zig")) continue;
+        if (!mem.eql(u8, issue.rule, RULE_DEFINITE_ASSIGNMENT)) continue;
+        try std.testing.expectEqual(@as(usize, 7), issue.line);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "'x'") != null);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA607: if-arm fill with empty else is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else path never assigns x; an empty else arm must not silence
+    // the maybe-undefined read (EPH-I0087 guard).
+    const content =
+        \\fn ifFillEmptyElse(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        x = 1;
+        \\    } else {
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_empty_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_empty_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: if-arm fill with non-assigning else is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else arm runs code but never assigns x, so the read stays a
+    // potential undefined read (EPH-I0087 guard).
+    const content =
+        \\fn ifFillElseNoFill(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        x = 1;
+        \\    } else {
+        \\        _ = cond;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_else_nofill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_else_nofill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: else-if-arm-only assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The fill sits in the else-if branch; the c-true path and the
+    // neither-c-nor-d path never assign x (EPH-I0108).
+    const content =
+        \\fn elseIfFill(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        _ = c;
+        \\    } else if (d) {
+        \\        x = 1;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_elseif.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_elseif.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: else-if assignment past struct-literal arm is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The struct literal in the first arm must not hide the conditional
+    // fill in the else-if arm (EPH-I0108).
+    const content =
+        \\fn elseIfStructFill(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const cfg = .{
+        \\            .a = 1,
+        \\        };
+        \\        _ = cfg;
+        \\    } else if (d) {
+        \\        x = 1;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_elseif_struct.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_elseif_struct.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: if and else-if fills without final else are detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Both named arms assign x, but the neither-c-nor-d path falls
+    // through with x undefined (EPH-I0087).
+    const content =
+        \\fn ifAndElseIfFill(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    } else if (d) {
+        \\        x = 2;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_elseif_noelse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_elseif_noelse.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: non-assigning final else does not cover earlier fills" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The final else runs code but never assigns x, so the c-false
+    // d-false path still reads x undefined (EPH-I0087).
+    const content =
+        \\fn elseIfFillBareElse(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    } else if (d) {
+        \\        x = 2;
+        \\    } else {
+        \\        _ = c;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_elseif_bareelse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_elseif_bareelse.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fills in every arm of if/else-if/else are silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every path assigns x, so the read is safe (EPH-I0087 guard).
+    const content =
+        \\fn allArmsFill(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    } else if (d) {
+        \\        x = 2;
+        \\    } else {
+        \\        x = 3;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_all_arms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_all_arms.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: allman else-arm-only assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Allman style: the bare `else` line still opens a conditional arm,
+    // so the fill inside it must not count as unconditional (EPH-I0087).
+    const content =
+        \\fn allmanElseFill(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond)
+        \\    {
+        \\    }
+        \\    else
+        \\    {
+        \\        x = 2;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_allman_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_allman_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless else-arm assignment is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A single-statement else body is still a conditional arm; its fill
+    // does not cover the cond-true path (EPH-I0087).
+    const content =
+        \\fn bracelessElseFill(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\    } else x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_braceless_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_braceless_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: three-link else-if chain without final else is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every named arm assigns x, but the all-conditions-false path falls
+    // through with x undefined (EPH-I0087).
+    const content =
+        \\fn threeLinkGap(c: bool, d: bool, e: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    } else if (d) {
+        \\        x = 2;
+        \\    } else if (e) {
+        \\        x = 3;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_chain3_gap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_chain3_gap.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless else-if statement body is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A single-statement else-if body assigns only on the d-true path;
+    // the c-true and neither paths still read x undefined (EPH-I0087 guard).
+    const content =
+        \\fn bracelessElseIf(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\    } else if (d) x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_braceless_elseif.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_braceless_elseif.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

@@ -582,6 +582,77 @@ fn isElseWordAt(code: []const u8, i: usize) bool {
     return i + 4 == code.len or !isIdent(code[i + 4]);
 }
 
+/// What follows an if/else-if condition's closing paren on the same line.
+const BodyStart = enum { none, brace, label_block, statement };
+
+/// Peek past the closing paren at index i: end-of-line (Allman — the
+/// pending_brace path), `{` (braced body), `ident: {` (labeled block —
+/// braced path), or any other code (a same-line statement body).
+fn peekBodyStart(code: []const u8, i: usize) BodyStart {
+    var j = i + 1;
+    while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+    if (j >= code.len) return .none;
+    if (code[j] == '{') return .brace;
+    if (isLabelBlockAhead(code, j)) return .label_block;
+    return .statement;
+}
+
+/// True when `code[j..]` starts `ident: {` — a labeled block body, which
+/// owns a real control brace and must not become a virtual body.
+fn isLabelBlockAhead(code: []const u8, j: usize) bool {
+    var k = j;
+    if (k >= code.len or !isIdent(code[k])) return false;
+    while (k < code.len and isIdent(code[k])) k += 1;
+    while (k < code.len and (code[k] == ' ' or code[k] == '\t')) k += 1;
+    if (k >= code.len or code[k] != ':') return false;
+    k += 1;
+    while (k < code.len and (code[k] == ' ' or code[k] == '\t')) k += 1;
+    return k < code.len and code[k] == '{';
+}
+
+/// Classify the start of a line the way peekBodyStart classifies text after
+/// a condition: `{` (Allman brace), `ident: {` (labeled block), other code
+/// (statement), or nothing.
+fn classifyLineStart(code: []const u8) BodyStart {
+    var j: usize = 0;
+    while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+    if (j >= code.len) return .none;
+    if (code[j] == '{') return .brace;
+    if (isLabelBlockAhead(code, j)) return .label_block;
+    return .statement;
+}
+
+/// Classify an else body starting at index i (just past the keyword): `{`
+/// (braced — else_open_pending claims it), `if` (else-if — its own `{`
+/// claim handles it), labeled block (brace-claimed), a plain statement
+/// (virtual else body), or nothing (Allman else).
+fn peekElseBody(code: []const u8, i: usize) BodyStart {
+    var j = i;
+    while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+    if (j >= code.len) return .none;
+    if (code[j] == '{') return .brace;
+    if (j + 2 <= code.len and mem.eql(u8, code[j .. j + 2], "if") and
+        (j + 2 == code.len or !isIdent(code[j + 2]))) return .none;
+    if (isLabelBlockAhead(code, j)) return .label_block;
+    return .statement;
+}
+
+/// True for a bare-else line whose body is a plain statement (`else y = 2;`)
+/// — not `else {`, not else-if, not a labeled block.
+fn isVirtualElseLine(code: []const u8) bool {
+    return isElseWordAt(code, 0) and peekElseBody(code, 4) == .statement;
+}
+
+/// True when the statement body after the condition's closing paren at i
+/// starts with the whole-word keyword `return`.
+fn bodyIsReturn(code: []const u8, i: usize) bool {
+    var j = i + 1;
+    while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+    if (j + 6 > code.len) return false;
+    if (!mem.eql(u8, code[j .. j + 6], "return")) return false;
+    return j + 6 == code.len or !isIdent(code[j + 6]);
+}
+
 /// True when the line claims a deferred close (pending_else): a line-start
 /// else pattern whose own walk has no close event. A close on this line
 /// pairs its else with the entry that close pops, so any saved entry must
@@ -652,6 +723,7 @@ const BraceKind = enum { fn_body, sig_container, control, expr };
 const ControlEvent = enum {
     open_control, // `{` claimed as a control block opener
     close_control, // `}` closed a control block (or a brace-less pending entry)
+    close_virtual, // a virtual (brace-less) body statement ended
     else_keyword, // whole-word `else` following a same-line control close
 };
 
@@ -659,6 +731,7 @@ const ControlEvent = enum {
 const BraceScanOut = struct {
     saw_control_close: bool = false, // `}` closed a control block, not an expression
     saw_control_open: bool = false, // `{` was claimed as a control brace
+    body_return: bool = false, // the virtual body statement is a `return`
     // Ordered events for the line; slices CFGBuildCtx.event_scratch, so it
     // is valid only until the next scanLineBraces call.
     events: []const ControlEvent = &.{},
@@ -671,6 +744,11 @@ const LineScanCtx = struct {
     dispatch_pop: bool, // line's dispatch pops a block-stack entry
     claimed: bool = false, // this line's control `{` has been claimed
     else_open_pending: bool = false, // an else keyword awaits its block `{`
+    virtual_ok: bool = false, // if/else-if opener or its condition-end line
+    virtual_seen: bool = false, // the condition's closing paren was reached
+    virtual_open: bool = false, // a virtual same-line body is open
+    else_virtual: bool = false, // a same-line virtual else body is open
+    suppress_pending: bool = false, // line is a pending opener's virtual body
     out: BraceScanOut = .{},
 };
 
@@ -691,9 +769,12 @@ const CFGBuildCtx = struct {
     // pattern as brace_stack).
     event_scratch: *std.ArrayListUnmanaged(ControlEvent),
     // Deferred if_block/else_block close: the entry popped by a `}` whose
-    // else has not arrived yet. The next non-comment, non-blank line either
-    // claims it (handleElse) or finishPendingElse wires the no-else merge.
+    // else has not arrived yet. The next non-comment line either claims it
+    // (handleElse) or finishPendingElse wires the no-else merge.
     pending_else: ?StackEntry = null,
+    // Set by scanLineBraces when the line's virtual body is a `return`;
+    // consumed by the walk at the matching close_virtual.
+    body_return: bool = false,
     paren_depth: usize, // carried across lines for multi-line conditions
     seen_fn_body: bool, // the fn body's own `{` is the scan baseline, never counted
 
@@ -726,6 +807,18 @@ const CFGBuildCtx = struct {
         return items[items.len - 1].pending_brace;
     }
 
+    /// True when the pending top entry is an if/else — only those may take
+    /// a brace-less virtual body (EPH-I0079 B2 scope). A pending while/for
+    /// must degrade to pre-B2 attribution: the entry lingers until a `}`
+    /// pops it, so following lines stay in the loop-body block.
+    fn topIsPendingIfElse(self: *CFGBuildCtx) bool {
+        const items = self.block_stack.items;
+        if (items.len == 0) return false;
+        const top = items[items.len - 1];
+        if (!top.pending_brace) return false;
+        return top.block_type == .if_block or top.block_type == .else_block;
+    }
+
     /// Classify one `{` at index i and push its kind onto the brace stack.
     /// Precedence: inside parens is always expression; signature containers
     /// (`error{`, `struct {`, ...) are not bodies; the first remaining
@@ -748,7 +841,9 @@ const CFGBuildCtx = struct {
         }
         const own_claim = line_scan.opener and !line_scan.claimed;
         const else_claim = line_scan.else_open_pending;
-        if (own_claim or else_claim or (!line_scan.opener and self.clearTopPending())) {
+        const pending_claim = !line_scan.opener and !line_scan.suppress_pending and
+            self.clearTopPending();
+        if (own_claim or else_claim or pending_claim) {
             line_scan.claimed = true;
             line_scan.else_open_pending = false;
             line_scan.out.saw_control_open = true;
@@ -788,11 +883,60 @@ const CFGBuildCtx = struct {
         try self.event_scratch.append(self.allocator, .close_control);
     }
 
-    /// True when the scan's latest event closed a control block — the only
-    /// position a same-line `else` keyword can follow.
+    /// True when the scan's latest event closed a control block (braced or
+    /// virtual) — the only position a same-line `else` keyword can follow.
     fn lastEventIsClose(self: *CFGBuildCtx) bool {
         const items = self.event_scratch.items;
-        return items.len > 0 and items[items.len - 1] == .close_control;
+        if (items.len == 0) return false;
+        const last = items[items.len - 1];
+        return last == .close_control or last == .close_virtual;
+    }
+
+    /// At the condition's closing paren on an if/else-if line: a same-line
+    /// plain-statement body emits a virtual control open, making the
+    /// brace-less form indistinguishable from the braced form downstream.
+    /// A `return` body is flagged so the walk marks the body block like a
+    /// braced body line would; break/continue bodies get plain-body edges
+    /// exactly as their braced forms (neither is modeled, see EPH-I0094).
+    fn tryVirtualBodyOpen(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
+        if (line_scan.virtual_seen) return;
+        line_scan.virtual_seen = true;
+        if (!line_scan.virtual_ok or line_scan.claimed) return;
+        if (peekBodyStart(line_scan.code, i) != .statement) return;
+        line_scan.claimed = true;
+        line_scan.virtual_open = true;
+        line_scan.out.saw_control_open = true;
+        line_scan.out.body_return = bodyIsReturn(line_scan.code, i);
+        // A pending opener (condition ended on this line) is claimed by the
+        // virtual body, not by a later `{`.
+        _ = self.clearTopPending();
+        try self.brace_stack.append(self.allocator, .control);
+        try self.event_scratch.append(self.allocator, .open_control);
+    }
+
+    /// Close a virtual else body: no brace was pushed, so the close event
+    /// alone drives the else block's handleBlockEnd in the walk.
+    fn closeElseVirtual(self: *CFGBuildCtx, line_scan: *LineScanCtx) !void {
+        if (!line_scan.else_virtual) return;
+        line_scan.else_virtual = false;
+        try self.event_scratch.append(self.allocator, .close_virtual);
+    }
+
+    /// Pop the virtual control brace pushed by tryVirtualBodyOpen (top of
+    /// stack by construction; defensive against unbalanced input).
+    fn popVirtualControl(self: *CFGBuildCtx) void {
+        const items = self.brace_stack.items;
+        if (items.len > 0 and items[items.len - 1] == .control)
+            _ = self.brace_stack.pop();
+    }
+
+    /// Close an open virtual body: the statement ended (`;`) or the line
+    /// did; emit the close event that a braced body's `}` would produce.
+    fn closeVirtualBody(self: *CFGBuildCtx, line_scan: *LineScanCtx) !void {
+        if (!line_scan.virtual_open) return;
+        line_scan.virtual_open = false;
+        self.popVirtualControl();
+        try self.event_scratch.append(self.allocator, .close_virtual);
     }
 
     /// Handle one code char (outside quotes/comments) for the brace scan.
@@ -802,15 +946,32 @@ const CFGBuildCtx = struct {
         const c = line_scan.code[i];
         if (c == 'e' and self.lastEventIsClose() and isElseWordAt(line_scan.code, i)) {
             try self.event_scratch.append(self.allocator, .else_keyword);
-            line_scan.else_open_pending = true;
+            if (peekElseBody(line_scan.code, i + 4) == .statement) {
+                line_scan.else_virtual = true;
+            } else {
+                line_scan.else_open_pending = true;
+            }
             return 3;
+        }
+        if (c == ';' and self.paren_depth == 0) {
+            if (line_scan.virtual_open) {
+                try self.closeVirtualBody(line_scan);
+                return 0;
+            }
+            if (line_scan.else_virtual) {
+                try self.closeElseVirtual(line_scan);
+                return 0;
+            }
         }
         if (c == '(') {
             self.paren_depth += 1;
             return 0;
         }
         if (c == ')') {
+            const was_open = self.paren_depth > 0;
             self.paren_depth -|= 1;
+            if (was_open and self.paren_depth == 0)
+                try self.tryVirtualBodyOpen(i, line_scan);
             return 0;
         }
         if (c == '{') {
@@ -822,13 +983,24 @@ const CFGBuildCtx = struct {
     }
 
     /// Scan one comment-stripped line, updating carried brace/paren state and
-    /// collecting the line's ordered control events.
-    fn scanLineBraces(self: *CFGBuildCtx, code: []const u8, pattern: CFPattern) !BraceScanOut {
+    /// collecting the line's ordered control events. suppress_pending marks
+    /// a pending opener's virtual-body line: its braces are expressions.
+    fn scanLineBraces(
+        self: *CFGBuildCtx,
+        code: []const u8,
+        pattern: CFPattern,
+        suppress_pending: bool,
+    ) !BraceScanOut {
         self.event_scratch.clearRetainingCapacity();
+        // The condition-end line of a multi-line if/else-if opener may
+        // carry the body; a pending while/for never takes a virtual body.
+        const cond_end = self.paren_depth > 0 and self.topIsPendingIfElse();
         var line_scan: LineScanCtx = .{
             .code = code,
             .opener = isControlOpener(pattern),
             .dispatch_pop = isPopDispatch(pattern),
+            .virtual_ok = pattern == .if_start or pattern == .else_if or cond_end,
+            .suppress_pending = suppress_pending,
         };
         var mode: QuoteMode = .none;
         var i: usize = 0;
@@ -841,6 +1013,9 @@ const CFGBuildCtx = struct {
             if (c == '/' and i + 1 < code.len and code[i + 1] == '/') break;
             i += try self.scanCodeChar(i, &line_scan);
         }
+        try self.closeVirtualBody(&line_scan);
+        try self.closeElseVirtual(&line_scan);
+        self.body_return = line_scan.out.body_return;
         line_scan.out.events = self.event_scratch.items;
         return line_scan.out;
     }
@@ -987,6 +1162,49 @@ const CFGBuildCtx = struct {
         self.setStartLine(line);
     }
 
+    /// After a virtual-else line, close the else block handleElse pushed
+    /// (the inline-return path pushes nothing and is left alone).
+    fn closeVirtualElseBlock(self: *CFGBuildCtx, line: usize) !void {
+        const items = self.block_stack.items;
+        if (items.len == 0) return;
+        if (items[items.len - 1].block_type != .else_block) return;
+        try self.handleBlockEnd(line);
+    }
+
+    /// Process one comment-stripped, non-comment line of a function body.
+    fn processCFGLine(self: *CFGBuildCtx, code: []const u8, line: usize) !void {
+        // A pending brace-less if/else opener whose next line is a
+        // statement (not an Allman `{`, not a labeled block) takes that
+        // line as its virtual body. A multi-line condition still open is
+        // not a body. A pending while/for is excluded: brace-less loops
+        // are out of B2 scope and degrade to pre-B2 attribution.
+        const next_body = self.topIsPendingIfElse() and self.paren_depth == 0 and
+            classifyLineStart(code) == .statement;
+        const virtual_else = self.pending_else != null and isVirtualElseLine(code);
+        const pattern = detectCFPattern(code);
+        const scan = try self.scanLineBraces(code, pattern, next_body);
+        // A deferred close with no else claiming it closes as no-else
+        // before this line is attributed. Comment lines never reach here;
+        // blank lines carry no code, so they must not clear the deferral.
+        if (self.pending_else != null and code.len > 0 and !virtual_else and
+            !scanClaimsElse(pattern, scan.events))
+            try self.finishPendingElse(line);
+        if (virtual_else) try self.handleElse(code, line);
+        self.cfg.blocks.items[self.current_block].end_line = line;
+        try self.walkLineEvents(pattern, code, line);
+        // Opener whose control `{` is on a later line (Allman, multi-line
+        // condition); an inline-return else has no brace coming at all.
+        if (isControlOpener(pattern) and !scan.saw_control_open and
+            !hasInlineElseReturn(code)) self.markTopPending();
+        // The virtual body lived in the true block; close the opener at
+        // this line's end. A body line that opened its own construct
+        // (nested if, braced loop) leaves the opener lingering as pre-B2 —
+        // documented approximation, no recursive nesting (B2.4).
+        if (next_body and !scan.saw_control_open and self.pending_else == null)
+            try self.handleBlockEndOrDefer(line);
+        if (virtual_else) try self.closeVirtualElseBlock(line);
+    }
+
     fn handleCatchStart(self: *CFGBuildCtx, line: usize) !void {
         const origin_block = self.current_block;
         const continuation_block = try self.cfg.addBlock();
@@ -1043,7 +1261,14 @@ const CFGBuildCtx = struct {
                     opener_dispatched = true;
                     try self.handleElse(code, line);
                 },
-                .close_control => {
+                .close_control, .close_virtual => {
+                    // A virtual `return` body marks its body block at the
+                    // close, exactly like a braced body line's return_stmt
+                    // dispatch; consumed once (an else may follow).
+                    if (event == .close_virtual and self.body_return) {
+                        self.body_return = false;
+                        try self.handleReturn();
+                    }
                     if (idx + 1 < events.len and events[idx + 1] == .else_keyword)
                         continue;
                     try self.handleBlockEndOrDefer(line);
@@ -1060,7 +1285,8 @@ const CFGBuildCtx = struct {
 fn hasInlineElseReturn(t: []const u8) bool {
     const else_pos = mem.indexOf(u8, t, "else") orelse return false;
     const after_else = mem.trimStart(u8, t[else_pos + 4 ..], " \t");
-    return mem.startsWith(u8, after_else, "return ");
+    return mem.startsWith(u8, after_else, "return ") or
+        mem.startsWith(u8, after_else, "return;");
 }
 
 fn buildCFG(
@@ -1096,21 +1322,7 @@ fn buildCFG(
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        const code = stripLineComment(t);
-        const pattern = detectCFPattern(code);
-        const scan = try ctx.scanLineBraces(code, pattern);
-        // A deferred close with no else claiming it closes as no-else
-        // before this line is attributed. Comment lines never reach here;
-        // blank lines carry no code, so they must not clear the deferral.
-        if (ctx.pending_else != null and code.len > 0 and
-            !scanClaimsElse(pattern, scan.events))
-            try ctx.finishPendingElse(func_line + idx);
-        cfg.blocks.items[ctx.current_block].end_line = func_line + idx;
-        try ctx.walkLineEvents(pattern, code, func_line + idx);
-        // Opener whose control `{` is on a later line (Allman, multi-line
-        // condition); an inline-return else has no brace coming at all.
-        if (isControlOpener(pattern) and !scan.saw_control_open and
-            !hasInlineElseReturn(code)) ctx.markTopPending();
+        try ctx.processCFGLine(stripLineComment(t), func_line + idx);
     }
 
     if (cfg.exit_blocks.items.len == 0)
@@ -2918,15 +3130,19 @@ fn isOrShortCircuitSafe(
 
 /// Check whether a plain `var_name = ...` statement unconditionally executes
 /// before the read on every path that reaches it: the assignment line starts
-/// with the bare name (so it cannot hide behind an `if` guard — assignments
-/// are statements, never expressions), it is nested no deeper than the read
-/// (the read may sit deeper inside the assignment's scope), and no
-/// intervening line closes the assignment's scope (a close would mean the
-/// assignment sat in a sibling conditional block).
+/// with the bare name, it is nested no deeper than the read (the read may
+/// sit deeper inside the assignment's scope), and no intervening line
+/// closes the assignment's scope (a close would mean the assignment sat in
+/// a sibling conditional block).
 ///
-/// Needed because the line-based CFG cannot model brace-less guard ifs such
-/// as `if (x) continue;`: it invents edges that bypass same-scope
-/// assignments, so the dataflow verdict alone cannot prove dominance there.
+/// The pos-0 bare-name shortcut predates the B-series CFG work: same-line
+/// guard ifs (`if (x) y = 1;`) keep the assignment mid-line, but a
+/// next-line virtual body (`if (x)\n    y = 1;`) now places a guarded
+/// assignment at pos 0, so "starts with the bare name" no longer proves
+/// "unguarded". The CFG models those bodies post-B, so this function is a
+/// conservative cross-check only: when it disagrees with the CFG verdict it
+/// suppresses a report, i.e. any residual error is on the FN side
+/// (EPH-I0095), never a fresh FP.
 fn hasDominatingScopeAssignment(
     lines: []const []const u8,
     read_idx: usize,
@@ -27363,7 +27579,7 @@ test "buildCFG: blank line between close and else keeps the pairing" {
     try std.testing.expect(cfgHasEdge(&cfg, else_block, i_block, .sequential));
 }
 
-test "buildCFG: bare else-identifier line is not an else-if" {
+test "buildCFG: bare else-identifier line wires as a virtual else body" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -27374,15 +27590,496 @@ test "buildCFG: bare else-identifier line is not an else-if" {
         "        g();", // 3
         "    }", // 4
         "    else ifx;", // 5: else branch holding an identifier statement
+        "    h();", // 6: in the merge — no phantom pending brace theft
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // `else ifx;` is NOT else-if (the word-delimited patterns reject it);
+    // it is a virtual else whose body is the statement `ifx;`.
+    try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(else_block, findBlockForLine(&cfg, 5));
+    const merge = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(merge != else_block);
+}
+
+// ============================================================================
+// CFG brace-less same-line body tests (EPH-I0079 B1)
+// ============================================================================
+
+fn cfgEdgesMatch(a: *const ControlFlowGraph, b: *const ControlFlowGraph) bool {
+    if (a.edges.items.len != b.edges.items.len) return false;
+    for (a.edges.items) |e| {
+        if (!cfgHasEdge(b, e.from, e.to, e.kind)) return false;
+    }
+    return true;
+}
+
+test "buildCFG: brace-less same-line if body closes at end of line" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) x = 1;", // 2
+        "    y = 2;", // 3: must land in the if's merge, not its true block
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, merge, .sequential));
+    const after = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(merge, after);
+}
+
+test "buildCFG: brace-less body CFG equals the braced form" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const bare = [_][]const u8{
+        "fn f(a: bool) void {",
+        "    if (a) x = 1;",
+        "    y = 2;",
+        "}",
+    };
+    const braced = [_][]const u8{
+        "fn f(a: bool) void {",
+        "    if (a) { x = 1; }",
+        "    y = 2;",
+        "}",
+    };
+
+    var cfg_bare = try buildCFG(allocator, "f", 1, &bare);
+    defer cfg_bare.deinit();
+    var cfg_braced = try buildCFG(allocator, "f", 1, &braced);
+    defer cfg_braced.deinit();
+
+    try std.testing.expectEqual(cfg_braced.blocks.items.len, cfg_bare.blocks.items.len);
+    try std.testing.expect(cfgEdgesMatch(&cfg_bare, &cfg_braced));
+}
+
+test "buildCFG: brace-less if with same-line else pairs correctly" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) x = 1; else { y = 2; }", // 2
+        "    z();", // 3: in the shared merge past both arms
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // entry + true + else + merge: the else keyword paired with the
+    // virtually-closed if exactly as in the braced form.
+    try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const merge = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(merge != true_block);
+    try std.testing.expect(merge != else_block);
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, merge, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_block, merge, .sequential));
+}
+
+// ============================================================================
+// CFG brace-less body tests: next-line bodies + virtual else (EPH-I0079 B2)
+// ============================================================================
+
+test "buildCFG: next-line statement is the pending opener's virtual body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a)", // 2
+        "        x = 1;", // 3: the virtual body — in the true block
+        "    y = 2;", // 4: in the merge
+        "}", // 5
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const body = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(true_block, body);
+    const after = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(merge, after);
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, merge, .sequential));
+}
+
+test "buildCFG: next-line body pairs with a virtual else" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a)", // 2
+        "        x = 1;", // 3
+        "    else y = 2;", // 4: virtual else body
+        "    z = 3;", // 5: in the merge
         "}", // 6
     };
 
     var cfg = try buildCFG(allocator, "f", 1, &lines);
     defer cfg.deinit();
 
-    // `else ifx;` must not dispatch handleElse: no phantom else block, no
-    // stolen pending brace — entry, true block, and merge only.
+    try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(true_block, findBlockForLine(&cfg, 3));
+    try std.testing.expectEqual(else_block, findBlockForLine(&cfg, 4));
+    const merge = findBlockForLine(&cfg, 5) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(merge != true_block);
+    try std.testing.expect(merge != else_block);
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, merge, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_block, merge, .sequential));
+}
+
+test "buildCFG: multi-line condition takes a next-line virtual body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a &&", // 2
+        "        b)", // 3: condition end, nothing after — still pending
+        "        x = 1;", // 4: the virtual body
+        "    y = 2;", // 5: in the merge
+        "}", // 6
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(true_block, findBlockForLine(&cfg, 4));
+    try std.testing.expectEqual(merge, findBlockForLine(&cfg, 5));
+}
+
+test "buildCFG: multi-line condition carries its body on the end line" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a &&", // 2
+        "        b) x = 1;", // 3: same-line body on the condition-end line
+        "    y = 2;", // 4: in the merge
+        "}", // 5
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
     try std.testing.expectEqual(@as(usize, 3), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(merge, findBlockForLine(&cfg, 4));
+}
+
+test "buildCFG: one-liner with both bodies virtual" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) x = 1; else y = 2;", // 2
+        "    z = 3;", // 3: in the merge, not the else block
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const after = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(after != true_block);
+    try std.testing.expect(after != else_block);
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, after, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_block, after, .sequential));
+}
+
+test "buildCFG: virtual else pairs after a braced if" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) {", // 2
+        "        x = 1;", // 3
+        "    }", // 4
+        "    else y = 2;", // 5: virtual else body claims the deferred close
+        "    z = 3;", // 6: in the merge
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(else_block, findBlockForLine(&cfg, 5));
+    const merge = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(merge != else_block);
+}
+
+test "buildCFG: nested same-line if is one plain virtual body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented approximation (B2.4): the outer body is the whole line
+    // `if (b) x = 1;`; the inner if is not modeled (one opener per line).
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a) if (b) x = 1;", // 2
+        "    y = 2;", // 3: in the outer merge
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(merge, findBlockForLine(&cfg, 3));
+}
+
+test "buildCFG: brace-less while body degrades exactly as before" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Brace-less while/for are out of B2 scope: the pending entry lingers
+    // until the fn close pops it, so h() and x = 1 both stay attributed
+    // to the loop body block (pre-B2 shape).
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    while (a) g();", // 2
+        "    h();", // 3
+        "    x = 1;", // 4
+        "}", // 5
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const body = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(body, findBlockForLine(&cfg, 3));
+    try std.testing.expectEqual(body, findBlockForLine(&cfg, 4));
+    // A `}` line is attributed to the block it closes, so the body extent
+    // runs to the fn close; the pending entry pops there, starting the
+    // merge on the line after — not right after h().
+    try std.testing.expectEqual(@as(usize, 5), cfg.blocks.items[body].end_line);
+    try std.testing.expectEqual(@as(usize, 6), cfg.blocks.items[merge].start_line);
+}
+
+// ============================================================================
+// CFG brace-less body semantics tests (EPH-I0079 B3)
+// ============================================================================
+
+fn cfgExitsMatch(a: *const ControlFlowGraph, b: *const ControlFlowGraph) bool {
+    if (a.exit_blocks.items.len != b.exit_blocks.items.len) return false;
+    for (a.exit_blocks.items) |x| {
+        for (b.exit_blocks.items) |y| {
+            if (x == y) break;
+        } else return false;
+    }
+    return true;
+}
+
+fn cfgTrueBlockReturns(cfg: *const ControlFlowGraph) bool {
+    const true_block = cfgSucc(cfg, cfg.entry_block, .branch_true) orelse
+        return false;
+    return cfg.blocks.items[true_block].is_return;
+}
+
+test "buildCFG: brace-less return body equals the multi-line braced form" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const bare = [_][]const u8{
+        "fn f(a: bool) void {",
+        "    if (a) return;",
+        "    x = 1;",
+        "}",
+    };
+    const bare_val = [_][]const u8{
+        "fn f(a: bool) u32 {",
+        "    if (a) return 1;",
+        "    x = 1;",
+        "    return x;",
+        "}",
+    };
+    const braced = [_][]const u8{
+        "fn f(a: bool) void {",
+        "    if (a) {",
+        "        return;",
+        "    }",
+        "    x = 1;",
+        "}",
+    };
+
+    var cfg_bare = try buildCFG(allocator, "f", 1, &bare);
+    defer cfg_bare.deinit();
+    var cfg_braced = try buildCFG(allocator, "f", 1, &braced);
+    defer cfg_braced.deinit();
+    var cfg_val = try buildCFG(allocator, "f", 1, &bare_val);
+    defer cfg_val.deinit();
+
+    try std.testing.expectEqual(cfg_braced.blocks.items.len, cfg_bare.blocks.items.len);
+    try std.testing.expect(cfgEdgesMatch(&cfg_bare, &cfg_braced));
+    try std.testing.expect(cfgExitsMatch(&cfg_bare, &cfg_braced));
+    try std.testing.expect(cfgTrueBlockReturns(&cfg_bare));
+    try std.testing.expect(cfgTrueBlockReturns(&cfg_braced));
+    try std.testing.expect(cfgTrueBlockReturns(&cfg_val));
+}
+
+test "buildCFG: next-line return body equals the multi-line braced form" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The next-line virtual body dispatches return_stmt on the body line,
+    // so the true block must be marked return/exit exactly like the
+    // same-line brace-less form and the braced form.
+    const bare = [_][]const u8{
+        "fn f(a: bool) void {",
+        "    if (a)",
+        "        return;",
+        "    x = 1;",
+        "}",
+    };
+    const braced = [_][]const u8{
+        "fn f(a: bool) void {",
+        "    if (a) {",
+        "        return;",
+        "    }",
+        "    x = 1;",
+        "}",
+    };
+
+    var cfg_bare = try buildCFG(allocator, "f", 1, &bare);
+    defer cfg_bare.deinit();
+    var cfg_braced = try buildCFG(allocator, "f", 1, &braced);
+    defer cfg_braced.deinit();
+
+    try std.testing.expectEqual(cfg_braced.blocks.items.len, cfg_bare.blocks.items.len);
+    try std.testing.expect(cfgEdgesMatch(&cfg_bare, &cfg_braced));
+    try std.testing.expect(cfgExitsMatch(&cfg_bare, &cfg_braced));
+    try std.testing.expect(cfgTrueBlockReturns(&cfg_bare));
+    try std.testing.expect(cfgTrueBlockReturns(&cfg_braced));
+}
+
+test "buildCFG: virtual else return marks the else block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) x = 1; else return;", // 2
+        "    y = 2;", // 3: in the merge
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfg.blocks.items[else_block].is_return);
+    try std.testing.expect(cfg.exit_blocks.items.len > 0);
+    const merge = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(merge != else_block);
+}
+
+test "buildCFG: brace-less break body equals the braced form" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // break/continue are not CFG-modeled in either form (dispatchPattern
+    // no-ops them, EPH-I0094): parity means identical plain-body structure.
+    const bare = [_][]const u8{
+        "fn f(a: bool, b: bool) void {",
+        "    while (a) {",
+        "        if (b) break;",
+        "        x = 1;",
+        "    }",
+        "}",
+    };
+    const braced = [_][]const u8{
+        "fn f(a: bool, b: bool) void {",
+        "    while (a) {",
+        "        if (b) { break; }",
+        "        x = 1;",
+        "    }",
+        "}",
+    };
+
+    var cfg_bare = try buildCFG(allocator, "f", 1, &bare);
+    defer cfg_bare.deinit();
+    var cfg_braced = try buildCFG(allocator, "f", 1, &braced);
+    defer cfg_braced.deinit();
+
+    try std.testing.expectEqual(cfg_braced.blocks.items.len, cfg_bare.blocks.items.len);
+    try std.testing.expect(cfgEdgesMatch(&cfg_bare, &cfg_braced));
 }
 
 // ============================================================================

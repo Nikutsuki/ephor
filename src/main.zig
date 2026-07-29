@@ -441,8 +441,8 @@ const BlockDataFlow = struct {
 const CFPattern = enum {
     none,
     if_start, // if (...) {
-    else_start, // } else {
-    else_if, // } else if {
+    else_start, // } else {  (or bare `else {` when the close is on the previous line)
+    else_if, // } else if {  (or bare `else if` when the close is on the previous line)
     while_start, // while (...) {
     for_start, // for (...) {
     switch_start, // switch (...) {
@@ -466,6 +466,7 @@ const CFPatternEntry = struct {
 const cf_patterns = [_]CFPatternEntry{
     .{ .prefix = "} else if", .exact = false, .result = .else_if },
     .{ .prefix = "} else", .exact = false, .result = .else_start },
+    .{ .prefix = "else if", .exact = false, .result = .else_if }, // close on previous line
     .{ .prefix = "else {", .exact = true, .result = .else_start },
     .{ .prefix = "if ", .exact = false, .result = .if_start },
     .{ .prefix = "if(", .exact = false, .result = .if_start },
@@ -570,6 +571,27 @@ fn stripLineComment(t: []const u8) []const u8 {
     return mem.trimEnd(u8, t[0..i], " \t\r");
 }
 
+/// True when `code[i..]` starts the whole-word keyword `else` (bounded by
+/// non-identifier chars on both sides). Callers handle quote/comment state.
+fn isElseWordAt(code: []const u8, i: usize) bool {
+    if (i + 4 > code.len) return false;
+    if (!mem.eql(u8, code[i .. i + 4], "else")) return false;
+    if (i > 0 and isIdent(code[i - 1])) return false;
+    return i + 4 == code.len or !isIdent(code[i + 4]);
+}
+
+/// True when the line claims a deferred close (pending_else): a line-start
+/// else pattern whose own walk has no close event. A close on this line
+/// pairs its else with the entry that close pops, so any saved entry must
+/// instead be finished as a no-else close.
+fn scanClaimsElse(pattern: CFPattern, events: []const ControlEvent) bool {
+    if (pattern != .else_start and pattern != .else_if) return false;
+    for (events) |event| {
+        if (event == .close_control) return false;
+    }
+    return true;
+}
+
 /// Patterns whose line owns a control brace (pushes a stack entry).
 /// switch_arm is excluded: arms create blocks but push no stack entry.
 fn isControlOpener(pattern: CFPattern) bool {
@@ -622,10 +644,22 @@ fn sigContainerOpen(code: []const u8, i: usize) bool {
 /// matching block-stack entry; every other kind is invisible to dispatch.
 const BraceKind = enum { fn_body, sig_container, control, expr };
 
+/// Ordered control event emitted by the per-line brace scan. buildCFG walks
+/// the list in position order instead of dispatching once per line, so a
+/// line like `if (a) { f(); } else { g(); }` opens and closes both blocks.
+const ControlEvent = enum {
+    open_control, // `{` claimed as a control block opener
+    close_control, // `}` closed a control block (or a brace-less pending entry)
+    else_keyword, // whole-word `else` following a same-line control close
+};
+
 /// Per-line output of the CFG brace scan.
 const BraceScanOut = struct {
     saw_control_close: bool = false, // `}` closed a control block, not an expression
     saw_control_open: bool = false, // `{` was claimed as a control brace
+    // Ordered events for the line; slices CFGBuildCtx.event_scratch, so it
+    // is valid only until the next scanLineBraces call.
+    events: []const ControlEvent = &.{},
 };
 
 /// Mutable per-line state threaded through the CFG brace scan.
@@ -634,6 +668,7 @@ const LineScanCtx = struct {
     opener: bool, // line matched a control-opener pattern
     dispatch_pop: bool, // line's dispatch pops a block-stack entry
     claimed: bool = false, // this line's control `{` has been claimed
+    else_open_pending: bool = false, // an else keyword awaits its block `{`
     out: BraceScanOut = .{},
 };
 
@@ -649,6 +684,14 @@ const CFGBuildCtx = struct {
     // iff it pops a `.control` brace. Owned by buildCFG (same pattern as
     // block_stack).
     brace_stack: *std.ArrayListUnmanaged(BraceKind),
+    // Per-line control-event list, rebuilt by each scanLineBraces call and
+    // consumed by walkLineEvents before the next. Owned by buildCFG (same
+    // pattern as brace_stack).
+    event_scratch: *std.ArrayListUnmanaged(ControlEvent),
+    // Deferred if_block/else_block close: the entry popped by a `}` whose
+    // else has not arrived yet. The next non-comment, non-blank line either
+    // claims it (handleElse) or finishPendingElse wires the no-else merge.
+    pending_else: ?StackEntry = null,
     paren_depth: usize, // carried across lines for multi-line conditions
     seen_fn_body: bool, // the fn body's own `{` is the scan baseline, never counted
 
@@ -684,9 +727,9 @@ const CFGBuildCtx = struct {
     /// Classify one `{` at index i and push its kind onto the brace stack.
     /// Precedence: inside parens is always expression; signature containers
     /// (`error{`, `struct {`, ...) are not bodies; the first remaining
-    /// paren-depth-0 `{` is the fn body; an opener's first `{` and pending
-    /// claims are control; everything else (switch arms, bare blocks,
-    /// literals) is expression.
+    /// paren-depth-0 `{` is the fn body; an opener's first `{`, an else
+    /// keyword's block `{`, and pending claims are control; everything else
+    /// (switch arms, bare blocks, literals) is expression.
     fn classifyOpenBrace(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
         if (self.paren_depth > 0) {
             try self.brace_stack.append(self.allocator, .expr);
@@ -702,59 +745,84 @@ const CFGBuildCtx = struct {
             return;
         }
         const own_claim = line_scan.opener and !line_scan.claimed;
-        if (own_claim or (!line_scan.opener and self.clearTopPending())) {
+        const else_claim = line_scan.else_open_pending;
+        if (own_claim or else_claim or (!line_scan.opener and self.clearTopPending())) {
             line_scan.claimed = true;
+            line_scan.else_open_pending = false;
             line_scan.out.saw_control_open = true;
             try self.brace_stack.append(self.allocator, .control);
+            try self.event_scratch.append(self.allocator, .open_control);
             return;
         }
         try self.brace_stack.append(self.allocator, .expr);
     }
 
-    /// Classify one `}`: pop the brace stack; it is a control-block end iff
-    /// it pops a `.control` brace on a pop-dispatching line.
-    fn classifyCloseBrace(self: *CFGBuildCtx, line_scan: *LineScanCtx) void {
+    /// Classify one `}`: pop the brace stack; emit `.close_control` iff it
+    /// pops a `.control` brace. A control brace opened on this same line is
+    /// always popped (same-line balanced `if (a) { f(); }`); a control brace
+    /// from an earlier line still waits for a pop-dispatching line.
+    fn classifyCloseBrace(self: *CFGBuildCtx, line_scan: *LineScanCtx) !void {
         // An entry still waiting for its `{` (brace-less body) is closed by
         // the next close event, matching pre-guard pop-on-`}` semantics.
         if (line_scan.dispatch_pop and self.topIsPending()) {
             line_scan.out.saw_control_close = true;
+            try self.event_scratch.append(self.allocator, .close_control);
             return;
         }
         const items = self.brace_stack.items;
         if (items.len == 0) {
             line_scan.out.saw_control_close = true;
+            try self.event_scratch.append(self.allocator, .close_control);
             return;
         }
         const kind = items[items.len - 1];
-        // A `.control` brace closed on a non-popping line (same-line
-        // `if (a) { f(); }`) stays open so a later block_end line pops the
-        // entry — pre-guard lingering semantics, unchanged.
-        if (kind == .control and !line_scan.dispatch_pop) return;
+        // A `.control` brace from an earlier line closed on a non-popping
+        // line stays open so a later block_end line pops the entry.
+        if (kind == .control and !line_scan.dispatch_pop and
+            !line_scan.out.saw_control_open) return;
         _ = self.brace_stack.pop();
-        if (kind == .control) line_scan.out.saw_control_close = true;
+        if (kind != .control) return;
+        line_scan.out.saw_control_close = true;
+        try self.event_scratch.append(self.allocator, .close_control);
+    }
+
+    /// True when the scan's latest event closed a control block — the only
+    /// position a same-line `else` keyword can follow.
+    fn lastEventIsClose(self: *CFGBuildCtx) bool {
+        const items = self.event_scratch.items;
+        return items.len > 0 and items[items.len - 1] == .close_control;
     }
 
     /// Handle one code char (outside quotes/comments) for the brace scan.
-    fn scanCodeChar(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
+    /// Returns extra chars consumed beyond the caller's own +1 (a whole-word
+    /// `else` eats the remaining 3).
+    fn scanCodeChar(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !usize {
         const c = line_scan.code[i];
+        if (c == 'e' and self.lastEventIsClose() and isElseWordAt(line_scan.code, i)) {
+            try self.event_scratch.append(self.allocator, .else_keyword);
+            line_scan.else_open_pending = true;
+            return 3;
+        }
         if (c == '(') {
             self.paren_depth += 1;
-            return;
+            return 0;
         }
         if (c == ')') {
             self.paren_depth -|= 1;
-            return;
+            return 0;
         }
         if (c == '{') {
             try self.classifyOpenBrace(i, line_scan);
-            return;
+            return 0;
         }
-        if (c == '}') self.classifyCloseBrace(line_scan);
+        if (c == '}') try self.classifyCloseBrace(line_scan);
+        return 0;
     }
 
     /// Scan one comment-stripped line, updating carried brace/paren state and
-    /// reporting whether the line opened or closed a control block.
+    /// collecting the line's ordered control events.
     fn scanLineBraces(self: *CFGBuildCtx, code: []const u8, pattern: CFPattern) !BraceScanOut {
+        self.event_scratch.clearRetainingCapacity();
         var line_scan: LineScanCtx = .{
             .code = code,
             .opener = isControlOpener(pattern),
@@ -769,8 +837,9 @@ const CFGBuildCtx = struct {
                 continue;
             }
             if (c == '/' and i + 1 < code.len and code[i + 1] == '/') break;
-            try self.scanCodeChar(i, &line_scan);
+            i += try self.scanCodeChar(i, &line_scan);
         }
+        line_scan.out.events = self.event_scratch.items;
         return line_scan.out;
     }
 
@@ -824,9 +893,21 @@ const CFGBuildCtx = struct {
         }
     }
 
+    /// Entry for handleElse: a deferred close (lone `}` on an earlier line)
+    /// claims its saved entry; a same-line `} else` pops the entry directly
+    /// (pending_else is null there by construction — a close event precedes
+    /// the else keyword).
+    fn takeElseEntry(self: *CFGBuildCtx) ?StackEntry {
+        if (self.pending_else) |entry| {
+            self.pending_else = null;
+            return entry;
+        }
+        if (self.block_stack.items.len == 0) return null;
+        return self.block_stack.pop();
+    }
+
     fn handleElse(self: *CFGBuildCtx, t: []const u8, line: usize) !void {
-        if (self.block_stack.items.len == 0) return;
-        const entry = self.block_stack.pop() orelse return;
+        const entry = self.takeElseEntry() orelse return;
         const else_block = entry.merge_block;
         const merge_block = try self.cfg.addBlock();
         try self.cfg.addEdge(self.current_block, merge_block, .sequential);
@@ -877,6 +958,33 @@ const CFGBuildCtx = struct {
         }
     }
 
+    /// Close the top entry; an if_block/else_block close defers its merge
+    /// wiring into pending_else so a next-line else can still claim the
+    /// entry (the double-pop fix; else_if chains defer every link).
+    /// Everything else closes immediately.
+    fn handleBlockEndOrDefer(self: *CFGBuildCtx, line: usize) !void {
+        const items = self.block_stack.items;
+        if (items.len > 0) {
+            const bt = items[items.len - 1].block_type;
+            if (bt == .if_block or bt == .else_block) {
+                self.pending_else = self.block_stack.pop();
+                return;
+            }
+        }
+        try self.handleBlockEnd(line);
+    }
+
+    /// Wire a deferred if/else close that no else claimed: the body falls
+    /// through to the entry's merge, mirroring handleBlockEnd's generic
+    /// branch.
+    fn finishPendingElse(self: *CFGBuildCtx, line: usize) !void {
+        const entry = self.pending_else orelse return;
+        self.pending_else = null;
+        try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
+        self.current_block = entry.merge_block;
+        self.setStartLine(line);
+    }
+
     fn handleCatchStart(self: *CFGBuildCtx, line: usize) !void {
         const origin_block = self.current_block;
         const continuation_block = try self.cfg.addBlock();
@@ -907,6 +1015,44 @@ const CFGBuildCtx = struct {
             else => {},
         }
     }
+
+    /// Walk the line's ordered control events (event_scratch, filled by the
+    /// scanLineBraces call immediately before), dispatching CFG handlers in
+    /// position order. The line's pattern supplies the construct kind for
+    /// the opener dispatch; a close directly before an `.else_keyword` is
+    /// popped by handleElse, not handleBlockEnd.
+    fn walkLineEvents(self: *CFGBuildCtx, pattern: CFPattern, code: []const u8, line: usize) !void {
+        switch (pattern) {
+            .return_stmt => return self.handleReturn(),
+            .switch_arm => return self.handleSwitchArm(line),
+            else => {},
+        }
+        const events = self.event_scratch.items;
+        var opener_dispatched = false;
+        for (events, 0..) |event, idx| {
+            switch (event) {
+                .open_control => {
+                    if (opener_dispatched) continue;
+                    opener_dispatched = true;
+                    if (isControlOpener(pattern))
+                        try self.dispatchPattern(pattern, code, line);
+                },
+                .else_keyword => {
+                    opener_dispatched = true;
+                    try self.handleElse(code, line);
+                },
+                .close_control => {
+                    if (idx + 1 < events.len and events[idx + 1] == .else_keyword)
+                        continue;
+                    try self.handleBlockEndOrDefer(line);
+                },
+            }
+        }
+        // Opener whose control `{` is on a later line (Allman / multi-line
+        // condition): push the entry now; the pending mark claims that brace.
+        if (!opener_dispatched and isControlOpener(pattern))
+            try self.dispatchPattern(pattern, code, line);
+    }
 };
 
 fn hasInlineElseReturn(t: []const u8) bool {
@@ -930,6 +1076,8 @@ fn buildCFG(
     defer block_stack.deinit(allocator);
     var brace_stack = std.ArrayListUnmanaged(BraceKind).empty;
     defer brace_stack.deinit(allocator);
+    var event_scratch = std.ArrayListUnmanaged(ControlEvent).empty;
+    defer event_scratch.deinit(allocator);
 
     var ctx = CFGBuildCtx{
         .cfg = &cfg,
@@ -938,6 +1086,7 @@ fn buildCFG(
         .current_block = current_block,
         .func_line = func_line,
         .brace_stack = &brace_stack,
+        .event_scratch = &event_scratch,
         .paren_depth = 0,
         .seen_fn_body = false,
     };
@@ -948,10 +1097,14 @@ fn buildCFG(
         const code = stripLineComment(t);
         const pattern = detectCFPattern(code);
         const scan = try ctx.scanLineBraces(code, pattern);
+        // A deferred close with no else claiming it closes as no-else
+        // before this line is attributed. Comment lines never reach here;
+        // blank lines carry no code, so they must not clear the deferral.
+        if (ctx.pending_else != null and code.len > 0 and
+            !scanClaimsElse(pattern, scan.events))
+            try ctx.finishPendingElse(func_line + idx);
         cfg.blocks.items[ctx.current_block].end_line = func_line + idx;
-        // `}`/`};`/`},` closing an expression brace is not a block end.
-        if (pattern == .block_end and !scan.saw_control_close) continue;
-        try ctx.dispatchPattern(pattern, code, func_line + idx);
+        try ctx.walkLineEvents(pattern, code, func_line + idx);
         // Opener whose control `{` is on a later line (Allman, multi-line
         // condition); an inline-return else has no brace coming at all.
         if (isControlOpener(pattern) and !scan.saw_control_open and
@@ -26833,6 +26986,379 @@ test "buildCFG: switch nested in switch arm keeps both switches on the stack" {
     }
     try std.testing.expect(else_arm != null);
     try std.testing.expect(cfgHasEdge(&cfg, header, else_arm.?, .branch_true));
+}
+
+// ============================================================================
+// CFG ordered per-line event tests (EPH-I0079 A2)
+// ============================================================================
+
+fn cfgSucc(cfg: *const ControlFlowGraph, from: usize, kind: EdgeKind) ?usize {
+    for (cfg.edges.items) |e| {
+        if (e.from == from and e.kind == kind) return e.to;
+    }
+    return null;
+}
+
+test "buildCFG: same-line balanced if opens and pops on one line" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) { g(); }", // 2
+        "    h();", // 3: must land in the if's merge, not its true block
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, merge, .sequential));
+    const after = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(merge, after);
+}
+
+test "buildCFG: same-line if/else wires true, else, and merge blocks" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) { f(); } else { g(); }", // 2
+        "    h();", // 3: past both branches, in the shared merge
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // entry + true + else + merge: the else keyword opened a real block.
+    try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    // g() lives in the else block, which starts on the same line.
+    try std.testing.expectEqual(@as(usize, 2), cfg.blocks.items[else_block].start_line);
+    const merge = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(merge != true_block);
+    try std.testing.expect(merge != else_block);
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, merge, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_block, merge, .sequential));
+}
+
+test "buildCFG: same-line if with struct literal pops on one line" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) { const x = C{ .a = 1, }; g(); }", // 2
+        "    h();", // 3: in the merge — the literal's braces emitted no events
+        "}", // 4
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const merge = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, merge, .sequential));
+    const after = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(merge, after);
+}
+
+test "buildCFG: nested same-line if — literal close pops only the inner if" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (b) {", // 2
+        "        if (a) { const x = C{ .a = 1, }; g(); }", // 3
+        "        j();", // 4: inner if's merge, still inside the outer if
+        "    }", // 5
+        "    h();", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // Line 3 sits in the outer if's true block; the inner if branches from
+    // it, and line 4 must be the inner merge — not the inner true block
+    // (leaked pop) and not the outer merge (a misclassified literal close
+    // popping the outer entry).
+    const outer_true = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const inner_merge = cfgSucc(&cfg, outer_true, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const after_inner = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(inner_merge, after_inner);
+    const outer_merge = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, inner_merge, outer_merge, .sequential));
+}
+
+test "buildCFG: next-line else still pops the if and wires the else block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) {", // 2
+        "        g();", // 3
+        "    } else {", // 4
+        "        h();", // 5
+        "    }", // 6
+        "    i();", // 7
+        "}", // 8
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const g_block = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const h_block = findBlockForLine(&cfg, 5) orelse return error.TestUnexpectedResult;
+    const i_block = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(g_block != h_block);
+    try std.testing.expect(h_block != i_block);
+    try std.testing.expect(g_block != i_block);
+    try std.testing.expect(cfgHasEdge(&cfg, g_block, i_block, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, h_block, i_block, .sequential));
+}
+
+test "buildCFG: next-line else pairs with the if across the close" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (b) {", // 2
+        "        if (a) {", // 3
+        "            f();", // 4
+        "        }", // 5
+        "        else {", // 6
+        "            g();", // 7
+        "        }", // 8
+        "        j();", // 9: inner merge, still inside the outer if
+        "    }", // 10
+        "    h();", // 11: outer merge — the double-pop used to destroy this
+        "}", // 12
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const outer_false = cfgSucc(&cfg, cfg.entry_block, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const outer_true = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const inner_false = cfgSucc(&cfg, outer_true, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const g_block = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(inner_false, g_block); // g() in the false block
+    const j_block = findBlockForLine(&cfg, 9) orelse return error.TestUnexpectedResult;
+    const h_block = findBlockForLine(&cfg, 11) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(outer_false, h_block); // outer entry survived
+    try std.testing.expect(j_block != outer_false);
+    try std.testing.expect(cfgHasEdge(&cfg, j_block, h_block, .sequential));
+}
+
+test "buildCFG: comment line between close and else keeps the pairing" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (b) {", // 2
+        "        if (a) {", // 3
+        "            f();", // 4
+        "        }", // 5
+        "        // end if", // 6: comment must not clear the deferred close
+        "        else {", // 7
+        "            g();", // 8
+        "        }", // 9
+        "        j();", // 10
+        "    }", // 11
+        "}", // 12
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const outer_false = cfgSucc(&cfg, cfg.entry_block, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const outer_true = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const inner_false = cfgSucc(&cfg, outer_true, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const g_block = findBlockForLine(&cfg, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(inner_false, g_block);
+    const j_block = findBlockForLine(&cfg, 10) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(j_block != g_block);
+    try std.testing.expect(cfgHasEdge(&cfg, j_block, outer_false, .sequential));
+}
+
+test "buildCFG: deferred if-close finishes as no-else on a plain statement" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (b) {", // 2
+        "        if (a) {", // 3
+        "            f();", // 4
+        "        }", // 5
+        "        x = 1;", // 6: no else — the deferred close wires the merge
+        "    }", // 7
+        "    h();", // 8
+        "}", // 9
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const outer_false = cfgSucc(&cfg, cfg.entry_block, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const outer_true = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const inner_merge = cfgSucc(&cfg, outer_true, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const stmt_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(inner_merge, stmt_block);
+    const h_block = findBlockForLine(&cfg, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(outer_false, h_block);
+    try std.testing.expect(cfgHasEdge(&cfg, stmt_block, h_block, .sequential));
+}
+
+test "buildCFG: lone close then next-line else wires four blocks" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) {", // 2
+        "        g();", // 3
+        "    }", // 4: lone close defers the if entry into pending_else
+        "    else {", // 5: claims the saved entry instead of popping again
+        "        h();", // 6
+        "    }", // 7
+        "    i();", // 8
+        "}", // 9
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // entry + true + else + merge: the deferred close paired with the else.
+    try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 5), cfg.blocks.items[else_block].start_line);
+    const g_block = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const h_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(true_block, g_block);
+    try std.testing.expectEqual(else_block, h_block);
+    const i_block = findBlockForLine(&cfg, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(i_block != true_block);
+    try std.testing.expect(i_block != else_block);
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, i_block, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_block, i_block, .sequential));
+}
+
+test "buildCFG: multi-line else-if chain pairs each close with its else" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a) {", // 2
+        "        g();", // 3
+        "    }", // 4: defers the if entry
+        "    else if (b) {", // 5: claims it, pushes the else-if entry
+        "        h();", // 6
+        "    }", // 7: defers the else-if entry
+        "    else {", // 8: claims it
+        "        j();", // 9
+        "    }", // 10
+        "    i();", // 11
+        "}", // 12
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const g_block = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const h_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    const j_block = findBlockForLine(&cfg, 9) orelse return error.TestUnexpectedResult;
+    // Three bodies, three distinct blocks.
+    try std.testing.expect(g_block != h_block);
+    try std.testing.expect(h_block != j_block);
+    try std.testing.expect(g_block != j_block);
+    // The chain branches from the entry: true body, then the else-if body.
+    try std.testing.expectEqual(g_block, cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult);
+    try std.testing.expectEqual(h_block, cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult);
+    // One shared merge past the chain.
+    const i_block = findBlockForLine(&cfg, 11) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(i_block != g_block);
+    try std.testing.expect(i_block != h_block);
+    try std.testing.expect(i_block != j_block);
+    try std.testing.expect(cfgHasEdge(&cfg, h_block, i_block, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, j_block, i_block, .sequential));
+}
+
+test "buildCFG: blank line between close and else keeps the pairing" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) {", // 2
+        "        g();", // 3
+        "    }", // 4
+        "", // 5: blank line must not clear the deferred close
+        "    else {", // 6
+        "        h();", // 7
+        "    }", // 8
+        "    i();", // 9
+        "}", // 10
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const true_block = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const h_block = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(else_block, h_block);
+    const i_block = findBlockForLine(&cfg, 9) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, true_block, i_block, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_block, i_block, .sequential));
 }
 
 // ============================================================================

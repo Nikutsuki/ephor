@@ -1670,10 +1670,11 @@ fn hasReassignmentBetween(
 }
 
 /// Check if position is an assignment target (not a read) - includes subscript
-/// Check if text starts with `=` but not `==`
+/// Check if text starts with an assignment `=`: `==` is a comparison and
+/// `=>` is a switch prong; neither assigns.
 fn isAssignmentOp(text: []const u8) bool {
     if (!mem.startsWith(u8, text, "=")) return false;
-    return !mem.startsWith(u8, text, "==");
+    return text.len == 1 or (text[1] != '=' and text[1] != '>');
 }
 
 /// Find closing bracket and check if `=` follows. Returns true if assignment.
@@ -1760,44 +1761,6 @@ fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
     }
 
     return false;
-}
-
-/// Track assignments to undefined vars
-fn trackAssignments(
-    t: []const u8,
-    undef_vars: *std.StringHashMap(usize),
-    def_vars: *std.StringHashMap(void),
-) !void {
-    var iter = undef_vars.iterator();
-    while (iter.next()) |entry| {
-        const name = entry.key_ptr.*;
-        const pos = mem.indexOf(u8, t, name) orelse continue;
-        if (isAssignmentTarget(t, name, pos)) try def_vars.put(name, {});
-    }
-}
-
-/// Mutable state for line-based undefined-read tracking: the vars declared
-/// `= undefined`, the vars since assigned, and the first-read findings.
-const UndefReadCtx = struct {
-    undef_vars: *std.StringHashMap(usize),
-    def_vars: *std.StringHashMap(void),
-    issues: *std.StringHashMap(usize),
-};
-
-/// Check for reads of undefined vars
-fn checkUndefinedReads(
-    t: []const u8,
-    line: usize,
-    ctx: UndefReadCtx,
-) !void {
-    var iter = ctx.undef_vars.iterator();
-    while (iter.next()) |entry| {
-        const name = entry.key_ptr.*;
-        if (ctx.def_vars.contains(name)) continue;
-        const pos = mem.indexOf(u8, t, name) orelse continue;
-        if (isAssignmentTarget(t, name, pos)) continue;
-        try ctx.issues.put(name, line);
-    }
 }
 
 /// Compute which block a line belongs to
@@ -2548,8 +2511,17 @@ fn blockContainsAssignment(
     while (j < limit and block_depth > 0) : (j += 1) {
         const inner = mem.trim(u8, lines[j], " \t\r");
         block_depth = computeBraceDepth(inner, block_depth);
-        if (mem.indexOf(u8, inner, var_name)) |vpos| {
-            if (isAssignmentTarget(inner, var_name, vpos)) return true;
+        var s: usize = 0;
+        while (mem.indexOf(u8, inner[s..], var_name)) |rel| {
+            const pos = s + rel;
+            s = pos + var_name.len;
+            // The match must be the variable itself: not mid-identifier
+            // (box =) and not a field of another var (foo.x =).
+            if (pos > 0 and isIdent(inner[pos - 1])) continue;
+            if (pos > 0 and inner[pos - 1] == '.') continue;
+            if (pos + var_name.len < inner.len and
+                isIdent(inner[pos + var_name.len])) continue;
+            if (isAssignmentTarget(inner, var_name, pos)) return true;
         }
     }
     return false;
@@ -8570,12 +8542,17 @@ fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
     // same-line loop header plus var_name[...] counts as a fill.
     if (mem.indexOf(u8, t, "for ") == null and mem.indexOf(u8, t, "for(") == null)
         return false;
-    const pos = mem.indexOf(u8, t, var_name) orelse return false;
-    // The match must be the variable itself: not mid-identifier (box[i])
-    // and not a field of another var (foo.x[i]).
-    if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) return false;
-    const end = pos + var_name.len;
-    return end < t.len and t[end] == '[';
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        // The match must be the variable itself: not mid-identifier (box[i])
+        // and not a field of another var (foo.x[i]).
+        if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) continue;
+        const end = pos + var_name.len;
+        if (end < t.len and t[end] == '[') return true;
+    }
+    return false;
 }
 
 /// Check if &var_name is passed to a call that fills its output buffer.
@@ -8600,13 +8577,18 @@ fn hasFillCall(t: []const u8, var_name: []const u8) bool {
 fn hasModifyingMethodCall(t: []const u8, var_name: []const u8) bool {
     const modifying_methods = compat.getModifyingMethodPatterns();
     for (modifying_methods) |method| {
-        const var_pos = mem.indexOf(u8, t, var_name) orelse continue;
-        // The receiver must be the variable itself: not mid-identifier
-        // (box.append) and not a field of another var (foo.x.append).
-        if (var_pos > 0 and (isIdent(t[var_pos - 1]) or t[var_pos - 1] == '.')) continue;
-        const after_var = var_pos + var_name.len;
-        if (after_var + method.len > t.len) continue;
-        if (mem.startsWith(u8, t[after_var..], method)) return true;
+        var s: usize = 0;
+        while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+            const var_pos = s + rel;
+            s = var_pos + var_name.len;
+            // The receiver must be the variable itself: not mid-identifier
+            // (box.append) and not a field of another var (foo.x.append).
+            if (var_pos > 0 and
+                (isIdent(t[var_pos - 1]) or t[var_pos - 1] == '.')) continue;
+            const after_var = var_pos + var_name.len;
+            if (after_var + method.len > t.len) continue;
+            if (mem.startsWith(u8, t[after_var..], method)) return true;
+        }
     }
     return false;
 }
@@ -28605,6 +28587,239 @@ test "ZA607: init call on other var does not mask read" {
     );
 }
 
+test "isAssignmentOp rejects switch prong arrow and comparisons" {
+    // EPH-I0082: `=>` is a switch prong, not an assignment — accepting it
+    // blinded hasVarRead to genuine reads in prong position and poisoned
+    // the gen set with a non-assignment.
+    try std.testing.expect(isAssignmentOp("= 1;"));
+    try std.testing.expect(isAssignmentOp("="));
+    try std.testing.expect(!isAssignmentOp("== 1;"));
+    try std.testing.expect(!isAssignmentOp("=> 1,"));
+    try std.testing.expect(!isAssignmentOp(">= 1;"));
+    try std.testing.expect(!isAssignmentOp("x = 1;"));
+}
+
+test "hasModifyingMethodCall scans every occurrence" {
+    // EPH-I0082: the first occurrence may be a different variable (box);
+    // checking only it missed the genuine receiver later on the line.
+    try std.testing.expect(hasModifyingMethodCall("box.append(1); x.append(2);", "x"));
+    try std.testing.expect(!hasModifyingMethodCall("box.append(1);", "x"));
+    try std.testing.expect(!hasModifyingMethodCall("foo.x.append(1);", "x"));
+}
+
+test "hasForLoopIndexedFill scans every occurrence" {
+    // EPH-I0082: same first-occurrence blindness as hasModifyingMethodCall.
+    try std.testing.expect(hasForLoopIndexedFill("for (box) |b| x[b] = 1;", "x"));
+    try std.testing.expect(!hasForLoopIndexedFill("for (items) |i| box[i] = 1;", "x"));
+    try std.testing.expect(!hasForLoopIndexedFill("for (items) |i| foo.x[i] = 1;", "x"));
+    try std.testing.expect(!hasForLoopIndexedFill("x[i] = 1;", "x"));
+}
+
+test "blockContainsAssignment scans every occurrence with word boundaries" {
+    // EPH-I0082: a read occurrence (x == 1) must not hide a later genuine
+    // assignment on the same line, and `box = 1` must not count for x.
+    const lines = [_][]const u8{ "x == 1; x = 2;", "}" };
+    try std.testing.expect(blockContainsAssignment(&lines, 0, 1, "x"));
+    const other = [_][]const u8{"box = 1;"};
+    try std.testing.expect(!blockContainsAssignment(&other, 0, 1, "x"));
+    const field = [_][]const u8{"foo.x = 1;"};
+    try std.testing.expect(!blockContainsAssignment(&field, 0, 1, "x"));
+}
+
+test "ZA607: or-guard read not suppressed by other-var assignment in body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0082 repro: blockContainsAssignment matched "x" inside "box" and
+    // accepted the `=` after it, so isOrShortCircuitSafe suppressed the
+    // genuine condition read of x.
+    const content =
+        \\fn reproCondOnly(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c or x == 1) {
+        \\        box = 1;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_orguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_orguard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard read stays silent when body genuinely assigns" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The boundary guard must keep the established or-short-circuit
+    // suppression when the body really assigns x (loop-carried class).
+    const content =
+        \\fn negOr(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c or x == 1) {
+        \\        x = 1;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_orguard_neg.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_orguard_neg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: correlated-guard read not suppressed by other-var assignment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0082: same name-blindness via the isCorrelatedGuardRead call
+    // site of blockContainsAssignment — `box = 1` is not an x assignment.
+    const content =
+        \\fn reproCorr(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        box = 1;
+        \\    }
+        \\    if (c) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_corrguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_corrguard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: correlated guard with genuine assignment stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Genuine correlated assignment must keep suppressing (x is read only
+    // under the same guard that assigned it).
+    const content =
+        \\fn negCorr(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    }
+        \\    if (c) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_corr_neg.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_corr_neg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: comparison operators in or-condition are reads on every path" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `!=`, `<=`, `>=` in the condition all read x; a body assigning only
+    // box must not suppress any of them (== is covered by the repro test).
+    const content =
+        \\fn cmpNe(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c or x != 1) {
+        \\        box = 1;
+        \\    }
+        \\}
+        \\fn cmpLe(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c or x <= 1) {
+        \\        box = 1;
+        \\    }
+        \\}
+        \\fn cmpGe(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c or x >= 1) {
+        \\        box = 1;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_cmp_ops.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        3,
+        countRuleIssues(run.issues.items, "da_cmp_ops.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: switch prong arrow does not count as assignment" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0082: isAssignmentOp accepted `=>`, so `x => ...` both gen'd x
+    // and blinded hasVarRead to the genuine prong read.
+    const content =
+        \\fn reproSwitch(c: u32) u32 {
+        \\    var x: u32 = undefined;
+        \\    const y = switch (c) {
+        \\        x => 1,
+        \\        else => 0,
+        \\    };
+        \\    return y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_prong.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_prong.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: switch prong read of assigned var stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // With x genuinely assigned before the switch, the prong read is safe;
+    // the `=>` fix must not introduce a false positive here.
+    const content =
+        \\fn negSwitchAssigned(c: u32) u32 {
+        \\    var x: u32 = undefined;
+        \\    x = 5;
+        \\    const y = switch (c) {
+        \\        x => 1,
+        \\        else => 0,
+        \\    };
+        \\    return y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_prong_neg.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_prong_neg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "integration: no false positive for valid catch-free-return" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -32162,6 +32377,39 @@ test "ZA204 no FP for memset after undefined" {
 
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.file, "test_za204_fill.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
+        }
+    }
+}
+
+test "ZA204 no FP when modifying method call follows other-var receiver" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // EPH-I0082: hasModifyingMethodCall checked only the first occurrence
+    // of the name; with box first, the genuine x.append fill was missed
+    // and x stayed in the pending-undefined set.
+    const test_content =
+        \\const std = @import("std");
+        \\fn foo() void {
+        \\    var x: u32 = undefined;
+        \\    box.append(1); x.append(2);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_occur.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_occur.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "test_za204_occur.zig")) {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
         }
     }

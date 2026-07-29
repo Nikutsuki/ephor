@@ -466,7 +466,9 @@ const CFPatternEntry = struct {
 const cf_patterns = [_]CFPatternEntry{
     .{ .prefix = "} else if", .exact = false, .result = .else_if },
     .{ .prefix = "} else", .exact = false, .result = .else_start },
-    .{ .prefix = "else if", .exact = false, .result = .else_if }, // close on previous line
+    // Line-start else-if (close on previous line); word-delimited like if/if(
+    .{ .prefix = "else if ", .exact = false, .result = .else_if },
+    .{ .prefix = "else if(", .exact = false, .result = .else_if },
     .{ .prefix = "else {", .exact = true, .result = .else_start },
     .{ .prefix = "if ", .exact = false, .result = .if_start },
     .{ .prefix = "if(", .exact = false, .result = .if_start },
@@ -27359,6 +27361,28 @@ test "buildCFG: blank line between close and else keeps the pairing" {
     const i_block = findBlockForLine(&cfg, 9) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cfgHasEdge(&cfg, true_block, i_block, .sequential));
     try std.testing.expect(cfgHasEdge(&cfg, else_block, i_block, .sequential));
+}
+
+test "buildCFG: bare else-identifier line is not an else-if" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) {", // 2
+        "        g();", // 3
+        "    }", // 4
+        "    else ifx;", // 5: else branch holding an identifier statement
+        "}", // 6
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // `else ifx;` must not dispatch handleElse: no phantom else block, no
+    // stolen pending brace — entry, true block, and merge only.
+    try std.testing.expectEqual(@as(usize, 3), cfg.blocks.items.len);
 }
 
 // ============================================================================

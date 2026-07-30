@@ -1111,11 +1111,15 @@ const CFGBuildCtx = struct {
         return line_scan.out;
     }
 
-    fn handleBranch(self: *CFGBuildCtx, bt: BlockType, line: usize) !void {
+    fn handleBranch(self: *CFGBuildCtx, bt: BlockType, t: []const u8, line: usize) !void {
         const true_block = try self.cfg.addBlock();
         const false_block = try self.cfg.addBlock();
         try self.cfg.addEdge(self.current_block, true_block, .branch_true);
-        try self.cfg.addEdge(self.current_block, false_block, .branch_false);
+        // A `while (true)` condition never goes false, so the zero-trip
+        // exit is a phantom path. Wiring it would blame post-loop reads
+        // that the body always covers before a break (EPH-I0110).
+        if (bt != .while_block or !isWhileLiteralTrue(t))
+            try self.cfg.addEdge(self.current_block, false_block, .branch_false);
         const origin = if (bt == .while_block or bt == .for_block)
             self.current_block
         else
@@ -1464,9 +1468,9 @@ const CFGBuildCtx = struct {
 
     fn dispatchPattern(self: *CFGBuildCtx, pattern: CFPattern, t: []const u8, line: usize) !void {
         switch (pattern) {
-            .if_start => try self.handleBranch(.if_block, line),
-            .while_start => try self.handleBranch(.while_block, line),
-            .for_start => try self.handleBranch(.for_block, line),
+            .if_start => try self.handleBranch(.if_block, t, line),
+            .while_start => try self.handleBranch(.while_block, t, line),
+            .for_start => try self.handleBranch(.for_block, t, line),
             .switch_start => try self.handleSwitchStart(),
             .switch_arm => try self.handleSwitchArm(line),
             .else_start, .else_if => try self.handleElse(t, line),
@@ -1537,6 +1541,25 @@ const CFGBuildCtx = struct {
         }
     }
 };
+
+/// True when the line opens a `while` whose condition is the literal
+/// `true`: the false exit is a phantom path, since the loop can only end
+/// through a break (EPH-I0110). A condition that spans lines has no `)`
+/// on this line and keeps the false edge, the conservative direction.
+fn isWhileLiteralTrue(t: []const u8) bool {
+    if (!mem.startsWith(u8, t, "while")) return false;
+    const open = mem.indexOfScalar(u8, t, '(') orelse return false;
+    var depth: usize = 0;
+    for (t[open..], 0..) |c, i| {
+        if (c == '(') depth += 1;
+        if (c != ')') continue;
+        depth -= 1;
+        if (depth != 0) continue;
+        const cond = mem.trim(u8, t[open + 1 .. open + i], " \t");
+        return mem.eql(u8, cond, "true");
+    }
+    return false;
+}
 
 fn hasInlineElseReturn(t: []const u8) bool {
     const else_pos = mem.indexOf(u8, t, "else") orelse return false;
@@ -2078,14 +2101,16 @@ fn isElseBodyStart(t: []const u8) bool {
 }
 
 /// True when a line opens a conditional body for the fill-before-use scan:
-/// an `if`/`else` at line start, or an `else`/`if` after leading
-/// block-closing `}` chars. The leading `}` chars pay the depth down during
-/// the char scan; this increment re-opens it for the new arm's body, so a
-/// fill inside an else arm stays conditional instead of looking like a
-/// top-level statement (EPH-I0087, EPH-I0108). A switch prong `else =>`
-/// never opens a conditional body: with the switch brace counted as an
-/// expression brace, the prong's depth would leak past the switch's `};`
-/// (EPH-I0106).
+/// an `if`/`else` at line start, an `else`/`if` after leading
+/// block-closing `}` chars, or a `while`/`for` loop opener. The leading
+/// `}` chars pay the depth down during the char scan; this increment
+/// re-opens it for the new arm's body, so a fill inside an else arm stays
+/// conditional instead of looking like a top-level statement (EPH-I0087,
+/// EPH-I0108). A loop body is conditional the same way: the loop may run
+/// zero times, so a fill inside never counts as unconditional (EPH-I0110).
+/// A switch prong `else =>` never opens a conditional body: with the
+/// switch brace counted as an expression brace, the prong's depth would
+/// leak past the switch's `};` (EPH-I0106).
 fn opensConditionalBody(check_line: []const u8) bool {
     var rest = check_line;
     while (rest.len > 0 and rest[0] == '}') {
@@ -2096,7 +2121,7 @@ fn opensConditionalBody(check_line: []const u8) bool {
         const after_else = mem.trimStart(u8, rest["else".len..], " \t");
         return !mem.startsWith(u8, after_else, "=>");
     }
-    return isConditionalStart(rest);
+    return isConditionalStart(rest) or isLoopStart(rest);
 }
 
 /// Column just past the declaration `=` on a `var`/`const` line, or null
@@ -2267,11 +2292,13 @@ fn isContainerParenHeader(code: []const u8, close_idx: usize) bool {
     return false;
 }
 
-/// Tracks if/else nesting depth during the fill-before-use scan. A `}`
-/// closes a conditional block only when no expression brace is pending:
-/// braces in struct literals, call args, strings, and comments never move
-/// the depth (EPH-I0083, EPH-I0085). An `else` after the closing `}` of
-/// the previous arm re-opens the depth for the next arm (EPH-I0087).
+/// Tracks if/else and loop nesting depth during the fill-before-use scan.
+/// A `}` closes a conditional block only when no expression brace is
+/// pending: braces in struct literals, call args, strings, and comments
+/// never move the depth (EPH-I0083, EPH-I0085). An `else` after the
+/// closing `}` of the previous arm re-opens the depth for the next arm
+/// (EPH-I0087). A loop opener opens the depth like an `if` does: the body
+/// may run zero times, so fills inside stay conditional (EPH-I0110).
 const CondNesting = struct {
     depth: usize = 0, // open if/else blocks
     pending_expr: usize = 0, // unmatched expression-position `{`
@@ -29472,11 +29499,11 @@ test "ZA607: fill before break in while-else stays silent" {
 
     // Guard (EPH-I0094): every path to the read fills x. The body fill
     // dominates the break, and the else fill covers the zero-trip path.
-    // The DA pre-filter scores the loop-body fill as unconditional and
-    // drops x before CFG analysis, so this test pins end-to-end silence.
-    // It cannot catch a break-model regression: the break edge and the
-    // fall-through carry the same filled state. Break-model coverage
-    // lives in "ZA607: break before fill in while-else body is detected".
+    // Since EPH-I0110 the pre-filter scores the loop-body fill as
+    // conditional and defers, so the CFG break model decides the silence
+    // here. The break edge and the fall-through carry the same filled
+    // state, so this test stays silent. Break-model coverage lives in
+    // "ZA607: break before fill in while-else body is detected".
     const content =
         \\fn use(v: u32) void {
         \\    _ = v;
@@ -29533,6 +29560,155 @@ test "ZA607: continue before fill still flags the post-loop read" {
         1,
         countRuleIssues(run.issues.items, "da_cont_fill.zig", RULE_DEFINITE_ASSIGNMENT),
     );
+}
+
+test "ZA607: while-body fill alone does not cover the zero-trip path" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0110: the loop may run zero times, so the body fill is
+    // conditional. The entry filter must defer to the CFG, whose
+    // branch_false edge from the header carries the unfilled state to the
+    // post-loop read.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn whileBodyFill() void {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < 3) : (i += 1) {
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_while_body.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_while_body.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: while-else with fills on both arms stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0110 regression lock: the else arm covers the zero-trip path
+    // and the body fill covers every break-free exit, so the read stays
+    // silent on both sides of the entry-filter fix.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn whileElseBothFill(c: bool) void {
+        \\    var w: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < 3) : (i += 1) {
+        \\        w = 1;
+        \\    } else {
+        \\        w = 2;
+        \\    }
+        \\    if (c) {
+        \\        use(9);
+        \\    }
+        \\    use(w);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_we_both.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_we_both.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: for-body fill alone does not cover the zero-trip path" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0110: a for over a slice runs zero times on an empty slice,
+    // the same zero-trip class as the while shape.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn forBodyFill(slice: []const u32) void {
+        \\    var x: u32 = undefined;
+        \\    for (slice) |it| {
+        \\        x = it;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_for_body.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_for_body.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: while(true) fill dominating the break stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0110: a literal-true condition has no zero-trip path. The only
+    // exit is the break, which the fill dominates, so the read is covered.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn whileTrueBreak() void {
+        \\    var x: u32 = undefined;
+        \\    while (true) {
+        \\        x = 1;
+        \\        break;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_wt_break.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_wt_break.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "buildCFG: while(true) wires no false exit" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0110: a literal-true condition never goes false, so the header
+    // keeps only the body edge. The loop-back edge is untouched.
+    const lines = [_][]const u8{
+        "fn f() void {", // 1
+        "    while (true) {", // 2
+        "        g();", // 3
+        "    }", // 4
+        "}", // 5
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const header = findBlockForLine(&cfg, 2) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgSucc(&cfg, header, .branch_false) == null);
+    const body = cfgSucc(&cfg, header, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, body, header, .loop_back));
 }
 
 test "ZA607: switch-arm break does not poison the switch merge" {

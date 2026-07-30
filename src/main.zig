@@ -2082,15 +2082,20 @@ fn isElseBodyStart(t: []const u8) bool {
 /// block-closing `}` chars. The leading `}` chars pay the depth down during
 /// the char scan; this increment re-opens it for the new arm's body, so a
 /// fill inside an else arm stays conditional instead of looking like a
-/// top-level statement (EPH-I0087, EPH-I0108).
+/// top-level statement (EPH-I0087, EPH-I0108). A switch prong `else =>`
+/// never opens a conditional body: with the switch brace counted as an
+/// expression brace, the prong's depth would leak past the switch's `};`
+/// (EPH-I0106).
 fn opensConditionalBody(check_line: []const u8) bool {
-    if (isConditionalStart(check_line)) return true;
     var rest = check_line;
     while (rest.len > 0 and rest[0] == '}') {
         rest = mem.trimStart(u8, rest[1..], " \t");
     }
-    if (isElseBodyStart(rest)) return true;
-    if (rest.len == check_line.len) return false;
+    if (isElseBodyStart(rest)) {
+        // A switch prong (`else => 0,`) is not a conditional arm.
+        const after_else = mem.trimStart(u8, rest["else".len..], " \t");
+        return !mem.startsWith(u8, after_else, "=>");
+    }
     return isConditionalStart(rest);
 }
 
@@ -2217,6 +2222,51 @@ const FillScan = struct {
     }
 };
 
+/// True when `name` is a type/container keyword whose parenthesized
+/// header precedes an expression brace: `switch (y) {`, `union(enum) {`,
+/// `enum(u8) {`. The closing brace of such a form never closes a
+/// conditional block (EPH-I0106).
+fn isContainerKeyword(name: []const u8) bool {
+    const keywords = [_][]const u8{ "switch", "union", "enum", "struct", "error", "opaque" };
+    for (keywords) |kw| {
+        if (mem.eql(u8, name, kw)) return true;
+    }
+    return false;
+}
+
+/// Identifier token immediately before `pos` in `code`, skipping spaces
+/// and tabs. Returns an empty slice when no identifier precedes `pos`.
+fn identBefore(code: []const u8, pos: usize) []const u8 {
+    var end = pos;
+    while (end > 0 and (code[end - 1] == ' ' or code[end - 1] == '\t')) end -= 1;
+    var start = end;
+    while (start > 0 and isIdent(code[start - 1])) start -= 1;
+    return code[start..end];
+}
+
+/// True when the `)` at `close_idx` closes the parenthesized header of a
+/// type/container expression on this line: a depth-counted backward scan
+/// finds the matching `(`, and the identifier before it is a container
+/// keyword (EPH-I0106). A multi-line header has no `(` on this line and
+/// falls back to false. Control keywords (`if`, `while`, `for`) and
+/// non-keyword identifiers also fall back to false.
+fn isContainerParenHeader(code: []const u8, close_idx: usize) bool {
+    var depth: usize = 0;
+    var k = close_idx;
+    while (k > 0) {
+        k -= 1;
+        switch (code[k]) {
+            ')' => depth += 1,
+            '(' => {
+                if (depth == 0) return isContainerKeyword(identBefore(code, k));
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Tracks if/else nesting depth during the fill-before-use scan. A `}`
 /// closes a conditional block only when no expression brace is pending:
 /// braces in struct literals, call args, strings, and comments never move
@@ -2226,6 +2276,11 @@ const CondNesting = struct {
     depth: usize = 0, // open if/else blocks
     pending_expr: usize = 0, // unmatched expression-position `{`
     paren_depth: usize = 0, // unmatched ( or [ — call args span lines
+    // Whether the header that opened the current paren span belongs to a
+    // type/container keyword. Set only on the 0-to-1 transition so nested
+    // parens never clobber it (EPH-I0106). The next span's transition
+    // overwrites it, so it needs no clearing when the span closes.
+    paren_container: bool = false,
     mode: QuoteMode = .none,
 
     /// Advance the state across one trimmed source line.
@@ -2250,7 +2305,12 @@ const CondNesting = struct {
     /// Fold one quote-free, comment-free char into the nesting state.
     fn scanChar(self: *CondNesting, code: []const u8, i: usize) void {
         switch (code[i]) {
-            '(', '[' => self.paren_depth += 1,
+            '(', '[' => {
+                if (self.paren_depth == 0) {
+                    self.paren_container = isContainerKeyword(identBefore(code, i));
+                }
+                self.paren_depth += 1;
+            },
             ')', ']' => self.paren_depth -|= 1,
             '{' => if (self.isExprBraceOpen(code, i)) {
                 self.pending_expr += 1;
@@ -2274,9 +2334,15 @@ const CondNesting = struct {
     /// call arg, block expression) rather than a control block. Inside
     /// parens or a pending expression every brace is an expression brace;
     /// otherwise the preceding non-space char decides: `.`, `=`, `,` and
-    /// friends open expressions, `)` and `|` end a control keyword's
-    /// condition or payload, and an identifier opens an expression unless
-    /// it is the `else` keyword.
+    /// friends open expressions, `|` ends a payload, and an identifier
+    /// opens an expression unless it is the `else` keyword. A `)` ends a
+    /// control keyword's condition, except when the matching `(` belongs
+    /// to a type/container header such as `switch (y)` or `union(enum)` —
+    /// that brace opens an expression (EPH-I0106). When the header spans
+    /// lines, the same-line scan finds no `(` and the paren_container
+    /// flag recorded at the span's opening paren decides instead. The
+    /// flag is always fresh here: in balanced code the `)` that returned
+    /// paren_depth to 0 closed the span whose opening set the flag.
     fn isExprBraceOpen(self: *const CondNesting, code: []const u8, i: usize) bool {
         if (self.paren_depth > 0) return true;
         if (self.pending_expr > 0) return true;
@@ -2286,7 +2352,8 @@ const CondNesting = struct {
         const prev = code[j - 1];
         switch (prev) {
             '.', '=', '(', '[', ',', '>', ':' => return true,
-            ')', '|' => return false,
+            '|' => return false,
+            ')' => return isContainerParenHeader(code, j - 1) or self.paren_container,
             else => {},
         }
         if (!isIdent(prev)) return false;
@@ -31419,6 +31486,319 @@ test "ZA607: switch prong read of assigned var stays silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_prong_neg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: switch expr struct prongs inside if keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: the `)` before the switch brace misread the brace as a
+    // control block, so the switch's `};` popped the if depth early and
+    // the fill passed as unconditional. The fill must stay conditional.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool, y: u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const v = switch (y) {
+        \\            1 => .{ .a = 1 },
+        \\            2 => .{ .a = 2 },
+        \\        };
+        \\        _ = v.a;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_swexpr2.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_swexpr2.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: switch expr scalar prongs inside if keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: same paren-container brace bug as the struct-prong case.
+    // Scalar prongs carry no inner braces, so the switch's `};` was the
+    // only close and it popped the if depth early.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool, y: u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const v = switch (y) {
+        \\            1 => 10,
+        \\            2 => 20,
+        \\        };
+        \\        _ = v;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_swexpr3.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_swexpr3.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: union(enum) decl inside if keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: `union(enum) {` has the same `)`-preceded brace as a
+    // switch header. Its `};` popped the if depth early and hid the
+    // conditional fill from the scan.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const T = union(enum) {
+        \\            a: u32,
+        \\            b: f64,
+        \\        };
+        \\        _ = T;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_unionenum.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_unionenum.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: enum(u8) decl inside if keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: `enum(u8) {` shares the `)`-preceded brace shape with
+    // `union(enum) {` and needs the same expression-brace classification.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const E = enum(u8) {
+        \\            a,
+        \\            b,
+        \\        };
+        \\        _ = E;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_enumtagged.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_enumtagged.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: switch expr else prong inside if keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: the old code fired here only by accident — the `else =>`
+    // line-prefix quirk added the depth that the switch's `};` then
+    // popped. The fix must keep this detection intentional.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool, y: u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const v = switch (y) {
+        \\            1 => .{ .a = 1 },
+        \\            else => .{ .a = 2 },
+        \\        };
+        \\        _ = v.a;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_swexpr_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_swexpr_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: top-level switch else prong does not leak conditional depth" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: with the switch brace counted as an expression brace, an
+    // `else =>` prong that still opened conditional depth would leak +1
+    // and mark the unconditional fill below as conditional. The prong
+    // must not open depth, so the fill wins and no issue fires.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: u32) void {
+        \\    var x: u32 = undefined;
+        \\    const y = switch (c) {
+        \\        1 => 1,
+        \\        else => 2,
+        \\    };
+        \\    _ = y;
+        \\    x = 1;
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_swexpr_top.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_swexpr_top.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line switch header inside if keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: the header spans lines, so the same-line paren scan
+    // finds no `(` on the `) {` line. The container flag recorded at the
+    // header's opening paren must classify the brace as an expression
+    // brace. Without it the `};` pops the if depth early.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool, y: u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const v = switch (
+        \\            y
+        \\        ) {
+        \\            1 => 10,
+        \\            else => 20,
+        \\        };
+        \\        _ = v;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_multiline_hdr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_multiline_hdr.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line switch header with call args keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: a call inside a multi-line header adds nested parens.
+    // The flag records the container keyword at the 0-to-1 transition,
+    // and the nested call parens must not clobber it.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn id(a: u32, b: u32) u32 {
+        \\    return a + b;
+        \\}
+        \\fn f(c: bool, y: u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const v = switch (id(y,
+        \\            1)) {
+        \\            1 => 10,
+        \\            else => 20,
+        \\        };
+        \\        _ = v;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_multiline_callargs.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_multiline_callargs.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line switch header without else prong keeps fill conditional" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0106: the no-else multi-line shape was a false negative even
+    // before the else-prong fix, because no quirk ever balanced the
+    // switch's `};`. The container flag closes the whole family.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool, y: u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const v = switch (
+        \\            y
+        \\        ) {
+        \\            1 => 10,
+        \\            2 => 20,
+        \\        };
+        \\        _ = v;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_multiline_noelse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_multiline_noelse.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

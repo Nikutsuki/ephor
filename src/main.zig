@@ -2651,8 +2651,17 @@ const ForLoopTracker = struct {
 
     fn checkLoopEnd(self: *ForLoopTracker, t: []const u8) void {
         if (!self.in_loop or mem.indexOf(u8, t, "}") == null) return;
+        // String and char content carries no braces: a '}' inside a
+        // literal must not end the loop early (EPH-I0107).
         var brace_count: i32 = 0;
-        for (t) |c| {
+        var mode: QuoteMode = .none;
+        var i: usize = 0;
+        while (i < t.len) : (i += 1) {
+            const c = t[i];
+            if (scanQuoteStep(&mode, c)) |skip| {
+                i += skip;
+                continue;
+            }
             if (c == '{') brace_count += 1;
             if (c == '}') brace_count -= 1;
         }
@@ -3434,9 +3443,17 @@ fn blockContainsAssignment(
 }
 
 /// Compute brace depth for a line given initial depth, returning new depth.
+/// String and char content carries no braces (EPH-I0107).
 fn computeBraceDepth(t: []const u8, initial: usize) usize {
     var depth = initial;
-    for (t) |c| {
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
         if (c == '{') depth += 1;
         if (c == '}' and depth > 0) depth -= 1;
     }
@@ -3538,27 +3555,41 @@ const BackwardBraceResult = struct {
     opens_enclosing_block: bool,
 };
 
-/// Scan a line in reverse for backward brace matching. Walking upward from a
-/// read, '}' enters a completed sibling block (depth +1) and '{' closes it
-/// (depth -1). A '{' seen at depth 0 opens the block containing the read —
-/// only an if on such a line genuinely encloses the read. Checking depth
-/// after scanning forward cannot distinguish that enclosing '{' from one
-/// that merely closes a skipped sibling block above the read.
+/// Brace matching for the upward walk from a read: '}' enters a completed
+/// sibling block (depth +1) and '{' closes it (depth -1). A '{' seen at
+/// depth 0 opens the block containing the read — only an if on such a line
+/// genuinely encloses the read.
+///
+/// The scan runs forward with standard stack matching, which pairs the
+/// same braces as a right-to-left walk: a matched pair cancels, an
+/// unmatched '}' adds carried depth, and an unmatched '{' first pays the
+/// carried depth and opens an enclosing block only when none is left.
+/// String and char content carries no braces: a '{' inside a literal must
+/// not pay the depth a real '}' added (EPH-I0107).
 fn trackBackwardBraces(t: []const u8, initial_depth: usize) BackwardBraceResult {
-    var depth = initial_depth;
-    var opens = false;
-    var i = t.len;
-    while (i > 0) {
-        i -= 1;
-        if (t[i] == '}') depth += 1;
-        if (t[i] != '{') continue;
-        if (depth > 0) {
-            depth -= 1;
+    var unmatched_open: usize = 0;
+    var unmatched_close: usize = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') unmatched_open += 1;
+        if (c != '}') continue;
+        if (unmatched_open > 0) {
+            unmatched_open -= 1;
         } else {
-            opens = true;
+            unmatched_close += 1;
         }
     }
-    return .{ .depth = depth, .opens_enclosing_block = opens };
+    const paid = @min(unmatched_open, initial_depth);
+    return .{
+        .depth = initial_depth - paid + unmatched_close,
+        .opens_enclosing_block = unmatched_open > paid,
+    };
 }
 
 /// Extract the condition from an enclosing if-statement by walking backwards.
@@ -3748,6 +3779,7 @@ const BraceZeroResult = struct {
 };
 
 /// Track braces through a line, detecting if depth passes through 0.
+/// String and char content carries no braces (EPH-I0107).
 fn trackBracesWithZeroDetect(
     t: []const u8,
     initial_depth: usize,
@@ -3756,7 +3788,14 @@ fn trackBracesWithZeroDetect(
     var depth = initial_depth;
     var found_open = initial_open;
     var touched_zero = false;
-    for (t) |c| {
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
         if (c == '{') {
             depth += 1;
             if (!found_open) found_open = true;
@@ -45037,5 +45076,125 @@ test "ZA607: multi-line guard condition fills cover post-guard reads" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_fc_guard_ml.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string brace in a conditional body does not suppress the read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0107: the `{` inside the string literal paid off the backward
+    // brace walk, so the guard filter read the post-block use as guarded.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const s = "{";
+        \\        _ = s;
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i107_body.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i107_body.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string brace in the if condition does not suppress the read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0107: the `{` inside the condition string read as the block
+    // opener on the backward walk, so the if looked like it enclosed the
+    // post-block use.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn takes(s: []const u8) bool {
+        \\    return s.len > 0;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (takes("{")) {
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i107_cond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i107_cond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string brace after the fill does not suppress the read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0107: the fill precedes the string line. The backward walk still
+    // crosses the string `{` first, so the same guard misread applies.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\        const s = "{";
+        \\        _ = s;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i107_after.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i107_after.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: conditional fill without string content fires" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0107 control: the same shape minus the string. Locks the
+    // behavior the three string repros must match.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i107_control.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i107_control.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }

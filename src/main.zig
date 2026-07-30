@@ -609,13 +609,22 @@ fn isElseWordAt(code: []const u8, i: usize) bool {
 /// What follows an if/else-if condition's closing paren on the same line.
 const BodyStart = enum { none, brace, label_block, statement };
 
-/// Peek past the closing paren at index i: end-of-line (Allman — the
-/// pending_brace path), `{` (braced body), `ident: {` (labeled block —
-/// braced path), or any other code (a same-line statement body).
+/// Peek past the closing paren at index i, past an optional `|payload|`
+/// capture (the capture belongs to the header, not to the body —
+/// EPH-I0095): end-of-line (Allman — the pending_brace path), `{` (braced
+/// body), `ident: {` (labeled block — braced path), or any other code (a
+/// same-line statement body).
 fn peekBodyStart(code: []const u8, i: usize) BodyStart {
     var j = i + 1;
     while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
     if (j >= code.len) return .none;
+    if (code[j] == '|') {
+        const close = mem.indexOfScalarPos(u8, code, j + 1, '|') orelse
+            return .statement;
+        j = close + 1;
+        while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+        if (j >= code.len) return .none;
+    }
     if (code[j] == '{') return .brace;
     if (isLabelBlockAhead(code, j)) return .label_block;
     return .statement;
@@ -3247,11 +3256,16 @@ fn findEnclosingIfCondition(
         i -= 1;
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
+        // Braces inside a trailing comment are not block structure — a
+        // commented `{` must not read as opening an enclosing block
+        // (EPH-I0095).
+        const code = stripLineComment(t);
+        if (code.len == 0) continue;
 
-        const braces = trackBackwardBraces(t, depth);
+        const braces = trackBackwardBraces(code, depth);
         depth = braces.depth;
         if (!braces.opens_enclosing_block) continue;
-        if (extractIfCondition(t)) |cond| return cond;
+        if (extractIfCondition(code)) |cond| return cond;
     }
     return null;
 }
@@ -3268,11 +3282,15 @@ fn findEnclosingIfLine(
         i -= 1;
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
+        // Braces inside a trailing comment are not block structure
+        // (EPH-I0095).
+        const code = stripLineComment(t);
+        if (code.len == 0) continue;
 
-        const braces = trackBackwardBraces(t, depth);
+        const braces = trackBackwardBraces(code, depth);
         depth = braces.depth;
         if (!braces.opens_enclosing_block) continue;
-        if (extractIfCondition(t) != null) return i;
+        if (extractIfCondition(code) != null) return i;
     }
     return null;
 }
@@ -3686,6 +3704,143 @@ fn isOrShortCircuitSafe(
     return false;
 }
 
+/// Net paren balance of one comment-stripped line (`(` minus `)`),
+/// quote-aware so parens inside string/char literals do not count. The
+/// file-wide parenBalance stays naive for its own callers (documented
+/// there); the guard walk needs the quote-aware form because if-conditions
+/// routinely hold string literals with parens.
+fn parenBalanceOutsideQuotes(t: []const u8) i32 {
+    var balance: i32 = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '(') balance += 1;
+        if (c == ')') balance -= 1;
+    }
+    return balance;
+}
+
+/// True when `s` starts with the whole-word keyword `kw` — the char right
+/// after it is a non-identifier char or the end of the text.
+fn startsWithKeyword(s: []const u8, kw: []const u8) bool {
+    if (!mem.startsWith(u8, s, kw)) return false;
+    return s.len == kw.len or !isIdent(s[kw.len]);
+}
+
+/// True when the text after a closed condition holds only an optional
+/// `|payload|` capture and whitespace — no `{` and no same-line body, so
+/// the body is pending on a later line (EPH-I0095).
+fn onlyPayloadRemains(rest: []const u8) bool {
+    const s = mem.trimStart(u8, rest, " \t");
+    if (s.len == 0) return true;
+    if (s[0] != '|') return false;
+    const close = mem.indexOfScalarPos(u8, s, 1, '|') orelse return false;
+    return mem.trimStart(u8, s[close + 1 ..], " \t").len == 0;
+}
+
+/// Scan one comment-stripped condition line from `start`, tracking paren
+/// `depth` and quote `mode` across calls. Returns the index just past the
+/// paren that closes the condition, or null when it closes on a later
+/// line (EPH-I0095).
+fn scanConditionLine(
+    line: []const u8,
+    start: usize,
+    depth: *usize,
+    mode: *QuoteMode,
+) ?usize {
+    var i = start;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (scanQuoteStep(mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '(') {
+            depth.* += 1;
+            continue;
+        }
+        if (c != ')') continue;
+        depth.* -= 1;
+        if (depth.* == 0) return i + 1;
+    }
+    return null;
+}
+
+/// True when the condition opened at `open` on the header line closes
+/// before `body_idx` with only an optional `|payload|` after it — the
+/// brace-less body is pending on line `body_idx` (EPH-I0095).
+fn conditionLeavesBodyPending(
+    lines: []const []const u8,
+    header_idx: usize,
+    body_idx: usize,
+    open: usize,
+) bool {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var idx = header_idx;
+    while (idx < body_idx) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const line = stripLineComment(t);
+        const start: usize = if (idx == header_idx) open + 1 else 0;
+        const after = scanConditionLine(line, start, &depth, &mode) orelse continue;
+        return onlyPayloadRemains(line[after..]);
+    }
+    return false;
+}
+
+/// True when the stripped line at `header_idx` opens an if/else whose body
+/// is pending on line `body_idx`: a bare `else` with nothing after it, or
+/// an if/else-if whose condition leaves the body pending (EPH-I0095).
+fn guardHeaderIsPending(
+    t: []const u8,
+    lines: []const []const u8,
+    header_idx: usize,
+    body_idx: usize,
+) bool {
+    var rest = t;
+    while (rest.len > 0 and rest[0] == '}') rest = mem.trimStart(u8, rest[1..], " \t");
+    if (startsWithKeyword(rest, "else")) {
+        rest = mem.trimStart(u8, rest[4..], " \t");
+        if (!startsWithKeyword(rest, "if")) return rest.len == 0;
+    }
+    if (!startsWithKeyword(rest, "if")) return false;
+    const open = mem.indexOfScalar(u8, t, '(') orelse return false;
+    return conditionLeavesBodyPending(lines, header_idx, body_idx, open);
+}
+
+/// True when line `idx` is the guarded virtual body of a brace-less
+/// if/else-if/else: walking back over blank lines, comment lines, and
+/// multi-line condition text lands on a header whose body is pending on
+/// this line, so the line runs only on the guarded path (EPH-I0095).
+/// Brace-less loop headers are excluded on purpose: they stay outside the
+/// CFG's virtual-body modeling (EPH-I0079 B2 scope).
+fn isGuardedVirtualBodyLine(lines: []const []const u8, idx: usize) bool {
+    var balance: i32 = 0;
+    var j = idx;
+    while (j > 0) {
+        j -= 1;
+        const t = mem.trim(u8, lines[j], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const stripped = stripLineComment(t);
+        if (stripped.len == 0) continue;
+        balance += parenBalanceOutsideQuotes(stripped);
+        // A positive balance means the candidate line closes a group this
+        // line opened — the candidate sits inside parens, not at pos 0 of
+        // a statement. A negative balance means the condition text is
+        // still open, so the header sits on an earlier line.
+        if (balance > 0) return false;
+        if (balance < 0) continue;
+        return guardHeaderIsPending(stripped, lines, j, idx);
+    }
+    return false;
+}
+
 /// Check whether a plain `var_name = ...` statement unconditionally executes
 /// before the read on every path that reaches it: the assignment line starts
 /// with the bare name, its statement terminates before the read line (a
@@ -3697,12 +3852,11 @@ fn isOrShortCircuitSafe(
 ///
 /// The pos-0 bare-name shortcut predates the B-series CFG work: same-line
 /// guard ifs (`if (x) y = 1;`) keep the assignment mid-line, but a
-/// next-line virtual body (`if (x)\n    y = 1;`) now places a guarded
+/// next-line virtual body (`if (x)\n    y = 1;`) places a guarded
 /// assignment at pos 0, so "starts with the bare name" no longer proves
-/// "unguarded". The CFG models those bodies post-B, so this function is a
-/// conservative cross-check only: when it disagrees with the CFG verdict it
-/// suppresses a report, i.e. any residual error is on the FN side
-/// (EPH-I0095), never a fresh FP.
+/// "unguarded". isGuardedVirtualBodyLine rejects those candidates: an
+/// assignment that runs only on the guarded path cannot dominate the read
+/// (EPH-I0095).
 fn hasDominatingScopeAssignment(
     lines: []const []const u8,
     read_idx: usize,
@@ -3715,21 +3869,27 @@ fn hasDominatingScopeAssignment(
     for (0..read_idx) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
+        // Comment text is never code: brace depth must not count it, and an
+        // assignment candidate lives before any trailing comment.
+        const code = stripLineComment(t);
         // isDirectAssignment does not verify the name at pos 0, so the
         // caller must establish it (with a word boundary) first. The
         // statement must also terminate before the read line — a read on a
         // continuation line of the assignment itself is not covered
-        // (EPH-I0103).
-        if (mem.startsWith(u8, t, var_name) and
-            (t.len == var_name.len or !isIdent(t[var_name.len])) and
-            isDirectAssignment(t, var_name, 0) and
-            statementEffectPos(lines, i, 0).line < read_idx)
+        // (EPH-I0103). A pos-0 assignment that is the guarded virtual body
+        // of a brace-less if/else runs only on the guarded path, so it
+        // cannot dominate the read (EPH-I0095).
+        if (mem.startsWith(u8, code, var_name) and
+            (code.len == var_name.len or !isIdent(code[var_name.len])) and
+            isDirectAssignment(code, var_name, 0) and
+            statementEffectPos(lines, i, 0).line < read_idx and
+            !isGuardedVirtualBodyLine(lines, i))
         {
             assign_depth = depth;
             min_since = depth;
             found = true;
         }
-        depth = computeBraceDepth(t, depth);
+        depth = computeBraceDepth(code, depth);
         if (depth < min_since) min_since = depth;
     }
     if (!found) return false;
@@ -30118,6 +30278,252 @@ test "ZA607: loop guard-continue before same-scope assignment is silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless if with next-line body is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The next-line virtual body assigns only on the cond-true path; the
+    // pos-0 shortcut must not claim it dominates the read (EPH-I0095).
+    const content =
+        \\fn bracelessNextLine(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond)
+        \\        x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_nextline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nextline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line condition with next-line body is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The header stays open across lines; the body after the closing paren
+    // is still guarded (EPH-I0095).
+    const content =
+        \\fn multiLineCond(a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a and
+        \\        b)
+        \\        x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_mlcond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_mlcond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested braceless if bodies are detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The inner header is the outer header's body; x assigns only on the
+    // a-and-b path (EPH-I0095).
+    const content =
+        \\fn nestedBraceless(a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a)
+        \\        if (b)
+        \\            x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_nested_bl.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nested_bl.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: brace text in a header comment does not disarm the guard" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A `{` inside the trailing comment must not read as a braced body;
+    // the next-line body stays guarded (EPH-I0095).
+    const content =
+        \\fn headerComment(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) // opens {
+        \\        x = 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_hdr_comment.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_hdr_comment.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: payload-capture if with next-line body is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The null path reaches the read with x undefined (EPH-I0095).
+    const content =
+        \\fn payloadNextLine(opt: ?u32) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (opt) |v|
+        \\        x = v;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_payload_nl.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_payload_nl.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless else-if with next-line body is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else-if arm assigns only on the d-true path; the CFG wires the
+    // chain correctly, so the shortcut must not suppress (EPH-I0114 shape,
+    // same pos-0 mechanism as EPH-I0095).
+    const content =
+        \\fn elseIfNextLine(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\    } else if (d)
+        \\        x = 2;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_elseif_nl.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_elseif_nl.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: unguarded assignment after braceless if stays silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The guarded x = 1 must not count, but the unconditional x = 2 still
+    // dominates the read — the guard check must not over-reject.
+    const content =
+        \\fn guardedThenPlain(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond)
+        \\        x = 1;
+        \\    x = 2;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_guarded_plain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_guarded_plain.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: both braceless arms assigning is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Both virtual bodies assign; the CFG merge covers the read without
+    // the shortcut.
+    const content =
+        \\fn bothArmsVirtual(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond)
+        \\        x = 1;
+        \\    else
+        \\        x = 2;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_both_virtual.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_both_virtual.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line braced if keeps current verdict" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pins the current line-granular verdict for a one-line braced if: the
+    // guard-state change must not alter it.
+    const content =
+        \\fn sameLineBraced(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) { x = 1; }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_sameline_braced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_sameline_braced.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless while body keeps pre-B2 verdict" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Brace-less loops are outside the CFG's virtual-body modeling
+    // (EPH-I0079 B2 exclusion), so the shortcut keeps its pre-B2 verdict.
+    const content =
+        \\fn whileBraceless(n: u32) u32 {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < n) : (i += 1)
+        \\        x = i;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_while_bl.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_while_bl.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

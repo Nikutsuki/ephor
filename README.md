@@ -1197,21 +1197,24 @@ mkdir -p /tmp/test-ephor && cd /tmp/test-ephor
 
 # Zig 0.16.0 project
 mkdir fresh-0160 && cd fresh-0160
-zenv init --zig 0.16.0
+zenv init
+zenv use 0.16.0
 source .zenv/activate && zig init
 sh /path/to/ephor/install.sh
 zig build ephor
 
 # Zig 0.15.2 project  
 mkdir fresh-0152 && cd fresh-0152
-zenv init --zig 0.15.2
+zenv init
+zenv use 0.15.2
 source .zenv/activate && zig init
 sh /path/to/ephor/install.sh
 zig build ephor
 
 # Upgrade from v0.11.x (simulate old install)
 mkdir upgrade-0160 && cd upgrade-0160
-zenv init --zig 0.16.0
+zenv init
+zenv use 0.16.0
 source .zenv/activate && zig init
 # Manually inject old v0.11.x snippet into build.zig and build.zig.zon
 sh /path/to/ephor/install.sh

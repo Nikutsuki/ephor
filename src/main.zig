@@ -852,6 +852,10 @@ const CFGBuildCtx = struct {
     body_jump: JumpKind = .none,
     paren_depth: usize, // carried across lines for multi-line conditions
     seen_fn_body: bool, // the fn body's own `{` is the scan baseline, never counted
+    // Block that evaluates a branch condition whose parens are still open:
+    // continuation lines of a multi-line condition belong to it, not to
+    // the body block handleBranch already switched to (EPH-I0102).
+    cond_origin: ?usize = null,
 
     fn setStartLine(self: *CFGBuildCtx, line: usize) void {
         self.cfg.blocks.items[self.current_block].start_line = line;
@@ -1121,6 +1125,9 @@ const CFGBuildCtx = struct {
             .merge_block = false_block,
             .catch_origin_block = origin,
         });
+        // The condition's parens are still open: it spans following lines,
+        // which belong to the origin block, not the body (EPH-I0102).
+        if (self.paren_depth > 0) self.cond_origin = self.current_block;
         self.current_block = true_block;
         self.setStartLine(line);
     }
@@ -1283,6 +1290,19 @@ const CFGBuildCtx = struct {
         const fallthrough = try self.cfg.addBlock();
         try self.cfg.addEdge(else_body, arm_block, .branch_true);
         try self.cfg.addEdge(else_body, fallthrough, .branch_false);
+        // The `} else if (cond) {` line holds the new condition, which runs
+        // in else_body — attribute the line to it, not the closing arm
+        // body, so condition-side fills and reads land in the block whose
+        // edges model the condition's true/false exits (EPH-I0102). A
+        // single-line body sharing the line keeps the old attribution:
+        // its body text lives on that line too.
+        self.cfg.blocks.items[else_body].start_line = line;
+        self.cfg.blocks.items[else_body].end_line = line;
+        const closing = &self.cfg.blocks.items[self.current_block];
+        if (closing.start_line < line) closing.end_line = line -| 1;
+        // A multi-line else-if condition continues on following lines.
+        // They belong to the condition header as well (EPH-I0102).
+        if (self.paren_depth > 0) self.cond_origin = else_body;
         try self.block_stack.append(self.allocator, .{
             .block_type = .else_if_block,
             .merge_block = merge_block,
@@ -1391,6 +1411,7 @@ const CFGBuildCtx = struct {
             classifyLineStart(code) == .statement;
         const virtual_else = self.pending_else != null and isVirtualElseLine(code);
         const pattern = detectCFPattern(code);
+        const paren_at_start = self.paren_depth;
         const scan = try self.scanLineBraces(code, pattern, next_body);
         // A deferred close with no else claiming it closes as no-else
         // before this line is attributed. Comment lines never reach here;
@@ -1399,7 +1420,18 @@ const CFGBuildCtx = struct {
             !scanClaimsElse(pattern, scan.events))
             try self.finishPendingElse(line);
         if (virtual_else) try self.handleElse(code, line);
-        self.cfg.blocks.items[self.current_block].end_line = line;
+        // A line that starts and ends inside a branch condition's open
+        // parens is condition text, not body text: attribute it to the
+        // block that evaluates the condition. The closing line holds the
+        // body's start and stays with the body block (EPH-I0102).
+        if (self.cond_origin != null and paren_at_start > 0 and
+            self.paren_depth > 0)
+        {
+            self.cfg.blocks.items[self.cond_origin.?].end_line = line;
+        } else {
+            self.cfg.blocks.items[self.current_block].end_line = line;
+        }
+        if (self.paren_depth == 0) self.cond_origin = null;
         try self.walkLineEvents(pattern, code, line);
         // Opener whose control `{` is on a later line (Allman, multi-line
         // condition); an inline-return else has no brace coming at all.
@@ -2107,17 +2139,24 @@ fn isLoopStart(check_line: []const u8) bool {
 
 /// What a candidate fill line means for fill-before-use: a direct
 /// assignment that also reads the var (`x = x + 1;`) uses the old value
-/// before the write completes — a use, not a fill (EPH-I0080).
-/// Builtin/method fills (whose destination occurrences look like reads)
-/// keep the historical fill-wins behavior, and so do slice reads
-/// (`const d = buf[0..n];`), which hasDirectFill counts as fills.
+/// before the write completes — a use, not a fill (EPH-I0080). A genuine
+/// read before a same-line fill-CALL (`use(x); fill(&x);`) is a use for
+/// the same reason (EPH-I0102). A read after the fill-call keeps the fill
+/// verdict and the CFG layer's statement-precise effect covers it.
+/// Slice reads (`const d = buf[0..n];`), which hasDirectFill Pattern-2
+/// counts as fills, keep the historical fill-wins behavior.
 const FillVerdict = enum { not_fill, fill, self_read_use };
 
 fn classifyFillLine(check_line: []const u8, name: []const u8) FillVerdict {
     if (!isFillPattern(check_line, name)) return .not_fill;
     const is_self_read = findAssignmentOccurrence(check_line, name) != null and
         firstVarReadPos(check_line, name) != null;
-    return if (is_self_read) .self_read_use else .fill;
+    if (is_self_read) return .self_read_use;
+    if (findFillCallOccurrence(check_line, name)) |fill_col| {
+        const read_col = firstVarReadPos(check_line, name) orelse return .fill;
+        if (read_col < fill_col) return .self_read_use;
+    }
+    return .fill;
 }
 
 /// Pending state for a multi-line fill statement: the fill must not win
@@ -2355,6 +2394,59 @@ fn statementEffectPos(
     return no_assign_effect;
 }
 
+/// Scan one trimmed line for the closing bracket that brings `depth` to
+/// zero, starting at column `start`. Returns the column just past it, or
+/// null when the expression continues past this line. Bracket depth and
+/// quote mode carry across lines through the pointers.
+fn scanLineForParenClose(
+    t: []const u8,
+    start: usize,
+    depth: *usize,
+    mode: *QuoteMode,
+) ?usize {
+    var i: usize = start;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (mode.* != .none) continue;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
+        if (c == '(' or c == '[' or c == '{') depth.* += 1;
+        if (c == ')' or c == ']' or c == '}') {
+            depth.* -= 1;
+            if (depth.* == 0) return i + 1;
+        }
+    }
+    return null;
+}
+
+/// Effect point of a fill-CALL: the column just past the call's closing
+/// `)`. A call's side effects complete when it returns, so a read after
+/// the `)` observes the filled value while a read in an earlier argument
+/// or an earlier same-line statement does not (EPH-I0102). The statement
+/// `;` would be wrong here: a fill-call inside an if/while condition has
+/// no `;` of its own, and the next `;` belongs to the guarded body.
+/// Falls back to the no-assignment sentinel when the parens never balance.
+fn fillCallEffectPos(
+    lines: []const []const u8,
+    start_idx: usize,
+    open_col: usize,
+) AssignEffect {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var idx = start_idx;
+    while (idx < lines.len) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const start: usize = if (idx == start_idx) open_col + 1 else 0;
+        const col = scanLineForParenClose(t, start, &depth, &mode) orelse continue;
+        return .{ .line = idx, .col = col };
+    }
+    return no_assign_effect;
+}
+
 /// Column of the first occurrence of var_name that is a direct assignment
 /// target (`x = ...`, `x.field = ...`, `x[i] = ...`), or null. Word
 /// boundaries and a leading-dot guard keep `box =` and `foo.x =` from
@@ -2372,6 +2464,85 @@ fn findAssignmentOccurrence(t: []const u8, var_name: []const u8) ?usize {
         if (pos + var_name.len < t.len and
             isIdent(t[pos + var_name.len])) continue;
         if (isAssignmentTarget(t, var_name, pos)) return pos;
+    }
+    return null;
+}
+
+/// True when the occurrence at `pos` is the bare destination argument of
+/// `@memset(` / `@memcpy(` — the builtin token immediately precedes it.
+/// The `&dest` form is matched by the address-of arm of the callers.
+fn isBuiltinDestAt(t: []const u8, pos: usize) bool {
+    return mem.endsWith(u8, t[0..pos], "@memset(") or
+        mem.endsWith(u8, t[0..pos], "@memcpy(");
+}
+
+/// Position of the unmatched `(` before `pos` — the call or grouping paren
+/// whose argument list contains `pos` — or null.
+fn unmatchedOpenParenBefore(t: []const u8, pos: usize) ?usize {
+    var depth: usize = 0;
+    var j = pos;
+    while (j > 0) {
+        j -= 1;
+        if (t[j] == ')') depth += 1;
+        if (t[j] == '(') {
+            if (depth == 0) return j;
+            depth -= 1;
+        }
+    }
+    return null;
+}
+
+/// True when var_name has a slice/index occurrence (`x[...]`) that is not
+/// an assignment target. hasDirectFill Pattern-2 counts these as fills
+/// even when they are reads, and that crudeness is load-bearing for
+/// slice-read silence (ghostty/flow, EPH-I0102): lines with one keep
+/// whole-line gen coverage.
+fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        // The match must be the variable itself: not mid-identifier
+        // (box[...]) and not a field of another var (foo.x[...]).
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos > 0 and t[pos - 1] == '.') continue;
+        const end = pos + var_name.len;
+        if (end < t.len and isIdent(t[end])) continue;
+        if (end < t.len and t[end] == '[' and !isAssignmentTarget(t, var_name, pos))
+            return true;
+    }
+    return false;
+}
+
+/// Column of the open paren of a fill-CALL targeting var_name, or null
+/// when the line has no fill-call for the var. Two classes: `&var` passed
+/// as a call argument (`fill(&x)`, `foo.read(&x)` — the call-fill
+/// heuristic writes through the pointer), and the bare `@memset(var` /
+/// `@memcpy(var` destination. Slice-index forms (`&x[0]`,
+/// `@memset(x[0..], v)`) and plain slice occurrences (`x[0..n]`) are
+/// hasDirectFill Pattern-2 territory and deliberately do NOT match — they
+/// keep whole-line coverage (EPH-I0102). A non-call `&x` (`const p = &x;`)
+/// is untrackable aliasing, not a fill.
+fn findFillCallOccurrence(t: []const u8, var_name: []const u8) ?usize {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        // The match must be the variable itself: not mid-identifier
+        // (box) and not a field of another var (foo.x).
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos > 0 and t[pos - 1] == '.') continue;
+        if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) continue;
+        // Slice-index occurrences are Pattern-2 — whole-line coverage.
+        if (pos + var_name.len < t.len and t[pos + var_name.len] == '[') continue;
+        // `&var` call argument: the call-fill heuristic writes through the
+        // pointer. Outside a call the address escapes untracked.
+        if (pos > 0 and t[pos - 1] == '&') {
+            if (unmatchedOpenParenBefore(t, pos - 1)) |open| return open;
+            continue;
+        }
+        // Bare @memset(var / @memcpy(var destination: the `(` precedes.
+        if (isBuiltinDestAt(t, pos)) return pos - 1;
     }
     return null;
 }
@@ -2512,15 +2683,22 @@ fn computeGenSetForVar(
         const bid = findBlockForLine(ctx.cfg, actual_line) orelse continue;
         gen[bid] = true;
         // Direct assignments take effect at their own `;` — a same-block
-        // read before that point is not covered (EPH-I0080). Fill-style
-        // patterns (@memset, x.init, fill(&x)) and `x[...]` slice
-        // occurrences — which hasDirectFill counts as fills even when they
-        // are reads — keep the historical whole-line coverage; tightening
-        // those is a separate detection change.
-        const effect = if (findAssignmentOccurrence(t, var_name)) |occ_col|
-            statementEffectPos(ctx.lines, idx, occ_col)
-        else
-            AssignEffect{ .line = idx, .col = 0 };
+        // read before that point is not covered (EPH-I0080). Fill-CALLS
+        // (fill(&x), foo(&x), @memset/@memcpy dests) take effect at the
+        // call's closing `)` (EPH-I0102). A line with both takes the
+        // earlier effect. A line with a non-assignment `x[...]` slice
+        // occurrence keeps the historical whole-line coverage:
+        // hasDirectFill Pattern-2 counts slice READS as fills and that
+        // crudeness is load-bearing (ghostty/flow FPs when tightened).
+        var effect: AssignEffect = .{ .line = idx, .col = 0 };
+        if (findAssignmentOccurrence(t, var_name)) |occ_col| {
+            effect = statementEffectPos(ctx.lines, idx, occ_col);
+            if (findFillCallOccurrence(t, var_name)) |open_col|
+                effect = minAssignEffect(effect, fillCallEffectPos(ctx.lines, idx, open_col));
+        } else if (!hasSliceOccurrence(t, var_name)) {
+            if (findFillCallOccurrence(t, var_name)) |open_col|
+                effect = fillCallEffectPos(ctx.lines, idx, open_col);
+        }
         first_effect[bid] = minAssignEffect(first_effect[bid], effect);
     }
     return .{ .gen = gen, .first_effect = first_effect };
@@ -2548,6 +2726,35 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
         if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
 
         return true;
+    }
+    return false;
+}
+
+/// True when a `&var_name` occurrence is untrackable: taking the address
+/// without passing it to a call (`const p = &x;`, `return &x;`) lets the
+/// pointer escape, and writes through it are invisible to the fill
+/// analysis. A `&var` call argument stays trackable — the call-fill
+/// heuristic covers it at statement precision (EPH-I0102).
+fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
+    var search_start: usize = 0;
+    while (search_start + 1 + var_name.len <= t.len) {
+        const amp_rel = mem.indexOf(u8, t[search_start..], "&") orelse return false;
+        const pos = search_start + amp_rel;
+        search_start = pos + 1;
+
+        // Must be immediately followed by var_name (no space)
+        if (pos + 1 + var_name.len > t.len) continue;
+        if (!mem.eql(u8, t[pos + 1 .. pos + 1 + var_name.len], var_name)) continue;
+
+        // Check word boundary after var_name
+        const end = pos + 1 + var_name.len;
+        if (end < t.len and isIdent(t[end])) continue;
+
+        // Make sure it's not inside a string or comment
+        if (isInsideString(t, pos)) continue;
+        if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
+
+        if (!isInsideCallArg(t, pos)) return true;
     }
     return false;
 }
@@ -2763,6 +2970,9 @@ fn analyzeDefiniteAssignment(
     try removeIndirectlyInitVars(allocator, &undef_vars, lines);
     if (undef_vars.count() == 0) return issues;
 
+    try removePayloadShadowedVars(allocator, &undef_vars, lines);
+    if (undef_vars.count() == 0) return issues;
+
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
@@ -2783,7 +2993,10 @@ fn analyzeDefiniteAssignment(
     return issues;
 }
 
-/// Remove vars passed by reference (&var) - can't track pointer writes.
+/// Remove vars whose address escapes untracked (`const p = &x;`,
+/// `return &x;`) — writes through the escaped pointer can't be tracked.
+/// A `&var` call argument stays tracked: the call-fill heuristic covers
+/// it at statement precision (EPH-I0102).
 fn removeAddressOfVars(
     allocator: Allocator,
     undef_vars: *std.StringHashMap(usize),
@@ -2797,7 +3010,7 @@ fn removeAddressOfVars(
         for (lines) |line| {
             const t = mem.trim(u8, line, " \t\r");
             if (isCommentOrMultilineString(t)) continue;
-            if (!hasAddressOfVar(t, vn)) continue;
+            if (!hasUntrackableAddressOf(t, vn)) continue;
             try remove.append(allocator, vn);
             break;
         }
@@ -2818,6 +3031,54 @@ fn removeIndirectlyInitVars(
         const vn = entry.key_ptr.*;
         if (isIndirectlyInitialized(lines, vn))
             try remove.append(allocator, vn);
+    }
+    for (remove.items) |vn| _ = undef_vars.remove(vn);
+}
+
+/// True when the line holds a payload binding of var_name: `|x|` or
+/// `|x, ...|` — adjacent pipe before the name, a payload delimiter after.
+/// Canonical (zig fmt) spacing puts spaces around bitwise-or operands, so
+/// the adjacent-pipe form is a binding, not `a | x | z`.
+fn hasPayloadBinding(t: []const u8, var_name: []const u8) bool {
+    var s: usize = 0;
+    while (s + 1 + var_name.len <= t.len) {
+        const pipe_rel = mem.indexOf(u8, t[s..], "|") orelse return false;
+        const pos = s + pipe_rel;
+        s = pos + 1;
+        if (pos + 1 + var_name.len > t.len) continue;
+        if (!mem.eql(u8, t[pos + 1 .. pos + 1 + var_name.len], var_name)) continue;
+        const end = pos + 1 + var_name.len;
+        if (end >= t.len) continue;
+        if (t[end] != '|' and t[end] != ',') continue;
+        if (isInsideString(t, pos)) continue;
+        if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
+        return true;
+    }
+    return false;
+}
+
+/// Remove vars whose name is also introduced by a payload binding
+/// (`for (xs) |x|`, `if (opt) |x|`): the payload shadows the tracked var,
+/// so its uses are ambiguous with the var's own — the name-keyed analysis
+/// cannot separate them (EPH-I0102). Dropping keeps the conservative
+/// direction: silence, never a false positive.
+fn removePayloadShadowedVars(
+    allocator: Allocator,
+    undef_vars: *std.StringHashMap(usize),
+    lines: []const []const u8,
+) !void {
+    var remove = std.ArrayListUnmanaged([]const u8).empty;
+    defer remove.deinit(allocator);
+    var it = undef_vars.iterator();
+    while (it.next()) |entry| {
+        const vn = entry.key_ptr.*;
+        for (lines) |line| {
+            const t = mem.trim(u8, line, " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            if (!hasPayloadBinding(t, vn)) continue;
+            try remove.append(allocator, vn);
+            break;
+        }
     }
     for (remove.items) |vn| _ = undef_vars.remove(vn);
 }
@@ -2935,17 +3196,7 @@ fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
 /// Look backwards for a '(' at paren depth 0 — true when vpos is inside a
 /// function-call argument list.
 fn isInsideCallArg(t: []const u8, vpos: usize) bool {
-    var depth: usize = 0;
-    var j = vpos;
-    while (j > 0) {
-        j -= 1;
-        if (t[j] == ')') depth += 1;
-        if (t[j] == '(') {
-            if (depth == 0) return true;
-            depth -= 1;
-        }
-    }
-    return false;
+    return unmatchedOpenParenBefore(t, vpos) != null;
 }
 
 /// Check if variable is assigned inside an inline for loop
@@ -3937,9 +4188,44 @@ fn computeBlockEntry(
     return if (has_pred) result else false;
 }
 
+/// True when the occurrence at `i` introduces a binding rather than
+/// reading a variable: a declaration name (`var x`, `const x`) or a
+/// payload capture (`for (xs) |x|`, `if (opt) |x|`). Neither reads a
+/// same-name var from a sibling scope (switch arms) or an outer scope
+/// (shadowing). The capture form requires adjacent pipes on both sides:
+/// canonical (zig fmt) spacing puts spaces around bitwise-or operands, so
+/// `|x|` is a binding, not `a | x | z`.
+fn isBindingNameAt(t: []const u8, var_name: []const u8, i: usize) bool {
+    if (i >= 4 and mem.eql(u8, t[i - 4 .. i], "var ") and
+        (i == 4 or !isIdent(t[i - 5]))) return true;
+    if (i >= 6 and mem.eql(u8, t[i - 6 .. i], "const ") and
+        (i == 6 or !isIdent(t[i - 7]))) return true;
+    const end_i = i + var_name.len;
+    return i > 0 and t[i - 1] == '|' and end_i < t.len and t[end_i] == '|';
+}
+
+/// True when the occurrence at `i` never reads the variable's value:
+/// mid-identifier match, field of another var (`foo.x`), a binding
+/// introduction (`var x`, `const x`, `|x|`), `.len` compile-time
+/// property, string literal, line comment, fill destination (`&x` or a
+/// bare @memset/@memcpy dest — a fill statement must not "read" its own
+/// destination, EPH-I0102), or an assignment target.
+fn isReadExemptOccurrence(t: []const u8, var_name: []const u8, i: usize) bool {
+    const end_i = i + var_name.len;
+    if (end_i < t.len and isIdent(t[end_i])) return true; // mid-word
+    if (i > 0 and isIdent(t[i - 1])) return true; // mid-word
+    if (i > 0 and t[i - 1] == '.') return true; // field of another var
+    if (isBindingNameAt(t, var_name, i)) return true;
+    if (isInsideString(t, i)) return true;
+    if (mem.indexOf(u8, t[0..i], "//")) |_| return true;
+    if (end_i + 4 <= t.len and mem.eql(u8, t[end_i .. end_i + 4], ".len")) return true;
+    if (i > 0 and t[i - 1] == '&') return true; // fill destination
+    if (isBuiltinDestAt(t, i)) return true;
+    return isAssignmentTarget(t, var_name, i);
+}
+
 /// Column of the first genuine read of var_name on the line, or null when
-/// every occurrence is an assignment target, a `.`-field access, a `.len`
-/// compile-time property, inside a string, or inside a comment.
+/// every occurrence is read-exempt (see isReadExemptOccurrence).
 fn firstVarReadPos(t: []const u8, var_name: []const u8) ?usize {
     // Skip comment and multiline string lines entirely
     if (isCommentOrMultilineString(t)) return null;
@@ -3947,26 +4233,7 @@ fn firstVarReadPos(t: []const u8, var_name: []const u8) ?usize {
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
         if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
-        const end_i = i + var_name.len;
-        if (end_i < t.len and isIdent(t[end_i])) continue; // Middle of word
-        if (i > 0 and isIdent(t[i - 1])) continue; // Middle of word
-
-        // Skip struct field access - e.g., self.file_id is not the local file_id
-        if (i > 0 and t[i - 1] == '.') continue;
-
-        // Skip if inside a string literal
-        // e.g., std.mem.eql(u8, field_name, "range") is not a read of var range
-        if (isInsideString(t, i)) continue;
-
-        // Skip if inside a comment (after //)
-        if (mem.indexOf(u8, t[0..i], "//")) |_| continue;
-
-        // Skip .len access - it's a compile-time property, not a read of undefined values
-        // e.g., "arr.len" doesn't read arr's contents
-        if (end_i + 4 <= t.len and mem.eql(u8, t[end_i .. end_i + 4], ".len")) continue;
-
-        // Check it's not an assignment target
-        if (!isAssignmentTarget(t, var_name, i)) return i;
+        if (!isReadExemptOccurrence(t, var_name, i)) return i;
     }
     return null;
 }
@@ -31541,6 +31808,607 @@ test "ZA607: read after multi-line fill completes is silent" {
     );
 }
 
+test "ZA607: same-line read before fill-call is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0102: `use(x)` reads x before the same-line `fill(&x)` takes
+    // effect. The entry filter called the whole line a fill, and
+    // removeAddressOfVars dropped the var for the `&x` — both layers hid
+    // the read.
+    const content =
+        \\fn readThenFillCall() u32 {
+        \\    var x: u32 = undefined;
+        \\    use(x); fill(&x);
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_read_first.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_read_first.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line fill-call before read is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The fill completes at its `;`, so the later same-line read observes
+    // the filled value (EPH-I0102 — mirror of the EPH-I0080 assignment
+    // ordering test).
+    const content =
+        \\fn fillThenReadCall() u32 {
+        \\    var x: u32 = undefined;
+        \\    fill(&x); use(x);
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_fill_first.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_fill_first.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line read before @memset dest is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0102: the `@memset(&x, 0)` dest is a fill-call effect, not a
+    // whole-line cover — the earlier `use(x)` reads the undefined array.
+    const content =
+        \\fn readThenMemset() void {
+        \\    var x: [4]u8 = undefined;
+        \\    use(x); @memset(&x, 0);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_memset_bad.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_memset_bad.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line @memset dest before read is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `@memset` effect point is its `;`, which precedes the read.
+    const content =
+        \\fn memsetThenRead() void {
+        \\    var x: [4]u8 = undefined;
+        \\    @memset(&x, 0); use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_memset_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_memset_ok.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line read before bare @memset slice dest is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0102: a bare slice dest (`@memset(s, 0)`, no `&`) is the same
+    // builtin-dest fill class — the earlier `use(s)` reads the undefined
+    // slice value.
+    const content =
+        \\fn readThenBareMemset() void {
+        \\    var s: []u8 = undefined;
+        \\    use(s); @memset(s, 0);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_bare_dest.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_bare_dest.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: init-call vars keep their dropped verdict" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pinned, not fixed (EPH-I0102 scope decision): removeIndirectlyInitVars
+    // drops every var with a method call, because an unknown `x.setup(...)`
+    // may initialize x. Statement-precise `x.init()` would require narrowing
+    // that filter to known fill methods, which trades these FNs for FPs on
+    // genuine init methods the analyzer cannot know.
+    const content =
+        \\const Box = struct {
+        \\    fn init() Box {
+        \\        return .{};
+        \\    }
+        \\};
+        \\fn initThenUse() void {
+        \\    var b: Box = undefined;
+        \\    b.init();
+        \\    use(b);
+        \\}
+        \\fn useThenInit() void {
+        \\    var b: Box = undefined;
+        \\    use(b); b.init();
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_init.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_init.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line slice read keeps Pattern-2 whole-line cover" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pinned (EPH-I0102): hasDirectFill Pattern-2 counts any `buf[`
+    // occurrence — including the slice READ `buf[0..n]` — as a whole-line
+    // fill, so the earlier `use(buf)` stays covered. Tightening Pattern-2
+    // produced 4 ghostty/flow FPs last time. It is load-bearing and stays
+    // crude here.
+    const content =
+        \\fn assignThenSliceRead(n: usize) void {
+        \\    var buf: [8]u8 = undefined;
+        \\    buf[0] = 1;
+        \\    const d = buf[0..n];
+        \\    use(d);
+        \\}
+        \\fn useThenSliceRead(n: usize) void {
+        \\    var buf: [8]u8 = undefined;
+        \\    use(buf); const d = buf[0..n];
+        \\    use(d);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_slice_read.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_slice_read.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: read after multi-line fill-call completes is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Verdict pinned, mechanism moved (EPH-I0102): the drop used to come
+    // from removeAddressOfVars. Now the FillScan pending path (EPH-I0103)
+    // completes the fill at its `;` and the later read is covered.
+    const content =
+        \\fn fillMultiThenUse() void {
+        \\    var x: u32 = undefined;
+        \\    fill(&x,
+        \\        0);
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_ml_fill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_ml_fill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line read before multi-line fill-call is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0102: the `use(x)` on the first line precedes the fill-call, and
+    // the fill takes effect only at the continuation line's `;`.
+    const content =
+        \\fn useThenFillMulti() void {
+        \\    var x: u32 = undefined;
+        \\    use(x); fill(&x,
+        \\        0);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_ml_read.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_ml_read.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill-call continuation self-read is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0102 + EPH-I0103: the continuation-line `x` argument reads x
+    // before the fill statement's `;` — the read observes the pre-fill
+    // value.
+    const content =
+        \\fn fillContinuationSelfRead() void {
+        \\    var x: u32 = undefined;
+        \\    fill(&x,
+        \\        x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_ml_cont.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_ml_cont.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill-call then read on later lines is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Mainline no-regression: a completed fill-call covers reads on later
+    // lines (the common `fill(&x); ... use(x);` shape).
+    const content =
+        \\fn fillThenUseNextLine() void {
+        \\    var x: u32 = undefined;
+        \\    fill(&x);
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_later_read.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_later_read.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: address-escape var stays dropped" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pinned (EPH-I0102): `const p = &x;` lets the pointer escape — writes
+    // through p are untrackable, so removeAddressOfVars still drops the
+    // var. Only `&x` call arguments (the fill-call heuristic) stay
+    // trackable.
+    const content =
+        \\fn addrEscapeDrops() u32 {
+        \\    var x: u32 = undefined;
+        \\    use(x);
+        \\    const p = &x;
+        \\    _ = p;
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_escape.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_escape.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill-call in else-if condition covers the arm body" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Flow project_manager shape (EPH-I0102 A/B): the condition's extract
+    // call fills context on exactly the paths that enter the arm. The fill
+    // takes effect at the call's `)` — a statement-`;` effect would scan
+    // into the arm body and blame the read there.
+    const content =
+        \\fn extract(p: *usize) bool {
+        \\    p.* = 1;
+        \\    return true;
+        \\}
+        \\fn conditionFillCall(m: u32) usize {
+        \\    var context: usize = undefined;
+        \\    if (m == 0) {
+        \\        return 0;
+        \\    } else if (extract(&context)) {
+        \\        return context;
+        \\    }
+        \\    return 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_cond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_cond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: slice read fed by same-line fill-call is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Flow win32/gui shape (EPH-I0102 A/B): `buf[0 .. fillRet(&buf)]`
+    // mixes a Pattern-2 slice occurrence with a fill-call on one line.
+    // The slice occurrence keeps whole-line coverage — the fill-call
+    // precision must not uncover the slice "read".
+    const content =
+        \\fn fillRet(p: *[8]u8) usize {
+        \\    p[0] = 1;
+        \\    return 1;
+        \\}
+        \\fn sliceFedByFillCall() void {
+        \\    var buf: [8]u8 = undefined;
+        \\    store(buf[0 .. fillRet(&buf)]);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_slice_fill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_slice_fill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: sibling-scope decl names of filled vars stay silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Ghostty os/hostname shape (EPH-I0102 A/B): two if-arms each declare
+    // their own `buf`. The second arm's declaration NAME must not count as
+    // a read of the first arm's buf — the analysis is name-keyed, so the
+    // decl occurrence needs an explicit skip.
+    const content =
+        \\fn fill(p: *[8]u8) void {
+        \\    p[0] = 1;
+        \\}
+        \\fn siblingDeclNames(c: bool) u8 {
+        \\    if (c) {
+        \\        var buf: [8]u8 = undefined;
+        \\        fill(&buf);
+        \\        return buf[0];
+        \\    } else {
+        \\        var buf: [8]u8 = undefined;
+        \\        fill(&buf);
+        \\        return buf[0];
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_sibling.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_sibling.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill-call before same-line self-assignment is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The line holds both a fill-call and an assignment: the earliest
+    // effect wins (min), so the completed `fill(&x)` covers the later
+    // self-assignment RHS read (EPH-I0102).
+    const content =
+        \\fn fillThenSelfAssign() u32 {
+        \\    var x: u32 = undefined;
+        \\    fill(&x); x = x + 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_min_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_min_ok.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: self-assignment before same-line fill-call is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The min effect is the assignment's own `;` here — the RHS read
+    // still observes the pre-fill, pre-assignment value (EPH-I0102).
+    const content =
+        \\fn selfAssignThenFill() u32 {
+        \\    var x: u32 = undefined;
+        \\    x = x + 1; fill(&x);
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_min_bad.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_min_bad.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "findFillCallOccurrence matches call-arg dests only" {
+    // The fill-call classes: `&x` passed to a call, and the bare
+    // `@memset(x` / `@memcpy(x` dest. The match column is the call's open
+    // paren. Slice-index forms (`&x[0]`, `@memset(x[0..], v)`) are
+    // Pattern-2 territory and must NOT match — they keep whole-line
+    // coverage (EPH-I0102). A non-call `&x` (`const p = &x;`) is
+    // untrackable aliasing, not a fill.
+    try std.testing.expectEqual(@as(?usize, 4), findFillCallOccurrence("fill(&x);", "x"));
+    try std.testing.expectEqual(@as(?usize, 12), findFillCallOccurrence("use(x); fill(&x);", "x"));
+    try std.testing.expectEqual(@as(?usize, 7), findFillCallOccurrence("@memset(x, 0);", "x"));
+    try std.testing.expectEqual(@as(?usize, 7), findFillCallOccurrence("@memcpy(x, y);", "x"));
+    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("const p = &x;", "x"));
+    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("foo(&x[0]);", "x"));
+    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("@memset(x[0..4], 0);", "x"));
+    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("const d = x[0..4];", "x"));
+    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("use(x);", "x"));
+}
+
+test "ZA607: payload capture of a filled same-name var is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Flow tui.zig shape (EPH-I0102 A/B): the loop-body `var arg` is
+    // filled by the extract and guarded. The later `for (args[0..n])
+    // |arg|` introduces a NEW payload binding whose uses are
+    // indistinguishable from the tracked var's — the name-keyed analysis
+    // drops payload-shadowed vars rather than guess (EPH-I0102).
+    const content =
+        \\fn extract(p: *[]const u8) bool {
+        \\    p.* = "x";
+        \\    return true;
+        \\}
+        \\fn payloadShadows(len: usize) !void {
+        \\    var args: [4][]const u8 = undefined;
+        \\    var n: usize = 0;
+        \\    var i = len;
+        \\    while (i > 0 and n < 4) : (i -= 1) {
+        \\        var arg: []const u8 = undefined;
+        \\        if (extract(&arg)) {
+        \\            args[n] = arg;
+        \\            n += 1;
+        \\        } else return error.Invalid;
+        \\    }
+        \\    for (args[0..n]) |arg| {
+        \\        consume(arg);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_payload.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_payload.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pinned FN (EPH-I0102, reviewer-accepted): `use(x)` precedes the
+    // `|x|` binding, so this occurrence is unambiguous and genuinely
+    // unassigned — but removePayloadShadowedVars drops the var for the
+    // whole function, and the read is missed. The drop is deliberate: a
+    // payload binding anywhere makes every same-name occurrence suspect,
+    // and a wrong-fire is worse than a miss. A scope-aware payload model
+    // would recover this read.
+    const content =
+        \\fn overDrop(items: []const u32) void {
+        \\    var x: u32 = undefined;
+        \\    use(x);
+        \\    for (items) |x| {
+        \\        use(x);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_overdrop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_overdrop.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: if/else-if chain condition fills cover the post-chain read" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Flow editor.save_file shape (EPH-I0102 A/B): every condition in the
+    // chain evaluates a fill-call for cmd, so every path past the chain —
+    // including the both-false fallthrough — is credited with the fill.
+    // (Crediting an evaluated fill-call to all its outgoing paths is the
+    // heuristic's call, matching the pre-EPH-I0102 verdict here.)
+    const content =
+        \\fn matchArgs(o: *usize, c: *[]const u8, a: *[]const u8) bool {
+        \\    o.* = 1;
+        \\    c.* = "c";
+        \\    a.* = "a";
+        \\    return true;
+        \\}
+        \\fn chainConditionFills() !void {
+        \\    var option: usize = 0;
+        \\    var then = false;
+        \\    var cmd: []const u8 = undefined;
+        \\    var args: []const u8 = undefined;
+        \\    if (matchArgs(&option, &cmd, &args)) {
+        \\        then = true;
+        \\    } else if (matchArgs(&option, &cmd, &args)) {
+        \\        then = true;
+        \\    }
+        \\    if (then)
+        \\        consume2(cmd, args);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_chain_cond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_chain_cond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: bool guard without any fill is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Sensitivity control: `then` is set in an arm that never fills cmd,
+    // so the guarded read must still fire.
+    const content =
+        \\fn boolGuardBroken(c: bool) !void {
+        \\    var then = false;
+        \\    var cmd: []const u8 = undefined;
+        \\    if (c) {
+        \\        then = true;
+        \\    }
+        \\    if (then)
+        \\        consume(cmd);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_boolguard_bad.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_boolguard_bad.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: multi-line struct literal in if body keeps conditional fill detected" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -43488,4 +44356,107 @@ test {
     // ast_tier is only referenced from inside function bodies, which does
     // not force analysis of its test declarations.
     _ = ast_tier;
+}
+
+test "buildCFG: else-if condition line attributes to the condition header" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0102: the `} else if (cond) {` line ran into the closing arm
+    // body's span, so condition-side fills landed in the block whose path
+    // never evaluates the condition. The line belongs to the condition
+    // header block — the one whose branch_true edge enters the arm.
+    const lines = [_][]const u8{
+        "fn elseIfChain(m: u32) usize {", // 1
+        "    var context: usize = undefined;", // 2
+        "    if (m == 0) {", // 3
+        "        return 0;", // 4
+        "    } else if (extract(&context)) {", // 5
+        "        return context;", // 6
+        "    }", // 7
+        "    return 1;", // 8
+        "}", // 9
+    };
+    var cfg = try buildCFG(allocator, "elseIfChain", 1, &lines);
+    defer cfg.deinit();
+
+    const cond_block = findBlockForLine(&cfg, 5) orelse return error.TestUnexpectedResult;
+    const arm_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cond_block != arm_block);
+    var enters_arm = false;
+    for (cfg.edges.items) |e| {
+        if (e.from == cond_block and e.to == arm_block and e.kind == .branch_true)
+            enters_arm = true;
+    }
+    try std.testing.expect(enters_arm);
+}
+
+test "buildCFG: multi-line condition continuations attribute to the origin block" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0102: the guard condition spans lines 4-7, so lines 5-6 are
+    // condition text and belong to the pre-if block — not the virtual
+    // body block (is_return) that would swallow their fills.
+    const lines = [_][]const u8{
+        "fn guardWrapped() !void {", // 1
+        "    var a: usize = undefined;", // 2
+        "    var b: usize = undefined;", // 3
+        "    if (!try match2(.{", // 4
+        "        extract(&a),", // 5
+        "        extract(&b),", // 6
+        "    })) return error.Invalid;", // 7
+        "    use(a);", // 8
+        "    use(b);", // 9
+        "}", // 10
+    };
+    var cfg = try buildCFG(allocator, "guardWrapped", 1, &lines);
+    defer cfg.deinit();
+
+    const origin = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(origin, findBlockForLine(&cfg, 5));
+    try std.testing.expectEqual(origin, findBlockForLine(&cfg, 6));
+    const body = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(body != origin);
+}
+
+test "ZA607: multi-line guard condition fills cover post-guard reads" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Flow mainview/Project shape (EPH-I0102 A/B): extracts inside a
+    // multi-line guard condition fill the vars on every path that reaches
+    // the reads — the failing path returns inside the guard. The fills
+    // must land in the block that evaluates the condition, not the
+    // is_return virtual-body block.
+    const content =
+        \\fn match2(a: anytype) !bool {
+        \\    _ = a;
+        \\    return true;
+        \\}
+        \\fn extract(p: *usize) usize {
+        \\    p.* = 1;
+        \\    return 0;
+        \\}
+        \\fn guardWrapped() !void {
+        \\    var a: usize = undefined;
+        \\    var b: usize = undefined;
+        \\    if (!try match2(.{
+        \\        extract(&a),
+        \\        extract(&b),
+        \\    })) return error.Invalid;
+        \\    use(a);
+        \\    use(b);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_fc_guard_ml.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_guard_ml.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
 }

@@ -370,31 +370,32 @@ pub fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// Check if position `col` is inside a string literal
-/// Handles escape sequences correctly:
-///   "normal"     - quotes toggle string state
-///   "with \" "   - escaped quote doesn't toggle
-///   "with \\" x  - escaped backslash, quote DOES toggle
-///   "with \\\" " - escaped backslash + escaped quote
+/// Check if position `col` is inside a string literal. Escape handling: an
+/// odd backslash run before a quote keeps the quote as character data, an
+/// even run keeps it as a delimiter. Char literal spans (`'...'`, with `\'`
+/// and `\\` escapes) never toggle string state: the `"` inside `'"'` stays
+/// character data (EPH-I0104).
 pub fn isInsideString(line: []const u8, col: usize) bool {
-    var in_string = false;
+    var mode: enum { none, str, char } = .none;
     var i: usize = 0;
     while (i < col and i < line.len) : (i += 1) {
-        if (line[i] != '"') continue;
-        // Count consecutive backslashes before this quote
-        var backslash_count: usize = 0;
-        var j = i;
-        while (j > 0 and line[j - 1] == '\\') {
-            backslash_count += 1;
-            j -= 1;
-        }
-        // Quote is escaped only if odd number of backslashes
-        // Even backslashes = pairs of escaped backslashes, quote is real
-        if (backslash_count % 2 == 0) {
-            in_string = !in_string;
+        const c = line[i];
+        switch (mode) {
+            .char => {
+                if (c == '\\') i += 1;
+                if (c == '\'') mode = .none;
+            },
+            .str => {
+                if (c == '\\') i += 1;
+                if (c == '"') mode = .none;
+            },
+            .none => {
+                if (c == '\'') mode = .char;
+                if (c == '"') mode = .str;
+            },
         }
     }
-    return in_string;
+    return mode == .str;
 }
 
 /// Check if a rule is disabled via inline comment
@@ -475,6 +476,20 @@ test "countLines counts newlines" {
 test "isInsideString detects strings" {
     try std.testing.expect(isInsideString("const x = \"hello", 14));
     try std.testing.expect(!isInsideString("const x = 42", 8));
+}
+
+test "isInsideString skips char literal spans" {
+    // A `"` inside a char literal stays character data. It must not open
+    // string state (EPH-I0104 review, Finding A).
+    try std.testing.expect(!isInsideString("const q = '\"'; x = 1;", 15));
+    // Escaped-quote (`'\''`) and backslash (`'\\'`) char literals close at
+    // their final quote.
+    try std.testing.expect(!isInsideString("const q = '\\''; x = 1;", 16));
+    try std.testing.expect(!isInsideString("const q = '\\\\'; x = 1;", 16));
+    // A string after a closed char literal still opens string state.
+    try std.testing.expect(isInsideString("const q = 'a'; const s = \"x", 26));
+    // Escape handling inside strings is unchanged: `\"` does not close.
+    try std.testing.expect(isInsideString("const s = \"a \\\" b", 17));
 }
 
 test "ReturnKind has all expected variants" {

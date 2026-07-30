@@ -9534,7 +9534,12 @@ fn hasPointerToVar(t: []const u8, pos: usize, var_name: []const u8) bool {
 
 /// Check if any occurrence of var_name is directly filled on this line:
 /// &var, &Struct.var, var[...] =, or var as an assignment target.
+/// String and comment content never fills a var: the check skips full-line
+/// comments and multiline-string lines, and ignores occurrences inside
+/// string literals and after a mid-line `//` (EPH-I0104 — mirrors
+/// firstVarReadPos).
 fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
+    if (isCommentOrMultilineString(t)) return false;
     // Check all occurrences of var_name (handles Struct.var_name patterns)
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
@@ -9543,6 +9548,8 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         const end_i = i + var_name.len;
         const after_ok = end_i >= t.len or !isIdent(t[end_i]);
         if (!after_ok) continue;
+        if (isInsideString(t, i)) continue;
+        if (mem.indexOf(u8, t[0..i], "//") != null) continue;
 
         // Pattern 1: &var_name or &Struct.var_name
         if (i > 0 and t[i - 1] == '&') return true;
@@ -32794,6 +32801,198 @@ test "ZA607: top-level while-else fill stays silent at the read" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_while_else_top.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+// ============================================================================
+// ZA607: string-content phantom fills (EPH-I0104)
+// ============================================================================
+
+test "ZA607: string-literal assignment text is not a fill" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0104: hasDirectFill matched `y =` inside the string literal, and
+    // the phantom fill dropped the tracked var before the read (p10 repro).
+    const content =
+        "fn use(v: u32) void {\n" ++
+        "    _ = v;\n" ++
+        "}\n" ++
+        "fn stringPhantom() void {\n" ++
+        "    var y: u32 = undefined;\n" ++
+        "    const s = \"y = 1\";\n" ++
+        "    _ = s;\n" ++
+        "    use(y);\n" ++
+        "}\n";
+    var run = try runCFGMemoryTest(allocator, "da_str_phantom.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_str_phantom.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multiline-string assignment text is not a fill" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0104: hasDirectFill matched `x =` on the `\\` multiline-string
+    // line, and the phantom fill dropped the tracked var (p6 repro).
+    const content =
+        "fn use(v: u32) void {\n" ++
+        "    _ = v;\n" ++
+        "}\n" ++
+        "fn multilineStringPhantom() void {\n" ++
+        "    var x: u32 = undefined;\n" ++
+        "    const s =\n" ++
+        "        \\\\x = 1\n" ++
+        "        \\\\more text\n" ++
+        "    ;\n" ++
+        "    _ = s;\n" ++
+        "    use(x);\n" ++
+        "}\n";
+    var run = try runCFGMemoryTest(allocator, "da_mlstr_phantom.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_mlstr_phantom.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill assigning a string literal still counts" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard (EPH-I0104): the fill target sits outside the string. The string
+    // guard must not skip a real fill whose RHS is a string literal.
+    const content =
+        "fn use(v: []const u8) void {\n" ++
+        "    _ = v;\n" ++
+        "}\n" ++
+        "fn fillAssignsString() void {\n" ++
+        "    var name: []const u8 = undefined;\n" ++
+        "    name = \"{\";\n" ++
+        "    use(name);\n" ++
+        "}\n";
+    var run = try runCFGMemoryTest(allocator, "da_str_real_fill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_str_real_fill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: escaped quotes around assignment text stay non-fill" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0104: the escaped `\"` must not end the string scan. The `name =`
+    // text stays inside the literal, so it never counts as a fill.
+    const content =
+        "fn use(v: u32) void {\n" ++
+        "    _ = v;\n" ++
+        "}\n" ++
+        "fn escapedStringPhantom() void {\n" ++
+        "    var name: u32 = undefined;\n" ++
+        "    const s = \"a \\\" b name = \";\n" ++
+        "    _ = s;\n" ++
+        "    use(name);\n" ++
+        "}\n";
+    var run = try runCFGMemoryTest(allocator, "da_str_escaped.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_str_escaped.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: char literal quote does not suppress a real fill" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0104 review (Finding A): the `"` inside the `'"'` char literal
+    // must not open string state. The real fill on the same line counts,
+    // so the read on the next line stays silent.
+    const content =
+        "fn use(v: u32) void {\n" ++
+        "    _ = v;\n" ++
+        "}\n" ++
+        "fn quoteCharFillSameLineReadNext() void {\n" ++
+        "    var x: u32 = undefined;\n" ++
+        "    const q = '\"'; x = 1;\n" ++
+        "    use(x);\n" ++
+        "    _ = q;\n" ++
+        "}\n";
+    var run = try runCFGMemoryTest(allocator, "da_char_quote.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_char_quote.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: trailing-comment assignment text is not a fill" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0104 review (Finding C): the mid-line `//` guard mirrors
+    // firstVarReadPos. Comment text after real code never fills a var.
+    const content =
+        "fn use(v: u32) void {\n" ++
+        "    _ = v;\n" ++
+        "}\n" ++
+        "fn trailingCommentPhantom() void {\n" ++
+        "    var x: u32 = undefined;\n" ++
+        "    const y = 1; // x = 1\n" ++
+        "    _ = y;\n" ++
+        "    use(x);\n" ++
+        "}\n";
+    var run = try runCFGMemoryTest(allocator, "da_trailing_comment.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_trailing_comment.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill assigning a multiline string still counts" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard (EPH-I0104): the fill statement is real code. Its `\\`
+    // continuation lines carry the string payload, and the pending fill
+    // completes at the `;`.
+    const content =
+        "fn use(v: []const u8) void {\n" ++
+        "    _ = v;\n" ++
+        "}\n" ++
+        "fn fillAssignsMultiline() void {\n" ++
+        "    var s: []const u8 = undefined;\n" ++
+        "    s =\n" ++
+        "        \\\\line one\n" ++
+        "        \\\\line two\n" ++
+        "    ;\n" ++
+        "    use(s);\n" ++
+        "}\n";
+    var run = try runCFGMemoryTest(allocator, "da_mlstr_real_fill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_mlstr_real_fill.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

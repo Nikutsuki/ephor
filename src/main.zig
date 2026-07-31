@@ -307,6 +307,28 @@ fn isLoopBlock(bt: BlockType) bool {
     return bt == .while_block or bt == .for_block;
 }
 
+/// Column span one basic block owns on a source line shared by several
+/// blocks. A same-line if/else packs the branch header, both arms, and
+/// the post-merge text into one line; whole-line ranges cannot attribute
+/// statements on it, so the walk records the split (EPH-I0111).
+const ColSpan = struct {
+    line: usize,
+    start_col: usize,
+    end_col: usize,
+    block: usize,
+};
+
+/// Column span of a same-line braced arm on a line without an else
+/// (`if (c) { x = 1; }`). A fill inside the arm runs on the guarded path
+/// only; the gen side uses the span to move the fill's effect past the
+/// line end so a same-line read after the construct stays uncovered,
+/// while later-line reads keep the entry-block verdict (EPH-I0111).
+const ArmSpan = struct {
+    line: usize,
+    start_col: usize,
+    end_col: usize,
+};
+
 /// Control Flow Graph for a single function
 const ControlFlowGraph = struct {
     allocator: Allocator,
@@ -316,6 +338,8 @@ const ControlFlowGraph = struct {
     edges: std.ArrayListUnmanaged(CFGEdge),
     entry_block: usize,
     exit_blocks: std.ArrayListUnmanaged(usize),
+    col_spans: std.ArrayListUnmanaged(ColSpan),
+    oneline_arms: std.ArrayListUnmanaged(ArmSpan),
 
     fn init(alloc: Allocator, name: []const u8, line: usize) ControlFlowGraph {
         return .{
@@ -326,6 +350,8 @@ const ControlFlowGraph = struct {
             .edges = .empty,
             .entry_block = 0,
             .exit_blocks = .empty,
+            .col_spans = .empty,
+            .oneline_arms = .empty,
         };
     }
 
@@ -336,6 +362,8 @@ const ControlFlowGraph = struct {
         self.blocks.deinit(self.allocator);
         self.edges.deinit(self.allocator);
         self.exit_blocks.deinit(self.allocator);
+        self.col_spans.deinit(self.allocator);
+        self.oneline_arms.deinit(self.allocator);
     }
 
     fn addBlock(self: *ControlFlowGraph) !usize {
@@ -726,7 +754,7 @@ fn classifyBracedJumpBody(code: []const u8, start: usize, end: usize) JumpKind {
 fn scanClaimsElse(pattern: CFPattern, events: []const ControlEvent) bool {
     if (pattern != .else_start and pattern != .else_if) return false;
     for (events) |event| {
-        if (event == .close_control) return false;
+        if (event.kind == .close_control) return false;
     }
     return true;
 }
@@ -786,11 +814,20 @@ const BraceKind = enum { fn_body, sig_container, control, expr };
 /// Ordered control event emitted by the per-line brace scan. buildCFG walks
 /// the list in position order instead of dispatching once per line, so a
 /// line like `if (a) { f(); } else { g(); }` opens and closes both blocks.
-const ControlEvent = enum {
-    open_control, // `{` claimed as a control block opener
-    close_control, // `}` closed a control block (or a brace-less pending entry)
-    close_virtual, // a virtual (brace-less) body statement ended
-    else_keyword, // whole-word `else` following a same-line control close
+/// The column locates the event in the trimmed, comment-stripped line; the
+/// walk uses it to split block ownership of a line shared by several
+/// blocks (EPH-I0111).
+const ControlEvent = struct {
+    /// Event kinds in scan order.
+    const Kind = enum {
+        open_control, // `{` claimed as a control block opener
+        close_control, // `}` closed a control block (or a brace-less pending entry)
+        close_virtual, // a virtual (brace-less) body statement ended
+        else_keyword, // whole-word `else` following a same-line control close
+    };
+
+    kind: Kind,
+    col: usize,
 };
 
 /// Per-line output of the CFG brace scan.
@@ -929,37 +966,44 @@ const CFGBuildCtx = struct {
             line_scan.out.saw_control_open = true;
             line_scan.last_control_open = i;
             try self.brace_stack.append(self.allocator, .control);
-            try self.event_scratch.append(self.allocator, .open_control);
+            try self.event_scratch.append(self.allocator, .{
+                .kind = .open_control,
+                .col = i,
+            });
             return;
         }
         try self.brace_stack.append(self.allocator, .expr);
     }
 
     /// Classify one `}` at index i: pop the brace stack; emit `.close_control`
-    /// iff it pops a `.control` brace. A control brace opened on this same line is
-    /// always popped (same-line balanced `if (a) { f(); }`); a control brace
-    /// from an earlier line still waits for a pop-dispatching line. A pop of
-    /// a same-line control brace also classifies the braced body text as
-    /// loop control (`{ break; }`) for the walk (EPH-I0094).
+    /// iff it pops a `.control` brace. A mid-line `}` after a statement also
+    /// closes the arm (`_ = c; } else {`): the kind-tagged brace stack makes
+    /// the pop unambiguous, and deferring it to a later pop-dispatching line
+    /// would hide the close and the else behind it from the walk
+    /// (EPH-I0111). A pop of a same-line control brace also classifies the
+    /// braced body text as loop control (`{ break; }`) for the walk
+    /// (EPH-I0094).
     fn classifyCloseBrace(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
         // An entry still waiting for its `{` (brace-less body) is closed by
         // the next close event, matching pre-guard pop-on-`}` semantics.
         if (line_scan.dispatch_pop and self.topIsPending()) {
             line_scan.out.saw_control_close = true;
-            try self.event_scratch.append(self.allocator, .close_control);
+            try self.event_scratch.append(self.allocator, .{
+                .kind = .close_control,
+                .col = i,
+            });
             return;
         }
         const items = self.brace_stack.items;
         if (items.len == 0) {
             line_scan.out.saw_control_close = true;
-            try self.event_scratch.append(self.allocator, .close_control);
+            try self.event_scratch.append(self.allocator, .{
+                .kind = .close_control,
+                .col = i,
+            });
             return;
         }
         const kind = items[items.len - 1];
-        // A `.control` brace from an earlier line closed on a non-popping
-        // line stays open so a later block_end line pops the entry.
-        if (kind == .control and !line_scan.dispatch_pop and
-            !line_scan.out.saw_control_open) return;
         _ = self.brace_stack.pop();
         if (kind != .control) return;
         if (line_scan.last_control_open) |open_i| {
@@ -970,7 +1014,10 @@ const CFGBuildCtx = struct {
             if (jump != .none) line_scan.out.body_jump = jump;
         }
         line_scan.out.saw_control_close = true;
-        try self.event_scratch.append(self.allocator, .close_control);
+        try self.event_scratch.append(self.allocator, .{
+            .kind = .close_control,
+            .col = i,
+        });
     }
 
     /// True when the scan's latest event closed a control block (braced or
@@ -979,7 +1026,7 @@ const CFGBuildCtx = struct {
         const items = self.event_scratch.items;
         if (items.len == 0) return false;
         const last = items[items.len - 1];
-        return last == .close_control or last == .close_virtual;
+        return last.kind == .close_control or last.kind == .close_virtual;
     }
 
     /// At the condition's closing paren on an if/else-if line: a same-line
@@ -1001,15 +1048,21 @@ const CFGBuildCtx = struct {
         // virtual body, not by a later `{`.
         _ = self.clearTopPending();
         try self.brace_stack.append(self.allocator, .control);
-        try self.event_scratch.append(self.allocator, .open_control);
+        try self.event_scratch.append(self.allocator, .{
+            .kind = .open_control,
+            .col = i,
+        });
     }
 
     /// Close a virtual else body: no brace was pushed, so the close event
     /// alone drives the else block's handleBlockEnd in the walk.
-    fn closeElseVirtual(self: *CFGBuildCtx, line_scan: *LineScanCtx) !void {
+    fn closeElseVirtual(self: *CFGBuildCtx, col: usize, line_scan: *LineScanCtx) !void {
         if (!line_scan.else_virtual) return;
         line_scan.else_virtual = false;
-        try self.event_scratch.append(self.allocator, .close_virtual);
+        try self.event_scratch.append(self.allocator, .{
+            .kind = .close_virtual,
+            .col = col,
+        });
     }
 
     /// Pop the virtual control brace pushed by tryVirtualBodyOpen (top of
@@ -1022,11 +1075,14 @@ const CFGBuildCtx = struct {
 
     /// Close an open virtual body: the statement ended (`;`) or the line
     /// did; emit the close event that a braced body's `}` would produce.
-    fn closeVirtualBody(self: *CFGBuildCtx, line_scan: *LineScanCtx) !void {
+    fn closeVirtualBody(self: *CFGBuildCtx, col: usize, line_scan: *LineScanCtx) !void {
         if (!line_scan.virtual_open) return;
         line_scan.virtual_open = false;
         self.popVirtualControl();
-        try self.event_scratch.append(self.allocator, .close_virtual);
+        try self.event_scratch.append(self.allocator, .{
+            .kind = .close_virtual,
+            .col = col,
+        });
     }
 
     /// Handle one code char (outside quotes/comments) for the brace scan.
@@ -1035,7 +1091,10 @@ const CFGBuildCtx = struct {
     fn scanCodeChar(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !usize {
         const c = line_scan.code[i];
         if (c == 'e' and self.lastEventIsClose() and isElseWordAt(line_scan.code, i)) {
-            try self.event_scratch.append(self.allocator, .else_keyword);
+            try self.event_scratch.append(self.allocator, .{
+                .kind = .else_keyword,
+                .col = i,
+            });
             if (peekElseBody(line_scan.code, i + 4) == .statement) {
                 line_scan.else_virtual = true;
             } else {
@@ -1045,11 +1104,11 @@ const CFGBuildCtx = struct {
         }
         if (c == ';' and self.paren_depth == 0) {
             if (line_scan.virtual_open) {
-                try self.closeVirtualBody(line_scan);
+                try self.closeVirtualBody(i, line_scan);
                 return 0;
             }
             if (line_scan.else_virtual) {
-                try self.closeElseVirtual(line_scan);
+                try self.closeElseVirtual(i, line_scan);
                 return 0;
             }
         }
@@ -1103,8 +1162,8 @@ const CFGBuildCtx = struct {
             if (c == '/' and i + 1 < code.len and code[i + 1] == '/') break;
             i += try self.scanCodeChar(i, &line_scan);
         }
-        try self.closeVirtualBody(&line_scan);
-        try self.closeElseVirtual(&line_scan);
+        try self.closeVirtualBody(code.len, &line_scan);
+        try self.closeElseVirtual(code.len, &line_scan);
         self.body_return = line_scan.out.body_return;
         self.body_jump = line_scan.out.body_jump;
         line_scan.out.events = self.event_scratch.items;
@@ -1481,6 +1540,112 @@ const CFGBuildCtx = struct {
         }
     }
 
+    /// Record the column span the current block owns on this line up to an
+    /// event boundary. Empty segments carry no statements and are skipped.
+    fn recordColSpan(self: *CFGBuildCtx, line: usize, start: usize, end: usize) !void {
+        if (start >= end) return;
+        try self.cfg.col_spans.append(self.allocator, .{
+            .line = line,
+            .start_col = start,
+            .end_col = end,
+            .block = self.current_block,
+        });
+    }
+
+    /// True when the else this walk is about to handle claims an if entry,
+    /// the plain-else shape whose same-line blocks get column spans. A
+    /// switch prong `else =>` or a loop `else` reaching here claims a
+    /// different entry kind and keeps whole-line attribution (EPH-I0111).
+    fn elseClaimsIfEntry(self: *CFGBuildCtx) bool {
+        if (self.pending_else) |entry| return entry.block_type == .if_block;
+        const items = self.block_stack.items;
+        if (items.len == 0) return false;
+        return items[items.len - 1].block_type == .if_block;
+    }
+
+    /// Record the same-line braced arm spans of a line without an else
+    /// (`if (c) { x = 1; }`). A fill inside the arm is conditional, which
+    /// whole-line attribution cannot express (EPH-I0111).
+    fn recordOnelineArms(self: *CFGBuildCtx, events: []const ControlEvent, line: usize) !void {
+        var open_col: ?usize = null;
+        for (events) |event| {
+            if (event.kind == .open_control) {
+                open_col = event.col;
+                continue;
+            }
+            if (event.kind != .close_control) continue;
+            const start = open_col orelse continue;
+            open_col = null;
+            try self.cfg.oneline_arms.append(self.allocator, .{
+                .line = line,
+                .start_col = start,
+                .end_col = event.col + 1,
+            });
+        }
+    }
+
+    /// Outcome of the span prelude for one line: whether the walk records
+    /// column spans for it, and the col_spans length to roll back to when
+    /// the else claims a non-if entry.
+    const SpanPrelude = struct {
+        record_spans: bool,
+        span_mark: usize,
+    };
+
+    /// Decide and start span recording for the line. A plain-else line
+    /// (`else {`, not an else-if chain, not `else return`) records the
+    /// column spans that split the line's ownership across the branch,
+    /// the arms, and the merge. A line without an else records same-line
+    /// braced arm spans instead — except a switch, whose prong braces are
+    /// expression braces: exhaustiveness has no unguarded path, so the
+    /// switch's own braces must not become a conditional arm (EPH-I0111).
+    fn beginLineSpans(
+        self: *CFGBuildCtx,
+        pattern: CFPattern,
+        code: []const u8,
+        line: usize,
+    ) !SpanPrelude {
+        const events = self.event_scratch.items;
+        var has_else = false;
+        for (events) |event| {
+            if (event.kind == .else_keyword) has_else = true;
+        }
+        if (!has_else and pattern != .switch_start)
+            try self.recordOnelineArms(events, line);
+        return .{
+            .record_spans = has_else and !elseChainsIntoIf(code) and
+                !hasInlineElseReturn(code),
+            .span_mark = self.cfg.col_spans.items.len,
+        };
+    }
+
+    /// Record the span the current block owns up to an event boundary and
+    /// advance the segment start. A close's span includes its `}`; every
+    /// other event ends the segment at its own column (EPH-I0111).
+    fn advanceSpan(self: *CFGBuildCtx, line: usize, span_col: *usize, event: ControlEvent) !void {
+        const end = if (event.kind == .close_control or
+            event.kind == .close_virtual) event.col + 1 else event.col;
+        try self.recordColSpan(line, span_col.*, end);
+        span_col.* = end;
+    }
+
+    /// Record the text after the line's last event: the merge owns it when
+    /// the close deferred, otherwise it stays with the current block
+    /// (EPH-I0111).
+    fn recordTrailingSpan(self: *CFGBuildCtx, line: usize, start: usize, end: usize) !void {
+        if (start >= end) return;
+        const target = if (self.pending_else) |entry|
+            entry.merge_block
+        else
+            self.current_block;
+        try self.cfg.col_spans.append(self.allocator, .{
+            .line = line,
+            .start_col = start,
+            .end_col = end,
+            .block = target,
+        });
+    }
+
     /// Walk the line's ordered control events (event_scratch, filled by the
     /// scanLineBraces call immediately before), dispatching CFG handlers in
     /// position order. The line's pattern supplies the construct kind for
@@ -1497,9 +1662,13 @@ const CFGBuildCtx = struct {
             else => {},
         }
         const events = self.event_scratch.items;
+        const prelude = try self.beginLineSpans(pattern, code, line);
+        var record_spans = prelude.record_spans;
         var opener_dispatched = false;
+        var span_col: usize = 0;
         for (events, 0..) |event, idx| {
-            switch (event) {
+            if (record_spans) try self.advanceSpan(line, &span_col, event);
+            switch (event.kind) {
                 .open_control => {
                     if (opener_dispatched) continue;
                     opener_dispatched = true;
@@ -1507,17 +1676,22 @@ const CFGBuildCtx = struct {
                         try self.dispatchPattern(pattern, code, line);
                 },
                 .else_keyword => {
+                    if (record_spans and !self.elseClaimsIfEntry()) {
+                        self.cfg.col_spans.shrinkRetainingCapacity(prelude.span_mark);
+                        record_spans = false;
+                    }
                     opener_dispatched = true;
                     try self.handleElse(code, line);
                 },
                 .close_control, .close_virtual => {
                     try self.closeBodyMarkers(event);
-                    if (idx + 1 < events.len and events[idx + 1] == .else_keyword)
+                    if (idx + 1 < events.len and events[idx + 1].kind == .else_keyword)
                         continue;
                     try self.handleBlockEndOrDefer(line);
                 },
             }
         }
+        if (record_spans) try self.recordTrailingSpan(line, span_col, code.len);
         // Opener whose control `{` is on a later line (Allman / multi-line
         // condition): push the entry now; the pending mark claims that brace.
         if (!opener_dispatched and isControlOpener(pattern))
@@ -1530,7 +1704,7 @@ const CFGBuildCtx = struct {
     /// break/continue body wires its jump before the close pops the entry,
     /// exactly like a braced body line's break_stmt dispatch (EPH-I0094).
     fn closeBodyMarkers(self: *CFGBuildCtx, event: ControlEvent) !void {
-        if (event == .close_virtual and self.body_return) {
+        if (event.kind == .close_virtual and self.body_return) {
             self.body_return = false;
             try self.handleReturn();
         }
@@ -2069,6 +2243,28 @@ fn findBlockForLine(cfg: *const ControlFlowGraph, line: usize) ?usize {
     return null;
 }
 
+/// Compute which block owns a column on a line. A recorded column span
+/// wins: a same-line if/else packs the branch, the arms, and the merge
+/// into one line, and whole-line ranges cannot separate them (EPH-I0111).
+/// Lines without spans fall back to the whole-line range.
+fn findBlockForLineCol(cfg: *const ControlFlowGraph, line: usize, col: usize) ?usize {
+    for (cfg.col_spans.items) |span| {
+        if (span.line != line) continue;
+        if (col >= span.start_col and col < span.end_col) return span.block;
+    }
+    return findBlockForLine(cfg, line);
+}
+
+/// True when the column sits inside a same-line braced arm on a line
+/// without an else (EPH-I0111).
+fn colInOnelineArm(cfg: *const ControlFlowGraph, line: usize, col: usize) bool {
+    for (cfg.oneline_arms.items) |span| {
+        if (span.line == line and col >= span.start_col and col < span.end_col)
+            return true;
+    }
+    return false;
+}
+
 /// Get predecessors of a block
 fn getBlockPredecessors(
     cfg: *const ControlFlowGraph,
@@ -2247,6 +2443,18 @@ const FillScan = struct {
     }
 };
 
+/// True when a whole-word `else` immediately precedes the `{` at i
+/// (whitespace allowed): the brace opens an else arm. A mid-line
+/// `} else {` after a statement pays the conditional depth down at the
+/// close, so the else arm's `{` must re-open it (EPH-I0111).
+fn isElseBraceOpen(code: []const u8, i: usize) bool {
+    var j = i;
+    while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+    if (j < 4) return false;
+    if (!mem.eql(u8, code[j - 4 .. j], "else")) return false;
+    return j == 4 or !isIdent(code[j - 5]);
+}
+
 /// True when `name` is a type/container keyword whose parenthesized
 /// header precedes an expression brace: `switch (y) {`, `union(enum) {`,
 /// `enum(u8) {`. The closing brace of such a form never closes a
@@ -2292,6 +2500,15 @@ fn isContainerParenHeader(code: []const u8, close_idx: usize) bool {
     return false;
 }
 
+/// The line's first `}` that pays conditional depth down, with the depth
+/// open just before it. A fill textually before that close still ran
+/// inside the arm (`x = 1; }`), so the fill-before-use scan judges it at
+/// depth_before, not at the end-of-line depth (EPH-I0111).
+const CloseMark = struct {
+    col: usize,
+    depth_before: usize,
+};
+
 /// Tracks if/else and loop nesting depth during the fill-before-use scan.
 /// A `}` closes a conditional block only when no expression brace is
 /// pending: braces in struct literals, call args, strings, and comments
@@ -2308,15 +2525,27 @@ const CondNesting = struct {
     // parens never clobber it (EPH-I0106). The next span's transition
     // overwrites it, so it needs no clearing when the span closes.
     paren_container: bool = false,
+    // The line-start opener was counted on this line, so a control `{`
+    // later on the line must not count twice. Only a mid-line else brace
+    // after a statement (`_ = c; } else {`) still re-opens the depth
+    // (EPH-I0111).
+    opener_counted: bool = false,
+    first_close: ?CloseMark = null,
     mode: QuoteMode = .none,
 
     /// Advance the state across one trimmed source line.
     fn update(self: *CondNesting, check_line: []const u8) void {
         if (isCommentOrMultilineString(check_line)) return;
+        self.opener_counted = false;
+        self.first_close = null;
         // An if/else keyword inside a pending expression is an if-EXPRESSION
         // (or junk): its body never contains scanned statements.
         if (self.paren_depth == 0 and self.pending_expr == 0 and
-            opensConditionalBody(check_line)) self.depth += 1;
+            opensConditionalBody(check_line))
+        {
+            self.depth += 1;
+            self.opener_counted = true;
+        }
         const code = stripLineComment(check_line);
         var i: usize = 0;
         while (i < code.len) : (i += 1) {
@@ -2339,10 +2568,19 @@ const CondNesting = struct {
                 self.paren_depth += 1;
             },
             ')', ']' => self.paren_depth -|= 1,
-            '{' => if (self.isExprBraceOpen(code, i)) {
-                self.pending_expr += 1;
+            '{' => {
+                if (self.isExprBraceOpen(code, i)) {
+                    self.pending_expr += 1;
+                } else if (!self.opener_counted and isElseBraceOpen(code, i)) {
+                    self.depth += 1;
+                }
             },
-            '}' => self.closeBrace(),
+            '}' => {
+                if (self.first_close == null and self.pending_expr == 0 and
+                    self.depth > 0)
+                    self.first_close = .{ .col = i, .depth_before = self.depth };
+                self.closeBrace();
+            },
             else => {},
         }
     }
@@ -2404,7 +2642,18 @@ fn hasUnconditionalFillBeforeUse(
             continue;
         }
         nesting.update(check_line);
-        if (scan.classifyLine(check_line, name, nesting.depth)) |verdict| return verdict;
+        // A fill textually before the line's first depth-paying close ran
+        // inside the arm (`x = 1; }`), so judge it at the depth open
+        // before the close, not at the end-of-line depth (EPH-I0111).
+        var fill_depth = nesting.depth;
+        if (nesting.first_close) |fc| {
+            const assign_col = findAssignmentOccurrence(check_line, name);
+            const call_col = findFillCallOccurrence(check_line, name);
+            const fill_col = assign_col orelse call_col;
+            if (fill_col != null and fill_col.? < fc.col)
+                fill_depth = @max(fill_depth, fc.depth_before);
+        }
+        if (scan.classifyLine(check_line, name, fill_depth)) |verdict| return verdict;
         if (isRealUseOfVar(check_line, name) and nesting.depth == 0) return false;
         if (mem.startsWith(u8, check_line, "return ")) break;
         if (mem.eql(u8, check_line, "}")) break;
@@ -2541,16 +2790,16 @@ fn fillCallEffectPos(
     return no_assign_effect;
 }
 
-/// Column of the first occurrence of var_name that is a direct assignment
-/// target (`x = ...`, `x.field = ...`, `x[i] = ...`), or null. Word
-/// boundaries and a leading-dot guard keep `box =` and `foo.x =` from
-/// matching. Fill-style writes (x.init(), @memset(&x, ...), fill(&x)) are
-/// not targets — callers fall back to the statement start for those.
-fn findAssignmentOccurrence(t: []const u8, var_name: []const u8) ?usize {
-    var s: usize = 0;
-    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-        const pos = s + rel;
-        s = pos + var_name.len;
+/// Next occurrence of var_name at or after s.* that is a direct assignment
+/// target (`x = ...`, `x.field = ...`, `x[i] = ...`), advancing s.* past
+/// the matched name. Word boundaries and a leading-dot guard keep `box =`
+/// and `foo.x =` from matching. Fill-style writes (x.init(), @memset(&x,
+/// ...), fill(&x)) are not targets — callers fall back to the statement
+/// start for those.
+fn nextAssignmentOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize {
+    while (mem.indexOf(u8, t[s.*..], var_name)) |rel| {
+        const pos = s.* + rel;
+        s.* = pos + var_name.len;
         // The match must be the variable itself: not mid-identifier
         // (box =) and not a field of another var (foo.x =).
         if (pos > 0 and isIdent(t[pos - 1])) continue;
@@ -2560,6 +2809,12 @@ fn findAssignmentOccurrence(t: []const u8, var_name: []const u8) ?usize {
         if (isAssignmentTarget(t, var_name, pos)) return pos;
     }
     return null;
+}
+
+/// Column of the first direct-assignment occurrence of var_name, or null.
+fn findAssignmentOccurrence(t: []const u8, var_name: []const u8) ?usize {
+    var s: usize = 0;
+    return nextAssignmentOccurrence(t, var_name, &s);
 }
 
 /// True when the occurrence at `pos` is the bare destination argument of
@@ -2608,20 +2863,19 @@ fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
-/// Column of the open paren of a fill-CALL targeting var_name, or null
-/// when the line has no fill-call for the var. Two classes: `&var` passed
-/// as a call argument (`fill(&x)`, `foo.read(&x)` — the call-fill
-/// heuristic writes through the pointer), and the bare `@memset(var` /
-/// `@memcpy(var` destination. Slice-index forms (`&x[0]`,
-/// `@memset(x[0..], v)`) and plain slice occurrences (`x[0..n]`) are
-/// hasDirectFill Pattern-2 territory and deliberately do NOT match — they
-/// keep whole-line coverage (EPH-I0102). A non-call `&x` (`const p = &x;`)
-/// is untrackable aliasing, not a fill.
-fn findFillCallOccurrence(t: []const u8, var_name: []const u8) ?usize {
-    var s: usize = 0;
-    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-        const pos = s + rel;
-        s = pos + var_name.len;
+/// Next occurrence of var_name at or after s.* that is a fill-CALL target,
+/// advancing s.* past the matched name. Two classes: `&var` passed as a
+/// call argument (`fill(&x)`, `foo.read(&x)` — the call-fill heuristic
+/// writes through the pointer), and the bare `@memset(var` / `@memcpy(var`
+/// destination. Slice-index forms (`&x[0]`, `@memset(x[0..], v)`) and
+/// plain slice occurrences (`x[0..n]`) are hasDirectFill Pattern-2
+/// territory and deliberately do NOT match — they keep whole-line coverage
+/// (EPH-I0102). A non-call `&x` (`const p = &x;`) is untrackable aliasing,
+/// not a fill.
+fn nextFillCallOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize {
+    while (mem.indexOf(u8, t[s.*..], var_name)) |rel| {
+        const pos = s.* + rel;
+        s.* = pos + var_name.len;
         // The match must be the variable itself: not mid-identifier
         // (box) and not a field of another var (foo.x).
         if (pos > 0 and isIdent(t[pos - 1])) continue;
@@ -2639,6 +2893,13 @@ fn findFillCallOccurrence(t: []const u8, var_name: []const u8) ?usize {
         if (isBuiltinDestAt(t, pos)) return pos - 1;
     }
     return null;
+}
+
+/// Column of the open paren of the first fill-CALL targeting var_name, or
+/// null when the line has no fill-call for the var.
+fn findFillCallOccurrence(t: []const u8, var_name: []const u8) ?usize {
+    var s: usize = 0;
+    return nextFillCallOccurrence(t, var_name, &s);
 }
 
 /// Record a loop-carried fill: the loop-header block gens the var, covered
@@ -2754,6 +3015,77 @@ const GenSets = struct {
     }
 };
 
+/// One fill occurrence on a line: the index into the function-body lines,
+/// the occurrence column in the trimmed line, and the point the fill
+/// takes effect.
+const GenOccurrence = struct {
+    idx: usize,
+    col: usize,
+    effect: AssignEffect,
+};
+
+/// Attribute one fill occurrence to the block that owns its column and
+/// merge its effect point into that block's first-effect set. A fill
+/// inside a same-line no-else if arm runs on the guarded path only, so it
+/// must not cover a same-line read after the construct; later-line reads
+/// keep the locked same-line-braced-if verdict through the entry block's
+/// gen bit (EPH-I0111).
+fn recordGenEffect(ctx: *const DefAssignCtx, occ: GenOccurrence, gen_sets: *GenSets) void {
+    const actual_line = ctx.func_line + occ.idx;
+    const bid = findBlockForLineCol(ctx.cfg, actual_line, occ.col) orelse return;
+    gen_sets.gen[bid] = true;
+    const effect = if (colInOnelineArm(ctx.cfg, actual_line, occ.col))
+        AssignEffect{ .line = occ.idx, .col = std.math.maxInt(usize) }
+    else
+        occ.effect;
+    gen_sets.first_effect[bid] = minAssignEffect(gen_sets.first_effect[bid], effect);
+}
+
+/// Record every fill occurrence of var_name on one body line. Each
+/// occurrence gens the block that owns its column: a same-line if/else
+/// can hold one fill per arm, and the first occurrence's block must not
+/// claim them all (EPH-I0111). Direct assignments take effect at their
+/// own `;` — a same-block read before that point is not covered
+/// (EPH-I0080). Fill-CALLS (fill(&x), foo(&x), @memset/@memcpy dests)
+/// take effect at the call's closing `)` (EPH-I0102).
+fn recordLineFills(
+    ctx: *const DefAssignCtx,
+    idx: usize,
+    var_name: []const u8,
+    gen_sets: *GenSets,
+) void {
+    const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+    var any = false;
+    var occ_s: usize = 0;
+    while (nextAssignmentOccurrence(t, var_name, &occ_s)) |occ_col| {
+        any = true;
+        recordGenEffect(ctx, .{
+            .idx = idx,
+            .col = occ_col,
+            .effect = statementEffectPos(ctx.lines, idx, occ_col),
+        }, gen_sets);
+    }
+    occ_s = 0;
+    while (nextFillCallOccurrence(t, var_name, &occ_s)) |open_col| {
+        any = true;
+        recordGenEffect(ctx, .{
+            .idx = idx,
+            .col = open_col,
+            .effect = fillCallEffectPos(ctx.lines, idx, open_col),
+        }, gen_sets);
+    }
+    // A line with a non-assignment `x[...]` slice occurrence keeps the
+    // historical whole-line coverage: hasDirectFill Pattern-2 counts
+    // slice READS as fills and that crudeness is load-bearing
+    // (ghostty/flow FPs when tightened).
+    if (!any and hasSliceOccurrence(t, var_name))
+        recordGenEffect(ctx, .{
+            .idx = idx,
+            .col = 0,
+            .effect = .{ .line = idx, .col = 0 },
+        }, gen_sets);
+}
+
 /// Compute gen set: which blocks assign a variable (includes loop fill patterns)
 fn computeGenSetForVar(
     ctx: *const DefAssignCtx,
@@ -2765,6 +3097,7 @@ fn computeGenSetForVar(
     const first_effect = try ctx.allocator.alloc(AssignEffect, ctx.num_blocks);
     errdefer ctx.allocator.free(first_effect);
     @memset(first_effect, no_assign_effect);
+    var gen_sets: GenSets = .{ .gen = gen, .first_effect = first_effect };
 
     var tracker = ForLoopTracker{};
     for (ctx.lines, 0..) |line, idx| {
@@ -2783,28 +3116,9 @@ fn computeGenSetForVar(
             isFillPattern(t, var_name) or
             hasAddressOfVar(t, var_name);
         if (!assigns_var) continue;
-        const bid = findBlockForLine(ctx.cfg, actual_line) orelse continue;
-        gen[bid] = true;
-        // Direct assignments take effect at their own `;` — a same-block
-        // read before that point is not covered (EPH-I0080). Fill-CALLS
-        // (fill(&x), foo(&x), @memset/@memcpy dests) take effect at the
-        // call's closing `)` (EPH-I0102). A line with both takes the
-        // earlier effect. A line with a non-assignment `x[...]` slice
-        // occurrence keeps the historical whole-line coverage:
-        // hasDirectFill Pattern-2 counts slice READS as fills and that
-        // crudeness is load-bearing (ghostty/flow FPs when tightened).
-        var effect: AssignEffect = .{ .line = idx, .col = 0 };
-        if (findAssignmentOccurrence(t, var_name)) |occ_col| {
-            effect = statementEffectPos(ctx.lines, idx, occ_col);
-            if (findFillCallOccurrence(t, var_name)) |open_col|
-                effect = minAssignEffect(effect, fillCallEffectPos(ctx.lines, idx, open_col));
-        } else if (!hasSliceOccurrence(t, var_name)) {
-            if (findFillCallOccurrence(t, var_name)) |open_col|
-                effect = fillCallEffectPos(ctx.lines, idx, open_col);
-        }
-        first_effect[bid] = minAssignEffect(first_effect[bid], effect);
+        recordLineFills(ctx, idx, var_name, &gen_sets);
     }
-    return .{ .gen = gen, .first_effect = first_effect };
+    return gen_sets;
 }
 
 /// Check if a line takes the address of a variable (&var_name)
@@ -3338,6 +3652,50 @@ const DefFlowSets = struct {
     num_blocks: usize,
 };
 
+/// Per-read scan context: the analysis inputs plus the flow results the
+/// per-line read check needs.
+const ReadScanCtx = struct {
+    da: *const DefAssignCtx,
+    def_entry: []const bool,
+    first_effect: []const AssignEffect,
+};
+
+/// True when the read of var_name on body-line idx is potentially
+/// uninitialized: the block's entry is not definitely assigned, no
+/// same-block assignment takes effect before the read, and no guard
+/// suppressor applies.
+fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) bool {
+    const al = sc.da.func_line + idx;
+    const t = mem.trim(u8, sc.da.lines[idx], " \t\r");
+    const read_col = firstVarReadPos(t, var_name) orelse return false;
+    const bid = findBlockForLineCol(sc.da.cfg, al, read_col) orelse return false;
+    if (sc.def_entry[bid]) return false;
+    // A same-block assignment covers this read only when it takes effect
+    // at or before the read position — block-granular gen hid reads that
+    // precede the assignment (`x = x + 1`, `y = x; x = 1;`) (EPH-I0080).
+    if (effectCoversRead(sc.first_effect[bid], idx, read_col)) return false;
+    // Check if the read is inside a correlated guard: the same if-condition
+    // that gates the read also gates an earlier assignment of the variable.
+    if (isCorrelatedGuardRead(sc.da.lines, idx, var_name)) return false;
+    // Check if the read is inside a null-guard on a variable that is only
+    // set non-null in blocks that also assign the flagged variable.
+    if (isNullGuardCorrelatedRead(sc.da.lines, idx, var_name)) return false;
+    // Check if all paths that don't assign the variable have early returns.
+    // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
+    if (hasEarlyReturnOnUnassignedPaths(sc.da.lines, var_name, idx)) return false;
+    // Check if the read is on the RHS of an `or` short-circuit in a
+    // condition where the LHS guards against the variable being
+    // uninitialized.
+    // e.g., if (param_group_t == null or i > param_group_end) {
+    //            param_group_end = ...; }
+    if (isOrShortCircuitSafe(sc.da.lines, idx, var_name)) return false;
+    // Check if a same-scope plain assignment textually dominates the
+    // read; the CFG mis-models brace-less guard ifs (`if (x) continue;`)
+    // and would otherwise blame reads the assignment always precedes.
+    if (hasDominatingScopeAssignment(sc.da.lines, idx, var_name)) return false;
+    return true;
+}
+
 /// Run data flow analysis for one variable.
 fn checkVarDefiniteAssignment(
     ctx: *const DefAssignCtx,
@@ -3362,36 +3720,15 @@ fn checkVarDefiniteAssignment(
         .num_blocks = ctx.num_blocks,
     });
 
-    for (ctx.lines, 0..) |line, idx| {
+    const sc: ReadScanCtx = .{
+        .da = ctx,
+        .def_entry = def_entry,
+        .first_effect = gen_sets.first_effect,
+    };
+    for (ctx.lines, 0..) |_, idx| {
         const al = ctx.func_line + idx;
         if (al <= var_line) continue;
-        const t = mem.trim(u8, line, " \t\r");
-        const bid = findBlockForLine(ctx.cfg, al) orelse continue;
-        if (def_entry[bid]) continue;
-        const read_col = firstVarReadPos(t, var_name) orelse continue;
-        // A same-block assignment covers this read only when it takes effect
-        // at or before the read position — block-granular gen hid reads that
-        // precede the assignment (`x = x + 1`, `y = x; x = 1;`) (EPH-I0080).
-        if (effectCoversRead(gen_sets.first_effect[bid], idx, read_col)) continue;
-        // Check if the read is inside a correlated guard: the same if-condition
-        // that gates the read also gates an earlier assignment of the variable.
-        if (isCorrelatedGuardRead(ctx.lines, idx, var_name)) continue;
-        // Check if the read is inside a null-guard on a variable that is only
-        // set non-null in blocks that also assign the flagged variable.
-        if (isNullGuardCorrelatedRead(ctx.lines, idx, var_name)) continue;
-        // Check if all paths that don't assign the variable have early returns.
-        // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
-        if (hasEarlyReturnOnUnassignedPaths(ctx.lines, var_name, idx)) continue;
-        // Check if the read is on the RHS of an `or` short-circuit in a
-        // condition where the LHS guards against the variable being
-        // uninitialized.
-        // e.g., if (param_group_t == null or i > param_group_end) {
-        //            param_group_end = ...; }
-        if (isOrShortCircuitSafe(ctx.lines, idx, var_name)) continue;
-        // Check if a same-scope plain assignment textually dominates the
-        // read; the CFG mis-models brace-less guard ifs (`if (x) continue;`)
-        // and would otherwise blame reads the assignment always precedes.
-        if (hasDominatingScopeAssignment(ctx.lines, idx, var_name)) continue;
+        if (!readIsUncovered(&sc, var_name, idx)) continue;
         try issues.put(var_name, al);
         break;
     }
@@ -45372,5 +45709,193 @@ test "ZA607: conditional fill without string content fires" {
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_i107_control.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line if/else with else-arm fill only is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0111: the if arm does not fill x, so the c-true path reads
+    // undefined. The CFG events fire on the one-liner, but the blocks
+    // must split the shared line at the arm boundaries.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {} else { x = 2; } use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i111_oneline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i111_oneline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: if-arm close sharing a line with a statement before else is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0111: `_ = c; } else {` puts a statement and the if-arm close
+    // on one line. The close must pop the arm so the else arm and the
+    // merge model as blocks of their own.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        _ = c; } else {
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i111_stmtclose.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i111_stmtclose.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line if/else with fills in both arms is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0111 regression lock: every path fills x before the read, so
+    // the one-liner must stay silent.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) { x = 1; } else { x = 2; } use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i111_bothfill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i111_bothfill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line braced if with same-line read is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0111: the read shares the line with a no-else one-line if.
+    // The fill covers later-line reads through the entry block (the
+    // locked same-line-braced-if verdict), but a same-line read after
+    // the construct still sees the unguarded path.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) { x = 1; } use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i111_ifonly.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i111_ifonly.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: if-arm close sharing a line with its last fill is detected" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0111: `x = 1; }` puts the arm's last fill and the close on one
+    // line. The fill is conditional, so the read after the if still sees
+    // the unguarded path.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1; }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i111_stmtclose_noelse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i111_stmtclose_noelse.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line switch with else prong is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0111: the else prong makes the switch exhaustive, so every
+    // path fills x before the read. Prong braces are expression braces,
+    // so the switch's own braces must not become a conditional arm span.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: u32) void {
+        \\    var x: u32 = undefined;
+        \\    switch (c) { 1 => { x = 1; }, else => { x = 2; } } use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i111_switch_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i111_switch_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line enum switch without else prong is silent" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0111: the two prongs cover the whole enum, so every path
+    // fills x before the read.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\const E = enum { a, b };
+        \\fn f(e: E) void {
+        \\    var x: u32 = undefined;
+        \\    switch (e) { .a => { x = 1; }, .b => { x = 2; } } use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i111_switch_enum.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i111_switch_enum.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }

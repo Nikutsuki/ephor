@@ -7487,19 +7487,32 @@ const ImportGraph = struct {
     fn markReachable(self: *ImportGraph, entry: []const u8) !void {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const norm = Fs.cwd().realpath(entry, &buf) catch return;
-        try self.markReachableRecursive(norm);
+        try self.markReachableResolved(norm);
     }
 
-    fn markReachableRecursive(self: *ImportGraph, path: []const u8) !void {
-        if (self.reachable.contains(path)) return;
-
-        const copy = try self.allocator.dupe(u8, path);
-        try self.reachable.put(copy, {});
-
-        const imports = self.findImportsForPath(path) orelse return;
-        for (imports) |imp| {
-            const resolved = imp.resolved orelse continue;
-            try self.markReachableRecursive(resolved);
+    /// Mark `path` (already realpath-resolved) and its transitive @import
+    /// closure reachable. Iterative worklist, not recursion: a linear
+    /// @import chain would recurse one stack frame per file and overflow
+    /// the 8 MB main-thread stack at ~30-50k files, aborting the audit
+    /// before any finding prints (RED1-2). The set owns a dupe of every
+    /// inserted path.
+    fn markReachableResolved(self: *ImportGraph, path: []const u8) !void {
+        var worklist: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer worklist.deinit(self.allocator);
+        try worklist.append(self.allocator, path);
+        while (worklist.pop()) |current| {
+            if (self.reachable.contains(current)) continue;
+            const copy = try self.allocator.dupe(u8, current);
+            self.reachable.put(copy, {}) catch |err| {
+                self.allocator.free(copy);
+                return err;
+            };
+            const imports = self.findImportsForPath(current) orelse continue;
+            for (imports) |imp| {
+                const resolved = imp.resolved orelse continue;
+                if (!self.reachable.contains(resolved))
+                    try worklist.append(self.allocator, resolved);
+            }
         }
     }
 
@@ -7605,7 +7618,7 @@ const ImportGraph = struct {
         const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
         if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved)) {
-            self.markReachableRecursive(resolved) catch return;
+            self.markReachableResolved(resolved) catch return;
         }
     }
 
@@ -7780,7 +7793,7 @@ const ImportGraph = struct {
         const target_owned = self.allocator.dupe(u8, target_abs) catch return;
         defer self.allocator.free(target_owned);
 
-        self.scanForNestedBuildZig(target_owned) catch return;
+        self.scanForNestedBuildZig(target_owned, 0) catch return;
     }
 
     /// Common directories to skip during traversal
@@ -7822,13 +7835,17 @@ const ImportGraph = struct {
             var buf2: [Fs.max_path_bytes]u8 = undefined;
             if (Fs.cwd().realpath(build_path, &buf2)) |resolved| {
                 if (!self.reachable.contains(resolved))
-                    self.markReachableRecursive(resolved) catch return;
+                    self.markReachableResolved(resolved) catch return;
             } else |_| {}
             self.markAllZigFilesReachable(subdir);
         } else |_| {}
     }
 
-    fn scanForNestedBuildZig(self: *ImportGraph, dir_path: []const u8) !void {
+    fn scanForNestedBuildZig(self: *ImportGraph, dir_path: []const u8, depth: u16) !void {
+        // Bound the recursion (RED1-8): a generated deep tree would
+        // overflow the stack. 64 doubles scanRecursive's 32 so discovery
+        // never truncates a tree the main walk can still scan.
+        if (depth > 64) return;
         var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
         defer dir.close(global_io.?);
         var iter = dir.iterate();
@@ -7844,7 +7861,7 @@ const ImportGraph = struct {
             self.handleNestedSubdir(subdir);
             if (isBuildManagedDir(entry.name))
                 self.markAllZigFilesReachable(subdir);
-            self.scanForNestedBuildZig(subdir) catch continue;
+            self.scanForNestedBuildZig(subdir, depth + 1) catch continue;
         }
     }
 
@@ -7887,7 +7904,7 @@ const ImportGraph = struct {
         const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
         if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved))
-            self.markReachableRecursive(resolved) catch return;
+            self.markReachableResolved(resolved) catch return;
     }
 
     fn scanFileBuildPathRefs(
@@ -7931,7 +7948,7 @@ const ImportGraph = struct {
     /// Mark all .zig files under a directory as reachable (for nested build.zig sub-projects
     /// where we can't statically resolve b.path(variable) calls)
     fn markAllZigFilesReachable(self: *ImportGraph, dir_path: []const u8) void {
-        self.markZigFilesRecursive(dir_path) catch return;
+        self.markZigFilesRecursive(dir_path, 0) catch return;
     }
 
     /// Mark a single .zig file as reachable via realpath resolution
@@ -7945,10 +7962,14 @@ const ImportGraph = struct {
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
         const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
         if (!self.reachable.contains(resolved))
-            self.markReachableRecursive(resolved) catch return;
+            self.markReachableResolved(resolved) catch return;
     }
 
-    fn markZigFilesRecursive(self: *ImportGraph, dir_path: []const u8) !void {
+    fn markZigFilesRecursive(self: *ImportGraph, dir_path: []const u8, depth: u16) !void {
+        // Bound the recursion (RED1-8): a generated deep tree would
+        // overflow the stack. The budget restarts at each sub-project
+        // root, and 64 levels from there covers real sub-project trees.
+        if (depth > 64) return;
         var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
         defer dir.close(global_io.?);
         var iter = dir.iterate();
@@ -7963,7 +7984,7 @@ const ImportGraph = struct {
                 .{ dir_path, entry.name },
             ) catch continue;
             defer self.allocator.free(sub);
-            self.markZigFilesRecursive(sub) catch continue;
+            self.markZigFilesRecursive(sub, depth + 1) catch continue;
         }
     }
 
@@ -19956,27 +19977,39 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
 // Runtime Analysis (Dynamic Analysis via Test Execution)
 // ============================================================================
 
-/// Run tests with Zig's GeneralPurposeAllocator and parse memory diagnostics
-fn parseCommandIntoArgv(cmd: []const u8, argv_buf: *[64][]const u8) usize {
+/// Result of splitting a `--command` string into the fixed argv buffer:
+/// the token count plus a truncation flag for tokens that did not fit.
+const ParsedArgv = struct {
+    argc: usize,
+    truncated: bool,
+};
+
+/// Split a `--command` string on unquoted spaces into `argv_buf`.
+/// Writes stop at the buffer bound and set `truncated` (RED5-1).
+fn parseCommandIntoArgv(cmd: []const u8, argv_buf: *[64][]const u8) ParsedArgv {
     var in_quote = false;
     var start: usize = 0;
     var argc: usize = 0;
     for (cmd, 0..) |c, i| {
-        if (c == '"' or c == '\'') {
-            in_quote = !in_quote;
-        } else if (c == ' ' and !in_quote and i > start) {
-            argv_buf[argc] = cmd[start..i];
-            argc += 1;
+        if (c == '"' or c == '\'') in_quote = !in_quote;
+        if (c != ' ' or in_quote) continue;
+        if (i == start) {
             start = i + 1;
-        } else if (c == ' ' and !in_quote) {
-            start = i + 1;
+            continue;
         }
+        // Bound every write: token 65 would write past the stack buffer
+        // (RED5-1). Stop and report truncation instead.
+        if (argc >= argv_buf.len) return .{ .argc = argc, .truncated = true };
+        argv_buf[argc] = cmd[start..i];
+        argc += 1;
+        start = i + 1;
     }
     if (start < cmd.len) {
+        if (argc >= argv_buf.len) return .{ .argc = argc, .truncated = true };
         argv_buf[argc] = cmd[start..];
         argc += 1;
     }
-    return argc;
+    return .{ .argc = argc, .truncated = false };
 }
 
 fn buildRuntimeArgv(
@@ -19987,7 +20020,13 @@ fn buildRuntimeArgv(
     if (custom_command) |cmd| {
         if (verbose)
             std.debug.print("Running: {s} (with GPA diagnostics)\n", .{cmd});
-        return parseCommandIntoArgv(cmd, argv_buf);
+        const parsed = parseCommandIntoArgv(cmd, argv_buf);
+        if (parsed.truncated)
+            std.debug.print(
+                "warning: --command truncated to {d} arguments\n",
+                .{argv_buf.len},
+            );
+        return parsed.argc;
     }
     argv_buf[0] = "zig";
     argv_buf[1] = "build";
@@ -24914,6 +24953,227 @@ test "ImportGraph.isSkippableDir skips dot-prefixed directories" {
     try std.testing.expect(!ImportGraph.isSkippableDir("src"));
     try std.testing.expect(!ImportGraph.isSkippableDir("lib"));
     try std.testing.expect(!ImportGraph.isSkippableDir("tests"));
+}
+
+/// Test helper: build the ImportInfo for a chain node's import of the
+/// file `/chain/f<j>.zig`. The caller's FileAnalysis owns the result.
+fn makeChainImport(allocator: Allocator, j: usize) !ImportInfo {
+    const path = try std.fmt.allocPrint(allocator, "f{d}.zig", .{j});
+    errdefer allocator.free(path);
+    const resolved = try std.fmt.allocPrint(allocator, "/chain/f{d}.zig", .{j});
+    errdefer allocator.free(resolved);
+    const name = try std.fmt.allocPrint(allocator, "f{d}", .{j});
+    errdefer allocator.free(name);
+    return .{
+        .path = path,
+        .resolved = resolved,
+        .name = name,
+        .line = 1,
+        .col = 1,
+    };
+}
+
+/// Test helper: free the owned strings of a chain ImportInfo. Mirrors the
+/// per-import frees in FileAnalysis.deinit.
+fn freeChainImport(allocator: Allocator, import: ImportInfo) void {
+    allocator.free(import.path);
+    if (import.resolved) |r| allocator.free(r);
+    allocator.free(import.name);
+}
+
+/// Test helper: append node `i` to an in-memory chain graph. When `next`
+/// is set, the node's single import resolves to `/chain/f<next>.zig`.
+fn addChainNode(graph: *ImportGraph, i: usize, next: ?usize) !void {
+    const allocator = graph.allocator;
+    const path = try std.fmt.allocPrint(allocator, "/chain/f{d}.zig", .{i});
+    var analysis = FileAnalysis{
+        .path = path,
+        .resolved_path = path,
+        .imports = .empty,
+        .content = try allocator.dupe(u8, ""),
+        .has_tests = false,
+        .pub_function_count = 0,
+        .line_count = 0,
+    };
+    errdefer analysis.deinit(allocator);
+    if (next) |j| {
+        const import = try makeChainImport(allocator, j);
+        errdefer freeChainImport(allocator, import);
+        try analysis.imports.append(allocator, import);
+    }
+    try graph.resolved_to_key.put(allocator, path, path);
+    try graph.files.put(path, analysis);
+}
+
+/// Test ferry: run the chain walk on a bounded-stack thread and carry the
+/// outcome back to the main thread.
+const ChainWalkRun = struct {
+    graph: *ImportGraph,
+    err: ?Allocator.Error = null,
+
+    fn run(self: *ChainWalkRun) void {
+        self.graph.markReachableResolved("/chain/f0.zig") catch |e| {
+            self.err = e;
+        };
+    }
+};
+
+test "markReachableResolved walks a 30000-node chain on a 1 MB stack" {
+    // Arena over testing.allocator: 30k nodes x ~7 allocations each cost
+    // ~40s under DebugAllocator bookkeeping. The arena bumps a pointer
+    // and frees in bulk. The arena is not thread-safe, but spawn and
+    // join bracket every use, so access stays sequential.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Recursion needs one stack frame per chain link. 30,000 frames
+    // overflow a 1 MB stack. The worklist keeps its state on the heap.
+    // The bounded-stack thread is what discriminates the worklist from
+    // recursion. On an unbounded stack both complete this walk.
+    const n = 30_000;
+    for (0..n) |i| try addChainNode(&graph, i, if (i + 1 < n) i + 1 else null);
+
+    // Direct main-thread call: the threaded walk below is statically
+    // invisible to ZT101's name-binding, so pin the direct path too.
+    var smoke = ImportGraph.init(allocator);
+    defer smoke.deinit();
+    try addChainNode(&smoke, 0, 1);
+    try addChainNode(&smoke, 1, null);
+    try smoke.markReachableResolved("/chain/f0.zig");
+    try std.testing.expectEqual(@as(u32, 2), smoke.reachable.count());
+
+    var walk = ChainWalkRun{ .graph = &graph };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = 1 << 20 },
+        ChainWalkRun.run,
+        .{&walk},
+    );
+    thread.join();
+    if (walk.err) |e| return e;
+
+    try std.testing.expectEqual(@as(u32, n), graph.reachable.count());
+    try std.testing.expect(graph.reachable.contains("/chain/f0.zig"));
+    try std.testing.expect(graph.reachable.contains("/chain/f29999.zig"));
+}
+
+test "markReachableResolved terminates on import cycles" {
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    try addChainNode(&graph, 0, 1);
+    try addChainNode(&graph, 1, 2);
+    try addChainNode(&graph, 2, 0);
+
+    try graph.markReachableResolved("/chain/f0.zig");
+
+    try std.testing.expectEqual(@as(u32, 3), graph.reachable.count());
+}
+
+test "markZigFilesRecursive stops at the depth cap" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 70 nested dirs exceed the 64-level cap. deep.zig sits at the bottom
+    // and must stay unreachable. shallow.zig at the root must be marked.
+    var nested: std.ArrayListUnmanaged(u8) = .empty;
+    defer nested.deinit(allocator);
+    try nested.appendSlice(allocator, "deep");
+    for (0..70) |_| try nested.appendSlice(allocator, "/d");
+    try tmp.dir.createDirPath(std.testing.io, nested.items);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "shallow.zig", .data = "" });
+    const deep_zig = try std.mem.concat(allocator, u8, &.{ nested.items, "/deep.zig" });
+    defer allocator.free(deep_zig);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = deep_zig, .data = "" });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.markZigFilesRecursive(root, 0);
+
+    const shallow = try tmpFilePath(allocator, &tmp, "shallow.zig");
+    defer allocator.free(shallow);
+    try std.testing.expect(graph.reachable.contains(shallow));
+    try std.testing.expectEqual(@as(u32, 1), graph.reachable.count());
+}
+
+test "scanForNestedBuildZig stops at the depth cap" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A nested build.zig one level down must be discovered. One below the
+    // 64-level cap must not.
+    try tmp.dir.createDirPath(std.testing.io, "proj");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "proj/build.zig", .data = "" });
+    var nested: std.ArrayListUnmanaged(u8) = .empty;
+    defer nested.deinit(allocator);
+    for (0..70) |_| {
+        if (nested.items.len > 0) try nested.append(allocator, '/');
+        try nested.appendSlice(allocator, "d");
+    }
+    try tmp.dir.createDirPath(std.testing.io, nested.items);
+    const deep_build = try std.mem.concat(allocator, u8, &.{ nested.items, "/build.zig" });
+    defer allocator.free(deep_build);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = deep_build, .data = "" });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.scanForNestedBuildZig(root, 0);
+
+    const shallow = try tmpFilePath(allocator, &tmp, "proj/build.zig");
+    defer allocator.free(shallow);
+    try std.testing.expect(graph.reachable.contains(shallow));
+    try std.testing.expectEqual(@as(u32, 1), graph.reachable.count());
+}
+
+test "parseCommandIntoArgv parses tokens within the buffer" {
+    var buf: [64][]const u8 = undefined;
+    const parsed = parseCommandIntoArgv("zig build test", &buf);
+    try std.testing.expectEqual(@as(usize, 3), parsed.argc);
+    try std.testing.expect(!parsed.truncated);
+    try std.testing.expectEqualStrings("zig", buf[0]);
+    try std.testing.expectEqualStrings("build", buf[1]);
+    try std.testing.expectEqualStrings("test", buf[2]);
+}
+
+test "parseCommandIntoArgv fits exactly 64 tokens without truncation" {
+    const allocator = std.testing.allocator;
+    var cmd: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd.deinit(allocator);
+    for (0..64) |i| {
+        if (i > 0) try cmd.append(allocator, ' ');
+        try cmd.append(allocator, 'x');
+    }
+    var buf: [64][]const u8 = undefined;
+    const parsed = parseCommandIntoArgv(cmd.items, &buf);
+    try std.testing.expectEqual(@as(usize, 64), parsed.argc);
+    try std.testing.expect(!parsed.truncated);
+}
+
+test "parseCommandIntoArgv truncates token 65 instead of overflowing" {
+    // RED5-1: 70 tokens previously wrote past the [64] stack buffer.
+    const allocator = std.testing.allocator;
+    var cmd: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd.deinit(allocator);
+    for (0..70) |i| {
+        if (i > 0) try cmd.append(allocator, ' ');
+        try cmd.appendSlice(allocator, "tok");
+    }
+    var buf: [64][]const u8 = undefined;
+    const parsed = parseCommandIntoArgv(cmd.items, &buf);
+    try std.testing.expectEqual(@as(usize, 64), parsed.argc);
+    try std.testing.expect(parsed.truncated);
+    try std.testing.expectEqualStrings("tok", buf[63]);
 }
 
 // ============================================================================

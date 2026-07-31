@@ -121,6 +121,14 @@ var path_dir_reject_count: usize = 0;
 /// Test hook: counts threshold values clamped at the documented maxima.
 var threshold_clamp_count: usize = 0;
 
+/// Test hook: counts suppression-accounting notes printed this run. Tests
+/// reset it to assert the note fired (or stayed silent) with stderr muted.
+var suppression_note_count: usize = 0;
+
+/// Test hook: counts ".ephor-ignore auto-load" notes. The explicit
+/// --known-issues path stays silent by design (the user asked for it).
+var known_issues_autoload_count: usize = 0;
+
 /// Print a CLI/config diagnostic unless tests have muted the channel.
 fn cliDiag(comptime fmt: []const u8, args: anytype) void {
     if (!cli_diagnostics_enabled) return;
@@ -20809,6 +20817,15 @@ const Config = struct {
     // Bitmask of Thresholds fields locked by CLI flags (RED3-6): a config
     // file must not overwrite a field the user set on the command line.
     threshold_cli_mask: u8 = 0,
+    // --no-suppression audit mode: inline directives and the known-issues
+    // list stop dropping findings (they print, and the accounting counts
+    // them as would-have-been-suppressed). Config disable/exclude still
+    // apply: those are the user's own explicit config.
+    no_suppression: bool = false,
+    // Load-once guard for loadKnownIssues: every finding command loads
+    // before reporting, and the guard stops a second load from
+    // duplicating entries or the auto-load note.
+    known_issues_loaded: bool = false,
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -23093,6 +23110,10 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         cfg.trust_target_config = true;
         return true;
     }
+    if (mem.eql(u8, arg, "--no-suppression")) {
+        cfg.no_suppression = true;
+        return true;
+    }
     return false;
 }
 
@@ -23364,6 +23385,11 @@ fn printHelp() void {
         \\                       ephor.json. Without it, a config outside the
         \\                       working directory and its ancestors sets only
         \\                       "entries". The rest is ignored with a note.
+        \\  --no-suppression     Audit mode: inline directives and the
+        \\                       known-issues list no longer hide findings.
+        \\                       The findings print, and the suppression note
+        \\                       counts what would have been hidden. Config
+        \\                       disable/exclude still apply.
         \\  -b, --build          With 'init': also show build.zig integration
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
@@ -23440,6 +23466,19 @@ fn printHelp() void {
         \\  // ephor:ignore-file ZA201  (suppresses rule for entire file)
         \\  // ephor:ignore             (omit rule to suppress all)
         \\
+        \\SUPPRESSION ACCOUNTING:
+        \\  Suppression is never silent. When an inline directive, the
+        \\  known-issues list, a config disable, or a config exclude hides
+        \\  a finding, ephor prints one note to stderr before the status:
+        \\    note: N findings suppressed (M inline, K known-issues, ...)
+        \\  The note omits zero-count channels. --format=json adds a
+        \\  "suppressed" object: a member of the summary object with
+        \\  --summary, a trailing top-level object without it. --export
+        \\  appends the same line to the markdown file. Off-by-default
+        \\  rules are ephor's own posture, not suppression, and do not
+        \\  count. A .ephor-ignore file in the scanned path auto-loads as
+        \\  the known-issues list and discloses the load with a note.
+        \\
         \\RULE IDS:
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
         \\                     ZA103: alloc-no-errdefer,
@@ -23506,6 +23545,13 @@ fn printHelp() void {
 /// Load known issues from file (file:line format, one per line)
 /// Supports .ephor-ignore auto-detection or --known-issues=<path>
 fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
+    // Every finding command loads before reporting. The guard keeps a
+    // second call from duplicating entries or the auto-load note.
+    if (cfg.known_issues_loaded) return;
+    defer cfg.known_issues_loaded = true;
+    // RED3-7: the auto-detected .ephor-ignore discloses its load. An
+    // explicit --known-issues path stays silent (the user asked for it).
+    const explicit = cfg.known_issues_path != null;
     const path = cfg.known_issues_path orelse blk: {
         // Auto-detect .ephor-ignore in project root
         const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
@@ -23542,6 +23588,15 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
         errdefer allocator.free(key);
         try cfg.known_issues.append(allocator, key);
         keys_added += 1;
+    }
+
+    if (!explicit) {
+        known_issues_autoload_count += 1;
+        cliDiag("note: loaded {d} known-issue {s} from {s}\n", .{
+            keys_added,
+            if (keys_added == 1) @as([]const u8, "entry") else "entries",
+            path,
+        });
     }
 }
 
@@ -23609,15 +23664,111 @@ fn writeExportIssue(
     try output.print(allocator, "---\n\n", .{});
 }
 
+/// Why the output filter drops a finding. path_scope and default_off are
+/// not suppression: the first is scan scope, the second is ephor's own
+/// off-by-default rule posture. The remaining verdicts are suppression
+/// channels. Attribution tries them most specific first: inline
+/// directive, known-issues, config disable, config exclude.
+const FilterDecision = enum {
+    print,
+    path_scope,
+    default_off,
+    inline_directive,
+    known_issue,
+    config_disable,
+    config_exclude,
+};
+
+/// Channel match facts for one in-scope finding, computed once and shared
+/// by the bucket attribution and the print decision. Soft channels
+/// (inline directive, known-issues) yield to --no-suppression. Hard
+/// channels (explicit disable, exclude, rule not enabled) never do.
+const ChannelHits = struct {
+    /// inline_directive or known_issue when a soft channel matched.
+    soft: FilterDecision,
+    /// The disable list names the rule and the enable list does not.
+    explicit_disable: bool,
+    /// The rule is not enabled at all (explicit disable or off-by-default).
+    rule_blocked: bool,
+    /// A config exclude pattern matches the finding's path.
+    excluded: bool,
+
+    /// First-match bucket attribution: soft channels outrank hard ones,
+    /// so a finding hidden by two channels counts once, under the most
+    /// specific channel.
+    fn attribution(self: ChannelHits) FilterDecision {
+        if (self.soft != .print) return self.soft;
+        if (self.explicit_disable) return .config_disable;
+        if (self.excluded) return .config_exclude;
+        if (self.rule_blocked) return .default_off;
+        return .print;
+    }
+
+    /// True when a hard channel matched. Hard channels drop the finding
+    /// under every mode, including --no-suppression.
+    fn hardBlocked(self: ChannelHits) bool {
+        return self.rule_blocked or self.excluded;
+    }
+};
+
+/// A finding's filter verdict: the bucket attribution for accounting plus
+/// the hard-channel flag for the print decision. --no-suppression waives
+/// only the soft channels. A soft-channel hit never overrides a hard one.
+const FilterVerdict = struct {
+    decision: FilterDecision,
+    hard_blocked: bool,
+
+    /// True when the finding reaches the output. Hard-blocked findings
+    /// never print. Soft-hidden findings print only under
+    /// --no-suppression, and only when no hard channel matched.
+    fn allowsPrint(self: FilterVerdict, cfg: *const Config) bool {
+        if (self.hard_blocked) return false;
+        return switch (self.decision) {
+            .print => true,
+            .path_scope, .default_off, .config_disable, .config_exclude => false,
+            .inline_directive, .known_issue => cfg.no_suppression,
+        };
+    }
+};
+
+/// Per-channel counts of suppressed findings (RED3-3). Suppression must
+/// never stay silent: a repo that hides every finding still shows these
+/// counts in the stderr note, the JSON output, and the export.
+const SuppressionStats = struct {
+    inline_directive: usize = 0,
+    known_issues: usize = 0,
+    config_disable: usize = 0,
+    config_exclude: usize = 0,
+
+    fn total(self: SuppressionStats) usize {
+        return self.inline_directive + self.known_issues +
+            self.config_disable + self.config_exclude;
+    }
+
+    /// Record one finding's verdict. Only suppression channels count.
+    /// path_scope and default_off drops are not suppression.
+    fn count(self: *SuppressionStats, decision: FilterDecision) void {
+        switch (decision) {
+            .print, .path_scope, .default_off => {},
+            .inline_directive => self.inline_directive += 1,
+            .known_issue => self.known_issues += 1,
+            .config_disable => self.config_disable += 1,
+            .config_exclude => self.config_exclude += 1,
+        }
+    }
+};
+
 /// Shared output context for issue reporting (print/export): base_path is
 /// the display root for relative paths, cfg carries format/filters, graph
 /// feeds inline-ignore content lookups, and ignore_cache memoizes the
-/// per-(file, rule) directive scans behind shouldPrintIssue.
+/// per-(file, rule) directive scans behind shouldPrintIssue. suppression
+/// accumulates the per-channel drop counts (RED3-3).
 const ReportOutCtx = struct {
     base_path: []const u8,
     cfg: *const Config,
     graph: ?*const ImportGraph,
     ignore_cache: *IgnoreCache,
+    suppression: *SuppressionStats,
 };
 
 fn exportIssues(
@@ -23656,6 +23807,18 @@ fn exportIssues(
         if (!shouldPrintIssue(issue, out)) continue;
         try writeExportIssue(allocator, &output, issue, out.cfg.path);
     }
+    // RED3-3: the export carries the same accounting as the stderr note.
+    // The printIssues passes already counted the suppression. This
+    // section only reports the totals.
+    if (out.suppression.total() > 0) {
+        var buf: [160]u8 = undefined;
+        try output.print(allocator, "## Suppression accounting\n\n" ++
+            "note: {d} finding{s} suppressed ({s})\n", .{
+            out.suppression.total(),
+            if (out.suppression.total() == 1) @as([]const u8, "") else "s",
+            formatSuppressionBreakdown(&buf, out.suppression.*),
+        });
+    }
     try file.writeStreamingAll(global_io.?, output.items);
     return filtered_count;
 }
@@ -23664,27 +23827,124 @@ fn exportIssues(
 // Output
 // ============================================================================
 
+/// True when an inline directive suppresses this finding. Commands without
+/// an import graph (fmt-check, runtime) cannot match directives at all.
+fn isInlineSuppressed(issue: Issue, out: ReportOutCtx) bool {
+    const g = out.graph orelse return false;
+    const analysis = g.files.get(issue.file) orelse return false;
+    return out.ignore_cache.isSuppressed(
+        analysis.content,
+        issue.file,
+        issue.line,
+        issue.rule,
+    );
+}
+
+/// True when the disable list names the rule and the enable list does not
+/// (enable wins over disable, mirroring Config.isRuleEnabled).
+fn isExplicitlyDisabled(rule: []const u8, cfg: *const Config) bool {
+    if (Config.matchesRuleList(cfg.enabled_rules.items, rule)) return false;
+    return Config.matchesRuleList(cfg.disabled_rules.items, rule);
+}
+
+/// The soft-channel verdict for one in-scope finding: inline directive
+/// first, then known-issues (most specific first).
+fn classifySoftChannel(issue: Issue, out: ReportOutCtx) FilterDecision {
+    if (isInlineSuppressed(issue, out)) return .inline_directive;
+    if (isKnownIssue(issue, out.cfg)) return .known_issue;
+    return .print;
+}
+
+/// Classify a finding against every output filter. The verdict carries
+/// the first-match bucket attribution for accounting and the hard-channel
+/// flag for the print decision, so tallyIssues and the print loops share
+/// one source of truth. A rule ephor ships OFF by default yields
+/// default_off — tool posture, never a suppression count.
+fn classifyIssue(issue: Issue, out: ReportOutCtx) FilterVerdict {
+    // Runtime issues (ZR1xx) use absolute paths from stack traces - skip path filter
+    const is_runtime_issue = mem.startsWith(u8, issue.rule, "ZR1");
+    if (!is_runtime_issue and !mem.startsWith(u8, issue.file, out.cfg.path))
+        return .{ .decision = .path_scope, .hard_blocked = true };
+    const hits = ChannelHits{
+        .soft = classifySoftChannel(issue, out),
+        .explicit_disable = isExplicitlyDisabled(issue.rule, out.cfg),
+        .rule_blocked = out.cfg.isRuleDisabled(issue.rule),
+        .excluded = !is_runtime_issue and out.cfg.isPathExcluded(issue.file),
+    };
+    return .{
+        .decision = hits.attribution(),
+        .hard_blocked = hits.hardBlocked(),
+    };
+}
+
 /// Check if issue should be printed based on config filters
 fn shouldPrintIssue(issue: Issue, out: ReportOutCtx) bool {
-    // Runtime issues (ZR1xx) use absolute paths from stack traces - skip path filter
-    const is_runtime_issue = std.mem.startsWith(u8, issue.rule, "ZR1");
-    if (!is_runtime_issue and !std.mem.startsWith(u8, issue.file, out.cfg.path)) return false;
-    if (out.cfg.isRuleDisabled(issue.rule)) return false;
-    if (!is_runtime_issue and out.cfg.isPathExcluded(issue.file)) return false;
-    if (isKnownIssue(issue, out.cfg)) return false;
-    // Check inline ignore/disable comments in source (cached per file+rule)
-    if (out.graph) |g| {
-        if (g.files.get(issue.file)) |analysis| {
-            const suppressed = out.ignore_cache.isSuppressed(
-                analysis.content,
-                issue.file,
-                issue.line,
-                issue.rule,
-            );
-            if (suppressed) return false;
-        }
+    return classifyIssue(issue, out).allowsPrint(out.cfg);
+}
+
+/// Format the per-channel breakdown of the suppression note, omitting zero
+/// buckets: "3 inline, 1 known-issues". Worst case is 138 bytes (four
+/// labels, four 20-digit usize values, three separators). 160 covers it.
+fn formatSuppressionBreakdown(buf: []u8, stats: SuppressionStats) []const u8 {
+    const buckets = [_]struct { n: usize, label: []const u8 }{
+        .{ .n = stats.inline_directive, .label = "inline" },
+        .{ .n = stats.known_issues, .label = "known-issues" },
+        .{ .n = stats.config_disable, .label = "config disable" },
+        .{ .n = stats.config_exclude, .label = "config exclude" },
+    };
+    var len: usize = 0;
+    for (buckets) |bucket| {
+        if (bucket.n == 0) continue;
+        const sep: []const u8 = if (len == 0) "" else ", ";
+        const wrote = std.fmt.bufPrint(buf[len..], "{s}{d} {s}", .{
+            sep, bucket.n, bucket.label,
+        }) catch break;
+        len += wrote.len;
     }
-    return true;
+    return buf[0..len];
+}
+
+/// Format the "suppressed" JSON object literal:
+/// {"inline": M, "known_issues": K, "config_disable": J, ... "total": N}
+/// Callers pass a 256-byte buffer (worst case is 192 bytes).
+fn formatSuppressedJson(buf: []u8, stats: SuppressionStats) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{{\"inline\": {d}, \"known_issues\": {d}, " ++
+        "\"config_disable\": {d}, \"config_exclude\": {d}, \"total\": {d}}}", .{
+        stats.inline_directive,
+        stats.known_issues,
+        stats.config_disable,
+        stats.config_exclude,
+        stats.total(),
+    });
+}
+
+/// Print the suppressed counts as a standalone trailing JSON object. JSON
+/// mode emits a stream of top-level objects, so a run without --summary
+/// still carries the accounting for machine consumers.
+fn printSuppressedJsonObject(stats: SuppressionStats) void {
+    var buf: [256]u8 = undefined;
+    // Overflow is impossible: 92 fixed bytes + 5 usize values (<=20 digits
+    // each) = 192 bytes worst case. No catch unreachable (ZA202 dogfood).
+    const member = formatSuppressedJson(&buf, stats) catch return;
+    std.debug.print("{{\n  \"suppressed\": {s}\n}}\n", .{member});
+}
+
+/// RED3-3 disclosure for every output path. The stderr note lands before
+/// any STATUS/summary/footer line, so a suppressed repo never shows a bare
+/// clean status. JSON mode also gets the standalone object whenever no
+/// summary object will carry the member (the summary object is check-only).
+fn reportSuppression(stats: *const SuppressionStats, cfg: *const Config) void {
+    const summary_prints = cfg.command == .check and cfg.show_summary;
+    if (cfg.format == .json and !summary_prints) printSuppressedJsonObject(stats.*);
+    const n = stats.total();
+    if (n == 0) return;
+    suppression_note_count += 1;
+    var buf: [160]u8 = undefined;
+    cliDiag("note: {d} finding{s} suppressed ({s})\n", .{
+        n,
+        if (n == 1) @as([]const u8, "") else "s",
+        formatSuppressionBreakdown(&buf, stats.*),
+    });
 }
 
 /// Print issues and return count of actionable issues (warnings + errors only).
@@ -23756,12 +24016,17 @@ fn applyStrictGate(total: PrintCounts, fail_on: FailOn, findings_fail: *bool) vo
     findings_fail.* = true;
 }
 
-fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) PrintCounts {
-    var total_printable: usize = 0;
+/// First pass of issue reporting: classify every finding, account each
+/// suppression into out.suppression, and count what reaches the output.
+/// Kept separate from the printing pass so tests exercise the accounting
+/// without writing to stderr. This pass tallies each finding exactly once.
+/// The printing pass re-classifies without counting.
+fn tallyIssues(issues: []const Issue, out: ReportOutCtx) PrintCounts {
     var counts = PrintCounts{};
     for (issues) |issue| {
-        if (!shouldPrintIssue(issue, out)) continue;
-        total_printable += 1;
+        const verdict = classifyIssue(issue, out);
+        out.suppression.count(verdict.decision);
+        if (!verdict.allowsPrint(out.cfg)) continue;
         switch (issue.severity) {
             .note => counts.notes += 1,
             .warning => counts.warnings += 1,
@@ -23773,6 +24038,12 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
             },
         }
     }
+    return counts;
+}
+
+fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) PrintCounts {
+    const counts = tallyIssues(issues, out);
+    const total_printable = counts.warnings + counts.notes;
     if (out.cfg.format == .json) {
         std.debug.print(
             "{{\n  \"analyzer\": \"{s}\",\n  \"count\": {d},\n  \"issues\": [\n",
@@ -23887,105 +24158,127 @@ const IssueCounts = struct {
     panic: usize = 0,
     tests: usize = 0,
     concurrency: usize = 0,
+
+    fn total(self: IssueCounts) usize {
+        return self.orphan + self.memory + self.err + self.unused +
+            self.complexity + self.fmt + self.style + self.null_safety +
+            self.panic + self.tests + self.concurrency;
+    }
 };
 
-fn printSummary(counts: IssueCounts, s: ProjectStats, format: OutputFormat) void {
-    const total = counts.orphan + counts.memory + counts.err + counts.unused +
-        counts.complexity + counts.fmt + counts.style + counts.null_safety + counts.panic +
-        counts.tests + counts.concurrency;
+/// Print the JSON summary. The suppression accounting rides as a
+/// "suppressed" member of the summary object, so a clean "status" never
+/// hides suppressed findings from machine consumers (RED3-3).
+fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: SuppressionStats) void {
+    std.debug.print(
+        \\{{
+        \\  "summary": {{
+        \\    "files": {d},
+        \\    "code_lines": {d},
+        \\    "issues": {{
+        \\      "orphans": {d},
+        \\      "memory": {d},
+        \\      "errors": {d},
+        \\      "unused": {d},
+        \\      "complexity": {d},
+        \\      "format": {d},
+        \\      "style": {d},
+        \\      "null_safety": {d},
+        \\      "panic": {d},
+        \\      "tests": {d},
+        \\      "concurrency": {d},
+        \\      "total": {d}
+        \\    }},
+        \\    "quality": {{
+        \\      "not_implemented": {d},
+        \\      "todos": {d}
+        \\    }},
+        \\    "status": "{s}",
+    , .{
+        s.total_files,
+        s.code_lines,
+        counts.orphan,
+        counts.memory,
+        counts.err,
+        counts.unused,
+        counts.complexity,
+        counts.fmt,
+        counts.style,
+        counts.null_safety,
+        counts.panic,
+        counts.tests,
+        counts.concurrency,
+        counts.total(),
+        s.not_implemented_count,
+        s.todo_count,
+        if (counts.total() == 0) "ok" else "issues_found",
+    });
+    var buf: [256]u8 = undefined;
+    // Overflow is impossible: 92 fixed bytes + 5 usize values (<=20 digits
+    // each) = 192 bytes worst case. No catch unreachable (ZA202 dogfood).
+    const member = formatSuppressedJson(&buf, suppression) catch return;
+    std.debug.print("    \"suppressed\": {s}\n  }}\n}}\n", .{member});
+}
 
+/// Print the text summary with the STATUS line.
+fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
+    std.debug.print(
+        \\
+        \\ephor summary
+        \\
+        \\Files: {d} | Code: {d} lines
+        \\
+        \\Issues:
+        \\  Orphans:    {d}
+        \\  Memory:     {d}
+        \\  Errors:     {d}
+        \\  Unused:     {d}
+        \\  Complexity: {d}
+        \\  Format:     {d}
+        \\  Style:      {d}
+        \\  NullSafety: {d}
+        \\  Panic:      {d}
+        \\  Tests:      {d}
+        \\  Concurrency: {d}
+        \\  TOTAL:      {d}
+        \\
+        \\Quality: NotImplemented={d} {s}={d}
+        \\
+        \\STATUS: {s}
+        \\
+    , .{
+        s.total_files,
+        s.code_lines,
+        counts.orphan,
+        counts.memory,
+        counts.err,
+        counts.unused,
+        counts.complexity,
+        counts.fmt,
+        counts.style,
+        counts.null_safety,
+        counts.panic,
+        counts.tests,
+        counts.concurrency,
+        counts.total(),
+        s.not_implemented_count,
+        @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
+        s.todo_count,
+        if (counts.total() == 0) "OK" else "ISSUES FOUND",
+    });
+}
+
+/// Print the summary block in the requested format.
+fn printSummary(
+    counts: IssueCounts,
+    s: ProjectStats,
+    suppression: SuppressionStats,
+    format: OutputFormat,
+) void {
     if (format == .json) {
-        std.debug.print(
-            \\{{
-            \\  "summary": {{
-            \\    "files": {d},
-            \\    "code_lines": {d},
-            \\    "issues": {{
-            \\      "orphans": {d},
-            \\      "memory": {d},
-            \\      "errors": {d},
-            \\      "unused": {d},
-            \\      "complexity": {d},
-            \\      "format": {d},
-            \\      "style": {d},
-            \\      "null_safety": {d},
-            \\      "panic": {d},
-            \\      "tests": {d},
-            \\      "concurrency": {d},
-            \\      "total": {d}
-            \\    }},
-            \\    "quality": {{
-            \\      "not_implemented": {d},
-            \\      "todos": {d}
-            \\    }},
-            \\    "status": "{s}"
-            \\  }}
-            \\}}
-            \\
-        , .{
-            s.total_files,
-            s.code_lines,
-            counts.orphan,
-            counts.memory,
-            counts.err,
-            counts.unused,
-            counts.complexity,
-            counts.fmt,
-            counts.style,
-            counts.null_safety,
-            counts.panic,
-            counts.tests,
-            counts.concurrency,
-            total,
-            s.not_implemented_count,
-            s.todo_count,
-            if (total == 0) "ok" else "issues_found",
-        });
+        printSummaryJson(counts, s, suppression);
     } else {
-        std.debug.print(
-            \\
-            \\ephor summary
-            \\
-            \\Files: {d} | Code: {d} lines
-            \\
-            \\Issues:
-            \\  Orphans:    {d}
-            \\  Memory:     {d}
-            \\  Errors:     {d}
-            \\  Unused:     {d}
-            \\  Complexity: {d}
-            \\  Format:     {d}
-            \\  Style:      {d}
-            \\  NullSafety: {d}
-            \\  Panic:      {d}
-            \\  Tests:      {d}
-            \\  Concurrency: {d}
-            \\  TOTAL:      {d}
-            \\
-            \\Quality: NotImplemented={d} {s}={d}
-            \\
-            \\STATUS: {s}
-            \\
-        , .{
-            s.total_files,
-            s.code_lines,
-            counts.orphan,
-            counts.memory,
-            counts.err,
-            counts.unused,
-            counts.complexity,
-            counts.fmt,
-            counts.style,
-            counts.null_safety,
-            counts.panic,
-            counts.tests,
-            counts.concurrency,
-            total,
-            s.not_implemented_count,
-            @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
-            s.todo_count,
-            if (total == 0) "OK" else "ISSUES FOUND",
-        });
+        printSummaryText(counts, s);
     }
 }
 
@@ -24052,6 +24345,11 @@ pub fn main(init: std.process.Init) !void {
     var ignore_cache = IgnoreCache.init(alloc);
     defer ignore_cache.deinit();
 
+    // RED3-3: suppression accounting for the whole run. Every printIssues
+    // pass funnels its dropped findings here. Each command path reports the
+    // totals before its status line so suppression never stays silent.
+    var suppression = SuppressionStats{};
+
     switch (cfg.command) {
         .help => printHelp(),
         .version => std.debug.print(
@@ -24093,6 +24391,7 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("Detected {d} entry points:\n", .{cfg.entries.items.len});
                     for (cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
                 }
+                try loadKnownIssues(alloc, &cfg);
                 var g = ImportGraph.init(alloc);
                 defer g.deinit();
                 g.scan_root = base_path;
@@ -24108,13 +24407,16 @@ pub fn main(init: std.process.Init) !void {
                     .cfg = &cfg,
                     .graph = &g,
                     .ignore_cache = &ignore_cache,
+                    .suppression = &suppression,
                 };
                 const c = printIssues(issues.items, "orphans", out);
+                reportSuppression(&suppression, &cfg);
                 applyStrictGate(c, cfg.fail_on, &strict_fail);
             }
         },
 
         .memory => {
+            try loadKnownIssues(alloc, &cfg);
             var g = ImportGraph.init(alloc);
             defer g.deinit();
             g.scan_root = base_path;
@@ -24131,12 +24433,15 @@ pub fn main(init: std.process.Init) !void {
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
+                .suppression = &suppression,
             };
             const c = printIssues(issues.items, "memory", out);
+            reportSuppression(&suppression, &cfg);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .errors => {
+            try loadKnownIssues(alloc, &cfg);
             var g = ImportGraph.init(alloc);
             defer g.deinit();
             g.scan_root = base_path;
@@ -24157,12 +24462,15 @@ pub fn main(init: std.process.Init) !void {
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
+                .suppression = &suppression,
             };
             const c = printIssues(issues.items, "errors", out);
+            reportSuppression(&suppression, &cfg);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .unused => {
+            try loadKnownIssues(alloc, &cfg);
             var g = ImportGraph.init(alloc);
             defer g.deinit();
             g.scan_root = base_path;
@@ -24174,12 +24482,15 @@ pub fn main(init: std.process.Init) !void {
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
+                .suppression = &suppression,
             };
             const c = printIssues(issues.items, "unused", out);
+            reportSuppression(&suppression, &cfg);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .complexity => {
+            try loadKnownIssues(alloc, &cfg);
             var g = ImportGraph.init(alloc);
             defer g.deinit();
             g.scan_root = base_path;
@@ -24191,12 +24502,15 @@ pub fn main(init: std.process.Init) !void {
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
+                .suppression = &suppression,
             };
             const c = printIssues(issues.items, "complexity", out);
+            reportSuppression(&suppression, &cfg);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
         .fmt_check => {
+            try loadKnownIssues(alloc, &cfg);
             var issues = try runFmtCheck(alloc, cfg.path);
             defer deinitIssues(&issues, alloc);
             const out = ReportOutCtx{
@@ -24204,8 +24518,10 @@ pub fn main(init: std.process.Init) !void {
                 .cfg = &cfg,
                 .graph = null,
                 .ignore_cache = &ignore_cache,
+                .suppression = &suppression,
             };
             const c = printIssues(issues.items, "format", out);
+            reportSuppression(&suppression, &cfg);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
@@ -24240,6 +24556,7 @@ pub fn main(init: std.process.Init) !void {
                     return;
                 }
             }
+            try loadKnownIssues(alloc, &cfg);
             var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
             defer deinitIssues(&issues, alloc);
             const out = ReportOutCtx{
@@ -24247,8 +24564,10 @@ pub fn main(init: std.process.Init) !void {
                 .cfg = &cfg,
                 .graph = null,
                 .ignore_cache = &ignore_cache,
+                .suppression = &suppression,
             };
             const c = printIssues(issues.items, "runtime", out);
+            reportSuppression(&suppression, &cfg);
             applyStrictGate(c, cfg.fail_on, &strict_fail);
         },
 
@@ -24364,6 +24683,7 @@ pub fn main(init: std.process.Init) !void {
                     .cfg = &cfg,
                     .graph = &g,
                     .ignore_cache = &ignore_cache,
+                    .suppression = &suppression,
                 };
                 const orphan_count = printIssues(orphan_issues.items, "orphans", out);
                 // Filter cfg_mem_issues by rule category
@@ -24409,6 +24729,10 @@ pub fn main(init: std.process.Init) !void {
                     .add(naming_count).add(style_count)
                     .add(test_count).add(conc_count);
 
+                // RED3-3: the suppression note lands before STATUS/summary/
+                // footer so a suppressed repo never shows a bare clean status.
+                reportSuppression(&suppression, &cfg);
+
                 if (cfg.show_summary) {
                     printSummary(.{
                         .orphan = orphan_count.warnings,
@@ -24422,7 +24746,7 @@ pub fn main(init: std.process.Init) !void {
                         .panic = panic_count.warnings,
                         .tests = test_count.warnings,
                         .concurrency = conc_count.warnings,
-                    }, stats, cfg.format);
+                    }, stats, suppression, cfg.format);
                 }
 
                 // Print summary footer
@@ -46616,4 +46940,352 @@ test "ZA607: one-line enum switch without else prong is silent" {
         0,
         countRuleIssues(run.issues.items, "da_i111_switch_enum.zig", RULE_DEFINITE_ASSIGNMENT),
     );
+}
+
+// ============================================================================
+// Suppression accounting (RED3-3 / RED3-7, EPH-I0137)
+// ============================================================================
+
+/// Test helper: one-file graph plus out-context wired to fresh suppression
+/// stats, ready for tallyIssues/classifyIssue assertions.
+const SuppressHarness = struct {
+    run: CFGTestRun,
+    cache: IgnoreCache,
+    stats: SuppressionStats,
+    cfg: Config,
+
+    fn out(self: *SuppressHarness) ReportOutCtx {
+        return .{
+            .base_path = self.cfg.path,
+            .cfg = &self.cfg,
+            .graph = &self.run.graph,
+            .ignore_cache = &self.cache,
+            .suppression = &self.stats,
+        };
+    }
+
+    fn deinit(self: *SuppressHarness, allocator: Allocator) void {
+        self.run.deinit(allocator);
+        self.cache.deinit();
+        self.cfg.deinit(allocator);
+    }
+};
+
+fn initSuppressHarness(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !SuppressHarness {
+    return .{
+        .run = try runCFGMemoryTest(allocator, path, content),
+        .cache = IgnoreCache.init(allocator),
+        .stats = .{},
+        .cfg = testConfig(),
+    };
+}
+
+/// Real findings on two rules per call: ZA101 for the allocs without
+/// defer, ZA103 for the second try-alloc without errdefer (same shape as
+/// the wrapped-alloc CFG test above, which asserts both rules fire).
+/// No directives, so the findings print unless a test suppresses them.
+const suppress_leak_source =
+    \\fn leak(allocator: std.mem.Allocator) !void {
+    \\    const buf = try allocator.alloc(
+    \\        u8,
+    \\        4096,
+    \\    );
+    \\    const more = try allocator.alloc(u8, 64);
+    \\    _ = more;
+    \\    _ = buf;
+    \\}
+;
+
+test "suppression: ignore-file directive drops the finding and counts inline" {
+    const allocator = std.testing.allocator;
+    const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
+    var h = try initSuppressHarness(allocator, "src/sup_inline.zig", content);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    // Every finding dropped, every drop counted in the inline bucket.
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.inline_directive);
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.total());
+
+    // The note content names the inline bucket and omits zero buckets.
+    var buf: [160]u8 = undefined;
+    const expected = try std.fmt.allocPrint(allocator, "{d} inline", .{h.run.issues.items.len});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, formatSuppressionBreakdown(&buf, h.stats));
+
+    suppression_note_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    reportSuppression(&h.stats, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 1), suppression_note_count);
+}
+
+test "suppression: known-issues entry drops the finding and counts known_issues" {
+    const allocator = std.testing.allocator;
+    var h = try initSuppressHarness(allocator, "src/sup_known.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    // Pin every produced finding into the known-issues list.
+    for (h.run.issues.items) |issue| {
+        const key = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ issue.file, issue.line });
+        try h.cfg.known_issues.append(allocator, key);
+    }
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.known_issues);
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.total());
+
+    // Under --no-suppression the same findings print and still count.
+    h.cfg.no_suppression = true;
+    h.stats = .{};
+    const audit_counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(h.run.issues.items.len, audit_counts.warnings);
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.known_issues);
+}
+
+test "suppression: config disable and exclude land in their own buckets" {
+    const allocator = std.testing.allocator;
+    var h = try initSuppressHarness(allocator, "src/sup_cfg.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    const file = "src/sup_cfg.zig";
+    const n_za101 = countRuleIssues(h.run.issues.items, file, RULE_ALLOC_NO_DEFER);
+    const n_za103 = countRuleIssues(h.run.issues.items, file, RULE_ALLOC_NO_ERRDEFER);
+    try std.testing.expect(n_za101 >= 1);
+    try std.testing.expect(n_za103 >= 1);
+
+    // ZA101 matches the disable list. Every other finding in the file
+    // matches exclude. First match wins: the ZA101 findings also sit under
+    // the exclude pattern but must count as disable only.
+    try h.cfg.disabled_rules.append(allocator, try allocator.dupe(u8, "ZA101"));
+    try h.cfg.exclude.append(allocator, try allocator.dupe(u8, "sup_cfg"));
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    try std.testing.expectEqual(n_za101, h.stats.config_disable);
+    try std.testing.expectEqual(n_za103, h.stats.config_exclude);
+}
+
+test "suppression: zero suppression emits no note" {
+    const allocator = std.testing.allocator;
+    var h = try initSuppressHarness(allocator, "src/sup_none.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(h.run.issues.items.len, counts.warnings);
+    try std.testing.expectEqual(@as(usize, 0), h.stats.total());
+
+    suppression_note_count = 0;
+    reportSuppression(&h.stats, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 0), suppression_note_count);
+}
+
+test "suppression: --no-suppression prints directive-hidden findings and counts them" {
+    const allocator = std.testing.allocator;
+    const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
+    var h = try initSuppressHarness(allocator, "src/sup_audit.zig", content);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    h.cfg.no_suppression = true;
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    // Findings reach the output as if unsuppressed...
+    try std.testing.expectEqual(h.run.issues.items.len, counts.warnings);
+    // ...and the buckets still report what would have been hidden.
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.inline_directive);
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.total());
+}
+
+test "suppression: --no-suppression never waives a hard config disable" {
+    const allocator = std.testing.allocator;
+    const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
+    var h = try initSuppressHarness(allocator, "src/sup_hard_disable.zig", content);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    // The finding hides behind BOTH a directive and the user's own
+    // disable list. Audit mode waives the directive only.
+    try h.cfg.disabled_rules.append(allocator, try allocator.dupe(u8, "Z"));
+    h.cfg.no_suppression = true;
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    // Attribution stays first-match: the inline bucket counts it.
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.inline_directive);
+}
+
+test "suppression: --no-suppression never prints an off-by-default rule" {
+    const allocator = std.testing.allocator;
+    const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
+    var h = try initSuppressHarness(allocator, "src/sup_hard_default.zig", content);
+    defer h.deinit(allocator);
+
+    // A bare ignore-file covers every rule, so a ZA305 finding (OFF by
+    // default, enabled nowhere) takes the inline channel...
+    const fake: Issue = .{
+        .file = "src/sup_hard_default.zig",
+        .line = 2,
+        .col = 1,
+        .severity = .warning,
+        .rule = RULE_CYCLOMATIC,
+        .message = "complex",
+        .help = null,
+    };
+    const verdict = classifyIssue(fake, h.out());
+    try std.testing.expectEqual(FilterDecision.inline_directive, verdict.decision);
+    try std.testing.expect(verdict.hard_blocked);
+
+    // ...and audit mode must not print it: the rule was never enabled.
+    h.cfg.no_suppression = true;
+    const issues = [_]Issue{fake};
+    const counts = tallyIssues(&issues, h.out());
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    try std.testing.expectEqual(@as(usize, 1), h.stats.inline_directive);
+}
+
+test "suppression: --no-suppression never waives a hard config exclude" {
+    const allocator = std.testing.allocator;
+    var h = try initSuppressHarness(allocator, "src/sup_hard_exclude.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    // The finding hides behind BOTH the known-issues list and an exclude
+    // pattern. Audit mode waives the list only.
+    for (h.run.issues.items) |issue| {
+        const key = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ issue.file, issue.line });
+        try h.cfg.known_issues.append(allocator, key);
+    }
+    try h.cfg.exclude.append(allocator, try allocator.dupe(u8, "sup_hard_exclude"));
+    h.cfg.no_suppression = true;
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    // Attribution stays first-match: the known-issues bucket counts it.
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.known_issues);
+}
+
+test "suppression: off-by-default rules are posture, not suppression" {
+    const allocator = std.testing.allocator;
+    var h = try initSuppressHarness(allocator, "src/sup_default.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    // ZA101/ZA103 are ON by default, so they print. An explicit disable of
+    // an unrelated on-by-default rule changes nothing here.
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(h.run.issues.items.len, counts.warnings);
+    try std.testing.expectEqual(@as(usize, 0), h.stats.total());
+
+    // A finding whose rule is off by default classifies as default_off and
+    // never enters the buckets.
+    const fake: Issue = .{
+        .file = "src/sup_default.zig",
+        .line = 1,
+        .col = 1,
+        .severity = .note,
+        .rule = RULE_CYCLOMATIC,
+        .message = "complex",
+        .help = null,
+    };
+    try std.testing.expectEqual(FilterDecision.default_off, classifyIssue(fake, h.out()).decision);
+    try std.testing.expectEqual(@as(usize, 0), h.stats.total());
+}
+
+test "suppression: JSON member parses and the total stays consistent" {
+    const allocator = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const stats = SuppressionStats{
+        .inline_directive = 2,
+        .known_issues = 1,
+        .config_disable = 3,
+        .config_exclude = 4,
+    };
+    const member = try formatSuppressedJson(&buf, stats);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, member, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 2), obj.get("inline").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), obj.get("known_issues").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), obj.get("config_disable").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), obj.get("config_exclude").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), obj.get("total").?.integer);
+}
+
+test "suppression: known-issues load works outside check and only once" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+
+    var h = try initSuppressHarness(allocator, "src/sup_load.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    try std.testing.expect(h.run.issues.items.len >= 1);
+
+    // Write one .ephor-ignore key per produced finding.
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    for (h.run.issues.items) |issue| {
+        try content.print(allocator, "{s}:{d}\n", .{ issue.file, issue.line });
+    }
+    const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
+    defer allocator.free(ignore_path);
+    try Fs.cwd().writeFile(ignore_path, content.items, .{});
+
+    // Every finding command loads from cfg.path before reporting...
+    known_issues_autoload_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    try setOwnedPath(allocator, &h.cfg, dir_path);
+    try loadKnownIssues(allocator, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
+    try std.testing.expectEqual(h.run.issues.items.len, h.cfg.known_issues.items.len);
+
+    // ...and the loaded entries suppress the findings at report time.
+    try setOwnedPath(allocator, &h.cfg, "src");
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    try std.testing.expectEqual(h.run.issues.items.len, h.stats.known_issues);
+
+    // The load-once guard: a second load adds no entries and no note.
+    try loadKnownIssues(allocator, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
+    try std.testing.expectEqual(h.run.issues.items.len, h.cfg.known_issues.items.len);
+}
+
+test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
+    defer allocator.free(ignore_path);
+    try Fs.cwd().writeFile(ignore_path, "# comment\nsrc/a.zig:1\nsrc/b.zig:2\n", .{});
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, dir_path);
+    known_issues_autoload_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    try loadKnownIssues(allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
+    try std.testing.expectEqual(@as(usize, 2), cfg.known_issues.items.len);
+
+    // The explicit --known-issues path stays silent.
+    known_issues_autoload_count = 0;
+    var cfg_explicit = testConfig();
+    defer cfg_explicit.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg_explicit.known_issues_path, ignore_path);
+    try loadKnownIssues(allocator, &cfg_explicit);
+    try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
+    try std.testing.expectEqual(@as(usize, 2), cfg_explicit.known_issues.items.len);
 }

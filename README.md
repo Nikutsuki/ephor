@@ -482,6 +482,49 @@ of the list. Rule ids must be whole tokens: `ZA201,` (trailing comma) is not
 a rule id and ends the list — comma-joined lists do not work, use
 space-separated ids.
 
+### Suppression Accounting
+
+Suppression is never silent. When an inline directive, the known-issues
+list, a config `disable`, or a config `exclude` hides a finding, ephor
+prints one note to stderr before the status line:
+
+```
+note: 3 findings suppressed (2 inline, 1 config disable)
+```
+
+The note omits zero-count channels. A finding hidden by two channels counts
+once, under the most specific channel: inline directive, known-issues,
+config disable, config exclude (in that order). Findings outside the
+scanned path are scope, not suppression. Rules that ephor ships OFF by
+default (for example ZA305) are ephor's own posture, not suppression.
+Neither one counts.
+
+`--format=json` adds a `"suppressed"` object for machine consumers. With
+`--summary`, ephor embeds it in the summary object. Without `--summary`,
+ephor prints it as a trailing top-level object:
+
+```json
+"suppressed": {"inline": 2, "known_issues": 0, "config_disable": 1, "config_exclude": 0, "total": 3}
+```
+
+`--export` appends the same note to the markdown export as a final
+"Suppression accounting" section.
+
+**Audit mode** — `--no-suppression` stops inline directives and the
+known-issues list from hiding findings. The findings print as if
+unsuppressed, and the note counts what would have been hidden. Config
+`disable` and `exclude` still apply — they are your own explicit config.
+Use it in CI to audit a repo you do not trust.
+
+A `.ephor-ignore` file in the scanned path auto-loads as the known-issues
+list. The load discloses itself once:
+
+```
+note: loaded 2 known-issue entries from repo/.ephor-ignore
+```
+
+An explicit `--known-issues=<file>` stays silent — you asked for it.
+
 ## CLI Reference
 
 Full command reference for the standalone `ephor` binary:
@@ -526,6 +569,11 @@ Options:
                        ephor.json. Without it, a config outside the
                        working directory and its ancestors sets only
                        "entries". The rest is ignored with a note.
+  --no-suppression     Audit mode: inline directives and the
+                       known-issues list no longer hide findings.
+                       The findings print, and the suppression note
+                       counts what would have been hidden. Config
+                       disable/exclude still apply.
   -b, --build          With 'init': also show build.zig integration
   --export=<file>      Export issues to file with code snippets
   --known-issues=<file> Filter out known true positives (file:line format)
@@ -540,6 +588,10 @@ per line in `file:line` format; lines starting with `#` are comments:
 src/main.zig:123
 src/util.zig:456
 ```
+
+When `--known-issues` is absent, ephor auto-loads `<path>/.ephor-ignore` in
+the same format and prints one note with the entry count. See
+[Suppression Accounting](#suppression-accounting).
 
 ## IDE Integration
 

@@ -198,16 +198,36 @@ Example config:
 | Option | Description |
 |--------|-------------|
 | `version` | Pinned ephor version (set by `install`/`upgrade`) |
-| `path_dir` | Directory to analyze (also accepts `code`, `src`, or `root` as aliases) |
+| `path_dir` | Directory to analyze (also accepts `code`, `src`, or `root` as aliases). Must resolve inside the config's own directory |
 | `entries` | Entry points for orphan detection |
-| `exclude` | Paths to exclude from all checks (substring match) |
+| `exclude` | Paths to exclude from all checks (substring match). Empty is a hard error. Ephor ignores `/` and `.zig` with a warning |
 | `orphan_exclude` | Patterns to exclude from orphan detection only |
 | `disable` | Rule IDs to disable (prefix matching: `ZA3` disables all) |
 | `enable` | Rule IDs to enable (overrides disable) |
 | `strict` | `true` to exit 1 when any warning/error is found (CI gate) |
 | `fail_on` | Finer CI gate: `error`, `warning`, `note`, `never` (overrides `strict`) |
 | `error_naming` | ZA703 convention for error values and error set members: `TitleCase` (default; `PascalCase` accepted as an alias) or `snake_case` |
-| `thresholds` | Complexity and style thresholds |
+| `thresholds` | Complexity and style thresholds. Values clamp at documented maxima (see Config trust model) |
+
+### Config trust model
+
+A config file is trusted when its directory is the working directory or an ancestor of it (realpath compare). Every other config is untrusted. `--trust-target-config` declares a scanned target's config trusted.
+
+Ephor honors only `entries` from an untrusted config. It ignores the suppression and CI-gate keys (`disable`, `enable`, `exclude`, `orphan_exclude`, `strict`, `fail_on`, `thresholds`, `error_naming`) and prints one note per offending file:
+
+```
+note: ignoring suppression/gate keys from untrusted <path> (use --trust-target-config to honor)
+```
+
+A target config's `path_dir` is containment-checked and then discarded. The scan root comes from the CLI path, the trusted working-directory config, or auto-detection.
+
+Residual: running ephor inside a tree trusts that tree's config. To audit an untrusted repo, run `ephor check <path>` from outside it, or review its `ephor.json` first.
+
+Validation rules:
+
+- Every config `path_dir` resolves relative to the config's directory and must stay inside it. Ephor ignores an escaping value (for example `..` or `/`) with a warning.
+- An honored `exclude` list rejects an empty pattern with a hard usage error. Ephor ignores the over-broad patterns `/` and `.zig` with a warning. Untrusted configs skip `exclude` before validation.
+- Threshold values clamp at documented maxima with a warning: 100000 (lines, nesting, params, branches, line length), 10000 (cyclomatic, cognitive), 100000000 (file bytes). Config files and CLI flags clamp alike.
 
 ## Rule IDs
 
@@ -502,6 +522,10 @@ Options:
   --strict             Exit 1 when any warning/error is found (CI gate)
   --fail-on=<level>    Exit 1 on findings at level: error, warning,
                        note, never (warning == --strict; overrides config)
+  --trust-target-config  Honor every key from a scanned target's
+                       ephor.json. Without it, a config outside the
+                       working directory and its ancestors sets only
+                       "entries". The rest is ignored with a note.
   -b, --build          With 'init': also show build.zig integration
   --export=<file>      Export issues to file with code snippets
   --known-issues=<file> Filter out known true positives (file:line format)

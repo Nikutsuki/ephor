@@ -109,6 +109,18 @@ var cli_diagnostics_enabled = true;
 /// Slice into the config content — valid until that caller frees it.
 var last_bad_fail_on: ?[]const u8 = null;
 
+/// Test hook: counts "ignoring suppression/gate keys from untrusted" notes
+/// printed this run. Tests reset it to assert the note fired exactly once
+/// per offending config file (stderr itself is muted in tests).
+var untrusted_config_note_count: usize = 0;
+
+/// Test hook: counts rejected config path_dir values. Tests reset it to
+/// assert a rejection fired (or stayed silent) without reading stderr.
+var path_dir_reject_count: usize = 0;
+
+/// Test hook: counts threshold values clamped at the documented maxima.
+var threshold_clamp_count: usize = 0;
+
 /// Print a CLI/config diagnostic unless tests have muted the channel.
 fn cliDiag(comptime fmt: []const u8, args: anytype) void {
     if (!cli_diagnostics_enabled) return;
@@ -20790,6 +20802,13 @@ const Config = struct {
     // ZA703 error-name convention. Absent config key = TitleCase (the
     // community standard); "snake_case" restores the pre-flip behavior.
     error_naming: ErrorNaming = .title_case,
+    // --trust-target-config: honor suppression and CI-gate keys from a
+    // scanned target's ephor.json. Default: untrusted configs set only
+    // entries and path_dir (see isConfigDirTrusted).
+    trust_target_config: bool = false,
+    // Bitmask of Thresholds fields locked by CLI flags (RED3-6): a config
+    // file must not overwrite a field the user set on the command line.
+    threshold_cli_mask: u8 = 0,
 
     fn deinit(self: *Config, allocator: Allocator) void {
         if (self.path_owned) allocator.free(self.path);
@@ -20864,17 +20883,25 @@ const Config = struct {
 
 const CONFIG_FILENAME = "ephor.json";
 
-/// Report a config parse failure. The CI-gate key error is hard (propagated
-/// to the caller as a usage error); every other parse error warns + continues.
+/// Report a config parse failure. CI-gate and fail-closed validation errors
+/// are hard (propagated to the caller as usage errors); every other parse
+/// error warns + continues.
 fn reportConfigParseError(err: anyerror, path: []const u8) !void {
-    if (err != error.InvalidFailOnValue) {
-        std.debug.print("warning: failed to parse {s}: {}\n", .{ path, err });
-        return;
+    switch (err) {
+        error.InvalidFailOnValue => cliDiag(
+            "error: {s}: invalid fail_on '{s}' (expected: error, warning, note, never)\n",
+            .{ path, last_bad_fail_on orelse "?" },
+        ),
+        error.EmptyExcludePattern => cliDiag(
+            "error: {s}: invalid exclude pattern '' — an empty pattern matches every path. " ++
+                "Use a specific prefix or remove the entry.\n",
+            .{path},
+        ),
+        else => {
+            std.debug.print("warning: failed to parse {s}: {}\n", .{ path, err });
+            return;
+        },
     }
-    cliDiag(
-        "error: {s}: invalid fail_on '{s}' (expected: error, warning, note, never)\n",
-        .{ path, last_bad_fail_on orelse "?" },
-    );
     return err;
 }
 
@@ -20911,12 +20938,32 @@ fn tryLoadConfigFromDir(
     const content = Fs.cwd().readFileAlloc(allocator, config_path, 64 * 1024) catch return false;
     defer allocator.free(content);
 
-    parseConfigJson(allocator, content, cfg) catch |err| {
+    // RED3-x trust boundary: only configs from the auditor's own tree (cwd
+    // or an ancestor) may suppress findings or move the CI gate.
+    // --trust-target-config declares the scanned target trusted.
+    // dir_copy (not dir) backs every use: dir can alias cfg.path, which a
+    // path_dir key frees mid-parse.
+    const trusted = cfg.trust_target_config or isConfigDirTrusted(dir_copy);
+    var ignored_any = false;
+    parseConfigJsonSource(allocator, content, cfg, .{
+        .trusted = trusted,
+        .path = config_path,
+        .dir = dir_copy,
+        .ignored_any = &ignored_any,
+    }) catch |err| {
         // The CI gate key must never fail open, no matter which config
         // file carried it; other parse errors stay warn-and-continue.
         try reportConfigParseError(err, config_path);
         return false;
     };
+    if (!trusted and ignored_any) {
+        untrusted_config_note_count += 1;
+        cliDiag(
+            "note: ignoring suppression/gate keys from untrusted {s} " ++
+                "(use --trust-target-config to honor)\n",
+            .{config_path},
+        );
+    }
 
     if (cfg.path_owned) allocator.free(cfg.path);
     cfg.path = saved_path;
@@ -20925,7 +20972,9 @@ fn tryLoadConfigFromDir(
     return true;
 }
 
-/// Loads entries from config (CLI path takes priority over config "path_dir")
+/// Loads entries from config (CLI path takes priority over config "path_dir").
+/// Each candidate file gets its own trust decision: the target-dir file and
+/// the parent-fallback file are tested independently (RED3-8).
 fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []const u8) !void {
     const saved_path = try allocator.dupe(u8, cfg.path);
     errdefer allocator.free(saved_path);
@@ -20963,74 +21012,253 @@ fn makeEntriesAbsolute(allocator: Allocator, cfg: *Config, base_path: []const u8
     }
 }
 
-/// Parse JSON string value starting at opening quote
+/// Index just past the closing quote of the JSON string whose opening quote
+/// is at start. A `\` escapes the next byte (RED1-9: `\"` must not end the
+/// span). Returns content.len for an unterminated string (RED1-1: callers
+/// must never receive an index past the buffer end).
+fn skipJsonStringSpan(content: []const u8, start: usize) usize {
+    var i = start + 1;
+    while (i < content.len) {
+        if (content[i] == '\\') {
+            i = @min(i + 2, content.len);
+            continue;
+        }
+        if (content[i] == '"') return i + 1;
+        i += 1;
+    }
+    return content.len;
+}
+
+/// Parse JSON string value starting at opening quote. The value is the raw
+/// span (escapes are not decoded — only span scanning needs them). On an
+/// unterminated string, val runs to content.len and end == content.len, so
+/// downstream indexes stay inside the buffer (RED1-1).
 fn parseJsonString(content: []const u8, start: usize) struct { val: []const u8, end: usize } {
     var i = start + 1;
-    const val_start = i;
-    while (i < content.len and content[i] != '"') i += 1;
-    return .{ .val = content[val_start..i], .end = i + 1 };
+    while (i < content.len) {
+        if (content[i] == '\\') {
+            i = @min(i + 2, content.len);
+            continue;
+        }
+        if (content[i] == '"') {
+            return .{ .val = content[start + 1 .. i], .end = i + 1 };
+        }
+        i += 1;
+    }
+    return .{ .val = content[start + 1 .. content.len], .end = content.len };
 }
 
 /// Skip unknown JSON value (string, array, or object)
 fn skipJsonValue(content: []const u8, start: usize) usize {
     var i = start;
     if (i >= content.len) return i;
-    if (content[i] == '"') {
-        i += 1;
-        while (i < content.len and content[i] != '"') i += 1;
-        return i + 1;
-    }
+    if (content[i] == '"') return skipJsonStringSpan(content, i);
     const open: u8 = if (content[i] == '[') '[' else if (content[i] == '{') '{' else return i;
     const close: u8 = if (open == '[') ']' else '}';
     var depth: usize = 1;
     i += 1;
     while (i < content.len and depth > 0) : (i += 1) {
+        // Brackets inside string spans never move the depth. The untrusted-
+        // config skip relies on this to stay aligned (RED3-x).
+        if (content[i] == '"') {
+            i = skipJsonStringSpan(content, i) -| 1;
+            continue;
+        }
         if (content[i] == open) depth += 1;
         if (content[i] == close) depth -= 1;
     }
     return i;
 }
 
-/// Set threshold value by key name
-fn setThresholdValue(th: *Thresholds, k: []const u8, num: usize) void {
-    if (mem.eql(u8, k, "max_lines") or mem.eql(u8, k, "max_function_lines")) th.max_function_lines = num;
-    if (mem.eql(u8, k, "max_nesting")) th.max_nesting_depth = num;
-    if (mem.eql(u8, k, "max_params")) th.max_params = num;
-    if (mem.eql(u8, k, "max_branches")) th.max_branches = num;
-    if (mem.eql(u8, k, "max_line_length")) th.max_line_length = num;
-    if (mem.eql(u8, k, "max_file_bytes")) th.max_file_bytes = num;
-    if (mem.eql(u8, k, "max_cyclomatic")) th.max_cyclomatic = num;
-    if (mem.eql(u8, k, "max_cognitive")) th.max_cognitive = num;
+/// Bit positions in Config.threshold_cli_mask, one per CLI-settable
+/// threshold. A field with bit 0 has no CLI flag and is never masked.
+const threshold_cli_max_lines: u8 = 1 << 0;
+const threshold_cli_max_nesting: u8 = 1 << 1;
+const threshold_cli_max_params: u8 = 1 << 2;
+const threshold_cli_max_branches: u8 = 1 << 3;
+const threshold_cli_max_line_length: u8 = 1 << 4;
+const threshold_cli_max_file_bytes: u8 = 1 << 5;
+
+/// Threshold maxima (RED3-6 residual): a threshold exists to gate findings,
+/// so an absurd value is a blinding attempt or a typo. Config files and CLI
+/// flags alike warn and clamp at these caps. The file-bytes cap sits above
+/// the analyzer's own 10 MB read cap, so it never clamps a real setting.
+const threshold_cap_generic: usize = 100_000;
+const threshold_cap_complexity: usize = 10_000;
+const threshold_cap_bytes: usize = 100_000_000;
+
+const ThresholdFieldId = enum {
+    max_lines,
+    max_nesting,
+    max_params,
+    max_branches,
+    max_line_length,
+    max_file_bytes,
+    max_cyclomatic,
+    max_cognitive,
+};
+
+const threshold_keys = [_]struct { key: []const u8, field: ThresholdFieldId }{
+    .{ .key = "max_lines", .field = .max_lines },
+    .{ .key = "max_function_lines", .field = .max_lines },
+    .{ .key = "max_nesting", .field = .max_nesting },
+    .{ .key = "max_params", .field = .max_params },
+    .{ .key = "max_branches", .field = .max_branches },
+    .{ .key = "max_line_length", .field = .max_line_length },
+    .{ .key = "max_file_bytes", .field = .max_file_bytes },
+    .{ .key = "max_cyclomatic", .field = .max_cyclomatic },
+    .{ .key = "max_cognitive", .field = .max_cognitive },
+};
+
+/// CLI-lock bit and value cap for one threshold field.
+fn thresholdFieldMeta(id: ThresholdFieldId) struct { bit: u8, cap: usize } {
+    return switch (id) {
+        .max_lines => .{ .bit = threshold_cli_max_lines, .cap = threshold_cap_generic },
+        .max_nesting => .{ .bit = threshold_cli_max_nesting, .cap = threshold_cap_generic },
+        .max_params => .{ .bit = threshold_cli_max_params, .cap = threshold_cap_generic },
+        .max_branches => .{ .bit = threshold_cli_max_branches, .cap = threshold_cap_generic },
+        .max_line_length => .{ .bit = threshold_cli_max_line_length, .cap = threshold_cap_generic },
+        .max_file_bytes => .{ .bit = threshold_cli_max_file_bytes, .cap = threshold_cap_bytes },
+        .max_cyclomatic => .{ .bit = 0, .cap = threshold_cap_complexity },
+        .max_cognitive => .{ .bit = 0, .cap = threshold_cap_complexity },
+    };
+}
+
+/// Value cap for a config/CLI threshold key name (null for unknown keys).
+fn thresholdCapFor(key: []const u8) ?usize {
+    for (threshold_keys) |binding| {
+        if (mem.eql(u8, key, binding.key)) return thresholdFieldMeta(binding.field).cap;
+    }
+    return null;
+}
+
+/// True when a CLI flag already set this threshold's field (RED3-6 lock).
+fn thresholdCliLocked(cli_mask: u8, key: []const u8) bool {
+    for (threshold_keys) |binding| {
+        if (mem.eql(u8, key, binding.key))
+            return cli_mask & thresholdFieldMeta(binding.field).bit != 0;
+    }
+    return false;
+}
+
+/// Clamp a threshold value at its documented cap, warning once per clamp.
+fn clampThreshold(source: []const u8, key: []const u8, num: usize, cap: usize) usize {
+    if (num <= cap) return num;
+    threshold_clamp_count += 1;
+    cliDiag(
+        "warning: clamping threshold '{s}' from {d} to the maximum {d} ({s})\n",
+        .{ key, num, cap, source },
+    );
+    return cap;
+}
+
+fn applyThresholdField(th: *Thresholds, id: ThresholdFieldId, num: usize) void {
+    switch (id) {
+        .max_lines => th.max_function_lines = num,
+        .max_nesting => th.max_nesting_depth = num,
+        .max_params => th.max_params = num,
+        .max_branches => th.max_branches = num,
+        .max_line_length => th.max_line_length = num,
+        .max_file_bytes => th.max_file_bytes = num,
+        .max_cyclomatic => th.max_cyclomatic = num,
+        .max_cognitive => th.max_cognitive = num,
+    }
+}
+
+/// Set threshold value by key name. A field whose CLI flag ran (bit set in
+/// cli_mask) is locked: the command line always wins over config (RED3-6).
+/// Callers clamp the value first (clampThreshold) where a source name is
+/// available for the warning.
+fn setThresholdValue(th: *Thresholds, cli_mask: u8, k: []const u8, num: usize) void {
+    for (threshold_keys) |binding| {
+        if (!mem.eql(u8, k, binding.key)) continue;
+        if (cli_mask & thresholdFieldMeta(binding.field).bit != 0) return;
+        return applyThresholdField(th, binding.field, num);
+    }
 }
 
 /// Parse threshold key-value pair
-fn parseThresholdPair(content: []const u8, start: usize, th: *Thresholds) usize {
+fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
+    const content = ctx.content;
     var i = start;
-    if (i >= content.len or content[i] != '"') return i + 1;
+    if (i >= content.len) return i;
+    if (content[i] != '"') return i + 1;
     const key_result = parseJsonString(content, i);
     i = key_result.end;
     while (i < content.len and content[i] != ':') i += 1;
+    // RED1-1: a truncated pair ends here — never index past the buffer end.
+    if (i >= content.len) return i;
     i += 1;
     while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
     const num_start = i;
     while (i < content.len and content[i] >= '0' and content[i] <= '9') i += 1;
-    const num = std.fmt.parseInt(usize, content[num_start..i], 10) catch return i;
-    setThresholdValue(th, key_result.val, num);
+    const raw = std.fmt.parseInt(usize, content[num_start..i], 10) catch return i;
+    const cap = thresholdCapFor(key_result.val) orelse return i;
+    // A CLI-locked field discards this value; clamping it would warn falsely.
+    if (thresholdCliLocked(ctx.cfg.threshold_cli_mask, key_result.val)) return i;
+    const num = clampThreshold(ctx.source.path, key_result.val, raw, cap);
+    setThresholdValue(&ctx.cfg.thresholds, ctx.cfg.threshold_cli_mask, key_result.val, num);
     return i;
 }
+
+/// Where a config text came from and how much ephor may trust it.
+/// trusted == false means only analysis keys (entries, path_dir) are
+/// honored; suppression and CI-gate keys are skipped and counted.
+const ConfigSource = struct {
+    trusted: bool,
+    path: []const u8, // config file path, for diagnostics
+    dir: []const u8, // config file's directory, for path_dir containment
+    ignored_any: *bool, // out: the config carried at least one ignored key
+};
 
 /// Context for JSON config parsing: source text plus the config being built
 const ConfigParseCtx = struct {
     allocator: Allocator,
     content: []const u8,
     cfg: *Config,
+    source: ConfigSource,
 };
+
+/// True for exclude patterns so broad they hide the whole tree (RED3-2).
+fn isOverbroadExcludePattern(pattern: []const u8) bool {
+    return mem.eql(u8, pattern, "/") or mem.eql(u8, pattern, ".zig");
+}
+
+/// Validate one exclude-list value (RED3-2). An empty pattern is a hard
+/// usage error (substring match would drop every path); the over-broad
+/// patterns "/" and ".zig" warn and are skipped. Returns false when the
+/// value must not be appended.
+fn checkExcludeValue(ctx: ConfigParseCtx, key: []const u8, val: []const u8) !bool {
+    const is_exclude_list = mem.eql(u8, key, "exclude") or
+        mem.eql(u8, key, "orphan_exclude");
+    if (!is_exclude_list) return true;
+    if (val.len == 0) return error.EmptyExcludePattern;
+    if (!isOverbroadExcludePattern(val)) return true;
+    cliDiag(
+        "warning: ignoring over-broad exclude pattern '{s}' in {s}. " ++
+            "Use a more specific pattern.\n",
+        .{ val, ctx.source.path },
+    );
+    return false;
+}
+
+/// Append one validated array value to the config list its key selects.
+fn appendConfigListValue(ctx: ConfigParseCtx, key: []const u8, raw: []const u8) !void {
+    const cfg = ctx.cfg;
+    const allocator = ctx.allocator;
+    const val = try allocator.dupe(u8, raw);
+    errdefer allocator.free(val);
+    if (mem.eql(u8, key, "entries")) return cfg.entries.append(allocator, val);
+    if (mem.eql(u8, key, "exclude")) return cfg.exclude.append(allocator, val);
+    if (mem.eql(u8, key, "orphan_exclude")) return cfg.orphan_exclude.append(allocator, val);
+    if (mem.eql(u8, key, "disable")) return cfg.disabled_rules.append(allocator, val);
+    if (mem.eql(u8, key, "enable")) return cfg.enabled_rules.append(allocator, val);
+    allocator.free(val);
+}
 
 /// Parse array of strings into appropriate config list
 fn parseConfigArray(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
-    const allocator = ctx.allocator;
     const content = ctx.content;
-    const cfg = ctx.cfg;
     var i = start + 1;
     while (i < content.len and content[i] != ']') {
         i = skipWhitespaceAndComments(content, i);
@@ -21040,52 +21268,108 @@ fn parseConfigArray(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
             continue;
         }
         const result = parseJsonString(content, i);
-        const val = try allocator.dupe(u8, result.val);
-        const is_entries = mem.eql(u8, key, "entries");
-        const is_exclude = mem.eql(u8, key, "exclude");
-        const is_orphan_ex = mem.eql(u8, key, "orphan_exclude");
-        const is_disable = mem.eql(u8, key, "disable");
-        const is_enable = mem.eql(u8, key, "enable");
-        if (is_entries) try cfg.entries.append(allocator, val);
-        if (is_exclude) try cfg.exclude.append(allocator, val);
-        if (is_orphan_ex) try cfg.orphan_exclude.append(allocator, val);
-        if (is_disable) try cfg.disabled_rules.append(allocator, val);
-        if (is_enable) try cfg.enabled_rules.append(allocator, val);
+        if (!try checkExcludeValue(ctx, key, result.val)) {
+            i = result.end;
+            continue;
+        }
+        try appendConfigListValue(ctx, key, result.val);
         i = result.end;
     }
-    return i + 1;
+    return @min(i + 1, content.len);
 }
 
 /// Parse thresholds object
-fn parseThresholdsObject(content: []const u8, start: usize, th: *Thresholds) usize {
+fn parseThresholdsObject(ctx: ConfigParseCtx, start: usize) usize {
+    const content = ctx.content;
     var i = start + 1;
     while (i < content.len and content[i] != '}') {
         i = skipWhitespaceAndComments(content, i);
         if (i >= content.len or content[i] == '}') break;
-        i = parseThresholdPair(content, i, th);
+        i = parseThresholdPair(ctx, i);
     }
     return if (i < content.len) i + 1 else i;
 }
 
+/// Keys an untrusted config may not set (RED3-1/2/4/6, RED3-8/9): each one
+/// suppresses findings or moves the CI gate. "entries" and "path_dir" stay
+/// honored as analysis params, with known residuals: a target entries list
+/// can neuter orphan detection (RED3-10), and target-config path_dir is
+/// containment-checked then discarded by the loader.
+fn isSuppressionGateKey(key: []const u8) bool {
+    const keys = [_][]const u8{
+        "disable", "enable", "exclude",    "orphan_exclude",
+        "fail_on", "strict", "thresholds", "error_naming",
+    };
+    for (keys) |k| {
+        if (mem.eql(u8, key, k)) return true;
+    }
+    return false;
+}
+
+/// Apply a config "path_dir" value under the RED4-1 containment rule:
+/// resolve the value relative to the config file's directory, realpath the
+/// result, and require it inside that directory. Any failure warns and
+/// leaves cfg.path alone (fail closed: a moved root is never silent).
+fn applyConfigPathDir(ctx: ConfigParseCtx, value: []const u8) !void {
+    const allocator = ctx.allocator;
+    const joined = if (value.len > 0 and value[0] == '/')
+        try allocator.dupe(u8, value)
+    else if (ctx.source.dir.len == 1 and ctx.source.dir[0] == '.')
+        try allocator.dupe(u8, value)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ctx.source.dir, value });
+    defer allocator.free(joined);
+
+    var dir_buf: [Fs.max_path_bytes]u8 = undefined;
+    var val_buf: [Fs.max_path_bytes]u8 = undefined;
+    const dir_real = Fs.cwd().realpath(ctx.source.dir, &dir_buf) catch {
+        warnPathDirRejected(ctx.source.path, value, "path does not resolve");
+        return;
+    };
+    const val_real = Fs.cwd().realpath(joined, &val_buf) catch {
+        warnPathDirRejected(ctx.source.path, value, "path does not resolve");
+        return;
+    };
+    if (!isPathAncestorOrEqual(dir_real, val_real)) {
+        warnPathDirRejected(ctx.source.path, value, "resolves outside config directory");
+        return;
+    }
+    try setOwnedPath(allocator, ctx.cfg, value);
+}
+
+fn warnPathDirRejected(config_path: []const u8, value: []const u8, reason: []const u8) void {
+    path_dir_reject_count += 1;
+    cliDiag(
+        "warning: ignoring path_dir '{s}' in {s}: {s}. Fix the value or remove the key.\n",
+        .{ value, config_path, reason },
+    );
+}
+
 /// Handle a single config key-value pair
 fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
-    const allocator = ctx.allocator;
     const content = ctx.content;
-    const cfg = ctx.cfg;
+    // RED1-1: a truncated config can leave start past the buffer end. An
+    // absent value is skipped, never indexed.
+    if (start >= content.len) return start;
+    // RED3-x: an untrusted config steers analysis scope only. Keys that
+    // suppress findings or move the CI gate are skipped; the loader prints
+    // one note per offending file.
+    if (!ctx.source.trusted and isSuppressionGateKey(key)) {
+        ctx.source.ignored_any.* = true;
+        return skipJsonValue(content, start);
+    }
     const is_path_dir_key = mem.eql(u8, key, "path_dir") or
         mem.eql(u8, key, "code") or mem.eql(u8, key, "src") or mem.eql(u8, key, "root");
     if (is_path_dir_key and content[start] == '"') {
         const result = parseJsonString(content, start);
-        if (cfg.path_owned) allocator.free(cfg.path);
-        cfg.path = try allocator.dupe(u8, result.val);
-        cfg.path_owned = true;
+        try applyConfigPathDir(ctx, result.val);
         return result.end;
     }
     if (isArrayKey(key) and content[start] == '[') {
         return try parseConfigArray(ctx, start, key);
     }
     if (mem.eql(u8, key, "thresholds") and content[start] == '{') {
-        return parseThresholdsObject(content, start, &cfg.thresholds);
+        return parseThresholdsObject(ctx, start);
     }
     if (try parseFailOnConfigKey(ctx, start, key)) |end| return end;
     if (parseErrorNamingConfigKey(ctx, start, key)) |end| return end;
@@ -21158,8 +21442,53 @@ fn skipWhitespaceAndComments(content: []const u8, start: usize) usize {
     return i;
 }
 
+/// Component-boundary "ancestor or same" test on two absolute paths.
+/// A raw startsWith would accept "/repo-evil" for root "/repo" (RED4-3
+/// shape); the byte after the matched prefix must be a separator.
+fn isPathAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
+    if (mem.eql(u8, ancestor, path)) return true;
+    if (ancestor.len == 0 or path.len <= ancestor.len) return false;
+    if (!mem.startsWith(u8, path, ancestor)) return false;
+    return path[ancestor.len] == '/' or ancestor[ancestor.len - 1] == '/';
+}
+
+/// Trust test for config files (RED3-x): a config is trusted when its
+/// directory realpath equals the invocation cwd realpath or is an ancestor
+/// of it — the config then comes from the auditor's tree, not the scanned
+/// one. Fails closed: an unresolvable directory is untrusted.
+fn isConfigDirTrusted(config_dir: []const u8) bool {
+    var dir_buf: [Fs.max_path_bytes]u8 = undefined;
+    var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
+    const dir_real = Fs.cwd().realpath(config_dir, &dir_buf) catch return false;
+    const cwd_real = Fs.cwd().realpath(".", &cwd_buf) catch return false;
+    return isPathAncestorOrEqual(dir_real, cwd_real);
+}
+
+/// Parse a config file's contents as a trusted source (cwd ephor.json and
+/// unit tests). Target-dir configs go through parseConfigJsonSource with a
+/// computed trust decision instead.
 fn parseConfigJson(allocator: Allocator, content: []const u8, cfg: *Config) !void {
-    const ctx = ConfigParseCtx{ .allocator = allocator, .content = content, .cfg = cfg };
+    var ignored_any = false;
+    try parseConfigJsonSource(allocator, content, cfg, .{
+        .trusted = true,
+        .path = CONFIG_FILENAME,
+        .dir = ".",
+        .ignored_any = &ignored_any,
+    });
+}
+
+fn parseConfigJsonSource(
+    allocator: Allocator,
+    content: []const u8,
+    cfg: *Config,
+    source: ConfigSource,
+) !void {
+    const ctx = ConfigParseCtx{
+        .allocator = allocator,
+        .content = content,
+        .cfg = cfg,
+        .source = source,
+    };
     var i: usize = 0;
     while (i < content.len and content[i] != '{') i += 1;
     if (i >= content.len) return;
@@ -22760,33 +23089,47 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         setFailOn(cfg, .warning, .cli);
         return true;
     }
+    if (mem.eql(u8, arg, "--trust-target-config")) {
+        cfg.trust_target_config = true;
+        return true;
+    }
     return false;
 }
 
-/// Parse threshold arguments (returns true if handled)
-fn parseThresholdArg(arg: []const u8, th: *Thresholds) bool {
+/// Parse threshold arguments (returns true if handled). Each matched flag
+/// locks its field in cfg.threshold_cli_mask so a later config-file load
+/// cannot overwrite it (RED3-6: CLI thresholds always win). Values clamp at
+/// the documented maxima, same as config-file values.
+fn parseThresholdArg(arg: []const u8, cfg: *Config) bool {
+    const th = &cfg.thresholds;
     if (parseThreshold(arg, "--max-lines=", 50)) |v| {
-        th.max_function_lines = v;
+        th.max_function_lines = clampThreshold(arg, "max_function_lines", v, threshold_cap_generic);
+        cfg.threshold_cli_mask |= threshold_cli_max_lines;
         return true;
     }
     if (parseThreshold(arg, "--max-nesting=", 3)) |v| {
-        th.max_nesting_depth = v;
+        th.max_nesting_depth = clampThreshold(arg, "max_nesting", v, threshold_cap_generic);
+        cfg.threshold_cli_mask |= threshold_cli_max_nesting;
         return true;
     }
     if (parseThreshold(arg, "--max-params=", 4)) |v| {
-        th.max_params = v;
+        th.max_params = clampThreshold(arg, "max_params", v, threshold_cap_generic);
+        cfg.threshold_cli_mask |= threshold_cli_max_params;
         return true;
     }
     if (parseThreshold(arg, "--max-branches=", 12)) |v| {
-        th.max_branches = v;
+        th.max_branches = clampThreshold(arg, "max_branches", v, threshold_cap_generic);
+        cfg.threshold_cli_mask |= threshold_cli_max_branches;
         return true;
     }
     if (parseThreshold(arg, "--max-line-length=", 100)) |v| {
-        th.max_line_length = v;
+        th.max_line_length = clampThreshold(arg, "max_line_length", v, threshold_cap_generic);
+        cfg.threshold_cli_mask |= threshold_cli_max_line_length;
         return true;
     }
     if (parseThreshold(arg, "--max-file-bytes=", 50_000)) |v| {
-        th.max_file_bytes = v;
+        th.max_file_bytes = clampThreshold(arg, "max_file_bytes", v, threshold_cap_bytes);
+        cfg.threshold_cli_mask |= threshold_cli_max_file_bytes;
         return true;
     }
     return false;
@@ -22890,7 +23233,7 @@ fn parseCliArg(
     if (mem.startsWith(u8, arg, "--entry="))
         return handleEntryArg(allocator, arg, cfg, cli_entries);
     if (parseSimpleFlag(arg, cfg)) return;
-    if (parseThresholdArg(arg, &cfg.thresholds)) return;
+    if (parseThresholdArg(arg, cfg)) return;
     if (try handleListArg(allocator, arg, cfg)) return;
     if (try handleOptionalPathArg(allocator, arg, cfg)) return;
     if (arg[0] != '-') try setOwnedPath(allocator, cfg, arg);
@@ -23017,6 +23360,10 @@ fn printHelp() void {
         \\  --strict             Exit 1 when any warning/error is found (CI gate)
         \\  --fail-on=<level>    Exit 1 on findings at level: error, warning,
         \\                       note, never (warning == --strict; overrides config)
+        \\  --trust-target-config  Honor every key from a scanned target's
+        \\                       ephor.json. Without it, a config outside the
+        \\                       working directory and its ancestors sets only
+        \\                       "entries". The rest is ignored with a note.
         \\  -b, --build          With 'init': also show build.zig integration
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
@@ -23069,6 +23416,23 @@ fn printHelp() void {
         \\      "max_file_bytes": 50000
         \\    }
         \\  }
+        \\
+        \\CONFIG TRUST MODEL:
+        \\  A config file is trusted when its directory is the working
+        \\  directory or an ancestor of it (realpath compare).
+        \\  --trust-target-config declares a scanned target's config trusted.
+        \\  From an untrusted config ephor honors only "entries"; it ignores
+        \\  disable, enable, exclude, orphan_exclude, strict, fail_on,
+        \\  thresholds, and error_naming, with one note per file. A target
+        \\  config's "path_dir" is containment-checked but discarded. The
+        \\  scan root comes from the CLI path, a trusted working-directory
+        \\  config, or auto-detection. Every config "path_dir" must
+        \\  resolve inside the config's own directory. An empty "exclude"
+        \\  pattern in a trusted config is a hard usage error.
+        \\
+        \\  Residual: running ephor inside a tree trusts that tree's config.
+        \\  To audit an untrusted repo, run "ephor check <path>" from outside
+        \\  it, or review its ephor.json first.
         \\
         \\INLINE IGNORE (in source code):
         \\  // ephor:ignore ZA201       (same line or next line)
@@ -38455,14 +38819,26 @@ test "ZA201 suppressed for multi-line defer non-cleanup catch {}" {
 
 test "setThresholdValue accepts max_function_lines alias" {
     var th = Thresholds{};
-    setThresholdValue(&th, "max_function_lines", 75);
+    setThresholdValue(&th, 0, "max_function_lines", 75);
     try std.testing.expectEqual(@as(usize, 75), th.max_function_lines);
 }
 
 test "setThresholdValue accepts max_lines" {
     var th = Thresholds{};
-    setThresholdValue(&th, "max_lines", 60);
+    setThresholdValue(&th, 0, "max_lines", 60);
     try std.testing.expectEqual(@as(usize, 60), th.max_function_lines);
+}
+
+test "setThresholdValue never overwrites a CLI-locked field" {
+    var th = Thresholds{};
+    setThresholdValue(&th, threshold_cli_max_lines, "max_function_lines", 75);
+    try std.testing.expectEqual(@as(usize, 50), th.max_function_lines);
+    // The alias maps to the same locked field.
+    setThresholdValue(&th, threshold_cli_max_lines, "max_lines", 75);
+    try std.testing.expectEqual(@as(usize, 50), th.max_function_lines);
+    // A field with no CLI lock still follows the config value.
+    setThresholdValue(&th, threshold_cli_max_lines, "max_nesting", 5);
+    try std.testing.expectEqual(@as(usize, 5), th.max_nesting_depth);
 }
 
 // ============================================================================
@@ -45452,6 +45828,348 @@ test "same source resolves last-wins" {
     try parseCliArg(std.testing.allocator, "--strict", &cfg, &cli_entries);
     try parseCliArg(std.testing.allocator, "--fail-on=error", &cfg, &cli_entries);
     try std.testing.expectEqual(FailOn.err, cfg.fail_on);
+}
+
+// ============================================================================
+// Config trust boundary + parser hardening (REDTEAM-2026-07-30)
+// ============================================================================
+
+/// Absolute path of the tmp dir itself (the config loaders are path-based).
+fn tmpDirPath(allocator: Allocator, tmp: *std.testing.TmpDir) ![:0]u8 {
+    return tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+}
+
+/// Write content as the ephor.json of dir_path (test helper).
+fn writeTestConfig(dir_path: []const u8, content: []const u8) !void {
+    const config_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/{s}",
+        .{ dir_path, CONFIG_FILENAME },
+    );
+    defer std.testing.allocator.free(config_path);
+    try Fs.cwd().writeFile(config_path, content, .{});
+}
+
+test "truncated configs parse without panic (RED1-1)" {
+    const allocator = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "{\"strict",
+        "{\"path_dir\":",
+        "{\"fail_on\":",
+        "{\"error_naming\":",
+        "{\"disable\": [\"ZA",
+        "{\"thresholds\": {\"max_lines",
+        "{\"thresholds\": {\"max_lines\" ",
+    };
+    for (inputs) |content| {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        try parseConfigJson(allocator, content, &cfg);
+        // A truncated-away value leaves gate and path at their defaults.
+        try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+        try std.testing.expectEqualStrings("src", cfg.path);
+    }
+}
+
+test "truncated disable array keeps its partial entries" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(allocator, "{\"disable\": [\"ZA", &cfg);
+    try std.testing.expectEqual(@as(usize, 1), cfg.disabled_rules.items.len);
+    try std.testing.expectEqualStrings("ZA", cfg.disabled_rules.items[0]);
+}
+
+test "config strings scan escaped quotes span-correctly (RED1-9)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(allocator, "{\"entries\": [\"a\\\"b.zig\", \"c.zig\"]}", &cfg);
+    try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("a\\\"b.zig", cfg.entries.items[0]);
+    try std.testing.expectEqualStrings("c.zig", cfg.entries.items[1]);
+}
+
+test "isPathAncestorOrEqual requires a component boundary" {
+    try std.testing.expect(isPathAncestorOrEqual("/repo", "/repo"));
+    try std.testing.expect(isPathAncestorOrEqual("/repo", "/repo/sub/file"));
+    try std.testing.expect(isPathAncestorOrEqual("/", "/anything"));
+    try std.testing.expect(!isPathAncestorOrEqual("/repo", "/repo-evil/x"));
+    try std.testing.expect(!isPathAncestorOrEqual("/repo/sub", "/repo"));
+    try std.testing.expect(!isPathAncestorOrEqual("", "/repo"));
+}
+
+test "config trust: cwd and ancestors trusted, descendants untrusted" {
+    global_io = std.testing.io;
+    try std.testing.expect(isConfigDirTrusted("."));
+    try std.testing.expect(!isConfigDirTrusted("src"));
+    // The working directory's parent is an ancestor, hence trusted.
+    var buf: [Fs.max_path_bytes]u8 = undefined;
+    const cwd = try Fs.cwd().realpath(".", &buf);
+    const parent = std.fs.path.dirname(cwd) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(isConfigDirTrusted(parent));
+}
+
+test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try writeTestConfig(dir_path, "{\"disable\": [\"Z\"], \"exclude\": [\"\"], " ++
+        "\"fail_on\": \"never\", \"strict\": true, " ++
+        "\"thresholds\": {\"max_function_lines\": 100000}, " ++
+        "\"error_naming\": \"snake_case\", \"entries\": [\"src/main.zig\"]}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    untrusted_config_note_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    try loadConfigFromTargetPath(allocator, &cfg, dir_path);
+
+    // Suppression and CI-gate keys are ignored...
+    try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.exclude.items.len);
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+    try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(ErrorNaming.title_case, cfg.error_naming);
+    // ...with exactly one note for the whole file...
+    try std.testing.expectEqual(@as(usize, 1), untrusted_config_note_count);
+    // ...while analysis keys stay honored (entries made absolute).
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expect(mem.startsWith(u8, cfg.entries.items[0], dir_path));
+}
+
+test "trusted config keeps full control of suppression and gates" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(allocator, "{\"disable\": [\"Z\"], \"fail_on\": \"never\"}", &cfg);
+    try std.testing.expectEqual(@as(usize, 1), cfg.disabled_rules.items.len);
+    try std.testing.expectEqualStrings("Z", cfg.disabled_rules.items[0]);
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+    try std.testing.expectEqual(FailOnSource.fail_on_key, cfg.fail_on_source);
+}
+
+test "untrusted target fail_on:never cannot lower a trusted gate (RED3-4)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try writeTestConfig(dir_path, "{\"fail_on\": \"never\"}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    untrusted_config_note_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    // The victim's own (trusted) config arms the gate first.
+    try parseConfigJson(allocator, "{\"strict\": true}", &cfg);
+    try loadConfigFromTargetPath(allocator, &cfg, dir_path);
+    try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
+    try std.testing.expectEqual(@as(usize, 1), untrusted_config_note_count);
+}
+
+test "CLI --trust-target-config sets the trust flag" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try std.testing.expect(!cfg.trust_target_config);
+    try parseCliArg(allocator, "--trust-target-config", &cfg, &cli_entries);
+    try std.testing.expect(cfg.trust_target_config);
+}
+
+test "--trust-target-config honors a target config in full" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try writeTestConfig(dir_path, "{\"disable\": [\"Z\"], \"fail_on\": \"never\"}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.trust_target_config = true;
+    untrusted_config_note_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    try loadConfigFromTargetPath(allocator, &cfg, dir_path);
+    try std.testing.expectEqual(@as(usize, 1), cfg.disabled_rules.items.len);
+    try std.testing.expectEqualStrings("Z", cfg.disabled_rules.items[0]);
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+    try std.testing.expectEqual(@as(usize, 0), untrusted_config_note_count);
+}
+
+test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var ignored_any = false;
+    try parseConfigJsonSource(
+        allocator,
+        "{\"disable\": [\"x]y\"], \"entries\": [\"e.zig\"]}",
+        &cfg,
+        .{
+            .trusted = false,
+            .path = "test",
+            .dir = ".",
+            .ignored_any = &ignored_any,
+        },
+    );
+    try std.testing.expect(ignored_any);
+    try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
+    // The key after the skipped array still parses (no desync).
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("e.zig", cfg.entries.items[0]);
+}
+
+test "config path_dir outside the config directory is rejected (RED4-1)" {
+    // Assumes tests run from the project root: ".." and "/" resolve outside
+    // it, while "src" resolves inside it.
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    path_dir_reject_count = 0;
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(allocator, "{\"path_dir\": \"..\"}", &cfg);
+    try std.testing.expectEqualStrings("src", cfg.path);
+    try std.testing.expect(!cfg.path_owned);
+
+    try parseConfigJson(allocator, "{\"path_dir\": \"/\"}", &cfg);
+    try std.testing.expectEqualStrings("src", cfg.path);
+    try std.testing.expect(!cfg.path_owned);
+    try std.testing.expectEqual(@as(usize, 2), path_dir_reject_count);
+
+    // A path inside the config directory is honored.
+    try parseConfigJson(allocator, "{\"path_dir\": \"src\"}", &cfg);
+    try std.testing.expectEqualStrings("src", cfg.path);
+    try std.testing.expect(cfg.path_owned);
+    try std.testing.expectEqual(@as(usize, 2), path_dir_reject_count);
+}
+
+test "target-dir config parse never aliases cfg.path (UAF regression)" {
+    // Regression: ConfigSource.dir aliased the dir argument, which IS the
+    // cfg.path buffer in production (loadConfigFromTargetPath(cfg, cfg.path)).
+    // A two-alias config ({"path_dir": "sub", "src": "sub"}) freed that
+    // buffer in key 1 (setOwnedPath) and read it in key 2 — a use-after-free.
+    // Under the test allocator the freed bytes are poisoned, so key 2 warned
+    // spuriously; the discriminating signal is zero rejections here.
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sub");
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try writeTestConfig(dir_path, "{\"path_dir\": \"sub\", \"src\": \"sub\"}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    // Owned cfg.path == the target dir buffer (the production aliasing).
+    try setOwnedPath(allocator, &cfg, dir_path);
+
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    path_dir_reject_count = 0;
+
+    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
+    try std.testing.expectEqual(@as(usize, 0), path_dir_reject_count);
+}
+
+test "empty exclude pattern is a hard usage error (RED3-2)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try std.testing.expectError(
+        error.EmptyExcludePattern,
+        parseConfigJson(allocator, "{\"exclude\": [\"\"]}", &cfg),
+    );
+    try std.testing.expectEqual(@as(usize, 0), cfg.exclude.items.len);
+
+    var cfg_orphan = testConfig();
+    defer cfg_orphan.deinit(allocator);
+    try std.testing.expectError(
+        error.EmptyExcludePattern,
+        parseConfigJson(allocator, "{\"orphan_exclude\": [\"\"]}", &cfg_orphan),
+    );
+}
+
+test "over-broad exclude patterns warn and are skipped (RED3-2)" {
+    const allocator = std.testing.allocator;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(allocator, "{\"exclude\": [\"/\", \".zig\", \"vendor\"]}", &cfg);
+    // Only the specific pattern survives.
+    try std.testing.expectEqual(@as(usize, 1), cfg.exclude.items.len);
+    try std.testing.expectEqualStrings("vendor", cfg.exclude.items[0]);
+}
+
+test "config thresholds clamp at the documented maxima (RED3-6)" {
+    const allocator = std.testing.allocator;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    threshold_clamp_count = 0;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        allocator,
+        "{\"thresholds\": {\"max_function_lines\": 999999999, " ++
+            "\"max_cognitive\": 99999, \"max_file_bytes\": 999999999999, " ++
+            "\"max_nesting\": 5}}",
+        &cfg,
+    );
+    try std.testing.expectEqual(@as(usize, 100_000), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(@as(usize, 10_000), cfg.thresholds.max_cognitive);
+    try std.testing.expectEqual(@as(usize, 100_000_000), cfg.thresholds.max_file_bytes);
+    // A value under the cap passes through untouched and unwarned.
+    try std.testing.expectEqual(@as(usize, 5), cfg.thresholds.max_nesting_depth);
+    try std.testing.expectEqual(@as(usize, 3), threshold_clamp_count);
+}
+
+test "CLI threshold flags clamp at the documented maxima (RED3-6)" {
+    const allocator = std.testing.allocator;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    threshold_clamp_count = 0;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try parseCliArg(allocator, "--max-lines=999999999", &cfg, &cli_entries);
+    try std.testing.expectEqual(@as(usize, 100_000), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(@as(usize, 1), threshold_clamp_count);
+    // The clamped value still locks the field against config files.
+    try parseConfigJson(allocator, "{\"thresholds\": {\"max_lines\": 60}}", &cfg);
+    try std.testing.expectEqual(@as(usize, 100_000), cfg.thresholds.max_function_lines);
+}
+
+test "CLI threshold flags beat config-file thresholds (RED3-6)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try parseCliArg(allocator, "--max-lines=50", &cfg, &cli_entries);
+    try parseConfigJson(
+        allocator,
+        "{\"thresholds\": {\"max_function_lines\": 100, \"max_nesting\": 5}}",
+        &cfg,
+    );
+    try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
+    // A field the CLI did not set still follows the config.
+    try std.testing.expectEqual(@as(usize, 5), cfg.thresholds.max_nesting_depth);
 }
 
 test "setOwnedPath OOM keeps the old path freeable exactly once" {

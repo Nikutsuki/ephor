@@ -2,9 +2,45 @@
 # Ephor installer - adds ephor to your Zig project
 # Usage: curl -fsSL https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.sh | sh
 
-set -e
+# pipefail is not portable to POSIX sh (dash), so each fallible command
+# handles its own exit status explicitly.
+set -eu
 
 REPO="https://codeberg.org/RhyosLabs/ephor"
+# Tests override this URL through EPHOR_TAGS_API to simulate an API failure.
+TAGS_API="${EPHOR_TAGS_API:-https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10}"
+# This tag is the fallback when the Codeberg tags API fails. Refresh it on every release.
+EPHOR_FALLBACK_TAG="v0.14.2"
+# Pin for Zig 0.15.x. Every remote tag (v0.12.3 and later) declares
+# minimum_zig_version 0.16.0. The 0.16 migration landed in v0.12.0, so no
+# remote tag builds on Zig 0.15.x. v0.11.13 declares minimum_zig_version
+# 0.15.0 and is the newest 0.15-era release. Its tag is deleted on the
+# remote, so pin the commit hash. Commit archives stay available.
+EPHOR_0_15_COMMIT="60145fe05a2b91e7dd32d1c671d98239cd19aea6"
+
+# Bare globals here stay POSIX-correct only while every call site is a $() subshell.
+# Print the newest stable release tag on stdout. Return 1 when the API
+# fails, the result is empty, or no tag is a strict vMAJOR.MINOR.PATCH.
+latest_ephor_tag() {
+    # 30s: the Codeberg API has answered in 20s+ on slow days; refusals still fail fast.
+    response=$(curl -fsSL --max-time 30 "$TAGS_API" 2>/dev/null) || return 1
+    tag=$(printf '%s\n' "$response" | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+    [ -n "$tag" ] || return 1
+    printf '%s\n' "$tag"
+}
+
+# Print the release tag to install: the latest tag from the Codeberg API, or
+# the pinned fallback tag when the API does not yield a valid tag.
+resolve_ephor_tag() {
+    tag=$(latest_ephor_tag) || tag=""
+    if [ -z "$tag" ]; then
+        echo "warning: could not resolve the latest ephor tag from the Codeberg API." >&2
+        echo "The install continues with the fallback tag ${EPHOR_FALLBACK_TAG}." >&2
+        tag="$EPHOR_FALLBACK_TAG"
+    fi
+    printf '%s\n' "$tag"
+}
 
 # Check we're in a Zig project
 if [ ! -f "build.zig" ]; then
@@ -16,7 +52,7 @@ if [ ! -f "build.zig" ]; then
     echo "    zig init"
     echo ""
     echo "  Then re-run the install:"
-    echo "    curl -fsSL ${REPO}/raw/main/install.sh | sh"
+    echo "    curl -fsSL ${REPO}/raw/branch/main/install.sh | sh"
     exit 1
 fi
 
@@ -42,21 +78,21 @@ fi
 
 # Detect Zig version and pick compatible ephor version
 ZIG_VERSION=$(zig version 2>/dev/null || echo "")
+EPHOR_URL=""
 if [ -n "$ZIG_VERSION" ]; then
     ZIG_MAJOR=$(echo "$ZIG_VERSION" | cut -d. -f1)
     ZIG_MINOR=$(echo "$ZIG_VERSION" | cut -d. -f2)
-    # Zig 0.16.0+ → ephor 0.14.x; Zig 0.15.x → ephor 0.11.13
+    # Zig 0.16.0 and later track the latest ephor release. Zig 0.15.x uses
+    # the pinned 0.15-era release by commit hash.
     if [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
-        EPHOR_TAG="v0.14.3"
+        EPHOR_TAG=$(resolve_ephor_tag)
     else
         EPHOR_TAG="v0.11.13"
+        EPHOR_URL="${REPO}/archive/${EPHOR_0_15_COMMIT}.tar.gz"
     fi
 else
     echo "warning: could not detect zig version, defaulting to latest"
-    # Fetch latest tagged version from Codeberg tags API
-    TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
-    LATEST_TAG=$(curl -sL "$TAGS_API" | grep -o '"name": "v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
-    EPHOR_TAG="v${LATEST_TAG}"
+    EPHOR_TAG=$(resolve_ephor_tag)
 fi
 
 # Detect if this is an upgrade or fresh install
@@ -66,11 +102,12 @@ else
     ACTION="Installing"
 fi
 
-if [ -z "$EPHOR_TAG" ] || [ "$EPHOR_TAG" = "v" ]; then
-    echo "warning: could not detect ephor version, using main branch"
-    EPHOR_URL="${REPO}/archive/main.tar.gz"
-else
+if [ -n "$ZIG_VERSION" ]; then
     echo "${ACTION} ephor ${EPHOR_TAG} (Zig ${ZIG_VERSION})..."
+else
+    echo "${ACTION} ephor ${EPHOR_TAG}..."
+fi
+if [ -z "$EPHOR_URL" ]; then
     EPHOR_URL="${REPO}/archive/${EPHOR_TAG}.tar.gz"
 fi
 

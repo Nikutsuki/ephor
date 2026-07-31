@@ -9,7 +9,7 @@
 #   2. src/main.zig          EPHOR_VERSION constant
 #   3. README.md             manual install URL (v*.tar.gz)
 #   4. README.md             example config "version" field
-#   5. install.sh            EPHOR_TAG
+#   5. install.sh            EPHOR_FALLBACK_TAG matches the latest remote tag
 #   6. Codeberg tags API     latest remote tag matches
 
 set -e
@@ -70,21 +70,28 @@ else
     echo "ok       README.md example config: ${README_CFG_VERSION}"
 fi
 
-# 5. install.sh EPHOR_TAG
-INSTALL_VERSION=$(grep 'EPHOR_TAG=' install.sh | head -1 | sed 's/.*"v\([0-9][0-9.]*\)".*/\1/')
-if [ -z "$INSTALL_VERSION" ]; then
-    echo "MISSING  install.sh: EPHOR_TAG not found"
+# Fetch the latest remote tag once. Sections 5 and 6 use it.
+# Give the API 30s: observed 20s+ responses must not skip the gate.
+TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
+REMOTE_TAG=$(curl -sL --max-time 30 "$TAGS_API" 2>/dev/null | grep -o '"name"[[:space:]]*:[[:space:]]*"v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
+
+# 5. install.sh EPHOR_FALLBACK_TAG matches the latest remote tag.
+# The fallback serves installs when the tags API fails. It must name the
+# newest existing tag, never the untagged version under development.
+INSTALL_FALLBACK=$(grep 'EPHOR_FALLBACK_TAG=' install.sh | head -1 | sed 's/.*"v\([0-9][0-9.]*\)".*/\1/')
+if [ -z "$INSTALL_FALLBACK" ]; then
+    echo "MISSING  install.sh: EPHOR_FALLBACK_TAG not found"
     ERRORS=$((ERRORS + 1))
-elif [ "$INSTALL_VERSION" != "$EXPECTED" ]; then
-    echo "MISMATCH install.sh EPHOR_TAG: v${INSTALL_VERSION} (expected v${EXPECTED})"
+elif [ -z "$REMOTE_TAG" ]; then
+    echo "SKIP     install.sh EPHOR_FALLBACK_TAG: Codeberg tags API unreachable"
+elif [ "$INSTALL_FALLBACK" != "$REMOTE_TAG" ]; then
+    echo "MISMATCH install.sh EPHOR_FALLBACK_TAG: v${INSTALL_FALLBACK} (latest remote tag v${REMOTE_TAG})"
     ERRORS=$((ERRORS + 1))
 else
-    echo "ok       install.sh EPHOR_TAG: v${INSTALL_VERSION}"
+    echo "ok       install.sh EPHOR_FALLBACK_TAG: v${INSTALL_FALLBACK}"
 fi
 
 # 6. Codeberg tags API - latest remote tag
-TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
-REMOTE_TAG=$(curl -sL --max-time 5 "$TAGS_API" 2>/dev/null | grep -o '"name"[[:space:]]*:[[:space:]]*"v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
 if [ -z "$REMOTE_TAG" ]; then
     echo "SKIP     Codeberg tags API: could not reach (offline?)"
 elif [ "$REMOTE_TAG" = "$EXPECTED" ]; then

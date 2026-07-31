@@ -7149,9 +7149,11 @@ const ImportGraph = struct {
     }
 
     /// Returns true if resolved path is within the scan root (or no root set).
+    /// Component-boundary compare (RED4-3): root "/tmp/repo" must not match
+    /// the sibling "/tmp/repo-evil".
     fn isWithinScanRoot(self: *const ImportGraph, resolved: []const u8) bool {
         const root = self.scan_root orelse return true;
-        return mem.startsWith(u8, resolved, root);
+        return isPathAncestorOrEqual(root, resolved);
     }
 
     fn deinit(self: *ImportGraph) void {
@@ -7857,7 +7859,7 @@ const ImportGraph = struct {
         {
             var iter = self.reachable.iterator();
             while (iter.next()) |entry| {
-                if (!mem.startsWith(u8, entry.key_ptr.*, abs_subdir)) continue;
+                if (!isPathAncestorOrEqual(abs_subdir, entry.key_ptr.*)) continue;
                 try to_scan.append(self.allocator, entry.key_ptr.*);
             }
         }
@@ -20315,7 +20317,9 @@ fn parseLocationLine(text: []const u8, file_end: usize) ?usize {
 // ============================================================================
 
 fn relativePath(path: []const u8, base: []const u8) []const u8 {
-    if (mem.startsWith(u8, path, base)) {
+    // Strip base only on a component boundary: a raw prefix strip would
+    // mangle "/repo-evil/x.zig" for base "/repo" (RED4-3 shape).
+    if (path.len >= base.len and isPathAncestorOrEqual(base, path)) {
         var rel = path[base.len..];
         while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
         if (rel.len > 0) return rel;
@@ -21459,14 +21463,25 @@ fn skipWhitespaceAndComments(content: []const u8, start: usize) usize {
     return i;
 }
 
-/// Component-boundary "ancestor or same" test on two absolute paths.
-/// A raw startsWith would accept "/repo-evil" for root "/repo" (RED4-3
-/// shape); the byte after the matched prefix must be a separator.
+/// Path separator test accepting both '/' and the host separator, so
+/// containment checks behave on Windows, where both forms appear.
+fn isPathSep(c: u8) bool {
+    return c == '/' or c == std.fs.path.sep;
+}
+
+/// Component-boundary "ancestor or same" test on two paths. A raw
+/// startsWith would accept "/repo-evil" for root "/repo" (RED4-3 shape);
+/// the byte after the matched prefix must be a separator. The test strips
+/// trailing separators from `ancestor` first, so both forms of a directory
+/// name match.
 fn isPathAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
-    if (mem.eql(u8, ancestor, path)) return true;
-    if (ancestor.len == 0 or path.len <= ancestor.len) return false;
-    if (!mem.startsWith(u8, path, ancestor)) return false;
-    return path[ancestor.len] == '/' or ancestor[ancestor.len - 1] == '/';
+    var root = ancestor;
+    while (root.len > 1 and isPathSep(root[root.len - 1]))
+        root = root[0 .. root.len - 1];
+    if (mem.eql(u8, root, path)) return true;
+    if (root.len == 0 or path.len <= root.len) return false;
+    if (!mem.startsWith(u8, path, root)) return false;
+    return isPathSep(path[root.len]) or isPathSep(root[root.len - 1]);
 }
 
 /// Trust test for config files (RED3-x): a config is trusted when its
@@ -21633,7 +21648,10 @@ fn writeDefaultConfig() !void {
 }
 
 /// Detect the path_dir from build.zig by finding root_source_file patterns.
-/// Returns an allocator-owned string. Caller must free.
+/// Returns an allocator-owned string. Caller must free. The detected
+/// directory must realpath inside the cwd (RED4-2 backstop: a symlinked
+/// source directory passes the string checks yet resolves outside the
+/// project). A violation warns and falls back to the "." default.
 fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
     const content = Fs.cwd().readFileAlloc(
         allocator,
@@ -21651,24 +21669,63 @@ fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
     defer allocator.free(content);
 
     const result = findPathDirInContent(content);
+    if (!detectedDirWithinCwd(result)) {
+        std.debug.print(
+            "warning: detected source directory '{s}' resolves outside the " ++
+                "project. Using \".\" as the scan root.\n",
+            .{result},
+        );
+        return allocator.dupe(u8, ".") catch ".";
+    }
     return allocator.dupe(u8, result) catch ".";
+}
+
+/// Containment backstop for the build.zig detection result (RED4-2): the
+/// candidate must realpath inside the cwd realpath. Fails closed: the
+/// check rejects an unresolvable directory, the same policy as
+/// isConfigDirTrusted.
+fn detectedDirWithinCwd(dir: []const u8) bool {
+    var dir_buf: [Fs.max_path_bytes]u8 = undefined;
+    var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
+    const cwd_real = Fs.cwd().realpath(".", &cwd_buf) catch return false;
+    const dir_real = Fs.cwd().realpath(dir, &dir_buf) catch return false;
+    return isPathAncestorOrEqual(cwd_real, dir_real);
+}
+
+/// Safety test for a build.zig path candidate (RED4-2): reject absolute
+/// paths and any ".." component. Both let a hostile build.zig move the
+/// scan root outside the project tree.
+fn isSafeDetectedPath(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) return false;
+    var comps = mem.splitAny(u8, path, "/\\");
+    while (comps.next()) |comp| {
+        if (mem.eql(u8, comp, "..")) return false;
+    }
+    return true;
 }
 
 /// Scan build.zig content for root_source_file pattern, return dir portion.
 /// Returns a slice into `content` - caller must dupe before freeing content.
+/// The scan skips comment and multiline-string lines and rejects a
+/// candidate that is absolute or carries a ".." component (RED4-2): a
+/// hostile build.zig must not move the scan root. The first valid match
+/// wins. A rejected match never selects a value and never aborts detection.
 fn findPathDirInContent(content: []const u8) []const u8 {
     const patterns = [_][]const u8{ "root_source_file", ".root_src" };
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
+        const t = mem.trimStart(u8, line, " \t\r");
+        if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
         for (patterns) |pattern| {
-            const pat_idx = mem.indexOf(u8, line, pattern) orelse continue;
-            const rest = line[pat_idx..];
+            const pat_idx = mem.indexOf(u8, t, pattern) orelse continue;
+            const rest = t[pat_idx..];
             const q1 = mem.indexOf(u8, rest, "\"") orelse continue;
             const after_q1 = q1 + 1;
             if (after_q1 >= rest.len) continue;
             const q2 = mem.indexOf(u8, rest[after_q1..], "\"") orelse continue;
             const path = rest[after_q1 .. after_q1 + q2];
             if (!mem.endsWith(u8, path, ".zig")) continue;
+            if (!isSafeDetectedPath(path)) continue;
             if (std.fs.path.dirname(path)) |dir| return dir;
             return ".";
         }
@@ -23863,7 +23920,7 @@ fn classifySoftChannel(issue: Issue, out: ReportOutCtx) FilterDecision {
 fn classifyIssue(issue: Issue, out: ReportOutCtx) FilterVerdict {
     // Runtime issues (ZR1xx) use absolute paths from stack traces - skip path filter
     const is_runtime_issue = mem.startsWith(u8, issue.rule, "ZR1");
-    if (!is_runtime_issue and !mem.startsWith(u8, issue.file, out.cfg.path))
+    if (!is_runtime_issue and !isPathAncestorOrEqual(out.cfg.path, issue.file))
         return .{ .decision = .path_scope, .hard_blocked = true };
     const hits = ChannelHits{
         .soft = classifySoftChannel(issue, out),
@@ -24592,8 +24649,10 @@ pub fn main(init: std.process.Init) !void {
                 // Also scan entry point files to build complete import graph
                 // This ensures orphan detection works when checking subdirectories
                 for (cfg.entries.items) |e| {
-                    // Only scan if not already in scanned path
-                    if (!std.mem.startsWith(u8, e, cfg.path)) {
+                    // Only scan if not already in scanned path. Boundary
+                    // compare (RED4-3): entry "src-evil/x.zig" is outside
+                    // path "src" and must still be scanned for orphans.
+                    if (!isPathAncestorOrEqual(cfg.path, e)) {
                         // Entry file may not exist, that's ok - just skip it
                         g.scanSingleFile(e) catch |err| {
                             if (cfg.verbose) {
@@ -46221,6 +46280,60 @@ test "isPathAncestorOrEqual requires a component boundary" {
     try std.testing.expect(!isPathAncestorOrEqual("/repo", "/repo-evil/x"));
     try std.testing.expect(!isPathAncestorOrEqual("/repo/sub", "/repo"));
     try std.testing.expect(!isPathAncestorOrEqual("", "/repo"));
+}
+
+test "isPathAncestorOrEqual accepts trailing-separator root forms" {
+    try std.testing.expect(isPathAncestorOrEqual("/repo/", "/repo"));
+    try std.testing.expect(isPathAncestorOrEqual("/repo/", "/repo/x"));
+    try std.testing.expect(!isPathAncestorOrEqual("/repo/", "/repo-evil"));
+}
+
+test "isWithinScanRoot rejects sibling-prefix paths (RED4-3)" {
+    var g = ImportGraph.init(std.testing.allocator);
+    defer g.deinit();
+    g.scan_root = "/tmp/repo";
+    try std.testing.expect(!g.isWithinScanRoot("/tmp/repo-evil/x.zig"));
+    try std.testing.expect(g.isWithinScanRoot("/tmp/repo/sub/x.zig"));
+    try std.testing.expect(g.isWithinScanRoot("/tmp/repo"));
+}
+
+test "findPathDirInContent skips comments and rejects unsafe candidates (RED4-2)" {
+    // A hostile comment line must not win over a later real match.
+    const hostile_comment =
+        \\// root_source_file = "/abs/evil.zig"
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/main.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(hostile_comment));
+
+    // A ".." candidate in a comment line is skipped like any comment.
+    const parent_comment =
+        \\// root_source_file = "../outside/x.zig"
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("lib/main.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("lib", findPathDirInContent(parent_comment));
+
+    // An absolute candidate in real code is rejected, not selected.
+    const absolute_code =
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .root_source_file = "/opt/evil/main.zig" });
+        \\    const lib = b.addStaticLibrary(.{ .root_source_file = b.path("src/lib.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(absolute_code));
+
+    // A ".." candidate in real code is rejected by the component check.
+    const parent_code =
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("../outside/main.zig") });
+        \\    const lib = b.addStaticLibrary(.{ .root_source_file = b.path("src/lib.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(parent_code));
 }
 
 test "config trust: cwd and ancestors trusted, descendants untrusted" {

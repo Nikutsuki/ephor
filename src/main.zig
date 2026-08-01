@@ -66,6 +66,13 @@ const Fs = struct {
         ) !std.Io.File {
             return std.Io.Dir.cwd().createFile(global_io.?, sub_path, flags);
         }
+        pub fn createFileAtomic(
+            _: CompatDir,
+            sub_path: []const u8,
+            options: std.Io.Dir.CreateFileAtomicOptions,
+        ) !std.Io.File.Atomic {
+            return std.Io.Dir.cwd().createFileAtomic(global_io.?, sub_path, options);
+        }
         pub fn statFile(_: CompatDir, sub_path: []const u8) !std.Io.Dir.Stat {
             return std.Io.Dir.cwd().statFile(global_io.?, sub_path, .{});
         }
@@ -20979,6 +20986,9 @@ const Config = struct {
     auto_approve: bool, // --yes: skip interactive confirmation prompts
     runtime_command: ?[]const u8, // --command=<cmd> for runtime analysis
     install_version: ?[]const u8, // --version=X.Y.Z for install/upgrade
+    // --force: allow 'upgrade' to resolve below the binary's own version
+    // (EPH-I0193). The floor refuses downgrades by default.
+    force_upgrade: bool = false,
     // CI gate: exit 1 when findings reach this level. --strict ≡ .warning.
     // Config "fail_on" is more specific than config "strict"; CLI always wins.
     fail_on: FailOn = .never,
@@ -22087,7 +22097,7 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
     , .{ ver, root_dir, entries_json.items });
     defer allocator.free(config_content);
 
-    try Fs.cwd().writeFile(CONFIG_FILENAME, config_content, .{});
+    try writeFileAtomic(Fs.cwd(), CONFIG_FILENAME, config_content);
 
     std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
         CONFIG_FILENAME, ver, root_dir,
@@ -22277,29 +22287,42 @@ fn patchBuildZig(allocator: Allocator) !?usize {
         if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK);
     }
 
-    try Fs.cwd().writeFile("build.zig", new_content.items, .{});
+    try writeFileAtomic(Fs.cwd(), "build.zig", new_content.items);
     return insert_after + 2;
+}
+
+/// True when build.zig.zon exists and declares an ephor dependency.
+fn projectHasEphorDependency(allocator: Allocator) bool {
+    const content = Fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch
+        return false;
+    defer allocator.free(content);
+    return mem.indexOf(u8, content, ".ephor") != null;
 }
 
 /// Run the upgrade command: updates ephor dependency in build.zig.zon.
 /// If install_version is provided, upgrades to that specific version;
 /// otherwise defaults to the binary's own version (EPHOR_VERSION).
-fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8) !void {
+/// Refuses to resolve below EPHOR_VERSION unless force is set (EPH-I0193).
+fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8, force: bool) !void {
     // If no explicit version, fetch the latest from Codeberg tags API
     const fetched_ver = if (install_version == null) fetchLatestVersion(allocator) else null;
     defer if (fetched_ver) |fv| allocator.free(fv);
     const ver = install_version orelse (fetched_ver orelse EPHOR_VERSION);
+
+    // Floor: a downgrade needs --force. Applies to an explicit --version
+    // too (EPH-I0193). Refuse before any fetch or write.
+    if (!upgradeFloorAllows(EPHOR_VERSION, ver, force)) {
+        std.debug.print(
+            "ERROR: refusing to downgrade ephor from v{s} to v{s}. Use --force to override.\n",
+            .{ EPHOR_VERSION, ver },
+        );
+        return;
+    }
+
     const package_url = try buildPackageUrl(allocator, ver);
     defer allocator.free(package_url);
 
-    // Check if build.zig.zon exists and has ephor dependency
-    const has_ephor = blk: {
-        const content = Fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch break :blk false;
-        defer allocator.free(content);
-        break :blk mem.indexOf(u8, content, ".ephor") != null;
-    };
-
-    if (!has_ephor) {
+    if (!projectHasEphorDependency(allocator)) {
         std.debug.print(
             \\No ephor dependency found in build.zig.zon.
             \\
@@ -22531,9 +22554,22 @@ fn insertVersionField(
     }) catch null;
 }
 
+/// Write contents to sub_path atomically. Creates a uniquely named temp
+/// file in the same directory (exclusive create), writes it, then renames
+/// over the target. WHY: a fixed-path writeFile follows a symlink planted
+/// in a hostile clone and truncates the victim file; rename replaces the
+/// link itself and never follows it (EPH-I0194). std's File.Atomic removes
+/// the temp file on failure.
+fn writeFileAtomic(dir: Fs.Dir, sub_path: []const u8, contents: []const u8) !void {
+    var atomic = try dir.createFileAtomic(sub_path, .{ .replace = true });
+    defer atomic.deinit(global_io.?);
+    try atomic.file.writeStreamingAll(global_io.?, contents);
+    try atomic.replace(global_io.?);
+}
+
 /// Write content to the config file (ephor.json).
 fn writeConfigFile(content: []const u8) !void {
-    try Fs.cwd().writeFile(CONFIG_FILENAME, content, .{});
+    try writeFileAtomic(Fs.cwd(), CONFIG_FILENAME, content);
 }
 
 /// Canonical ephor build.zig integration block.
@@ -22606,7 +22642,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
     }) catch return;
     defer allocator.free(new_content);
 
-    Fs.cwd().writeFile("build.zig", new_content, .{}) catch return;
+    writeFileAtomic(Fs.cwd(), "build.zig", new_content) catch return;
 
     std.debug.print("Updated build.zig (ephor build steps)\n", .{});
 }
@@ -22767,8 +22803,10 @@ fn resolveLatestVersion(
 /// Fetch latest version from the Codeberg tags API (not cached raw files).
 /// Falls back to parsing build.zig.zon from main branch if tags API fails.
 fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
-    // Primary: use tags API (sorted by date, most recent first)
-    const api_url = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1";
+    // Primary: tags API. The page is date-ordered and tag dates are
+    // attacker-influenceable, so the parser takes the semver-max over the
+    // page instead of the first entry (EPH-I0193).
+    const api_url = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10";
     const api_result = std.process.run(allocator, global_io.?, .{
         .argv = &.{ "curl", "-sL", "--max-time", "5", api_url },
     }) catch return fetchVersionFromZon(allocator);
@@ -22795,23 +22833,61 @@ fn fetchVersionFromZon(allocator: Allocator) ?[]const u8 {
     return parseVersionFromZon(allocator, result.stdout);
 }
 
-/// Parse version from Codeberg tags API JSON response.
-/// Looks for `"name": "vX.Y.Z"` pattern.
-fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
-    // Find "name": "vX.Y.Z" — the first match is the latest tag
-    const name_marker = "\"name\":";
-    const idx = mem.indexOf(u8, json, name_marker) orelse return null;
-    var pos = idx + name_marker.len;
-    // Skip whitespace
+/// Extract the quoted tag name after a "name": marker offset. Returns null
+/// when the value is missing or not a quoted string.
+fn extractTagName(json: []const u8, after_marker: usize) ?[]const u8 {
+    var pos = after_marker;
     while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t')) : (pos += 1) {}
     if (pos >= json.len or json[pos] != '"') return null;
     pos += 1; // skip opening quote
     const end = mem.indexOfPos(u8, json, pos, "\"") orelse return null;
-    const tag_name = json[pos..end];
-    // Strip leading 'v' if present
-    const ver = if (tag_name.len > 0 and tag_name[0] == 'v') tag_name[1..] else tag_name;
-    if (ver.len == 0) return null;
-    return allocator.dupe(u8, ver) catch null;
+    return json[pos..end];
+}
+
+/// True when ver is strict "X.Y.Z": ASCII digits and exactly two dots, no
+/// empty component, no suffix. Prerelease tags ("0.15.0-beta.1") fail.
+fn isStrictSemverTag(ver: []const u8) bool {
+    var dots: usize = 0;
+    var digit_run: usize = 0;
+    for (ver) |c| {
+        if (c == '.') {
+            if (digit_run == 0) return false;
+            digit_run = 0;
+            dots += 1;
+            continue;
+        }
+        if (!std.ascii.isDigit(c)) return false;
+        digit_run += 1;
+    }
+    return dots == 2 and digit_run > 0;
+}
+
+/// Parse the newest stable version from a Codeberg tags API JSON response.
+/// Scans EVERY "name" field and returns the semver-max of strict vX.Y.Z /
+/// X.Y.Z tags. WHY max and not first: the API orders tags by date, and tag
+/// dates are attacker-influenceable (a re-dated old tag sorts first), while
+/// the semver maximum is not (EPH-I0193). Prerelease tags are rejected by
+/// isStrictSemverTag. Caller owns the returned slice.
+fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
+    const name_marker = "\"name\":";
+    var best: ?[3]u32 = null;
+    var best_ver: []const u8 = "";
+    var search_pos: usize = 0;
+    while (mem.indexOfPos(u8, json, search_pos, name_marker)) |idx| {
+        const after_marker = idx + name_marker.len;
+        search_pos = after_marker;
+        const tag = extractTagName(json, after_marker) orelse continue;
+        const ver = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
+        if (!isStrictSemverTag(ver)) continue;
+        const parsed = parseSemver(ver) orelse continue;
+        if (best) |b| {
+            if (!semverGreater(parsed, b)) continue;
+        }
+        best = parsed;
+        best_ver = ver;
+    }
+    if (best == null) return null;
+    return allocator.dupe(u8, best_ver) catch null;
 }
 
 /// Parse `.version = "X.Y.Z"` from build.zig.zon content.
@@ -22835,13 +22911,30 @@ fn parseVersionFromZon(allocator: Allocator, content: []const u8) ?[]const u8 {
     return null;
 }
 
+/// True when a is semver-greater than b (lexicographic on major/minor/patch).
+fn semverGreater(a: [3]u32, b: [3]u32) bool {
+    if (a[0] != b[0]) return a[0] > b[0];
+    if (a[1] != b[1]) return a[1] > b[1];
+    return a[2] > b[2];
+}
+
 /// Compare two semver strings. Returns true if remote > local.
 fn isNewerVersion(local: []const u8, remote: []const u8) bool {
     const l = parseSemver(local) orelse return false;
     const r = parseSemver(remote) orelse return false;
-    if (r[0] != l[0]) return r[0] > l[0];
-    if (r[1] != l[1]) return r[1] > l[1];
-    return r[2] > l[2];
+    return semverGreater(r, l);
+}
+
+/// True when the upgrade path may resolve to target. A target older than
+/// current is a downgrade and needs force. WHY: tag order and explicit
+/// flags can resolve below the installed binary, and a silent downgrade
+/// re-introduces fixed bugs (EPH-I0193). An unparseable target is not
+/// blocked here: explicit-flag validation belongs to EPH-I0166.
+fn upgradeFloorAllows(current: []const u8, target: []const u8, force: bool) bool {
+    if (force) return true;
+    // isNewerVersion(local=target, remote=current) is true exactly when
+    // current is newer than target — the downgrade case.
+    return !isNewerVersion(target, current);
 }
 
 /// Parse "X.Y.Z" into [3]u32. Returns null on failure.
@@ -23404,6 +23497,10 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         cfg.no_suppression = true;
         return true;
     }
+    if (mem.eql(u8, arg, "--force")) {
+        cfg.force_upgrade = true;
+        return true;
+    }
     return false;
 }
 
@@ -23686,6 +23783,8 @@ fn printHelp() void {
         \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
         \\  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
         \\  --version=<X.Y.Z>   For 'install'/'upgrade': pin a specific version
+        \\  --force             For 'upgrade': allow a downgrade below the
+        \\                       binary's own version (refused by default)
         \\
         \\ENVIRONMENT VARIABLES:
         \\  EPHOR_NO_UPDATE_CHECK   When set (any value, including empty), skip the
@@ -24708,7 +24807,7 @@ pub fn main(init: std.process.Init) !void {
             should_exit_error = true;
         },
 
-        .upgrade => runUpgradeCommand(alloc, cfg.install_version) catch |err| {
+        .upgrade => runUpgradeCommand(alloc, cfg.install_version, cfg.force_upgrade) catch |err| {
             std.debug.print("error: failed to upgrade: {}\n", .{err});
             should_exit_error = true;
         },
@@ -35998,6 +36097,119 @@ test "resolveLatestVersion without cache path always fetches" {
     defer allocator.free(latest);
     try std.testing.expectEqualStrings("9.9.9", latest);
     try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+}
+
+test "parseVersionFromTagsApi returns semver-max of the page (EPH-I0193)" {
+    const allocator = std.testing.allocator;
+    // Date-ordered page: the first tag is not the semver-max. Pre-fix the
+    // first match won and this returned "0.9.0".
+    const json =
+        \\[{"name": "v0.9.0"}, {"name": "v0.14.3"}, {"name": "v0.13.0"}]
+    ;
+    const ver = parseVersionFromTagsApi(allocator, json) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.14.3", ver);
+}
+
+test "parseVersionFromTagsApi skips prerelease tags" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\[{"name": "v0.15.0-beta.1"}, {"name": "v0.14.3"}]
+    ;
+    const ver = parseVersionFromTagsApi(allocator, json) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.14.3", ver);
+}
+
+test "parseVersionFromTagsApi returns null when every tag is a prerelease" {
+    const allocator = std.testing.allocator;
+    // "1.2.3.4" joins the rejects: strict X.Y.Z has exactly two dots.
+    const json =
+        \\[{"name": "v0.15.0-beta.1"}, {"name": "0.16.0-rc1"}, {"name": "1.2.3.4"}]
+    ;
+    try std.testing.expect(parseVersionFromTagsApi(allocator, json) == null);
+}
+
+test "parseVersionFromTagsApi accepts a bare X.Y.Z tag" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\[{"name": "0.14.3"}]
+    ;
+    const ver = parseVersionFromTagsApi(allocator, json) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.14.3", ver);
+}
+
+test "parseVersionFromTagsApi returns null for garbage input" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(parseVersionFromTagsApi(allocator, "not json") == null);
+    try std.testing.expect(parseVersionFromTagsApi(allocator, "{\"name\": 42}") == null);
+    try std.testing.expect(parseVersionFromTagsApi(allocator, "") == null);
+}
+
+test "upgradeFloorAllows blocks downgrades without force (EPH-I0193)" {
+    try std.testing.expect(!upgradeFloorAllows("0.14.3", "0.13.0", false));
+    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.13.0", true));
+    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.14.3", false));
+    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.15.0", false));
+    // Unparseable targets pass the floor: EPH-I0166 owns flag validation.
+    try std.testing.expect(upgradeFloorAllows("0.14.3", "garbage", false));
+}
+
+test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Victim the planted symlink points at.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "victim.txt",
+        .data = "victim",
+    });
+    try tmp.dir.symLink(std.testing.io, "victim.txt", CONFIG_FILENAME, .{});
+
+    const target_path = try tmpFilePath(allocator, &tmp, CONFIG_FILENAME);
+    defer allocator.free(target_path);
+    try writeFileAtomic(Fs.cwd(), target_path, "new-content");
+
+    // The victim keeps its bytes: the write must not have followed the link.
+    const victim = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "victim.txt",
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(victim);
+    try std.testing.expectEqualStrings("victim", victim);
+
+    // The link is replaced by a regular file holding the new content.
+    const stat = try tmp.dir.statFile(std.testing.io, CONFIG_FILENAME, .{
+        .follow_symlinks = false,
+    });
+    try std.testing.expect(stat.kind == .file);
+    const written = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        CONFIG_FILENAME,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings("new-content", written);
+
+    // Success leaves no temp files behind.
+    var it = tmp.dir.iterate();
+    var entries: usize = 0;
+    while (try it.next(std.testing.io)) |entry| {
+        entries += 1;
+        const is_expected = mem.eql(u8, entry.name, "victim.txt") or
+            mem.eql(u8, entry.name, CONFIG_FILENAME);
+        try std.testing.expect(is_expected);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries);
 }
 
 // ============================================================================
@@ -47504,6 +47716,16 @@ test "CLI --trust-target-config sets the trust flag" {
     try std.testing.expect(!cfg.trust_target_config);
     try parseCliArg(allocator, "--trust-target-config", &cfg, &cli_entries);
     try std.testing.expect(cfg.trust_target_config);
+}
+
+test "CLI --force sets force_upgrade" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try std.testing.expect(!cfg.force_upgrade);
+    try parseCliArg(allocator, "--force", &cfg, &cli_entries);
+    try std.testing.expect(cfg.force_upgrade);
 }
 
 test "--trust-target-config honors a target config in full" {

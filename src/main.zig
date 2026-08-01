@@ -17830,8 +17830,9 @@ fn isNullCheckConditional(t: []const u8) bool {
 }
 
 /// Shared context for the CFG null-safety passes (ZA801/ZA802): the graph,
-/// the function's lines, and the per-block null-check sets the collect phase
-/// builds and the scan phase consumes.
+/// the function's lines, the per-block null-check sets the collect phase
+/// builds and the scan phase consumes, and the fn-wide nullable-pointer
+/// declaration set ZA802 gates on.
 const NullSafetyCtx = struct {
     allocator: Allocator,
     cfg: *ControlFlowGraph,
@@ -17839,6 +17840,7 @@ const NullSafetyCtx = struct {
     func_line: usize,
     file_path: []const u8,
     checked: []std.StringHashMapUnmanaged(void),
+    nullable_ptrs: *const std.StringHashMapUnmanaged(void),
     issues: *std.ArrayListUnmanaged(Issue),
 };
 
@@ -17962,14 +17964,16 @@ fn checkOptionalUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
     });
 }
 
-/// Check for unsafe .* deref on optional pointer (maybe_/opt_ prefix)
+/// Check for unsafe .* deref on a nullable pointer (ZA802, EPH-I0219).
+/// Type-based: fires only when the deref target was declared in the fn with
+/// a nullable-pointer annotation. The maybe_/opt_ name gate it replaces
+/// fired on every non-optional maybe_* variable and missed every nullable
+/// pointer without the prefix.
 fn checkOptionalDeref(ctx: NullSafetyCtx, line: NullLineCtx) !void {
     const col = mem.indexOf(u8, line.t, ".*") orelse return;
-    const before = line.t[0..col];
-    const has_opt = mem.indexOf(u8, before, "maybe_") != null or
-        mem.indexOf(u8, before, "opt_") != null;
-    if (!has_opt or isInSafeContext(line.t)) return;
+    if (isInSafeContext(line.t)) return;
     const var_name = extractDerefVar(line.t, col) orelse return;
+    if (!ctx.nullable_ptrs.contains(var_name)) return;
     if (line.checked_set.contains(var_name)) return;
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.file_path,
@@ -17977,8 +17981,8 @@ fn checkOptionalDeref(ctx: NullSafetyCtx, line: NullLineCtx) !void {
         .col = col + 1,
         .severity = .warning,
         .rule = RULE_ORELSE_QUESTION_UNSAFE,
-        .message = "dereferencing optional pointer may panic if null",
-        .help = "check for null before dereferencing, or use 'orelse'",
+        .message = "dereferencing nullable pointer without a null check",
+        .help = "check for null before dereferencing",
     });
 }
 
@@ -18039,6 +18043,86 @@ fn scanBlockForUnsafeUnwraps(
     }
 }
 
+/// True when a type annotation (the text after `:` and whitespace) starts
+/// with a nullable-pointer type: `?*` optional pointer, `?[*` optional
+/// many-item pointer, `[*c]` C pointer, or `*allowzero`. `*allowzero`
+/// needs a non-identifier successor: `*allowzerox` is a plain pointer to a
+/// type named `allowzerox`.
+fn isNullablePtrAnnotation(annotation: []const u8) bool {
+    if (mem.startsWith(u8, annotation, "?*")) return true;
+    if (mem.startsWith(u8, annotation, "?[*")) return true;
+    if (mem.startsWith(u8, annotation, "[*c]")) return true;
+    if (mem.startsWith(u8, annotation, "*allowzero")) {
+        const rest = annotation["*allowzero".len..];
+        return rest.len == 0 or !isIdent(rest[0]);
+    }
+    return false;
+}
+
+/// Extract the identifier immediately before a colon (skipping whitespace),
+/// or null when no identifier precedes it. Params (`p: ?*u8`), decls
+/// (`const p: ?*u8 = ...`), and multi-line signature lines each yield their
+/// name from the same walk.
+fn identBeforeColon(t: []const u8, colon: usize) ?[]const u8 {
+    var end = colon;
+    while (end > 0 and (t[end - 1] == ' ' or t[end - 1] == '\t')) end -= 1;
+    var start = end;
+    while (start > 0 and isIdent(t[start - 1])) start -= 1;
+    if (start >= end) return null;
+    return t[start..end];
+}
+
+/// Scan one line for `IDENT: <nullable-type>` declarations and add each
+/// name to the set. Colons inside string literals are skipped: a string
+/// can carry lookalike decl text (`"ptr: ?*u8"`) that is not a decl.
+/// Names are duped; the caller frees them with the map.
+fn collectNullablePtrDeclsInLine(
+    allocator: Allocator,
+    t: []const u8,
+    nullable_ptrs: *std.StringHashMapUnmanaged(void),
+) !void {
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, t, pos, ":")) |colon| {
+        pos = colon + 1;
+        if (isInsideString(t, colon)) continue;
+        const name = identBeforeColon(t, colon) orelse continue;
+        const annotation = mem.trimStart(u8, t[colon + 1 ..], " \t");
+        if (!isNullablePtrAnnotation(annotation)) continue;
+        if (nullable_ptrs.contains(name)) continue;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try nullable_ptrs.put(allocator, owned, {});
+    }
+}
+
+/// Collect the names declared in the function with a nullable-pointer type
+/// annotation (EPH-I0219). ZA802 gates on this set: type-based detection
+/// replaced the maybe_/opt_ name match, which fired on every non-optional
+/// maybe_* variable (FP) and missed every nullable pointer without the
+/// prefix (FN).
+///
+/// Matches `IDENT: <nullable-type>` on any fn line. Trailing comments
+/// are stripped and string-literal colons skipped first: both can carry
+/// lookalike decl text that is not a declaration (EPH-I0219 review).
+///
+/// Accepted limitations: inferred types (`const p = getPtr();`) stay
+/// silent; a name declared nullable anywhere in the fn is treated as
+/// nullable everywhere (shadowing resolves any-match); field derefs
+/// (`self.p.*` extracts `self.p`, never in the set) stay silent.
+/// [*]allowzero u8 and *align(N) allowzero u8 are legal nullable forms the prefix list misses.
+/// A multi-line split (const p: then ?*u8) is missed: zig fmt always joins the decl.
+fn collectNullablePtrDecls(
+    allocator: Allocator,
+    lines: []const []const u8,
+    nullable_ptrs: *std.StringHashMapUnmanaged(void),
+) !void {
+    for (lines) |raw| {
+        const t = stripLineComment(mem.trim(u8, raw, " \t\r"));
+        if (isCommentOrMultilineString(t)) continue;
+        try collectNullablePtrDeclsInLine(allocator, t, nullable_ptrs);
+    }
+}
+
 fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const allocator = run.file.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -18055,6 +18139,14 @@ fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     }
     for (checked) |*map| map.* = .empty;
 
+    var nullable_ptrs: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var key_it = nullable_ptrs.keyIterator();
+        while (key_it.next()) |key| allocator.free(key.*);
+        nullable_ptrs.deinit(allocator);
+    }
+    try collectNullablePtrDecls(allocator, run.func.lines, &nullable_ptrs);
+
     const ctx: NullSafetyCtx = .{
         .allocator = allocator,
         .cfg = run.cfg,
@@ -18062,6 +18154,7 @@ fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
         .func_line = run.func.start,
         .file_path = run.file.file_path,
         .checked = checked,
+        .nullable_ptrs = &nullable_ptrs,
         .issues = &issues,
     };
     try collectNullChecksPerBlock(ctx);
@@ -27574,6 +27667,227 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// CFG null safety: ZA802 nullable-pointer deref, type-based (EPH-I0219)
+// ---------------------------------------------------------------------------
+
+test "analyzeCFGMemory ZA802 fires on nullable pointer decl deref (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // FN flip: `p` has no maybe_/opt_ prefix, so the pre-fix name gate
+    // stays silent on this deref.
+    const content =
+        \\fn deref_nullable() void {
+        \\    const p: ?*u32 = null;
+        \\    const v = p.*;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_decl.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_decl.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) > 0);
+}
+
+test "analyzeCFGMemory ZA802 silent on plain pointer with maybe_ name (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // FP flip: `maybe_p` is a non-nullable *u8, but the pre-fix name gate
+    // fires on the prefix alone.
+    const content =
+        \\fn deref_plain() void {
+        \\    const maybe_p: *u8 = undefined;
+        \\    const v = maybe_p.*;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_plain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_plain.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 fires on nullable pointer param deref (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Param annotations live on the fn line; `p` carries no name prefix.
+    const content =
+        \\fn deref_param(p: ?*u8) void {
+        \\    const v = p.*;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_param.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_param.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) > 0);
+}
+
+test "analyzeCFGMemory ZA802 silent after null-equality guard (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The checked-set suppression channel must survive the re-gate.
+    const content =
+        \\fn deref_guarded(p: ?*u8) void {
+        \\    if (p != null) {
+        \\        const v = p.*;
+        \\        _ = v;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_guarded.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_guarded.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pins extractNullCheckedVar's `if (p) |v|` form through the re-gate.
+    const content =
+        \\fn deref_capture(p: ?*u8) void {
+        \\    if (p) |v| {
+        \\        _ = v;
+        \\        const w = p.*;
+        \\        _ = w;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_capture.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_capture.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 fires on C pointer deref (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // [*c] pointers carry no null guarantee: deref without a check is UB.
+    const content =
+        \\fn deref_c_ptr() void {
+        \\    const q: [*c]u8 = undefined;
+        \\    const v = q.*;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_cptr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_cptr.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) > 0);
+}
+
+test "analyzeCFGMemory ZA802 fires on allowzero pointer deref (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // *allowzero permits address zero: deref without a check is UB.
+    const content =
+        \\fn deref_allowzero() void {
+        \\    const r: *allowzero u8 = undefined;
+        \\    const v = r.*;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_allowzero.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_allowzero.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) > 0);
+}
+
+test "analyzeCFGMemory ZA802 silent on string literal lookalike decl (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `ptr: ?*u8` inside the string literal is not a decl: `ptr`
+    // must stay out of the nullable set, so the plain *u8 deref is safe.
+    const content =
+        \\fn deref_str_poison() void {
+        \\    const s = "ptr: ?*u8";
+        \\    _ = s;
+        \\    const ptr: *u8 = undefined;
+        \\    const v = ptr.*;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_str_poison.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_str_poison.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent on trailing-comment lookalike decl (EPH-I0219)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `ptr: ?*u8` in the trailing comment is not a decl: `ptr` must
+    // stay out of the nullable set, so the plain *u8 deref is safe.
+    const content =
+        \\fn deref_comment_poison() void {
+        \\    const n: u32 = 0; // ptr: ?*u8
+        \\    _ = n;
+        \\    const ptr: *u8 = undefined;
+        \\    const v = ptr.*;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_comment_poison.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_comment_poison.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
 }
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {

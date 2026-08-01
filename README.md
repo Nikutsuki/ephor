@@ -363,7 +363,7 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA801** | warning | OFF | Optional unwrap (`.?`) may panic if null — fires on any continuation except `;`, `,`, `)`; suppressed in if/while/orelse/expect/`testing.` contexts (use `--enable=ZA8`) |
-| **ZA802** | warning | OFF | Dereferencing optional pointer may panic if null (use `--enable=ZA8`). Only fires on `.*` derefs of variables named `maybe_*`/`opt_*`. |
+| **ZA802** | warning | OFF | Dereferencing a nullable pointer may panic or cause undefined behavior (use `--enable=ZA8`). Fires on `.*` derefs of variables declared `?*T`, `[*c]T`, or `*allowzero T` without a null check on the path. |
 
 **When to enable ZA8xx:** Pre-release audits for safety-critical code (servers, databases) where a null panic means downtime. Off by default because `.?` is extremely common in Zig and usually intentionally guarded.
 

@@ -22153,17 +22153,23 @@ fn isSafeDetectedPath(path: []const u8) bool {
 /// Returns a slice into `content` - caller must dupe before freeing content.
 /// The scan skips comment and multiline-string lines and rejects a
 /// candidate that is absolute or carries a ".." component (RED4-2): a
-/// hostile build.zig must not move the scan root. The first valid match
-/// wins. A rejected match never selects a value and never aborts detection.
+/// hostile build.zig must not move the scan root. Each line is masked at
+/// the first `//` outside a string literal before the pattern scan
+/// (EPH-I0144): a payload in a trailing comment, for example
+/// `const b = std.Build; // root_source_file = "evil/x.zig"`, steered the
+/// detected root under a bare `ephor check` when it came before the real
+/// match. The first valid match wins. A rejected match never selects a
+/// value and never aborts detection.
 fn findPathDirInContent(content: []const u8) []const u8 {
     const patterns = [_][]const u8{ "root_source_file", ".root_src" };
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         const t = mem.trimStart(u8, line, " \t\r");
         if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
+        const code = stripLineComment(t);
         for (patterns) |pattern| {
-            const pat_idx = mem.indexOf(u8, t, pattern) orelse continue;
-            const rest = t[pat_idx..];
+            const pat_idx = mem.indexOf(u8, code, pattern) orelse continue;
+            const rest = code[pat_idx..];
             const q1 = mem.indexOf(u8, rest, "\"") orelse continue;
             const after_q1 = q1 + 1;
             if (after_q1 >= rest.len) continue;
@@ -47917,6 +47923,57 @@ test "findPathDirInContent skips comments and rejects unsafe candidates (RED4-2)
         \\}
     ;
     try std.testing.expectEqualStrings("src", findPathDirInContent(parent_code));
+}
+
+test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)" {
+    // A payload in a trailing comment on a code line must not win over a
+    // later real match.
+    const trailing_comment =
+        \\const b = std.Build; // root_source_file = "evil/x.zig"
+        \\pub fn build(b2: *std.Build) void {
+        \\    const exe = b2.addExecutable(.{ .root_source_file = b2.path("src/main.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(trailing_comment));
+
+    // A real match keeps its value when a comment follows it.
+    const real_then_comment =
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/m.zig") }); // note
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(real_then_comment));
+
+    // A `//` inside a string literal is not a comment. The quote-aware
+    // strip must keep such a line whole.
+    const url_own_line =
+        \\const url = "https://example.com";
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/main.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(url_own_line));
+
+    // Same-line form: a naive strip would cut at the string's `//` and
+    // hide the pattern after it.
+    const url_same_line =
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = "https://x"; exe.root_src = "src/m.zig";
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(url_same_line));
+
+    // A payload on a line-initial `\\` multiline-string body line stays
+    // skipped. The existing skip already covers this shape; this pins it.
+    const string_body =
+        \\pub fn build(b: *std.Build) void {
+        \\    const note =
+        \\        \\root_source_file = "evil/x.zig"
+        \\    ;
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/main.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(string_body));
 }
 
 test "config trust: cwd and ancestors trusted, descendants untrusted" {

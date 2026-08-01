@@ -219,6 +219,20 @@ Ephor honors only `entries` from an untrusted config. It ignores the suppression
 note: ignoring suppression/gate keys from untrusted <path> (use --trust-target-config to honor)
 ```
 
+Ephor containment-checks honored `entries` at load. Each entry must resolve inside the scan root (realpath compare). Ephor drops an entry that resolves outside, escapes through `..`, or does not resolve, and prints one note per file:
+
+```
+note: ignoring <N> outside-root entries from untrusted <path> (use --trust-target-config to honor)
+```
+
+Entries extracted from build.zig files in the scanned tree pass the same check, with one note per scan:
+
+```
+note: ignoring <N> outside-root entries extracted from target tree <path>
+```
+
+Operator channels stay exempt: `--entry`, a trusted config's `entries`, and the working directory's own build.zig may point outside the scan root. Orphan detection then stays complete for files the scan root does not cover.
+
 A target config's `path_dir` is containment-checked and then discarded. The scan root comes from the CLI path, the trusted working-directory config, or auto-detection.
 
 The `.ephor-ignore` auto-load honors the same trust decision. Ephor refuses an untrusted file with one skip note:

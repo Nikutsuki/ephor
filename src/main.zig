@@ -125,6 +125,16 @@ var untrusted_config_note_count: usize = 0;
 /// assert a rejection fired (or stayed silent) without reading stderr.
 var path_dir_reject_count: usize = 0;
 
+/// Test hook: counts entries dropped by the EPH-I0195 containment gates
+/// (untrusted config entries, target-tree build.zig extraction). Tests
+/// reset it to assert rejections fired without reading stderr.
+var entries_reject_count: usize = 0;
+
+/// Test hook: counts outside-root entry notes printed this run. The gates
+/// print one note per config file or per extraction run, never per entry;
+/// tests reset it to pin that semantics with stderr muted.
+var entries_reject_note_count: usize = 0;
+
 /// Test hook: counts threshold values clamped at the documented maxima.
 var threshold_clamp_count: usize = 0;
 
@@ -21185,23 +21195,49 @@ fn tryLoadConfigFromDir(
         try reportConfigParseError(allocator, err, config_path);
         return false;
     };
-    if (!trusted and ignored_any) {
-        untrusted_config_note_count += 1;
-        // The scanned tree supplies the path bytes here: sanitize them.
-        var safe_config = try types.sanitizeTerminal(allocator, config_path);
-        defer safe_config.deinit(allocator);
-        cliDiag(
-            "note: ignoring suppression/gate keys from untrusted {s} " ++
-                "(use --trust-target-config to honor)\n",
-            .{safe_config.slice},
-        );
-    }
+    if (!trusted and ignored_any) try noteSuppressionKeysIgnored(allocator, config_path);
 
     if (cfg.path_owned) allocator.free(cfg.path);
     cfg.path = saved_path;
     cfg.path_owned = true;
-    try makeEntriesAbsolute(allocator, cfg, dir_copy);
+    const dropped_entries = try makeEntriesAbsolute(allocator, cfg, dir_copy, trusted);
+    if (dropped_entries > 0) try noteEntriesRejected(
+        allocator,
+        "note: ignoring {d} outside-root entries from untrusted {s} " ++
+            "(use --trust-target-config to honor)\n",
+        config_path,
+        dropped_entries,
+    );
     return true;
+}
+
+/// Print the per-file note for suppression/gate keys refused from an
+/// untrusted config (RED3-x). The path bytes come from the scanned tree,
+/// so they cross the terminal sanitizer.
+fn noteSuppressionKeysIgnored(allocator: Allocator, config_path: []const u8) !void {
+    untrusted_config_note_count += 1;
+    var safe_config = try types.sanitizeTerminal(allocator, config_path);
+    defer safe_config.deinit(allocator);
+    cliDiag(
+        "note: ignoring suppression/gate keys from untrusted {s} " ++
+            "(use --trust-target-config to honor)\n",
+        .{safe_config.slice},
+    );
+}
+
+/// Emit one EPH-I0195 rejection note (counted for the test hook). `path`
+/// crosses the terminal sanitizer: it may carry scanned-tree bytes
+/// (EPH-I0147).
+fn noteEntriesRejected(
+    allocator: Allocator,
+    comptime fmt: []const u8,
+    path: []const u8,
+    dropped: usize,
+) !void {
+    entries_reject_note_count += 1;
+    var safe_path = try types.sanitizeTerminal(allocator, path);
+    defer safe_path.deinit(allocator);
+    cliDiag(fmt, .{ dropped, safe_path.slice });
 }
 
 /// Loads entries from config (CLI path takes priority over config "path_dir").
@@ -21223,25 +21259,95 @@ fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []c
     allocator.free(saved_path);
 }
 
-/// Convert relative entry paths to absolute paths based on config file location
-fn makeEntriesAbsolute(allocator: Allocator, cfg: *Config, base_path: []const u8) !void {
-    if (base_path.len == 0) return;
+/// Convert relative entry paths to absolute paths based on config file
+/// location. Untrusted configs (EPH-I0195): every entry must realpath
+/// inside the realpath'd scan root — the textual ancestor test is
+/// traversal-blind, and a nonexistent entry must fail closed, not pass.
+/// Violators drop and count toward a per-file note at the call site.
+/// Returns the drop count.
+///
+/// Two phases keep every slot owned 1:1 across an OOM unwind (the
+/// EPH-I0061 class). Phase 1 absolutizes in place and is the only fallible
+/// part: absolutizeEntry frees the old slice only after the replacement
+/// exists, so a failed slot keeps its original. Phase 2 gates and compacts
+/// without allocating (the realpath buffers are stack memory), so the
+/// shrink always runs and no stale slot survives inside len.
+fn makeEntriesAbsolute(
+    allocator: Allocator,
+    cfg: *Config,
+    base_path: []const u8,
+    trusted: bool,
+) !usize {
+    if (base_path.len == 0) return 0;
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root_real: ?[]const u8 = if (trusted)
+        null
+    else
+        Fs.cwd().realpath(cfg.path, &root_buf) catch null;
 
-    var i: usize = 0;
-    while (i < cfg.entries.items.len) : (i += 1) {
-        const entry = cfg.entries.items[i];
-        // Skip if already absolute
-        if (entry.len > 0 and entry[0] == '/') continue;
-
-        // Make relative path absolute
-        const abs_path = try std.fmt.allocPrint(
-            allocator,
-            "{s}/{s}",
-            .{ base_path, entry },
-        );
-        allocator.free(entry);
-        cfg.entries.items[i] = abs_path;
+    // Phase 1 (fallible): absolutize each entry into its own slot. An OOM
+    // here leaves the array owned 1:1, so Config.deinit frees each slot
+    // exactly once.
+    for (cfg.entries.items, 0..) |entry, i| {
+        cfg.entries.items[i] = try absolutizeEntry(allocator, base_path, entry);
     }
+
+    // Phase 2 (infallible): gate, then compact in place. kept never leads
+    // the read index, so a kept write never clobbers an unread slot.
+    var dropped: usize = 0;
+    var kept: usize = 0;
+    for (cfg.entries.items) |entry| {
+        if (entryPassesTrust(trusted, root_real, entry)) {
+            cfg.entries.items[kept] = entry;
+            kept += 1;
+            continue;
+        }
+        allocator.free(entry);
+        dropped += 1;
+        entries_reject_count += 1;
+    }
+    cfg.entries.shrinkRetainingCapacity(kept);
+    return dropped;
+}
+
+/// Make one config entry absolute against the config file's directory.
+/// The original is freed only after its replacement exists, so an OOM
+/// leaves the caller's slot owned (makeEntriesAbsolute phase 1 relies on
+/// this for its 1:1 slot invariant).
+fn absolutizeEntry(allocator: Allocator, base_path: []const u8, entry: []const u8) ![]const u8 {
+    if (entry.len > 0 and entry[0] == '/') return entry;
+    const abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, entry });
+    allocator.free(entry);
+    return abs;
+}
+
+/// Trust gate for one config entry (EPH-I0195). Trusted entries pass
+/// untouched: operator channels may point outside the root for orphan
+/// completeness (RED4-3). Untrusted entries must realpath inside the
+/// scan-root realpath. A null root_real means the scan root itself did
+/// not resolve, which fails closed.
+fn entryPassesTrust(trusted: bool, root_real: ?[]const u8, abs: []const u8) bool {
+    if (trusted) return true;
+    const root = root_real orelse return false;
+    return realpathContained(root, abs);
+}
+
+/// EPH-I0195 containment core: realpath the candidate and require it under
+/// the realpath'd root. Fails closed when the candidate does not resolve.
+fn realpathContained(root_real: []const u8, candidate: []const u8) bool {
+    var cand_buf: [Fs.max_path_bytes]u8 = undefined;
+    const cand_real = Fs.cwd().realpath(candidate, &cand_buf) catch return false;
+    return isPathAncestorOrEqual(root_real, cand_real);
+}
+
+/// EPH-I0195 containment gate for one target-tree candidate (build.zig
+/// extraction). Both paths realpath per call: entry lists are small and
+/// EntryScanCtx passes by value, so the root cannot be cached there.
+/// Fails closed on any resolution failure.
+fn passTargetEntryGate(scan_root: []const u8, candidate: []const u8) bool {
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root_real = Fs.cwd().realpath(scan_root, &root_buf) catch return false;
+    return realpathContained(root_real, candidate);
 }
 
 /// Index just past the closing quote of the JSON string whose opening quote
@@ -23037,6 +23143,9 @@ fn scanBuildZigEntries(
         .added = added,
         .prefix = cfg.path,
         .build_path = build_zig_path,
+        // EPH-I0195: these build.zig files live in the scanned tree —
+        // attacker content. Containment-gate every derived entry.
+        .gate_containment = true,
     };
     try extractBuildZigEntriesFromPath(ctx);
 
@@ -23062,6 +23171,7 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
     const src_files = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig" };
     try tryAddEntryFiles(allocator, cfg, &src_files, &added);
 
+    const rejects_before = entries_reject_count;
     try scanBuildZigEntries(allocator, cfg, &added);
 
     const multi_entry_dirs = [_][]const u8{
@@ -23076,15 +23186,29 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
         .cfg = cfg,
         .added = &added,
         .check_access = true,
+        // EPH-I0195: dir walk over the scanned tree — containment-gate.
+        .gate_containment = true,
     };
     for (multi_entry_dirs) |dir| {
         const dir_path = try buildPathWithPrefix(allocator, cfg.path, dir);
         defer allocator.free(dir_path);
         try scanDirForEntries(scan_ctx, dir_path);
     }
+
+    // One note per extraction run, not per entry (EPH-I0195).
+    const dropped_entries = entries_reject_count - rejects_before;
+    if (dropped_entries > 0) try noteEntriesRejected(
+        allocator,
+        "note: ignoring {d} outside-root entries extracted from target tree {s}\n",
+        cfg.path,
+        dropped_entries,
+    );
 }
 
-/// Extract entry points from build.zig by parsing common patterns
+/// Extract entry points from build.zig by parsing common patterns.
+/// EPH-I0195 exempt: reads the working directory's own build.zig (the
+/// operator's tree); the target-tree extraction family carries the
+/// containment gate.
 fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
     const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return;
     defer allocator.free(content);
@@ -23249,6 +23373,9 @@ fn addEntryIfValid(
 /// set, and prefix/build_path/depth carry the path plumbing for nested
 /// build-module recursion. `check_access` gates the access() probe used by
 /// target-path directory scans (standard-entry scans skip it).
+/// `gate_containment` turns on the EPH-I0195 realpath containment check for
+/// candidates derived from the scanned tree (attacker-controlled build.zig
+/// content); operator channels (cwd build.zig, cwd dir walk) leave it off.
 const EntryScanCtx = struct {
     allocator: Allocator,
     cfg: *Config,
@@ -23257,9 +23384,13 @@ const EntryScanCtx = struct {
     build_path: []const u8 = "",
     depth: u8 = 0,
     check_access: bool = false,
+    gate_containment: bool = false,
 };
 
-/// Add entry with prefix if the file exists
+/// Add entry with prefix if the file exists. Target-tree scans
+/// (gate_containment) containment-check the candidate first: build.zig
+/// content is attacker-controlled and must not steer reads outside the
+/// scan root (EPH-I0195).
 fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
     // When prefix is ".", don't add it (avoid "./src/file.zig" paths)
     const is_dot = ctx.prefix.len == 1 and ctx.prefix[0] == '.';
@@ -23269,6 +23400,10 @@ fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
         try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.prefix, path });
     defer ctx.allocator.free(full_path);
     if (ctx.added.contains(full_path)) return;
+    if (ctx.gate_containment and !passTargetEntryGate(ctx.cfg.path, full_path)) {
+        entries_reject_count += 1;
+        return;
+    }
     Fs.cwd().access(full_path, .{}) catch return;
     const duped = try ctx.allocator.dupe(u8, full_path);
     try ctx.cfg.entries.append(ctx.allocator, duped);
@@ -23325,11 +23460,17 @@ fn followImportsInLine(ctx: EntryScanCtx, line: []const u8) !void {
     }
 }
 
-/// Resolve and recurse into a nested build module
+/// Resolve and recurse into a nested build module. The nested file is
+/// READ, so a target-tree scan containment-checks the path before the
+/// read, not just the entries the module would add (EPH-I0195).
 fn recurseNestedBuildModule(ctx: EntryScanCtx, imp_path: []const u8) Allocator.Error!void {
     const cur_dir = std.fs.path.dirname(ctx.build_path) orelse ".";
     const nested = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ cur_dir, imp_path });
     defer ctx.allocator.free(nested);
+    if (ctx.gate_containment and !passTargetEntryGate(ctx.cfg.path, nested)) {
+        entries_reject_count += 1;
+        return;
+    }
     var child = ctx;
     child.build_path = nested;
     child.depth += 1;
@@ -23371,10 +23512,18 @@ fn isEntryPointFile(name: []const u8) bool {
     return mem.endsWith(u8, name, "_test.zig");
 }
 
-/// Add an entry from a directory scan, checking access and dedup
+/// Add an entry from a directory scan, checking access and dedup.
+/// Target-tree scans also containment-check the candidate (EPH-I0195):
+/// readdir names cannot escape, but a symlinked directory inside the
+/// tree can point outside the scan root.
 fn addDirEntry(ctx: EntryScanCtx, dir_path: []const u8, name: []const u8) !void {
     const full = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ dir_path, name });
     if (ctx.added.contains(full)) {
+        ctx.allocator.free(full);
+        return;
+    }
+    if (ctx.gate_containment and !passTargetEntryGate(ctx.cfg.path, full)) {
+        entries_reject_count += 1;
         ctx.allocator.free(full);
         return;
     }
@@ -23437,6 +23586,8 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
         "clients",   "drivers", "apps",    "cmd",
         "bin",       "ci",      "user",
     };
+    // EPH-I0195 exempt: cwd dir walk over the operator's own tree, so
+    // gate_containment stays off (default).
     const scan_ctx = EntryScanCtx{ .allocator = allocator, .cfg = cfg, .added = &added };
     for (multi_entry_dirs) |dir| {
         try scanDirForEntries(scan_ctx, dir);
@@ -23544,7 +23695,9 @@ fn parseThresholdArg(arg: []const u8, cfg: *Config) bool {
 }
 
 /// Parse a single CLI argument
-/// Handle --entry= CLI argument
+/// Handle --entry= CLI argument. EPH-I0195 exempt: --entry is operator
+/// intent; only the untrusted channels (target config, target-tree
+/// build.zig extraction) are containment-gated.
 fn handleEntryArg(
     allocator: Allocator,
     arg: []const u8,
@@ -25034,6 +25187,11 @@ pub fn main(init: std.process.Init) !void {
                     // Only scan if not already in scanned path. Boundary
                     // compare (RED4-3): entry "src-evil/x.zig" is outside
                     // path "src" and must still be scanned for orphans.
+                    // EPH-I0195: this gate stays textual — ingest is the
+                    // containment boundary, so out-of-root entries can only
+                    // arrive here via operator channels (CLI --entry,
+                    // trusted config), where outside reads are the
+                    // documented RED4-3 orphan feature.
                     if (!isPathAncestorOrEqual(cfg.path, e)) {
                         // Entry file may not exist, that's ok - just skip it
                         g.scanSingleFile(e) catch |err| {
@@ -47653,14 +47811,23 @@ test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)
         "\"fail_on\": \"never\", \"strict\": true, " ++
         "\"thresholds\": {\"max_function_lines\": 100000}, " ++
         "\"error_naming\": \"snake_case\", \"entries\": [\"src/main.zig\"]}");
+    // EPH-I0195: the untrusted entry must resolve inside the scan root to
+    // survive the containment gate.
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn f() void {}\n",
+    });
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
+    // Production shape: cfg.path IS the target dir (the containment root).
+    try setOwnedPath(allocator, &cfg, dir_path);
     untrusted_config_note_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
-    try loadConfigFromTargetPath(allocator, &cfg, dir_path);
+    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
 
     // Suppression and CI-gate keys are ignored...
     try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
@@ -47749,6 +47916,228 @@ test "--trust-target-config honors a target config in full" {
     try std.testing.expectEqualStrings("Z", cfg.disabled_rules.items[0]);
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
     try std.testing.expectEqual(@as(usize, 0), untrusted_config_note_count);
+}
+
+test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
+    // Layout: <tmp>/root is the scan root (ephor.json + inside.zig);
+    // <tmp>/outside.zig is the traversal target one level up. The config
+    // carries one entry per attack shape: inside (survives), absolute
+    // outside, ".." traversal outside, and nonexistent (fail closed).
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/inside.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "outside.zig",
+        .data = "pub fn g() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/root", .{tmp_path});
+    defer allocator.free(root_path);
+    try writeTestConfig(root_path, "{\"entries\": [" ++
+        "\"inside.zig\", \"/etc/passwd\", \"../outside.zig\", \"ghost.zig\"]}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, root_path);
+    entries_reject_count = 0;
+    entries_reject_note_count = 0;
+    untrusted_config_note_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
+
+    // Only the inside entry survives, made absolute (pre-fix: all 4 do).
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    const want_entry = try std.fmt.allocPrint(allocator, "{s}/inside.zig", .{root_path});
+    defer allocator.free(want_entry);
+    try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
+    // 3 drops from one file produce exactly one note (per-file semantics).
+    try std.testing.expectEqual(@as(usize, 3), entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 1), entries_reject_note_count);
+    // No suppression keys in the fixture: that note must not fire.
+    try std.testing.expectEqual(@as(usize, 0), untrusted_config_note_count);
+}
+
+test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
+    // Operator intent: a config the trust model accepts may point entries
+    // outside the scan root for orphan completeness (RED4-3).
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/inside.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/root", .{tmp_path});
+    defer allocator.free(root_path);
+    try writeTestConfig(root_path, "{\"entries\": [\"inside.zig\", \"/etc/passwd\"]}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.trust_target_config = true;
+    try setOwnedPath(allocator, &cfg, root_path);
+    entries_reject_count = 0;
+    entries_reject_note_count = 0;
+
+    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("/etc/passwd", cfg.entries.items[1]);
+    try std.testing.expectEqual(@as(usize, 0), entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), entries_reject_note_count);
+}
+
+test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
+    // The scanned tree's own build.zig is attacker content: a .path("..")
+    // entry must not steer reads outside the root, an in-tree entry must
+    // pass untouched.
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/inside.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "outside.zig",
+        .data = "pub fn g() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/build.zig",
+        .data = "pub fn build(b: *std.Build) void {\n" ++
+            "    const exe = b.addExecutable(.{ .root_source_file = b.path(\"inside.zig\") });\n" ++
+            "    const lib = b.addStaticLibrary(.{ .root_source_file = b.path(\"../outside.zig\") });\n" ++
+            "}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/root", .{tmp_path});
+    defer allocator.free(root_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, root_path);
+    entries_reject_count = 0;
+    entries_reject_note_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    try detectTargetEntries(allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    const want_entry = try std.fmt.allocPrint(allocator, "{s}/inside.zig", .{root_path});
+    defer allocator.free(want_entry);
+    try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
+    // 1 drop from the extraction run produces exactly one note.
+    try std.testing.expectEqual(@as(usize, 1), entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 1), entries_reject_note_count);
+}
+
+/// Build the OOM-sweep fixture Config: one gate-rejecting absolute entry
+/// first, then two relative entries that absolutize (and allocate) under
+/// root_path. All Config memory comes from the given allocator so the
+/// sweep's byte balance covers the whole Config.deinit.
+fn buildEntriesSweepConfig(allocator: Allocator, root_path: []const u8) !Config {
+    var cfg = testConfig();
+    errdefer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, root_path);
+    const fixture = [_][]const u8{ "/etc/passwd", "b.zig", "c.zig" };
+    for (fixture) |entry| {
+        const owned = try allocator.dupe(u8, entry);
+        errdefer allocator.free(owned);
+        try cfg.entries.append(allocator, owned);
+    }
+    return cfg;
+}
+
+/// One OOM-sweep iteration: run makeEntriesAbsolute under an allocator
+/// that fails on its fail_at-th inner allocation (fail_at == inner_allocs
+/// induces no failure), then prove deinit releases every byte exactly once.
+fn runEntriesSweepIteration(root_path: []const u8, fail_at: usize, inner_allocs: usize) !void {
+    const parent = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(parent, .{});
+    var cfg = try buildEntriesSweepConfig(failing.allocator(), root_path);
+    failing.fail_index = failing.allocations + fail_at;
+    entries_reject_count = 0;
+    if (fail_at == inner_allocs) {
+        // No induced failure: the gate must still land once phase 1
+        // completes — the outside-root entry drops, the rest survive
+        // absolutized.
+        const dropped = try makeEntriesAbsolute(failing.allocator(), &cfg, root_path, false);
+        try std.testing.expectEqual(@as(usize, 1), dropped);
+        try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
+        const want_b = try std.fmt.allocPrint(parent, "{s}/b.zig", .{root_path});
+        defer parent.free(want_b);
+        const want_c = try std.fmt.allocPrint(parent, "{s}/c.zig", .{root_path});
+        defer parent.free(want_c);
+        try std.testing.expectEqualStrings(want_b, cfg.entries.items[0]);
+        try std.testing.expectEqualStrings(want_c, cfg.entries.items[1]);
+        try std.testing.expectEqual(@as(usize, 1), entries_reject_count);
+    } else {
+        try std.testing.expectError(error.OutOfMemory, makeEntriesAbsolute(
+            failing.allocator(),
+            &cfg,
+            root_path,
+            false,
+        ));
+    }
+    cfg.deinit(failing.allocator());
+    // Byte balance is the leak proof. A double-free panics the parent
+    // DebugAllocator before this line runs.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
+    // Reviewer r1 trace: entries ["/etc/passwd", "b.zig", "c.zig"],
+    // untrusted, allocPrint failing on a relative entry. The pre-fix fused
+    // loop freed the rejected "/etc/passwd" and unwound with its stale
+    // slot still inside len, so Config.deinit freed it a second time.
+    // Pre-fix this test panics at fail_at == 0 on that double-free.
+    global_io = std.testing.io;
+    const parent = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/b.zig",
+        .data = "pub fn b() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/c.zig",
+        .data = "pub fn c() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(parent, &tmp);
+    defer parent.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(parent, "{s}/root", .{tmp_path});
+    defer parent.free(root_path);
+
+    // Measure the allocation count inside makeEntriesAbsolute so the sweep
+    // covers every induced failure point plus one no-failure run.
+    var probe = std.testing.FailingAllocator.init(parent, .{});
+    var probe_cfg = try buildEntriesSweepConfig(probe.allocator(), root_path);
+    const probe_base = probe.allocations;
+    _ = try makeEntriesAbsolute(probe.allocator(), &probe_cfg, root_path, false);
+    probe_cfg.deinit(probe.allocator());
+    const inner_allocs = probe.allocations - probe_base;
+
+    var fail_at: usize = 0;
+    while (fail_at <= inner_allocs) : (fail_at += 1) {
+        try runEntriesSweepIteration(root_path, fail_at, inner_allocs);
+    }
 }
 
 test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)" {

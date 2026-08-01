@@ -74,7 +74,7 @@ const Fs = struct {
             return out_buffer[0..n];
         }
         pub fn realpathAlloc(_: CompatDir, allocator: Allocator, sub_path: []const u8) ![:0]u8 {
-            return std.Io.Dir.cwd().realPathFileAlloc(global_io.?, allocator, sub_path);
+            return std.Io.Dir.cwd().realPathFileAlloc(global_io.?, sub_path, allocator);
         }
         pub fn iterate(_: CompatDir) std.Io.Dir.Iterator {
             return std.Io.Dir.cwd().iterate();
@@ -48068,4 +48068,85 @@ test "ZT101: control bytes in a test name are sanitized at print time" {
     try std.testing.expect(
         mem.indexOf(u8, out.buf.items, "parseHeader a?[31m?b") != null,
     );
+}
+
+// ============================================================================
+// Fs compat wrapper tests (Zig 0.16.0 std.Io.Dir shims)
+// ============================================================================
+
+test "Fs.openFile reads back bytes written to a tmp file" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = "ephor fs wrapper\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "in.txt", .data = content });
+    const path = try tmpFilePath(allocator, &tmp, "in.txt");
+    defer allocator.free(path);
+    const missing = try tmpFilePath(allocator, &tmp, "missing.txt");
+    defer allocator.free(missing);
+
+    const file = try Fs.cwd().openFile(path, .{});
+    defer file.close(std.testing.io);
+    var buf: [64]u8 = undefined;
+    const n = try file.readPositionalAll(std.testing.io, &buf, 0);
+    try std.testing.expectEqualStrings(content, buf[0..n]);
+    try std.testing.expectError(error.FileNotFound, Fs.cwd().openFile(missing, .{}));
+}
+
+test "Fs.createFile creates a tmp file that holds the written bytes" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpFilePath(allocator, &tmp, "out.txt");
+    defer allocator.free(path);
+
+    const content = "written through createFile";
+    const file = try Fs.cwd().createFile(path, .{});
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, content, 0);
+
+    const limit: std.Io.Limit = .limited(1024);
+    const read_back = try tmp.dir.readFileAlloc(std.testing.io, "out.txt", allocator, limit);
+    defer allocator.free(read_back);
+    try std.testing.expectEqualStrings(content, read_back);
+}
+
+test "Fs.statFile reports the size and kind of a tmp file" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = "0123456789";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stat.txt", .data = content });
+    const path = try tmpFilePath(allocator, &tmp, "stat.txt");
+    defer allocator.free(path);
+
+    const stat = try Fs.cwd().statFile(path);
+    try std.testing.expectEqual(@as(u64, content.len), stat.size);
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+}
+
+test "Fs.realpathAlloc resolves a dot component to the canonical path" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real.txt", .data = "" });
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const dotted = try std.fmt.allocPrint(allocator, "{s}/./real.txt", .{dir_path});
+    defer allocator.free(dotted);
+
+    const resolved = try Fs.cwd().realpathAlloc(allocator, dotted);
+    defer allocator.free(resolved);
+
+    // A real resolution never echoes the `/./` back: it returns the same
+    // canonical path the OS reports for the plain spelling.
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expect(mem.endsWith(u8, resolved, "real.txt"));
+    const canonical = try tmpFilePath(allocator, &tmp, "real.txt");
+    defer allocator.free(canonical);
+    try std.testing.expectEqualStrings(canonical, resolved);
 }

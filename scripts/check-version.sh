@@ -10,6 +10,7 @@
 #   3. README.md             manual install URL (v*.tar.gz)
 #   4. README.md             example config "version" field
 #   5. install.sh            EPHOR_FALLBACK_TAG matches the latest remote tag
+#   5b. install.ps1          EPHOR_FALLBACK_TAG matches install.sh's value
 #   6. Codeberg tags API     latest remote tag matches
 
 set -e
@@ -100,6 +101,24 @@ elif [ "$INSTALL_FALLBACK" != "$REMOTE_TAG" ]; then
     ERRORS=$((ERRORS + 1))
 else
     echo "ok       install.sh EPHOR_FALLBACK_TAG: v${INSTALL_FALLBACK}"
+fi
+
+# 5b. install.ps1 EPHOR_FALLBACK_TAG matches install.sh's value. The two
+# installers must never diverge: a Windows install and a POSIX install hit
+# the same API failure modes and must land on the same pinned floor.
+PS1_FALLBACK=$(grep 'EPHOR_FALLBACK_TAG = ' install.ps1 | head -1 \
+    | sed 's/.*"v\([0-9][0-9.]*\)".*/\1/')
+if [ -z "$PS1_FALLBACK" ]; then
+    echo "MISSING  install.ps1: EPHOR_FALLBACK_TAG not found"
+    ERRORS=$((ERRORS + 1))
+elif [ -z "$INSTALL_FALLBACK" ]; then
+    echo "SKIP     install.ps1 EPHOR_FALLBACK_TAG: install.sh pin missing"
+elif [ "$PS1_FALLBACK" != "$INSTALL_FALLBACK" ]; then
+    echo "MISMATCH install.ps1 EPHOR_FALLBACK_TAG: v${PS1_FALLBACK}" \
+        "(install.sh v${INSTALL_FALLBACK})"
+    ERRORS=$((ERRORS + 1))
+else
+    echo "ok       install.ps1 EPHOR_FALLBACK_TAG: v${PS1_FALLBACK}"
 fi
 
 # 6. Codeberg tags API - latest remote tag

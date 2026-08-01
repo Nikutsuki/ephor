@@ -34,12 +34,9 @@ if (-not (Test-Path "build.zig.zon")) {
 }
 "@ | Set-Content "build.zig.zon"
 
-    # Zig computes the correct fingerprint - capture it
-    $output = zig build 2>&1 | Out-String
-    if ($output -match 'use this value: (0x[0-9a-f]+)') {
-        $fingerprint = $Matches[1]
-        (Get-Content "build.zig.zon" -Raw) -replace '\.fingerprint = 0x0', ".fingerprint = $fingerprint" | Set-Content "build.zig.zon"
-    }
+    # EPH-I0192: do not spawn zig build for the fingerprint here. A hostile
+    # build.zig would run attacker code. The zig fetch step below repairs
+    # the 0x0 fingerprint from the hint zig fetch prints.
     Write-Host "Created build.zig.zon for project '$projectName'"
 }
 
@@ -61,7 +58,34 @@ if (-not $LATEST_TAG) {
 }
 
 Write-Host "Adding ephor dependency..."
-zig fetch --save=ephor $EPHOR_URL
+# EPH-I0192: zig fetch reads build.zig.zon but never runs build.zig, so a
+# hostile build.zig still executes no code here. On a fresh zon with
+# fingerprint 0x0, zig fetch fails and prints a "use this value" hint with
+# the computed fingerprint. Patch the hint in and fetch again.
+# PowerShell 7.4+ turns a nonzero native exit into a terminating error under
+# "Stop". Relax the preference so this code can inspect the failure.
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$fetchOut = zig fetch --save=ephor $EPHOR_URL 2>&1 | Out-String
+$fetchRc = $LASTEXITCODE
+$ErrorActionPreference = $prevEAP
+if ($null -eq $fetchRc) { $fetchRc = 1 }
+if ($fetchRc -ne 0) {
+    if ($fetchOut -match 'use this value: (0x[0-9a-f]+)') {
+        $suggested = $Matches[1]
+        $zon = Get-Content "build.zig.zon" -Raw
+        $zon -replace '\.fingerprint = 0x0', ".fingerprint = $suggested" |
+            Set-Content "build.zig.zon"
+        # This fetch is authoritative: a failure aborts the install.
+        zig fetch --save=ephor $EPHOR_URL
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    } else {
+        # No hint means a real fetch failure (network, hash, server). Show
+        # the captured error and keep the original exit code.
+        Write-Host $fetchOut
+        exit $fetchRc
+    }
+}
 
 # Canonical ephor block for build.zig
 $EPHOR_BLOCK = @"

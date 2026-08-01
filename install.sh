@@ -6,6 +6,23 @@
 # handles its own exit status explicitly.
 set -eu
 
+# EPH-I0194: a cloned repo can plant a symlink at a fixed temp name such as
+# build.zig.tmp. A ">" redirect follows the symlink and overwrites the
+# target. Every writer below uses mktemp, whose name cannot exist yet, and
+# mv, whose rename replaces a planted symlink instead of following it. The
+# trap removes the temp file when the script exits before the mv.
+INSTALL_TMP=""
+trap '[ -z "$INSTALL_TMP" ] || rm -f "$INSTALL_TMP"' EXIT
+
+# Create the swap file for the next mktemp+mv write and publish its path in
+# INSTALL_TMP for the EXIT trap. mktemp makes the file 0600, but the files
+# this script replaces came from a ">" redirect at 0666 & ~umask. Restore
+# that mode so the install does not tighten project files to 0600.
+make_install_tmp() {
+    INSTALL_TMP=$(mktemp "$1")
+    chmod "$(printf '%03o' $((0666 & ~$(umask))))" "$INSTALL_TMP"
+}
+
 REPO="https://codeberg.org/RhyosLabs/ephor"
 # Tests override this URL through EPHOR_TAGS_API to simulate an API failure.
 TAGS_API="${EPHOR_TAGS_API:-https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10}"
@@ -19,13 +36,33 @@ EPHOR_FALLBACK_TAG="v0.14.2"
 EPHOR_0_15_COMMIT="60145fe05a2b91e7dd32d1c671d98239cd19aea6"
 
 # Bare globals here stay POSIX-correct only while every call site is a $() subshell.
+# Read strict vX.Y.Z tags on stdin and print the semver-highest one. Print
+# nothing on empty input.
+# EPH-I0193: the Codeberg API orders tags by date, so the first entry is not
+# always the highest version. A re-dated old tag must never downgrade an
+# install. The numeric sort keys are the portable (BSD+GNU) semver compare.
+# sort -V is GNU-only.
+max_stable_tag() {
+    sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 | sed 's/^/v/'
+}
+
+# Return 0 when the strict tag $1 sorts below the strict tag $2, else 1.
+# EPH-I0193: the downgrade floor needs a version compare, not a string
+# compare.
+version_older() {
+    [ "$1" != "$2" ] || return 1
+    lower=$(printf '%s\n%s\n' "${1#v}" "${2#v}" \
+        | sort -t. -k1,1n -k2,2n -k3,3n | head -n 1)
+    [ "$lower" = "${1#v}" ]
+}
+
 # Print the newest stable release tag on stdout. Return 1 when the API
 # fails, the result is empty, or no tag is a strict vMAJOR.MINOR.PATCH.
 latest_ephor_tag() {
     # 30s: the Codeberg API has answered in 20s+ on slow days; refusals still fail fast.
     response=$(curl -fsSL --max-time 30 "$TAGS_API" 2>/dev/null) || return 1
     tag=$(printf '%s\n' "$response" | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 \
-        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | max_stable_tag)
     [ -n "$tag" ] || return 1
     printf '%s\n' "$tag"
 }
@@ -37,6 +74,12 @@ resolve_ephor_tag() {
     if [ -z "$tag" ]; then
         echo "warning: could not resolve the latest ephor tag from the Codeberg API." >&2
         echo "The install continues with the fallback tag ${EPHOR_FALLBACK_TAG}." >&2
+        tag="$EPHOR_FALLBACK_TAG"
+    elif version_older "$tag" "$EPHOR_FALLBACK_TAG"; then
+        # EPH-I0193: a stale or re-dated API response must not downgrade the
+        # install below the pinned fallback.
+        echo "warning: the resolved tag ${tag} is below the fallback ${EPHOR_FALLBACK_TAG}." >&2
+        echo "The install continues with the fallback tag." >&2
         tag="$EPHOR_FALLBACK_TAG"
     fi
     printf '%s\n' "$tag"
@@ -59,7 +102,8 @@ fi
 if [ ! -f "build.zig.zon" ]; then
     PROJECT_NAME=$(basename "$(pwd)" | tr '-' '_' | tr '[:upper:]' '[:lower:]')
     echo "No build.zig.zon found, creating one..."
-    cat > build.zig.zon << ZONEOF
+    make_install_tmp ./build.zig.zon.tmp.XXXXXXXX
+    cat > "$INSTALL_TMP" << ZONEOF
 .{
     .name = .${PROJECT_NAME},
     .version = "0.0.0",
@@ -67,12 +111,11 @@ if [ ! -f "build.zig.zon" ]; then
     .paths = .{ "build.zig", "build.zig.zon", "src" },
 }
 ZONEOF
-    # Zig computes the correct fingerprint - capture it
-    SUGGESTED=$(zig build 2>&1 | grep -o 'use this value: 0x[0-9a-f]*' | sed 's/use this value: //')
-    if [ -n "$SUGGESTED" ]; then
-        sed -i.bak "s/\.fingerprint = 0x0/.fingerprint = ${SUGGESTED}/" build.zig.zon
-        rm -f build.zig.zon.bak
-    fi
+    mv "$INSTALL_TMP" build.zig.zon
+    INSTALL_TMP=""
+    # EPH-I0192: do not spawn zig build for the fingerprint here. A hostile
+    # build.zig would run attacker code. The zig fetch step below repairs
+    # the 0x0 fingerprint from the hint zig fetch prints.
     echo "Created build.zig.zon for project '${PROJECT_NAME}'"
 fi
 
@@ -108,11 +151,30 @@ else
     echo "${ACTION} ephor ${EPHOR_TAG}..."
 fi
 if [ -z "$EPHOR_URL" ]; then
-    EPHOR_URL="${REPO}/archive/${EPHOR_TAG}.tar.gz"
+    # Tests override the archive URL through EPHOR_ARCHIVE_URL.
+    EPHOR_URL="${EPHOR_ARCHIVE_URL:-${REPO}/archive/${EPHOR_TAG}.tar.gz}"
 fi
 
 echo "Adding ephor dependency..."
-zig fetch --save=ephor "$EPHOR_URL"
+# EPH-I0192: zig fetch reads build.zig.zon but never runs build.zig, so a
+# hostile build.zig still executes no code here. On a fresh zon with
+# fingerprint 0x0, zig fetch fails and prints a "use this value" hint with
+# the computed fingerprint. Patch the hint in and fetch again.
+FETCH_OUT=$(zig fetch --save=ephor "$EPHOR_URL" 2>&1) && FETCH_RC=0 || FETCH_RC=$?
+if [ "$FETCH_RC" -ne 0 ]; then
+    SUGGESTED=$(printf '%s\n' "$FETCH_OUT" | grep -o 'use this value: 0x[0-9a-f]*' \
+        | sed 's/use this value: //')
+    if [ -z "$SUGGESTED" ]; then
+        # No hint means a real fetch failure (network, hash, server). Show
+        # the captured error and keep the original exit code.
+        printf '%s\n' "$FETCH_OUT" >&2
+        exit "$FETCH_RC"
+    fi
+    sed -i.bak "s/\.fingerprint = 0x0/.fingerprint = ${SUGGESTED}/" build.zig.zon
+    rm -f build.zig.zon.bak
+    # This fetch is authoritative: a failure aborts the install under set -e.
+    zig fetch --save=ephor "$EPHOR_URL"
+fi
 
 # Canonical ephor block for build.zig (single source of truth)
 EPHOR_BLOCK='
@@ -146,14 +208,14 @@ if grep -q '// Ephor static analysis' build.zig; then
         fi
         # head -n 0 is fatal on BSD ("illegal line count") — a line-1 block
         # has nothing above it to keep.
+        make_install_tmp ./build.zig.tmp.XXXXXXXX
         if [ "$START_LINE" -gt 1 ]; then
-            head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
-        else
-            : > build.zig.tmp
+            head -n "$((START_LINE - 1))" build.zig > "$INSTALL_TMP"
         fi
-        echo "$EPHOR_BLOCK" >> build.zig.tmp
-        tail -n +"$((END_LINE + 1))" build.zig >> build.zig.tmp
-        mv build.zig.tmp build.zig
+        echo "$EPHOR_BLOCK" >> "$INSTALL_TMP"
+        tail -n +"$((END_LINE + 1))" build.zig >> "$INSTALL_TMP"
+        mv "$INSTALL_TMP" build.zig
+        INSTALL_TMP=""
         echo "Updated ephor build steps in build.zig"
     fi
 elif grep -q '=== Ephor Static Analysis ===' build.zig; then
@@ -170,14 +232,14 @@ elif grep -q '=== Ephor Static Analysis ===' build.zig; then
         fi
         # head -n 0 is fatal on BSD ("illegal line count") — a line-1 block
         # has nothing above it to keep.
+        make_install_tmp ./build.zig.tmp.XXXXXXXX
         if [ "$START_LINE" -gt 1 ]; then
-            head -n "$((START_LINE - 1))" build.zig > build.zig.tmp
-        else
-            : > build.zig.tmp
+            head -n "$((START_LINE - 1))" build.zig > "$INSTALL_TMP"
         fi
-        echo "$EPHOR_BLOCK" >> build.zig.tmp
-        tail -n +"$((END_LINE + 1))" build.zig >> build.zig.tmp
-        mv build.zig.tmp build.zig
+        echo "$EPHOR_BLOCK" >> "$INSTALL_TMP"
+        tail -n +"$((END_LINE + 1))" build.zig >> "$INSTALL_TMP"
+        mv "$INSTALL_TMP" build.zig
+        INSTALL_TMP=""
         echo "Updated ephor build steps in build.zig (migrated from v0.11.x snippet)"
     fi
 elif grep -q 'dependency("ephor"' build.zig; then
@@ -196,10 +258,12 @@ else
         exit 0
     fi
 
-    head -n "$LINE" build.zig > build.zig.tmp
-    echo "$EPHOR_BLOCK" >> build.zig.tmp
-    tail -n +"$((LINE + 1))" build.zig >> build.zig.tmp
-    mv build.zig.tmp build.zig
+    make_install_tmp ./build.zig.tmp.XXXXXXXX
+    head -n "$LINE" build.zig > "$INSTALL_TMP"
+    echo "$EPHOR_BLOCK" >> "$INSTALL_TMP"
+    tail -n +"$((LINE + 1))" build.zig >> "$INSTALL_TMP"
+    mv "$INSTALL_TMP" build.zig
+    INSTALL_TMP=""
 fi
 
 echo ""

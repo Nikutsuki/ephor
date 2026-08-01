@@ -70,10 +70,21 @@ else
     echo "ok       README.md example config: ${README_CFG_VERSION}"
 fi
 
+# Read a Codeberg tags API response on stdin. Print the semver-highest
+# strict vX.Y.Z tag without the leading v. Print nothing when no tag matches.
+# EPH-I0193: the API orders tags by date, so limit=1 plus head -1 can select
+# a re-dated older tag. The numeric sort keys are the portable (BSD+GNU)
+# semver compare. sort -V is GNU-only.
+max_stable_version() {
+    grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
+}
+
 # Fetch the latest remote tag once. Sections 5 and 6 use it.
 # Give the API 30s: observed 20s+ responses must not skip the gate.
-TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=1"
-REMOTE_TAG=$(curl -sL --max-time 30 "$TAGS_API" 2>/dev/null | grep -o '"name"[[:space:]]*:[[:space:]]*"v[0-9.]*"' | head -1 | sed 's/.*"v\([0-9.]*\)".*/\1/')
+TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10"
+REMOTE_TAG=$(curl -sL --max-time 30 "$TAGS_API" 2>/dev/null | max_stable_version)
 
 # 5. install.sh EPHOR_FALLBACK_TAG matches the latest remote tag.
 # The fallback serves installs when the tags API fails. It must name the

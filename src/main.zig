@@ -7182,13 +7182,27 @@ const ImportGraph = struct {
 
     fn scanDirectory(self: *ImportGraph, dir_path: []const u8) !void {
         var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
-            std.debug.print("error: cannot open '{s}': {}\n", .{
-                dir_path, err,
-            });
+            reportScanOpenError(self.allocator, dir_path, err);
             return err;
         };
         defer dir.close(global_io.?);
         try self.scanRecursive(dir, dir_path, 0);
+    }
+
+    /// Print the scan-open diagnostic. The path crosses the terminal
+    /// sanitizer first: scan roots can derive from config files, so their
+    /// bytes are not necessarily the operator's own (EPH-I0147).
+    fn reportScanOpenError(
+        allocator: Allocator,
+        dir_path: []const u8,
+        err: anyerror,
+    ) void {
+        var safe = types.sanitizeTerminal(allocator, dir_path) catch {
+            std.debug.print("error: cannot open scan directory: {}\n", .{err});
+            return;
+        };
+        defer safe.deinit(allocator);
+        std.debug.print("error: cannot open '{s}': {}\n", .{ safe.slice, err });
     }
 
     fn scanSingleFile(self: *ImportGraph, file_path: []const u8) !void {
@@ -20997,23 +21011,49 @@ const CONFIG_FILENAME = "ephor.json";
 /// Report a config parse failure. CI-gate and fail-closed validation errors
 /// are hard (propagated to the caller as usage errors); every other parse
 /// error warns + continues.
-fn reportConfigParseError(err: anyerror, path: []const u8) !void {
+fn reportConfigParseError(allocator: Allocator, err: anyerror, path: []const u8) !void {
+    var safe_path = types.sanitizeTerminal(allocator, path) catch {
+        // OOM must not flip the fail posture: propagate the gated errors,
+        // warn-and-continue the rest, exactly as the sanitized path does.
+        if (err == error.InvalidFailOnValue or err == error.EmptyExcludePattern)
+            return err;
+        std.debug.print("warning: failed to parse config: {}\n", .{err});
+        return;
+    };
+    defer safe_path.deinit(allocator);
     switch (err) {
-        error.InvalidFailOnValue => cliDiag(
-            "error: {s}: invalid fail_on '{s}' (expected: error, warning, note, never)\n",
-            .{ path, last_bad_fail_on orelse "?" },
-        ),
+        error.InvalidFailOnValue => reportBadFailOn(allocator, safe_path.slice),
         error.EmptyExcludePattern => cliDiag(
             "error: {s}: invalid exclude pattern '' — an empty pattern matches every path. " ++
                 "Use a specific prefix or remove the entry.\n",
-            .{path},
+            .{safe_path.slice},
         ),
         else => {
-            std.debug.print("warning: failed to parse {s}: {}\n", .{ path, err });
+            std.debug.print("warning: failed to parse {s}: {}\n", .{
+                safe_path.slice, err,
+            });
             return;
         },
     }
     return err;
+}
+
+/// The InvalidFailOnValue diagnostic. The offending value is config file
+/// content, so it crosses the terminal sanitizer like the path does
+/// (EPH-I0147).
+fn reportBadFailOn(allocator: Allocator, safe_path: []const u8) void {
+    var safe = types.sanitizeTerminal(allocator, last_bad_fail_on orelse "?") catch {
+        cliDiag(
+            "error: {s}: invalid fail_on value (expected: error, warning, note, never)\n",
+            .{safe_path},
+        );
+        return;
+    };
+    defer safe.deinit(allocator);
+    cliDiag(
+        "error: {s}: invalid fail_on '{s}' (expected: error, warning, note, never)\n",
+        .{ safe_path, safe.slice },
+    );
 }
 
 fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
@@ -21023,7 +21063,7 @@ fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
 
     // Simple JSON parsing for config format
     parseConfigJson(allocator, content, cfg) catch |err| {
-        try reportConfigParseError(err, CONFIG_FILENAME);
+        try reportConfigParseError(allocator, err, CONFIG_FILENAME);
     };
 }
 
@@ -21064,15 +21104,18 @@ fn tryLoadConfigFromDir(
     }) catch |err| {
         // The CI gate key must never fail open, no matter which config
         // file carried it; other parse errors stay warn-and-continue.
-        try reportConfigParseError(err, config_path);
+        try reportConfigParseError(allocator, err, config_path);
         return false;
     };
     if (!trusted and ignored_any) {
         untrusted_config_note_count += 1;
+        // The scanned tree supplies the path bytes here: sanitize them.
+        var safe_config = try types.sanitizeTerminal(allocator, config_path);
+        defer safe_config.deinit(allocator);
         cliDiag(
             "note: ignoring suppression/gate keys from untrusted {s} " ++
                 "(use --trust-target-config to honor)\n",
-            .{config_path},
+            .{safe_config.slice},
         );
     }
 
@@ -21434,26 +21477,58 @@ fn applyConfigPathDir(ctx: ConfigParseCtx, value: []const u8) !void {
     var dir_buf: [Fs.max_path_bytes]u8 = undefined;
     var val_buf: [Fs.max_path_bytes]u8 = undefined;
     const dir_real = Fs.cwd().realpath(ctx.source.dir, &dir_buf) catch {
-        warnPathDirRejected(ctx.source.path, value, "path does not resolve");
+        warnPathDirRejected(allocator, ctx.source.path, value, "path does not resolve");
         return;
     };
     const val_real = Fs.cwd().realpath(joined, &val_buf) catch {
-        warnPathDirRejected(ctx.source.path, value, "path does not resolve");
+        warnPathDirRejected(allocator, ctx.source.path, value, "path does not resolve");
         return;
     };
     if (!isPathAncestorOrEqual(dir_real, val_real)) {
-        warnPathDirRejected(ctx.source.path, value, "resolves outside config directory");
+        warnPathDirRejected(allocator, ctx.source.path, value, "resolves outside config directory");
         return;
     }
     try setOwnedPath(allocator, ctx.cfg, value);
 }
 
-fn warnPathDirRejected(config_path: []const u8, value: []const u8, reason: []const u8) void {
-    path_dir_reject_count += 1;
-    cliDiag(
+/// Render the path_dir rejection warning into `out`. The value is
+/// undecoded config file content and the path comes from the scanned
+/// tree, so both cross the terminal sanitizer (EPH-I0147).
+fn formatPathDirRejected(
+    out: *types.OutBuf,
+    config_path: []const u8,
+    value: []const u8,
+    reason: []const u8,
+) !void {
+    var safe_value = try types.sanitizeTerminal(out.allocator, value);
+    defer safe_value.deinit(out.allocator);
+    var safe_path = try types.sanitizeTerminal(out.allocator, config_path);
+    defer safe_path.deinit(out.allocator);
+    try out.buf.print(
+        out.allocator,
         "warning: ignoring path_dir '{s}' in {s}: {s}. Fix the value or remove the key.\n",
-        .{ value, config_path, reason },
+        .{ safe_value.slice, safe_path.slice, reason },
     );
+}
+
+fn warnPathDirRejected(
+    allocator: Allocator,
+    config_path: []const u8,
+    value: []const u8,
+    reason: []const u8,
+) void {
+    path_dir_reject_count += 1;
+    var out = types.OutBuf{ .allocator = allocator };
+    defer out.deinit();
+    formatPathDirRejected(&out, config_path, value, reason) catch {
+        // OOM: keep the warning but drop the untrusted values.
+        cliDiag(
+            "warning: ignoring path_dir in config: {s}. Fix the value or remove the key.\n",
+            .{reason},
+        );
+        return;
+    };
+    cliDiag("{s}", .{out.buf.items});
 }
 
 /// Handle a single config key-value pair
@@ -23739,10 +23814,13 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
 
     if (!explicit) {
         known_issues_autoload_count += 1;
+        // path_dir can steer cfg.path into an attacker-named directory.
+        var safe_path = try types.sanitizeTerminal(allocator, path);
+        defer safe_path.deinit(allocator);
         cliDiag("note: loaded {d} known-issue {s} from {s}\n", .{
             keys_added,
             if (keys_added == 1) @as([]const u8, "entry") else "entries",
-            path,
+            safe_path.slice,
         });
     }
 }
@@ -23763,7 +23841,10 @@ fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
 }
 
 /// Export issues to a file with code snippets
-/// Write a code snippet around a given line from a file
+/// Write a code snippet around a given line from a file. Embedded source
+/// lines pass through types.sanitizeSnippet: control bytes and
+/// fence-capable backtick runs become placeholders, so a hostile line can
+/// neither break the export fence nor forge prose around it (EPH-I0162).
 fn writeCodeSnippet(
     allocator: Allocator,
     output: *std.ArrayListUnmanaged(u8),
@@ -23785,12 +23866,21 @@ fn writeCodeSnippet(
         if (line_num > end_line) break;
         if (line_num < start_line) continue;
         const prefix: []const u8 = if (line_num == issue_line) ">>> " else "    ";
-        try output.print(allocator, "{s}{d}: {s}\n", .{ prefix, line_num, line });
+        // CRLF sources carry a structural trailing CR. The CR is
+        // line-ending framing, not content, so the code trims it instead
+        // of replacing it with a placeholder.
+        const trimmed = mem.trimEnd(u8, line, "\r");
+        var safe = try types.sanitizeSnippet(allocator, trimmed);
+        defer safe.deinit(allocator);
+        try output.print(allocator, "{s}{d}: {s}\n", .{ prefix, line_num, safe.slice });
     }
     try output.print(allocator, "```\n\n", .{});
 }
 
-/// Write a single issue entry to the export writer
+/// Write a single issue entry to the export writer. Every repo-derived
+/// field (path, message, help) passes through types.sanitizeMarkdown so
+/// hostile bytes cannot inject markdown structure or terminal controls
+/// into issues.md (EPH-I0162).
 fn writeExportIssue(
     allocator: Allocator,
     output: *std.ArrayListUnmanaged(u8),
@@ -23798,14 +23888,20 @@ fn writeExportIssue(
     base_path: []const u8,
 ) !void {
     const rel_path = types.relativePath(issue.file, base_path);
+    var safe_path = try types.sanitizeMarkdown(allocator, rel_path);
+    defer safe_path.deinit(allocator);
+    var safe_msg = try types.sanitizeMarkdown(allocator, issue.message);
+    defer safe_msg.deinit(allocator);
     try output.print(allocator, "## {s}:{d}:{d} [{s}]\n", .{
-        rel_path, issue.line, issue.col, issue.rule,
+        safe_path.slice, issue.line, issue.col, issue.rule,
     });
     try output.print(allocator, "**{s}**: {s}\n", .{
-        @tagName(issue.severity), issue.message,
+        @tagName(issue.severity), safe_msg.slice,
     });
     if (issue.help) |help| {
-        try output.print(allocator, "**Help**: {s}\n", .{help});
+        var safe_help = try types.sanitizeMarkdown(allocator, help);
+        defer safe_help.deinit(allocator);
+        try output.print(allocator, "**Help**: {s}\n", .{safe_help.slice});
     }
     try writeCodeSnippet(allocator, output, issue.file, issue.line);
     try output.print(allocator, "---\n\n", .{});
@@ -23906,12 +24002,14 @@ const SuppressionStats = struct {
 };
 
 /// Shared output context for issue reporting (print/export): base_path is
-/// the display root for relative paths, cfg carries format/filters, graph
-/// feeds inline-ignore content lookups, and ignore_cache memoizes the
+/// the display root for relative paths, allocator feeds the per-issue
+/// sanitization buffers, cfg carries format/filters, graph feeds
+/// inline-ignore content lookups, and ignore_cache memoizes the
 /// per-(file, rule) directive scans behind shouldPrintIssue. suppression
 /// accumulates the per-channel drop counts (RED3-3).
 const ReportOutCtx = struct {
     base_path: []const u8,
+    allocator: Allocator,
     cfg: *const Config,
     graph: ?*const ImportGraph,
     ignore_cache: *IgnoreCache,
@@ -24200,13 +24298,13 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
         for (issues) |issue| {
             if (!shouldPrintIssue(issue, out)) continue;
             printed += 1;
-            issue.printJson(out.base_path, printed == total_printable);
+            issue.printJson(out.allocator, out.base_path, printed == total_printable);
         }
         std.debug.print("  ]\n}}\n", .{});
     } else {
         for (issues) |issue| {
             if (!shouldPrintIssue(issue, out)) continue;
-            issue.printText(out.base_path);
+            issue.printText(out.allocator, out.base_path);
         }
     }
     return counts;
@@ -24551,6 +24649,7 @@ pub fn main(init: std.process.Init) !void {
 
                 const out = ReportOutCtx{
                     .base_path = base_path,
+                    .allocator = alloc,
                     .cfg = &cfg,
                     .graph = &g,
                     .ignore_cache = &ignore_cache,
@@ -24577,6 +24676,7 @@ pub fn main(init: std.process.Init) !void {
             ast_issues.items.len = 0; // ownership moved to issues
             const out = ReportOutCtx{
                 .base_path = base_path,
+                .allocator = alloc,
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
@@ -24606,6 +24706,7 @@ pub fn main(init: std.process.Init) !void {
             ignored.items.len = 0;
             const out = ReportOutCtx{
                 .base_path = base_path,
+                .allocator = alloc,
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
@@ -24626,6 +24727,7 @@ pub fn main(init: std.process.Init) !void {
             defer deinitIssues(&issues, alloc);
             const out = ReportOutCtx{
                 .base_path = base_path,
+                .allocator = alloc,
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
@@ -24646,6 +24748,7 @@ pub fn main(init: std.process.Init) !void {
             defer deinitIssues(&issues, alloc);
             const out = ReportOutCtx{
                 .base_path = base_path,
+                .allocator = alloc,
                 .cfg = &cfg,
                 .graph = &g,
                 .ignore_cache = &ignore_cache,
@@ -24662,6 +24765,7 @@ pub fn main(init: std.process.Init) !void {
             defer deinitIssues(&issues, alloc);
             const out = ReportOutCtx{
                 .base_path = base_path,
+                .allocator = alloc,
                 .cfg = &cfg,
                 .graph = null,
                 .ignore_cache = &ignore_cache,
@@ -24708,6 +24812,7 @@ pub fn main(init: std.process.Init) !void {
             defer deinitIssues(&issues, alloc);
             const out = ReportOutCtx{
                 .base_path = base_path,
+                .allocator = alloc,
                 .cfg = &cfg,
                 .graph = null,
                 .ignore_cache = &ignore_cache,
@@ -24829,6 +24934,7 @@ pub fn main(init: std.process.Init) !void {
                 // Print all issues (returns filtered count)
                 const out = ReportOutCtx{
                     .base_path = base_path,
+                    .allocator = alloc,
                     .cfg = &cfg,
                     .graph = &g,
                     .ignore_cache = &ignore_cache,
@@ -46931,6 +47037,41 @@ test "config path_dir outside the config directory is rejected (RED4-1)" {
     try std.testing.expectEqual(@as(usize, 2), path_dir_reject_count);
 }
 
+test "config path_dir rejection warning sanitizes hostile value bytes" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    path_dir_reject_count = 0;
+
+    // An untrusted config whose path_dir carries ESC and CR bytes raw.
+    // The value does not resolve, so the rejection warning fires
+    // (EPH-I0147).
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var ignored_any = false;
+    try parseConfigJsonSource(
+        allocator,
+        "{\"path_dir\": \"ev\x1bil\r\"}",
+        &cfg,
+        .{
+            .trusted = false,
+            .path = "test",
+            .dir = ".",
+            .ignored_any = &ignored_any,
+        },
+    );
+    try std.testing.expectEqual(@as(usize, 1), path_dir_reject_count);
+
+    // The emitted warning text contains none of the raw bytes.
+    var out = types.OutBuf{ .allocator = allocator };
+    defer out.deinit();
+    try formatPathDirRejected(&out, "ephor.json", "ev\x1bil\r", "path does not resolve");
+    try std.testing.expect(mem.indexOfScalar(u8, out.buf.items, 0x1B) == null);
+    try std.testing.expect(mem.indexOfScalar(u8, out.buf.items, '\r') == null);
+    try std.testing.expect(mem.indexOf(u8, out.buf.items, "ev?il?") != null);
+}
+
 test "target-dir config parse never aliases cfg.path (UAF regression)" {
     // Regression: ConfigSource.dir aliased the dir argument, which IS the
     // cfg.path buffer in production (loadConfigFromTargetPath(cfg, cfg.path)).
@@ -47505,6 +47646,7 @@ const SuppressHarness = struct {
     fn out(self: *SuppressHarness) ReportOutCtx {
         return .{
             .base_path = self.cfg.path,
+            .allocator = std.testing.allocator,
             .cfg = &self.cfg,
             .graph = &self.run.graph,
             .ignore_cache = &self.cache,
@@ -47836,4 +47978,94 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
     try loadKnownIssues(allocator, &cfg_explicit);
     try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
     try std.testing.expectEqual(@as(usize, 2), cfg_explicit.known_issues.items.len);
+}
+
+// ============================================================================
+// Output Sanitization Tests (RED5: EPH-I0146, I0147, I0148, I0149, I0162)
+// ============================================================================
+
+test "writeExportIssue neutralizes markdown metacharacters and control bytes" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const issue = Issue{
+        .file = "ev*il_[x].zig",
+        .line = 10,
+        .col = 2,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "forged\n## heading",
+        .help = "use `try`",
+    };
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(allocator);
+    try writeExportIssue(allocator, &output, issue, "/repo");
+
+    // The newline in the message cannot forge a markdown heading line.
+    try std.testing.expect(mem.indexOf(u8, output.items, "\n## heading") == null);
+    // Metacharacters are backslash-escaped.
+    try std.testing.expect(
+        mem.indexOf(u8, output.items, "ev\\*il\\_\\[x\\].zig") != null,
+    );
+    try std.testing.expect(mem.indexOf(u8, output.items, "\\`try\\`") != null);
+}
+
+test "writeCodeSnippet neutralizes fence sequences in source lines" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = "fn a() void {}\n```\nbe\x1blow\n";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "snip.zig",
+        .data = content,
+    });
+    const path = try tmpFilePath(allocator, &tmp, "snip.zig");
+    defer allocator.free(path);
+
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(allocator);
+    try writeCodeSnippet(allocator, &output, path, 2);
+
+    // The embedded fence line is stripped to placeholders: exactly the two
+    // wrapper fences carry a backtick run.
+    try std.testing.expectEqual(2, types.countOccurrences(output.items, "```"));
+    try std.testing.expect(mem.indexOf(u8, output.items, ">>> 2: ???") != null);
+    // Control bytes from the source line never reach the export.
+    try std.testing.expect(mem.indexOfScalar(u8, output.items, 0x1B) == null);
+    try std.testing.expect(mem.indexOf(u8, output.items, "be?low") != null);
+}
+
+test "ZT101: control bytes in a test name are sanitized at print time" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The test name carries ESC and CR bytes raw, as a hostile repo file
+    // would: ephor scans files it cannot necessarily compile.
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\
+    ++ "test \"parseHeader a\x1b[31m\rb\" {\n" ++
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_ctrl.zig", content);
+    defer run.deinit(allocator);
+
+    var found: ?Issue = null;
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_TEST_LIE)) found = issue;
+    }
+    try std.testing.expect(found != null);
+    var out = types.OutBuf{ .allocator = allocator };
+    defer out.deinit();
+    try found.?.formatText("/repo", &out);
+    try std.testing.expect(mem.indexOfScalar(u8, out.buf.items, 0x1B) == null);
+    try std.testing.expect(mem.indexOfScalar(u8, out.buf.items, '\r') == null);
+    try std.testing.expect(
+        mem.indexOf(u8, out.buf.items, "parseHeader a?[31m?b") != null,
+    );
 }

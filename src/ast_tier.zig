@@ -11,8 +11,10 @@
 //!
 //! Degradation contract: when a file's parse produces errors the tree is
 //! partial and `AstContext.ok` is false — AST rules skip the file and the
-//! line tier still covers it. Nothing is logged per file; corpus runs
-//! touch thousands of files.
+//! line tier still covers it. Files that nest delimiters or prefix
+//! operators past `max_nesting_depth` skip the same way before the parse
+//! runs (EPH-I0191). Nothing is logged per file. Corpus runs touch
+//! thousands of files.
 
 const std = @import("std");
 const mem = std.mem;
@@ -38,16 +40,25 @@ pub const AstContext = struct {
     /// rules must skip this file.
     ok: bool,
 
+    /// Parses on a worker thread with a `parse_stack_bytes` stack: the
+    /// hard half of the EPH-I0191 guarantee (EPH-I0268). Parser stack
+    /// need grows with input size, so the byte cap plus this stack bound
+    /// the worst case by construction, with no grammar assumptions. The
+    /// caller blocks in join while the worker allocates, so every
+    /// allocation happens-before the caller resumes: no concurrent
+    /// allocator access. Direct use on untrusted input above
+    /// `max_ast_file_bytes` still reopens the crash class. Production
+    /// callers must go through `analyzeFileAstTier`.
     pub fn init(allocator: Allocator, source: []const u8) !AstContext {
-        const zsource = try allocator.dupeZ(u8, source);
-        errdefer allocator.free(zsource);
-        var tree = try Ast.parse(allocator, zsource, .zig);
-        errdefer tree.deinit(allocator);
-        return .{
-            .tree = tree,
-            .source = zsource,
-            .ok = tree.errors.len == 0,
-        };
+        var job = ParseJob{ .allocator = allocator, .source = source };
+        const worker = try std.Thread.spawn(
+            .{ .stack_size = parse_stack_bytes },
+            parseWorker,
+            .{&job},
+        );
+        worker.join();
+        if (job.err) |err| return err;
+        return job.result.?;
     }
 
     pub fn deinit(self: *AstContext, allocator: Allocator) void {
@@ -68,11 +79,233 @@ pub const Stats = struct {
     skipped: usize = 0,
 };
 
+/// Stack for the parse worker thread. The byte cap bounds the input and
+/// the worst verified density is ten frames per byte pair, so 64 KiB of
+/// source needs well under 512 MB even with chunky Parse.zig frames.
+/// The OS commits stack pages lazily, so resident cost tracks real use.
+const parse_stack_bytes: usize = 512 * 1024 * 1024;
+
+/// Worker payload for the threaded parse. The result slot moves the
+/// context back to the caller after join.
+const ParseJob = struct {
+    allocator: Allocator,
+    source: []const u8,
+    result: ?AstContext = null,
+    err: ?anyerror = null,
+};
+
+fn parseWorker(job: *ParseJob) void {
+    job.result = parseOnCurrentThread(job.allocator, job.source) catch |err| {
+        job.err = err;
+        return;
+    };
+}
+
+fn parseOnCurrentThread(allocator: Allocator, source: []const u8) !AstContext {
+    const zsource = try allocator.dupeZ(u8, source);
+    errdefer allocator.free(zsource);
+    var tree = try Ast.parse(allocator, zsource, .zig);
+    errdefer tree.deinit(allocator);
+    return .{
+        .tree = tree,
+        .source = zsource,
+        .ok = tree.errors.len == 0,
+    };
+}
+
 /// Sink for one file's AST-tier analysis: issues plus optional counters.
 pub const AstTierOut = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     stats: ?*Stats = null,
 };
+
+// ============================================================================
+// Nesting budget (EPH-I0191)
+// ============================================================================
+
+/// Parse-recursion budget for the AST tier. The host parser recurses ten
+/// frames per nesting level (verified in zig 0.16.0 Parse.zig: parseExpr →
+/// parseExprPrecedence → parsePrefixExpr → parsePrimaryExpr →
+/// parseCurlySuffixExpr → parseTypeExpr → parseErrorUnionExpr →
+/// parseSuffixExpr → parsePrimaryTypeExpr → expectExpr). At that rate
+/// 20-50k nested parens exhaust the 8 MB default stack and SIGSEGV
+/// mid-run with no output. Prefix operators recurse two to five frames
+/// each without any delimiter, so the pre-scan budgets them with the
+/// same constant. Real code nests tens of levels, so 512 keeps a wide
+/// margin.
+pub const max_nesting_depth: usize = 512;
+
+/// AST-tier input byte cap (EPH-I0268). Parser stack need grows with
+/// input size, so this cap plus `parse_stack_bytes` bounds the worst
+/// case by construction: the pre-scan and the grammar audit table are
+/// the cheap first gate, this is the guarantee that needs no grammar
+/// assumptions. 64 KiB sits past ZA702's exceptional-file threshold
+/// (50 KB default), so real code is unaffected. Over-cap files degrade
+/// to line-tier coverage, the same contract as parse errors.
+pub const max_ast_file_bytes: usize = 64 * 1024;
+
+/// Carried state for the pre-scan: two counters that estimate live
+/// parser frames, plus the pending-arrow watch for `anyframe->`.
+const NestingScan = struct {
+    depth: usize = 0,
+    run: usize = 0,
+    /// Set while an `anyframe` keyword waits for its `->`. The word alone
+    /// is a type operand, so the run parks here until the arrow decides.
+    arrow_run: ?usize = null,
+};
+
+/// True when `source` would push the recursive host parser past `budget`.
+/// One iterative pass with no allocation keeps two counters: delimiter
+/// nesting and sequential right-recursion runs. The run counter
+/// increments on `! - ~ & ? *`, on `-%`, on `[`, on `anyframe->`, and on
+/// the right-recursive keywords (grammar-audit table below). It resets
+/// only at statement boundaries (`;`, `=`, `,`), where the frames of a
+/// prefix chain provably return. It never resets on whitespace,
+/// identifiers, or delimiters: prefix frames stay live across the
+/// operand, and error-union chains interleave operators with operands.
+/// Over-counting is deliberate and fail-safe. Infix chains of `- & *`,
+/// deep index chains, and keyword-dense statements can force a skip. A
+/// skip degrades one file to line-tier coverage. An under-count defeats
+/// only this gate. The byte cap and the parse stack absorb it
+/// (EPH-I0268). Operators inside strings, char literals, `\\`
+/// multiline bodies, and `//` comments are data and do not count.
+///
+/// Grammar-audit table (zig 0.16.0 Parse.zig; EPH-I0268). Every
+/// production classified by how it consumes stack: nested (the depth
+/// counter), sequential right-recursive (the run counter), or iterative
+/// (not counted). The table is the union of the 0.15/0.16 grammars: a
+/// production unknown to one version never matches there, and
+/// over-counting fails safe. Re-audit this table on every new Zig
+/// version.
+///
+///   parens / blocks / index brackets   nested            depth
+///   sequential slice types `[]T`       right-recursive   run (via `[`)
+///   prefix ops `! - ~ & ? * -%`        right-recursive   run
+///   error union `T!U`                  right-recursive   run (via `!`)
+///   try / anyframe->                   right-recursive   run
+///   comptime/nosuspend/resume/         right-recursive   run
+///   break/return (expression prefix)
+///   if/while/for bodies                right-recursive   run
+///   fn-type chains `fn() fn() void`    right-recursive   run (fn + `(`)
+///   binary ops and/or/orelse/catch     left-assoc loop   not counted
+///   switch prongs                      iterative list    not counted
+///   defer/errdefer payloads            block statements  not counted
+///   fn declarations `fn name(`         container loop    not counted
+///   statement boundary `;` `=` `,`     frames return     resets run
+///   strings/chars/comments/`\\` bodies data              masked
+fn exceedsNestingBudget(source: []const u8, budget: usize) bool {
+    var scan = NestingScan{};
+    var lines = mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        if (lineCrossesBudget(line, &scan, budget)) return true;
+    }
+    return false;
+}
+
+/// Fold one line into `scan` and report true when a counter crosses
+/// `budget`. Closers at zero depth clamp instead of underflowing.
+fn lineCrossesBudget(line: []const u8, scan: *NestingScan, budget: usize) bool {
+    var lit = types.LiteralState.forLine(line) orelse return false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        _ = lit.updateForChar(line, i) orelse continue;
+        scanCodeChar(line, &i, scan);
+        if (scan.depth > budget or scan.run > budget) return true;
+    }
+    return false;
+}
+
+/// Fold one code-context char into the scan. Advances `i` past
+/// identifier tails and two-char operator forms so their parts never
+/// double-count.
+fn scanCodeChar(line: []const u8, i: *usize, scan: *NestingScan) void {
+    const c = line[i.*];
+    if (scan.arrow_run) |saved| {
+        if (c == '>') {
+            scan.run = saved + 1;
+            scan.arrow_run = null;
+            return;
+        }
+        // Whitespace and the arrow's `-` keep the watch alive.
+        if (c == '-' or c == ' ' or c == '\t' or c == '\r') return;
+        scan.arrow_run = null;
+        scan.run = 0;
+        // Fall through: the char that broke the arrow still counts.
+    }
+    switch (c) {
+        '(', '{' => scan.depth += 1,
+        '[' => {
+            scan.depth += 1;
+            // Sequential slice/array types (`[][]u8`) recurse per level
+            // while their brackets balance within the level, invisible
+            // to depth alone (audit table row 2). Index chains
+            // over-count here. Over-counting skips. An under-count is
+            // absorbed by the byte cap and the parse stack (EPH-I0268).
+            scan.run += 1;
+        },
+        ')', ']', '}' => {
+            if (scan.depth > 0) scan.depth -= 1;
+        },
+        '!', '~', '&', '?', '*' => scan.run += 1,
+        '-' => {
+            // `-%` is one wrapping-negation token. Count it once.
+            scan.run += 1;
+            if (i.* + 1 < line.len and line[i.* + 1] == '%') i.* += 1;
+        },
+        ' ', '\t', '\r' => {},
+        else => scanWordOrReset(line, i, scan),
+    }
+}
+
+/// Identifiers keep the run: error-union chains interleave operands with
+/// `!`, and infix `- & *` sequences must over-count toward a safe skip.
+/// Only statement boundaries (`;`, `=`, `,`) reset: every other non-word
+/// char can sit inside an operand (`.` `@` `:` in types) where parent
+/// operator frames are still live (audit table, hole A). Right-recursive
+/// keywords increment. `anyframe` arms the arrow watch.
+fn scanWordOrReset(line: []const u8, i: *usize, scan: *NestingScan) void {
+    if (!types.isIdent(line[i.*])) {
+        const c = line[i.*];
+        if (c == ';' or c == '=' or c == ',') scan.run = 0;
+        return;
+    }
+    const start = i.*;
+    while (i.* + 1 < line.len and types.isIdent(line[i.* + 1])) i.* += 1;
+    const word = line[start .. i.* + 1];
+    if (mem.eql(u8, word, "fn")) {
+        // A declaration `fn name(` is one iterative frame in the
+        // container loop. The type form `fn (` recurses per level
+        // (audit table, fn-type chains), so only that form counts.
+        if (nextNonSpaceIsParen(line, i.*)) scan.run += 1;
+        return;
+    }
+    if (isRightRecursiveKeyword(word)) scan.run += 1;
+    if (mem.eql(u8, word, "anyframe")) {
+        scan.arrow_run = scan.run;
+        scan.run = 0;
+    }
+}
+
+/// True when the next non-space char after `i` is `(`: the fn-type form.
+fn nextNonSpaceIsParen(line: []const u8, i: usize) bool {
+    var j = i + 1;
+    while (j < line.len and (line[j] == ' ' or line[j] == '\t' or line[j] == '\r')) j += 1;
+    return j < line.len and line[j] == '(';
+}
+
+/// Keywords whose productions recurse into the following expression or
+/// type without a delimiter (grammar-audit table, EPH-I0268). `fn` is
+/// handled apart: only its type form recurses.
+fn isRightRecursiveKeyword(word: []const u8) bool {
+    const keywords = [_][]const u8{
+        "try",    "comptime", "nosuspend", "resume", "break",
+        "return", "if",       "while",     "for",
+    };
+    for (keywords) |kw| {
+        if (mem.eql(u8, word, kw)) return true;
+    }
+    return false;
+}
 
 // ============================================================================
 // ZA111: returned-stack-reference
@@ -1068,15 +1301,30 @@ fn analyzeFileZa111(ctx: *const Za111Ctx) !void {
     }
 }
 
-/// Run every AST-tier rule over one file. Files with parse errors are
-/// skipped (partial trees would misplace rules); the line tier still
-/// covers them. Only error.OutOfMemory is propagated.
+/// Run every AST-tier rule over one file. Files with parse errors, deep
+/// nesting, or a size past `max_ast_file_bytes` are skipped. The line
+/// tier still covers them. Only allocation and thread-spawn errors are
+/// propagated.
 pub fn analyzeFileAstTier(
     a: Allocator,
     out: AstTierOut,
     path: []const u8,
     content: []const u8,
 ) !void {
+    // Parser stack need grows with input size (EPH-I0191). The byte cap
+    // bounds it by construction. The parse thread's big stack
+    // (parse_stack_bytes) holds the rest.
+    if (content.len > max_ast_file_bytes) {
+        if (out.stats) |s| s.skipped += 1;
+        return;
+    }
+    // Deep delimiter or operator nesting SIGSEGVs the recursive host
+    // parser mid-run (EPH-I0191). Degrade to line-tier coverage, the
+    // same contract as parse errors.
+    if (exceedsNestingBudget(content, max_nesting_depth)) {
+        if (out.stats) |s| s.skipped += 1;
+        return;
+    }
     var actx = try AstContext.init(a, content);
     defer actx.deinit(a);
     if (!actx.ok) {
@@ -1498,4 +1746,442 @@ test "ZA111: optional-unwrap chain fires" {
     );
     defer types.deinitIssues(&issues, a);
     try expectZa111(issues.items, 3, "'s'");
+}
+
+// ============================================================================
+// Nesting budget tests (EPH-I0191)
+// ============================================================================
+
+test "exceedsNestingBudget: boundary is exactly at budget" {
+    try std.testing.expect(!exceedsNestingBudget("(((1))", 4));
+    try std.testing.expect(!exceedsNestingBudget("((((1))))", 4));
+    try std.testing.expect(exceedsNestingBudget("(((((1)))))", 4));
+}
+
+test "exceedsNestingBudget: empty source is within budget" {
+    try std.testing.expect(!exceedsNestingBudget("", 0));
+}
+
+test "exceedsNestingBudget: literal and comment delimiters do not count" {
+    const src =
+        \\const a = "(((((((((((";
+        \\const b = "escaped \" (((( still string";
+        \\const c = '(';
+        \\const d = '}';
+        \\// (((( comment (((( ))))
+        \\\\ (((( multiline string body
+        \\const e = f(1, g[2], .{ .x = 3 });
+    ;
+    // Code nesting peaks at 2 (call holding index holding init). Literal
+    // and comment delimiters would push it past 12 if they counted.
+    try std.testing.expect(!exceedsNestingBudget(src, 2));
+}
+
+test "exceedsNestingBudget: mixed bracket kinds share one counter" {
+    try std.testing.expect(exceedsNestingBudget("([{([", 4));
+    // Mismatched closers still decrement: the peak here is exactly 4.
+    try std.testing.expect(!exceedsNestingBudget("([{(}])", 4));
+}
+
+test "exceedsNestingBudget: unbalanced closers clamp at zero" {
+    // A usize counter would panic on underflow without the clamp.
+    try std.testing.expect(!exceedsNestingBudget("))) ] }}", 1));
+    try std.testing.expect(!exceedsNestingBudget(")(", 1));
+    try std.testing.expect(exceedsNestingBudget(")((", 1));
+}
+
+/// Valid Zig with `n` nested grouped expressions: `const x = (((1)));`.
+/// The shape stays parseable at any depth, so only the budget decides
+/// skip vs parse.
+fn buildNestedParens(a: Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    try buf.appendSlice(a, "const x = ");
+    try buf.appendNTimes(a, '(', n);
+    try buf.append(a, '1');
+    try buf.appendNTimes(a, ')', n);
+    try buf.append(a, ';');
+    return buf.toOwnedSlice(a);
+}
+
+/// Parts of a synthetic operator-run file: `head` + `op`×n + `tail`.
+const RunSpec = struct {
+    head: []const u8,
+    op: []const u8,
+    tail: []const u8,
+};
+
+/// Valid Zig with `n` repetitions of `spec.op` between head and tail.
+/// The shapes stay parseable at any count, so only the budget decides
+/// skip vs parse.
+fn buildRun(a: Allocator, spec: RunSpec, n: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    try buf.appendSlice(a, spec.head);
+    for (0..n) |_| try buf.appendSlice(a, spec.op);
+    try buf.appendSlice(a, spec.tail);
+    return buf.toOwnedSlice(a);
+}
+
+/// Run the AST tier over `src` and assert the parse/skip counters. A
+/// skip or a parse must never produce issues from these synthetic files.
+fn expectTierCounters(src: []const u8, want_parsed: usize, want_skipped: usize) !void {
+    const a = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer types.deinitIssues(&issues, a);
+    var stats = Stats{};
+    try analyzeFileAstTier(a, .{ .issues = &issues, .stats = &stats }, "run.zig", src);
+    try std.testing.expectEqual(want_parsed, stats.parsed);
+    try std.testing.expectEqual(want_skipped, stats.skipped);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "EPH-I0191: over-budget nesting skips the AST tier, counted in stats" {
+    const a = std.testing.allocator;
+    const src = try buildNestedParens(a, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: within-budget nesting parses and counts as parsed" {
+    const a = std.testing.allocator;
+    const src = try buildNestedParens(a, max_nesting_depth - 1);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
+}
+
+test "exceedsNestingBudget: prefix runs span whitespace and newlines" {
+    try std.testing.expect(exceedsNestingBudget("!  \n\n  !\t! x", 2));
+    try std.testing.expect(!exceedsNestingBudget("!  \n\n  !\t! x", 3));
+}
+
+test "exceedsNestingBudget: run resets at statement boundaries" {
+    try std.testing.expect(!exceedsNestingBudget("!a; !b; !c;", 1));
+    try std.testing.expect(exceedsNestingBudget("!!!!!a; !b;", 4));
+    try std.testing.expect(!exceedsNestingBudget("!!!!!a; !b;", 5));
+}
+
+test "exceedsNestingBudget: error-union chains accumulate across operands" {
+    // Each `!` recurses through expectTypeExpr (Parse.zig
+    // parseErrorUnionExpr), so the operands between operators must not
+    // reset the run. A reset-on-operand rule peaks at 1 here and misses
+    // the whole class.
+    const src = "const x: anyerror!anyerror!anyerror!u8 = undefined;";
+    try std.testing.expect(exceedsNestingBudget(src, 2));
+    try std.testing.expect(!exceedsNestingBudget(src, 3));
+}
+
+test "exceedsNestingBudget: infix operator chains over-count toward a skip" {
+    // `-` is infix here and the real parse stays flat. The counter cannot
+    // tell infix from prefix, so it accumulates: over-count forces a safe
+    // skip, never an under-count.
+    try std.testing.expect(exceedsNestingBudget("const x = a - b - c - d - e;", 3));
+    try std.testing.expect(!exceedsNestingBudget("const x = a - b - c - d - e;", 4));
+}
+
+test "exceedsNestingBudget: keyword and two-char prefix forms count" {
+    try std.testing.expect(exceedsNestingBudget("const x = try try try f();", 2));
+    try std.testing.expect(exceedsNestingBudget("const x = -% -% -% y;", 2));
+    try std.testing.expect(exceedsNestingBudget("const x: anyframe->anyframe->u8 = undefined;", 1));
+    // An arrow split across lines still completes the operator.
+    try std.testing.expect(exceedsNestingBudget("const x: anyframe\n->anyframe\n->u8 = undefined;", 1));
+    // A bare `anyframe` is a type operand, not an operator.
+    try std.testing.expect(!exceedsNestingBudget("var af: anyframe = undefined;", 0));
+}
+
+test "exceedsNestingBudget: prefix operators in literal contexts do not count" {
+    const src =
+        \\const a = "!!!!!!";
+        \\const b = '!';
+        \\// !!!!!!
+        \\\\ !!!!!!
+        \\const c = !x;
+    ;
+    try std.testing.expect(!exceedsNestingBudget(src, 1));
+    try std.testing.expect(exceedsNestingBudget(src, 0));
+}
+
+test "exceedsNestingBudget: delimiters do not reset the run" {
+    // Prefix frames stay live while the parenthesized operand parses, so
+    // `(` must not bound the run. Otherwise 512 parens holding 40 `!`
+    // each pass both counters and still overflow the stack.
+    try std.testing.expect(exceedsNestingBudget("!!(!!(!!x)))", 5));
+    try std.testing.expect(!exceedsNestingBudget("!!(!!(!!x)))", 6));
+}
+
+test "EPH-I0191: prefix-not run over budget skips the AST tier" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x = ",
+        .op = "!",
+        .tail = " true;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: optional-type run over budget skips the AST tier" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x: ",
+        .op = "?",
+        .tail = "u8 = undefined;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: error-union run over budget skips the AST tier" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x: anyerror",
+        .op = "!anyerror",
+        .tail = " = undefined;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: anyframe-arrow run over budget skips the AST tier" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x: ",
+        .op = "anyframe->",
+        .tail = "u8 = undefined;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: within-budget prefix run parses and counts as parsed" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x = ",
+        .op = "!",
+        .tail = " true;",
+    }, max_nesting_depth - 1);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
+}
+
+// ============================================================================
+// Grammar-audit table tests (EPH-I0268)
+// ============================================================================
+
+test "exceedsNestingBudget: sequential slice types count in the run (hole C)" {
+    // `[][][]u8` recurses per level while its brackets balance within
+    // the level, so depth alone misses it.
+    try std.testing.expect(exceedsNestingBudget("const x: [][][]u8 = undefined;", 2));
+    try std.testing.expect(!exceedsNestingBudget("const x: [][][]u8 = undefined;", 3));
+}
+
+test "exceedsNestingBudget: index chains over-count toward a skip" {
+    // `a[0][1][2][3]` is a flat parse, but `[` also counts in the run.
+    // Over-counting skips. An under-count is absorbed by the byte cap
+    // and the parse stack (EPH-I0268).
+    try std.testing.expect(exceedsNestingBudget("const x = a[0][1][2][3];", 3));
+    try std.testing.expect(!exceedsNestingBudget("const x = a[0][1][2][3];", 4));
+}
+
+test "exceedsNestingBudget: qualified error-union operands keep the run (hole A)" {
+    // `.` sits inside the operand while the parent `!` frames are live,
+    // so it must not reset. A reset-on-non-ident rule peaks at 1 here.
+    try std.testing.expect(exceedsNestingBudget("const x: a.b!a.b!a.b!u8 = undefined;", 2));
+    try std.testing.expect(!exceedsNestingBudget("const x: a.b!a.b!a.b!u8 = undefined;", 3));
+}
+
+test "exceedsNestingBudget: right-recursive keywords count (holes B and E)" {
+    try std.testing.expect(exceedsNestingBudget("const x = comptime comptime comptime true;", 2));
+    try std.testing.expect(!exceedsNestingBudget("const x = comptime comptime comptime true;", 3));
+    try std.testing.expect(exceedsNestingBudget("if (a) if (b) if (c) x;", 2));
+    try std.testing.expect(!exceedsNestingBudget("if (a) if (b) if (c) x;", 3));
+}
+
+test "exceedsNestingBudget: fn-type chains count, declarations do not (hole D)" {
+    try std.testing.expect(exceedsNestingBudget("const x: fn() fn() fn() void = undefined;", 2));
+    try std.testing.expect(!exceedsNestingBudget("const x: fn() fn() fn() void = undefined;", 3));
+    // A declaration is one iterative frame in the container loop. Its
+    // parens still count in depth, so the run budget is not the binding
+    // constraint here.
+    try std.testing.expect(!exceedsNestingBudget("fn f() void {}", 1));
+}
+
+test "exceedsNestingBudget: left-assoc binary chains and statement streams stay flat" {
+    // `and` is an iterative same-precedence loop, not recursion.
+    try std.testing.expect(!exceedsNestingBudget("const x = a and b and c and d;", 0));
+    // Sequential statements reset at `;`: a long file of small statements
+    // peaks at a run of 1.
+    try std.testing.expect(!exceedsNestingBudget("if (a) b(); if (c) d();", 1));
+    try std.testing.expect(exceedsNestingBudget("if (a) b(); if (c) d();", 0));
+}
+
+test "EPH-I0191: qualified error-union run over budget skips the AST tier (hole A)" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x: a.b",
+        .op = "!a.b",
+        .tail = "!u8 = undefined;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: keyword run over budget skips the AST tier (hole B)" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x = ",
+        .op = "comptime ",
+        .tail = "true;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: slice-type run over budget skips the AST tier (hole C)" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x: ",
+        .op = "[]",
+        .tail = "u8 = undefined;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: fn-type run over budget skips the AST tier (hole D)" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x: ",
+        .op = "fn() ",
+        .tail = "void = undefined;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0191: if-body run over budget skips the AST tier (hole E)" {
+    const a = std.testing.allocator;
+    const src = try buildRun(a, .{
+        .head = "const x = ",
+        .op = "if (a) ",
+        .tail = "true;",
+    }, max_nesting_depth + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+/// Valid Zig of `n` sequential if-statements inside one function.
+fn buildSequentialIfs(a: Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    try buf.appendSlice(a, "fn f() void {\n");
+    for (0..n) |_| try buf.appendSlice(a, "if (a) b();\n");
+    try buf.append(a, '}');
+    return buf.toOwnedSlice(a);
+}
+
+/// Valid Zig of `n` distinctly-named function declarations.
+fn buildFnDecls(a: Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    for (0..n) |k| {
+        const line = try std.fmt.allocPrint(a, "fn f{d}() void {{}}\n", .{k});
+        defer a.free(line);
+        try buf.appendSlice(a, line);
+    }
+    return buf.toOwnedSlice(a);
+}
+
+test "EPH-I0191: sequential if-statements parse (statement boundaries reset)" {
+    const a = std.testing.allocator;
+    const src = try buildSequentialIfs(a, max_nesting_depth + 100);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
+}
+
+test "EPH-I0191: function declarations parse (container loop is iterative)" {
+    const a = std.testing.allocator;
+    const src = try buildFnDecls(a, max_nesting_depth + 100);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
+}
+
+test "EPH-I0191: within-budget fn-type chain parses" {
+    try expectTierCounters("const x: fn() fn() void = undefined;", 1, 0);
+}
+
+/// Valid Zig padded with comment bytes to exactly `total` bytes.
+fn buildPaddedSource(a: Allocator, total: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    const head = "fn f() void {}\n//";
+    try buf.appendSlice(a, head);
+    try buf.appendNTimes(a, 'x', total - head.len);
+    return buf.toOwnedSlice(a);
+}
+
+test "EPH-I0268: over-cap file skips the AST tier, counted in stats" {
+    const a = std.testing.allocator;
+    const src = try buildPaddedSource(a, max_ast_file_bytes + 1);
+    defer a.free(src);
+    try expectTierCounters(src, 0, 1);
+}
+
+test "EPH-I0268: at-cap file parses" {
+    const a = std.testing.allocator;
+    const src = try buildPaddedSource(a, max_ast_file_bytes);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
+}
+
+test "EPH-I0268: init parses nesting past the default thread stack" {
+    const a = std.testing.allocator;
+    // 20k nested parens need ~40-100 MB of parse stack at the verified
+    // ten frames per level: past the 16 MB default thread stack, inside
+    // parse_stack_bytes, and under the byte cap. Without the worker
+    // thread this input SIGSEGVs the default stack. Do not run it
+    // against a pre-thread build: the crash kills the test runner.
+    const src = try buildNestedParens(a, 20_000);
+    defer a.free(src);
+    var actx = try AstContext.init(a, src);
+    defer actx.deinit(a);
+    try std.testing.expect(actx.ok);
+}
+
+/// Valid Zig of one switch with `n` distinctly-tagged prongs.
+fn buildSwitchProngs(a: Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    try buf.appendSlice(a, "fn f(x: u16) u16 { return switch (x) {\n");
+    for (0..n) |k| {
+        const line = try std.fmt.allocPrint(a, "{d} => 1,\n", .{k});
+        defer a.free(line);
+        try buf.appendSlice(a, line);
+    }
+    try buf.appendSlice(a, "else => 0, }; }");
+    return buf.toOwnedSlice(a);
+}
+
+test "EPH-I0268: switch prongs parse (iterative list, not counted)" {
+    const a = std.testing.allocator;
+    const src = try buildSwitchProngs(a, max_nesting_depth + 100);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
+}
+
+/// Valid Zig of `n` defer and `n` errdefer statements in one function.
+fn buildDeferStatements(a: Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    try buf.appendSlice(a, "fn f() !void {\n");
+    for (0..n) |_| try buf.appendSlice(a, "defer b();\nerrdefer b();\n");
+    try buf.append(a, '}');
+    return buf.toOwnedSlice(a);
+}
+
+test "EPH-I0268: defer and errdefer payloads parse (block statements, not counted)" {
+    const a = std.testing.allocator;
+    const src = try buildDeferStatements(a, max_nesting_depth + 100);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
 }

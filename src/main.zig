@@ -15099,65 +15099,11 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     };
 }
 
-/// State for masking string/char literals and comments while parsing a line
-const LiteralState = struct {
-    in_str: bool = false,
-    in_chr: bool = false,
-    in_comment: bool = false,
-
-    /// Start masking for one line. Returns null when the line is a
-    /// multiline-string body — after optional leading whitespace, `\\` makes
-    /// the whole line string data, so no position on it is code (Zig has no
-    /// block comments, so this is the only whole-line data form).
-    fn forLine(line: []const u8) ?LiteralState {
-        const t = mem.trimStart(u8, line, " \t");
-        if (mem.startsWith(u8, t, "\\\\")) return null;
-        return .{};
-    }
-
-    /// Returns the position to process as code, or null when the char is
-    /// string/char-literal data or comment text (including the delimiters
-    /// themselves).
-    fn updateForChar(self: *LiteralState, t: []const u8, i: usize) ?usize {
-        if (self.in_comment) return null;
-        const c = t[i];
-        // `//` opens a comment only in code context — inside a string or char
-        // literal it is data. A comment swallows the rest of the line.
-        if (c == '/' and !self.in_str and !self.in_chr and
-            i + 1 < t.len and t[i + 1] == '/')
-        {
-            self.in_comment = true;
-            return null;
-        }
-        if (c == '\'' and !self.in_str) {
-            if (hasEvenBackslashRun(t, i)) self.in_chr = !self.in_chr;
-            return null;
-        }
-        if (c == '"' and !self.in_chr) {
-            if (hasEvenBackslashRun(t, i)) self.in_str = !self.in_str;
-            return null;
-        }
-        return if (self.in_str or self.in_chr) null else i;
-    }
-};
-
-/// True when the backslash run immediately before `t[i]` has even length, so
-/// a quote at `i` is a delimiter. An odd run escapes the quote (the middle
-/// quote in `'\''`), making it content — toggling on escaped content quotes
-/// leaves the state stuck and swallows the rest of the line. An even run
-/// (the closing quote in `'\\'`, `"\\"`) leaves the quote a delimiter.
-fn hasEvenBackslashRun(t: []const u8, i: usize) bool {
-    var backslashes: usize = 0;
-    var j = i;
-    while (j > 0 and t[j - 1] == '\\') : (j -= 1) backslashes += 1;
-    return backslashes % 2 == 0;
-}
-
 /// Track brace nesting, returns true if function ended.
 /// Also updates cognitive nesting via cog_markers and cog_nest.
 fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     const is_switch = mem.indexOf(u8, t, "=>") != null;
-    var lit = LiteralState.forLine(t) orelse return false;
+    var lit = types.LiteralState.forLine(t) orelse return false;
     var first = true;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
@@ -20625,7 +20571,7 @@ fn isIgnoreCommentLine(line: []const u8, rule: []const u8) bool {
 /// data, and counting them leaks the suppression scope past the real
 /// closing brace.
 fn unmatchedOpenBraces(line: []const u8) usize {
-    var lit = LiteralState.forLine(line) orelse return 0;
+    var lit = types.LiteralState.forLine(line) orelse return 0;
     var depth: usize = 0;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
@@ -20639,7 +20585,7 @@ fn unmatchedOpenBraces(line: []const u8) usize {
 /// True when `line` holds a `{` in code context. A brace inside a string,
 /// char literal, or comment is data — it must not open a suppression scope.
 fn hasCodeOpenBrace(line: []const u8) bool {
-    var lit = LiteralState.forLine(line) orelse return false;
+    var lit = types.LiteralState.forLine(line) orelse return false;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
         const pos = lit.updateForChar(line, i) orelse continue;
@@ -20655,7 +20601,7 @@ fn hasCodeOpenBrace(line: []const u8) bool {
 /// stops at the closing brace, so trailing text is not treated as scope
 /// content.
 fn consumeIgnoredScopeLine(scope: *ScopeIgnore, line: []const u8, is_target: bool) bool {
-    var lit = LiteralState.forLine(line) orelse return is_target;
+    var lit = types.LiteralState.forLine(line) orelse return is_target;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
         const pos = lit.updateForChar(line, i) orelse continue;
@@ -24917,7 +24863,7 @@ pub fn main(init: std.process.Init) !void {
                 // default): parse coverage of the AST tier.
                 if (init.environ_map.get("EPHOR_DEBUG_AST") != null) {
                     std.debug.print(
-                        "ast tier: {d} files parsed, {d} skipped (parse errors)\n",
+                        "ast tier: {d} files parsed, {d} skipped (parse errors/budget)\n",
                         .{ ast_stats.parsed, ast_stats.skipped },
                     );
                 }
@@ -48149,4 +48095,57 @@ test "Fs.realpathAlloc resolves a dot component to the canonical path" {
     const canonical = try tmpFilePath(allocator, &tmp, "real.txt");
     defer allocator.free(canonical);
     try std.testing.expectEqualStrings(canonical, resolved);
+}
+
+// ============================================================================
+// AST tier nesting budget (EPH-I0191)
+// ============================================================================
+
+/// Build `const x = (((...1...)));` with `n` nested grouped expressions —
+/// valid Zig at any depth, so only the budget decides skip vs parse.
+fn buildNestedParensSource(a: Allocator, n: usize) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(a);
+    try buf.appendSlice(a, "const x = ");
+    try buf.appendNTimes(a, '(', n);
+    try buf.append(a, '1');
+    try buf.appendNTimes(a, ')', n);
+    try buf.append(a, ';');
+    return buf.toOwnedSlice(a);
+}
+
+/// One-file graph holding `content`, ready for analyzeAstTier.
+fn buildOneFileGraph(a: Allocator, path: []const u8, content: []const u8) !ImportGraph {
+    var graph = ImportGraph.init(a);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(a, path, content);
+    try graph.files.put(analysis.path, analysis);
+    return graph;
+}
+
+test "EPH-I0191: analyzeAstTier skips over-budget nesting without crashing" {
+    const a = std.testing.allocator;
+    const src = try buildNestedParensSource(a, ast_tier.max_nesting_depth + 1);
+    defer a.free(src);
+    var graph = try buildOneFileGraph(a, "deep.zig", src);
+    defer graph.deinit();
+    var stats = ast_tier.Stats{};
+    var issues = try analyzeAstTier(a, &graph, &stats);
+    defer deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped);
+    try std.testing.expectEqual(@as(usize, 0), stats.parsed);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "EPH-I0191: analyzeAstTier parses within-budget nesting" {
+    const a = std.testing.allocator;
+    const src = try buildNestedParensSource(a, ast_tier.max_nesting_depth - 1);
+    defer a.free(src);
+    var graph = try buildOneFileGraph(a, "shallow.zig", src);
+    defer graph.deinit();
+    var stats = ast_tier.Stats{};
+    var issues = try analyzeAstTier(a, &graph, &stats);
+    defer deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 1), stats.parsed);
+    try std.testing.expectEqual(@as(usize, 0), stats.skipped);
 }

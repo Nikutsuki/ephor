@@ -859,6 +859,60 @@ pub fn isInsideString(line: []const u8, col: usize) bool {
     return mode == .str;
 }
 
+/// State for masking string/char literals and comments while parsing a line
+pub const LiteralState = struct {
+    in_str: bool = false,
+    in_chr: bool = false,
+    in_comment: bool = false,
+
+    /// Start masking for one line. Returns null when the line is a
+    /// multiline-string body — after optional leading whitespace, `\\` makes
+    /// the whole line string data, so no position on it is code (Zig has no
+    /// block comments, so this is the only whole-line data form).
+    pub fn forLine(line: []const u8) ?LiteralState {
+        const t = mem.trimStart(u8, line, " \t");
+        if (mem.startsWith(u8, t, "\\\\")) return null;
+        return .{};
+    }
+
+    /// Returns the position to process as code, or null when the char is
+    /// string/char-literal data or comment text (including the delimiters
+    /// themselves).
+    pub fn updateForChar(self: *LiteralState, t: []const u8, i: usize) ?usize {
+        if (self.in_comment) return null;
+        const c = t[i];
+        // `//` opens a comment only in code context — inside a string or char
+        // literal it is data. A comment swallows the rest of the line.
+        if (c == '/' and !self.in_str and !self.in_chr and
+            i + 1 < t.len and t[i + 1] == '/')
+        {
+            self.in_comment = true;
+            return null;
+        }
+        if (c == '\'' and !self.in_str) {
+            if (hasEvenBackslashRun(t, i)) self.in_chr = !self.in_chr;
+            return null;
+        }
+        if (c == '"' and !self.in_chr) {
+            if (hasEvenBackslashRun(t, i)) self.in_str = !self.in_str;
+            return null;
+        }
+        return if (self.in_str or self.in_chr) null else i;
+    }
+};
+
+/// True when the backslash run immediately before `t[i]` has even length, so
+/// a quote at `i` is a delimiter. An odd run escapes the quote (the middle
+/// quote in `'\''`), making it content — toggling on escaped content quotes
+/// leaves the state stuck and swallows the rest of the line. An even run
+/// (the closing quote in `'\\'`, `"\\"`) leaves the quote a delimiter.
+fn hasEvenBackslashRun(t: []const u8, i: usize) bool {
+    var backslashes: usize = 0;
+    var j = i;
+    while (j > 0 and t[j - 1] == '\\') : (j -= 1) backslashes += 1;
+    return backslashes % 2 == 0;
+}
+
 /// Check if a rule is disabled via inline comment
 pub fn isInlineDisabled(
     content: []const u8,

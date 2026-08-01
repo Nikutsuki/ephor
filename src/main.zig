@@ -22602,6 +22602,15 @@ fn printRecordedHash(allocator: Allocator, ver: []const u8) void {
 /// If install_version is provided, upgrades to that specific version;
 /// otherwise defaults to the binary's own version (EPHOR_VERSION).
 /// Refuses to resolve below EPHOR_VERSION unless force is set (EPH-I0193).
+/// Manifest-write invariant (EPH-I0271): only the init, install, and
+/// upgrade commands write project manifest files. Init writes ephor.json
+/// through writeDefaultConfig. Install writes build.zig.zon through
+/// zig fetch --save, build.zig through patchBuildZig, and ephor.json
+/// through createInstallConfig. Upgrade writes build.zig.zon through
+/// zig fetch --save, build.zig through updateBuildZigIntegration, and
+/// ephor.json through updateConfigVersion. The analysis commands never
+/// write project files. The test "analysis path never writes project
+/// manifest files" pins this invariant.
 fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8, force: bool) !void {
     // If no explicit version, fetch the latest from Codeberg tags API
     const fetched_ver = if (install_version == null) fetchLatestVersion(allocator) else null;
@@ -36744,6 +36753,175 @@ test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194
         try std.testing.expect(is_expected);
     }
     try std.testing.expectEqual(@as(usize, 2), entries);
+}
+
+// Zon fixture for the EPH-I0271 write guard: a consumer project that
+// depends on ephor. The hash is the real 0.13.5 value recorded in-tree.
+const analysis_write_guard_zon =
+    \\.{
+    \\    .name = .fixture,
+    \\    .version = "0.1.0",
+    \\    .dependencies = .{
+    \\        .ephor = .{
+    \\            .url = "https://codeberg.org/RhyosLabs/ephor/archive/v0.13.5.tar.gz",
+    \\            .hash = "ephor-0.13.5-p-Eoi8l4DwBnPTjUIikRbM-wANkuFfCs_4rXnR6ggX-M",
+    \\        },
+    \\    },
+    \\    .paths = .{"src"},
+    \\}
+    \\
+;
+
+// Config fixture for the EPH-I0271 write guard.
+const analysis_write_guard_config =
+    \\{
+    \\  "version": "0.13.5",
+    \\  "path_dir": "src",
+    \\  "entries": ["src/x.zig"]
+    \\}
+    \\
+;
+
+/// Drive the in-process analyzer battery of the .check command against
+/// cfg.path (EPH-I0271). Mirrors the .check arm in main: the known-issues
+/// probe, the scan, the orphan pass, then every file-touching analyzer.
+/// Excludes runFmtCheck: it spawns `zig fmt --check`, a read-only
+/// subprocess that needs a zig binary the test host does not guarantee.
+fn runCheckAnalysisBattery(allocator: Allocator, cfg: *Config) !void {
+    try loadKnownIssues(allocator, cfg);
+    var g = ImportGraph.init(allocator);
+    defer g.deinit();
+    g.scan_root = cfg.path;
+    try scanPath(&g, cfg.path);
+    // The fixture entry sits under the scan root, so .check's extra
+    // single-file entry scan no-ops; markReachable still needs the entry.
+    for (cfg.entries.items) |e| try g.markReachable(e);
+    try g.markBuildPathReferences(cfg);
+
+    var orphan_issues = try g.getOrphanIssues(allocator, cfg);
+    defer deinitIssues(&orphan_issues, allocator);
+    var cfg_mem_issues = try analyzeCFGMemory(allocator, &g);
+    defer deinitIssues(&cfg_mem_issues, allocator);
+    var cast_issues = try analyzeIntCastGuards(allocator, &g);
+    defer deinitIssues(&cast_issues, allocator);
+    var err_issues = try analyzeErrors(allocator, &g);
+    defer deinitIssues(&err_issues, allocator);
+    var ignored_issues = try analyzeIgnoredErrors(allocator, &g);
+    defer deinitIssues(&ignored_issues, allocator);
+    var unused_issues = try analyzeUnused(allocator, &g);
+    defer deinitIssues(&unused_issues, allocator);
+    var cx_issues = try analyzeComplexity(allocator, &g, cfg.thresholds);
+    defer deinitIssues(&cx_issues, allocator);
+    var style_issues = try analyzeStyle(allocator, &g, cfg.thresholds);
+    defer deinitIssues(&style_issues, allocator);
+    var naming_issues = try analyzeNaming(allocator, &g, cfg.error_naming);
+    defer deinitIssues(&naming_issues, allocator);
+    var test_issues = try analyzeTests(allocator, &g);
+    defer deinitIssues(&test_issues, allocator);
+    var conc_issues = try analyzeConcurrency(allocator, &g);
+    defer deinitIssues(&conc_issues, allocator);
+    var ast_stats = ast_tier.Stats{};
+    var ast_issues = try analyzeAstTier(allocator, &g, &ast_stats);
+    defer deinitIssues(&ast_issues, allocator);
+}
+
+/// Snapshot of the two manifest files the EPH-I0271 write guard watches.
+const ManifestSnapshot = struct {
+    zon: []u8,
+    config: []u8,
+
+    fn deinit(self: ManifestSnapshot, allocator: Allocator) void {
+        allocator.free(self.zon);
+        allocator.free(self.config);
+    }
+};
+
+/// Read both manifest fixtures from dir. WHY: the write-guard test
+/// snapshots the pair before and after the battery. One helper keeps the
+/// test under the 50-line limit and keeps the 4096-byte bound in one
+/// place.
+fn readManifestSnapshot(allocator: Allocator, dir: std.Io.Dir) !ManifestSnapshot {
+    const zon = try dir.readFileAlloc(
+        std.testing.io,
+        "build.zig.zon",
+        allocator,
+        .limited(4096),
+    );
+    errdefer allocator.free(zon);
+    const config = try dir.readFileAlloc(
+        std.testing.io,
+        CONFIG_FILENAME,
+        allocator,
+        .limited(4096),
+    );
+    return .{ .zon = zon, .config = config };
+}
+
+/// Write the fixture manifests and one source file into tmp. WHY: the
+/// EPH-I0271 write guard needs a consumer-project layout the analysis
+/// battery can scan but must never write.
+fn writeManifestFixture(tmp: *std.testing.TmpDir) !void {
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = analysis_write_guard_zon,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = CONFIG_FILENAME,
+        .data = analysis_write_guard_config,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/x.zig",
+        .data = "fn x() void {}\n",
+    });
+}
+
+test "analysis path never writes project manifest files (EPH-I0271)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Fixture: the manifests install/upgrade own, plus one source file.
+    try writeManifestFixture(&tmp);
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+
+    const before = try readManifestSnapshot(allocator, tmp.dir);
+    defer before.deinit(allocator);
+
+    // A Config pointing at the fixture, as `ephor check <dir>` builds it.
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, dir_path);
+    // Ownership of the duped entry moves to cfg.entries on append (the
+    // same single-expression transfer the CLI parsers use).
+    try cfg.entries.append(
+        allocator,
+        try std.fmt.allocPrint(allocator, "{s}/src/x.zig", .{dir_path}),
+    );
+
+    try runCheckAnalysisBattery(allocator, &cfg);
+
+    const after = try readManifestSnapshot(allocator, tmp.dir);
+    defer after.deinit(allocator);
+
+    // A future writer in the analysis path flips one of these red.
+    try std.testing.expectEqualStrings(before.zon, after.zon);
+    try std.testing.expectEqualStrings(before.config, after.config);
+
+    // No new files in the fixture root: no ephor.json creation, no
+    // .ephor-ignore, no zon backups.
+    var it = tmp.dir.iterate();
+    var root_entries: usize = 0;
+    while (try it.next(std.testing.io)) |entry| {
+        root_entries += 1;
+        const expected = mem.eql(u8, entry.name, "build.zig.zon") or
+            mem.eql(u8, entry.name, CONFIG_FILENAME) or
+            mem.eql(u8, entry.name, "src");
+        try std.testing.expect(expected);
+    }
+    try std.testing.expectEqual(@as(usize, 3), root_entries);
 }
 
 // ============================================================================

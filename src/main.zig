@@ -22402,7 +22402,8 @@ fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
         return;
     }
 
-    std.debug.print("Added ephor v{s} to build.zig.zon\n\n", .{ver});
+    printRecordedHash(allocator, ver);
+    std.debug.print("\n", .{});
 
     const patched = patchBuildZig(allocator) catch |err| {
         std.debug.print("Could not auto-patch build.zig: {}\n", .{err});
@@ -22507,6 +22508,96 @@ fn projectHasEphorDependency(allocator: Allocator) bool {
     return mem.indexOf(u8, content, ".ephor") != null;
 }
 
+/// True when the marker match at `pos` sits in code. Returns false when
+/// the line is a `\\` multiline string line (the whole line is string
+/// data), when the match follows a `//` comment opener on its line, or
+/// when the match is inside a string literal. The comment scan is
+/// quote-aware: the `//` in `https://` sits inside the URL string, so it
+/// never opens a comment (findCommentStart + isInsideString). WHY: raw
+/// marker searches must not match text a Zon reader treats as comment or
+/// string content, or stale text would shadow the live entry (EPH-I0139).
+fn isCodeMatch(content: []const u8, pos: usize) bool {
+    const before = content[0..pos];
+    const line_start = if (mem.lastIndexOfScalar(u8, before, '\n')) |nl| nl + 1 else 0;
+    const line_end = mem.indexOfScalarPos(u8, content, pos, '\n') orelse content.len;
+    const line = content[line_start..line_end];
+    const col = pos - line_start;
+    if (mem.startsWith(u8, mem.trimStart(u8, line, " \t"), "\\\\")) return false;
+    if (findCommentStart(line)) |comment_col| {
+        if (col >= comment_col) return false;
+    }
+    return !isInsideString(line, col);
+}
+
+/// First occurrence of `needle` at or after `start` that isCodeMatch
+/// accepts. Returns null when no occurrence sits in code.
+fn indexOfCode(content: []const u8, start: usize, needle: []const u8) ?usize {
+    var from = start;
+    while (mem.indexOfPos(u8, content, from, needle)) |pos| {
+        if (isCodeMatch(content, pos)) return pos;
+        from = pos + 1;
+    }
+    return null;
+}
+
+/// Extract the `.hash` value of the `.ephor` dependency entry from
+/// build.zig.zon content. Caller frees the result. Returns null on any
+/// miss: the fetch-time print is advisory and never fails the command
+/// (EPH-I0139). The marker is `.ephor =`, the shape zig fetch writes, so
+/// a project named "ephor" (`.name = .ephor`) cannot self-match. Assumes
+/// the single-object entry `.ephor = .{ .url = ..., .hash = "..." }`: the
+/// search window ends at the first `}` after the marker, so a missing
+/// hash cannot capture a later dependency's hash. isCodeMatch rejects a
+/// candidate marker inside a comment, inside a string, or on a `\\`
+/// multiline string line, so a stale commented-out entry cannot shadow
+/// the live one.
+fn parseEphorHashFromZon(allocator: Allocator, content: []const u8) ?[]u8 {
+    const dep_pos = indexOfCode(content, 0, ".ephor =") orelse return null;
+    const window_end = mem.indexOfScalarPos(u8, content, dep_pos, '}') orelse content.len;
+    const window = content[dep_pos..window_end];
+    const hash_marker = ".hash";
+    const marker_pos = indexOfCode(window, 0, hash_marker) orelse return null;
+    var pos = marker_pos + hash_marker.len;
+    while (pos < window.len and (window[pos] == ' ' or
+        window[pos] == '=' or window[pos] == '\t')) : (pos += 1)
+    {}
+    if (pos >= window.len or window[pos] != '"') return null;
+    pos += 1;
+    const end = mem.indexOfScalarPos(u8, window, pos, '"') orelse return null;
+    const hash = window[pos..end];
+    if (hash.len == 0) return null;
+    return allocator.dupe(u8, hash) catch null;
+}
+
+/// Read the ephor dependency hash recorded in the working directory's
+/// build.zig.zon. Caller frees the result. Returns null on any read or
+/// parse miss (EPH-I0139).
+fn readRecordedEphorHash(allocator: Allocator) ?[]u8 {
+    const content = Fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch
+        return null;
+    defer allocator.free(content);
+    return parseEphorHashFromZon(allocator, content);
+}
+
+/// Print the installed version with the hash recorded in build.zig.zon,
+/// plus the trust-on-first-use note. WHY: the first fetch trusts the
+/// download channel, so the printed hash is the user's comparison
+/// baseline for later upgrades (EPH-I0139). When the hash is unreadable,
+/// print the version alone and skip the note: no fabricated values.
+fn printRecordedHash(allocator: Allocator, ver: []const u8) void {
+    const hash = readRecordedEphorHash(allocator) orelse {
+        std.debug.print("Installed ephor v{s}.\n", .{ver});
+        return;
+    };
+    defer allocator.free(hash);
+    std.debug.print("Installed ephor v{s} (hash {s}).\n", .{ ver, hash });
+    std.debug.print(
+        \\The first fetch trusts the download channel.
+        \\Record this hash from build.zig.zon and compare it on every upgrade.
+        \\
+    , .{});
+}
+
 /// Run the upgrade command: updates ephor dependency in build.zig.zon.
 /// If install_version is provided, upgrades to that specific version;
 /// otherwise defaults to the binary's own version (EPHOR_VERSION).
@@ -22556,6 +22647,8 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8, force: 
         std.debug.print("Failed to upgrade ephor to v{s}.\n", .{ver});
         return;
     }
+
+    printRecordedHash(allocator, ver);
 
     // Update version in ephor.json if it exists
     updateConfigVersion(allocator, ver);
@@ -36451,6 +36544,153 @@ test "upgradeFloorAllows blocks downgrades without force (EPH-I0193)" {
     try std.testing.expect(upgradeFloorAllows("0.14.3", "0.15.0", false));
     // Unparseable targets pass the floor: EPH-I0166 owns flag validation.
     try std.testing.expect(upgradeFloorAllows("0.14.3", "garbage", false));
+}
+
+test "parseEphorHashFromZon extracts the hash from a zig-written entry (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    const zon =
+        \\.{
+        \\    .name = .demo,
+        \\    .version = "1.0.0",
+        \\    .dependencies = .{
+        \\        .ephor = .{
+        \\            .url = "https://codeberg.org/RhyosLabs/ephor/archive/v0.13.5.tar.gz",
+        \\            .hash = "ephor-0.13.5-p-Eoi8l4DwBnPTjUIikRbM-wANkuFfCs_4rXnR6ggX-M",
+        \\        },
+        \\    },
+        \\}
+    ;
+    const hash = parseEphorHashFromZon(allocator, zon).?;
+    defer allocator.free(hash);
+    try std.testing.expectEqualStrings(
+        "ephor-0.13.5-p-Eoi8l4DwBnPTjUIikRbM-wANkuFfCs_4rXnR6ggX-M",
+        hash,
+    );
+}
+
+test "parseEphorHashFromZon reads a single-line entry (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    const zon =
+        \\.{ .dependencies = .{ .ephor = .{ .url = "https://x", .hash = "1220abcdef" } } }
+    ;
+    const hash = parseEphorHashFromZon(allocator, zon).?;
+    defer allocator.free(hash);
+    try std.testing.expectEqualStrings("1220abcdef", hash);
+}
+
+test "parseEphorHashFromZon returns null when the ephor entry has no hash (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    // The window ends at the entry close, so a later dependency's hash
+    // must not leak into the ephor result.
+    const zon =
+        \\.{
+        \\    .dependencies = .{
+        \\        .ephor = .{
+        \\            .url = "https://codeberg.org/RhyosLabs/ephor/archive/v0.13.5.tar.gz",
+        \\        },
+        \\        .other = .{
+        \\            .hash = "other-1.0.0-deadbeef",
+        \\        },
+        \\    },
+        \\}
+    ;
+    try std.testing.expect(parseEphorHashFromZon(allocator, zon) == null);
+}
+
+test "parseEphorHashFromZon returns null when ephor is not a dependency (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    // A project named "ephor" (`.name = .ephor`) must not self-match.
+    const zon =
+        \\.{
+        \\    .name = .ephor,
+        \\    .version = "0.14.3",
+        \\    .dependencies = .{
+        \\        .other = .{ .hash = "other-1.0.0-deadbeef" },
+        \\    },
+        \\}
+    ;
+    try std.testing.expect(parseEphorHashFromZon(allocator, zon) == null);
+}
+
+test "parseEphorHashFromZon returns null on garbage (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(parseEphorHashFromZon(allocator, "") == null);
+    try std.testing.expect(parseEphorHashFromZon(allocator, "not a zon file") == null);
+    try std.testing.expect(parseEphorHashFromZon(allocator, ".ephor = .{ .hash = }") == null);
+    try std.testing.expect(parseEphorHashFromZon(allocator, ".ephor = .{ .hash = \"\" }") == null);
+}
+
+test "parseEphorHashFromZon skips a commented-out stale entry (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    const zon =
+        \\.{
+        \\    .dependencies = .{
+        \\        // .ephor = .{ .url = "https://old.example", .hash = "OLD-hash" },
+        \\        .ephor = .{
+        \\            .url = "https://codeberg.org/RhyosLabs/ephor/archive/v0.13.5.tar.gz",
+        \\            .hash = "REAL-hash",
+        \\        },
+        \\    },
+        \\}
+    ;
+    const hash = parseEphorHashFromZon(allocator, zon).?;
+    defer allocator.free(hash);
+    try std.testing.expectEqualStrings("REAL-hash", hash);
+}
+
+test "parseEphorHashFromZon skips a hash in a comment inside the entry (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    const zon =
+        \\.{
+        \\    .dependencies = .{
+        \\        .ephor = .{
+        \\            .url = "https://codeberg.org/RhyosLabs/ephor/archive/v0.13.5.tar.gz",
+        \\            // .hash = "OLD-hash",
+        \\            .hash = "REAL-hash",
+        \\        },
+        \\    },
+        \\}
+    ;
+    const hash = parseEphorHashFromZon(allocator, zon).?;
+    defer allocator.free(hash);
+    try std.testing.expectEqualStrings("REAL-hash", hash);
+}
+
+test "parseEphorHashFromZon skips a marker on a multiline string line (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    const zon =
+        \\.{
+        \\    .name = .demo,
+        \\    .description =
+        \\        \\notes mention .ephor = .{ .hash = "OLD-hash" } here
+        \\    ,
+        \\    .dependencies = .{
+        \\        .ephor = .{
+        \\            .hash = "REAL-hash",
+        \\        },
+        \\    },
+        \\}
+    ;
+    const hash = parseEphorHashFromZon(allocator, zon).?;
+    defer allocator.free(hash);
+    try std.testing.expectEqualStrings("REAL-hash", hash);
+}
+
+test "parseEphorHashFromZon skips a hash marker inside a string value (EPH-I0139)" {
+    const allocator = std.testing.allocator;
+    const zon =
+        \\.{
+        \\    .dependencies = .{
+        \\        .ephor = .{
+        \\            .url = "https://example.com/ephor.tgz?x=.hash=\"OLD-hash\"",
+        \\            .hash = "REAL-hash",
+        \\        },
+        \\    },
+        \\}
+    ;
+    const hash = parseEphorHashFromZon(allocator, zon).?;
+    defer allocator.free(hash);
+    try std.testing.expectEqualStrings("REAL-hash", hash);
 }
 
 test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194)" {

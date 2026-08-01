@@ -59,6 +59,20 @@ If you already have the `ephor-upgrade` step in `build.zig`:
 zig build ephor-upgrade
 ```
 
+### Upgrade Integrity
+
+The first install or upgrade fetches whatever the release tag points to.
+zig fetch records the content hash of that download in `build.zig.zon`. This
+model is trust on first use (TOFU). The download channel is the only check
+on the first fetch.
+
+- Ephor prints the recorded hash after every fetch. Compare it across
+  upgrades to catch a changed artifact.
+- Upgrades refuse to move below the running binary's version. Pass
+  `--force` to override.
+- Cryptographic signature verification is planned. It is tracked as
+  EPH-I0287.
+
 ### Update Check
 
 Analysis commands (everything except `help`, `version`, `init`, `install`,
@@ -582,6 +596,8 @@ Options:
   --max-file-bytes=N   Max file size in bytes (requires --enable=ZA702)
   -y, --yes            Skip interactive confirmation (e.g., runtime approval)
   --version=<X.Y.Z>   For install/upgrade: pin a specific version
+  --force             For upgrade: allow a downgrade below the running
+                      binary's version (refused by default)
   --command=<cmd>      For runtime: custom command instead of 'zig build test'
   -V, --verbose        Verbose output
   -s, --summary        Show summary at end (off by default)

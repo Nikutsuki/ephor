@@ -135,6 +135,11 @@ var entries_reject_count: usize = 0;
 /// tests reset it to pin that semantics with stderr muted.
 var entries_reject_note_count: usize = 0;
 
+/// Test hook: counts zig fmt output lines the EPH-I0197 safety gates
+/// rejected (hostile bytes, outside-root paths). Tests reset it to assert
+/// rejections fired without reading stderr.
+var fmt_reject_count: usize = 0;
+
 /// Test hook: counts threshold values clamped at the documented maxima.
 var threshold_clamp_count: usize = 0;
 
@@ -20068,24 +20073,69 @@ fn analyzeIntCastGuards(
     return issues;
 }
 
+/// Run zig fmt --check on `path` and parse its output into ZA601
+/// findings. Different toolchains write the list to different
+/// streams. Both go through parseFmtOutput, which owns every name it
+/// keeps and gates the untrusted bytes.
 fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-
     const result = std.process.run(allocator, global_io.?, .{
         .argv = &.{ "zig", "fmt", "--check", path },
     }) catch |err| {
         std.debug.print("error: cannot run zig fmt: {}\n", .{err});
-        return issues;
+        return .empty;
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    var lines = mem.splitScalar(u8, result.stderr, '\n');
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root_real = scanRootRealpath(path, &root_buf);
+    // Different toolchains write the needs-format list to different
+    // streams, so parse both. The defers above free both buffers at
+    // return: the parse must own every name it keeps (EPH-I0196).
+    var issues = try parseFmtOutput(allocator, result.stdout, root_real);
+    errdefer deinitIssues(&issues, allocator);
+    var stderr_issues = try parseFmtOutput(allocator, result.stderr, root_real);
+    errdefer deinitIssues(&stderr_issues, allocator);
+    try issues.appendSlice(allocator, stderr_issues.items);
+    // Item ownership moved with the append. Only the array frees here.
+    stderr_issues.deinit(allocator);
+    return issues;
+}
+
+/// Parse `zig fmt --check` output into ZA601 findings. Kept names are
+/// duped and marked file_owned: the caller frees the child buffers after
+/// return, while findings print later (EPH-I0196). The bytes are
+/// untrusted filesystem metadata. Gates: printable ASCII only, a .zig
+/// suffix, resolution inside root_real (EPH-I0197). A null root_real
+/// fails closed. Each rejected hostile line prints one sanitized note.
+fn parseFmtOutput(
+    allocator: Allocator,
+    output_bytes: []const u8,
+    root_real: ?[]const u8,
+) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
+
+    var lines = mem.splitScalar(u8, output_bytes, '\n');
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (t.len == 0 or !mem.endsWith(u8, t, ".zig")) continue;
+        if (t.len == 0) continue;
+        if (!isPrintableAscii(t)) {
+            try rejectFmtLine(allocator, t, "control or non-ASCII bytes in the path");
+            continue;
+        }
+        // Not a bare file name (zig fmt parse errors, status lines). The
+        // pre-gate filter, kept silent so a broken build stays quiet.
+        if (!mem.endsWith(u8, t, ".zig")) continue;
+        if (!resolvesInRoot(t, root_real)) {
+            try rejectFmtLine(allocator, t, "the path points outside the scan root");
+            continue;
+        }
+        const owned = try allocator.dupe(u8, t);
+        errdefer allocator.free(owned);
         try issues.append(allocator, .{
-            .file = t,
+            .file = owned,
+            .file_owned = true,
             .line = 1,
             .col = 1,
             .severity = .warning,
@@ -20094,8 +20144,17 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
             .help = "run 'zig fmt' to fix",
         });
     }
-
     return issues;
+}
+
+/// Count and report one rejected zig fmt output line (EPH-I0197). The
+/// line failed a safety gate, so its bytes are hostile by definition and
+/// pass through sanitizeTerminal before they reach the terminal.
+fn rejectFmtLine(allocator: Allocator, line: []const u8, cause: []const u8) !void {
+    fmt_reject_count += 1;
+    var safe = try types.sanitizeTerminal(allocator, line);
+    defer safe.deinit(allocator);
+    cliDiag("note: ignoring zig fmt output line {s}: {s}\n", .{ safe.slice, cause });
 }
 
 // ============================================================================
@@ -21831,6 +21890,43 @@ fn isPathAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
     if (root.len == 0 or path.len <= root.len) return false;
     if (!mem.startsWith(u8, path, root)) return false;
     return isPathSep(path[root.len]) or isPathSep(root[root.len - 1]);
+}
+
+/// True when every byte of `s` is printable ASCII (0x20..0x7E inclusive).
+/// Filenames from child-process stderr are untrusted: a control byte in a
+/// finding path can clear the terminal or forge log lines (EPH-I0197).
+/// Real non-ASCII names fail this gate too. The skip is deliberate: a
+/// lost fmt finding beats a path ephor cannot render safely.
+fn isPrintableAscii(s: []const u8) bool {
+    for (s) |c| {
+        if (c < 0x20 or c > 0x7E) return false;
+    }
+    return true;
+}
+
+/// True when `name` resolves (symlinks and ".." included) to a path at or
+/// under `root_real`. Fails closed: an unresolvable name or a null root
+/// is not contained. Shared by the gates that trust a subprocess path:
+/// the fmt finding parser (EPH-I0197), the export snippet reader
+/// (EPH-I0198), and later the ZR1xx located findings (EPH-I0202).
+fn resolvesInRoot(name: []const u8, root_real: ?[]const u8) bool {
+    const root = root_real orelse return false;
+    var buf: [Fs.max_path_bytes]u8 = undefined;
+    const resolved = Fs.cwd().realpath(name, &buf) catch return false;
+    return isPathAncestorOrEqual(root, resolved);
+}
+
+/// Canonical containment root for a scan path: the realpath itself for a
+/// directory scan, its dirname for a single-file scan (ephor check
+/// file.zig). The dirname keeps the root a directory, the shape every
+/// containment gate in ephor expects, and the scanned file still passes
+/// the ancestor test against its own directory. Returns null when the
+/// path does not resolve, so callers fail closed.
+fn scanRootRealpath(path: []const u8, buf: *[Fs.max_path_bytes]u8) ?[]const u8 {
+    const real = Fs.cwd().realpath(path, buf) catch return null;
+    const stat = Fs.cwd().statFile(path) catch return null;
+    if (stat.kind != .file) return real;
+    return std.fs.path.dirname(real) orelse real;
 }
 
 /// Trust test for config files (RED3-x): a config is trusted when its
@@ -24180,32 +24276,47 @@ fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
     return false;
 }
 
-/// Export issues to a file with code snippets
-/// Write a code snippet around a given line from a file. Embedded source
-/// lines pass through types.sanitizeSnippet: control bytes and
+/// Path pair for one export run. base_path is the raw configured scan
+/// path and drives relative display paths. scan_root_real is the
+/// canonical containment root for snippet reads (EPH-I0198). A null root
+/// fails closed: the export writes no snippet.
+const ExportPathCtx = struct {
+    base_path: []const u8,
+    scan_root_real: ?[]const u8,
+};
+
+/// Write a code snippet around the issue's line from its file. Embedded
+/// source lines pass through types.sanitizeSnippet: control bytes and
 /// fence-capable backtick runs become placeholders, so a hostile line can
 /// neither break the export fence nor forge prose around it (EPH-I0162).
+/// The finding path itself is repo-derived (EPH-I0197 is one injection
+/// channel). The upstream scope filter is lexical only. The read is
+/// therefore contained: issue.file must resolve at or under
+/// scan_root_real, else no snippet (EPH-I0198). An unresolvable path
+/// skips the same way. That preserves the long-standing skip for a
+/// finding whose file was deleted.
 fn writeCodeSnippet(
     allocator: Allocator,
     output: *std.ArrayListUnmanaged(u8),
-    issue_file: []const u8,
-    issue_line: usize,
+    issue: Issue,
+    scan_root_real: ?[]const u8,
 ) !void {
-    const content = Fs.cwd().readFileAlloc(allocator, issue_file, 10 * 1024 * 1024) catch return;
+    if (!resolvesInRoot(issue.file, scan_root_real)) return;
+    const content = Fs.cwd().readFileAlloc(allocator, issue.file, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
     var line_num: usize = 1;
     try output.print(allocator, "```zig\n", .{});
 
-    const start_line = if (issue_line > 2) issue_line - 2 else 1;
-    const end_line = issue_line + 2;
+    const start_line = if (issue.line > 2) issue.line - 2 else 1;
+    const end_line = issue.line + 2;
 
     while (line_iter.next()) |line| {
         defer line_num += 1;
         if (line_num > end_line) break;
         if (line_num < start_line) continue;
-        const prefix: []const u8 = if (line_num == issue_line) ">>> " else "    ";
+        const prefix: []const u8 = if (line_num == issue.line) ">>> " else "    ";
         // CRLF sources carry a structural trailing CR. The CR is
         // line-ending framing, not content, so the code trims it instead
         // of replacing it with a placeholder.
@@ -24220,14 +24331,15 @@ fn writeCodeSnippet(
 /// Write a single issue entry to the export writer. Every repo-derived
 /// field (path, message, help) passes through types.sanitizeMarkdown so
 /// hostile bytes cannot inject markdown structure or terminal controls
-/// into issues.md (EPH-I0162).
+/// into issues.md (EPH-I0162). paths carries the display base and the
+/// snippet containment root (EPH-I0198).
 fn writeExportIssue(
     allocator: Allocator,
     output: *std.ArrayListUnmanaged(u8),
     issue: Issue,
-    base_path: []const u8,
+    paths: ExportPathCtx,
 ) !void {
-    const rel_path = types.relativePath(issue.file, base_path);
+    const rel_path = types.relativePath(issue.file, paths.base_path);
     var safe_path = try types.sanitizeMarkdown(allocator, rel_path);
     defer safe_path.deinit(allocator);
     var safe_msg = try types.sanitizeMarkdown(allocator, issue.message);
@@ -24243,7 +24355,7 @@ fn writeExportIssue(
         defer safe_help.deinit(allocator);
         try output.print(allocator, "**Help**: {s}\n", .{safe_help.slice});
     }
-    try writeCodeSnippet(allocator, output, issue.file, issue.line);
+    try writeCodeSnippet(allocator, output, issue, paths.scan_root_real);
     try output.print(allocator, "---\n\n", .{});
 }
 
@@ -24356,18 +24468,13 @@ const ReportOutCtx = struct {
     suppression: *SuppressionStats,
 };
 
-fn exportIssues(
+/// Write the export document header: title, generation timestamp in UTC,
+/// and the filtered issue total.
+fn writeExportHeader(
     allocator: Allocator,
-    export_path: []const u8,
-    all_issues: []const Issue,
-    out: ReportOutCtx,
-) !usize {
-    var file = try Fs.cwd().createFile(export_path, .{});
-    defer file.close(global_io.?);
-
-    var output = std.ArrayListUnmanaged(u8).empty;
-    defer output.deinit(allocator);
-
+    output: *std.ArrayListUnmanaged(u8),
+    filtered_count: usize,
+) !void {
     const ts: u64 = @intCast(std.Io.Clock.Timestamp.now(global_io.?, .real).raw.toSeconds());
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = ts };
     const day_secs = epoch_secs.getDaySeconds();
@@ -24382,15 +24489,38 @@ fn exportIssues(
         day_secs.getMinutesIntoHour(),
         day_secs.getSecondsIntoMinute(),
     });
+    try output.print(allocator, "# Total issues: {d}\n\n", .{filtered_count});
+}
+
+fn exportIssues(
+    allocator: Allocator,
+    export_path: []const u8,
+    all_issues: []const Issue,
+    out: ReportOutCtx,
+) !usize {
+    var file = try Fs.cwd().createFile(export_path, .{});
+    defer file.close(global_io.?);
+
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(allocator);
+
     var filtered_count: usize = 0;
     for (all_issues) |issue| {
         if (shouldPrintIssue(issue, out)) filtered_count += 1;
     }
-    try output.print(allocator, "# Total issues: {d}\n\n", .{filtered_count});
+    try writeExportHeader(allocator, &output, filtered_count);
 
+    // The display base stays the raw configured path. The snippet
+    // containment root is the canonical scan root (EPH-I0198). A null
+    // root fails closed and the export writes no snippets.
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const paths = ExportPathCtx{
+        .base_path = out.cfg.path,
+        .scan_root_real = scanRootRealpath(out.cfg.path, &root_buf),
+    };
     for (all_issues) |issue| {
         if (!shouldPrintIssue(issue, out)) continue;
-        try writeExportIssue(allocator, &output, issue, out.cfg.path);
+        try writeExportIssue(allocator, &output, issue, paths);
     }
     // RED3-3: the export carries the same accounting as the stderr note.
     // The printIssues passes already counted the suppression. This
@@ -49216,7 +49346,12 @@ test "writeExportIssue neutralizes markdown metacharacters and control bytes" {
     };
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(allocator);
-    try writeExportIssue(allocator, &output, issue, "/repo");
+    // Null containment root fails closed: no snippet, and the test does
+    // not touch the filesystem (EPH-I0198).
+    try writeExportIssue(allocator, &output, issue, .{
+        .base_path = "/repo",
+        .scan_root_real = null,
+    });
 
     // The newline in the message cannot forge a markdown heading line.
     try std.testing.expect(mem.indexOf(u8, output.items, "\n## heading") == null);
@@ -49239,10 +49374,21 @@ test "writeCodeSnippet neutralizes fence sequences in source lines" {
     });
     const path = try tmpFilePath(allocator, &tmp, "snip.zig");
     defer allocator.free(path);
+    const root = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(root);
+    const issue = Issue{
+        .file = path,
+        .line = 2,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "m",
+        .help = null,
+    };
 
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(allocator);
-    try writeCodeSnippet(allocator, &output, path, 2);
+    try writeCodeSnippet(allocator, &output, issue, root);
 
     // The embedded fence line is stripped to placeholders: exactly the two
     // wrapper fences carry a backtick run.
@@ -49420,4 +49566,219 @@ test "EPH-I0191: analyzeAstTier parses within-budget nesting" {
     defer deinitIssues(&issues, a);
     try std.testing.expectEqual(@as(usize, 1), stats.parsed);
     try std.testing.expectEqual(@as(usize, 0), stats.skipped);
+}
+
+// ============================================================================
+// Subprocess finding gates (EPH-I0196, EPH-I0197, EPH-I0198)
+// ============================================================================
+
+/// Issue factory for the export/fmt gate tests: line 1, warning, ZA101.
+fn makeTestIssue(file: []const u8) Issue {
+    return .{
+        .file = file,
+        .line = 1,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA101",
+        .message = "m",
+        .help = null,
+    };
+}
+
+test "parseFmtOutput findings own their file bytes after the source frees" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    global_io = std.testing.io;
+    fmt_reject_count = 0;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "fn a() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.zig", .data = "fn b() void {}\n" });
+    const root = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(root);
+    const a_path = try tmpFilePath(allocator, &tmp, "a.zig");
+    defer allocator.free(a_path);
+    const b_path = try tmpFilePath(allocator, &tmp, "b.zig");
+    defer allocator.free(b_path);
+
+    const source = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ a_path, b_path });
+    // No defer: the test frees the source before the reads, replicating
+    // runFmtCheck's free-then-print order (EPH-I0196).
+    var issues = try parseFmtOutput(allocator, source, root);
+    defer deinitIssues(&issues, allocator);
+    allocator.free(source);
+
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expect(issues.items[0].file_owned);
+    try std.testing.expectEqualStrings(a_path, issues.items[0].file);
+    try std.testing.expectEqualStrings(b_path, issues.items[1].file);
+
+    // The production print path reads .file after the source is gone.
+    var out = types.OutBuf{ .allocator = allocator };
+    defer out.deinit();
+    for (issues.items) |issue| try issue.formatText(root, &out);
+    try std.testing.expect(mem.indexOf(u8, out.buf.items, "a.zig: warning[ZA601]") != null);
+    try std.testing.expectEqual(@as(usize, 0), fmt_reject_count);
+    // deinitIssues frees each owned name exactly once. The DebugAllocator
+    // flags a borrow (invalid free) or a double free when this is wrong.
+}
+
+test "parseFmtOutput rejects control and non-ASCII bytes" {
+    const allocator = std.testing.allocator;
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    fmt_reject_count = 0;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ok.zig", .data = "" });
+    const root = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(root);
+    const ok_path = try tmpFilePath(allocator, &tmp, "ok.zig");
+    defer allocator.free(ok_path);
+
+    const source = try std.fmt.allocPrint(allocator, "{s}\x1b[2J\n{s}\x01\n{s}\xc3\xa9.zig\n{s}\n", .{
+        root, root, root, ok_path,
+    });
+    defer allocator.free(source);
+
+    var issues = try parseFmtOutput(allocator, source, root);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(ok_path, issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 3), fmt_reject_count);
+}
+
+test "parseFmtOutput silently skips zig fmt lines that are not file names" {
+    const allocator = std.testing.allocator;
+    fmt_reject_count = 0;
+
+    // Parse errors and status lines never reach the safety gates, so a
+    // broken build stays quiet and the reject counter does not move.
+    const source = "src/main.zig:3:1: error: expected ';', found '}'\n" ++
+        "note: 1 file did not parse\n";
+    var issues = try parseFmtOutput(allocator, source, null);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fmt_reject_count);
+}
+
+test "parseFmtOutput rejects paths that resolve outside the scan root" {
+    const allocator = std.testing.allocator;
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    fmt_reject_count = 0;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "escape.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sub/inside.zig", .data = "" });
+    const root = try tmpFilePath(allocator, &tmp, "sub");
+    defer allocator.free(root);
+    const escape = try tmpFilePath(allocator, &tmp, "escape.zig");
+    defer allocator.free(escape);
+    const trav_out = try std.fmt.allocPrint(allocator, "{s}/../escape.zig", .{root});
+    defer allocator.free(trav_out);
+    const trav_in = try std.fmt.allocPrint(allocator, "{s}/../sub/inside.zig", .{root});
+    defer allocator.free(trav_in);
+
+    const source = try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n", .{
+        escape, trav_out, trav_in,
+    });
+    defer allocator.free(source);
+    var issues = try parseFmtOutput(allocator, source, root);
+    defer deinitIssues(&issues, allocator);
+
+    // The absolute outside path and the escaping traversal are rejected.
+    // The traversal that lands back inside the root is accepted and keeps
+    // its original spelling: resolution is the gate, not the ".." text.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(trav_in, issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 2), fmt_reject_count);
+
+    // A null root fails closed, even for a plain in-root-looking name.
+    var closed = try parseFmtOutput(allocator, "src/ok.zig\n", null);
+    defer deinitIssues(&closed, allocator);
+    try std.testing.expectEqual(@as(usize, 0), closed.items.len);
+    try std.testing.expectEqual(@as(usize, 3), fmt_reject_count);
+}
+
+test "writeCodeSnippet skips out-of-root and unresolvable paths" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sub/inside.zig", .data = "fn i() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "escape.zig", .data = "fn s() void {}\n" });
+    const root = try tmpFilePath(allocator, &tmp, "sub");
+    defer allocator.free(root);
+    const inside = try tmpFilePath(allocator, &tmp, "sub/inside.zig");
+    defer allocator.free(inside);
+    const forged = try std.fmt.allocPrint(allocator, "{s}/../escape.zig", .{root});
+    defer allocator.free(forged);
+    const missing = try tmpFilePath(allocator, &tmp, "sub/gone.zig");
+    defer allocator.free(missing);
+
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(allocator);
+    // EPH-I0198: a forged finding path escapes the root and gets no
+    // snippet, not even an empty fence.
+    try writeCodeSnippet(allocator, &output, makeTestIssue(forged), root);
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+    // A deleted file skips, preserving the old catch-return behavior.
+    try writeCodeSnippet(allocator, &output, makeTestIssue(missing), root);
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+    // A null root fails closed even for a real in-root file.
+    try writeCodeSnippet(allocator, &output, makeTestIssue(inside), null);
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+}
+
+test "writeCodeSnippet keeps an in-root snippet with the marker line" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = "fn a() void {}\nfn b() void {}\nfn c() void {}\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ok.zig", .data = content });
+    const path = try tmpFilePath(allocator, &tmp, "ok.zig");
+    defer allocator.free(path);
+    const root = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(root);
+
+    var issue = makeTestIssue(path);
+    issue.line = 2;
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(allocator);
+    try writeCodeSnippet(allocator, &output, issue, root);
+
+    try std.testing.expect(mem.indexOf(u8, output.items, "```zig\n") != null);
+    try std.testing.expect(mem.indexOf(u8, output.items, ">>> 2: fn b() void {}") != null);
+}
+
+test "scanRootRealpath roots a file scan at the file's directory" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "one.zig", .data = "" });
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const file_path = try tmpFilePath(allocator, &tmp, "one.zig");
+    defer allocator.free(file_path);
+
+    var buf: [Fs.max_path_bytes]u8 = undefined;
+    // Read dir_root before the second call overwrites the shared buffer.
+    const dir_root = scanRootRealpath(dir_path, &buf);
+    try std.testing.expectEqualStrings(dir_path, dir_root.?);
+    const file_root = scanRootRealpath(file_path, &buf);
+    try std.testing.expectEqualStrings(dir_path, file_root.?);
+    try std.testing.expect(scanRootRealpath("/nonexistent-ephor-test", &buf) == null);
 }

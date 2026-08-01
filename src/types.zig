@@ -209,11 +209,19 @@ pub const Issue = struct {
     message: []const u8,
     help: ?[]const u8,
     message_owned: bool = false,
+    /// True when `file` is heap-owned by this issue and deinit must free
+    /// it. A finding parsed from child-process output outlives that
+    /// output, so the producer dupes the name and sets this (EPH-I0196).
+    file_owned: bool = false,
 
     pub fn deinit(self: *Issue, allocator: Allocator) void {
         if (self.message_owned) {
             allocator.free(self.message);
             self.message_owned = false;
+        }
+        if (self.file_owned) {
+            allocator.free(self.file);
+            self.file_owned = false;
         }
     }
 
@@ -788,7 +796,7 @@ pub const FileAnalysis = struct {
 // Utility Functions
 // ============================================================================
 
-/// Properly deinit an issues array, freeing any owned messages
+/// Properly deinit an issues array, freeing any owned messages and owned file bytes
 pub fn deinitIssues(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,

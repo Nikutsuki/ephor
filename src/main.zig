@@ -15085,39 +15085,65 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     };
 }
 
-/// State for tracking string/char literals while parsing
+/// State for masking string/char literals and comments while parsing a line
 const LiteralState = struct {
     in_str: bool = false,
     in_chr: bool = false,
+    in_comment: bool = false,
+
+    /// Start masking for one line. Returns null when the line is a
+    /// multiline-string body — after optional leading whitespace, `\\` makes
+    /// the whole line string data, so no position on it is code (Zig has no
+    /// block comments, so this is the only whole-line data form).
+    fn forLine(line: []const u8) ?LiteralState {
+        const t = mem.trimStart(u8, line, " \t");
+        if (mem.startsWith(u8, t, "\\\\")) return null;
+        return .{};
+    }
 
     /// Returns the position to process as code, or null when the char is
-    /// string/char-literal data (including the delimiters themselves).
+    /// string/char-literal data or comment text (including the delimiters
+    /// themselves).
     fn updateForChar(self: *LiteralState, t: []const u8, i: usize) ?usize {
+        if (self.in_comment) return null;
         const c = t[i];
-        if (c == '\'' and !self.in_str) {
-            // A quote is a char-literal delimiter only when the backslash
-            // run before it is EVEN; an odd run escapes it (`'\''`, `'\\'`),
-            // making it content. Toggling on escaped content quotes leaves
-            // in_chr stuck and swallows the rest of the line's braces.
-            var backslashes: usize = 0;
-            var j = i;
-            while (j > 0 and t[j - 1] == '\\') : (j -= 1) backslashes += 1;
-            if (backslashes % 2 == 0) self.in_chr = !self.in_chr;
+        // `//` opens a comment only in code context — inside a string or char
+        // literal it is data. A comment swallows the rest of the line.
+        if (c == '/' and !self.in_str and !self.in_chr and
+            i + 1 < t.len and t[i + 1] == '/')
+        {
+            self.in_comment = true;
             return null;
         }
-        if (c == '"' and !self.in_chr and (i == 0 or t[i - 1] != '\\')) {
-            self.in_str = !self.in_str;
+        if (c == '\'' and !self.in_str) {
+            if (hasEvenBackslashRun(t, i)) self.in_chr = !self.in_chr;
+            return null;
+        }
+        if (c == '"' and !self.in_chr) {
+            if (hasEvenBackslashRun(t, i)) self.in_str = !self.in_str;
             return null;
         }
         return if (self.in_str or self.in_chr) null else i;
     }
 };
 
+/// True when the backslash run immediately before `t[i]` has even length, so
+/// a quote at `i` is a delimiter. An odd run escapes the quote (the middle
+/// quote in `'\''`), making it content — toggling on escaped content quotes
+/// leaves the state stuck and swallows the rest of the line. An even run
+/// (the closing quote in `'\\'`, `"\\"`) leaves the quote a delimiter.
+fn hasEvenBackslashRun(t: []const u8, i: usize) bool {
+    var backslashes: usize = 0;
+    var j = i;
+    while (j > 0 and t[j - 1] == '\\') : (j -= 1) backslashes += 1;
+    return backslashes % 2 == 0;
+}
+
 /// Track brace nesting, returns true if function ended.
 /// Also updates cognitive nesting via cog_markers and cog_nest.
 fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     const is_switch = mem.indexOf(u8, t, "=>") != null;
-    var lit = LiteralState{};
+    var lit = LiteralState.forLine(t) orelse return false;
     var first = true;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
@@ -20580,23 +20606,47 @@ fn isIgnoreCommentLine(line: []const u8, rule: []const u8) bool {
 }
 
 /// `{` braces left unmatched at end of line; a `}` at depth 0 is ignored,
-/// matching the scope tracker's floor-at-zero counting.
+/// matching the scope tracker's floor-at-zero counting. Only braces in code
+/// context count: braces inside strings, char literals, and comments are
+/// data, and counting them leaks the suppression scope past the real
+/// closing brace.
 fn unmatchedOpenBraces(line: []const u8) usize {
+    var lit = LiteralState.forLine(line) orelse return 0;
     var depth: usize = 0;
-    for (line) |ch| {
-        if (ch == '{') depth += 1;
-        if (ch == '}' and depth > 0) depth -= 1;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const pos = lit.updateForChar(line, i) orelse continue;
+        if (line[pos] == '{') depth += 1;
+        if (line[pos] == '}' and depth > 0) depth -= 1;
     }
     return depth;
 }
 
+/// True when `line` holds a `{` in code context. A brace inside a string,
+/// char literal, or comment is data — it must not open a suppression scope.
+fn hasCodeOpenBrace(line: []const u8) bool {
+    var lit = LiteralState.forLine(line) orelse return false;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const pos = lit.updateForChar(line, i) orelse continue;
+        if (line[pos] == '{') return true;
+    }
+    return false;
+}
+
 /// Advance scope tracking across one line. True when the target line is
-/// inside the still-open scope or is the line that closes it. Scanning stops
-/// at the closing brace, so trailing text is not treated as scope content.
+/// inside the still-open scope or is the line that closes it. Only braces in
+/// code context count — a brace inside a string, char literal, or comment
+/// would otherwise close the scope early or hold it open to EOF. Scanning
+/// stops at the closing brace, so trailing text is not treated as scope
+/// content.
 fn consumeIgnoredScopeLine(scope: *ScopeIgnore, line: []const u8, is_target: bool) bool {
-    for (line) |ch| {
-        if (ch == '{') scope.depth += 1;
-        if (ch != '}') continue;
+    var lit = LiteralState.forLine(line) orelse return is_target;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const pos = lit.updateForChar(line, i) orelse continue;
+        if (line[pos] == '{') scope.depth += 1;
+        if (line[pos] != '}') continue;
         if (scope.depth == 0) continue;
         scope.depth -= 1;
         if (scope.depth == 0) {
@@ -20637,7 +20687,7 @@ fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool
 
         // A comment-only ignore line suppresses the next line; when that line
         // opens a brace scope the suppression extends over the whole scope.
-        if (prev_ignores and mem.indexOf(u8, line, "{") != null) {
+        if (prev_ignores and hasCodeOpenBrace(line)) {
             scope.depth = unmatchedOpenBraces(line);
             scope.active = scope.depth > 0;
             if (is_target) return true;
@@ -20669,8 +20719,9 @@ const RuleFacts = struct {
 
 /// Build the suppression facts for one (file, rule) pair in a single O(lines)
 /// pass. WHY: mirrors isInlineDisabled's decision tree branch-for-branch —
-/// same isIgnoreCommentLine prev-line test, same unmatchedOpenBraces scope
-/// open, same consumeIgnoredScopeLine close semantics — so cached lookups
+/// same isIgnoreCommentLine prev-line test, same hasCodeOpenBrace scope open,
+/// same unmatchedOpenBraces depth, same consumeIgnoredScopeLine close
+/// semantics, all counting braces in code context only — so cached lookups
 /// reproduce the per-issue rescan verdict exactly. A line entered while a
 /// scope is active is suppressed (including the line that closes it); the
 /// scope-opening line itself is always suppressed.
@@ -20695,7 +20746,7 @@ fn buildRuleFacts(allocator: Allocator, content: []const u8, rule: []const u8) !
             // line is suppressed; the call's purpose is the scope tracking.
             _ = consumeIgnoredScopeLine(&scope, line, true);
             suppressed = true;
-        } else if (prev_ignores and mem.indexOf(u8, line, "{") != null) {
+        } else if (prev_ignores and hasCodeOpenBrace(line)) {
             scope.depth = unmatchedOpenBraces(line);
             scope.active = scope.depth > 0;
             suppressed = true;
@@ -28798,6 +28849,113 @@ test "ephor:ignore scope works with nested braces" {
     try std.testing.expect(!isInlineDisabled(content, 8, "ZA201"));
 }
 
+/// Assert one (line, ZA201) suppression verdict through BOTH the per-issue
+/// rescan and the cached RuleFacts lookup. buildRuleFacts must mirror
+/// isInlineDisabled branch-for-branch, so a verdict probed through only one
+/// path leaves the mirror invariant unproven.
+fn expectSuppression(content: []const u8, line_num: usize, want: bool) !void {
+    try std.testing.expectEqual(want, isInlineDisabled(content, line_num, "ZA201"));
+    var cache = IgnoreCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const got = cache.isSuppressed(content, "fixture.zig", line_num, "ZA201");
+    try std.testing.expectEqual(want, got);
+}
+
+test "ignore scope survives braces inside string literals" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\fn leaky() void {
+        \\    const s = "}";
+        \\    foo() catch {};
+        \\}
+        \\const after = bar() catch {};
+    ;
+    // The `}` inside the string is data: the scope closes at the real
+    // closing brace on line 5, not at the string on line 3.
+    try expectSuppression(content, 2, true);
+    try expectSuppression(content, 3, true);
+    try expectSuppression(content, 4, true);
+    try expectSuppression(content, 5, true);
+    try expectSuppression(content, 6, false);
+}
+
+test "ignore scope survives brace inside char literal" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\fn leaky() void {
+        \\    const c = '}';
+        \\    foo() catch {};
+        \\}
+        \\const after = bar() catch {};
+    ;
+    // `'}'` is char data: it must not close the scope early.
+    try expectSuppression(content, 3, true);
+    try expectSuppression(content, 4, true);
+    try expectSuppression(content, 5, true);
+    try expectSuppression(content, 6, false);
+}
+
+test "ignore scope ignores brace in trailing comment" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\fn leaky() void {
+        \\    foo() catch {}; // }
+        \\    bar() catch {};
+        \\}
+        \\const after = baz() catch {};
+    ;
+    // The `}` after `//` is comment text: the scope closes on line 5.
+    try expectSuppression(content, 3, true);
+    try expectSuppression(content, 4, true);
+    try expectSuppression(content, 5, true);
+    try expectSuppression(content, 6, false);
+}
+
+test "brace in comment does not open ignore scope" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\var x: u32 = 0; // {
+        \\x += 1;
+    ;
+    // The only `{` is comment text, so no scope opens: the directive
+    // suppresses just the next line.
+    try expectSuppression(content, 2, true);
+    try expectSuppression(content, 3, false);
+}
+
+test "multiline-string line braces do not perturb ignore scope" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\fn leaky() void {
+        \\    const fixture =
+        \\        \\} closing brace data
+        \\    ;
+        \\    foo() catch {};
+        \\}
+        \\const after = bar() catch {};
+    ;
+    // Line 4 is a multiline-string body: its `}` is string data, so the
+    // scope stays open until the real closing brace on line 7.
+    try expectSuppression(content, 2, true);
+    try expectSuppression(content, 3, true);
+    try expectSuppression(content, 4, true);
+    try expectSuppression(content, 6, true);
+    try expectSuppression(content, 7, true);
+    try expectSuppression(content, 8, false);
+}
+
+test "brace in string on directive next line does not open ignore scope" {
+    const content =
+        \\// ephor:ignore ZA201
+        \\const s = "{";
+        \\const y = foo() catch {};
+    ;
+    // The `{` inside the string is data: no scope opens, so the directive
+    // suppresses just the next line.
+    try expectSuppression(content, 2, true);
+    try expectSuppression(content, 3, false);
+}
+
 test "ephor:ignore-file suppresses entire file" {
     const content =
         \\// ephor:ignore-file ZA201
@@ -29124,7 +29282,8 @@ const ignore_cache_fixtures = [_][]const u8{
     \\const x = blk: { break :blk foo() catch {}; };
     \\bar() catch {};
     ,
-    // brace inside a string on the open line still opens a scope (frozen quirk)
+    // brace inside a string on the would-be open line opens no scope: the
+    // directive suppresses only the next line
     \\// ephor:ignore ZA201
     \\const s = "{";
     \\foo() catch {};
@@ -41605,6 +41764,22 @@ test "trackBraceNesting handles escaped-quote char literals" {
     try std.testing.expectEqual(@as(usize, 3), state.nest);
     try std.testing.expect(!trackBraceNesting("}", &state));
     try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting treats quote after even backslash run as delimiter" {
+    // `"\\"` closes the string — the backslash run before the quote is even,
+    // so the quote is a delimiter and the `}` after the string is code that
+    // ends the function scope.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(trackBraceNesting("const s = \"\\\\\"; }", &state));
+}
+
+test "trackBraceNesting keeps escaped quote as string data" {
+    // `"\""` — the middle quote has an odd backslash run before it, so it is
+    // escaped data; the string ends at the last quote and the trailing `}`
+    // still closes the scope.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(trackBraceNesting("const s = \"\\\"\"; }", &state));
 }
 
 test "ZA302: char-literal braces do not inflate nesting depth" {

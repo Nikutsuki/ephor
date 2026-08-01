@@ -129,6 +129,10 @@ var suppression_note_count: usize = 0;
 /// --known-issues path stays silent by design (the user asked for it).
 var known_issues_autoload_count: usize = 0;
 
+/// Test hook: counts refused untrusted .ephor-ignore auto-loads. Tests
+/// reset it to assert the skip note fired (stderr is muted in tests).
+var untrusted_ignore_skip_count: usize = 0;
+
 /// Print a CLI/config diagnostic unless tests have muted the channel.
 fn cliDiag(comptime fmt: []const u8, args: anytype) void {
     if (!cli_diagnostics_enabled) return;
@@ -23670,7 +23674,10 @@ fn printHelp() void {
         \\  appends the same line to the markdown file. Off-by-default
         \\  rules are ephor's own posture, not suppression, and do not
         \\  count. A .ephor-ignore file in the scanned path auto-loads as
-        \\  the known-issues list and discloses the load with a note.
+        \\  the known-issues list when the path is trusted. The load
+        \\  discloses itself with a note. Ephor refuses an untrusted file
+        \\  with a skip note. Ephor always honors an explicit
+        \\  --known-issues=<file>.
         \\
         \\RULE IDS:
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
@@ -23745,17 +23752,8 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
     // RED3-7: the auto-detected .ephor-ignore discloses its load. An
     // explicit --known-issues path stays silent (the user asked for it).
     const explicit = cfg.known_issues_path != null;
-    const path = cfg.known_issues_path orelse blk: {
-        // Auto-detect .ephor-ignore in project root
-        const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
-        defer allocator.free(ignore_path);
-        if (Fs.cwd().access(ignore_path, .{})) |_| {
-            cfg.known_issues_path = try allocator.dupe(u8, ignore_path);
-            break :blk cfg.known_issues_path.?;
-        } else |_| {
-            return; // No known issues file
-        }
-    };
+    const path = cfg.known_issues_path orelse
+        (try detectKnownIssuesPath(allocator, cfg)) orelse return;
 
     const content = Fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
@@ -23794,6 +23792,32 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
             safe_path.slice,
         });
     }
+}
+
+/// Auto-detect `<cfg.path>/.ephor-ignore` and adopt it as the known-issues
+/// path. The file suppresses the scanned tree's own findings, so the
+/// adoption honors the ephor.json trust decision (EPH-I0222): an
+/// untrusted file is refused with one skip note and the path stays null.
+/// Returns null when no file exists or the file is untrusted.
+fn detectKnownIssuesPath(allocator: Allocator, cfg: *Config) !?[]const u8 {
+    const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
+    defer allocator.free(ignore_path);
+    Fs.cwd().access(ignore_path, .{}) catch return null; // No known issues file
+    const trusted = cfg.trust_target_config or isConfigDirTrusted(cfg.path);
+    if (!trusted) {
+        untrusted_ignore_skip_count += 1;
+        // The scanned tree supplies the path bytes here: sanitize them.
+        var safe_path = try types.sanitizeTerminal(allocator, ignore_path);
+        defer safe_path.deinit(allocator);
+        cliDiag(
+            "note: ignoring untrusted .ephor-ignore at {s} " ++
+                "(use --trust-target-config to honor)\n",
+            .{safe_path.slice},
+        );
+        return null; // Leave cfg.known_issues_path unset.
+    }
+    cfg.known_issues_path = try allocator.dupe(u8, ignore_path);
+    return cfg.known_issues_path.?;
 }
 
 /// Check if an issue is in the known issues list
@@ -47975,6 +47999,9 @@ test "suppression: known-issues load works outside check and only once" {
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     try setOwnedPath(allocator, &h.cfg, dir_path);
+    // The tmpDir is outside the cwd tree, so the auto-load needs the
+    // trust flag (EPH-I0222 gates untrusted .ephor-ignore files).
+    h.cfg.trust_target_config = true;
     try loadKnownIssues(allocator, &h.cfg);
     try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
     try std.testing.expectEqual(h.run.issues.items.len, h.cfg.known_issues.items.len);
@@ -48005,6 +48032,9 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, dir_path);
+    // The tmpDir is outside the cwd tree: the trust flag honors the
+    // auto-load (EPH-I0222). The explicit path below needs no flag.
+    cfg.trust_target_config = true;
     known_issues_autoload_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
@@ -48021,6 +48051,65 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
     try loadKnownIssues(allocator, &cfg_explicit);
     try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
     try std.testing.expectEqual(@as(usize, 2), cfg_explicit.known_issues.items.len);
+}
+
+test "suppression: untrusted .ephor-ignore auto-load is refused (EPH-I0222)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
+    defer allocator.free(ignore_path);
+    try Fs.cwd().writeFile(ignore_path, "src/a.zig:1\nsrc/b.zig:2\n", .{});
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, dir_path);
+    known_issues_autoload_count = 0;
+    untrusted_ignore_skip_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    // The tmpDir is outside the cwd tree, so the auto-load is refused:
+    // no entries, no adopted path, one skip note, no disclosure note.
+    try loadKnownIssues(allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 0), cfg.known_issues.items.len);
+    try std.testing.expect(cfg.known_issues_path == null);
+    try std.testing.expectEqual(@as(usize, 1), untrusted_ignore_skip_count);
+    try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
+
+    // The load-once guard keeps a second probe silent.
+    try loadKnownIssues(allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), untrusted_ignore_skip_count);
+}
+
+test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
+    defer allocator.free(ignore_path);
+    try Fs.cwd().writeFile(ignore_path, "src/a.zig:1\nsrc/b.zig:2\n", .{});
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.trust_target_config = true;
+    try setOwnedPath(allocator, &cfg, dir_path);
+    known_issues_autoload_count = 0;
+    untrusted_ignore_skip_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    // The trust flag admits the same file: entries load and disclose.
+    try loadKnownIssues(allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 2), cfg.known_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
+    try std.testing.expectEqual(@as(usize, 0), untrusted_ignore_skip_count);
 }
 
 // ============================================================================

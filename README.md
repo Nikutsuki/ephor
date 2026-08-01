@@ -221,6 +221,14 @@ note: ignoring suppression/gate keys from untrusted <path> (use --trust-target-c
 
 A target config's `path_dir` is containment-checked and then discarded. The scan root comes from the CLI path, the trusted working-directory config, or auto-detection.
 
+The `.ephor-ignore` auto-load honors the same trust decision. Ephor refuses an untrusted file with one skip note:
+
+```
+note: ignoring untrusted .ephor-ignore at <path> (use --trust-target-config to honor)
+```
+
+Ephor always honors an explicit `--known-issues=<file>`, and the load stays silent.
+
 Residual: running ephor inside a tree trusts that tree's config. To audit an untrusted repo, run `ephor check <path>` from outside it, or review its `ephor.json` first.
 
 Validation rules:
@@ -517,7 +525,8 @@ unsuppressed, and the note counts what would have been hidden. Config
 Use it in CI to audit a repo you do not trust.
 
 A `.ephor-ignore` file in the scanned path auto-loads as the known-issues
-list. The load discloses itself once:
+list. The auto-load honors the same trust decision as `ephor.json`: Ephor
+refuses an untrusted file with a skip note. The load discloses itself once:
 
 ```
 note: loaded 2 known-issue entries from repo/.ephor-ignore
@@ -590,7 +599,8 @@ src/util.zig:456
 ```
 
 When `--known-issues` is absent, ephor auto-loads `<path>/.ephor-ignore` in
-the same format and prints one note with the entry count. See
+the same format and prints one note with the entry count. The auto-load
+requires a trusted path (see [Config trust model](#config-trust-model)). See
 [Suppression Accounting](#suppression-accounting).
 
 ## IDE Integration

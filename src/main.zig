@@ -15099,10 +15099,35 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     };
 }
 
+/// True when `=>` appears at a code position (outside string literals, char
+/// literals, and comments). Raw substring search is string/comment blind
+/// (EPH-I0221): a literal like `"=>"` or a trailing comment containing `=>`
+/// poisons the switch-prong heuristic in trackBraceNesting, so the real block
+/// brace is skipped and the fn is reported ended at the block's close.
+/// Matches raw `mem.indexOf` semantics on real code lines: `==>` matches at
+/// the second char, `= = >` does not, and `'=' + '>'` does not because the
+/// `=` is char-literal data.
+fn hasCodeArrow(t: []const u8) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var prev_eq = false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse {
+            // A masked char breaks adjacency — `"=>"` or `= // >` is not an
+            // arrow even when a code `>` follows a masked region.
+            prev_eq = false;
+            continue;
+        };
+        if (t[pos] == '>' and prev_eq) return true;
+        prev_eq = t[pos] == '=';
+    }
+    return false;
+}
+
 /// Track brace nesting, returns true if function ended.
 /// Also updates cognitive nesting via cog_markers and cog_nest.
 fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
-    const is_switch = mem.indexOf(u8, t, "=>") != null;
+    const is_switch = hasCodeArrow(t);
     var lit = types.LiteralState.forLine(t) orelse return false;
     var first = true;
     var i: usize = 0;
@@ -41832,6 +41857,78 @@ test "trackBraceNesting keeps escaped quote as string data" {
     // still closes the scope.
     var state = ComplexityState{ .in_fn = true, .nest = 1 };
     try std.testing.expect(trackBraceNesting("const s = \"\\\"\"; }", &state));
+}
+
+test "trackBraceNesting counts the brace on a string-literal arrow line" {
+    // EPH-I0221: `"=>"` is string data, not a switch prong. The raw
+    // substring check poisoned is_switch, so the real block brace was
+    // skipped and the block's closing `}` ended the fn early.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    const line = "if (mem.eql(u8, tok, \"=>\")) {";
+    try std.testing.expect(!trackBraceNesting(line, &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting counts the brace on a comment arrow line" {
+    // EPH-I0221: `=>` inside a `//` comment is not code — the masked check
+    // must leave is_switch false so the block brace still counts.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(!trackBraceNesting("if (x) { // =>", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting still skips the brace of a real switch prong" {
+    // A code-level `=>` keeps the prong heuristic: `1 => {` opens a prong
+    // block, not a new nesting level.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(!trackBraceNesting("1 => {", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+}
+
+test "ZA302: poisoned arrow line does not hide a deeply nested tail" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // EPH-I0221: the string-literal `"=>"` on the first body line must not
+    // arm the prong heuristic. Pre-fix, the poisoned block's closing `}`
+    // reported the fn ended and the depth-4 tail was never measured.
+    const code =
+        \\fn poisoned_arrow(tok: []const u8) void {
+        \\    if (mem.eql(u8, tok, "=>")) {
+        \\        sink(tok);
+        \\    }
+        \\    if (a) {
+        \\        if (b) {
+        \\            if (c) {
+        \\                sink(tok);
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\fn sink(v: []const u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "arrow.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "arrow.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var nesting_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "arrow.zig") and
+            mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP))
+        {
+            nesting_findings += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), nesting_findings);
 }
 
 test "ZA302: char-literal braces do not inflate nesting depth" {

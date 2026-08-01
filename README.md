@@ -1133,7 +1133,7 @@ Ephor uses three testing layers:
 - `examples/error_handling_demo.zig` — Error handling patterns (ZA201-ZA210)
 
 **4. Corpus validation** (3000+ community Zig projects):
-- Dogfood: `ephor check src/` → zero warnings (11 ZT105 notes: statically-invisible integration coverage, see ZT105)
+- Dogfood: `ephor check src/` → zero warnings, zero notes
 - Community baseline regression testing against key projects
 
 ## Changelog

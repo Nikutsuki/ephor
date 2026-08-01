@@ -27890,6 +27890,167 @@ test "analyzeCFGMemory ZA802 silent on trailing-comment lookalike decl (EPH-I021
     ) == 0);
 }
 
+test "analyzeCFGMemory ZA801 fires on unguarded optional unwrap (EPH-I0220)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // No guard on any path: a .? with usage after it is an unsafe unwrap.
+    const content =
+        \\fn f(opt: ?u32) u32 {
+        \\    return opt.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_unguarded.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_unguarded.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 silent on orelse unwrap (EPH-I0220)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The orelse path unwraps without .?, so ZA801 must stay silent.
+    const content =
+        \\fn f(opt: ?u32) u32 {
+        \\    const v = opt orelse return 0;
+        \\    return v + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_orelse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_orelse.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent inside null-equality guard (EPH-I0220)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The if (opt != null) guard puts opt in the block's checked set, and
+    // the CFG propagates it into the then-block that holds the unwrap.
+    const content =
+        \\fn f(opt: ?u32) u32 {
+        \\    if (opt != null) {
+        \\        return opt.? + 1;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_null_eq_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_null_eq_guard.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent after early-return null guard (EPH-I0220)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // if (opt == null) return 0 enters the checked set and also matches
+    // the early-return guard lookback, so the later unwrap is safe.
+    const content =
+        \\fn f(opt: ?u32) u32 {
+        \\    if (opt == null) return 0;
+        \\    return opt.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_early_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_early_return.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent inside payload-capture guard (EPH-I0220)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The if (opt) |_| capture form marks opt checked inside the then-block.
+    const content =
+        \\fn f(opt: ?u32) u32 {
+        \\    if (opt) |_| {
+        \\        return opt.? + 1;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_payload_capture.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_payload_capture.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent on bare unwrap statement (EPH-I0220)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // isUnsafeUnwrapUsage: a bare `opt.?;` statement (semicolon after the
+    // .?) binds a value but does not use it, so it stays silent.
+    const content =
+        \\fn f(opt: ?u32) void {
+        \\    const v = opt.?;
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_bare_unwrap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_bare_unwrap.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // An unrelated statement before the unwrap must not suppress the
+    // finding: only null-check guards populate the checked set.
+    const content =
+        \\fn f(opt: ?u32) u32 {
+        \\    const n = 41;
+        \\    return opt.? + n;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_mid_block.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_mid_block.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
 test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();

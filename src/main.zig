@@ -66,13 +66,6 @@ const Fs = struct {
         ) !std.Io.File {
             return std.Io.Dir.cwd().createFile(global_io.?, sub_path, flags);
         }
-        pub fn createFileAtomic(
-            _: CompatDir,
-            sub_path: []const u8,
-            options: std.Io.Dir.CreateFileAtomicOptions,
-        ) !std.Io.File.Atomic {
-            return std.Io.Dir.cwd().createFileAtomic(global_io.?, sub_path, options);
-        }
         pub fn statFile(_: CompatDir, sub_path: []const u8) !std.Io.Dir.Stat {
             return std.Io.Dir.cwd().statFile(global_io.?, sub_path, .{});
         }
@@ -21162,7 +21155,8 @@ fn reportConfigParseError(allocator: Allocator, err: anyerror, path: []const u8)
     var safe_path = types.sanitizeTerminal(allocator, path) catch {
         // OOM must not flip the fail posture: propagate the gated errors,
         // warn-and-continue the rest, exactly as the sanitized path does.
-        if (err == error.InvalidFailOnValue or err == error.EmptyExcludePattern)
+        if (err == error.InvalidFailOnValue or err == error.EmptyExcludePattern or
+            err == error.EmptyRulePattern)
             return err;
         std.debug.print("warning: failed to parse config: {}\n", .{err});
         return;
@@ -21173,6 +21167,11 @@ fn reportConfigParseError(allocator: Allocator, err: anyerror, path: []const u8)
         error.EmptyExcludePattern => cliDiag(
             "error: {s}: invalid exclude pattern '' — an empty pattern matches every path. " ++
                 "Use a specific prefix or remove the entry.\n",
+            .{safe_path.slice},
+        ),
+        error.EmptyRulePattern => cliDiag(
+            "error: {s}: invalid rule pattern '' — an empty pattern matches every rule. " ++
+                "Give a rule ID or prefix, or remove the entry.\n",
             .{safe_path.slice},
         ),
         else => {
@@ -21621,11 +21620,17 @@ fn isOverbroadExcludePattern(pattern: []const u8) bool {
     return mem.eql(u8, pattern, "/") or mem.eql(u8, pattern, ".zig");
 }
 
-/// Validate one exclude-list value (RED3-2). An empty pattern is a hard
-/// usage error (substring match would drop every path); the over-broad
+/// Validate one array value before it joins a config list (RED3-2,
+/// EPH-I0236). An empty exclude pattern or rule pattern is a hard usage
+/// error: each one matches everything it gates. The over-broad exclude
 /// patterns "/" and ".zig" warn and are skipped. Returns false when the
 /// value must not be appended.
-fn checkExcludeValue(ctx: ConfigParseCtx, key: []const u8, val: []const u8) !bool {
+fn checkConfigListValue(ctx: ConfigParseCtx, key: []const u8, val: []const u8) !bool {
+    const is_rule_list = mem.eql(u8, key, "disable") or mem.eql(u8, key, "enable");
+    if (is_rule_list) {
+        if (val.len == 0) return error.EmptyRulePattern;
+        return true;
+    }
     const is_exclude_list = mem.eql(u8, key, "exclude") or
         mem.eql(u8, key, "orphan_exclude");
     if (!is_exclude_list) return true;
@@ -21665,7 +21670,7 @@ fn parseConfigArray(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
             continue;
         }
         const result = parseJsonString(content, i);
-        if (!try checkExcludeValue(ctx, key, result.val)) {
+        if (!try checkConfigListValue(ctx, key, result.val)) {
             i = result.end;
             continue;
         }
@@ -22305,7 +22310,7 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
     , .{ ver, root_dir, entries_json.items });
     defer allocator.free(config_content);
 
-    try writeFileAtomic(Fs.cwd(), CONFIG_FILENAME, config_content);
+    try writeFileAtomic(std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
 
     std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
         CONFIG_FILENAME, ver, root_dir,
@@ -22325,7 +22330,7 @@ fn buildPackageUrl(allocator: Allocator, ver: ?[]const u8) ![]const u8 {
 
 /// Print instructions when build.zig.zon is missing during install.
 fn printMissingProjectFileHelp(file: []const u8) void {
-    std.debug.print(
+    cliDiag(
         "error: no {s} found in current directory\n" ++
             "\n" ++
             "  Ephor requires a Zig project with build.zig and build.zig.zon.\n" ++
@@ -22342,7 +22347,7 @@ fn printMissingProjectFileHelp(file: []const u8) void {
 
 /// Print fallback instructions when zig fetch fails.
 fn printFetchFailedHelp(package_url: []const u8) void {
-    std.debug.print(
+    cliDiag(
         \\
         \\Failed to fetch ephor package. You can add it manually:
         \\
@@ -22355,14 +22360,11 @@ fn printFetchFailedHelp(package_url: []const u8) void {
     , .{package_url});
 }
 
-/// Run the install command: adds ephor to project's build system.
-/// If install_version is provided, installs that specific version;
-/// otherwise defaults to the binary's own version (EPHOR_VERSION).
-/// Check that build.zig and build.zig.zon exist. Returns false
-/// and prints help if either is missing.
-fn checkProjectPrerequisites() bool {
+/// Check that build.zig and build.zig.zon exist in project_dir. Returns
+/// false and prints help if either is missing.
+fn checkProjectPrerequisites(project_dir: std.Io.Dir) bool {
     const has_build_zig = blk: {
-        Fs.cwd().access("build.zig", .{}) catch break :blk false;
+        project_dir.access(global_io.?, "build.zig", .{}) catch break :blk false;
         break :blk true;
     };
     if (!has_build_zig) {
@@ -22370,7 +22372,7 @@ fn checkProjectPrerequisites() bool {
         return false;
     }
     const has_zon = blk: {
-        Fs.cwd().access("build.zig.zon", .{}) catch break :blk false;
+        project_dir.access(global_io.?, "build.zig.zon", .{}) catch break :blk false;
         break :blk true;
     };
     if (!has_zon) {
@@ -22380,10 +22382,23 @@ fn checkProjectPrerequisites() bool {
     return true;
 }
 
-fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
+/// Run the install command: adds ephor to project's build system.
+/// If install_version is provided, installs that specific version;
+/// otherwise defaults to the binary's own version (EPHOR_VERSION).
+/// project_dir is the project root for the prerequisite gate and the
+/// zig-fetch child. Production passes the process working directory. The
+/// post-fetch steps (recorded hash, ephor.json) run in the process working
+/// directory, which is the same directory in production. Every failure
+/// path returns error.InstallFailed (EPH-I0235): a CI step doing
+/// `ephor install && zig build ephor` must not proceed on a failed install.
+fn runInstallCommand(
+    allocator: Allocator,
+    project_dir: std.Io.Dir,
+    install_version: ?[]const u8,
+) !void {
     const ver = install_version orelse EPHOR_VERSION;
 
-    if (!checkProjectPrerequisites()) return;
+    if (!checkProjectPrerequisites(project_dir)) return error.InstallFailed;
 
     const package_url = try buildPackageUrl(allocator, install_version);
     defer allocator.free(package_url);
@@ -22395,38 +22410,49 @@ fn runInstallCommand(allocator: Allocator, install_version: ?[]const u8) !void {
 
     var child = try std.process.spawn(global_io.?, .{
         .argv = &.{ "zig", "fetch", "--save=ephor", url_z },
+        .cwd = .{ .dir = project_dir },
     });
     const term = try child.wait(global_io.?);
-    if (term.exited != 0) {
-        printFetchFailedHelp(package_url);
-        return;
-    }
+    try installFetchOutcome(term.exited, package_url);
 
     printRecordedHash(allocator, ver);
     std.debug.print("\n", .{});
 
-    const patched = patchBuildZig(allocator) catch |err| {
-        std.debug.print("Could not auto-patch build.zig: {}\n", .{err});
-        std.debug.print("\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_BLOCK});
-        std.debug.print("Then run: zig build ephor\n", .{});
-        return;
-    };
-
-    if (patched) |line| {
-        std.debug.print("Added ephor step to build.zig at line {d}\n", .{line});
-    } else {
-        std.debug.print("Ephor step already exists in build.zig\n", .{});
-    }
+    try patchBuildZigOrFail(allocator, project_dir);
 
     createInstallConfig(allocator, ver) catch |err| {
-        std.debug.print("Could not create {s}: {}\n", .{ CONFIG_FILENAME, err });
+        cliDiag("error: could not create {s}: {}\n", .{ CONFIG_FILENAME, err });
+        return error.InstallFailed;
     };
 
     std.debug.print("Run: zig build ephor\n", .{});
 }
 
-/// Patch build.zig to add ephor step. Returns line number
-/// where inserted, or null if already exists.
+/// Map a finished zig-fetch child to the install outcome (EPH-I0235). A
+/// nonzero exit prints the manual fallback, then fails the install.
+fn installFetchOutcome(exited: u8, package_url: []const u8) !void {
+    if (exited == 0) return;
+    printFetchFailedHelp(package_url);
+    return error.InstallFailed;
+}
+
+/// Patch the project's build.zig after a successful fetch (EPH-I0235). A
+/// patch failure prints the manual integration block, then fails the
+/// install: the project is half-integrated, so the exit code must say so.
+fn patchBuildZigOrFail(allocator: Allocator, project_dir: std.Io.Dir) !void {
+    const patched = patchBuildZig(allocator, project_dir) catch |err| {
+        cliDiag("error: could not auto-patch build.zig: {}\n", .{err});
+        cliDiag("\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_BLOCK});
+        cliDiag("Then run: zig build ephor\n", .{});
+        return error.InstallFailed;
+    };
+    if (patched) |line| {
+        std.debug.print("Added ephor step to build.zig at line {d}\n", .{line});
+    } else {
+        std.debug.print("Ephor step already exists in build.zig\n", .{});
+    }
+}
+
 /// Build function scan state for finding insertion point
 const BuildFnScan = struct {
     last_install_artifact: ?usize = null,
@@ -22467,10 +22493,17 @@ fn updateBuildFnScanBraces(scan: *BuildFnScan, trimmed: []const u8, idx: usize) 
     }
 }
 
-fn patchBuildZig(allocator: Allocator) !?usize {
-    const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch |err| {
+/// Patch build.zig to add ephor step. Returns line number
+/// where inserted, or null if already exists.
+fn patchBuildZig(allocator: Allocator, project_dir: std.Io.Dir) !?usize {
+    const content = project_dir.readFileAlloc(
+        global_io.?,
+        "build.zig",
+        allocator,
+        .limited(1024 * 1024),
+    ) catch |err| {
         if (err == error.FileNotFound)
-            std.debug.print("No build.zig found in current directory.\n", .{});
+            cliDiag("error: no build.zig found in the project directory.\n", .{});
         return err;
     };
     defer allocator.free(content);
@@ -22484,7 +22517,7 @@ fn patchBuildZig(allocator: Allocator) !?usize {
     while (line_iter.next()) |line| try line_list.append(allocator, line);
 
     const insert_after = findBuildZigInsertionPoint(line_list.items) orelse {
-        std.debug.print("Could not find insertion point in build.zig\n", .{});
+        cliDiag("error: could not find an insertion point in build.zig.\n", .{});
         return error.NoInsertionPoint;
     };
 
@@ -22496,14 +22529,18 @@ fn patchBuildZig(allocator: Allocator) !?usize {
         if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK);
     }
 
-    try writeFileAtomic(Fs.cwd(), "build.zig", new_content.items);
+    try writeFileAtomic(project_dir, "build.zig", new_content.items);
     return insert_after + 2;
 }
 
 /// True when build.zig.zon exists and declares an ephor dependency.
-fn projectHasEphorDependency(allocator: Allocator) bool {
-    const content = Fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch
-        return false;
+fn projectHasEphorDependency(allocator: Allocator, project_dir: std.Io.Dir) bool {
+    const content = project_dir.readFileAlloc(
+        global_io.?,
+        "build.zig.zon",
+        allocator,
+        .limited(64 * 1024),
+    ) catch return false;
     defer allocator.free(content);
     return mem.indexOf(u8, content, ".ephor") != null;
 }
@@ -22611,7 +22648,17 @@ fn printRecordedHash(allocator: Allocator, ver: []const u8) void {
 /// ephor.json through updateConfigVersion. The analysis commands never
 /// write project files. The test "analysis path never writes project
 /// manifest files" pins this invariant.
-fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8, force: bool) !void {
+/// project_dir is the project root for the dependency gate and the
+/// zig-fetch child. Production passes the process working directory. The
+/// post-fetch steps run in the process working directory, which is the
+/// same directory in production. Every failure path returns
+/// error.UpgradeFailed (EPH-I0235): a script must see a nonzero exit.
+fn runUpgradeCommand(
+    allocator: Allocator,
+    project_dir: std.Io.Dir,
+    install_version: ?[]const u8,
+    force: bool,
+) !void {
     // If no explicit version, fetch the latest from Codeberg tags API
     const fetched_ver = if (install_version == null) fetchLatestVersion(allocator) else null;
     defer if (fetched_ver) |fv| allocator.free(fv);
@@ -22620,24 +22667,24 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8, force: 
     // Floor: a downgrade needs --force. Applies to an explicit --version
     // too (EPH-I0193). Refuse before any fetch or write.
     if (!upgradeFloorAllows(EPHOR_VERSION, ver, force)) {
-        std.debug.print(
+        cliDiag(
             "ERROR: refusing to downgrade ephor from v{s} to v{s}. Use --force to override.\n",
             .{ EPHOR_VERSION, ver },
         );
-        return;
+        return error.UpgradeFailed;
     }
 
     const package_url = try buildPackageUrl(allocator, ver);
     defer allocator.free(package_url);
 
-    if (!projectHasEphorDependency(allocator)) {
-        std.debug.print(
+    if (!projectHasEphorDependency(allocator, project_dir)) {
+        cliDiag(
             \\No ephor dependency found in build.zig.zon.
             \\
             \\Run 'ephor install' first to add ephor to your project.
             \\
         , .{});
-        return;
+        return error.UpgradeFailed;
     }
 
     std.debug.print("Upgrading ephor to v{s}...\n", .{ver});
@@ -22648,14 +22695,11 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8, force: 
     // Run zig fetch --save to update the dependency
     var child = try std.process.spawn(global_io.?, .{
         .argv = &.{ "zig", "fetch", "--save=ephor", url_z },
+        .cwd = .{ .dir = project_dir },
     });
 
     const term = try child.wait(global_io.?);
-
-    if (term.exited != 0) {
-        std.debug.print("Failed to upgrade ephor to v{s}.\n", .{ver});
-        return;
-    }
+    try upgradeFetchOutcome(term.exited, ver);
 
     printRecordedHash(allocator, ver);
 
@@ -22671,6 +22715,14 @@ fn runUpgradeCommand(allocator: Allocator, install_version: ?[]const u8, force: 
         \\Run 'zig build ephor' to verify.
         \\
     , .{ver});
+}
+
+/// Map a finished zig-fetch child to the upgrade outcome (EPH-I0235). A
+/// nonzero exit reports the failure, then fails the upgrade.
+fn upgradeFetchOutcome(exited: u8, ver: []const u8) !void {
+    if (exited == 0) return;
+    cliDiag("error: failed to upgrade ephor to v{s}.\n", .{ver});
+    return error.UpgradeFailed;
 }
 
 const ThresholdsSpan = struct {
@@ -22870,8 +22922,8 @@ fn insertVersionField(
 /// in a hostile clone and truncates the victim file; rename replaces the
 /// link itself and never follows it (EPH-I0194). std's File.Atomic removes
 /// the temp file on failure.
-fn writeFileAtomic(dir: Fs.Dir, sub_path: []const u8, contents: []const u8) !void {
-    var atomic = try dir.createFileAtomic(sub_path, .{ .replace = true });
+fn writeFileAtomic(dir: std.Io.Dir, sub_path: []const u8, contents: []const u8) !void {
+    var atomic = try dir.createFileAtomic(global_io.?, sub_path, .{ .replace = true });
     defer atomic.deinit(global_io.?);
     try atomic.file.writeStreamingAll(global_io.?, contents);
     try atomic.replace(global_io.?);
@@ -22879,7 +22931,7 @@ fn writeFileAtomic(dir: Fs.Dir, sub_path: []const u8, contents: []const u8) !voi
 
 /// Write content to the config file (ephor.json).
 fn writeConfigFile(content: []const u8) !void {
-    try writeFileAtomic(Fs.cwd(), CONFIG_FILENAME, content);
+    try writeFileAtomic(std.Io.Dir.cwd(), CONFIG_FILENAME, content);
 }
 
 /// Canonical ephor build.zig integration block.
@@ -22952,7 +23004,7 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
     }) catch return;
     defer allocator.free(new_content);
 
-    writeFileAtomic(Fs.cwd(), "build.zig", new_content) catch return;
+    writeFileAtomic(std.Io.Dir.cwd(), "build.zig", new_content) catch return;
 
     std.debug.print("Updated build.zig (ephor build steps)\n", .{});
 }
@@ -23297,9 +23349,30 @@ fn parseCommand(cmd: []const u8) ?Command {
     return null;
 }
 
-fn parseThreshold(arg: []const u8, prefix: []const u8, default: usize) ?usize {
-    if (!mem.startsWith(u8, arg, prefix)) return null;
-    return std.fmt.parseInt(usize, arg[prefix.len..], 10) catch default;
+/// Outcome of matching one threshold flag against an argument.
+const ThresholdMatch = union(enum) {
+    no_match,
+    value: usize,
+    /// The prefix matched but the value is not a positive integer. Never
+    /// substitute the factory default (EPH-I0237): a typo must not reset
+    /// the field and CLI-lock it against the config file.
+    invalid,
+};
+
+fn parseThreshold(arg: []const u8, prefix: []const u8) ThresholdMatch {
+    if (!mem.startsWith(u8, arg, prefix)) return .no_match;
+    const num = std.fmt.parseInt(usize, arg[prefix.len..], 10) catch return .invalid;
+    return .{ .value = num };
+}
+
+/// Hard usage error for a threshold flag whose value does not parse
+/// (EPH-I0237), matching the parseFailOnArg fail-closed policy.
+fn reportInvalidThreshold(arg: []const u8, prefix: []const u8) error{InvalidThresholdValue} {
+    cliDiag("error: invalid {s} value '{s}' (expected a positive integer)\n", .{
+        prefix[0 .. prefix.len - 1], // strip the trailing '='
+        arg[prefix.len..],
+    });
+    return error.InvalidThresholdValue;
 }
 
 /// Build a path with optional prefix (skips prefix if ".")
@@ -23859,41 +23932,36 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
     return false;
 }
 
+/// CLI threshold flags and the field each one sets. The display key names
+/// the field in the clamp warning, same as the config-file keys.
+const CliThresholdFlag = struct { prefix: []const u8, field: ThresholdFieldId, key: []const u8 };
+const cli_threshold_flags = [_]CliThresholdFlag{
+    .{ .prefix = "--max-lines=", .field = .max_lines, .key = "max_function_lines" },
+    .{ .prefix = "--max-nesting=", .field = .max_nesting, .key = "max_nesting" },
+    .{ .prefix = "--max-params=", .field = .max_params, .key = "max_params" },
+    .{ .prefix = "--max-branches=", .field = .max_branches, .key = "max_branches" },
+    .{ .prefix = "--max-line-length=", .field = .max_line_length, .key = "max_line_length" },
+    .{ .prefix = "--max-file-bytes=", .field = .max_file_bytes, .key = "max_file_bytes" },
+};
+
 /// Parse threshold arguments (returns true if handled). Each matched flag
 /// locks its field in cfg.threshold_cli_mask so a later config-file load
 /// cannot overwrite it (RED3-6: CLI thresholds always win). Values clamp at
-/// the documented maxima, same as config-file values.
-fn parseThresholdArg(arg: []const u8, cfg: *Config) bool {
-    const th = &cfg.thresholds;
-    if (parseThreshold(arg, "--max-lines=", 50)) |v| {
-        th.max_function_lines = clampThreshold(arg, "max_function_lines", v, threshold_cap_generic);
-        cfg.threshold_cli_mask |= threshold_cli_max_lines;
-        return true;
-    }
-    if (parseThreshold(arg, "--max-nesting=", 3)) |v| {
-        th.max_nesting_depth = clampThreshold(arg, "max_nesting", v, threshold_cap_generic);
-        cfg.threshold_cli_mask |= threshold_cli_max_nesting;
-        return true;
-    }
-    if (parseThreshold(arg, "--max-params=", 4)) |v| {
-        th.max_params = clampThreshold(arg, "max_params", v, threshold_cap_generic);
-        cfg.threshold_cli_mask |= threshold_cli_max_params;
-        return true;
-    }
-    if (parseThreshold(arg, "--max-branches=", 12)) |v| {
-        th.max_branches = clampThreshold(arg, "max_branches", v, threshold_cap_generic);
-        cfg.threshold_cli_mask |= threshold_cli_max_branches;
-        return true;
-    }
-    if (parseThreshold(arg, "--max-line-length=", 100)) |v| {
-        th.max_line_length = clampThreshold(arg, "max_line_length", v, threshold_cap_generic);
-        cfg.threshold_cli_mask |= threshold_cli_max_line_length;
-        return true;
-    }
-    if (parseThreshold(arg, "--max-file-bytes=", 50_000)) |v| {
-        th.max_file_bytes = clampThreshold(arg, "max_file_bytes", v, threshold_cap_bytes);
-        cfg.threshold_cli_mask |= threshold_cli_max_file_bytes;
-        return true;
+/// the documented maxima, same as config-file values. A matched flag with
+/// an unparseable value is a hard usage error (EPH-I0237).
+fn parseThresholdArg(arg: []const u8, cfg: *Config) !bool {
+    for (cli_threshold_flags) |flag| {
+        switch (parseThreshold(arg, flag.prefix)) {
+            .no_match => continue,
+            .invalid => return reportInvalidThreshold(arg, flag.prefix),
+            .value => |num| {
+                const meta = thresholdFieldMeta(flag.field);
+                const clamped = clampThreshold(arg, flag.key, num, meta.cap);
+                applyThresholdField(&cfg.thresholds, flag.field, clamped);
+                cfg.threshold_cli_mask |= meta.bit;
+                return true;
+            },
+        }
     }
     return false;
 }
@@ -23923,14 +23991,30 @@ fn handleListArg(
     cfg: *Config,
 ) !bool {
     if (mem.startsWith(u8, arg, "--disable=")) {
-        try cfg.disabled_rules.append(allocator, try allocator.dupe(u8, arg[10..]));
+        try appendRuleListEntry(allocator, &cfg.disabled_rules, arg[10..], "--disable");
         return true;
     }
     if (mem.startsWith(u8, arg, "--enable=")) {
-        try cfg.enabled_rules.append(allocator, try allocator.dupe(u8, arg[9..]));
+        try appendRuleListEntry(allocator, &cfg.enabled_rules, arg[9..], "--enable");
         return true;
     }
     return false;
+}
+
+/// Append one CLI rule-list entry. An empty entry prefix-matches every
+/// rule (EPH-I0236), so it is a hard usage error — the same fail-closed
+/// policy as an empty config exclude pattern (RED3-2).
+fn appendRuleListEntry(
+    allocator: Allocator,
+    list: *std.ArrayListUnmanaged([]const u8),
+    entry: []const u8,
+    flag: []const u8,
+) !void {
+    if (entry.len == 0) {
+        cliDiag("error: {s} requires a rule ID or prefix (see ephor --help)\n", .{flag});
+        return error.EmptyRulePattern;
+    }
+    try list.append(allocator, try allocator.dupe(u8, entry));
 }
 
 /// Replace cfg.path with an owned copy. Dupe BEFORE free: when the dupe
@@ -23988,20 +24072,34 @@ fn parseFailOnArg(arg: []const u8, cfg: *Config) !bool {
     return true;
 }
 
+/// Parse one CLI argument. Fail closed on malformed input (EPH-I0233/34):
+/// an empty element is a hard usage error, never an index panic, and an
+/// unmatched -flag is a hard usage error, never a silently ignored typo
+/// (a dropped --strict would neuter a CI gate). Positional paths stay
+/// positional. Anything else starting with '-' must name a known flag.
 fn parseCliArg(
     allocator: Allocator,
     arg: []const u8,
     cfg: *Config,
     cli_entries: *bool,
 ) !void {
+    if (arg.len == 0) {
+        cliDiag("error: empty argument is not valid (see ephor --help)\n", .{});
+        return error.EmptyArgument;
+    }
     if (try parseFailOnArg(arg, cfg)) return;
     if (mem.startsWith(u8, arg, "--entry="))
         return handleEntryArg(allocator, arg, cfg, cli_entries);
     if (parseSimpleFlag(arg, cfg)) return;
-    if (parseThresholdArg(arg, cfg)) return;
+    if (try parseThresholdArg(arg, cfg)) return;
     if (try handleListArg(allocator, arg, cfg)) return;
     if (try handleOptionalPathArg(allocator, arg, cfg)) return;
-    if (arg[0] != '-') try setOwnedPath(allocator, cfg, arg);
+    if (arg[0] != '-') {
+        try setOwnedPath(allocator, cfg, arg);
+        return;
+    }
+    cliDiag("error: unknown flag '{s}' (see ephor --help)\n", .{arg});
+    return error.UnknownFlag;
 }
 
 /// CLI-default config: command=check, borrowed path "src", all lists empty.
@@ -24068,8 +24166,9 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
             cfg.command = c;
-        } else if (cmd.len > 0 and cmd[0] == '-') {
-            // First argument is a flag, not a path — parse it
+        } else if (cmd.len == 0 or cmd[0] == '-') {
+            // A flag — or the invalid empty element — goes through the flag
+            // parser, which rejects what it cannot match (EPH-I0233/34).
             try parseCliArg(allocator, cmd, &cfg, &cli_entries);
         } else {
             try setOwnedPath(allocator, &cfg, cmd);
@@ -25186,19 +25285,24 @@ pub fn main(init: std.process.Init) !void {
             };
             // If --build flag, also print build integration info
             if (cfg.init_build and !should_exit_error) {
-                runInstallCommand(alloc, cfg.install_version) catch |err| {
+                runInstallCommand(alloc, std.Io.Dir.cwd(), cfg.install_version) catch |err| {
                     std.debug.print("error: failed to run install: {}\n", .{err});
                     should_exit_error = true;
                 };
             }
         },
 
-        .install => runInstallCommand(alloc, cfg.install_version) catch |err| {
+        .install => runInstallCommand(alloc, std.Io.Dir.cwd(), cfg.install_version) catch |err| {
             std.debug.print("error: failed to install: {}\n", .{err});
             should_exit_error = true;
         },
 
-        .upgrade => runUpgradeCommand(alloc, cfg.install_version, cfg.force_upgrade) catch |err| {
+        .upgrade => runUpgradeCommand(
+            alloc,
+            std.Io.Dir.cwd(),
+            cfg.install_version,
+            cfg.force_upgrade,
+        ) catch |err| {
             std.debug.print("error: failed to upgrade: {}\n", .{err});
             should_exit_error = true;
         },
@@ -36717,7 +36821,7 @@ test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194
 
     const target_path = try tmpFilePath(allocator, &tmp, CONFIG_FILENAME);
     defer allocator.free(target_path);
-    try writeFileAtomic(Fs.cwd(), target_path, "new-content");
+    try writeFileAtomic(std.Io.Dir.cwd(), target_path, "new-content");
 
     // The victim keeps its bytes: the write must not have followed the link.
     const victim = try tmp.dir.readFileAlloc(
@@ -48941,6 +49045,261 @@ test "CLI threshold flags beat config-file thresholds (RED3-6)" {
     try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
     // A field the CLI did not set still follows the config.
     try std.testing.expectEqual(@as(usize, 5), cfg.thresholds.max_nesting_depth);
+}
+
+// ============================================================================
+// Fail-closed CLI and install/upgrade exit codes (EPH-I0233–I0237)
+// ============================================================================
+
+test "CLI empty argument is a hard usage error (EPH-I0233)" {
+    // Regression: an empty argv element panicked index-out-of-bounds at the
+    // positional-path check. It must be a usage error, never a panic.
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try std.testing.expectError(
+        error.EmptyArgument,
+        parseCliArg(allocator, "", &cfg, &cli_entries),
+    );
+}
+
+test "CLI unknown flags are a hard usage error (EPH-I0234)" {
+    // Regression: --bogusflag, --strictt, and --format=xml each exited 0
+    // with a scan. --strictt silently dropped the CI gate.
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    const bad_flags = [_][]const u8{ "--bogusflag", "--strictt", "--format=xml" };
+    for (bad_flags) |flag| {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var cli_entries = false;
+        try std.testing.expectError(
+            error.UnknownFlag,
+            parseCliArg(allocator, flag, &cfg, &cli_entries),
+        );
+    }
+}
+
+test "CLI every documented flag still parses (EPH-I0234)" {
+    // Guard against over-reach: the fail-closed else must not reject any
+    // flag printHelp documents (including the -f=json/-f=text aliases).
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    const documented = [_][]const u8{
+        "--entry=src/main.zig",  "--format=text",            "-f=json",
+        "--disable=ZA301",       "--enable=ZA305",           "--max-lines=60",
+        "--max-nesting=4",       "--max-params=5",           "--max-branches=10",
+        "--max-line-length=120", "--max-file-bytes=60000",   "-V",
+        "--verbose",             "-s",                       "--summary",
+        "--strict",              "--fail-on=error",          "--trust-target-config",
+        "--no-suppression",      "-b",                       "--build",
+        "--export=issues.md",    "--known-issues=known.txt", "--command=zig build test",
+        "-y",                    "--yes",                    "--version=0.14.3",
+        "--force",               "-f=text",
+    };
+    for (documented) |flag| try parseCliArg(allocator, flag, &cfg, &cli_entries);
+    try std.testing.expect(cfg.verbose);
+    try std.testing.expect(cfg.show_summary);
+    try std.testing.expectEqual(OutputFormat.text, cfg.format);
+    try std.testing.expect(cfg.init_build);
+    try std.testing.expect(cfg.auto_approve);
+    try std.testing.expectEqual(FailOn.err, cfg.fail_on);
+    try std.testing.expect(cfg.trust_target_config);
+    try std.testing.expect(cfg.no_suppression);
+    try std.testing.expect(cfg.force_upgrade);
+    try std.testing.expectEqual(@as(usize, 60), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(@as(usize, 4), cfg.thresholds.max_nesting_depth);
+    try std.testing.expectEqual(@as(usize, 5), cfg.thresholds.max_params);
+    try std.testing.expectEqual(@as(usize, 10), cfg.thresholds.max_branches);
+    try std.testing.expectEqual(@as(usize, 120), cfg.thresholds.max_line_length);
+    try std.testing.expectEqual(@as(usize, 60000), cfg.thresholds.max_file_bytes);
+    try std.testing.expectEqualStrings("ZA301", cfg.disabled_rules.items[0]);
+    try std.testing.expectEqualStrings("ZA305", cfg.enabled_rules.items[0]);
+    try std.testing.expectEqualStrings("src/main.zig", cfg.entries.items[0]);
+    try std.testing.expectEqualStrings("issues.md", cfg.export_path.?);
+    try std.testing.expectEqualStrings("known.txt", cfg.known_issues_path.?);
+    try std.testing.expectEqualStrings("zig build test", cfg.runtime_command.?);
+    try std.testing.expectEqualStrings("0.14.3", cfg.install_version.?);
+}
+
+test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {
+    // Regression: an empty --disable= value prefix-matched every rule and
+    // suppressed the whole report.
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try std.testing.expectError(
+        error.EmptyRulePattern,
+        parseCliArg(allocator, "--disable=", &cfg, &cli_entries),
+    );
+    try std.testing.expectError(
+        error.EmptyRulePattern,
+        parseCliArg(allocator, "--enable=", &cfg, &cli_entries),
+    );
+    // Fail closed: the rejected entries never joined the lists.
+    try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cfg.enabled_rules.items.len);
+}
+
+test "config empty disable/enable entry is a hard usage error (EPH-I0236)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try std.testing.expectError(
+        error.EmptyRulePattern,
+        parseConfigJson(allocator, "{\"disable\": [\"\"]}", &cfg),
+    );
+    try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
+
+    var cfg_enable = testConfig();
+    defer cfg_enable.deinit(allocator);
+    try std.testing.expectError(
+        error.EmptyRulePattern,
+        parseConfigJson(allocator, "{\"enable\": [\"\"]}", &cfg_enable),
+    );
+    try std.testing.expectEqual(@as(usize, 0), cfg_enable.enabled_rules.items.len);
+}
+
+test "CLI malformed threshold value is a hard usage error (EPH-I0237)" {
+    // Regression: --max-lines=abc silently reset the field to the factory
+    // default and CLI-locked it, discarding the config-file value.
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try std.testing.expectError(
+        error.InvalidThresholdValue,
+        parseCliArg(allocator, "--max-lines=abc", &cfg, &cli_entries),
+    );
+    try std.testing.expectError(
+        error.InvalidThresholdValue,
+        parseCliArg(allocator, "--max-lines=", &cfg, &cli_entries),
+    );
+    // Fail closed: the rejected flags neither set the field nor locked it.
+    try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(@as(u8, 0), cfg.threshold_cli_mask);
+}
+
+test "CLI valid threshold value parses and locks (EPH-I0237)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    try parseCliArg(allocator, "--max-lines=80", &cfg, &cli_entries);
+    try std.testing.expectEqual(@as(usize, 80), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(threshold_cli_max_lines, cfg.threshold_cli_mask);
+    // The lock still holds: a later config load cannot clobber the CLI value.
+    try parseConfigJson(allocator, "{\"thresholds\": {\"max_function_lines\": 100}}", &cfg);
+    try std.testing.expectEqual(@as(usize, 80), cfg.thresholds.max_function_lines);
+}
+
+test "install without project files returns InstallFailed (EPH-I0235)" {
+    // Regression: `ephor install` outside a Zig project printed help and
+    // exited 0, so CI proceeded to `zig build ephor` on a failed install.
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(
+        error.InstallFailed,
+        runInstallCommand(allocator, tmp.dir, null),
+    );
+
+    // A build.zig without a build.zig.zon fails the same gate.
+    var tmp_half = std.testing.tmpDir(.{});
+    defer tmp_half.cleanup();
+    try tmp_half.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void {\n    _ = b;\n}\n",
+    });
+    try std.testing.expectError(
+        error.InstallFailed,
+        runInstallCommand(allocator, tmp_half.dir, null),
+    );
+}
+
+test "install zig-fetch failure maps to InstallFailed (EPH-I0235)" {
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    try std.testing.expectError(
+        error.InstallFailed,
+        installFetchOutcome(1, "https://example.invalid/ephor.tar.gz"),
+    );
+    try installFetchOutcome(0, "https://example.invalid/ephor.tar.gz");
+}
+
+test "install patch failure maps to InstallFailed (EPH-I0235)" {
+    // A build.zig with no build function gives findBuildZigInsertionPoint
+    // nothing to anchor to, so the patch stage must fail the install.
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "const std = @import(\"std\");\n",
+    });
+    try std.testing.expectError(
+        error.InstallFailed,
+        patchBuildZigOrFail(allocator, tmp.dir),
+    );
+}
+
+test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
+    // Regression: the downgrade-floor refusal printed and exited 0, so a
+    // script could not detect the refusal.
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(
+        error.UpgradeFailed,
+        runUpgradeCommand(allocator, tmp.dir, "0.0.1", false),
+    );
+}
+
+test "upgrade without ephor dependency returns UpgradeFailed (EPH-I0235)" {
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .version = \"0.1.0\" }\n",
+    });
+    try std.testing.expectError(
+        error.UpgradeFailed,
+        runUpgradeCommand(allocator, tmp.dir, EPHOR_VERSION, false),
+    );
+}
+
+test "upgrade zig-fetch failure maps to UpgradeFailed (EPH-I0235)" {
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    try std.testing.expectError(
+        error.UpgradeFailed,
+        upgradeFetchOutcome(1, "0.14.3"),
+    );
+    try upgradeFetchOutcome(0, "0.14.3");
 }
 
 test "setOwnedPath OOM keeps the old path freeable exactly once" {

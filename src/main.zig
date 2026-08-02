@@ -4068,16 +4068,33 @@ fn trackBackwardBraces(t: []const u8, initial_depth: usize) BackwardBraceResult 
     };
 }
 
+/// Bounded backward-scan windows for per-candidate guard queries
+/// (EPH-I0225). An unbounded scan costs O(function lines) per candidate.
+/// Many candidates then cost O(lines^2) per function on hostile content.
+/// A guard farther back than the window is an accepted false negative.
+/// The query misses the guard, and the protected operation can be reported.
+/// The 10/20-line precedents (hasBreakGuardOnPriorLines,
+/// hasEarlyReturnNullGuard) set this trade-off first.
+const enclosing_block_lookback = 40;
+const null_guard_lookback = 20;
+const paired_increment_lookback = 20;
+const short_circuit_lookback = 10;
+
 /// Extract the condition from an enclosing if-statement by walking backwards.
 /// Returns the condition string (e.g., "big" from "if (big) {") or null.
+///
+/// The walk stops enclosing_block_lookback lines back (EPH-I0225). A block
+/// opener sits above its whole body, so this walk gets the widest window.
+/// An opener beyond the window is missed (accepted false negative).
 fn findEnclosingIfCondition(
     lines: []const []const u8,
     read_idx: usize,
 ) ?[]const u8 {
     // Walk backwards to find the nearest enclosing if
+    const stop = read_idx -| enclosing_block_lookback;
     var depth: usize = 0;
     var i = read_idx;
-    while (i > 0) {
+    while (i > stop) {
         i -= 1;
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
@@ -4097,13 +4114,17 @@ fn findEnclosingIfCondition(
 
 /// Find the line index of the nearest enclosing if-statement by walking
 /// backwards. Returns the line index or null if not found.
+///
+/// The walk stops enclosing_block_lookback lines back (EPH-I0225). An
+/// opener beyond the window is missed (accepted false negative).
 fn findEnclosingIfLine(
     lines: []const []const u8,
     read_idx: usize,
 ) ?usize {
+    const stop = read_idx -| enclosing_block_lookback;
     var depth: usize = 0;
     var i = read_idx;
-    while (i > 0) {
+    while (i > stop) {
         i -= 1;
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
@@ -14944,6 +14965,8 @@ fn countLineBranches(t: []const u8) usize {
 
 /// Count cyclomatic complexity decision points per line (McCabe).
 /// CCN = sum of all decision points in a function + 1 (entry point).
+/// The try/orelse/and/or counts use hasToken (EPH-I0226). Raw substring
+/// matching counted these keywords inside strings and trailing comments.
 fn countLineCyclomatic(t: []const u8) usize {
     var c: usize = 0;
     // else if counts as 1 (not if+else separately)
@@ -14960,14 +14983,16 @@ fn countLineCyclomatic(t: []const u8) usize {
     if (hasToken(t, "switch")) c += 1;
     c += countSwitchArms(t);
     if (hasToken(t, "catch")) c += 1;
-    if (mem.indexOf(u8, t, "try ") != null) c += 1;
-    if (mem.indexOf(u8, t, "orelse") != null) c += 1;
-    if (mem.indexOf(u8, t, " and ") != null) c += 1;
-    if (mem.indexOf(u8, t, " or ") != null) c += 1;
+    if (hasToken(t, "try")) c += 1;
+    if (hasToken(t, "orelse")) c += 1;
+    if (hasToken(t, "and")) c += 1;
+    if (hasToken(t, "or")) c += 1;
     return c;
 }
 
 /// Count cognitive complexity cost for a line based on current nesting level.
+/// The try/orelse/and/or counts use hasToken (EPH-I0226). Raw substring
+/// matching counted these keywords inside strings and trailing comments.
 fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
     var cost: usize = 0;
     // else if counts as 1, not as both if and else if
@@ -14982,15 +15007,17 @@ fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
     if (hasToken(t, "switch")) cost += 1 + cog_nest;
     cost += countSwitchArms(t) * (1 + cog_nest);
     if (hasToken(t, "catch")) cost += 1 + cog_nest;
-    if (mem.indexOf(u8, t, "try ") != null) cost += 1 + cog_nest;
+    if (hasToken(t, "try")) cost += 1 + cog_nest;
     // Secondary — no nesting impact
-    if (mem.indexOf(u8, t, "orelse") != null) cost += 1;
-    if (mem.indexOf(u8, t, " and ") != null) cost += 1;
-    if (mem.indexOf(u8, t, " or ") != null) cost += 1;
+    if (hasToken(t, "orelse")) cost += 1;
+    if (hasToken(t, "and")) cost += 1;
+    if (hasToken(t, "or")) cost += 1;
     return cost;
 }
 
-/// Check if line opens a cognitive-nesting-increasing scope (has control keyword + {)
+/// Check if line opens a cognitive-nesting-increasing scope (has control keyword + {).
+/// The try check uses hasToken (EPH-I0226): a raw substring match opened a
+/// scope for `try` inside a string literal or a trailing comment.
 fn opensCognitiveScope(t: []const u8) bool {
     if (mem.indexOf(u8, t, "{") == null) return false;
     return hasToken(t, "if") or
@@ -14998,7 +15025,7 @@ fn opensCognitiveScope(t: []const u8) bool {
         hasToken(t, "while") or
         hasToken(t, "for") or
         hasToken(t, "catch") or
-        mem.indexOf(u8, t, "try ") != null;
+        hasToken(t, "try");
 }
 
 /// Calculate limit with type factory multiplier
@@ -18659,8 +18686,12 @@ fn hasNullGuard(
     name: []const u8,
 ) bool {
     _ = func_line;
+    // Window 20 matches hasEarlyReturnNullGuard, the sibling null-guard
+    // query for ZA801 (EPH-I0225). A null check with an exit farther back
+    // is stale for ZA203 suppression and is missed on purpose.
+    const stop = current_idx -| null_guard_lookback;
     var i = current_idx;
-    while (i > 0) {
+    while (i > stop) {
         i -= 1;
         const line = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(line)) continue;
@@ -19250,9 +19281,16 @@ fn isSignedVarInContext(lines: []const []const u8, current_idx: usize, var_name:
 }
 
 /// Check for paired increment in lines
+///
+/// The scan stops paired_increment_lookback lines back (EPH-I0225). The
+/// increment paired with a decrement sits earlier in the same accumulate
+/// then consume block. The 20-line window covers loop bodies that
+/// accumulate then consume. A pairing farther back is missed (accepted
+/// false negative).
 fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bool {
+    const stop = lines.len -| paired_increment_lookback;
     var i = lines.len;
-    while (i > 0) {
+    while (i > stop) {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) {
@@ -19305,11 +19343,16 @@ fn scanLineDelimiters(ctx: []const u8, parens: usize, braces: usize) DelimScanRe
 }
 
 fn hasShortCircuitGuardOnPriorLines(lines: []const []const u8, current_idx: usize) bool {
+    // The guard lives on a prior line of the same multi-line expression.
+    // The `;` break at depth 0 bounds most scans to the statement start.
+    // The 10-line window caps a pathological open-delimiter continuation
+    // (EPH-I0225). A real multi-line assert spans about 2 to 5 lines.
+    const stop = current_idx -| short_circuit_lookback;
     var close_parens: usize = 0;
     var close_braces: usize = 0;
     var line_idx = current_idx;
 
-    while (line_idx > 0) {
+    while (line_idx > stop) {
         line_idx -= 1;
         const ctx = mem.trim(u8, lines[line_idx], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
@@ -19614,14 +19657,19 @@ fn hasConditionalGuardForVar(ctx: []const u8, var_name: []const u8) bool {
 }
 
 /// Walk backwards through enclosing blocks, checking for a guarded variable
+///
+/// The walk stops enclosing_block_lookback lines back (EPH-I0225). A block
+/// opener sits above its whole body, so this walk gets the widest window.
+/// An opener beyond the window is missed (accepted false negative).
 fn hasEnclosingGuardForVar(
     lines: []const []const u8,
     current_idx: usize,
     var_name: []const u8,
 ) bool {
+    const stop = current_idx -| enclosing_block_lookback;
     var brace_depth: i32 = 0;
     var i = current_idx;
-    while (i > 0) {
+    while (i > stop) {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
@@ -43568,6 +43616,197 @@ test "opensCognitiveScope detects control keyword + brace" {
     try std.testing.expect(!opensCognitiveScope("var x: u32 = 0;"));
     try std.testing.expect(!opensCognitiveScope("if (x) return;"));
     try std.testing.expect(!opensCognitiveScope("} else {"));
+}
+
+test "countLineCyclomatic ignores keywords in strings and comments (EPH-I0226)" {
+    // Raw substring counting reported each of these as 4 decision points.
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("foo(); // try and or orelse"));
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("// try and or orelse"));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countLineCyclomatic("const s = \"try and or orelse\";"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countLineCyclomatic("const s = \"try \\\"and\\\" or orelse\";"),
+    );
+    // Real tokens keep their counts (cardinality unchanged).
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("try foo();"));
+    try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a and b) {"));
+    try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a or b) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("const v = x orelse return;"));
+}
+
+test "countLineCognitive ignores keywords in strings and comments (EPH-I0226)" {
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countLineCognitive("foo(); // try and or orelse", 0),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countLineCognitive("const s = \"try and or orelse\";", 3),
+    );
+    // Real tokens keep their counts at any nesting level.
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("try foo();", 0));
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("try foo();", 3));
+    try std.testing.expectEqual(@as(usize, 2), countLineCognitive("if (a and b) {", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 3));
+}
+
+test "opensCognitiveScope ignores a try in a string or comment (EPH-I0226)" {
+    try std.testing.expect(!opensCognitiveScope("foo(); // try {"));
+    try std.testing.expect(!opensCognitiveScope("const s = \"try {\";"));
+    try std.testing.expect(opensCognitiveScope("try foo() catch |e| {"));
+}
+
+test "ZA305: keyword-heavy trailing comment does not inflate CCN (EPH-I0226)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 14 real decision points (CCN 15, at the threshold). The trailing
+    // comment added 4 phantom points pre-fix (raw 19) and fired ZA305.
+    // The nested chain keeps the fn out of the flat-chain 2x multiplier.
+    const code =
+        \\fn commentInflated(x: u32) u32 {
+        \\    if (x == 1) {
+        \\        if (x == 2) {
+        \\            if (x == 3) {
+        \\                if (x == 4) {
+        \\                    if (x == 5) {
+        \\                        if (x == 6) {
+        \\                            if (x == 7) {
+        \\                                if (x == 8) return 8;
+        \\                            }
+        \\                        }
+        \\                    }
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\    if (x == 9) return 9;
+        \\    if (x == 10) return 10;
+        \\    if (x == 11) return 11;
+        \\    if (x == 12) return 12;
+        \\    if (x == 13) return 13;
+        \\    if (x == 14) return 14;
+        \\    return 0; // try and or orelse
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "comment.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "comment.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+    try expectNoCyclomaticWarnings(issues.items, "comment.zig");
+}
+
+// --- EPH-I0225: bounded backward-scan windows ---
+
+/// Fill every slot with `filler`, then place `guard` at `guard_idx`.
+fn guardScanFixture(
+    buf: [][]const u8,
+    filler: []const u8,
+    guard: []const u8,
+    guard_idx: usize,
+) [][]const u8 {
+    for (buf) |*slot| slot.* = filler;
+    buf[guard_idx] = guard;
+    return buf;
+}
+
+test "hasNullGuard finds a guard inside the lookback window (EPH-I0225)" {
+    var buf: [8][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (x == null) return;", 1);
+    try std.testing.expect(hasNullGuard(lines, lines.len - 1, 0, "x"));
+}
+
+test "hasNullGuard misses a guard beyond the lookback window (EPH-I0225)" {
+    var buf: [30][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (x == null) return;", 1);
+    // The guard is 28 lines back, past the 20-line window (accepted FN).
+    try std.testing.expect(!hasNullGuard(lines, lines.len - 1, 0, "x"));
+}
+
+test "hasPairedIncrementInLines finds an increment inside the window (EPH-I0225)" {
+    var buf: [8][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "total += 1;", 2);
+    try std.testing.expect(hasPairedIncrementInLines(lines, "total"));
+}
+
+test "hasPairedIncrementInLines misses an increment beyond the window (EPH-I0225)" {
+    var buf: [30][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "total += 1;", 2);
+    // The pairing is 27 lines back, past the 20-line window (accepted FN).
+    try std.testing.expect(!hasPairedIncrementInLines(lines, "total"));
+}
+
+test "hasShortCircuitGuardOnPriorLines finds a guard inside the window (EPH-I0225)" {
+    var buf: [6][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "arg,", "assert(offset == 0 or", 1);
+    try std.testing.expect(hasShortCircuitGuardOnPriorLines(lines, lines.len - 1));
+}
+
+test "hasShortCircuitGuardOnPriorLines misses a guard beyond the window (EPH-I0225)" {
+    var buf: [20][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "arg,", "assert(offset == 0 or", 1);
+    // The guard is 18 lines back, past the 10-line window (accepted FN).
+    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1));
+}
+
+test "findEnclosingIfCondition finds an enclosing if inside the window (EPH-I0225)" {
+    var buf: [8][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (big) {", 1);
+    const cond = findEnclosingIfCondition(lines, lines.len - 1) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("big", cond);
+}
+
+test "findEnclosingIfCondition misses an enclosing if beyond the window (EPH-I0225)" {
+    var buf: [50][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (big) {", 1);
+    // The opener is 48 lines back, past the 40-line window (accepted FN).
+    try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1) == null);
+}
+
+test "findEnclosingIfLine finds and misses by the same window (EPH-I0225)" {
+    var buf: [50][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (big) {", 1);
+    // Inside the window: 7 lines back from index 8.
+    try std.testing.expectEqual(@as(?usize, 1), findEnclosingIfLine(lines, 8));
+    // Beyond the window: 48 lines back from the last index.
+    try std.testing.expect(findEnclosingIfLine(lines, lines.len - 1) == null);
+}
+
+test "hasEnclosingGuardForVar finds a guard inside the window (EPH-I0225)" {
+    var buf: [8][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (count > 0) {", 1);
+    try std.testing.expect(hasEnclosingGuardForVar(lines, lines.len - 1, "count"));
+}
+
+test "hasEnclosingGuardForVar misses a guard beyond the window (EPH-I0225)" {
+    var buf: [50][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (count > 0) {", 1);
+    // The opener is 48 lines back, past the 40-line window (accepted FN).
+    try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "count"));
+}
+
+test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
+    var buf: [20000][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (x == null) return;", 0);
+    // The only guard sits 19999 lines back, past every window. The unbounded
+    // pre-fix scans walked all 20000 lines per call. Each query now returns
+    // after at most its window of lines.
+    try std.testing.expect(!hasNullGuard(lines, lines.len - 1, 0, "x"));
+    try std.testing.expect(!hasPairedIncrementInLines(lines, "x"));
+    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1));
+    try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1) == null);
+    try std.testing.expect(findEnclosingIfLine(lines, lines.len - 1) == null);
+    try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "x"));
 }
 
 // --- Integration tests with exact counts ---

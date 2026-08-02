@@ -265,6 +265,19 @@ Validation rules:
 - An honored `exclude` list rejects an empty pattern with a hard usage error. Ephor ignores the over-broad patterns `/` and `.zig` with a warning. Untrusted configs skip `exclude` before validation.
 - Threshold values clamp at documented maxima with a warning: 100000 (lines, nesting, params, branches, line length), 10000 (cyclomatic, cognitive), 100000000 (file bytes). Config files and CLI flags clamp alike.
 
+### Subprocess trust
+
+Ephor executes the `zig` and `curl` binaries it finds on `PATH`. A poisoned `PATH` is code execution on every analysis run, including a bare `ephor check`. Run ephor in a clean environment, or pin the tools with the overrides below.
+
+Set `EPHOR_ZIG_PATH` and `EPHOR_CURL_PATH` to absolute paths to override the `PATH` lookup:
+
+```bash
+export EPHOR_ZIG_PATH=/usr/local/bin/zig
+export EPHOR_CURL_PATH=/usr/bin/curl
+```
+
+An override that is not absolute or does not resolve prints a warning and falls back to `PATH`. The fallback keeps a typo from blocking the run. The threat is a hostile environment, and the operator controls the overrides.
+
 ## Rule IDs
 
 ### Memory (ZA1xx)

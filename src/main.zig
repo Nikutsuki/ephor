@@ -98,6 +98,64 @@ const Fs = struct {
 /// Global I/O handle for child process and file operations.
 var global_io: ?std.Io = null;
 
+/// Spawn paths for the external tools ephor executes (EPH-I0154). main
+/// resolves them once from the EPHOR_ZIG_PATH / EPHOR_CURL_PATH env
+/// overrides. The bare defaults route the spawn through PATH.
+var tool_zig_path: []const u8 = "zig";
+var tool_curl_path: []const u8 = "curl";
+
+/// An external tool ephor spawns, for EPHOR_*_PATH resolution (EPH-I0154).
+const ToolKind = enum {
+    zig,
+    curl,
+
+    /// Env var that overrides the spawn path of this tool.
+    fn envVar(self: ToolKind) []const u8 {
+        return switch (self) {
+            .zig => "EPHOR_ZIG_PATH",
+            .curl => "EPHOR_CURL_PATH",
+        };
+    }
+
+    /// argv[0] used when no valid override is set: the PATH lookup name.
+    fn bareName(self: ToolKind) []const u8 {
+        return switch (self) {
+            .zig => "zig",
+            .curl => "curl",
+        };
+    }
+};
+
+/// Resolve the spawn path of an external tool (EPH-I0154). An absolute env
+/// override that resolves wins. Anything else falls back to the bare name
+/// and PATH. The fallback is fail-open with a warning, not a hard error:
+/// the threat is a hostile environment, which the operator controls, and a
+/// path typo must not brick the run.
+fn resolveToolFromEnv(io: std.Io, tool: ToolKind, env_val: ?[]const u8) []const u8 {
+    const val = env_val orelse return tool.bareName();
+    if (!std.fs.path.isAbsolute(val)) {
+        cliDiag(
+            "warning: ignoring {s} value '{s}' (not an absolute path). Using PATH.\n",
+            .{ tool.envVar(), val },
+        );
+        return tool.bareName();
+    }
+    std.Io.Dir.cwd().access(io, val, .{}) catch {
+        cliDiag(
+            "warning: {s} path '{s}' does not resolve. Using PATH.\n",
+            .{ tool.envVar(), val },
+        );
+        return tool.bareName();
+    };
+    return val;
+}
+
+/// Resolve every tool spawn path once from the process environment.
+fn initToolPaths(io: std.Io, environ_map: *const std.process.Environ.Map) void {
+    tool_zig_path = resolveToolFromEnv(io, .zig, environ_map.get("EPHOR_ZIG_PATH"));
+    tool_curl_path = resolveToolFromEnv(io, .curl, environ_map.get("EPHOR_CURL_PATH"));
+}
+
 /// Test hook: zig build test's runner surfaces any stderr output as a step
 /// failure, so tests that exercise error paths mute parse diagnostics and
 /// assert on the resulting state instead of on the printed text.
@@ -20174,7 +20232,7 @@ fn reportFmtFailure(
 /// keeps and gates the untrusted bytes.
 fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(Issue) {
     const result = std.process.run(allocator, global_io.?, .{
-        .argv = &.{ "zig", "fmt", "--check", path },
+        .argv = &.{ tool_zig_path, "fmt", "--check", path },
     }) catch |err| {
         std.debug.print("error: cannot run zig fmt: {}\n", .{err});
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -20309,7 +20367,7 @@ fn buildRuntimeArgv(
             );
         return parsed.argc;
     }
-    argv_buf[0] = "zig";
+    argv_buf[0] = tool_zig_path;
     argv_buf[1] = "build";
     argv_buf[2] = "test";
     if (verbose)
@@ -22571,14 +22629,17 @@ fn checkProjectPrerequisites(project_dir: std.Io.Dir) bool {
 /// project_dir is the project root for the prerequisite gate and the
 /// zig-fetch child. Production passes the process working directory. The
 /// post-fetch steps (recorded hash, ephor.json) run in the process working
-/// directory, which is the same directory in production. Every failure
-/// path returns error.InstallFailed (EPH-I0235): a CI step doing
-/// `ephor install && zig build ephor` must not proceed on a failed install.
+/// directory, which is the same directory in production. An invalid
+/// --version returns error.InvalidVersion before any project check
+/// (EPH-I0155). Every other failure path returns error.InstallFailed
+/// (EPH-I0235): a CI step doing `ephor install && zig build ephor` must
+/// not proceed on a failed install.
 fn runInstallCommand(
     allocator: Allocator,
     project_dir: std.Io.Dir,
     install_version: ?[]const u8,
 ) !void {
+    try requireStrictExplicitVersion(install_version);
     const ver = install_version orelse EPHOR_VERSION;
 
     if (!checkProjectPrerequisites(project_dir)) return error.InstallFailed;
@@ -22592,7 +22653,7 @@ fn runInstallCommand(
     defer allocator.free(url_z);
 
     var child = try std.process.spawn(global_io.?, .{
-        .argv = &.{ "zig", "fetch", "--save=ephor", url_z },
+        .argv = &.{ tool_zig_path, "fetch", "--save=ephor", url_z },
         .cwd = .{ .dir = project_dir },
     });
     const term = try child.wait(global_io.?);
@@ -22760,6 +22821,32 @@ fn indexOfCode(content: []const u8, start: usize, needle: []const u8) ?usize {
     return null;
 }
 
+/// True when the match at `pos` is the first content on its line: only
+/// spaces and tabs precede it. WHY: a marker that follows real tokens sits
+/// inside an expression, so it cannot open or close the ephor build block
+/// (EPH-I0168).
+fn isLineAnchored(content: []const u8, pos: usize) bool {
+    const before = content[0..pos];
+    const line_start = if (mem.lastIndexOfScalar(u8, before, '\n')) |nl| nl + 1 else 0;
+    for (content[line_start..pos]) |c| {
+        if (c != ' ' and c != '\t') return false;
+    }
+    return true;
+}
+
+/// First occurrence of a build.zig block marker at or after `start` that
+/// is line-anchored and sits in code context. A hostile build.zig can
+/// plant the marker text inside a string, a comment, or a `\\` multiline
+/// body to steer the splice cut (EPH-I0168). Both filters must pass.
+fn indexOfBlockMarker(content: []const u8, start: usize, marker: []const u8) ?usize {
+    var from = start;
+    while (mem.indexOfPos(u8, content, from, marker)) |pos| {
+        if (isLineAnchored(content, pos) and isCodeMatch(content, pos)) return pos;
+        from = pos + 1;
+    }
+    return null;
+}
+
 /// Extract the `.hash` value of the `.ephor` dependency entry from
 /// build.zig.zon content. Caller frees the result. Returns null on any
 /// miss: the fetch-time print is advisory and never fails the command
@@ -22834,14 +22921,19 @@ fn printRecordedHash(allocator: Allocator, ver: []const u8) void {
 /// project_dir is the project root for the dependency gate and the
 /// zig-fetch child. Production passes the process working directory. The
 /// post-fetch steps run in the process working directory, which is the
-/// same directory in production. Every failure path returns
-/// error.UpgradeFailed (EPH-I0235): a script must see a nonzero exit.
+/// same directory in production. An invalid --version returns
+/// error.InvalidVersion before any fetch (EPH-I0155). Every other failure
+/// path returns error.UpgradeFailed (EPH-I0235): a script must see a
+/// nonzero exit.
 fn runUpgradeCommand(
     allocator: Allocator,
     project_dir: std.Io.Dir,
     install_version: ?[]const u8,
     force: bool,
 ) !void {
+    // Validate before the fetch: an explicit version reaches the URL below
+    // unchecked without this gate (EPH-I0155).
+    try requireStrictExplicitVersion(install_version);
     // If no explicit version, fetch the latest from Codeberg tags API
     const fetched_ver = if (install_version == null) fetchLatestVersion(allocator) else null;
     defer if (fetched_ver) |fv| allocator.free(fv);
@@ -22877,7 +22969,7 @@ fn runUpgradeCommand(
 
     // Run zig fetch --save to update the dependency
     var child = try std.process.spawn(global_io.?, .{
-        .argv = &.{ "zig", "fetch", "--save=ephor", url_z },
+        .argv = &.{ tool_zig_path, "fetch", "--save=ephor", url_z },
         .cwd = .{ .dir = project_dir },
     });
 
@@ -23138,54 +23230,122 @@ const EPHOR_BUILD_BLOCK =
     \\    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
 ;
 
+/// Outcome of composing the canonical-block replacement for build.zig
+/// content (EPH-I0168).
+const IntegrationUpdate = union(enum) {
+    /// No marker pair in anchored code context: nothing to replace.
+    no_markers,
+    /// The existing block already matches the canonical block.
+    current,
+    /// Replacement content. The caller owns the slice.
+    replaced: []u8,
+};
+
+/// A start/end marker pair locating an ephor build block.
+const IntegrationMarkerPair = struct { start: []const u8, end: []const u8 };
+
+/// Marker pairs for the ephor block: the canonical block marker first,
+/// then the old v0.11.x snippet marker.
+const integration_marker_pairs = &[_]IntegrationMarkerPair{
+    .{
+        .start = "    // Ephor static analysis",
+        .end = "ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);",
+    },
+    .{
+        .start = "    // === Ephor Static Analysis ===",
+        .end = "ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);",
+    },
+};
+
+/// Attempt the canonical-block splice for one marker pair. Returns null
+/// when the pair's markers do not both appear in anchored code context.
+/// Markers match only at line start in code context (EPH-I0168): a hostile
+/// build.zig can plant the marker text inside a string, a comment, or a
+/// `\\` multiline body to steer the cut, and the end marker is searched
+/// only after the accepted start marker.
+fn tryIntegrationMarkerPair(
+    allocator: Allocator,
+    content: []const u8,
+    m: IntegrationMarkerPair,
+) !?IntegrationUpdate {
+    const sp = indexOfBlockMarker(content, 0, m.start) orelse return null;
+    const ep = indexOfBlockMarker(content, sp + m.start.len, m.end) orelse return null;
+    const be = ep + m.end.len;
+
+    // Extract current block and compare
+    const current_block = content[sp..be];
+    if (mem.eql(u8, current_block, EPHOR_BUILD_BLOCK)) return .current;
+
+    return .{ .replaced = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        content[0..sp],
+        EPHOR_BUILD_BLOCK,
+        content[be..],
+    }) };
+}
+
+/// Compose the build.zig content with the canonical ephor block replacing
+/// the existing one. Finds the ephor section by its start/end markers and
+/// replaces it entirely. Supports both the old snippet marker
+/// (// === Ephor Static Analysis ===) and the new canonical block marker
+/// (// Ephor static analysis).
+fn buildIntegrationUpdate(allocator: Allocator, content: []const u8) !IntegrationUpdate {
+    for (integration_marker_pairs) |m| {
+        if (try tryIntegrationMarkerPair(allocator, content, m)) |update| return update;
+    }
+    return .no_markers;
+}
+
+/// Byte cap on captured zig ast-check output (EPH-I0168). ast-check prints
+/// one line per parse error. A hostile composed file could carry many.
+const ast_check_capture_limit_bytes = 1024 * 1024;
+
+/// True when `content` parses as Zig: write it to a uniquely named temp
+/// file in `dir` and run `zig ast-check` on it (EPH-I0168). The temp name
+/// cannot exist yet, so no planted symlink is followed, and deinit removes
+/// the file without publishing it. The spawn resolves zig through the
+/// I0154 tool resolver. Any defect (write, spawn, nonzero exit) reads as
+/// "does not parse": the caller keeps the live file.
+fn zigContentParses(allocator: Allocator, dir: std.Io.Dir, content: []const u8) bool {
+    var atomic = dir.createFileAtomic(global_io.?, "build.zig", .{ .replace = false }) catch
+        return false;
+    defer atomic.deinit(global_io.?);
+    atomic.file.writeStreamingAll(global_io.?, content) catch return false;
+    const tmp_name = std.fmt.hex(atomic.file_basename_hex);
+    const result = std.process.run(allocator, global_io.?, .{
+        .argv = &.{ tool_zig_path, "ast-check", &tmp_name },
+        .cwd = .{ .dir = dir },
+        .stdout_limit = .limited(ast_check_capture_limit_bytes),
+        .stderr_limit = .limited(ast_check_capture_limit_bytes),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term == .exited and result.term.exited == 0;
+}
+
 /// Update the ephor build steps in build.zig to match the current canonical block.
-/// Finds the ephor section by its start/end markers and replaces it entirely.
-/// Supports both the old snippet marker (// === Ephor Static Analysis ===) and
-/// the new canonical block marker (// Ephor static analysis).
 /// Best-effort: silently does nothing if build.zig is missing or has no ephor section.
+/// The composed content must pass `zig ast-check` before it replaces the
+/// live file (EPH-I0168): a marker cut that landed mid-expression would
+/// leave the project unbuildable, so a parse failure aborts the replace
+/// and keeps the old content.
 fn updateBuildZigIntegration(allocator: Allocator) void {
     const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
     defer allocator.free(content);
 
-    // Try multiple marker pairs: (start_marker, end_marker)
-    const MarkerPair = struct { start: []const u8, end: []const u8 };
-    const markers = &[_]MarkerPair{
-        .{
-            .start = "    // Ephor static analysis",
-            .end = "ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);",
-        },
-        .{
-            .start = "    // === Ephor Static Analysis ===",
-            .end = "ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);",
-        },
+    const update = buildIntegrationUpdate(allocator, content) catch return;
+    const new_content = switch (update) {
+        .no_markers, .current => return,
+        .replaced => |nc| nc,
     };
-
-    var start_pos: ?usize = null;
-    var block_end: ?usize = null;
-
-    for (markers) |m| {
-        const sp = mem.indexOf(u8, content, m.start) orelse continue;
-        const end_search_start = sp + m.start.len;
-        const ep = mem.indexOf(u8, content[end_search_start..], m.end) orelse continue;
-        start_pos = sp;
-        block_end = end_search_start + ep + m.end.len;
-        break;
-    }
-
-    const sp = start_pos orelse return;
-    const be = block_end orelse return;
-
-    // Extract current block and compare
-    const current_block = content[sp..be];
-    if (mem.eql(u8, current_block, EPHOR_BUILD_BLOCK)) return;
-
-    // Replace the block
-    const new_content = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
-        content[0..sp],
-        EPHOR_BUILD_BLOCK,
-        content[be..],
-    }) catch return;
     defer allocator.free(new_content);
+
+    if (!zigContentParses(allocator, std.Io.Dir.cwd(), new_content)) {
+        cliDiag(
+            "warning: composed build.zig failed zig ast-check. Keeping the current block.\n",
+            .{},
+        );
+        return;
+    }
 
     writeFileAtomic(std.Io.Dir.cwd(), "build.zig", new_content) catch return;
 
@@ -23304,9 +23464,17 @@ fn readUpdateCache(allocator: Allocator, path: []const u8) ?CachedCheck {
     return .{ .epoch = epoch, .version = owned };
 }
 
-/// Persist the cache as "<epoch>\n<version>\n". Direct write: a crash
-/// mid-write leaves a corrupt file that readUpdateCache rejects, so the next
-/// run simply refetches — the format is self-healing.
+/// Owner-only mode of the update-check cache (EPH-I0167). The file lives
+/// in $HOME, so a umask-loose default would leak the version stamp.
+const update_cache_file_mode = 0o600;
+
+/// Persist the cache as "<epoch>\n<version>\n". Atomic: a uniquely named
+/// temp file in the same directory plus rename, so a planted symlink at
+/// the cache path is replaced, never followed (EPH-I0167). The temp file
+/// is chmod 0600 (fchmod through File.setPermissions) before the rename
+/// publishes it. A crash mid-write leaves a corrupt file that
+/// readUpdateCache rejects, so the next run simply refetches — the format
+/// is self-healing.
 fn writeUpdateCache(
     allocator: Allocator,
     path: []const u8,
@@ -23315,7 +23483,22 @@ fn writeUpdateCache(
 ) void {
     const content = std.fmt.allocPrint(allocator, "{d}\n{s}\n", .{ now, version }) catch return;
     defer allocator.free(content);
-    Fs.cwd().writeFile(path, content, .{}) catch return;
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    const base = std.fs.path.basename(path);
+    if (base.len == 0) return;
+    var dir = std.Io.Dir.cwd().openDir(global_io.?, dir_path, .{}) catch return;
+    defer dir.close(global_io.?);
+    var atomic = dir.createFileAtomic(global_io.?, base, .{ .replace = true }) catch return;
+    defer atomic.deinit(global_io.?);
+    atomic.file.writeStreamingAll(global_io.?, content) catch return;
+    // POSIX-only: the Windows permissions model has no mode_t.
+    if (comptime std.posix.mode_t != u0) {
+        atomic.file.setPermissions(
+            global_io.?,
+            std.Io.File.Permissions.fromMode(update_cache_file_mode),
+        ) catch return;
+    }
+    atomic.replace(global_io.?) catch return;
 }
 
 /// Return the cached version (ownership transferred to the caller) when a
@@ -23345,6 +23528,29 @@ fn resolveLatestVersion(
     return latest;
 }
 
+/// Byte cap on a version-fetch curl stdout (EPH-I0156). The tags API page
+/// (limit=10) is a few KiB and the zon page is smaller. 64 KiB is
+/// generous. A larger body fails the fetch with StreamTooLong, which the
+/// existing catch routes into the fallback chain.
+const version_fetch_stdout_limit_bytes = 64 * 1024;
+
+/// Build the argv both version-fetch curl spawns share (EPH-I0156). One
+/// builder keeps the hardening flags in sync between the two call sites.
+/// --proto and --proto-redir clamp the fetch to https, so a hostile
+/// network cannot redirect into a file:// read of local files. The URL
+/// goes last.
+fn buildCurlFetchArgv(
+    curl_path: []const u8,
+    max_time_s: []const u8,
+    url: []const u8,
+) [9][]const u8 {
+    return .{
+        curl_path, "-sL",    "--max-time",    max_time_s,
+        "--proto", "=https", "--proto-redir", "=https",
+        url,
+    };
+}
+
 /// Fetch latest version from the Codeberg tags API (not cached raw files).
 /// Falls back to parsing build.zig.zon from main branch if tags API fails.
 fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
@@ -23352,8 +23558,10 @@ fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
     // attacker-influenceable, so the parser takes the semver-max over the
     // page instead of the first entry (EPH-I0193).
     const api_url = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10";
+    const api_argv = buildCurlFetchArgv(tool_curl_path, "5", api_url);
     const api_result = std.process.run(allocator, global_io.?, .{
-        .argv = &.{ "curl", "-sL", "--max-time", "5", api_url },
+        .argv = &api_argv,
+        .stdout_limit = .limited(version_fetch_stdout_limit_bytes),
     }) catch return fetchVersionFromZon(allocator);
     defer allocator.free(api_result.stdout);
     defer allocator.free(api_result.stderr);
@@ -23368,8 +23576,10 @@ fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
 
 /// Fetch version by parsing build.zig.zon from the main branch (CDN-cached fallback).
 fn fetchVersionFromZon(allocator: Allocator) ?[]const u8 {
+    const zon_argv = buildCurlFetchArgv(tool_curl_path, "3", EPHOR_VERSION_URL);
     const result = std.process.run(allocator, global_io.?, .{
-        .argv = &.{ "curl", "-sL", "--max-time", "3", EPHOR_VERSION_URL },
+        .argv = &zon_argv,
+        .stdout_limit = .limited(version_fetch_stdout_limit_bytes),
     }) catch return null;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -23405,6 +23615,18 @@ fn isStrictSemverTag(ver: []const u8) bool {
         digit_run += 1;
     }
     return dots == 2 and digit_run > 0;
+}
+
+/// Validate an explicit --version value before it reaches a fetch URL
+/// (EPH-I0155, EPH-I0166). The grammar is the I0193 strict tag shape
+/// X.Y.Z, and buildPackageUrl splices the value into the URL unchecked, so
+/// anything else is a hard usage error, never a URL component. Null (no
+/// explicit version) always passes.
+fn requireStrictExplicitVersion(install_version: ?[]const u8) !void {
+    const ver = install_version orelse return;
+    if (isStrictSemverTag(ver)) return;
+    cliDiag("error: invalid --version value '{s}' (expected X.Y.Z)\n", .{ver});
+    return error.InvalidVersion;
 }
 
 /// Parse the newest stable version from a Codeberg tags API JSON response.
@@ -24430,6 +24652,14 @@ fn printHelp() void {
         \\                          version update check entirely: no network fetch,
         \\                          no cache read, no warning. Without it, the latest
         \\                          version is cached for 24h at ~/.ephor_update_check.
+        \\  EPHOR_ZIG_PATH        Absolute path of the zig binary ephor spawns.
+        \\                          Overrides the PATH lookup. A value that is not
+        \\                          absolute or does not resolve warns and falls back
+        \\                          to PATH (EPH-I0154).
+        \\  EPHOR_CURL_PATH       Same override for the curl binary the update check
+        \\                          spawns. Ephor executes the zig and curl found via
+        \\                          PATH. A poisoned PATH is code execution, so pin
+        \\                          these in a hostile environment.
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
@@ -25480,6 +25710,7 @@ fn scanPath(g: *ImportGraph, path: []const u8) !void {
 
 pub fn main(init: std.process.Init) !void {
     global_io = init.io;
+    initToolPaths(init.io, init.environ_map);
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -37227,6 +37458,45 @@ test "update cache write/read round-trip" {
     try std.testing.expectEqual(now, cached.epoch);
 }
 
+test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Victim the planted symlink points at.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "victim", .data = "victim" });
+    try tmp.dir.symLink(std.testing.io, "victim", "cache", .{});
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+
+    const now: i64 = 1_800_000_000;
+    writeUpdateCache(allocator, path, "1.2.3", now);
+
+    // The victim keeps its bytes: the write must not have followed the link.
+    const victim = try tmp.dir.readFileAlloc(std.testing.io, "victim", allocator, .limited(64));
+    defer allocator.free(victim);
+    try std.testing.expectEqualStrings("victim", victim);
+
+    // The cache path is now a regular file holding the entry.
+    const stat = try tmp.dir.statFile(std.testing.io, "cache", .{ .follow_symlinks = false });
+    try std.testing.expect(stat.kind == .file);
+    const cached = readUpdateCache(allocator, path) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(cached.version);
+    try std.testing.expectEqualStrings("1.2.3", cached.version);
+    try std.testing.expectEqual(now, cached.epoch);
+
+    // Owner-only mode on the published file (POSIX permissions only).
+    if (comptime std.posix.mode_t != u0) {
+        try std.testing.expectEqual(
+            @as(std.posix.mode_t, update_cache_file_mode),
+            stat.permissions.toMode() & 0o777,
+        );
+    }
+}
+
 test "resolveLatestVersion returns fresh cache without fetching" {
     global_io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -37432,6 +37702,48 @@ test "parseVersionFromTagsApi returns null for garbage input" {
     try std.testing.expect(parseVersionFromTagsApi(allocator, "not json") == null);
     try std.testing.expect(parseVersionFromTagsApi(allocator, "{\"name\": 42}") == null);
     try std.testing.expect(parseVersionFromTagsApi(allocator, "") == null);
+}
+
+test "buildCurlFetchArgv pins the https clamp flags (EPH-I0156)" {
+    // Pre-fix both spawns were inline argv literals that could drift apart.
+    // The builder is the single source. The flags block non-https schemes
+    // (redirects included), so a hostile network cannot turn the fetch into
+    // a local file read.
+    const argv = buildCurlFetchArgv("curl", "5", "https://example.invalid/tags");
+    try std.testing.expectEqualStrings("curl", argv[0]);
+    try std.testing.expectEqualStrings("-sL", argv[1]);
+    try std.testing.expectEqualStrings("--max-time", argv[2]);
+    try std.testing.expectEqualStrings("5", argv[3]);
+    try std.testing.expectEqualStrings("--proto", argv[4]);
+    try std.testing.expectEqualStrings("=https", argv[5]);
+    try std.testing.expectEqualStrings("--proto-redir", argv[6]);
+    try std.testing.expectEqualStrings("=https", argv[7]);
+    try std.testing.expectEqualStrings("https://example.invalid/tags", argv[8]);
+}
+
+test "requireStrictExplicitVersion accepts null and strict X.Y.Z (EPH-I0155)" {
+    const good = [_]?[]const u8{ null, "0.14.3", "10.20.30" };
+    for (good) |value| {
+        try requireStrictExplicitVersion(value);
+        // The gate's acceptance grammar is exactly the I0193 tag grammar.
+        try std.testing.expect(value == null or isStrictSemverTag(value.?));
+    }
+}
+
+test "requireStrictExplicitVersion rejects non-strict values (EPH-I0155)" {
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    // "v1.2.3" fails: buildPackageUrl prepends the v itself. "1.2.3-beta.1"
+    // fails: the I0193 tag grammar has no suffix. "" fails: no components.
+    const bad = [_][]const u8{
+        "garbage", "1.2", "1.2.3.4", "v1.2.3", "1.2.3-beta.1", "", "../1.2.3",
+    };
+    for (bad) |value| {
+        try std.testing.expectError(
+            error.InvalidVersion,
+            requireStrictExplicitVersion(value),
+        );
+    }
 }
 
 test "upgradeFloorAllows blocks downgrades without force (EPH-I0193)" {
@@ -37641,6 +37953,146 @@ test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194
         try std.testing.expect(is_expected);
     }
     try std.testing.expectEqual(@as(usize, 2), entries);
+}
+
+test "buildIntegrationUpdate ignores forged markers in strings and comments (EPH-I0168)" {
+    // The start marker sits inside a string, the end marker inside a
+    // comment. Pre-fix the raw indexOf matched both and the splice cut at
+    // the forged positions, corrupting the file.
+    const allocator = std.testing.allocator;
+    const content =
+        \\const std = @import("std");
+        \\const note = "    // Ephor static analysis";
+        \\// ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b;
+        \\}
+        \\
+    ;
+    const update = try buildIntegrationUpdate(allocator, content);
+    try std.testing.expect(update == .no_markers);
+}
+
+test "buildIntegrationUpdate rejects a forged end marker inside a string (EPH-I0168)" {
+    // The start marker is real, but the only end marker sits in a string
+    // after it. Pre-fix the splice cut through the string text.
+    const allocator = std.testing.allocator;
+    const content =
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b;
+        \\    // Ephor static analysis
+        \\    const ephor_dep = 1;
+        \\    const help = "ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);";
+        \\}
+        \\
+    ;
+    const update = try buildIntegrationUpdate(allocator, content);
+    try std.testing.expect(update == .no_markers);
+}
+
+test "buildIntegrationUpdate rejects a marker that follows code on its line (EPH-I0168)" {
+    // The start marker text follows real tokens. isCodeMatch passes it
+    // (the match starts before the comment opener), so the line anchor is
+    // the filter that rejects it.
+    const allocator = std.testing.allocator;
+    const content =
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b;
+        \\    call(    // Ephor static analysis
+        \\        1,
+        \\    );
+        \\    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
+        \\}
+        \\
+    ;
+    const update = try buildIntegrationUpdate(allocator, content);
+    try std.testing.expect(update == .no_markers);
+}
+
+test "buildIntegrationUpdate replaces an outdated block (EPH-I0168)" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = 1;
+        \\    _ = exe;
+        \\    _ = b;
+        \\    // Ephor static analysis
+        \\    const ephor_dep = b.dependency("ephor", .{});
+        \\    _ = ephor_dep;
+        \\    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
+        \\}
+        \\
+    ;
+    const update = try buildIntegrationUpdate(allocator, content);
+    const new_content = switch (update) {
+        .replaced => |nc| nc,
+        else => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(new_content);
+
+    // The canonical block landed between the preserved prefix and suffix.
+    try std.testing.expect(mem.indexOf(u8, new_content, EPHOR_BUILD_BLOCK) != null);
+    try std.testing.expect(mem.startsWith(u8, new_content, "pub fn build"));
+    try std.testing.expect(mem.endsWith(u8, new_content, "}\n"));
+    // The replaced text is gone.
+    try std.testing.expect(mem.indexOf(u8, new_content, "const ephor_dep = 1") == null);
+}
+
+test "buildIntegrationUpdate reports an already-canonical block (EPH-I0168)" {
+    const allocator = std.testing.allocator;
+    const content = "pub fn build(b: *std.Build) void {\n    _ = b;\n" ++
+        EPHOR_BUILD_BLOCK ++ "\n}\n";
+    const update = try buildIntegrationUpdate(allocator, content);
+    try std.testing.expect(update == .current);
+}
+
+test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expect(zigContentParses(allocator, tmp.dir, "pub fn build() void {}\n"));
+    try std.testing.expect(!zigContentParses(allocator, tmp.dir, "pub fn build( void {\n"));
+
+    // Both runs cleaned their temp file: no litter in the project dir.
+    var it = tmp.dir.iterate();
+    try std.testing.expect((try it.next(std.testing.io)) == null);
+}
+
+test "resolveToolFromEnv falls back to the bare name when unset (EPH-I0154)" {
+    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(std.testing.io, .zig, null));
+    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(std.testing.io, .curl, null));
+}
+
+test "resolveToolFromEnv accepts an absolute override that resolves (EPH-I0154)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectEqualStrings(
+        "/bin/sh",
+        resolveToolFromEnv(std.testing.io, .zig, "/bin/sh"),
+    );
+}
+
+test "resolveToolFromEnv warns and falls back on a relative override (EPH-I0154)" {
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    try std.testing.expectEqualStrings(
+        "zig",
+        resolveToolFromEnv(std.testing.io, .zig, "tools/zig"),
+    );
+    // An empty value is not absolute either.
+    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(std.testing.io, .curl, ""));
+}
+
+test "resolveToolFromEnv warns and falls back on an unresolvable override (EPH-I0154)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    try std.testing.expectEqualStrings(
+        "zig",
+        resolveToolFromEnv(std.testing.io, .zig, "/nonexistent/ephor-i0154/zig"),
+    );
 }
 
 // Zon fixture for the EPH-I0271 write guard: a consumer project that
@@ -50041,6 +50493,35 @@ test "install patch failure maps to InstallFailed (EPH-I0235)" {
     try std.testing.expectError(
         error.InstallFailed,
         patchBuildZigOrFail(allocator, tmp.dir),
+    );
+}
+
+test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {
+    // Regression: an explicit --version reached the fetch URL unvalidated.
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(
+        error.InvalidVersion,
+        runUpgradeCommand(allocator, tmp.dir, "garbage", false),
+    );
+}
+
+test "install with an invalid --version returns InvalidVersion (EPH-I0155)" {
+    // Validation runs before the project-file gate: an empty directory
+    // must report the version error, not InstallFailed.
+    global_io = std.testing.io;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(
+        error.InvalidVersion,
+        runInstallCommand(allocator, tmp.dir, "1.2.3.4"),
     );
 }
 

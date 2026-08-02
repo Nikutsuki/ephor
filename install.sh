@@ -60,7 +60,17 @@ version_older() {
 # fails, the result is empty, or no tag is a strict vMAJOR.MINOR.PATCH.
 latest_ephor_tag() {
     # 30s: the Codeberg API has answered in 20s+ on slow days; refusals still fail fast.
-    response=$(curl -fsSL --max-time 30 "$TAGS_API" 2>/dev/null) || return 1
+    # EPH-I0156: an https fetch is clamped to the https scheme, redirects
+    # included, and capped at 1 MiB. A hostile network cannot redirect the
+    # fetch into a local file read or spew an unbounded body. The
+    # EPHOR_TAGS_API test channel (file://, http://) skips the clamp: the
+    # operator picks that URL, and the strict-tag filter below still gates
+    # the result. The word split of $proto_flags is intentional.
+    proto_flags=""
+    case "$TAGS_API" in
+        https://*) proto_flags="--proto =https --proto-redir =https --max-filesize 1048576" ;;
+    esac
+    response=$(curl -fsSL --max-time 30 $proto_flags "$TAGS_API" 2>/dev/null) || return 1
     tag=$(printf '%s\n' "$response" | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 \
         | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | max_stable_tag)
     [ -n "$tag" ] || return 1

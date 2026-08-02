@@ -84,8 +84,12 @@ max_stable_version() {
 
 # Fetch the latest remote tag once. Sections 5 and 6 use it.
 # Give the API 30s: observed 20s+ responses must not skip the gate.
+# EPH-I0156: clamp the fetch to the https scheme, redirects included, and
+# cap the body at 1 MiB. A hostile network cannot redirect the fetch into
+# a local file read or spew an unbounded body.
 TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10"
-REMOTE_TAG=$(curl -sL --max-time 30 "$TAGS_API" 2>/dev/null | max_stable_version)
+REMOTE_TAG=$(curl -sL --max-time 30 --proto "=https" --proto-redir "=https" \
+    --max-filesize 1048576 "$TAGS_API" 2>/dev/null | max_stable_version)
 
 # 5. install.sh EPHOR_FALLBACK_TAG matches the latest remote tag.
 # The fallback serves installs when the tags API fails. It must name the

@@ -4,10 +4,14 @@
 // To add support for a new Zig version:
 //   1. Create a new file: vX_YZ.zig (e.g., v0_17.zig)
 //   2. Implement all the required arrays and functions
-//   3. Add import below and register in version_registry
+//   3. Add the import below, a Tables constant, and a knownTablesFor arm
+//   4. Bump newest_supported_minor so the fallback clamps to the new tables
 //
-// The linter will automatically detect the Zig version and use the appropriate
-// compatibility layer.
+// Dispatch is a hardcoded switch by design (EPH-I0229): the per-version
+// modules are the only source of pattern tables. A version with no exact
+// tables falls back to the nearest supported tables — a newer version
+// clamps to the newest, an older version clamps to the oldest — and ephor
+// warns once per process when the fallback applies.
 //
 // Each version module exports:
 //   - builtins: All @builtin functions
@@ -27,6 +31,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const vocab = @import("vocab.zig");
 
 // Import all supported version modules
 pub const v0_15 = @import("v0_15.zig");
@@ -84,84 +89,189 @@ pub fn getCurrentVersion() VersionInfo {
     return comptime parseVersion(builtin.zig_version_string);
 }
 
-/// Version compatibility interface
-/// Each version module must export these functions
-pub const VersionCompat = struct {
-    /// Version identifier (e.g., "0.15", "0.16")
-    version_id: []const u8,
-
-    /// Minimum supported patch version
-    min_patch: u16,
-
-    /// Maximum supported patch version (255 = any)
-    max_patch: u16,
-
-    /// HashMap put signature changed between versions
-    /// True if hashmap.put takes (allocator, key, value) vs (key, value)
-    hashmap_put_has_allocator: bool,
-
-    /// ArrayList append signature
-    /// Returns true if append takes (allocator, item) vs (item)
-    arraylist_append_has_allocator: bool,
-
-    /// Get version-specific notes for diagnostics
-    notes: []const u8,
+/// Every pattern table and predicate one version module supplies.
+/// tables_0_15 and tables_0_16 are the whole dispatch table: the getters
+/// read fields instead of switching on the version at every call site.
+const Tables = struct {
+    /// Module version label ("0.15", "0.16") for the fallback warning.
+    version_label: []const u8,
+    builtins: []const []const u8,
+    optional_methods: []const []const u8,
+    error_methods: []const []const u8,
+    alloc_patterns: []const []const u8,
+    create_patterns: []const []const u8,
+    free_patterns: []const []const u8,
+    destroy_patterns: []const []const u8,
+    keywords: []const []const u8,
+    breaking_changes: []const []const u8,
+    std_modules: []const []const u8,
+    no_free_init_patterns: []const []const u8,
+    no_free_field_type_patterns: []const []const u8,
+    all_init_patterns: []const []const u8,
+    global_alloc_names: []const []const u8,
+    alloc_method_patterns: []const []const u8,
+    alloc_method_short_names: []const []const u8,
+    qualified_alloc_fn_patterns: []const []const u8,
+    /// The module's cleanup_pattern_strs list.
+    cleanup_patterns: []const []const u8,
+    container_ownership_methods: []const []const u8,
+    no_free_type_ptrs: []const []const u8,
+    safe_method_patterns: []const []const u8,
+    void_method_patterns: []const []const u8,
+    modifying_method_patterns: []const []const u8,
+    stdlib_container_init_patterns: []const []const u8,
+    managed_container_type_patterns: []const []const u8,
+    contains_optional_method: *const fn (line: []const u8) bool,
+    contains_error_method: *const fn (line: []const u8) bool,
+    contains_allocation: *const fn (line: []const u8) bool,
+    contains_builtin: *const fn (line: []const u8) bool,
+    check_deprecated: *const fn (line: []const u8) ?vocab.DeprecatedPattern,
 };
 
-/// Registry of all supported Zig versions
-/// Add new versions here - order from newest to oldest
-pub const version_registry = [_]VersionCompat{
-    // Zig 0.16.x (future)
-    .{
-        .version_id = "0.16",
-        .min_patch = 0,
-        .max_patch = 255,
-        .hashmap_put_has_allocator = false,
-        .arraylist_append_has_allocator = true,
-        .notes = "Zig 0.16.x - API changes TBD",
-    },
-    // Zig 0.15.x (current)
-    .{
-        .version_id = "0.15",
-        .min_patch = 0,
-        .max_patch = 255,
-        .hashmap_put_has_allocator = false,
-        .arraylist_append_has_allocator = true,
-        .notes = "Zig 0.15.x - ArrayList.append(allocator, item)",
-    },
+/// Table set for Zig 0.15.x. The knownTablesFor dispatch references this set.
+const tables_0_15 = Tables{
+    .version_label = v0_15.version,
+    .builtins = &v0_15.builtins,
+    .optional_methods = &v0_15.optional_methods,
+    .error_methods = &v0_15.error_methods,
+    .alloc_patterns = &v0_15.alloc_patterns,
+    .create_patterns = &v0_15.create_patterns,
+    .free_patterns = &v0_15.free_patterns,
+    .destroy_patterns = &v0_15.destroy_patterns,
+    .keywords = &v0_15.keywords,
+    .breaking_changes = &v0_15.breaking_changes,
+    .std_modules = &v0_15.std_modules,
+    .no_free_init_patterns = v0_15.no_free_init_patterns,
+    .no_free_field_type_patterns = v0_15.no_free_field_type_patterns,
+    .all_init_patterns = v0_15.all_init_patterns,
+    .global_alloc_names = v0_15.global_alloc_names,
+    .alloc_method_patterns = v0_15.alloc_method_patterns,
+    .alloc_method_short_names = v0_15.alloc_method_short_names,
+    .qualified_alloc_fn_patterns = v0_15.qualified_alloc_fn_patterns,
+    .cleanup_patterns = v0_15.cleanup_pattern_strs,
+    .container_ownership_methods = v0_15.container_ownership_methods,
+    .no_free_type_ptrs = v0_15.no_free_type_ptrs,
+    .safe_method_patterns = v0_15.safe_method_patterns,
+    .void_method_patterns = v0_15.void_method_patterns,
+    .modifying_method_patterns = v0_15.modifying_method_patterns,
+    .stdlib_container_init_patterns = v0_15.stdlib_container_init_patterns,
+    .managed_container_type_patterns = v0_15.managed_container_type_patterns,
+    .contains_optional_method = v0_15.containsOptionalMethod,
+    .contains_error_method = v0_15.containsErrorMethod,
+    .contains_allocation = v0_15.containsAllocation,
+    .contains_builtin = v0_15.containsBuiltin,
+    .check_deprecated = v0_15.checkDeprecated,
 };
 
-/// Get compatibility info for the current Zig version
-pub fn getCompat() ?VersionCompat {
-    const version = getCurrentVersion();
-    return getCompatForVersion(version);
-}
+/// Table set for Zig 0.16.x. The knownTablesFor dispatch references this set.
+const tables_0_16 = Tables{
+    .version_label = v0_16.version,
+    .builtins = &v0_16.builtins,
+    .optional_methods = &v0_16.optional_methods,
+    .error_methods = &v0_16.error_methods,
+    .alloc_patterns = &v0_16.alloc_patterns,
+    .create_patterns = &v0_16.create_patterns,
+    .free_patterns = &v0_16.free_patterns,
+    .destroy_patterns = &v0_16.destroy_patterns,
+    .keywords = &v0_16.keywords,
+    .breaking_changes = &v0_16.breaking_changes,
+    .std_modules = &v0_16.std_modules,
+    .no_free_init_patterns = v0_16.no_free_init_patterns,
+    .no_free_field_type_patterns = v0_16.no_free_field_type_patterns,
+    .all_init_patterns = v0_16.all_init_patterns,
+    .global_alloc_names = v0_16.global_alloc_names,
+    .alloc_method_patterns = v0_16.alloc_method_patterns,
+    .alloc_method_short_names = v0_16.alloc_method_short_names,
+    .qualified_alloc_fn_patterns = v0_16.qualified_alloc_fn_patterns,
+    .cleanup_patterns = v0_16.cleanup_pattern_strs,
+    .container_ownership_methods = v0_16.container_ownership_methods,
+    .no_free_type_ptrs = v0_16.no_free_type_ptrs,
+    .safe_method_patterns = v0_16.safe_method_patterns,
+    .void_method_patterns = v0_16.void_method_patterns,
+    .modifying_method_patterns = v0_16.modifying_method_patterns,
+    .stdlib_container_init_patterns = v0_16.stdlib_container_init_patterns,
+    .managed_container_type_patterns = v0_16.managed_container_type_patterns,
+    .contains_optional_method = v0_16.containsOptionalMethod,
+    .contains_error_method = v0_16.containsErrorMethod,
+    .contains_allocation = v0_16.containsAllocation,
+    .contains_builtin = v0_16.containsBuiltin,
+    .check_deprecated = v0_16.checkDeprecated,
+};
 
-/// Get compatibility info for a specific version
-pub fn getCompatForVersion(version: VersionInfo) ?VersionCompat {
-    for (version_registry) |compat| {
-        // Parse the version_id
-        var parts = std.mem.splitScalar(u8, compat.version_id, '.');
-        const major_str = parts.next() orelse "0";
-        const minor_str = parts.next() orelse "0";
-        const reg_major = std.fmt.parseInt(u16, major_str, 10) catch 0;
-        const reg_minor = std.fmt.parseInt(u16, minor_str, 10) catch 0;
+/// Minor version of the newest supported Zig release. An unknown newer
+/// version clamps to this version's tables.
+const newest_supported_minor = 16;
 
-        if (version.major == reg_major and version.minor == reg_minor) {
-            const in_range = version.patch >= compat.min_patch and
-                version.patch <= compat.max_patch;
-            if (in_range) return compat;
-        }
+/// Tables plus whether the version matched exactly.
+const Resolution = struct {
+    tables: Tables,
+    /// False only for an exact major.minor match with a supported version.
+    used_fallback: bool,
+};
+
+/// Resolve a Zig version to its pattern tables. Pure: no warning and no
+/// cache, so tests can probe any version. resolveVersion compares the
+/// major version first, so the minor number alone cannot misroute a
+/// future 1.x.
+fn resolveVersion(version: VersionInfo) Resolution {
+    if (knownTablesFor(version)) |tables| {
+        return .{ .tables = tables, .used_fallback = false };
     }
-    return null;
+    return .{ .tables = fallbackTablesFor(version), .used_fallback = true };
 }
 
-/// Check if current Zig version is supported
-pub fn isVersionSupported() bool {
-    return getCompat() != null;
+/// Exact-match dispatch over the supported versions. The only switch over
+/// the version set: a new Zig version adds one arm here.
+fn knownTablesFor(version: VersionInfo) ?Tables {
+    if (version.major != 0) return null;
+    return switch (version.minor) {
+        15 => tables_0_15,
+        16 => tables_0_16,
+        else => null,
+    };
 }
 
-/// Get human-readable version support string
+/// Fallback policy for a version with no exact tables: anything newer than
+/// the newest supported release (including a future 1.x) clamps to the
+/// newest tables. Anything older clamps to the oldest tables.
+fn fallbackTablesFor(version: VersionInfo) Tables {
+    const is_newer = version.major > 0 or version.minor > newest_supported_minor;
+    return if (is_newer) tables_0_16 else tables_0_15;
+}
+
+/// Resolved tables for the running compiler. The resolve runs once per
+/// process: the first call also emits the unknown-version warning when the
+/// fallback applies. The analyzer is single-threaded, so a plain global is
+/// race-free here.
+var cached_tables: ?Tables = null;
+
+/// Tables for the running compiler, resolved once. The unknown-version
+/// warning fires inside this resolve, not in the pure resolveVersion.
+fn currentTables() Tables {
+    if (cached_tables) |tables| return tables;
+    const version = getCurrentVersion();
+    const resolution = resolveVersion(version);
+    if (resolution.used_fallback) {
+        warnUnknownVersion(version, resolution.tables.version_label);
+    }
+    cached_tables = resolution.tables;
+    return resolution.tables;
+}
+
+/// Print the unknown-version warning to stderr. std.debug.print is the
+/// error channel in this codebase: compat cannot call the CLI diagnostic
+/// helpers in main.zig without a circular import.
+fn warnUnknownVersion(version: VersionInfo, fallback_label: []const u8) void {
+    std.debug.print(
+        "WARNING: ephor does not have pattern tables for Zig {}. " ++
+            "ephor uses the Zig {s} tables, so results can be inaccurate. " ++
+            "Run ephor with a supported Zig version: {s}.\n",
+        .{ version, fallback_label, getSupportedVersionsString() },
+    );
+}
+
+/// Human-readable list of the supported Zig versions.
+/// Feeds the unknown-version warning.
 pub fn getSupportedVersionsString() []const u8 {
     return "0.15.x, 0.16.x";
 }
@@ -174,55 +284,30 @@ pub fn getSupportedVersionsString() []const u8 {
 /// Check if line contains an optional-returning method (version-aware)
 /// Used by ZA205/ZA201 analyzers to avoid false positives
 pub fn containsOptionalMethod(line: []const u8) bool {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return v0_16.containsOptionalMethod(line);
-    }
-    // Default to 0.15.x
-    return v0_15.containsOptionalMethod(line);
+    return currentTables().contains_optional_method(line);
 }
 
 /// Check if line contains an error-returning method (version-aware)
 /// Used by ZA205 to detect discarded error returns
 pub fn containsErrorMethod(line: []const u8) bool {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return v0_16.containsErrorMethod(line);
-    }
-    return v0_15.containsErrorMethod(line);
+    return currentTables().contains_error_method(line);
 }
 
 /// Check if line contains an allocation pattern (version-aware)
 /// Used by ZA101/ZA102 for memory leak detection
 pub fn containsAllocation(line: []const u8) bool {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return v0_16.containsAllocation(line);
-    }
-    return v0_15.containsAllocation(line);
+    return currentTables().contains_allocation(line);
 }
 
 /// Check if line contains a builtin function (version-aware)
 pub fn containsBuiltin(line: []const u8) bool {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return v0_16.containsBuiltin(line);
-    }
-    return v0_15.containsBuiltin(line);
+    return currentTables().contains_builtin(line);
 }
 
 /// Check for deprecated patterns (version-aware)
 /// Returns replacement suggestion if found
-pub fn checkDeprecated(line: []const u8) ?v0_15.DeprecatedPattern {
-    const version = getCurrentVersion();
-    if (version.minor < 16) return v0_15.checkDeprecated(line);
-    // Both versions use compatible DeprecatedPattern struct
-    const dep = v0_16.checkDeprecated(line) orelse return null;
-    return .{
-        .pattern = dep.pattern,
-        .replacement = dep.replacement,
-        .rule = dep.rule,
-    };
+pub fn checkDeprecated(line: []const u8) ?vocab.DeprecatedPattern {
+    return currentTables().check_deprecated(line);
 }
 
 // ============================================================================
@@ -231,92 +316,52 @@ pub fn checkDeprecated(line: []const u8) ?v0_15.DeprecatedPattern {
 
 /// Get the optional methods list for the current version
 pub fn getOptionalMethods() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.optional_methods;
-    }
-    return &v0_15.optional_methods;
+    return currentTables().optional_methods;
 }
 
 /// Get the error methods list for the current version
 pub fn getErrorMethods() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.error_methods;
-    }
-    return &v0_15.error_methods;
+    return currentTables().error_methods;
 }
 
 /// Get the builtin functions list for the current version
 pub fn getBuiltins() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.builtins;
-    }
-    return &v0_15.builtins;
+    return currentTables().builtins;
 }
 
 /// Get the allocation patterns for the current version
 pub fn getAllocPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.alloc_patterns;
-    }
-    return &v0_15.alloc_patterns;
+    return currentTables().alloc_patterns;
 }
 
 /// Get the create patterns for the current version
 pub fn getCreatePatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.create_patterns;
-    }
-    return &v0_15.create_patterns;
+    return currentTables().create_patterns;
 }
 
 /// Get the free patterns for the current version
 pub fn getFreePatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.free_patterns;
-    }
-    return &v0_15.free_patterns;
+    return currentTables().free_patterns;
 }
 
 /// Get the destroy patterns for the current version
 pub fn getDestroyPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.destroy_patterns;
-    }
-    return &v0_15.destroy_patterns;
+    return currentTables().destroy_patterns;
 }
 
 /// Get the keywords list for the current version
 pub fn getKeywords() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.keywords;
-    }
-    return &v0_15.keywords;
+    return currentTables().keywords;
 }
 
 /// Get the breaking changes list for the current version
 pub fn getBreakingChanges() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.breaking_changes;
-    }
-    return &v0_15.breaking_changes;
+    return currentTables().breaking_changes;
 }
 
 /// Get the std modules list for the current version
 pub fn getStdModules() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) {
-        return &v0_16.std_modules;
-    }
-    return &v0_15.std_modules;
+    return currentTables().std_modules;
 }
 
 // ============================================================================
@@ -326,9 +371,7 @@ pub fn getStdModules() []const []const u8 {
 
 /// Init patterns for allocator types that don't need per-allocation free
 pub fn getNoFreeInitPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.no_free_init_patterns;
-    return v0_15.no_free_init_patterns;
+    return currentTables().no_free_init_patterns;
 }
 
 /// Struct field type patterns for no-free allocators.
@@ -336,101 +379,73 @@ pub fn getNoFreeInitPatterns() []const []const u8 {
 /// allocations through field chains (e.g. self.arena.alloc()) are suppressed.
 /// Type-based only — never matches on field names, only on declared types.
 pub fn getNoFreeFieldTypePatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.no_free_field_type_patterns;
-    return v0_15.no_free_field_type_patterns;
+    return currentTables().no_free_field_type_patterns;
 }
 
 /// Init patterns for ALL allocator types (no-free + needs-free)
 pub fn getAllInitPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.all_init_patterns;
-    return v0_15.all_init_patterns;
+    return currentTables().all_init_patterns;
 }
 
 /// Names of global singleton allocators
 pub fn getGlobalAllocNames() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.global_alloc_names;
-    return v0_15.global_alloc_names;
+    return currentTables().global_alloc_names;
 }
 
 /// Allocation method patterns for line matching (e.g. ".alloc(")
 pub fn getAllocMethodPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.alloc_method_patterns;
-    return v0_15.alloc_method_patterns;
+    return currentTables().alloc_method_patterns;
 }
 
 /// Short names for allocation methods (identifier matching, e.g. "alloc")
 pub fn getAllocMethodShortNames() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.alloc_method_short_names;
-    return v0_15.alloc_method_short_names;
+    return currentTables().alloc_method_short_names;
 }
 
 /// Qualified stdlib function patterns that allocate (e.g. "mem.concat(")
 /// These have generic names that need module prefix to avoid false positives.
 pub fn getQualifiedAllocFnPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.qualified_alloc_fn_patterns;
-    return v0_15.qualified_alloc_fn_patterns;
+    return currentTables().qualified_alloc_fn_patterns;
 }
 
 /// Cleanup/deallocation patterns (.free, .destroy, .deinit)
 pub fn getCleanupPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.cleanup_pattern_strs;
-    return v0_15.cleanup_pattern_strs;
+    return currentTables().cleanup_patterns;
 }
 
 /// Container methods that transfer ownership (store/consume passed values)
 pub fn getContainerOwnershipMethods() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.container_ownership_methods;
-    return v0_15.container_ownership_methods;
+    return currentTables().container_ownership_methods;
 }
 
 /// Pointer type patterns for no-free allocator parameter detection
 pub fn getNoFreeTypePtrs() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.no_free_type_ptrs;
-    return v0_15.no_free_type_ptrs;
+    return currentTables().no_free_type_ptrs;
 }
 
 /// Stdlib methods safe to discard (void or value-returning, not !T)
 pub fn getSafeMethodPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.safe_method_patterns;
-    return v0_15.safe_method_patterns;
+    return currentTables().safe_method_patterns;
 }
 
 /// Stdlib void methods (subset of safe methods)
 pub fn getVoidMethodPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.void_method_patterns;
-    return v0_15.void_method_patterns;
+    return currentTables().void_method_patterns;
 }
 
 /// Stdlib container mutation methods (fill/modify receiver)
 pub fn getModifyingMethodPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.modifying_method_patterns;
-    return v0_15.modifying_method_patterns;
+    return currentTables().modifying_method_patterns;
 }
 
 /// Stdlib container type init patterns (for type-based detection)
 pub fn getStdlibContainerInitPatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.stdlib_container_init_patterns;
-    return v0_15.stdlib_container_init_patterns;
+    return currentTables().stdlib_container_init_patterns;
 }
 
 /// Managed-container type families (heap backing store; by-value copy aliases)
 pub fn getManagedContainerTypePatterns() []const []const u8 {
-    const version = getCurrentVersion();
-    if (version.minor >= 16) return v0_16.managed_container_type_patterns;
-    return v0_15.managed_container_type_patterns;
+    return currentTables().managed_container_type_patterns;
 }
 
 // ============================================================================
@@ -457,11 +472,6 @@ test "getCurrentVersion returns valid version" {
     const v = getCurrentVersion();
     try std.testing.expect(v.major == 0);
     try std.testing.expect(v.minor >= 15);
-}
-
-test "getCompat returns compat for current version" {
-    const compat = getCompat();
-    try std.testing.expect(compat != null);
 }
 
 test "containsOptionalMethod detects optional patterns" {
@@ -593,14 +603,56 @@ test "getStdlibContainerInitPatterns returns non-empty list" {
     try std.testing.expect(found_arraylist);
 }
 
-test "isVersionSupported accepts the running compiler version" {
-    try std.testing.expect(isVersionSupported());
-}
-
 test "getSupportedVersionsString names the supported minor versions" {
     const s = getSupportedVersionsString();
     try std.testing.expect(std.mem.indexOf(u8, s, "0.15") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "0.16") != null);
+}
+
+test "resolveVersion maps 0.15.x to the 0.15 tables without fallback" {
+    const r = resolveVersion(.{ .major = 0, .minor = 15, .patch = 2, .dev = false });
+    try std.testing.expect(!r.used_fallback);
+    try std.testing.expectEqualStrings("0.15", r.tables.version_label);
+    try std.testing.expectEqual(
+        @intFromPtr(&v0_15.keywords),
+        @intFromPtr(r.tables.keywords.ptr),
+    );
+}
+
+test "resolveVersion maps 0.16.x-dev to the 0.16 tables without fallback" {
+    const r = resolveVersion(.{ .major = 0, .minor = 16, .patch = 0, .dev = true });
+    try std.testing.expect(!r.used_fallback);
+    try std.testing.expectEqualStrings("0.16", r.tables.version_label);
+    try std.testing.expectEqual(
+        @intFromPtr(&v0_16.keywords),
+        @intFromPtr(r.tables.keywords.ptr),
+    );
+}
+
+test "resolveVersion clamps 0.17 to the newest tables with fallback" {
+    const r = resolveVersion(.{ .major = 0, .minor = 17, .patch = 0, .dev = false });
+    try std.testing.expect(r.used_fallback);
+    try std.testing.expectEqualStrings("0.16", r.tables.version_label);
+}
+
+test "resolveVersion clamps 0.14 to the oldest tables with fallback" {
+    const r = resolveVersion(.{ .major = 0, .minor = 14, .patch = 2, .dev = false });
+    try std.testing.expect(r.used_fallback);
+    try std.testing.expectEqualStrings("0.15", r.tables.version_label);
+}
+
+test "resolveVersion compares the major version before the minor" {
+    // 1.0 has minor 0: a minor-only dispatch would clamp it to the oldest
+    // tables. The major comparison clamps it to the newest tables instead.
+    const r = resolveVersion(.{ .major = 1, .minor = 0, .patch = 0, .dev = false });
+    try std.testing.expect(r.used_fallback);
+    try std.testing.expectEqualStrings("0.16", r.tables.version_label);
+}
+
+test "resolveVersion resolves the running compiler without fallback" {
+    // Fails when ephor builds with an untested Zig: add the new table set.
+    const r = resolveVersion(getCurrentVersion());
+    try std.testing.expect(!r.used_fallback);
 }
 
 test "getErrorMethods returns non-empty list" {

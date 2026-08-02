@@ -924,18 +924,18 @@ Ephor uses a modular compatibility layer to support Zig 0.16.x API patterns. The
 
 ```
 src/compat/
-├── compat.zig     # Main module: version detection, registry
+├── compat.zig     # Main module: version detection, table dispatch
 └── v0_16.zig      # Zig 0.16.x specific implementations
 ```
 
 **Adding support for a new Zig version:**
 
-1. Create `src/compat/vX_YZ.zig` (e.g., `v0_17.zig`)
-2. Implement the version-specific API wrappers
-3. Add import to `compat.zig`
-4. Register in `version_registry`
+1. Create the module `src/compat/vX_YZ.zig` (e.g., `v0_17.zig`).
+2. Implement the pattern tables and the pattern-checking helpers.
+3. Add the import, a `Tables` constant, and a `knownTablesFor` switch arm in `compat.zig`.
+4. Bump `newest_supported_minor` so the fallback clamps to the new tables.
 
-Each version module exports consistent wrapper functions that handle API differences between Zig versions (e.g., `std.process.Init` main signature changes).
+Each version module exports the same pattern tables and pattern-checking helpers for its Zig version.
 
 ## Technical: How Detection Works
 

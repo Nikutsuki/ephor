@@ -73,3 +73,14 @@ pub const SafeMethod = struct {
     /// true if method returns void (known void)
     is_void: bool,
 };
+
+/// A deprecated pattern and its modern replacement.
+/// Shared so every version module's checkDeprecated returns the same type.
+pub const DeprecatedPattern = struct {
+    /// Text to match: "std.ChildProcess"
+    pattern: []const u8,
+    /// Replacement text for the diagnostic
+    replacement: []const u8,
+    /// Rule identifier for the diagnostic: "ZAV102"
+    rule: []const u8,
+};

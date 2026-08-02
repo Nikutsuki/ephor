@@ -506,13 +506,10 @@ pub const breaking_changes = [_][]const u8{
 // Deprecated patterns - old code that needs updating
 // ============================================================================
 
-/// Named struct type for deprecated pattern information
-/// Used for consistent typing across checkDeprecated return values
-pub const DeprecatedPattern = struct {
-    pattern: []const u8,
-    replacement: []const u8,
-    rule: []const u8,
-};
+/// Named struct type for deprecated pattern information.
+/// Alias of the shared vocab type, so checkDeprecated returns one type
+/// across all version modules.
+pub const DeprecatedPattern = vocab.DeprecatedPattern;
 
 pub const deprecated_patterns = [_]DeprecatedPattern{
     .{

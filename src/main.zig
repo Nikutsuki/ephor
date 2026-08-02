@@ -737,6 +737,38 @@ fn stripLineComment(t: []const u8) []const u8 {
     return mem.trimEnd(u8, t[0..i], " \t\r");
 }
 
+/// Find the next `tag` occurrence in `line` at or after `from` whose first
+/// byte is a code position, or null. Code position per LiteralState: the
+/// line is not a `\\` multiline-string body, and the byte is not
+/// string/char-literal data or comment text. The state walks from the line
+/// start on every call, so `from` only gates the match test.
+/// WHY (EPH-I0227): a tag matched inside string data is text, not a
+/// reference. Treating it as one injects reachability: an entry file whose
+/// doc string carries `@import("orphan.zig")` marks orphan.zig reachable
+/// and silences its genuine ZA501 orphan warning.
+fn findTagInCode(line: []const u8, tag: []const u8, from: usize) ?usize {
+    var lit = types.LiteralState.forLine(line) orelse return null;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (lit.updateForChar(line, i) == null) continue;
+        if (i < from) continue;
+        if (i + tag.len > line.len) return null;
+        if (mem.eql(u8, line[i .. i + tag.len], tag)) return i;
+    }
+    return null;
+}
+
+/// True when `pos` in `line` is string data, not code: the whole line is a
+/// `\\` multiline-string body (LiteralState.forLine), or `pos` sits inside
+/// a string literal (isInsideString). Comment text is NOT masked here.
+/// Callers that must mask comments use findTagInCode. WHY (EPH-I0227):
+/// this issue masks the string reachability-injection only. The comment
+/// variant is EPH-I0299's scope.
+fn isStringDataPosition(line: []const u8, pos: usize) bool {
+    if (types.LiteralState.forLine(line) == null) return true;
+    return isInsideString(line, pos);
+}
+
 /// True when `code[i..]` starts the whole-word keyword `else` (bounded by
 /// non-identifier chars on both sides). Callers handle quote/comment state.
 fn isElseWordAt(code: []const u8, i: usize) bool {
@@ -7446,18 +7478,26 @@ const ImportGraph = struct {
         return if (end > start) content[start..end] else null;
     }
 
-    /// Find import path in line starting from position
+    /// Find import path in line starting from position. The scan is
+    /// line-bounded: a real @import("...") closes on its own line. Matches
+    /// are masked to code positions (EPH-I0227): a match whose `@` sits in
+    /// a string or comment is text — `const s = "see @import(" ;` must not
+    /// extract the bytes after the string's closing quote as a path.
     fn findImportPath(content: []const u8, start: usize) ?[]const u8 {
-        var j = start;
-        while (j < content.len and content[j] != '\n') : (j += 1) {
-            if (j + 9 >= content.len) continue;
-            if (!mem.eql(u8, content[j .. j + 9], "@import(\"")) continue;
-            const path_start = j + 9;
+        const import_tag = "@import(\"";
+        const line_start = if (mem.lastIndexOfScalar(u8, content[0..start], '\n')) |nl|
+            nl + 1
+        else
+            0;
+        const line_end = mem.indexOfScalarPos(u8, content, start, '\n') orelse content.len;
+        const line = content[line_start..line_end];
+        var from = start - line_start;
+        while (findTagInCode(line, import_tag, from)) |idx| {
+            const path_start = idx + import_tag.len;
             var path_end = path_start;
-            while (path_end < content.len and content[path_end] != '"') {
-                path_end += 1;
-            }
-            if (path_end > path_start) return content[path_start..path_end];
+            while (path_end < line.len and line[path_end] != '"') path_end += 1;
+            if (path_end > path_start) return line[path_start..path_end];
+            from = idx + 1;
         }
         return null;
     }
@@ -7589,6 +7629,9 @@ const ImportGraph = struct {
 
     /// Extract @import("...") patterns that aren't preceded by `const`
     /// Catches switch arms like `=> @import("x.zig")`, array inits, etc.
+    /// Matches are masked to code positions (EPH-I0227): a `@import("...")`
+    /// inside a string, comment, or `\\` multiline-string body is text, not
+    /// an import, and must not mark its target reachable.
     fn extractBareImports(
         self: *ImportGraph,
         content: []const u8,
@@ -7596,39 +7639,17 @@ const ImportGraph = struct {
         analysis: *FileAnalysis,
     ) !void {
         const import_tag = "@import(\"";
-        var pos: usize = 0;
-        var in_line_comment = false;
-
-        while (pos < content.len) {
-            if (content[pos] == '\n') {
-                in_line_comment = false;
-                pos += 1;
-                continue;
+        var lines = mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            var from: usize = 0;
+            while (findTagInCode(line, import_tag, from)) |idx| {
+                const path_start = idx + import_tag.len;
+                var path_end = path_start;
+                while (path_end < line.len and line[path_end] != '"') path_end += 1;
+                if (path_end > path_start)
+                    try self.tryAddBareImport(file_path, analysis, line[path_start..path_end]);
+                from = path_end + 1;
             }
-            if (!in_line_comment and pos + 1 < content.len and
-                content[pos] == '/' and content[pos + 1] == '/')
-            {
-                in_line_comment = true;
-                pos += 2;
-                continue;
-            }
-            if (in_line_comment) {
-                pos += 1;
-                continue;
-            }
-
-            const matches_tag = pos + import_tag.len < content.len and
-                mem.eql(u8, content[pos .. pos + import_tag.len], import_tag);
-            if (!matches_tag) {
-                pos += 1;
-                continue;
-            }
-            const path_start = pos + import_tag.len;
-            var path_end = path_start;
-            while (path_end < content.len and content[path_end] != '"') path_end += 1;
-            if (path_end > path_start)
-                try self.tryAddBareImport(file_path, analysis, content[path_start..path_end]);
-            pos = path_end + 1;
         }
     }
 
@@ -7726,49 +7747,63 @@ const ImportGraph = struct {
     }
 
     /// Scan already-loaded content for b.path("...zig") and pathJoin refs, marking reachable.
+    /// Refs are masked to code positions (EPH-I0227): a b.path("...") inside
+    /// a string, comment, or `\\` multiline-string body is text and must not
+    /// mark its target reachable.
     fn scanContentBuildPathRefs(
         self: *ImportGraph,
         content: []const u8,
         build_root: []const u8,
     ) void {
         const bp_tag = "b.path(\"";
-        var pos: usize = 0;
-        while (pos + bp_tag.len < content.len) {
-            const rest = content[pos..];
-            const rel = mem.indexOf(u8, rest, bp_tag) orelse break;
-            const str_start = pos + rel + bp_tag.len;
-            var str_end = str_start;
-            while (str_end < content.len and content[str_end] != '"') str_end += 1;
-            if (str_end > str_start) {
-                self.tryMarkBuildPath(
-                    content[str_start..str_end],
-                    build_root,
-                );
+        var lines = mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            var from: usize = 0;
+            while (findTagInCode(line, bp_tag, from)) |idx| {
+                const str_start = idx + bp_tag.len;
+                var str_end = str_start;
+                while (str_end < line.len and line[str_end] != '"') str_end += 1;
+                if (str_end > str_start)
+                    self.tryMarkBuildPath(line[str_start..str_end], build_root);
+                from = str_end + 1;
             }
-            pos = str_end + 1;
         }
         // Also scan for pathJoin(&.{ "dir", "file.zig" }) patterns
         self.scanContentPathJoinRefs(content, build_root);
     }
 
     /// Scan content for pathJoin(&.{ ... }) patterns and mark .zig results reachable.
+    /// The tag is matched at code positions (EPH-I0227). extractPathJoin then
+    /// parses the brace span content-wide, so a pathJoin split across lines
+    /// still resolves.
     fn scanContentPathJoinRefs(
         self: *ImportGraph,
         content: []const u8,
         build_root: []const u8,
     ) void {
         const tag = "pathJoin(&.{";
-        var pos: usize = 0;
-        while (pos + tag.len < content.len) {
-            const rest = content[pos..];
-            const rel = mem.indexOf(u8, rest, tag) orelse break;
-            const abs_pos = pos + rel + tag.len;
-            if (extractPathJoin(self.allocator, content, abs_pos - 1)) |joined| {
-                defer self.allocator.free(joined);
-                self.tryMarkBuildPath(joined, build_root);
+        var lines = mem.splitScalar(u8, content, '\n');
+        var offset: usize = 0;
+        while (lines.next()) |line| : (offset += line.len + 1) {
+            var from: usize = 0;
+            while (findTagInCode(line, tag, from)) |idx| {
+                self.tryMarkPathJoinAt(content, offset + idx + tag.len - 1, build_root);
+                from = idx + tag.len;
             }
-            pos = abs_pos;
         }
+    }
+
+    /// Extract the pathJoin call whose `{` sits at `brace_pos` in `content`
+    /// and mark the joined .zig path reachable.
+    fn tryMarkPathJoinAt(
+        self: *ImportGraph,
+        content: []const u8,
+        brace_pos: usize,
+        build_root: []const u8,
+    ) void {
+        const joined = extractPathJoin(self.allocator, content, brace_pos) orelse return;
+        defer self.allocator.free(joined);
+        self.tryMarkBuildPath(joined, build_root);
     }
 
     /// Resolve a single b.path ref and mark it reachable if it's a .zig file.
@@ -8055,8 +8090,6 @@ const ImportGraph = struct {
         }
     }
 
-    /// Scan a specific file for b.path("...") references and resolve them
-    /// relative to the given base directory
     /// Resolve a b.path() .zig reference and mark as reachable
     fn resolveAndMarkBuildPath(
         self: *ImportGraph,
@@ -8077,6 +8110,10 @@ const ImportGraph = struct {
             self.markReachableResolved(resolved) catch return;
     }
 
+    /// Scan a specific file for b.path("...") references and resolve them
+    /// relative to the given base directory. Refs are masked to code
+    /// positions (EPH-I0227): a b.path("...") inside a string, comment, or
+    /// `\\` multiline-string body is text and must not mark its target.
     fn scanFileBuildPathRefs(
         self: *ImportGraph,
         file_path: []const u8,
@@ -8090,16 +8127,17 @@ const ImportGraph = struct {
         defer self.allocator.free(content);
 
         const bp_tag = "b.path(\"";
-        var pos: usize = 0;
-        while (pos + bp_tag.len < content.len) {
-            const rest = content[pos..];
-            const rel = mem.indexOf(u8, rest, bp_tag) orelse break;
-            const str_start = pos + rel + bp_tag.len;
-            var str_end = str_start;
-            while (str_end < content.len and content[str_end] != '"') str_end += 1;
-            if (str_end > str_start)
-                self.resolveAndMarkBuildPath(base_dir, content[str_start..str_end]);
-            pos = str_end + 1;
+        var lines = mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            var from: usize = 0;
+            while (findTagInCode(line, bp_tag, from)) |idx| {
+                const str_start = idx + bp_tag.len;
+                var str_end = str_start;
+                while (str_end < line.len and line[str_end] != '"') str_end += 1;
+                if (str_end > str_start)
+                    self.resolveAndMarkBuildPath(base_dir, line[str_start..str_end]);
+                from = str_end + 1;
+            }
         }
     }
 
@@ -15844,12 +15882,19 @@ fn fnReturnsType(t: []const u8, after_name: usize) bool {
     return false;
 }
 
+/// Check function names against the naming convention (ZA703). The search
+/// for `fn ` stops at the start of a line comment. EPH-I0228: comment text
+/// is prose, not a declaration, so `const x = 1; // fn bad_name()` must not
+/// report an issue.
 fn checkFnNaming(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Extern declaration names are ABI-fixed and can never conform.
     // `export fn` is NOT exempt — those names are project-chosen identifiers.
     if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
-    const fn_pos = mem.indexOf(u8, t, "fn ") orelse return;
+    // Comment text is prose, not a declaration. Bound the search to the code
+    // before it (the same data-not-syntax rule as the string check below).
+    const limit = findCommentStart(t) orelse t.len;
+    const fn_pos = mem.indexOf(u8, t[0..limit], "fn ") orelse return;
     // `fn ` inside a string literal is data (fixture text), not a declaration.
     if (isInsideString(t, fn_pos)) return;
     const start = fn_pos + 3;
@@ -23923,18 +23968,24 @@ fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
     }
 }
 
-/// Extract a .zig path from a build.zig line
+/// Extract a .zig path from a build.zig line. Matches are masked to code
+/// positions (EPH-I0227): a pattern on a `\\` multiline-string body line or
+/// inside a string literal is text, not a reference, and must not add an
+/// entry.
 fn extractPathFromLine(
     allocator: Allocator,
     cfg: *Config,
     line: []const u8,
     added: *std.StringHashMap(void),
 ) !void {
+    if (types.LiteralState.forLine(line) == null) return;
     // Pattern: .path("...") - matches b.path("..."), dep.path("..."), dep.builder.path("...")
     if (mem.indexOf(u8, line, ".path(\"")) |idx| {
-        const start = idx + 7; // len of '.path("'
-        if (extractQuotedPath(line, start)) |path|
-            try addEntryIfValid(allocator, cfg, path, added);
+        if (!isStringDataPosition(line, idx)) {
+            const start = idx + 7; // len of '.path("'
+            if (extractQuotedPath(line, start)) |path|
+                try addEntryIfValid(allocator, cfg, path, added);
+        }
     }
     // Pattern: .path = "..." or .root_src = "..." or .root_source_file = "..."
     const path_patterns = [_]struct { tag: []const u8, len: usize }{
@@ -23944,6 +23995,7 @@ fn extractPathFromLine(
     };
     for (path_patterns) |pat| {
         const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
+        if (isStringDataPosition(line, idx)) continue;
         const start = idx + pat.len;
         if (extractQuotedPath(line, start)) |path|
             try addEntryIfValid(allocator, cfg, path, added);
@@ -23953,8 +24005,10 @@ fn extractPathFromLine(
     while (mem.indexOf(u8, line[search_pos..], "@import(\"")) |rel_idx| {
         const idx = search_pos + rel_idx;
         const start = idx + 9; // len of '@import("'
-        if (extractQuotedPath(line, start)) |path|
-            try addEntryIfValid(allocator, cfg, path, added);
+        if (!isStringDataPosition(line, idx)) {
+            if (extractQuotedPath(line, start)) |path|
+                try addEntryIfValid(allocator, cfg, path, added);
+        }
         search_pos = start;
     }
 }
@@ -24104,7 +24158,8 @@ fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
     try ctx.added.put(duped, {});
 }
 
-/// Extract path-tag based entries from a build.zig line
+/// Extract path-tag based entries from a build.zig line. Matches are
+/// masked to code positions (EPH-I0227).
 fn extractPathTagEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const path_tags = [_]struct { tag: []const u8, len: usize }{
         .{ .tag = ".path = \"", .len = 9 },
@@ -24113,23 +24168,26 @@ fn extractPathTagEntries(ctx: EntryScanCtx, line: []const u8) !void {
     };
     for (path_tags) |pat| {
         const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
+        if (isStringDataPosition(line, idx)) continue;
         if (extractQuotedPath(line, idx + pat.len)) |path|
             try addEntryWithPrefix(ctx, path);
     }
 }
 
-/// Extract pathJoin(&.{ "dir", "file.zig" }) entries from a build.zig line
+/// Extract pathJoin(&.{ "dir", "file.zig" }) entries from a build.zig line.
+/// Matches are masked to code positions (EPH-I0227).
 fn extractPathJoinEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const tag = "pathJoin(&.{";
     var pos: usize = 0;
     while (pos < line.len) {
         const idx = mem.indexOf(u8, line[pos..], tag) orelse break;
         const abs_pos = pos + idx + tag.len;
+        pos = abs_pos;
+        if (isStringDataPosition(line, abs_pos - tag.len)) continue;
         if (extractPathJoin(ctx.allocator, line, abs_pos - 1)) |joined| {
             defer ctx.allocator.free(joined);
             try addEntryWithPrefix(ctx, joined);
         }
-        pos = abs_pos;
     }
 }
 
@@ -24141,12 +24199,14 @@ fn isValidZigImport(imp_path: []const u8) bool {
     return true;
 }
 
-/// Follow @import entries in a build.zig line and recurse into nested modules
+/// Follow @import entries in a build.zig line and recurse into nested modules.
+/// Matches are masked to code positions (EPH-I0227).
 fn followImportsInLine(ctx: EntryScanCtx, line: []const u8) !void {
     var imp_pos: usize = 0;
     while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
         const istart = imp_pos + rel + 9;
         defer imp_pos = istart;
+        if (isStringDataPosition(line, imp_pos + rel)) continue;
         const imp_path = extractQuotedPath(line, istart) orelse continue;
         if (!isValidZigImport(imp_path)) continue;
         try addEntryWithPrefix(ctx, imp_path);
@@ -24176,6 +24236,15 @@ fn recurseNestedBuildModule(ctx: EntryScanCtx, imp_path: []const u8) Allocator.E
     };
 }
 
+/// Extract the first .path("...") entry from a build.zig line. The match is
+/// masked to code positions (EPH-I0227): a match inside a string is text.
+fn extractDotPathEntry(ctx: EntryScanCtx, line: []const u8) !void {
+    const idx = mem.indexOf(u8, line, ".path(\"") orelse return;
+    if (isStringDataPosition(line, idx)) return;
+    if (extractQuotedPath(line, idx + 7)) |path|
+        try addEntryWithPrefix(ctx, path);
+}
+
 /// Extract entry points from a build.zig file at a specific path
 fn extractBuildZigEntriesFromPath(ctx: EntryScanCtx) !void {
     // Prevent stack overflow from circular @import chains (e.g., A imports B imports A)
@@ -24187,10 +24256,10 @@ fn extractBuildZigEntriesFromPath(ctx: EntryScanCtx) !void {
 
     var line_iter = mem.splitScalar(u8, content, '\n');
     while (line_iter.next()) |line| {
-        if (mem.indexOf(u8, line, ".path(\"")) |idx| {
-            if (extractQuotedPath(line, idx + 7)) |path|
-                try addEntryWithPrefix(ctx, path);
-        }
+        // A `\\` multiline-string body line is all string data (EPH-I0227):
+        // patterns on it are text, not references.
+        if (types.LiteralState.forLine(line) == null) continue;
+        try extractDotPathEntry(ctx, line);
         // Handle b.pathJoin(&.{ "dir", "file.zig" }) patterns
         try extractPathJoinEntries(ctx, line);
         try extractPathTagEntries(ctx, line);
@@ -26620,6 +26689,237 @@ test "markZigFilesRecursive does not memoize a depth-capped dir" {
     try std.testing.expectEqual(@as(u32, 0), graph.marked_dirs.count());
     try graph.markZigFilesRecursive(root, 0);
     try std.testing.expectEqual(@as(u32, 1), graph.marked_dirs.count());
+}
+
+// ============================================================================
+// EPH-I0227: string-masked reachability extraction
+// ============================================================================
+
+/// True when `issues` holds the ZA501 orphan warning for `path`.
+fn hasOrphanIssue(issues: []const Issue, path: []const u8) bool {
+    for (issues) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ORPHAN_FILE) and
+            mem.eql(u8, issue.file, path)) return true;
+    }
+    return false;
+}
+
+test "extractBareImports ignores @import in a multiline-string body (EPH-I0227)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The live-verified shape: `\\@import("orphan.zig")` is doc text.
+    // Pre-fix the bare-import scan matched it, resolved orphan.zig, and
+    // marked it reachable, which suppressed the genuine ZA501 warning.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "const docs =\n" ++
+            "    \\\\@import(\"orphan.zig\")\n" ++
+            ";\n" ++
+            "pub fn main() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "orphan.zig",
+        .data = "pub fn f() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
+    defer allocator.free(entry);
+    const orphan = try tmpFilePath(allocator, &tmp, "orphan.zig");
+    defer allocator.free(orphan);
+    try graph.analyzeFile(entry);
+    try graph.analyzeFile(orphan);
+    try graph.markReachable(entry);
+
+    try std.testing.expect(!graph.reachable.contains(orphan));
+    const cfg = testConfig();
+    var issues = try graph.getOrphanIssues(allocator, &cfg);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expect(hasOrphanIssue(issues.items, orphan));
+}
+
+test "extractBareImports ignores @import inside a string literal (EPH-I0227)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Line 1 is the escaped-quote shape: the naive tag scan cannot match
+    // `@import(\"`, so it is a pin. Line 2 is the closing-delimiter shape:
+    // the string ends right after `@import(`, so the naive scan matched the
+    // closing quote and extracted the bytes behind it as a path.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "const s = \"@import(\\\"fake.zig\\\")\";\n" ++
+            "const truncated = \"see @import(\" ;\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "fake.zig",
+        .data = "pub fn f() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
+    defer allocator.free(entry);
+    const fake = try tmpFilePath(allocator, &tmp, "fake.zig");
+    defer allocator.free(fake);
+    try graph.analyzeFile(entry);
+    try graph.markReachable(entry);
+
+    const imports = graph.findImportsForPath(entry) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), imports.len);
+    try std.testing.expect(!graph.reachable.contains(fake));
+}
+
+test "extractBareImports still records a real bare @import (EPH-I0227)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "pub fn f() void {\n" ++
+            "    _ = @import(\"real.zig\");\n" ++
+            "}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "real.zig",
+        .data = "pub fn g() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
+    defer allocator.free(entry);
+    const real = try tmpFilePath(allocator, &tmp, "real.zig");
+    defer allocator.free(real);
+    try graph.analyzeFile(entry);
+    try graph.markReachable(entry);
+
+    try std.testing.expect(graph.reachable.contains(real));
+}
+
+test "build-path scanners ignore refs inside strings (EPH-I0227)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Refs on `\\` multiline-string body lines are doc text. Pre-fix both
+    // content scanners matched them and marked the targets reachable.
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/f_p.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/f_j.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/f_f.zig", .data = "" });
+    const content = "const docs =\n" ++
+        "    \\\\const exe = b.addExecutable(.{ .root_source_file = b.path(\"src/f_p.zig\") });\n" ++
+        "    \\\\const m = b.pathJoin(&.{ \"src\", \"f_j.zig\" });\n" ++
+        ";\n";
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    graph.scanContentBuildPathRefs(content, root);
+    try std.testing.expectEqual(@as(u32, 0), graph.reachable.count());
+
+    // The per-file variant carries the same masking.
+    const file_content = "const docs =\n" ++
+        "    \\\\const exe = b.addExecutable(.{ .root_source_file = b.path(\"src/f_f.zig\") });\n" ++
+        ";\n";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "nested.zig",
+        .data = file_content,
+    });
+    const nested = try tmpFilePath(allocator, &tmp, "nested.zig");
+    defer allocator.free(nested);
+    graph.scanFileBuildPathRefs(nested, root);
+    try std.testing.expectEqual(@as(u32, 0), graph.reachable.count());
+}
+
+test "build-path scanners still mark refs in real code (EPH-I0227)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/r_p.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/r_j.zig", .data = "" });
+    const content = "pub fn build(b: *std.Build) void {\n" ++
+        "    const exe = b.addExecutable(.{ .root_source_file = b.path(\"src/r_p.zig\") });\n" ++
+        "    const m = b.pathJoin(&.{ \"src\", \"r_j.zig\" });\n" ++
+        "}\n";
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    graph.scanContentBuildPathRefs(content, root);
+
+    const real_path = try tmpFilePath(allocator, &tmp, "src/r_p.zig");
+    defer allocator.free(real_path);
+    const real_join = try tmpFilePath(allocator, &tmp, "src/r_j.zig");
+    defer allocator.free(real_join);
+    try std.testing.expect(graph.reachable.contains(real_path));
+    try std.testing.expect(graph.reachable.contains(real_join));
+    try std.testing.expectEqual(@as(u32, 2), graph.reachable.count());
+}
+
+test "build.zig entry extractors ignore refs on multiline-string lines (EPH-I0227)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fake.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void {\n" ++
+            "    const exe = b.addExecutable(.{ .root_source_file = b.path(\"real.zig\") });\n" ++
+            "    const docs =\n" ++
+            "        \\\\.path(\"fake.zig\")\n" ++
+            "        \\\\@import(\"fake.zig\")\n" ++
+            "    ;\n" ++
+            "}\n",
+    });
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    // The pathTag extractor on a `\\` body line: pre-fix it pulled the doc
+    // text into the entries.
+    const ctx = EntryScanCtx{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .added = &added,
+        .prefix = root,
+    };
+    try extractPathTagEntries(ctx, "    \\\\.path = \"fake.zig\"");
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+
+    // The whole per-line band skips body lines. The real ref still lands.
+    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{root});
+    defer allocator.free(build_path);
+    var band_ctx = ctx;
+    band_ctx.build_path = build_path;
+    try extractBuildZigEntriesFromPath(band_ctx);
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    const want = try std.fmt.allocPrint(allocator, "{s}/real.zig", .{root});
+    defer allocator.free(want);
+    try std.testing.expectEqualStrings(want, cfg.entries.items[0]);
 }
 
 test "parseCommandIntoArgv parses tokens within the buffer" {
@@ -39303,6 +39603,96 @@ test "checkFnNaming: non-camelCase fn is still flagged" {
         .line_num = 1,
     });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+}
+
+test "checkFnNaming: fn keyword in a trailing comment is ignored (EPH-I0228)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const x = 1; // fn bad_name()",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkFnNaming: bad fn name still fires (EPH-I0228 pin)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "fn bad_name() void {}",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+}
+
+test "checkFnNaming: declaration before a trailing comment still fires (EPH-I0228)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "fn bad_name() void {} // note",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+}
+
+test "checkFnNaming: fn keyword inside a string literal is ignored (pin)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const s = \"fn bad_name() void {}\";",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkFnNaming: full-comment line is ignored (pin)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "// fn bad_name()",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 test "checkErrorNaming: underscore-prefixed error names are exempt" {

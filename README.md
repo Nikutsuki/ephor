@@ -459,8 +459,9 @@ ZC104 binds each `std.Thread.spawn` result name (`const t =`, `self.t =`; `child
 | **ZR101** | error | Memory leak detected at runtime |
 | **ZR102** | error | Double-free detected at runtime |
 | **ZR103** | error | Use-after-free detected at runtime |
-| **ZR104** | error | Test failed |
+| **ZR104** | error | Test failed or command could not run |
 | **ZR105** | error | Panic detected during test execution |
+| **ZR106** | error | Command terminated by signal |
 
 ### Enabling/Disabling Rules
 

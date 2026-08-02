@@ -205,6 +205,7 @@ const RULE_RUNTIME_DOUBLE_FREE = types.RULE_RUNTIME_DOUBLE_FREE;
 const RULE_RUNTIME_USE_AFTER_FREE = types.RULE_RUNTIME_USE_AFTER_FREE;
 const RULE_RUNTIME_TEST_FAILURE = types.RULE_RUNTIME_TEST_FAILURE;
 const RULE_RUNTIME_PANIC = types.RULE_RUNTIME_PANIC;
+const RULE_RUNTIME_SIGNAL_DEATH = types.RULE_RUNTIME_SIGNAL_DEATH;
 const RULE_TEST_LIE = types.RULE_TEST_LIE;
 const RULE_TEST_NO_ASSERTIONS = types.RULE_TEST_NO_ASSERTIONS;
 const RULE_TEST_TRIVIAL_ASSERT = types.RULE_TEST_TRIVIAL_ASSERT;
@@ -20066,6 +20067,32 @@ fn analyzeIntCastGuards(
     return issues;
 }
 
+/// ZR104 for a zig fmt spawn failure (EPH-I0232): an empty list would
+/// read as ran-clean, so the failure becomes a finding. ZR104, not
+/// ZA601: a missing zig is a command failure, not a format finding.
+fn reportFmtFailure(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    err: std.process.RunError,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "cannot run zig fmt: {s}",
+        .{@errorName(err)},
+    );
+    errdefer allocator.free(msg);
+    try issues.append(allocator, .{
+        .file = "build.zig",
+        .line = 1,
+        .col = 1,
+        .severity = .err,
+        .rule = RULE_RUNTIME_TEST_FAILURE,
+        .message = msg,
+        .help = "check that zig is installed and on PATH",
+        .message_owned = true,
+    });
+}
+
 /// Run zig fmt --check on `path` and parse its output into ZA601
 /// findings. Different toolchains write the list to different
 /// streams. Both go through parseFmtOutput, which owns every name it
@@ -20075,7 +20102,9 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
         .argv = &.{ "zig", "fmt", "--check", path },
     }) catch |err| {
         std.debug.print("error: cannot run zig fmt: {}\n", .{err});
-        return .empty;
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        try reportFmtFailure(allocator, &issues, err);
+        return issues;
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -20233,6 +20262,73 @@ fn reportCommandFailure(
     });
 }
 
+/// ZR106: the child died by signal, not by exit code (EPH-I0231). Fires
+/// on top of any parsed diagnostics: the run did not complete.
+fn reportSignalDeath(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    sig: std.posix.SIG,
+) !void {
+    // std.posix.SIG is void on targets without signals (PSP and other
+    // bare targets). The guard keeps the enum read off those targets.
+    const sig_num: u32 = if (@TypeOf(sig) == void) 0 else @intFromEnum(sig);
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "command terminated by signal {d}",
+        .{sig_num},
+    );
+    errdefer allocator.free(msg);
+    try issues.append(allocator, .{
+        .file = "runtime",
+        .line = 1,
+        .col = 1,
+        .severity = .err,
+        .rule = RULE_RUNTIME_SIGNAL_DEATH,
+        .message = msg,
+        .help = "check the command for crashes",
+        .message_owned = true,
+    });
+}
+
+/// ZR104 for a runtime command that produced no parsable output: the
+/// spawn failed or the captured output hit the byte cap (EPH-I0232).
+/// Returning an empty list would read as ran-clean, so the failure
+/// becomes a finding.
+fn reportRunFailure(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    cmd_str: []const u8,
+    err: std.process.RunError,
+) !void {
+    const msg = if (err == error.StreamTooLong)
+        try std.fmt.allocPrint(
+            allocator,
+            "command output exceeded the {d} MB capture limit",
+            .{runtime_capture_limit_bytes / (1024 * 1024)},
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "cannot run {s}: {s}",
+            .{ cmd_str, @errorName(err) },
+        );
+    errdefer allocator.free(msg);
+    try issues.append(allocator, .{
+        .file = "runtime",
+        .line = 1,
+        .col = 1,
+        .severity = .err,
+        .rule = RULE_RUNTIME_TEST_FAILURE,
+        .message = msg,
+        .help = "check the command and the project build",
+        .message_owned = true,
+    });
+}
+
+/// Byte cap on captured child stdout/stderr in the runtime band. Larger
+/// outputs fail with StreamTooLong instead of growing unbounded.
+const runtime_capture_limit_bytes = 10 * 1024 * 1024;
+
 fn runRuntimeAnalysis(
     allocator: Allocator,
     path: []const u8,
@@ -20246,11 +20342,12 @@ fn runRuntimeAnalysis(
     const result = std.process.run(allocator, global_io.?, .{
         .argv = argv_buf[0..argv_len],
         .cwd = .{ .path = path },
-        .stdout_limit = .limited(10 * 1024 * 1024),
-        .stderr_limit = .limited(10 * 1024 * 1024),
+        .stdout_limit = .limited(runtime_capture_limit_bytes),
+        .stderr_limit = .limited(runtime_capture_limit_bytes),
     }) catch |err| {
         const cmd_str = custom_command orelse "zig build test";
         std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
+        try reportRunFailure(allocator, &issues, cmd_str, err);
         return issues;
     };
     defer allocator.free(result.stdout);
@@ -20259,8 +20356,19 @@ fn runRuntimeAnalysis(
     try parseGPADiagnostics(allocator, &issues, result.stderr, verbose);
     try parseTestOutput(allocator, &issues, result.stdout, verbose);
 
-    if (result.term.exited != 0 and issues.items.len == 0)
-        try reportCommandFailure(allocator, &issues, custom_command != null);
+    // Term is a tagged union in 0.16: a signal-killed child is .signal,
+    // and reading .exited on it is a safety-checked panic (EPH-I0231).
+    switch (result.term) {
+        .exited => |code| {
+            if (code != 0 and issues.items.len == 0)
+                try reportCommandFailure(allocator, &issues, custom_command != null);
+        },
+        .signal => |sig| try reportSignalDeath(allocator, &issues, sig),
+        .stopped, .unknown => {
+            if (issues.items.len == 0)
+                try reportCommandFailure(allocator, &issues, custom_command != null);
+        },
+    }
 
     return issues;
 }
@@ -24354,7 +24462,7 @@ fn printHelp() void {
         \\                     ZA703: naming)
         \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
         \\                     ZR103: use-after-free, ZR104: test-failure,
-        \\                     ZR105: panic)
+        \\                     ZR105: panic, ZR106: signal-death)
         \\  ZT1xx  Tests      (ZT101: lie-test, ZT102: no-assertions (note for
         \\                     try-only smoke tests), ZT103: trivially-true-assert,
         \\                     ZT104: swallowed-error, ZT105: untested-pub-fn (note))
@@ -26018,6 +26126,391 @@ test "parseCommandIntoArgv truncates token 65 instead of overflowing" {
     try std.testing.expectEqual(@as(usize, 64), parsed.argc);
     try std.testing.expect(parsed.truncated);
     try std.testing.expectEqualStrings("tok", buf[63]);
+}
+
+// ============================================================================
+// Runtime analysis tests (ZR1xx, EPH-I0230, EPH-I0231, EPH-I0232)
+// ============================================================================
+
+/// Run classifyGPALine on the first line of `input` with the rest of the
+/// input as the live iterator, mirroring parseGPADiagnostics.
+fn runClassifyGPALine(allocator: Allocator, input: []const u8) !std.ArrayListUnmanaged(Issue) {
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
+    var iter = mem.splitScalar(u8, input, '\n');
+    const first = iter.next() orelse return issues;
+    const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
+    try classifyGPALine(ctx, &iter, false, first);
+    return issues;
+}
+
+test "extractFileLocation parses file:line shapes" {
+    const Case = struct { input: []const u8, file: []const u8, line: usize };
+    const cases = [_]Case{
+        .{ .input = "/a/b.zig:12:3: 0x1 in foo", .file = "/a/b.zig", .line = 12 },
+        .{ .input = "src/main.zig:42", .file = "src/main.zig", .line = 42 },
+        .{ .input = "no location here", .file = "unknown", .line = 0 },
+        .{ .input = "x.zig:notdigits", .file = "x.zig", .line = 0 },
+        // A bare .zig name at end of input is not matched: the scan
+        // requires one byte past the extension (i + 4 < len).
+        .{ .input = "bare.zig", .file = "unknown", .line = 0 },
+        // Line numbers that overflow usize parse to 0 (catch 0).
+        .{ .input = "x.zig:99999999999999999999999999999 x", .file = "x.zig", .line = 0 },
+        // The first .zig match wins, even when a later one carries the
+        // line number.
+        .{ .input = "a.zig b.zig:5", .file = "a.zig", .line = 0 },
+    };
+    for (cases) |c| {
+        const loc = extractFileLocation(c.input);
+        try std.testing.expectEqualStrings(c.file, loc.file);
+        try std.testing.expectEqual(c.line, loc.line);
+    }
+}
+
+test "parseLocationLine parses the :NN suffix after a file name" {
+    try std.testing.expectEqual(@as(?usize, 123), parseLocationLine("f.zig:123:45", 5));
+    try std.testing.expectEqual(@as(?usize, 0), parseLocationLine("f.zig:0", 5));
+    try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig:", 5));
+    try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig:abc", 5));
+    try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig", 5));
+    // Overflowing line numbers parse to 0, not null (catch 0).
+    try std.testing.expectEqual(@as(?usize, 0), parseLocationLine("f.zig:99999999999999999999999999", 5));
+}
+
+test "classifyGPALine routes every gpa_classifications pattern to its rule" {
+    const allocator = std.testing.allocator;
+    for (gpa_classifications) |cls| {
+        for (cls.patterns) |pat| {
+            const line = try std.fmt.allocPrint(allocator, "err: {s} in /t.zig:7", .{pat});
+            defer allocator.free(line);
+            var issues = try runClassifyGPALine(allocator, line);
+            defer deinitIssues(&issues, allocator);
+            try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+            try std.testing.expectEqualStrings(cls.rule, issues.items[0].rule);
+            try std.testing.expectEqualStrings(cls.message, issues.items[0].message);
+        }
+    }
+}
+
+test "classifyGPALine honors the located flag of each classification" {
+    const allocator = std.testing.allocator;
+    const Case = struct {
+        input: []const u8,
+        rule: []const u8,
+        file: []const u8,
+        line: usize,
+    };
+    const cases = [_]Case{
+        // Located classes take file:line from the diagnostic line itself.
+        .{ .input = "Double free at /x/y.zig:9 now", .rule = RULE_RUNTIME_DOUBLE_FREE, .file = "/x/y.zig", .line = 9 },
+        .{ .input = "use after free in /z.zig:3", .rule = RULE_RUNTIME_USE_AFTER_FREE, .file = "/z.zig", .line = 3 },
+        .{ .input = "Invalid free of /a.zig:5", .rule = RULE_RUNTIME_DOUBLE_FREE, .file = "/a.zig", .line = 5 },
+        // Non-located classes anchor at the synthetic "runtime" file.
+        .{ .input = "Segmentation fault at address 0x0", .rule = RULE_RUNTIME_PANIC, .file = "runtime", .line = 1 },
+        .{ .input = "stack overflow in deepRecursion", .rule = RULE_RUNTIME_PANIC, .file = "runtime", .line = 1 },
+        .{ .input = "OutOfMemory while growing", .rule = RULE_RUNTIME_PANIC, .file = "runtime", .line = 1 },
+    };
+    for (cases) |c| {
+        var issues = try runClassifyGPALine(allocator, c.input);
+        defer deinitIssues(&issues, allocator);
+        try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+        try std.testing.expectEqualStrings(c.rule, issues.items[0].rule);
+        try std.testing.expectEqualStrings(c.file, issues.items[0].file);
+        try std.testing.expectEqual(c.line, issues.items[0].line);
+        try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+    }
+}
+
+test "classifyGPALine stays silent on an unmatched line" {
+    const allocator = std.testing.allocator;
+    var issues = try runClassifyGPALine(allocator, "1/1 tests passed");
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "isPanicLine matches panic markers" {
+    const Case = struct { input: []const u8, is_panic: bool };
+    const cases = [_]Case{
+        .{ .input = "panic: index out of bounds", .is_panic = true },
+        .{ .input = "thread 123 panic: reached unreachable", .is_panic = true },
+        .{ .input = "a panic: b", .is_panic = true },
+        .{ .input = "thread 123 panicked", .is_panic = false },
+        .{ .input = "no colon here", .is_panic = false },
+        .{ .input = "", .is_panic = false },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.is_panic, isPanicLine(c.input));
+}
+
+test "parseGPADiagnostics leak consumes the stack-trace line" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    // handleMemoryLeak eats the line after the leak marker, so the
+    // "double free" text on that line never classifies (EPH-I0230 pin).
+    const input = "0x1 leaked:\ndouble free was here\nSegmentation fault next";
+    try parseGPADiagnostics(allocator, &issues, input, false);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
+    try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
+    try std.testing.expect(!issues.items[0].message_owned);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[1].rule);
+}
+
+test "parseTestOutput classifies failure-summary shapes" {
+    const allocator = std.testing.allocator;
+    const Case = struct {
+        input: []const u8,
+        rule: []const u8,
+        file: []const u8,
+        line: usize,
+    };
+    const cases = [_]Case{
+        // A FAIL line without a path anchors at the "unknown" file.
+        .{ .input = "FAIL (TestFailed)", .rule = RULE_RUNTIME_TEST_FAILURE, .file = "unknown", .line = 0 },
+        .{ .input = "FAIL /src/t.zig:9 boom", .rule = RULE_RUNTIME_TEST_FAILURE, .file = "/src/t.zig", .line = 9 },
+        .{ .input = "thread 9 panic: bad /p.zig:3", .rule = RULE_RUNTIME_PANIC, .file = "/p.zig", .line = 3 },
+    };
+    for (cases) |c| {
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        defer deinitIssues(&issues, allocator);
+        try parseTestOutput(allocator, &issues, c.input, false);
+        try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+        try std.testing.expectEqualStrings(c.rule, issues.items[0].rule);
+        try std.testing.expectEqualStrings(c.file, issues.items[0].file);
+        try std.testing.expectEqual(c.line, issues.items[0].line);
+    }
+}
+
+test "parseTestOutput stays silent on clean output" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    try parseTestOutput(allocator, &issues, "1/1 tests passed\nok\n", false);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "parseTestOutput emits both panic and failure for a FAIL panic line" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    // The panic check runs first, so the panic finding lands first
+    // (EPH-I0230 pin of the double classification).
+    try parseTestOutput(allocator, &issues, "FAIL panic: x", false);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[1].rule);
+}
+
+test "handleMemoryLeak builds an owned message from the next line" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var iter = mem.splitScalar(u8, "/src/x.zig:42:5: 0xabc in foo", '\n');
+    const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
+    try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
+    try std.testing.expectEqualStrings("memory leak at /src/x.zig:42", issues.items[0].message);
+    try std.testing.expect(issues.items[0].message_owned);
+    try std.testing.expectEqualStrings("runtime", issues.items[0].file);
+}
+
+test "handleMemoryLeak falls back to a static message without a location" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var iter = mem.splitScalar(u8, "", '\n');
+    const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
+    try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
+    try std.testing.expect(!issues.items[0].message_owned);
+}
+
+test "emitLocatedIssue borrows the location slice from the input line" {
+    // EPH-I0202: the file slice borrows the input buffer (file_owned ==
+    // false) while the runtime band frees the child output after
+    // parsing. This pins the current ownership contract; the fix is
+    // tracked in EPH-I0202 and is out of scope here.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
+    const spec = RuntimeIssueSpec{ .rule = RULE_RUNTIME_PANIC, .message = "m", .help = "h" };
+    const input = "boom at /a/b.zig:12 now";
+    try emitLocatedIssue(ctx, spec, input);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("/a/b.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 12), issues.items[0].line);
+    try std.testing.expect(!issues.items[0].file_owned);
+    try std.testing.expect(issues.items[0].file.ptr == input[8..].ptr);
+    try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+}
+
+test "emitRuntimeIssue appends a file-less runtime finding" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
+    const spec = RuntimeIssueSpec{ .rule = RULE_RUNTIME_PANIC, .message = "m", .help = "h" };
+    try emitRuntimeIssue(ctx, spec);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("runtime", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 1), issues.items[0].line);
+    try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings("m", issues.items[0].message);
+    try std.testing.expectEqualStrings("h", issues.items[0].help.?);
+    try std.testing.expect(!issues.items[0].message_owned);
+}
+
+test "reportCommandFailure varies help by command kind" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    try reportCommandFailure(allocator, &issues, false);
+    try reportCommandFailure(allocator, &issues, true);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    for (issues.items) |issue| {
+        try std.testing.expectEqualStrings("build.zig", issue.file);
+        try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issue.rule);
+        try std.testing.expectEqualStrings("command failed", issue.message);
+        try std.testing.expectEqual(Severity.err, issue.severity);
+    }
+    try std.testing.expectEqualStrings("run 'zig build test' to see details", issues.items[0].help.?);
+    try std.testing.expectEqualStrings("check command output for details", issues.items[1].help.?);
+}
+
+test "buildRuntimeArgv builds default and custom argv" {
+    var buf: [64][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), buildRuntimeArgv(null, &buf, false));
+    try std.testing.expectEqualStrings("zig", buf[0]);
+    try std.testing.expectEqualStrings("build", buf[1]);
+    try std.testing.expectEqualStrings("test", buf[2]);
+    try std.testing.expectEqual(@as(usize, 2), buildRuntimeArgv("sh run.sh", &buf, false));
+    try std.testing.expectEqualStrings("sh", buf[0]);
+    try std.testing.expectEqualStrings("run.sh", buf[1]);
+}
+
+test "reportSignalDeath names the signal number in an owned message" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    try reportSignalDeath(allocator, &issues, .TERM);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("ZR106", issues.items[0].rule);
+    try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+    try std.testing.expectEqualStrings("command terminated by signal 15", issues.items[0].message);
+    try std.testing.expect(issues.items[0].message_owned);
+    try std.testing.expectEqualStrings("check the command for crashes", issues.items[0].help.?);
+}
+
+test "reportRunFailure distinguishes spawn failure from output overflow" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    try reportRunFailure(allocator, &issues, "/nonexistent/x", error.FileNotFound);
+    try reportRunFailure(allocator, &issues, "zig build test", error.StreamTooLong);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "cannot run /nonexistent/x: FileNotFound",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "command output exceeded the 10 MB capture limit",
+        issues.items[1].message,
+    );
+    for (issues.items) |issue| {
+        try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issue.rule);
+        try std.testing.expectEqual(Severity.err, issue.severity);
+        try std.testing.expect(issue.message_owned);
+    }
+}
+
+test "reportFmtFailure reports a missing zig as a command failure" {
+    // EPH-I0232: the fmt band's spawn failure becomes a ZR104 finding
+    // (not ZA601). A missing zig is not a format finding.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    try reportFmtFailure(allocator, &issues, error.FileNotFound);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("build.zig", issues.items[0].file);
+    try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+    try std.testing.expectEqualStrings("cannot run zig fmt: FileNotFound", issues.items[0].message);
+    try std.testing.expect(issues.items[0].message_owned);
+    try std.testing.expectEqualStrings("check that zig is installed and on PATH", issues.items[0].help.?);
+}
+
+test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The --command splitter keeps quote characters, so a script file
+    // gives sh a clean single-token argv.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "die.sh", .data = "kill -TERM $$\n" });
+    const script = try tmpFilePath(allocator, &tmp, "die.sh");
+    defer allocator.free(script);
+    const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
+    defer allocator.free(cmd);
+
+    var issues = try runRuntimeAnalysis(allocator, ".", false, cmd);
+    defer deinitIssues(&issues, allocator);
+
+    // Pre-fix the .exited read on a signal term was a safety panic.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("ZR106", issues.items[0].rule);
+    try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "signal 15") != null);
+}
+
+test "runRuntimeAnalysis reports ZR104 when the command cannot spawn" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var issues = try runRuntimeAnalysis(allocator, ".", false, "/nonexistent/ephor-i0232-x");
+    defer deinitIssues(&issues, allocator);
+
+    // Pre-fix the catch returned a bare empty list: indistinguishable
+    // from ran-clean (EPH-I0232).
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("ZR104", issues.items[0].rule);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "cannot run") != null);
+}
+
+test "runRuntimeAnalysis reports ZR104 when output exceeds the capture limit" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    // `yes` writes unbounded output and trips the 10 MB cap fast.
+    var issues = try runRuntimeAnalysis(allocator, ".", false, "yes");
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("ZR104", issues.items[0].rule);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "10 MB") != null);
+}
+
+test "runRuntimeAnalysis returns no findings for a clean command" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var issues = try runRuntimeAnalysis(allocator, ".", false, "true");
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "runRuntimeAnalysis reports ZR104 for a nonzero exit with no diagnostics" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var issues = try runRuntimeAnalysis(allocator, ".", false, "false");
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("command failed", issues.items[0].message);
 }
 
 // ============================================================================

@@ -47,6 +47,7 @@ pub const RULE_UNUSED_VAR = "ZA403";
 
 // ZA5xx - Structure
 pub const RULE_ORPHAN_FILE = "ZA501";
+pub const RULE_FILE_TOO_LARGE = "ZA502";
 
 // ZA6xx - Formatting (ZA607 is a semantic definite-assignment check that kept
 // its ZA6xx ID for backward compatibility with existing inline-ignores)
@@ -873,6 +874,53 @@ pub fn isInsideString(line: []const u8, col: usize) bool {
     return mode == .str;
 }
 
+/// Incremental per-line string/char-literal classifier (EPH-I0153).
+/// isInsideString rescans from column 0 per query, so a rule that tests k
+/// candidates on one line costs O(k * line): one 10 MB single-line file
+/// with 50k needles costs ~2.5e11 byte-ops per rule. Hot rules (hasToken,
+/// findCatchSite, the complexity counters) query many positions per line.
+/// This classifier walks the line once: each query continues the scan from
+/// the previous position, so any non-decreasing query sequence on one line
+/// costs O(line) total. Queries MUST NOT move backwards. The assert keeps a
+/// regressing caller loud in Debug and ReleaseSafe.
+pub const LineClassifier = struct {
+    line: []const u8,
+    scanned: usize = 0,
+    mode: QuoteMode = .none,
+
+    const QuoteMode = enum { none, str, char };
+
+    pub fn init(line: []const u8) LineClassifier {
+        return .{ .line = line };
+    }
+
+    /// True when column `col` sits inside a string literal. Matches
+    /// isInsideString exactly: the escape skip, and the EPH-I0104
+    /// char-literal spans where a `"` stays character data. `col` must be
+    /// at or after the previously queried column.
+    pub fn isInsideString(self: *LineClassifier, col: usize) bool {
+        std.debug.assert(col >= self.scanned);
+        while (self.scanned < col and self.scanned < self.line.len) : (self.scanned += 1) {
+            const c = self.line[self.scanned];
+            switch (self.mode) {
+                .char => {
+                    if (c == '\\') self.scanned += 1;
+                    if (c == '\'') self.mode = .none;
+                },
+                .str => {
+                    if (c == '\\') self.scanned += 1;
+                    if (c == '"') self.mode = .none;
+                },
+                .none => {
+                    if (c == '\'') self.mode = .char;
+                    if (c == '"') self.mode = .str;
+                },
+            }
+        }
+        return self.mode == .str;
+    }
+};
+
 /// State for masking string/char literals and comments while parsing a line
 pub const LiteralState = struct {
     in_str: bool = false,
@@ -1019,6 +1067,68 @@ test "isInsideString skips char literal spans" {
     try std.testing.expect(isInsideString("const q = 'a'; const s = \"x", 26));
     // Escape handling inside strings is unchanged: `\"` does not close.
     try std.testing.expect(isInsideString("const s = \"a \\\" b", 17));
+}
+
+/// Assert the incremental classifier agrees with the from-column-0 rescan
+/// at every column of `line`, queried in ascending order (EPH-I0153).
+fn expectClassifierParity(line: []const u8) !void {
+    var cls = LineClassifier.init(line);
+    var col: usize = 0;
+    while (col <= line.len) : (col += 1) {
+        try std.testing.expectEqual(isInsideString(line, col), cls.isInsideString(col));
+    }
+}
+
+test "LineClassifier matches isInsideString on a shape battery" {
+    // The battery pins parity, including the shapes where isInsideString's
+    // quote-only state machine surprises: comments do not mask quotes, and
+    // a `\\` body does not either (callers mask those via LiteralState).
+    const shapes = [_][]const u8{
+        "",
+        "const x = 42;",
+        "const s = \"hello\";",
+        "const s = \"a \\\"nested\\\" b\";",
+        "const q = '\"'; const s = \"x\";",
+        "const q = '\\'';",
+        "const q = '\\\\';",
+        "// comment with \"quote",
+        "\\\\ multiline \"body\"",
+        "const s = \"unterminated",
+        "const s = \"\\\\\";",
+        "catch { // }",
+        "\"starts with quote\"",
+        "'",
+        "\"",
+        "fn f() void { s.print(\"{d}\", .{x}); } // \"trailing",
+    };
+    for (shapes) |line| try expectClassifierParity(line);
+}
+
+test "LineClassifier bounds work to one walk per line" {
+    // 1 MiB single-line string body with 10k ascending candidates: total
+    // scanned bytes must stay <= line length (one walk), not candidates
+    // times line length (EPH-I0153).
+    const allocator = std.testing.allocator;
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(allocator);
+    try line.appendSlice(allocator, "const s = \"");
+    try line.appendNTimes(allocator, 'a', 1024 * 1024);
+    try line.appendSlice(allocator, "\"; x();");
+
+    var cls = LineClassifier.init(line.items);
+    const candidates: usize = 10 * 1000;
+    const stride = line.items.len / candidates;
+    var col: usize = 12;
+    var string_hits: usize = 0;
+    for (0..candidates) |_| {
+        if (cls.isInsideString(col)) string_hits += 1;
+        col += stride;
+    }
+    try std.testing.expect(cls.scanned <= line.items.len);
+    // The body is one long string: interior candidates classify inside.
+    try std.testing.expect(string_hits > candidates / 2);
+    // The code after the closing quote is outside.
+    try std.testing.expect(!cls.isInsideString(line.items.len - 1));
 }
 
 test "ReturnKind has all expected variants" {

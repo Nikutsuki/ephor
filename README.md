@@ -351,6 +351,7 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA501** | warning | ON | Orphan file (not imported from entry points) |
+| **ZA502** | warning | ON | File reaches or exceeds the 10 MiB source read cap and is skipped from analysis (split the file into smaller units) |
 
 ### Formatting (ZA6xx)
 

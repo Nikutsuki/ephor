@@ -220,6 +220,23 @@ var corpus_bytes_warn_threshold: usize = 1024 * 1024 * 1024;
 /// the warning is edge-triggered, so tests reset it to re-arm.
 var corpus_warn_count: usize = 0;
 
+/// Read cap for Zig SOURCE files (EPH-I0150): the import graph's per-file
+/// content read (analyzeFile) and the export path's snippet re-read
+/// (writeCodeSnippet) share this one cap, so a file the graph skipped can
+/// never re-enter through the snippet path. 10 MiB sits far past real
+/// source files (ZA702's exceptional-file threshold defaults to 50 KB)
+/// and bounds the resident corpus the graph holds (EPH-I0199). std's
+/// limited read trips when the cap is reached, so a file at or over the
+/// cap is recorded in ImportGraph.skipped_files and reported as ZA502
+/// instead of vanishing silently.
+///
+/// The other read caps are different classes and stay separate: config
+/// files read at 64 KiB, build.zig variants at 512 KiB-4 MiB by call
+/// site, the known-issues list at 10 MiB, and the runtime capture limits
+/// (10 MiB test output, 1 MiB ast-check output) bound child processes,
+/// not source reads.
+const max_source_file_bytes = 10 * 1024 * 1024;
+
 /// Print a CLI/config diagnostic unless tests have muted the channel.
 fn cliDiag(comptime fmt: []const u8, args: anytype) void {
     if (!cli_diagnostics_enabled) return;
@@ -262,6 +279,7 @@ const RULE_UNUSED_IMPORT = types.RULE_UNUSED_IMPORT;
 const RULE_UNUSED_CONST = types.RULE_UNUSED_CONST;
 const RULE_UNUSED_VAR = types.RULE_UNUSED_VAR;
 const RULE_ORPHAN_FILE = types.RULE_ORPHAN_FILE;
+const RULE_FILE_TOO_LARGE = types.RULE_FILE_TOO_LARGE;
 const RULE_NEEDS_FORMAT = types.RULE_NEEDS_FORMAT;
 const RULE_DEFINITE_ASSIGNMENT = types.RULE_DEFINITE_ASSIGNMENT;
 const RULE_LINE_TOO_LONG = types.RULE_LINE_TOO_LONG;
@@ -304,6 +322,7 @@ const countOccurrences = types.countOccurrences;
 const countLines = types.countLines;
 const isIdent = types.isIdent;
 const isInsideString = types.isInsideString;
+const LineClassifier = types.LineClassifier;
 const skipWhitespace = types.skipWhitespace;
 
 const ReturnKind = types.ReturnKind;
@@ -2003,12 +2022,14 @@ fn hasPatternNotInString(t: []const u8, pattern: []const u8) bool {
 /// "try " on both counts). Iterates ALL occurrences — an early one may be
 /// inside a string while a later one is real.
 fn hasRealKeyword(t: []const u8, kw: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], kw)) |rel| {
         const pos = s + rel;
         s = pos + kw.len;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         return true;
     }
     return false;
@@ -2244,6 +2265,8 @@ fn isDirectAssignment(t: []const u8, name: []const u8, pos: usize) bool {
 /// Used to detect when a freed variable is reassigned to new memory.
 /// Skips `==` (comparison), `[` (subscript), string literals, and field access.
 fn hasDirectReassignment(t: []const u8, var_name: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], var_name)) |rel| {
         const pos = s + rel;
@@ -2252,7 +2275,7 @@ fn hasDirectReassignment(t: []const u8, var_name: []const u8) bool {
         if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) continue;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos > 0 and t[pos - 1] == '.') continue; // field access
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         // Check for direct assignment (not ==, not subscript)
         if (isDirectAssignment(t, var_name, pos)) return true;
     }
@@ -3268,6 +3291,8 @@ fn computeGenSetForVar(
 /// Check if a line takes the address of a variable (&var_name)
 /// This indicates out-parameter usage where the variable may be assigned
 fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var search_start: usize = 0;
     while (search_start + 1 + var_name.len <= t.len) {
         const amp_pos = mem.indexOf(u8, t[search_start..], "&") orelse return false;
@@ -3283,7 +3308,7 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
         if (end < t.len and isIdent(t[end])) continue;
 
         // Make sure it's not inside a string or comment
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
 
         return true;
@@ -3297,6 +3322,8 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
 /// analysis. A `&var` call argument stays trackable — the call-fill
 /// heuristic covers it at statement precision (EPH-I0102).
 fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var search_start: usize = 0;
     while (search_start + 1 + var_name.len <= t.len) {
         const amp_rel = mem.indexOf(u8, t[search_start..], "&") orelse return false;
@@ -3312,7 +3339,7 @@ fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
         if (end < t.len and isIdent(t[end])) continue;
 
         // Make sure it's not inside a string or comment
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
 
         if (!isInsideCallArg(t, pos)) return true;
@@ -3329,7 +3356,7 @@ fn isAllIdent(s: []const u8) bool {
     return true;
 }
 
-fn isMethodCallAt(t: []const u8, abs_pos: usize, var_name: []const u8) bool {
+fn isMethodCallAt(t: []const u8, abs_pos: usize, var_name: []const u8, cls: *LineClassifier) bool {
     if (abs_pos > 0 and isIdent(t[abs_pos - 1])) return false;
     const after = abs_pos + var_name.len;
     if (after >= t.len or t[after] != '.') return false;
@@ -3337,18 +3364,20 @@ fn isMethodCallAt(t: []const u8, abs_pos: usize, var_name: []const u8) bool {
     const paren = mem.indexOf(u8, rest, "(") orelse return false;
     const method_name = rest[0..paren];
     if (method_name.len == 0 or !isAllIdent(method_name)) return false;
-    if (isInsideString(t, abs_pos)) return false;
+    if (cls.isInsideString(abs_pos)) return false;
     if (mem.indexOf(u8, t[0..abs_pos], "//") != null) return false;
     return true;
 }
 
 fn hasMethodCallOnVar(t: []const u8, var_name: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var search_start: usize = 0;
     while (search_start + var_name.len + 2 <= t.len) {
         const pos = mem.indexOf(u8, t[search_start..], var_name) orelse return false;
         const abs_pos = search_start + pos;
         search_start = abs_pos + 1;
-        if (isMethodCallAt(t, abs_pos, var_name)) return true;
+        if (isMethodCallAt(t, abs_pos, var_name, &cls)) return true;
     }
     return false;
 }
@@ -3394,6 +3423,8 @@ fn hasAsmOutputVar(t: []const u8, var_name: []const u8) bool {
 /// And multi-line: @field(result, switch (i) { ... }) = value
 fn hasComptimeFieldAssignment(t: []const u8, var_name: []const u8) bool {
     const prefix = "@field(";
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var search_start: usize = 0;
     while (search_start + prefix.len + var_name.len + 1 <= t.len) {
         const pos = mem.indexOf(u8, t[search_start..], prefix) orelse return false;
@@ -3401,7 +3432,7 @@ fn hasComptimeFieldAssignment(t: []const u8, var_name: []const u8) bool {
         search_start = abs_pos + 1;
 
         // Check if inside string or comment
-        if (isInsideString(t, abs_pos)) continue;
+        if (cls.isInsideString(abs_pos)) continue;
         if (mem.indexOf(u8, t[0..abs_pos], "//")) |_| continue;
 
         // After @field(, expect var_name followed by comma or )
@@ -3601,6 +3632,8 @@ fn removeIndirectlyInitVars(
 /// Canonical (zig fmt) spacing puts spaces around bitwise-or operands, so
 /// the adjacent-pipe form is a binding, not `a | x | z`.
 fn hasPayloadBinding(t: []const u8, var_name: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var s: usize = 0;
     while (s + 1 + var_name.len <= t.len) {
         const pipe_rel = mem.indexOf(u8, t[s..], "|") orelse return false;
@@ -3611,7 +3644,7 @@ fn hasPayloadBinding(t: []const u8, var_name: []const u8) bool {
         const end = pos + 1 + var_name.len;
         if (end >= t.len) continue;
         if (t[end] != '|' and t[end] != ',') continue;
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
         return true;
     }
@@ -3715,6 +3748,8 @@ fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
 /// Passing a mutable slice allows the callee to write into the array,
 /// effectively initializing it (e.g., reader.readSliceShort(buf[0..])).
 fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var pos: usize = 0;
     while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
         // Word boundary check before
@@ -3733,7 +3768,7 @@ fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
             continue;
         }
         // Skip if inside string or comment
-        if (isInsideString(t, vpos)) {
+        if (cls.isInsideString(vpos)) {
             pos = end;
             continue;
         }
@@ -4845,13 +4880,18 @@ fn isBindingNameAt(t: []const u8, var_name: []const u8, i: usize) bool {
 /// property, string literal, line comment, fill destination (`&x` or a
 /// bare @memset/@memcpy dest — a fill statement must not "read" its own
 /// destination, EPH-I0102), or an assignment target.
-fn isReadExemptOccurrence(t: []const u8, var_name: []const u8, i: usize) bool {
+fn isReadExemptOccurrence(
+    t: []const u8,
+    var_name: []const u8,
+    i: usize,
+    cls: *LineClassifier,
+) bool {
     const end_i = i + var_name.len;
     if (end_i < t.len and isIdent(t[end_i])) return true; // mid-word
     if (i > 0 and isIdent(t[i - 1])) return true; // mid-word
     if (i > 0 and t[i - 1] == '.') return true; // field of another var
     if (isBindingNameAt(t, var_name, i)) return true;
-    if (isInsideString(t, i)) return true;
+    if (cls.isInsideString(i)) return true;
     if (mem.indexOf(u8, t[0..i], "//")) |_| return true;
     if (end_i + 4 <= t.len and mem.eql(u8, t[end_i .. end_i + 4], ".len")) return true;
     if (i > 0 and t[i - 1] == '&') return true; // fill destination
@@ -4865,10 +4905,12 @@ fn firstVarReadPos(t: []const u8, var_name: []const u8) ?usize {
     // Skip comment and multiline string lines entirely
     if (isCommentOrMultilineString(t)) return null;
 
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
         if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
-        if (!isReadExemptOccurrence(t, var_name, i)) return i;
+        if (!isReadExemptOccurrence(t, var_name, i, &cls)) return i;
     }
     return null;
 }
@@ -5344,6 +5386,8 @@ fn hasExclusiveArmBetween(
 }
 
 fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], vn)) |rel| {
         const pos = s + rel;
@@ -5354,7 +5398,7 @@ fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
         if (pos > 0 and t[pos - 1] == '.') continue;
         // Capture binding: |var| in for/while/switch/catch creates a new binding
         if (pos > 0 and t[pos - 1] == '|') continue;
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         if (isDirectAssignment(t, vn, pos)) continue;
         return pos;
     }
@@ -6740,12 +6784,14 @@ fn isBareIdentReturnExpr(expr: []const u8) bool {
 /// or a success value abandoning the alloc; both leave the alloc
 /// untransferred on that path, so either way a LATER transfer cannot cover it.
 fn hasBareIdentReturn(t: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], "return ")) |rel| {
         const pos = s + rel;
         s = pos + "return ".len;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         if (isBareIdentReturnExpr(t[pos + "return ".len ..])) return true;
     }
     return false;
@@ -7293,6 +7339,11 @@ const ImportGraph = struct {
     /// re-walk once per root (64 roots × 50k files ≈ 3.2M realpath
     /// syscalls). Keys are owned dupes, freed in deinit.
     marked_dirs: std.StringHashMapUnmanaged(void),
+    /// Paths skipped because the source read hit max_source_file_bytes
+    /// (EPH-I0150). Without the record an over-cap file vanishes from
+    /// every analyzer and orphan detection with no warning. Owned dupes,
+    /// freed in deinit.
+    skipped_files: std.ArrayListUnmanaged([]const u8),
 
     fn init(allocator: Allocator) ImportGraph {
         return .{
@@ -7303,6 +7354,7 @@ const ImportGraph = struct {
             .scan_root = null,
             .resident_bytes = 0,
             .marked_dirs = .empty,
+            .skipped_files = .empty,
         };
     }
 
@@ -7318,6 +7370,9 @@ const ImportGraph = struct {
         // resolved_to_key aliases entries owned by self.files — just
         // drop the table, don't free the slices.
         self.resolved_to_key.deinit(self.allocator);
+
+        for (self.skipped_files.items) |path| self.allocator.free(path);
+        self.skipped_files.deinit(self.allocator);
 
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
@@ -7432,8 +7487,15 @@ const ImportGraph = struct {
     }
 
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
-        const max_size = 10 * 1024 * 1024;
-        const content = Fs.cwd().readFileAlloc(self.allocator, file_path, max_size) catch {
+        const content = Fs.cwd().readFileAlloc(
+            self.allocator,
+            file_path,
+            max_source_file_bytes,
+        ) catch |err| {
+            // Over-cap files are recorded so the skip surfaces as ZA502
+            // (EPH-I0150). Other read failures keep the long-standing
+            // silent skip: a missing entry file is an accepted input.
+            if (err == error.StreamTooLong) try self.noteSkippedFile(file_path);
             return;
         };
         self.resident_bytes += content.len;
@@ -7466,6 +7528,46 @@ const ImportGraph = struct {
                 path_copy,
             );
         }
+    }
+
+    /// Record a file skipped at the source read cap (EPH-I0150). Without
+    /// the record the file vanishes from every analyzer and orphan
+    /// detection with no warning: the read fails before files.put, so no
+    /// downstream pass can observe the loss.
+    fn noteSkippedFile(self: *ImportGraph, file_path: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, file_path);
+        errdefer self.allocator.free(copy);
+        try self.skipped_files.append(self.allocator, copy);
+    }
+
+    /// Skipped-file findings (ZA502): one warning per over-cap path. The
+    /// message is comptime-built from max_source_file_bytes so it names
+    /// the cap and can never drift from it. std's limited read trips at
+    /// the cap, not past it, so the message says "reaches or exceeds".
+    /// The findings ride the orphans/structure list so the skip survives
+    /// the pipeline into print and export. `file` borrows the graph-owned
+    /// paths, the same lifetime pattern as getOrphanIssues.
+    fn getSkippedFileIssues(
+        self: *ImportGraph,
+        allocator: Allocator,
+    ) !std.ArrayListUnmanaged(Issue) {
+        const msg = std.fmt.comptimePrint(
+            "file reaches or exceeds the {d} MiB source read cap and is skipped from analysis",
+            .{max_source_file_bytes / (1024 * 1024)},
+        );
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        for (self.skipped_files.items) |path| {
+            try issues.append(allocator, .{
+                .file = path,
+                .line = 1,
+                .col = 1,
+                .severity = .warning,
+                .rule = RULE_FILE_TOO_LARGE,
+                .message = msg,
+                .help = "split the file into smaller units so ephor can analyze it",
+            });
+        }
+        return issues;
     }
 
     /// Extract variable name after "const "
@@ -9468,13 +9570,15 @@ const TupleElementRegion = struct {
 /// NOT a match: distinguishing them from call args costs more than the shape
 /// occurs in practice (disclosed residual).
 fn isReturnTupleElement(t: []const u8, name: []const u8, region: TupleElementRegion) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var s = region.from;
     while (s < region.to) {
         const rel = mem.indexOf(u8, t[s..region.to], name) orelse return false;
         const pos = s + rel;
         s = pos + name.len;
         if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) continue;
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         if (parenDepthAt(t, region.from, pos, region.base_depth) != 0) continue;
         if (hasElementFollower(t, pos + name.len)) return true;
     }
@@ -9495,12 +9599,14 @@ fn hasElementFollower(t: []const u8, end0: usize) bool {
 
 /// Paren nesting depth at `pos`, counting t[from..pos] on top of `base`
 /// (the depth carried from previous lines) and ignoring parens inside
-/// string literals.
+/// string literals. The per-char queries ascend, so one classifier walks
+/// the span once instead of rescanning per char (EPH-I0153).
 fn parenDepthAt(t: []const u8, from: usize, pos: usize, base: usize) usize {
+    var cls = LineClassifier.init(t);
     var depth = base;
     var i = from;
     while (i < pos and i < t.len) : (i += 1) {
-        if (isInsideString(t, i)) continue;
+        if (cls.isInsideString(i)) continue;
         if (t[i] == '(') depth += 1;
         if (t[i] == ')') depth -|= 1;
     }
@@ -10063,14 +10169,15 @@ fn trackTestBlock(
 
 /// Line context for silent-catch detection (ZA201): the trimmed line, its
 /// position, the enclosing fn name, and the lookback/lookahead lines the
-/// multi-line suppression forms need.
+/// multi-line suppression forms need. `next_lines` is the bounded forward
+/// window the empty-catch close probe scans (EPH-I0151).
 const SilentCatchCtx = struct {
     t: []const u8,
     path: []const u8,
     line: usize,
     func_name: []const u8,
     preceding_lines: ?[]const []const u8 = null,
-    next_line: ?[]const u8 = null,
+    next_lines: []const []const u8 = &.{},
 };
 
 /// Check for silent catch patterns (ZA201)
@@ -10089,7 +10196,7 @@ fn checkSilentCatch(ctx: SilentCatchCtx) ?Issue {
     if (isDeferCatchMultiline(ctx.t, ctx.preceding_lines)) return null;
     // Suppress writer/stream catch {} — uses paren-balanced lookback for multi-line
     if (isStreamWriteCatchMultiline(ctx.t, ctx.preceding_lines)) return null;
-    const found = findSilentCatchCol(ctx.t, ctx.next_line) orelse return null;
+    const found = findSilentCatchCol(ctx.t, ctx.next_lines) orelse return null;
     return .{
         .file = ctx.path,
         .line = ctx.line,
@@ -10128,6 +10235,8 @@ fn isCleanupMethodCall(t: []const u8) bool {
         "revoke",  "close",   "cleanup",  "shutdown",   "deinit",
         "release", "destroy", "teardown", "disconnect",
     };
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     // Find method calls: look for .methodName( patterns
     var pos: usize = 0;
     while (mem.indexOfScalarPos(u8, t, pos, '.')) |dot| {
@@ -10141,7 +10250,7 @@ fn isCleanupMethodCall(t: []const u8) bool {
         const method = t[pos..end];
         // Check if method name contains any cleanup keyword (case-insensitive)
         if (containsCleanupKeyword(method, &cleanup_keywords)) {
-            if (!isInsideString(t, dot)) return true;
+            if (!cls.isInsideString(dot)) return true;
         }
     }
     return false;
@@ -10173,15 +10282,20 @@ const CatchSite = struct { col: usize, rest: usize };
 /// follows (`{}`, `unreachable`, `undefined`) without hardcoding exact
 /// whitespace/payload spellings (`catch{}`, `catch |err| unreachable`).
 fn findCatchSite(t: []const u8, start: usize) ?CatchSite {
+    // One classifier walk plus one comment-start walk per call
+    // (EPH-I0153): candidates ascend, and the comment start is
+    // position-invariant, so the per-occurrence rescans go away.
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var s = start;
     while (mem.indexOfPos(u8, t, s, "catch")) |pos| {
         s = pos + 5;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         const after = pos + 5;
         if (after < t.len and isIdent(t[after])) continue;
-        if (isInsideString(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
         // A comment swallows the rest of the line — no real catch beyond it.
-        if (isInTrailingComment(t, pos)) return null;
+        if (comment_start != null and pos >= comment_start.?) return null;
         var rest = after + skipLeadingWhitespace(t[after..]);
         if (rest < t.len and t[rest] == '|') {
             const close = mem.indexOfScalarPos(u8, t, rest + 1, '|') orelse break;
@@ -10203,16 +10317,70 @@ fn silentCatchMsg(t: []const u8, site: CatchSite) []const u8 {
     return "silent catch |err| {} discards error";
 }
 
-/// Check if a line is just the close of an empty catch body: `}` or `};`.
-fn isCatchCloseLine(next_line: ?[]const u8) bool {
-    const nl = next_line orelse return false;
-    const t = mem.trim(u8, nl, " \t\r");
-    return mem.eql(u8, t, "}") or mem.eql(u8, t, "};");
+/// Check if a trimmed line is just the close of an empty catch body: `}`
+/// followed by nothing but expression terminators and trivia. `;`, `,`,
+/// `)`, and further `}` bytes close enclosing scopes or statements, never
+/// the catch body itself. A trailing `//` comment is trivia. `} else {` and
+/// `} catch {` carry code after the brace and are not closes (EPH-I0151).
+fn isCatchCloseLine(t: []const u8) bool {
+    if (t.len == 0 or t[0] != '}') return false;
+    var i: usize = 1;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == ' ' or c == '\t' or c == ';' or c == ',' or
+            c == ')' or c == '}') continue;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return true;
+        return false;
+    }
+    return true;
+}
+
+/// Bound for forward probes past a line opener (EPH-I0151, EPH-I0152):
+/// how many lines the empty-catch close search and the split catch-verdict
+/// search scan. Comment and blank padding in real code is one or two
+/// lines. Four keeps the scan O(1) per catch while covering the observed
+/// evasion forms.
+const catch_probe_max_lines = 4;
+
+/// Bounded forward probe window after line `idx` (EPH-I0151, EPH-I0152):
+/// up to catch_probe_max_lines following lines, empty at end of input.
+fn forwardProbeWindow(lines: []const []const u8, idx: usize) []const []const u8 {
+    if (idx + 1 >= lines.len) return &.{};
+    return lines[idx + 1 .. @min(idx + 1 + catch_probe_max_lines, lines.len)];
+}
+
+/// First code line in the bounded forward window, else null. Blank lines
+/// and comment-only lines are trivia. A `\\` multiline-string body counts
+/// as content, not trivia: it holds string data that can be the catch
+/// payload expression, so the probes must see it and fail on it
+/// (EPH-I0151, EPH-I0152).
+fn firstCodeLine(next_lines: []const []const u8) ?[]const u8 {
+    var scanned: usize = 0;
+    for (next_lines) |nl| {
+        // Deliberate defense: forwardProbeWindow already caps the slice.
+        // The cap repeats here so an uncapped future caller keeps the
+        // per-catch probe O(1) (EPH-I0151).
+        if (scanned >= catch_probe_max_lines) return null;
+        scanned += 1;
+        const t = mem.trim(u8, nl, " \t\r");
+        if (t.len == 0) continue;
+        if (mem.startsWith(u8, t, "//")) continue;
+        return t;
+    }
+    return null;
+}
+
+/// True when the bounded forward window closes an empty catch body: the
+/// first code line past blank and comment-only padding is the body's
+/// close. Anything else first means the body holds code (EPH-I0151).
+fn probeEmptyCatchClose(next_lines: []const []const u8) bool {
+    const code = firstCodeLine(next_lines) orelse return false;
+    return isCatchCloseLine(code);
 }
 
 fn findSilentCatchCol(
     t: []const u8,
-    next_line: ?[]const u8,
+    next_lines: []const []const u8,
 ) ?struct { col: usize, msg: []const u8 } {
     var start: usize = 0;
     while (findCatchSite(t, start)) |site| {
@@ -10223,8 +10391,13 @@ fn findSilentCatchCol(
         const msg = silentCatchMsg(t, site);
         if (body.len > 0 and body[0] == '}')
             return .{ .col = site.col, .msg = msg };
-        // `catch {` ending the line: empty only if the next line just closes it
-        if (body.len == 0 and isCatchCloseLine(next_line))
+        // Empty means no code statements before the matching close
+        // (EPH-I0151): only trivia (nothing, or a trailing comment) may
+        // follow the open brace, and the first code line in the bounded
+        // window must be the close. A comment/blank line between the
+        // opener and the close no longer hides the verdict.
+        if (body.len > 0 and !mem.startsWith(u8, body, "//")) continue;
+        if (probeEmptyCatchClose(next_lines))
             return .{ .col = site.col, .msg = msg };
     }
     return null;
@@ -10279,6 +10452,8 @@ fn hasPointerToVar(t: []const u8, pos: usize, var_name: []const u8) bool {
 /// firstVarReadPos).
 fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
     if (isCommentOrMultilineString(t)) return false;
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     // Check all occurrences of var_name (handles Struct.var_name patterns)
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
@@ -10287,7 +10462,7 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         const end_i = i + var_name.len;
         const after_ok = end_i >= t.len or !isIdent(t[end_i]);
         if (!after_ok) continue;
-        if (isInsideString(t, i)) continue;
+        if (cls.isInsideString(i)) continue;
         if (mem.indexOf(u8, t[0..i], "//") != null) continue;
 
         // Pattern 1: &var_name or &Struct.var_name
@@ -10708,13 +10883,17 @@ fn scanUndefinedOccurrences(
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
 ) !void {
+    // One classifier walk plus one comment-start walk per line
+    // (EPH-I0153): candidates ascend, the comment start is invariant.
+    var cls = LineClassifier.init(ctx.t);
+    const comment_start = findCommentStart(ctx.t);
     var s: usize = 0;
     while (mem.indexOfPos(u8, ctx.t, s, "= undefined")) |col| {
         s = col + 1;
         if (isUndefinedContinuation(ctx.t, col)) continue;
-        if (isInsideString(ctx.t, col)) continue;
+        if (cls.isInsideString(col)) continue;
         // Everything from the comment start on is prose, not code.
-        if (isInTrailingComment(ctx.t, col)) return;
+        if (comment_start != null and col >= comment_start.?) return;
         if (isStructFieldPattern(ctx.t, col)) continue;
         if (isCleanupUndefinedPattern(ctx.t, col)) continue;
         if (extractVarDeclNameBefore(ctx.t, col)) |name| {
@@ -11144,9 +11323,11 @@ fn reportUnfilledField(
 
 /// Index of the first `catch |` outside a string literal, or null.
 fn findCatchPayloadStart(t: []const u8) ?usize {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, t, from, "catch |")) |pos| {
-        if (!isInsideString(t, pos)) return pos;
+        if (!cls.isInsideString(pos)) return pos;
         from = pos + 1;
     }
     return null;
@@ -11252,13 +11433,15 @@ const ErrRetFnScan = struct {
 /// is only enforced when the word ends in an identifier char (so "try "
 /// still matches before an operand).
 fn hasWordOutsideString(t: []const u8, word: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, t, from, word)) |pos| {
         const before_ok = pos == 0 or !isIdent(t[pos - 1]);
         const after_pos = pos + word.len;
         const after_ok = after_pos >= t.len or
             !isIdent(word[word.len - 1]) or !isIdent(t[after_pos]);
-        if (before_ok and after_ok and !isInsideString(t, pos)) return true;
+        if (before_ok and after_ok and !cls.isInsideString(pos)) return true;
         from = pos + 1;
     }
     return false;
@@ -11266,9 +11449,11 @@ fn hasWordOutsideString(t: []const u8, word: []const u8) bool {
 
 /// First `catch |payload|` identifier outside a string literal, or null.
 fn extractCatchPayloadIdent(t: []const u8) ?[]const u8 {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, t, from, "catch |")) |pos| {
-        if (isInsideString(t, pos)) {
+        if (cls.isInsideString(pos)) {
             from = pos + 1;
             continue;
         }
@@ -11295,10 +11480,12 @@ fn hasReturnOfIdent(t: []const u8, ident: []const u8) bool {
 /// error union ephor cannot resolve (cross-module), so it counts as an
 /// error path (FP-safe over-suppression for a note rule).
 fn hasReturnCallEvidence(t: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, t, from, "return ")) |pos| {
         const before_ok = pos == 0 or !isIdent(t[pos - 1]);
-        if (before_ok and !isInsideString(t, pos)) {
+        if (before_ok and !cls.isInsideString(pos)) {
             const rest = t[pos + "return ".len ..];
             const semi = mem.indexOfScalar(u8, rest, ';') orelse rest.len;
             if (mem.indexOfScalar(u8, rest[0..semi], '(') != null) return true;
@@ -11322,10 +11509,12 @@ fn returnExprIsNamespaced(rest: []const u8) bool {
 /// cannot resolve, so it counts as an error path (FP-safe). Lowercase-head
 /// qualified returns (`self.x`) stay non-evidence.
 fn hasNamespacedReturnEvidence(t: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, t, from, "return ")) |pos| {
         const before_ok = pos == 0 or !isIdent(t[pos - 1]);
-        if (before_ok and !isInsideString(t, pos) and
+        if (before_ok and !cls.isInsideString(pos) and
             returnExprIsNamespaced(t[pos + "return ".len ..])) return true;
         from = pos + 1;
     }
@@ -11638,7 +11827,7 @@ const ErrorLineCtx = struct {
     type_ctx: ?*const TypeContext,
     func_name: []const u8,
     preceding_lines: ?[]const []const u8,
-    next_line: ?[]const u8,
+    next_lines: []const []const u8,
 
     /// Bundle the fields checkSilentCatch needs for the ZA201 sub-check.
     fn silentCatchCtx(self: ErrorLineCtx) SilentCatchCtx {
@@ -11648,7 +11837,18 @@ const ErrorLineCtx = struct {
             .line = self.line,
             .func_name = self.func_name,
             .preceding_lines = self.preceding_lines,
-            .next_line = self.next_line,
+            .next_lines = self.next_lines,
+        };
+    }
+
+    /// Bundle the fields the ZA202/ZA207 verdict checks need (EPH-I0152).
+    fn catchVerdictCtx(self: ErrorLineCtx) CatchVerdictCtx {
+        return .{
+            .t = self.t,
+            .path = self.path,
+            .line = self.line,
+            .preceding_lines = self.preceding_lines,
+            .next_lines = self.next_lines,
         };
     }
 };
@@ -11665,7 +11865,7 @@ fn checkLineErrors(ctx: ErrorLineCtx) !void {
     }
     // ZA202: catch unreachable — suppress in test blocks (intentional assertions)
     if (!ctx.in_test) {
-        if (checkCatchUnreachable(ctx.t, ctx.path, ctx.line, ctx.preceding_lines)) |i| {
+        if (checkCatchUnreachable(ctx.catchVerdictCtx())) |i| {
             try ctx.issues.append(ctx.allocator, i);
         }
     }
@@ -11676,7 +11876,7 @@ fn checkLineErrors(ctx: ErrorLineCtx) !void {
         }
     }
     // ZA207: catch undefined (dangerous — converts errors to UB)
-    if (checkCatchUndefined(ctx.t, ctx.path, ctx.line)) |i| {
+    if (checkCatchUndefined(ctx.catchVerdictCtx())) |i| {
         try ctx.issues.append(ctx.allocator, i);
     }
     // Always resolve pending undefineds (even at module boundary) to avoid
@@ -11821,11 +12021,9 @@ fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: u
         try checkPendingFields(pf_ctx, ctx.state, ctx.issues, ctx.allocator);
     }
     const preceding: ?[]const []const u8 = if (line_idx > 0) ctx.all_lines[0..line_idx] else null;
-    // Needed for the bounded 2-line empty-catch form: `catch {` + `}` alone
-    const next_line: ?[]const u8 = if (line_idx + 1 < ctx.all_lines.len)
-        ctx.all_lines[line_idx + 1]
-    else
-        null;
+    // Bounded forward window for the empty-catch close probe (EPH-I0151)
+    // and the split catch-verdict probe (EPH-I0152).
+    const next_lines = forwardProbeWindow(ctx.all_lines, line_idx);
     const in_test = isInTestContext(ctx.path, ctx.state.in_test_block);
     try checkLineErrors(.{
         .t = t,
@@ -11840,7 +12038,7 @@ fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: u
         .type_ctx = ctx.type_ctx,
         .func_name = ctx.state.current_func_name,
         .preceding_lines = preceding,
-        .next_line = next_line,
+        .next_lines = next_lines,
     });
 
     if (checkExitBypassesDefer(.{
@@ -12080,13 +12278,15 @@ fn hasCallBeforeSemicolon(rest: []const u8) bool {
 /// Count `try`-propagated calls in one comment-stripped code slice (ZT102).
 fn countTryCalls(code: []const u8) usize {
     var count: usize = 0;
+    // One classifier walk per slice (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(code);
     var pos: usize = 0;
     while (mem.indexOfPos(u8, code, pos, "try")) |idx| {
         pos = idx + 3;
         const before_ok = idx == 0 or !isIdent(code[idx - 1]);
         const after_ok = idx + 3 >= code.len or !isIdent(code[idx + 3]);
         if (!before_ok or !after_ok) continue;
-        if (isInsideString(code, idx)) continue;
+        if (cls.isInsideString(idx)) continue;
         if (hasCallBeforeSemicolon(code[idx + 3 ..])) count += 1;
     }
     return count;
@@ -12389,13 +12589,15 @@ const LieTestState = struct {
 /// literals — a value reference like `Duration.parse_flag_value` handed to
 /// a fuzz/table harness, which exercises the fn without a call expression.
 fn hasIdentRef(code: []const u8, name: []const u8) bool {
+    // One classifier walk per slice (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(code);
     var pos: usize = 0;
     while (mem.indexOfPos(u8, code, pos, name)) |idx| {
         pos = idx + name.len;
         const before_ok = idx == 0 or !isIdent(code[idx - 1]);
         const after_ok = pos >= code.len or !isIdent(code[pos]);
         if (!before_ok or !after_ok) continue;
-        if (isInsideString(code, idx)) continue;
+        if (cls.isInsideString(idx)) continue;
         return true;
     }
     return false;
@@ -12842,16 +13044,18 @@ fn reportLieTest(ctx: *const TestScanCtx, state: *const TestFileScanState) !void
 // --- ZT104: swallowed errors in test context ---
 
 /// Shared ZT104 message for the empty-catch form (one-line `{}` or the
-/// bounded 2-line close).
+/// bounded multi-line close, EPH-I0151).
 const empty_test_catch_msg =
     "test swallows error: empty catch {} leaves failures unobservable";
 
 /// One test-context line plus the context ZT104 needs (bundled for param
 /// counts): trimmed and comment-stripped forms, lookahead and lookback.
+/// `next_lines` is the bounded forward window the empty-catch close probe
+/// scans (EPH-I0151).
 const CatchLineCtx = struct {
     t: []const u8,
     code: []const u8,
-    next_line: ?[]const u8,
+    next_lines: []const []const u8,
     preceding: ?[]const []const u8,
     in_defer_block: bool,
 };
@@ -12896,7 +13100,10 @@ fn testSwallowedCatchMsg(
     if (isCleanupCatchForm(clc)) return null;
     const body = mem.trim(u8, rest[1..], " \t");
     if (body.len > 0 and body[0] == '}') return empty_test_catch_msg;
-    if (body.len == 0 and isCatchCloseLine(clc.next_line)) return empty_test_catch_msg;
+    // Multi-line empty form (EPH-I0151): trivia after the opener, then the
+    // first code line in the bounded window must be the close.
+    if (body.len > 0 and !mem.startsWith(u8, body, "//")) return null;
+    if (probeEmptyCatchClose(clc.next_lines)) return empty_test_catch_msg;
     return null;
 }
 
@@ -12996,10 +13203,12 @@ fn scanLineCatches(
     state: *const TestFileScanState,
 ) !void {
     if (!isInTestContext(ctx.sink.path, sl.in_block_now)) return;
+    // Bounded forward window for the empty-catch close probe (EPH-I0151).
+    const next_lines = forwardProbeWindow(ctx.lines, idx);
     const clc: CatchLineCtx = .{
         .t = sl.t,
         .code = sl.code,
-        .next_line = if (idx + 1 < ctx.lines.len) ctx.lines[idx + 1] else null,
+        .next_lines = next_lines,
         .preceding = if (idx > 0) ctx.lines[0..idx] else null,
         .in_defer_block = state.in_defer,
     };
@@ -13071,8 +13280,9 @@ fn analyzeFileTests(
     facts: *const FnCallFacts,
     project_asserting: *const std.StringHashMapUnmanaged(void),
 ) !void {
-    // Lines are collected (not streamed) for the bounded 2-line empty-catch
-    // lookahead (ZT104): a `catch {` opener closes on the next line.
+    // Lines are collected (not streamed) for the bounded empty-catch close
+    // probe (ZT104, EPH-I0151): a `catch {` opener closes within a few
+    // lines past comment/blank padding.
     var all_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer all_lines.deinit(sink.allocator);
     var split = mem.splitScalar(u8, a.content, '\n');
@@ -14734,6 +14944,8 @@ fn analyzeConcurrency(
 /// must not count as a use of the alias.
 fn countIdentInCode(code: []const u8, name: []const u8) usize {
     var count: usize = 0;
+    // One classifier walk per slice (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(code);
     var i: usize = 0;
     while (i + name.len <= code.len) : (i += 1) {
         if (!mem.eql(u8, code[i .. i + name.len], name)) continue;
@@ -14741,7 +14953,7 @@ fn countIdentInCode(code: []const u8, name: []const u8) usize {
         const end_idx = i + name.len;
         const after_ok = end_idx >= code.len or !isIdent(code[end_idx]);
         if (!before_ok or !after_ok) continue;
-        if (isInsideString(code, i)) continue;
+        if (cls.isInsideString(i)) continue;
         count += 1;
     }
     return count;
@@ -14931,14 +15143,20 @@ fn hasSelfParam(t: []const u8, paren_pos: usize) bool {
 /// comment. Iterates ALL occurrences — an early one may be inside a string
 /// or comment while a later one is real code.
 fn hasToken(t: []const u8, needle: []const u8) bool {
+    // One classifier walk plus one comment-start walk per call
+    // (EPH-I0153): the complexity counters call this once per needle per
+    // line, and candidates ascend within a call, so per-occurrence
+    // rescans are the dominant cost. Both walks are O(line) once each.
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], needle)) |rel| {
         const pos = s + rel;
         s = pos + needle.len;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos + needle.len < t.len and isIdent(t[pos + needle.len])) continue;
-        if (isInsideString(t, pos)) continue;
-        if (isInTrailingComment(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
         return true;
     }
     return false;
@@ -14955,14 +15173,17 @@ fn hasRuntimeLoop(t: []const u8, comptime kw: []const u8) bool {
 /// Check if an `else` token is a switch prong (`else =>`), which is already
 /// counted by countSwitchArms and must not double-count as a branch.
 fn hasElseArrow(t: []const u8) bool {
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], "else")) |rel| {
         const pos = s + rel;
         s = pos + 4;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos + 4 < t.len and isIdent(t[pos + 4])) continue;
-        if (isInsideString(t, pos)) continue;
-        if (isInTrailingComment(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
         var j = pos + 4;
         while (j < t.len and t[j] == ' ') j += 1;
         if (j + 1 < t.len and t[j] == '=' and t[j + 1] == '>') return true;
@@ -14979,10 +15200,12 @@ fn hasElseBranch(t: []const u8) bool {
 /// Count switch arms (`=>`) on a line, skipping matches inside string literals.
 fn countSwitchArms(t: []const u8) usize {
     var count: usize = 0;
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var i: usize = 0;
     while (i + 1 < t.len) {
         const arrow_pos = mem.indexOfPos(u8, t, i, "=>") orelse break;
-        if (!types.isInsideString(t, arrow_pos)) count += 1;
+        if (!cls.isInsideString(arrow_pos)) count += 1;
         i = arrow_pos + 2;
     }
     return count;
@@ -15941,6 +16164,8 @@ fn checkErrorValueNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Trailing-comment text is prose, not a reference (same rule as strings).
     const limit = lineCommentStart(t);
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var pos: usize = 0;
     while (pos < t.len) {
         const err_pos = mem.indexOfPos(u8, t[0..limit], pos, "error.") orelse break;
@@ -15950,7 +16175,7 @@ fn checkErrorValueNames(ctx: NamingLineCtx) !void {
             continue;
         }
         // `error.` inside a string literal is data (fixture text), not a reference.
-        if (isInsideString(t, err_pos)) {
+        if (cls.isInsideString(err_pos)) {
             pos = err_pos + 6;
             continue;
         }
@@ -18292,10 +18517,12 @@ fn collectNullablePtrDeclsInLine(
     t: []const u8,
     nullable_ptrs: *std.StringHashMapUnmanaged(void),
 ) !void {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
     var pos: usize = 0;
     while (mem.indexOfPos(u8, t, pos, ":")) |colon| {
         pos = colon + 1;
-        if (isInsideString(t, colon)) continue;
+        if (cls.isInsideString(colon)) continue;
         const name = identBeforeColon(t, colon) orelse continue;
         const annotation = mem.trimStart(u8, t[colon + 1 ..], " \t");
         if (!isNullablePtrAnnotation(annotation)) continue;
@@ -18380,6 +18607,25 @@ fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
 /// - Cleanup function context (deinit, close, destroy, etc.)
 /// - Defer block context (best-effort cleanup)
 /// - Test block context (nested functions inside tests)
+/// ZA202 for one CFG block line: build the verdict context (lookback plus
+/// the bounded forward probe window, EPH-I0152) and run the check. Kept
+/// out of analyzeCFGErrors so the block loop stays within nesting limits.
+fn checkCFGCatchUnreachable(
+    run: CFGRunCtx,
+    t: []const u8,
+    line_num: usize,
+    idx: usize,
+) ?Issue {
+    const preceding: ?[]const []const u8 = if (idx > 0) run.func.lines[0..idx] else null;
+    return checkCatchUnreachable(.{
+        .t = t,
+        .path = run.file.file_path,
+        .line = line_num,
+        .preceding_lines = preceding,
+        .next_lines = forwardProbeWindow(run.func.lines, idx),
+    });
+}
+
 fn analyzeCFGErrors(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const allocator = run.file.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -18398,8 +18644,7 @@ fn analyzeCFGErrors(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
             if (isCommentOrMultilineString(t)) continue;
             if (is_test_ctx) continue;
 
-            const preceding: ?[]const []const u8 = if (idx > 0) run.func.lines[0..idx] else null;
-            if (checkCatchUnreachable(t, run.file.file_path, line_num, preceding)) |issue|
+            if (checkCFGCatchUnreachable(run, t, line_num, idx)) |issue|
                 try issues.append(allocator, issue);
             if (checkOrelseUnreachable(run, t, line_num, idx)) |issue|
                 try issues.append(allocator, issue);
@@ -18409,29 +18654,53 @@ fn analyzeCFGErrors(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     return issues;
 }
 
+/// Line context for the catch-verdict checks (ZA202/ZA207): the trimmed
+/// line and its position, plus the lookback/lookahead windows the
+/// multi-line forms need. `next_lines` is the bounded forward window the
+/// split-verdict probe scans (EPH-I0152).
+const CatchVerdictCtx = struct {
+    t: []const u8,
+    path: []const u8,
+    line: usize,
+    preceding_lines: ?[]const []const u8,
+    next_lines: []const []const u8 = &.{},
+};
+
+/// Match the `unreachable` verdict form at the start of a code segment:
+/// the bare token, not a longer identifier (`unreachableFoo`).
+fn startsWithVerdict(code: []const u8, comptime verdict: []const u8) bool {
+    if (!mem.startsWith(u8, code, verdict)) return false;
+    return code.len == verdict.len or !isIdent(code[verdict.len]);
+}
+
+/// Probe for a split catch verdict (EPH-I0152): the valid multi-line form
+/// `foo() catch\n    unreachable;` puts the verdict on a following code
+/// line. Only the FIRST code line past blank/comment padding can carry it
+/// — anything else means the catch payload is that line's expression.
+fn probeSplitVerdict(next_lines: []const []const u8, comptime verdict: []const u8) bool {
+    const code = firstCodeLine(next_lines) orelse return false;
+    return startsWithVerdict(code, verdict);
+}
+
 /// ZA202: catch unreachable will panic on error
 /// Accepts preceding lines context for multi-line expression lookback.
-fn checkCatchUnreachable(
-    t: []const u8,
-    file_path: []const u8,
-    line_num: usize,
-    preceding_lines: ?[]const []const u8,
-) ?Issue {
+fn checkCatchUnreachable(ctx: CatchVerdictCtx) ?Issue {
     var start: usize = 0;
-    while (findCatchSite(t, start)) |site| {
+    while (findCatchSite(ctx.t, start)) |site| {
         start = site.col + 5;
-        const rest = t[site.rest..];
-        if (!mem.startsWith(u8, rest, "unreachable")) continue;
-        if (rest.len > 11 and isIdent(rest[11])) continue;
+        const rest = ctx.t[site.rest..];
+        const split = rest.len == 0 or mem.startsWith(u8, rest, "//");
+        if (split and !probeSplitVerdict(ctx.next_lines, "unreachable")) continue;
+        if (!split and !startsWithVerdict(rest, "unreachable")) continue;
         // Suppress inside @TypeOf() — compile-time only, never executed at runtime
-        if (isInsideTypeOf(t, site.col, preceding_lines)) return null;
+        if (isInsideTypeOf(ctx.t, site.col, ctx.preceding_lines)) return null;
         // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe
-        if (isBufPrintCatchUnreachable(t, preceding_lines)) return null;
+        if (isBufPrintCatchUnreachable(ctx.t, ctx.preceding_lines)) return null;
         // Suppress stdlib functions called with string literals (parseIp("0.0.0.0", ...))
-        if (isSafeStdlibLiteralCall(t, preceding_lines)) return null;
+        if (isSafeStdlibLiteralCall(ctx.t, ctx.preceding_lines)) return null;
         return .{
-            .file = file_path,
-            .line = line_num,
+            .file = ctx.path,
+            .line = ctx.line,
             .col = site.col + 1,
             .severity = .warning,
             .rule = RULE_CATCH_UNREACHABLE,
@@ -18620,12 +18889,15 @@ fn checkLineOrelseUnreachable(
     file_path: []const u8,
     line_num: usize,
 ) ?Issue {
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var s: usize = 0;
     while (mem.indexOfPos(u8, t, s, "orelse unreachable")) |col| {
         s = col + 1;
-        if (isInsideString(t, col)) continue;
+        if (cls.isInsideString(col)) continue;
         // A mention inside a trailing comment is prose, not code.
-        if (isInTrailingComment(t, col)) return null;
+        if (comment_start != null and col >= comment_start.?) return null;
         return .{
             .file = file_path,
             .line = line_num,
@@ -18640,22 +18912,19 @@ fn checkLineOrelseUnreachable(
 }
 
 /// ZA207: catch undefined converts errors to undefined behavior
-fn checkCatchUndefined(
-    t: []const u8,
-    file_path: []const u8,
-    line_num: usize,
-) ?Issue {
+fn checkCatchUndefined(ctx: CatchVerdictCtx) ?Issue {
     // Any payload form (`catch |_| undefined`, `catch |err| undefined`) is
     // equally UB — the payload does not rescue the error.
     var start: usize = 0;
-    while (findCatchSite(t, start)) |site| {
+    while (findCatchSite(ctx.t, start)) |site| {
         start = site.col + 5;
-        const rest = t[site.rest..];
-        if (!mem.startsWith(u8, rest, "undefined")) continue;
-        if (rest.len > 9 and isIdent(rest[9])) continue;
+        const rest = ctx.t[site.rest..];
+        const split = rest.len == 0 or mem.startsWith(u8, rest, "//");
+        if (split and !probeSplitVerdict(ctx.next_lines, "undefined")) continue;
+        if (!split and !startsWithVerdict(rest, "undefined")) continue;
         return .{
-            .file = file_path,
-            .line = line_num,
+            .file = ctx.path,
+            .line = ctx.line,
             .col = site.col + 1,
             .severity = .warning,
             .rule = RULE_CATCH_UNDEFINED,
@@ -18672,12 +18941,15 @@ fn checkPanic(
     file_path: []const u8,
     line_num: usize,
 ) ?Issue {
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var s: usize = 0;
     while (mem.indexOfPos(u8, t, s, "@panic(")) |col| {
         s = col + 1;
-        if (isInsideString(t, col)) continue;
+        if (cls.isInsideString(col)) continue;
         // A mention inside a trailing comment is prose, not code.
-        if (isInTrailingComment(t, col)) return null;
+        if (comment_start != null and col >= comment_start.?) return null;
         return .{
             .file = file_path,
             .line = line_num,
@@ -19076,6 +19348,9 @@ fn isArrayIndexGuarded(ctx: GuardLineCtx) bool {
 /// and `x = -1` cannot match (the chars are `= -`, not `-=`). Matches
 /// inside string literals and trailing comments are not code.
 fn findDecrementOp(t: []const u8) ?usize {
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var s: usize = 0;
     while (mem.indexOfPos(u8, t, s, "-=")) |pos| {
         s = pos + 2;
@@ -19084,8 +19359,8 @@ fn findDecrementOp(t: []const u8) ?usize {
         if (j >= t.len) continue;
         const rhs = t[j];
         if (!isIdent(rhs) and rhs != '(' and rhs != '@' and rhs != '-') continue;
-        if (isInsideString(t, pos)) continue;
-        if (isInTrailingComment(t, pos)) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
         return pos;
     }
     return null;
@@ -19778,9 +20053,9 @@ fn charLiteralAt(inside: []const u8, i: usize) usize {
 /// Check if `inside[i]` is a subtraction operator: a `-` with a real operand
 /// on both sides, not a negative literal, not saturating `-|`, not in a
 /// string.
-fn isSubtractionOpAt(inside: []const u8, i: usize) bool {
+fn isSubtractionOpAt(inside: []const u8, i: usize, cls: *LineClassifier) bool {
     if (inside[i] != '-') return false;
-    if (isInsideString(inside, i)) return false;
+    if (cls.isInsideString(i)) return false;
     if (i + 1 < inside.len and inside[i + 1] == '|') return false;
     if (!hasIndexOperandBefore(inside, i)) return false;
     return hasIndexOperandAfter(inside, i);
@@ -19792,6 +20067,8 @@ fn isSubtractionOpAt(inside: []const u8, i: usize) bool {
 /// not a subtraction — it has no left operand. Char-literal content is data
 /// (`a['-']`), and `-|` is saturating subtraction (guarded by design).
 fn findIndexSubtraction(inside: []const u8) ?usize {
+    // One classifier walk per expression (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(inside);
     var i: usize = 0;
     while (i < inside.len) : (i += 1) {
         const lit = charLiteralAt(inside, i);
@@ -19799,7 +20076,7 @@ fn findIndexSubtraction(inside: []const u8) ?usize {
             i += lit - 1;
             continue;
         }
-        if (isSubtractionOpAt(inside, i)) return i;
+        if (isSubtractionOpAt(inside, i, &cls)) return i;
     }
     return null;
 }
@@ -20205,11 +20482,14 @@ fn checkCastNeedleOnLine(
     n: CastNeedle,
 ) !void {
     const line = lines[idx];
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
     var pos: usize = 0;
     while (mem.indexOfPos(u8, line, pos, n.needle)) |col| {
         pos = col + n.needle.len;
-        if (isInsideString(line, col)) continue;
-        if (isInTrailingComment(line, col)) continue;
+        if (cls.isInsideString(col)) continue;
+        if (comment_start != null and col >= comment_start.?) continue;
         const ident = extractCastIdent(line, col + n.needle.len - 1) orelse continue;
         if (hasCastBoundsProof(lines, idx, col, ident)) continue;
         try sink.issues.append(sink.allocator, .{
@@ -21020,9 +21300,11 @@ fn findCommentStart(line: []const u8) ?usize {
     // text is string data, so no real comment can begin on it.
     const t = mem.trimStart(u8, line, " \t");
     if (mem.startsWith(u8, t, "\\\\")) return null;
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(line);
     var pos: usize = 0;
     while (mem.indexOfPos(u8, line, pos, "//")) |idx| {
-        if (!isInsideString(line, idx)) return idx;
+        if (!cls.isInsideString(idx)) return idx;
         pos = idx + 2;
     }
     return null;
@@ -22341,7 +22623,7 @@ fn writeDefaultConfig() !void {
         \\  //                     ZA303 too-many-params, ZA304 too-many-branches,
         \\  //                     ZA305 cyclomatic (OFF by default), ZA306 cognitive (OFF by default)
         \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
-        \\  //   ZA5xx Structure:  ZA501 orphan-file
+        \\  //   ZA5xx Structure:  ZA501 orphan-file, ZA502 file-too-large
         \\  //   ZA6xx Format:     ZA601 needs-format,
         \\  //                     ZA607 read-before-assign (semantic, not formatting)
         \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long,
@@ -24841,7 +25123,7 @@ fn printHelp() void {
         \\                     ZA305: cyclomatic (off by default), ZA306: cognitive (off by default))
         \\  ZA4xx  Unused     (ZA401: unused-import, ZA402: unused-const,
         \\                     ZA403: unused-var)
-        \\  ZA5xx  Structure  (ZA501: orphan-file)
+        \\  ZA5xx  Structure  (ZA501: orphan-file, ZA502: file-too-large)
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long,
@@ -25003,7 +25285,13 @@ fn writeCodeSnippet(
     scan_root_real: ?[]const u8,
 ) !void {
     if (!resolvesInRoot(issue.file, scan_root_real)) return;
-    const content = Fs.cwd().readFileAlloc(allocator, issue.file, 10 * 1024 * 1024) catch return;
+    // max_source_file_bytes (EPH-I0150): the same cap the graph read
+    // under, so a skipped file cannot re-enter through the snippet path.
+    const content = Fs.cwd().readFileAlloc(
+        allocator,
+        issue.file,
+        max_source_file_bytes,
+    ) catch return;
     defer allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -25883,6 +26171,12 @@ pub fn main(init: std.process.Init) !void {
                 try g.markBuildPathReferences(&cfg);
                 var issues = try g.getOrphanIssues(alloc, &cfg);
                 defer deinitIssues(&issues, alloc);
+                // ZA502 skipped files ride the structure list (EPH-I0150):
+                // same graph-owned lifetime, static messages. The merge
+                // moves items, so the skipped list frees only its array.
+                var skipped_issues = try g.getSkippedFileIssues(alloc);
+                defer skipped_issues.deinit(alloc);
+                for (skipped_issues.items) |si| try issues.append(alloc, si);
                 sortIssuesByFile(issues.items);
 
                 const out = ReportOutCtx{
@@ -26110,6 +26404,12 @@ pub fn main(init: std.process.Init) !void {
 
                 var orphan_issues = try g.getOrphanIssues(alloc, &cfg);
                 defer deinitIssues(&orphan_issues, alloc);
+                // ZA502 skipped files ride the structure list (EPH-I0150):
+                // same graph-owned lifetime, static messages. The merge
+                // moves items, so the skipped list frees only its array.
+                var skipped_issues = try g.getSkippedFileIssues(alloc);
+                defer skipped_issues.deinit(alloc);
+                for (skipped_issues.items) |si| try orphan_issues.append(alloc, si);
                 sortIssuesByFile(orphan_issues.items);
 
                 // CFG-based memory analysis (ZA101-ZA106)
@@ -42604,33 +42904,33 @@ test "hasDirectReassignment detects variable reassignment" {
 
 test "ZA202 suppressed inside @TypeOf" {
     // @TypeOf(expr catch unreachable) is compile-time only, never executed
-    const issue = checkCatchUnreachable(
-        "const T = @TypeOf(pool.query(\"\", &.{}) catch unreachable);",
-        "test.zig",
-        1,
-        null,
-    );
+    const issue = checkCatchUnreachable(.{
+        .t = "const T = @TypeOf(pool.query(\"\", &.{}) catch unreachable);",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA202 suppressed for bufPrint same-line" {
     // bufPrint(...) catch unreachable — only error is NoSpaceLeft
-    const issue = checkCatchUnreachable(
-        "const s = std.fmt.bufPrint(&buf, \"{d}\", .{val}) catch unreachable;",
-        "test.zig",
-        1,
-        null,
-    );
+    const issue = checkCatchUnreachable(.{
+        .t = "const s = std.fmt.bufPrint(&buf, \"{d}\", .{val}) catch unreachable;",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA202 suppressed for bufPrintZ same-line" {
-    const issue = checkCatchUnreachable(
-        "const s = std.fmt.bufPrintZ(&buf, \"{d}\", .{val}) catch unreachable;",
-        "test.zig",
-        1,
-        null,
-    );
+    const issue = checkCatchUnreachable(.{
+        .t = "const s = std.fmt.bufPrintZ(&buf, \"{d}\", .{val}) catch unreachable;",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+    });
     try std.testing.expect(issue == null);
 }
 
@@ -42642,23 +42942,23 @@ test "ZA202 suppressed for bufPrint multi-line" {
         "    \"0x{x}\",",
         "    .{block_num},",
     };
-    const issue = checkCatchUnreachable(
-        ") catch unreachable;",
-        "test.zig",
-        5,
-        &prev,
-    );
+    const issue = checkCatchUnreachable(.{
+        .t = ") catch unreachable;",
+        .path = "test.zig",
+        .line = 5,
+        .preceding_lines = &prev,
+    });
     try std.testing.expect(issue == null);
 }
 
 test "ZA202 NOT suppressed for regular catch unreachable" {
     // Normal catch unreachable should still fire
-    const issue = checkCatchUnreachable(
-        "const x = bar() catch unreachable;",
-        "test.zig",
-        1,
-        null,
-    );
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch unreachable;",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+    });
     try std.testing.expect(issue != null);
 }
 
@@ -42668,12 +42968,12 @@ test "ZA202 NOT suppressed for non-bufPrint multi-line" {
         "const result = someOtherFunction(",
         "    arg1,",
     };
-    const issue = checkCatchUnreachable(
-        ") catch unreachable;",
-        "test.zig",
-        3,
-        &prev,
-    );
+    const issue = checkCatchUnreachable(.{
+        .t = ") catch unreachable;",
+        .path = "test.zig",
+        .line = 3,
+        .preceding_lines = &prev,
+    });
     try std.testing.expect(issue != null);
 }
 
@@ -42739,6 +43039,356 @@ test "ZA201 NOT suppressed in regular function" {
         .func_name = "processData",
     });
     try std.testing.expect(issue != null);
+}
+
+// ============================================================================
+// EPH-I0151: ZA201 multi-line empty-catch evasion forms
+// ============================================================================
+
+test "ZA201 fires on comment-only catch body (I0151)" {
+    // Pre-fix the trailing comment made body non-empty, so the close probe
+    // never ran: `catch { // nothing` + `}` stayed silent.
+    const next = [_][]const u8{"}"};
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch { // nothing",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_SILENT_CATCH, issue.?.rule);
+}
+
+test "ZA201 fires on blank-only catch body (I0151)" {
+    // Pre-fix the probe required the immediate next raw line to be the
+    // close: a blank line between opener and close defeated it.
+    const next = [_][]const u8{ "", "}" };
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+}
+
+test "ZA201 fires on spaced `} ;` close (I0151)" {
+    // Pre-fix the close matcher accepted only `}` and `};`, not `} ;`.
+    const next = [_][]const u8{"} ;"};
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+}
+
+test "ZA201 fires on comment-padded close (I0151)" {
+    // Comment and blank padding inside the bounded window still closes.
+    const next = [_][]const u8{ "// note", "", "};" };
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+}
+
+test "ZA201 silent on multi-line catch with real handling (I0151 pin)" {
+    // The first code line in the window is a statement, not the close.
+    const next = [_][]const u8{ "    handle(err);", "}" };
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 silent when a string masks the close (I0151 pin)" {
+    // The string line is code, not a close: the probe must not read the
+    // `"}"` text as the body's close brace.
+    const next = [_][]const u8{ "    const s = \"}\";", "}" };
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 silent when close carries else (I0151 pin)" {
+    // `} else {` starts with a brace but carries code: not an empty close.
+    const next = [_][]const u8{"} else {"};
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 silent when close sits past the probe window (I0151 bound)" {
+    // Five code-free lines push the close past catch_probe_max_lines: the
+    // verdict stays bounded and silent.
+    const next = [_][]const u8{ "", "// a", "", "// b", "", "}" };
+    const issue = checkSilentCatch(.{
+        .t = "foo() catch {",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "processData",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZT104 fires on comment-only catch body in test context (I0151)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\test "swallows" {
+        \\    foo() catch { // nothing
+        \\    }
+        \\}
+        \\fn foo() !void {}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "zt104_comment_body.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+
+    var issues = try analyzeTests(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_TEST_SWALLOWED_ERROR)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+// ============================================================================
+// EPH-I0152: ZA202/ZA207 split-line verdict evasion
+// ============================================================================
+
+test "ZA202 fires on split catch unreachable (I0152)" {
+    // Pre-fix `unreachable` had to sit on the catch line: the valid
+    // multi-line form evaded.
+    const next = [_][]const u8{"    unreachable;"};
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_CATCH_UNREACHABLE, issue.?.rule);
+}
+
+test "ZA202 fires on split verdict past comment padding (I0152)" {
+    const next = [_][]const u8{ "    // panics on error", "", "    unreachable;" };
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+}
+
+test "ZA202 silent on split catch with a fallback expression (I0152 pin)" {
+    // The first code line is the catch payload, not the verdict.
+    const next = [_][]const u8{"    default_value;"};
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA202 silent when payload precedes an unrelated unreachable (I0152 pin)" {
+    // `fallback;` is the catch expression. The later `unreachable;` is a
+    // separate statement and must not attach to the catch.
+    const next = [_][]const u8{ "    fallback;", "    unreachable;" };
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA202 silent when split verdict sits past the window (I0152 bound)" {
+    const next = [_][]const u8{ "", "// a", "", "// b", "    unreachable;" };
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA207 fires on split catch undefined (I0152)" {
+    const next = [_][]const u8{"    undefined;"};
+    const issue = checkCatchUndefined(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_CATCH_UNDEFINED, issue.?.rule);
+}
+
+test "ZA207 silent on split catch with real handling (I0152 pin)" {
+    const next = [_][]const u8{"    doSomething();"};
+    const issue = checkCatchUndefined(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA202 split form fires end-to-end via analyzeErrors (I0152)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn risky() !u32 {
+        \\    return 1;
+        \\}
+        \\fn caller() u32 {
+        \\    const x = risky() catch
+        \\        unreachable;
+        \\    return x;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za202_split.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "za202_split.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
+// ============================================================================
+// EPH-I0150: over-cap source file is recorded and reported (ZA502)
+// ============================================================================
+
+test "I0150: over-cap file records a ZA502 skipped-file warning" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // One byte past the cap trips error.StreamTooLong.
+    const big = try allocator.alloc(u8, max_source_file_bytes + 1);
+    defer allocator.free(big);
+    @memset(big, 'a');
+    big[0] = '/';
+    big[1] = '/';
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.zig", .data = big });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "small.zig",
+        .data = "pub fn f() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.scanDirectory(root);
+
+    // The scan continues: the small file is analyzed, the big one is not.
+    try std.testing.expect(graph.files.count() == 1);
+    try std.testing.expectEqual(@as(usize, 1), graph.skipped_files.items.len);
+
+    var issues = try graph.getSkippedFileIssues(allocator);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    const issue = issues.items[0];
+    try std.testing.expectEqualStrings("ZA502", issue.rule);
+    try std.testing.expect(issue.severity == .warning);
+    // The finding names the file and the cap.
+    try std.testing.expect(mem.indexOf(u8, issue.file, "big.zig") != null);
+    try std.testing.expect(mem.indexOf(u8, issue.message, "10 MiB") != null);
+}
+
+test "I0150: exact-cap file also skips (boundary pin)" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // std's limited read trips when the cap is REACHED, not only when it
+    // is exceeded. Pin the boundary so a cap-semantics change is loud.
+    const exact = try allocator.alloc(u8, max_source_file_bytes);
+    defer allocator.free(exact);
+    @memset(exact, 'a');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "exact.zig", .data = exact });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.scanDirectory(root);
+
+    try std.testing.expect(graph.files.count() == 0);
+    try std.testing.expectEqual(@as(usize, 1), graph.skipped_files.items.len);
+}
+
+test "I0150: noteSkippedFile append failure frees the path copy" {
+    const allocator = std.testing.allocator;
+    // fail_index 1: the dupe (allocation 0) succeeds, the append's growth
+    // allocation fails. Without the errdefer the copy leaks and the
+    // testing allocator fails the test at deinit.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    var graph = ImportGraph.init(failing.allocator());
+    defer graph.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, graph.noteSkippedFile("big.zig"));
+    try std.testing.expectEqual(@as(usize, 0), graph.skipped_files.items.len);
 }
 
 // ============================================================================

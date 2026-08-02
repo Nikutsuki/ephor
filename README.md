@@ -850,6 +850,7 @@ src/main.zig:506:25: warning[ZA201]: silent catch {} discards error without hand
 ephor summary
 
 Files: 156 | Code: 66884 lines
+AST tier: 148 parsed, 8 skipped
 
 Issues:
   Orphans:    155

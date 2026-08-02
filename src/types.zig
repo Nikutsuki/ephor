@@ -762,6 +762,11 @@ pub const ProjectStats = struct {
     not_implemented_count: usize = 0,
     todo_count: usize = 0,
     files_with_tests: usize = 0,
+    /// AST-tier coverage (EPH-I0200). Zero unless the caller merges the
+    /// ast_tier.Stats counters in: getStats walks content only and cannot
+    /// observe parse outcomes. The .check flow owns that merge.
+    ast_parsed: usize = 0,
+    ast_skipped: usize = 0,
 };
 
 pub const FileAnalysis = struct {

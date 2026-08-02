@@ -148,6 +148,20 @@ var known_issues_autoload_count: usize = 0;
 /// reset it to assert the skip note fired (stderr is muted in tests).
 var untrusted_ignore_skip_count: usize = 0;
 
+/// Test hook: counts AST-tier skip notes (EPH-I0200). Tests reset it to
+/// assert the note fired when skipped > 0 (stderr is muted in tests).
+var ast_skip_note_count: usize = 0;
+
+/// Resident-content budget for the corpus warning (EPH-I0199). Real
+/// monorepos sit far below 1 GiB of Zig source. Hostile amplification
+/// (thousands of near-10 MB files) crosses it. A var, not a const, so
+/// tests can shrink it — same pattern as the other test hooks.
+var corpus_bytes_warn_threshold: usize = 1024 * 1024 * 1024;
+
+/// Test hook: counts corpus-bytes warnings. Also the once-per-run guard:
+/// the warning is edge-triggered, so tests reset it to re-arm.
+var corpus_warn_count: usize = 0;
+
 /// Print a CLI/config diagnostic unless tests have muted the channel.
 fn cliDiag(comptime fmt: []const u8, args: anytype) void {
     if (!cli_diagnostics_enabled) return;
@@ -7157,6 +7171,17 @@ const ImportGraph = struct {
     /// both alias the `files` map's entries.
     resolved_to_key: std.StringHashMapUnmanaged([]const u8),
     scan_root: ?[]const u8,
+    /// Total content bytes held by `files` (EPH-I0199). Increment-only:
+    /// entries are never removed before deinit, so the counter can only
+    /// grow. warnIfCorpusBytesCrossed compares it against
+    /// corpus_bytes_warn_threshold.
+    resident_bytes: usize,
+    /// Memo of realpath-resolved directories already walked by
+    /// markZigFilesRecursive (EPH-I0204). Nested build.zig roots restart
+    /// the walk at depth 0 per root. Without the memo, shared subtrees
+    /// re-walk once per root (64 roots × 50k files ≈ 3.2M realpath
+    /// syscalls). Keys are owned dupes, freed in deinit.
+    marked_dirs: std.StringHashMapUnmanaged(void),
 
     fn init(allocator: Allocator) ImportGraph {
         return .{
@@ -7165,6 +7190,8 @@ const ImportGraph = struct {
             .reachable = std.StringHashMap(void).init(allocator),
             .resolved_to_key = .empty,
             .scan_root = null,
+            .resident_bytes = 0,
+            .marked_dirs = .empty,
         };
     }
 
@@ -7195,6 +7222,16 @@ const ImportGraph = struct {
             keys.append(self.allocator, key.*) catch continue;
         }
         self.reachable.deinit();
+        for (keys.items) |key| {
+            self.allocator.free(key);
+        }
+
+        keys.clearRetainingCapacity();
+        var marked_iter = self.marked_dirs.keyIterator();
+        while (marked_iter.next()) |key| {
+            keys.append(self.allocator, key.*) catch continue;
+        }
+        self.marked_dirs.deinit(self.allocator);
         for (keys.items) |key| {
             self.allocator.free(key);
         }
@@ -7265,11 +7302,31 @@ const ImportGraph = struct {
         }
     }
 
+    /// Edge-triggered corpus-size warning (EPH-I0199). The graph holds
+    /// every file's full content until deinit, so a hostile monorepo can
+    /// OOM the audit host. Fires once per run on the first threshold
+    /// crossing. The long-term fix is a resident budget with streaming or
+    /// LRU eviction. The warning is this issue's scope.
+    fn warnIfCorpusBytesCrossed(self: *ImportGraph) void {
+        if (corpus_warn_count > 0) return;
+        if (self.resident_bytes <= corpus_bytes_warn_threshold) return;
+        corpus_warn_count += 1;
+        const gib = self.resident_bytes / (1024 * 1024 * 1024);
+        cliDiag(
+            "warning: corpus content exceeds {d} GiB resident. " ++
+                "ephor keeps all file content in memory. " ++
+                "Scan subtrees separately on huge trees.\n",
+            .{gib},
+        );
+    }
+
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
         const max_size = 10 * 1024 * 1024;
         const content = Fs.cwd().readFileAlloc(self.allocator, file_path, max_size) catch {
             return;
         };
+        self.resident_bytes += content.len;
+        self.warnIfCorpusBytesCrossed();
         const has_tests = mem.indexOf(u8, content, "test \"") != null;
         const pub_fn_count = types.countOccurrences(content, "pub fn ");
         const path_copy = try self.allocator.dupe(u8, file_path);
@@ -7999,11 +8056,29 @@ const ImportGraph = struct {
             self.markReachableResolved(resolved) catch return;
     }
 
+    /// Memo insert for EPH-I0204. Returns true when `dir_path` resolves to
+    /// a directory a previous walk already covered: the caller skips the
+    /// re-walk. Returns false on a fresh insert and when realpath fails
+    /// (the walk then proceeds unmemoized, the pre-memo behavior).
+    fn memoInsertMarkedDir(self: *ImportGraph, dir_path: []const u8) !bool {
+        var rbuf: [Fs.max_path_bytes]u8 = undefined;
+        const resolved = Fs.cwd().realpath(dir_path, &rbuf) catch return false;
+        if (self.marked_dirs.contains(resolved)) return true;
+        const key = try self.allocator.dupe(u8, resolved);
+        errdefer self.allocator.free(key);
+        try self.marked_dirs.put(self.allocator, key, {});
+        return false;
+    }
+
     fn markZigFilesRecursive(self: *ImportGraph, dir_path: []const u8, depth: u16) !void {
         // Bound the recursion (RED1-8): a generated deep tree would
         // overflow the stack. The budget restarts at each sub-project
         // root, and 64 levels from there covers real sub-project trees.
+        // Depth-cap interplay (EPH-I0204): the cap check runs before the
+        // memo, so a capped dir is never memoized and a later closer root
+        // can still cover it — pre-memo coverage semantics preserved.
         if (depth > 64) return;
+        if (try self.memoInsertMarkedDir(dir_path)) return;
         var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
         defer dir.close(global_io.?);
         var iter = dir.iterate();
@@ -25196,15 +25271,34 @@ const IssueCounts = struct {
     }
 };
 
-/// Print the JSON summary. The suppression accounting rides as a
-/// "suppressed" member of the summary object, so a clean "status" never
-/// hides suppressed findings from machine consumers (RED3-3).
-fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: SuppressionStats) void {
-    std.debug.print(
+/// Stack buffer for formatSummaryText. Worst case: ~320 fixed template
+/// bytes + 17 usize fields at <=20 digits each = ~660 bytes. 1024 covers
+/// it with headroom for additive lines.
+const summary_text_buf_bytes = 1024;
+
+/// Stack buffer for formatSummaryJson. Worst case: ~370 fixed bytes + 18
+/// usize fields at <=20 digits + the 192-byte suppressed member = ~960
+/// bytes. 1536 covers it with headroom for additive members.
+const summary_json_buf_bytes = 1536;
+
+/// Format the JSON summary into `buf`. The suppression accounting rides as
+/// a "suppressed" member of the summary object, so a clean "status" never
+/// hides suppressed findings from machine consumers (RED3-3). The AST-tier
+/// members (EPH-I0200) are additive: machine consumers keep every member
+/// they already read.
+fn formatSummaryJson(
+    buf: []u8,
+    counts: IssueCounts,
+    s: ProjectStats,
+    suppression: SuppressionStats,
+) ![]const u8 {
+    const head = try std.fmt.bufPrint(buf,
         \\{{
         \\  "summary": {{
         \\    "files": {d},
         \\    "code_lines": {d},
+        \\    "ast_parsed": {d},
+        \\    "ast_skipped": {d},
         \\    "issues": {{
         \\      "orphans": {d},
         \\      "memory": {d},
@@ -25227,6 +25321,8 @@ fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: Suppressi
     , .{
         s.total_files,
         s.code_lines,
+        s.ast_parsed,
+        s.ast_skipped,
         counts.orphan,
         counts.memory,
         counts.err,
@@ -25243,20 +25339,36 @@ fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: Suppressi
         s.todo_count,
         if (counts.total() == 0) "ok" else "issues_found",
     });
-    var buf: [256]u8 = undefined;
+    var mbuf: [256]u8 = undefined;
     // Overflow is impossible: 92 fixed bytes + 5 usize values (<=20 digits
-    // each) = 192 bytes worst case. No catch unreachable (ZA202 dogfood).
-    const member = formatSuppressedJson(&buf, suppression) catch return;
-    std.debug.print("    \"suppressed\": {s}\n  }}\n}}\n", .{member});
+    // each) = 192 bytes worst case.
+    const member = try formatSuppressedJson(&mbuf, suppression);
+    const tail = try std.fmt.bufPrint(
+        buf[head.len..],
+        "    \"suppressed\": {s}\n  }}\n}}\n",
+        .{member},
+    );
+    return buf[0 .. head.len + tail.len];
 }
 
-/// Print the text summary with the STATUS line.
-fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
-    std.debug.print(
+/// Print the JSON summary.
+fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: SuppressionStats) void {
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    // Overflow is impossible: see summary_json_buf_bytes. No catch
+    // unreachable (ZA202 dogfood).
+    const text = formatSummaryJson(&buf, counts, s, suppression) catch return;
+    std.debug.print("{s}", .{text});
+}
+
+/// Format the text summary with the STATUS line into `buf`. The AST-tier
+/// line (EPH-I0200) keeps parse coverage visible in every --summary run.
+fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u8 {
+    return std.fmt.bufPrint(buf,
         \\
         \\ephor summary
         \\
         \\Files: {d} | Code: {d} lines
+        \\AST tier: {d} parsed, {d} skipped
         \\
         \\Issues:
         \\  Orphans:    {d}
@@ -25279,6 +25391,8 @@ fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
     , .{
         s.total_files,
         s.code_lines,
+        s.ast_parsed,
+        s.ast_skipped,
         counts.orphan,
         counts.memory,
         counts.err,
@@ -25296,6 +25410,28 @@ fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
         s.todo_count,
         if (counts.total() == 0) "OK" else "ISSUES FOUND",
     });
+}
+
+/// Print the text summary.
+fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
+    var buf: [summary_text_buf_bytes]u8 = undefined;
+    // Overflow is impossible: see summary_text_buf_bytes. No catch
+    // unreachable (ZA202 dogfood).
+    const text = formatSummaryText(&buf, counts, s) catch return;
+    std.debug.print("{s}", .{text});
+}
+
+/// Surface partial AST-tier coverage (EPH-I0200): a version-skew or
+/// over-cap file loses ZA111 coverage, and the line tier has no equivalent
+/// signal. Fires whenever the tier skipped at least one file.
+fn noteAstTierSkips(stats: ast_tier.Stats) void {
+    if (stats.skipped == 0) return;
+    ast_skip_note_count += 1;
+    cliDiag(
+        "note: {d} file{s} skipped by the AST tier (parse errors, byte " ++
+            "cap, or grammar pre-scan). ZA111 coverage is partial for those files.\n",
+        .{ stats.skipped, if (stats.skipped == 1) @as([]const u8, "") else "s" },
+    );
 }
 
 /// Print the summary block in the requested format.
@@ -25460,6 +25596,9 @@ pub fn main(init: std.process.Init) !void {
             var issues = try analyzeCFGMemory(alloc, &g);
             defer deinitIssues(&issues, alloc);
             // AST tier (ZA111) is a memory-family rule — include it here too.
+            // Stats stay null: check is the coverage surface (its summary
+            // carries the parsed/skipped counts, EPH-I0200). The memory
+            // command prints findings only.
             var ast_issues = try analyzeAstTier(alloc, &g, null);
             defer ast_issues.deinit(alloc);
             for (ast_issues.items) |ai| try issues.append(alloc, ai);
@@ -25708,14 +25847,9 @@ pub fn main(init: std.process.Init) !void {
                 defer ast_issues.deinit(alloc);
                 for (ast_issues.items) |ai| try cfg_mem_issues.append(alloc, ai);
                 ast_issues.items.len = 0;
-                // Debug instrumentation for corpus robustness runs (off by
-                // default): parse coverage of the AST tier.
-                if (init.environ_map.get("EPHOR_DEBUG_AST") != null) {
-                    std.debug.print(
-                        "ast tier: {d} files parsed, {d} skipped (parse errors/budget)\n",
-                        .{ ast_stats.parsed, ast_stats.skipped },
-                    );
-                }
+                // EPH-I0200: coverage gaps surface by default (the summary
+                // carries the counts, and this note fires on any skip).
+                noteAstTierSkips(ast_stats);
 
                 // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
                 var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
@@ -25724,7 +25858,12 @@ pub fn main(init: std.process.Init) !void {
                 // Note: Null safety (ZA801/ZA802) and Panic (ZA9xx) are now CFG-based
                 // and included in cfg_mem_issues. We filter them out for categorization.
 
-                const stats = g.getStats();
+                var stats = g.getStats();
+                // EPH-I0200: getStats walks content only and cannot observe
+                // parse outcomes, so the .check arm merges the AST-tier
+                // counters here — the .stats command never runs the tier.
+                stats.ast_parsed = ast_stats.parsed;
+                stats.ast_skipped = ast_stats.skipped;
 
                 // Print all issues (returns filtered count)
                 const out = ReportOutCtx{
@@ -26086,6 +26225,158 @@ test "scanForNestedBuildZig stops at the depth cap" {
     defer allocator.free(shallow);
     try std.testing.expect(graph.reachable.contains(shallow));
     try std.testing.expectEqual(@as(u32, 1), graph.reachable.count());
+}
+
+test "summary text carries the AST tier counts" {
+    var buf: [summary_text_buf_bytes]u8 = undefined;
+    const text = try formatSummaryText(&buf, .{}, .{
+        .ast_parsed = 7,
+        .ast_skipped = 2,
+    });
+    // EPH-I0200: pre-fix the counts printed only under EPHOR_DEBUG_AST.
+    try std.testing.expect(mem.indexOf(
+        u8,
+        text,
+        "AST tier: 7 parsed, 2 skipped",
+    ) != null);
+}
+
+test "summary JSON parses with the AST tier members" {
+    const allocator = std.testing.allocator;
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    const text = try formatSummaryJson(&buf, .{}, .{
+        .ast_parsed = 7,
+        .ast_skipped = 2,
+    }, .{});
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    const summary = parsed.value.object.get("summary").?.object;
+    // EPH-I0200: additive members. Existing members stay (files pinned).
+    try std.testing.expectEqual(@as(i64, 7), summary.get("ast_parsed").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("ast_skipped").?.integer);
+    try std.testing.expect(summary.get("files") != null);
+}
+
+test "AST skip note fires only when files were skipped" {
+    ast_skip_note_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    noteAstTierSkips(.{ .parsed = 3, .skipped = 0 });
+    try std.testing.expectEqual(@as(usize, 0), ast_skip_note_count);
+    noteAstTierSkips(.{ .parsed = 3, .skipped = 2 });
+    try std.testing.expectEqual(@as(usize, 1), ast_skip_note_count);
+}
+
+test "corpus warning fires once when resident bytes cross the threshold" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const saved_threshold = corpus_bytes_warn_threshold;
+    defer corpus_bytes_warn_threshold = saved_threshold;
+    corpus_bytes_warn_threshold = 1024;
+    corpus_warn_count = 0;
+    defer corpus_warn_count = 0;
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pad_a = try allocator.alloc(u8, 600);
+    defer allocator.free(pad_a);
+    @memset(pad_a, 'a');
+    const pad_b = try allocator.alloc(u8, 700);
+    defer allocator.free(pad_b);
+    @memset(pad_b, 'b');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = pad_a });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.zig", .data = pad_b });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.zig", .data = pad_a });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const path_a = try tmpFilePath(allocator, &tmp, "a.zig");
+    defer allocator.free(path_a);
+    const path_b = try tmpFilePath(allocator, &tmp, "b.zig");
+    defer allocator.free(path_b);
+    const path_c = try tmpFilePath(allocator, &tmp, "c.zig");
+    defer allocator.free(path_c);
+
+    // 600 < 1024: under the threshold, no warning.
+    try graph.analyzeFile(path_a);
+    try std.testing.expectEqual(@as(usize, 600), graph.resident_bytes);
+    try std.testing.expectEqual(@as(usize, 0), corpus_warn_count);
+    // 600 + 700 = 1300 > 1024: the crossing fires the warning once.
+    try graph.analyzeFile(path_b);
+    try std.testing.expectEqual(@as(usize, 1300), graph.resident_bytes);
+    try std.testing.expectEqual(@as(usize, 1), corpus_warn_count);
+    // Past the threshold the edge trigger holds: no second warning.
+    try graph.analyzeFile(path_c);
+    try std.testing.expectEqual(@as(usize, 1), corpus_warn_count);
+}
+
+test "markAllZigFilesReachable memoizes overlapping roots" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // inner is a nested sub-project root: the outer walk covers it, and
+    // the inner walk must not re-walk the shared subtree (EPH-I0204).
+    try tmp.dir.createDirPath(std.testing.io, "src/inner/deep");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/top.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/inner/build.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/inner/deep/x.zig", .data = "" });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const inner = try tmpFilePath(allocator, &tmp, "src/inner");
+    defer allocator.free(inner);
+
+    graph.markAllZigFilesReachable(root);
+    const memo_after_first = graph.marked_dirs.count();
+    try std.testing.expect(memo_after_first > 1);
+    graph.markAllZigFilesReachable(inner);
+
+    // The overlapping root added no new memo entries: the walk stopped at
+    // the memo hit on inner.
+    try std.testing.expectEqual(memo_after_first, graph.marked_dirs.count());
+    // Coverage pin: every .zig file still lands in reachable.
+    const top = try tmpFilePath(allocator, &tmp, "src/top.zig");
+    defer allocator.free(top);
+    const inner_build = try tmpFilePath(allocator, &tmp, "src/inner/build.zig");
+    defer allocator.free(inner_build);
+    const deep = try tmpFilePath(allocator, &tmp, "src/inner/deep/x.zig");
+    defer allocator.free(deep);
+    try std.testing.expect(graph.reachable.contains(top));
+    try std.testing.expect(graph.reachable.contains(inner_build));
+    try std.testing.expect(graph.reachable.contains(deep));
+}
+
+test "markZigFilesRecursive does not memoize a depth-capped dir" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "" });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    // The cap check runs before the memo (EPH-I0204): a capped entry
+    // leaves no memo record, so a later closer root can still cover it.
+    try graph.markZigFilesRecursive(root, 65);
+    try std.testing.expectEqual(@as(u32, 0), graph.marked_dirs.count());
+    try graph.markZigFilesRecursive(root, 0);
+    try std.testing.expectEqual(@as(u32, 1), graph.marked_dirs.count());
 }
 
 test "parseCommandIntoArgv parses tokens within the buffer" {

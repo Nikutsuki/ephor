@@ -17896,17 +17896,58 @@ fn analyzeIgnoredErrorsInFile(
 // Null Safety Analysis Helpers
 // ============================================================================
 
+/// True when the identifier starting at `from` is followed directly by
+/// `(`, i.e. the token is a call target.
+fn isCallWithIdentAt(code: []const u8, from: usize) bool {
+    var i = from;
+    while (i < code.len and isIdent(code[i])) i += 1;
+    return i < code.len and code[i] == '(';
+}
+
+/// True when the line calls into the test framework: `testing.<name>(` at a
+/// word boundary, or an expect-family call `.expect<tail>(` such as
+/// `.expect(`, `.expectEqual(`, `.expectError(`. Call shapes only: names
+/// like `unexpected_total` or `protesting.count(` and string literals no
+/// longer disarm ZA801/ZA802 (EPH-I0224).
+fn hasTestingCall(code: []const u8) bool {
+    var start: usize = 0;
+    while (mem.indexOfPos(u8, code, start, "testing.")) |pos| {
+        const word_edge = pos == 0 or !isIdent(code[pos - 1]);
+        if (word_edge and !isPatternInString(code, pos) and
+            isCallWithIdentAt(code, pos + "testing.".len)) return true;
+        start = pos + 1;
+    }
+    start = 0;
+    while (mem.indexOfPos(u8, code, start, ".expect")) |pos| {
+        if (!isPatternInString(code, pos) and
+            isCallWithIdentAt(code, pos + ".expect".len)) return true;
+        start = pos + 1;
+    }
+    return false;
+}
+
+/// True when ` orelse ` appears as an operator outside string data. A
+/// string literal that mentions the word must not disarm ZA801/ZA802
+/// (EPH-I0224).
+fn hasOrelseOperator(code: []const u8) bool {
+    var start: usize = 0;
+    while (mem.indexOfPos(u8, code, start, " orelse ")) |pos| {
+        if (!isPatternInString(code, pos)) return true;
+        start = pos + 1;
+    }
+    return false;
+}
+
 /// Check if line is in a safe context (if/while condition, orelse, test)
 fn isInSafeContext(t: []const u8) bool {
     // Control flow checks
     if (mem.startsWith(u8, t, "if ")) return true;
     if (mem.startsWith(u8, t, "while ")) return true;
     if (mem.startsWith(u8, t, "} else if ")) return true;
-    if (mem.indexOf(u8, t, " orelse ") != null) return true;
-    // Testing context
-    if (mem.indexOf(u8, t, "expect") != null) return true;
-    if (mem.indexOf(u8, t, "testing.") != null) return true;
-    return false;
+    // Comment text never establishes a safe context (EPH-I0224).
+    const code = stripLineComment(t);
+    if (hasOrelseOperator(code)) return true;
+    return hasTestingCall(code);
 }
 
 /// Check if .? unwrap is followed by usage (unsafe)
@@ -17915,57 +17956,6 @@ fn isUnsafeUnwrapUsage(t: []const u8, col: usize) bool {
     const after = mem.trim(u8, t[col + 2 ..], " \t");
     if (after.len == 0) return false;
     return after[0] != ';' and after[0] != ',' and after[0] != ')';
-}
-
-/// Per-file context for the legacy line-based null-safety scan (ZA801/ZA802).
-const NullScanFileCtx = struct {
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
-    file_path: []const u8,
-};
-
-/// Check for unsafe .? unwrap (ZA801)
-fn checkUnsafeUnwrap(
-    ctx: NullScanFileCtx,
-    t: []const u8,
-    line_num: usize,
-) !void {
-    const col = mem.indexOf(u8, t, ".?") orelse return;
-    if (isInSafeContext(t) or !isUnsafeUnwrapUsage(t, col)) return;
-    try ctx.issues.append(ctx.allocator, .{
-        .file = ctx.file_path,
-        .line = line_num,
-        .col = col + 1,
-        .severity = .warning,
-        .rule = RULE_OPTIONAL_UNWRAP_UNSAFE,
-        .message = "optional unwrap (.?) may panic if null",
-        .help = "use 'orelse' for safe unwrap, or check for null with 'if'",
-    });
-}
-
-/// Check for unsafe optional pointer deref (ZA802)
-fn checkUnsafeDeref(
-    ctx: NullScanFileCtx,
-    t: []const u8,
-    line_num: usize,
-) !void {
-    const has_maybe = mem.indexOf(u8, t, "maybe_") != null;
-    const has_opt = mem.indexOf(u8, t, "opt_") != null;
-    if (!has_maybe and !has_opt) return;
-    const col = mem.indexOf(u8, t, ".*") orelse return;
-    const before = t[0..col];
-    const prefix_maybe = mem.indexOf(u8, before, "maybe_") != null;
-    const prefix_opt = mem.indexOf(u8, before, "opt_") != null;
-    if ((!prefix_maybe and !prefix_opt) or isInSafeContext(t)) return;
-    try ctx.issues.append(ctx.allocator, .{
-        .file = ctx.file_path,
-        .line = line_num,
-        .col = col + 1,
-        .severity = .warning,
-        .rule = RULE_ORELSE_QUESTION_UNSAFE,
-        .message = "dereferencing optional pointer may panic if null",
-        .help = "check for null before dereferencing, or use 'orelse'",
-    });
 }
 
 /// CFG-based null safety analysis (ZA801/ZA802)
@@ -19904,32 +19894,6 @@ fn hasIndexGuardOnLine(t: []const u8) bool {
         if (mem.indexOf(u8, t, "> ") != null or mem.indexOf(u8, t, ">= ") != null) return true;
     }
     return hasIfElseExprGuard(t);
-}
-
-/// ZA801/ZA802: Detect unsafe optional unwrapping (legacy line-based - kept for comparison)
-fn analyzeNullSafety(
-    allocator: Allocator,
-    graph: *ImportGraph,
-) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        const ctx: NullScanFileCtx = .{
-            .allocator = allocator,
-            .issues = &issues,
-            .file_path = entry.key_ptr.*,
-        };
-        var line_num: usize = 1;
-        var lines_iter = mem.splitScalar(u8, entry.value_ptr.content, '\n');
-        while (lines_iter.next()) |line| {
-            defer line_num += 1;
-            const t = mem.trim(u8, line, " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-            try checkUnsafeUnwrap(ctx, t, line_num);
-            try checkUnsafeDeref(ctx, t, line_num);
-        }
-    }
-    return issues;
 }
 
 // ============================================================================
@@ -29665,6 +29629,191 @@ test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
     ) == 1);
 }
 
+test "analyzeCFGMemory ZA801 fires past unexpected_ identifier (EPH-I0224)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the "expect" substring check suppressed on `unexpected_`.
+    const content =
+        \\fn f(p: ?u32) u32 {
+        \\    const unexpected_total = p.? + 1;
+        \\    return unexpected_total;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_unexpected.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_unexpected.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 fires past attestation_ identifier (EPH-I0224)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `attestation_` trips neither old substring, so this fired pre-fix
+    // too. The pin locks the word-boundary contract for test-ish names.
+    const content =
+        \\fn f(p: ?u32) u32 {
+        \\    const attestation_total = p.? + 1;
+        \\    return attestation_total;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_attestation.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_attestation.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 fires past testing.-substring identifier (EPH-I0224)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the "testing." substring check suppressed on `protesting.`.
+    // The unwrap needs trailing usage: `.?)` reads as safe either way.
+    const content =
+        \\fn f(p: ?u32) u32 {
+        \\    const n = protesting.tally + p.? + 1;
+        \\    return n;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_protesting.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_protesting.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 silent on real std.testing call (EPH-I0224)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A genuine std.testing call site keeps the testing-context suppression.
+    const content =
+        \\fn f(p: ?u32) void {
+        \\    const total = std.testing.expect(p.? == 1);
+        \\    _ = total;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_real_testing.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_real_testing.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 fires past expect in trailing comment (EPH-I0224)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Comment text never establishes a testing context: the suppression
+    // matches call shapes in code only.
+    const content =
+        \\fn f(p: ?u32) u32 {
+        \\    const v = p.? + 1; // expect this to hold
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_comment.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_comment.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 fires past orelse in string literal (EPH-I0224)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the " orelse " substring check suppressed on string data.
+    const content =
+        \\fn f(p: ?u32) u32 {
+        \\    const v = p.? + msg("use orelse here");
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_orelse_str.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_orelse_str.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the "expect" substring check suppressed the deref side too.
+    const content =
+        \\fn f() void {
+        \\    const p: ?*u32 = null;
+        \\    const unexpected_total = p.*;
+        \\    _ = unexpected_total;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_unexpected.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_unexpected.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "hasTestingCall matches std.testing call shapes (EPH-I0224)" {
+    try std.testing.expect(hasTestingCall("const t = std.testing.expect(p.? == 1);"));
+    try std.testing.expect(hasTestingCall("try testing.expectEqual(x, 1);"));
+    try std.testing.expect(hasTestingCall("try std.testing.expectError(error.E, f());"));
+    try std.testing.expect(hasTestingCall("try std.testing.expectEqualSlices(u8, a, b);"));
+}
+
+test "hasTestingCall rejects substrings, strings, and non-calls (EPH-I0224)" {
+    try std.testing.expect(!hasTestingCall("const unexpected_total = p.? + 1;"));
+    try std.testing.expect(!hasTestingCall("const n = protesting.count(p.?);"));
+    try std.testing.expect(!hasTestingCall("const s = \".expect(\";"));
+    try std.testing.expect(!hasTestingCall("const alloc = testing.allocator;"));
+}
+
+test "hasOrelseOperator ignores string literal contents (EPH-I0224)" {
+    try std.testing.expect(hasOrelseOperator("const v = p orelse 0;"));
+    try std.testing.expect(!hasOrelseOperator("const v = p.? + msg(\"use orelse here\");"));
+}
+
+test "isInSafeContext masks trailing comment text (EPH-I0224)" {
+    try std.testing.expect(!isInSafeContext("const v = p.? + 1; // expect this"));
+    try std.testing.expect(!isInSafeContext("const v = p.? + 1; // std.testing.expect(v)"));
+    try std.testing.expect(isInSafeContext("if (p) |x| {"));
+    try std.testing.expect(isInSafeContext("const v = p orelse 0;"));
+    try std.testing.expect(isInSafeContext("const t = std.testing.expect(p.? == 1);"));
+}
+
 test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -30626,139 +30775,6 @@ test "ZA205 type-aware: multiple user types in same file resolved independently"
         }
     }
     try std.testing.expectEqual(@as(usize, 1), za205_count);
-}
-
-// ============================================================================
-// Phase 5: Null Safety Tests (ZA801, ZA802)
-// ============================================================================
-
-test "analyzeNullSafety detects unsafe optional unwrap (ZA801)" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var graph = ImportGraph.init(allocator);
-    defer graph.deinit();
-
-    const test_content =
-        \\fn bad_unwrap() void {
-        \\    const opt: ?u32 = null;
-        \\    const val = opt.?.value; // Unsafe unwrap!
-        \\}
-    ;
-
-    const analysis = try createTestFileAnalysis(allocator, "test_unwrap.zig", test_content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, "test_unwrap.zig"), {});
-
-    var issues = try analyzeNullSafety(allocator, &graph);
-    defer deinitIssues(&issues, allocator);
-
-    // Should detect unsafe unwrap
-    var found_za801 = false;
-    for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_OPTIONAL_UNWRAP_UNSAFE)) {
-            found_za801 = true;
-            break;
-        }
-    }
-    try std.testing.expect(found_za801);
-}
-
-test "analyzeNullSafety no false positive for safe unwrap with orelse" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var graph = ImportGraph.init(allocator);
-    defer graph.deinit();
-
-    const test_content =
-        \\fn safe_unwrap() void {
-        \\    const opt: ?u32 = null;
-        \\    const val = opt orelse 0; // Safe with orelse
-        \\    _ = val;
-        \\}
-    ;
-
-    const analysis = try createTestFileAnalysis(allocator, "test_safe.zig", test_content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, "test_safe.zig"), {});
-
-    var issues = try analyzeNullSafety(allocator, &graph);
-    defer deinitIssues(&issues, allocator);
-
-    // Should NOT report issues for safe unwrap
-    for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_safe.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_OPTIONAL_UNWRAP_UNSAFE));
-        }
-    }
-}
-
-test "analyzeNullSafety no false positive for if check" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var graph = ImportGraph.init(allocator);
-    defer graph.deinit();
-
-    const test_content =
-        \\fn safe_if_check() void {
-        \\    const opt: ?u32 = get_optional();
-        \\    if (opt) |val| {
-        \\        process(val);
-        \\    }
-        \\}
-    ;
-
-    const analysis = try createTestFileAnalysis(allocator, "test_if.zig", test_content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, "test_if.zig"), {});
-
-    var issues = try analyzeNullSafety(allocator, &graph);
-    defer deinitIssues(&issues, allocator);
-
-    // Should NOT report issues for safe if check
-    for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_if.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_OPTIONAL_UNWRAP_UNSAFE));
-        }
-    }
-}
-
-test "analyzeNullSafety detects unsafe deref of maybe_ variable (ZA802)" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var graph = ImportGraph.init(allocator);
-    defer graph.deinit();
-
-    const test_content =
-        \\fn bad_deref() void {
-        \\    const maybe_ptr: ?*u32 = null;
-        \\    const val = maybe_ptr.*; // Unsafe deref!
-        \\}
-    ;
-
-    const analysis = try createTestFileAnalysis(allocator, "test_deref.zig", test_content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, "test_deref.zig"), {});
-
-    var issues = try analyzeNullSafety(allocator, &graph);
-    defer deinitIssues(&issues, allocator);
-
-    // Should detect unsafe deref of maybe_ prefixed optional
-    var found_za802 = false;
-    for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_ORELSE_QUESTION_UNSAFE)) {
-            found_za802 = true;
-            break;
-        }
-    }
-    try std.testing.expect(found_za802);
 }
 
 // ============================================================================

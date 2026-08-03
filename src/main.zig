@@ -18287,6 +18287,7 @@ const NullSafetyCtx = struct {
     func_line: usize,
     file_path: []const u8,
     checked: []std.StringHashMapUnmanaged(void),
+    polarity: []std.StringHashMapUnmanaged(NullCheckPolarity),
     nullable_ptrs: *const std.StringHashMapUnmanaged(void),
     issues: *std.ArrayListUnmanaged(Issue),
 };
@@ -18300,93 +18301,186 @@ const NullLineCtx = struct {
     checked_set: *const std.StringHashMapUnmanaged(void),
 };
 
+/// The CFG edge a null-check fact holds on (EPH-I0678): `x != null` and
+/// payload capture hold on the true edge. `x == null` with an exit
+/// (return, continue, break) holds on the fall-through, which is the false
+/// edge. The meet must not propagate a fact down the other edge.
+const NullCheckPolarity = enum { true_edge, false_edge };
+
+/// A null-check conditional reduced to the var it covers and the edge the
+/// check holds on.
+const NullCheckFact = struct {
+    var_name: []const u8,
+    polarity: NullCheckPolarity,
+};
+
 fn collectNullChecksPerBlock(ctx: NullSafetyCtx) !void {
     for (ctx.cfg.blocks.items, 0..) |block, bid| {
         if (block.start_line == 0 or
             block.start_line > block.end_line) continue;
-        try collectNullChecksInBlock(
-            ctx,
-            block.start_line,
-            block.end_line,
-            &ctx.checked[bid],
-        );
+        try collectNullChecksInBlock(ctx, bid);
     }
 }
 
-/// Collect null-checked variables from conditionals within a single block
-fn collectNullChecksInBlock(
-    ctx: NullSafetyCtx,
-    start_line: usize,
-    end_line: usize,
-    checked: *std.StringHashMapUnmanaged(void),
-) !void {
-    for (start_line..end_line + 1) |ln| {
+/// True when the block has a branch_true or branch_false out-edge.
+fn blockHasBranchEdge(cfg: *ControlFlowGraph, bid: usize) bool {
+    for (cfg.edges.items) |edge| {
+        if (edge.from != bid) continue;
+        if (edge.kind == .branch_true or edge.kind == .branch_false) return true;
+    }
+    return false;
+}
+
+/// True when block `bid` owns the condition on `line`: its branch edges are
+/// the ones that condition created (EPH-I0678). Line attribution overlaps —
+/// the then block's range starts at the condition line, so two blocks can
+/// hold the same conditional, and a nested condition shares the outer then
+/// block's range. The owner is the branch-edged block covering the line
+/// with the smallest end line: the origin ends at the condition, the then
+/// block merely starts there. Only the owner's polarity record may gate its
+/// out-edges. A non-owner's edges test a different condition.
+fn ownsConditionLine(cfg: *ControlFlowGraph, bid: usize, line: usize) bool {
+    var owner: ?usize = null;
+    for (cfg.blocks.items, 0..) |block, i| {
+        if (line < block.start_line or line > block.end_line) continue;
+        if (!blockHasBranchEdge(cfg, i)) continue;
+        if (owner) |o| {
+            if (block.end_line >= cfg.blocks.items[o].end_line) continue;
+        }
+        owner = i;
+    }
+    return owner != null and owner.? == bid;
+}
+
+/// Place a fall-through fact into the block's branch_false successors. The
+/// fact holds on the false edge. The successor's line range never covers
+/// the condition line, and a return-block pred can poison its meet
+/// (EPH-I0747), so genFallThroughFact places the fact at the successor
+/// directly. ZA802 has no textual backstop (EPH-I0488) and relies on this
+/// placement.
+fn genFallThroughFact(ctx: NullSafetyCtx, bid: usize, var_name: []const u8) !void {
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.from != bid or edge.kind != .branch_false) continue;
+        try ctx.checked[edge.to].put(ctx.allocator, var_name, {});
+    }
+}
+
+/// Collect null-check facts from conditionals within a single block: the
+/// checked set the scan consults for every block holding the line, and the
+/// polarity record plus fall-through placement only from the block that
+/// owns the condition's branch edges (EPH-I0678).
+fn collectNullChecksInBlock(ctx: NullSafetyCtx, bid: usize) !void {
+    const block = ctx.cfg.blocks.items[bid];
+    for (block.start_line..block.end_line + 1) |ln| {
         if (ln < ctx.func_line) continue;
         const idx = ln - ctx.func_line;
         if (idx >= ctx.lines.len) continue;
         const t = mem.trim(u8, ctx.lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (!isNullCheckConditional(t)) continue;
-        const var_name = extractNullCheckedVar(t) orelse continue;
-        try checked.put(ctx.allocator, var_name, {});
+        const fact = classifyNullCheck(t) orelse continue;
+        try ctx.checked[bid].put(ctx.allocator, fact.var_name, {});
+        if (!ownsConditionLine(ctx.cfg, bid, ln)) continue;
+        try ctx.polarity[bid].put(ctx.allocator, fact.var_name, fact.polarity);
+        if (fact.polarity == .false_edge)
+            try genFallThroughFact(ctx, bid, fact.var_name);
     }
 }
 
-/// Intersect predecessor null-check sets into a block
-/// Copy all entries from a source hash map into an intersection map
-fn initIntersectionFromMap(
+/// Meet inputs for the null-check propagation (EPH-I0678): the per-block
+/// checked sets the fixpoint grows and the per-block polarity records that
+/// gate which out-edge each conditional fact may flow down.
+const NullMeetCtx = struct {
     allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    checked: []std.StringHashMapUnmanaged(void),
+    polarity: []const std.StringHashMapUnmanaged(NullCheckPolarity),
+};
+
+/// A CFG predecessor of a block and the kind of edge it connects through.
+const NullPredInfo = struct { block: usize, kind: EdgeKind };
+
+/// True when a polarity-recorded fact may flow down an edge of this kind:
+/// true-edge facts only down branch_true, false-edge facts only down
+/// branch_false. Sequential, loop-back, and jump edges carry no
+/// conditional fact: the condition re-tests the var on every path that
+/// reaches it again.
+fn factFlowsOnEdge(polarity: NullCheckPolarity, kind: EdgeKind) bool {
+    return switch (polarity) {
+        .true_edge => kind == .branch_true,
+        .false_edge => kind == .branch_false,
+    };
+}
+
+/// True when a fact from a pred block may flow down the edge: always when
+/// the pred records no polarity for the var (it holds on every out-edge),
+/// otherwise only when the edge kind matches the recorded polarity.
+fn predFactFlows(
+    polarity: *const std.StringHashMapUnmanaged(NullCheckPolarity),
+    var_name: []const u8,
+    kind: EdgeKind,
+) bool {
+    const pol = polarity.get(var_name) orelse return true;
+    return factFlowsOnEdge(pol, kind);
+}
+
+/// Copy the first pred's edge-visible facts into the intersection set
+fn initFilteredIntersection(
+    ctx: NullMeetCtx,
     intersection: *std.StringHashMapUnmanaged(void),
-    source: *const std.StringHashMapUnmanaged(void),
+    pred: NullPredInfo,
 ) !void {
-    var it = source.iterator();
+    var it = ctx.checked[pred.block].iterator();
     while (it.next()) |e| {
-        try intersection.put(allocator, e.key_ptr.*, {});
+        if (!predFactFlows(&ctx.polarity[pred.block], e.key_ptr.*, pred.kind))
+            continue;
+        try intersection.put(ctx.allocator, e.key_ptr.*, {});
     }
 }
 
-/// Remove entries from intersection that are not present in the pred set
-fn removeAbsentKeys(
-    allocator: Allocator,
+/// Remove intersection entries the pred's edge-visible set does not carry
+fn narrowFilteredIntersection(
+    ctx: NullMeetCtx,
     intersection: *std.StringHashMapUnmanaged(void),
-    pred_set: *const std.StringHashMapUnmanaged(void),
+    pred: NullPredInfo,
 ) !void {
     var rm = std.ArrayListUnmanaged([]const u8).empty;
-    defer rm.deinit(allocator);
+    defer rm.deinit(ctx.allocator);
     var it = intersection.iterator();
     while (it.next()) |e| {
-        if (!pred_set.contains(e.key_ptr.*))
-            try rm.append(allocator, e.key_ptr.*);
+        const key = e.key_ptr.*;
+        if (ctx.checked[pred.block].contains(key) and
+            predFactFlows(&ctx.polarity[pred.block], key, pred.kind)) continue;
+        try rm.append(ctx.allocator, key);
     }
     for (rm.items) |key| _ = intersection.remove(key);
 }
 
-fn intersectPredChecks(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    bid: usize,
-    checked: []std.StringHashMapUnmanaged(void),
-) !bool {
-    var preds = std.ArrayListUnmanaged(usize).empty;
-    defer preds.deinit(allocator);
-    for (cfg.edges.items) |edge| {
-        if (edge.to == bid) try preds.append(allocator, edge.from);
+/// Intersect predecessor null-check sets into a block, filtering each
+/// pred's contribution to the facts that hold on the connecting edge
+/// (EPH-I0678).
+fn intersectPredChecks(ctx: NullMeetCtx, bid: usize) !bool {
+    var preds = std.ArrayListUnmanaged(NullPredInfo).empty;
+    defer preds.deinit(ctx.allocator);
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.to == bid)
+            try preds.append(ctx.allocator, .{ .block = edge.from, .kind = edge.kind });
     }
     if (preds.items.len == 0) return false;
 
     var intersection: std.StringHashMapUnmanaged(void) = .empty;
-    defer intersection.deinit(allocator);
+    defer intersection.deinit(ctx.allocator);
     for (preds.items, 0..) |pred, pi| {
         if (pi == 0) {
-            try initIntersectionFromMap(allocator, &intersection, &checked[pred]);
+            try initFilteredIntersection(ctx, &intersection, pred);
         } else {
-            try removeAbsentKeys(allocator, &intersection, &checked[pred]);
+            try narrowFilteredIntersection(ctx, &intersection, pred);
         }
     }
     var any_changed = false;
     var it = intersection.iterator();
     while (it.next()) |e| {
-        const gop = try checked[bid].getOrPut(allocator, e.key_ptr.*);
+        const gop = try ctx.checked[bid].getOrPut(ctx.allocator, e.key_ptr.*);
         if (!gop.found_existing) any_changed = true;
     }
     return any_changed;
@@ -18440,20 +18534,14 @@ fn checkLineForUnsafeUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
 }
 
 /// Propagate null checks across CFG until fixpoint
-fn propagateNullChecks(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    checked: []std.StringHashMapUnmanaged(void),
-    num_blocks: usize,
-) !void {
+fn propagateNullChecks(ctx: NullMeetCtx) !void {
     var iters: usize = 0;
     var changed = true;
     while (changed and iters < 100) {
         changed = false;
         iters += 1;
-        for (0..num_blocks) |bid| {
-            if (try intersectPredChecks(allocator, cfg, bid, checked))
-                changed = true;
+        for (0..ctx.checked.len) |bid| {
+            if (try intersectPredChecks(ctx, bid)) changed = true;
         }
     }
 }
@@ -18572,21 +18660,43 @@ fn collectNullablePtrDecls(
     }
 }
 
+/// Per-block analysis state for the null-safety passes (EPH-I0678): the
+/// checked sets the scan consults and the polarity records the meet
+/// consults, both indexed by block ID.
+const NullBlockState = struct {
+    checked: []std.StringHashMapUnmanaged(void),
+    polarity: []std.StringHashMapUnmanaged(NullCheckPolarity),
+
+    fn deinit(self: NullBlockState, allocator: Allocator) void {
+        for (self.checked) |*map| map.deinit(allocator);
+        allocator.free(self.checked);
+        for (self.polarity) |*map| map.deinit(allocator);
+        allocator.free(self.polarity);
+    }
+};
+
+/// Allocate the per-block checked and polarity map arrays, all empty.
+fn allocNullBlockState(allocator: Allocator, num_blocks: usize) !NullBlockState {
+    const checked = try allocator.alloc(std.StringHashMapUnmanaged(void), num_blocks);
+    errdefer allocator.free(checked);
+    for (checked) |*map| map.* = .empty;
+    const polarity = try allocator.alloc(
+        std.StringHashMapUnmanaged(NullCheckPolarity),
+        num_blocks,
+    );
+    errdefer allocator.free(polarity);
+    for (polarity) |*map| map.* = .empty;
+    return .{ .checked = checked, .polarity = polarity };
+}
+
 fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const allocator = run.file.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     const num_blocks = run.cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    const checked = try allocator.alloc(
-        std.StringHashMapUnmanaged(void),
-        num_blocks,
-    );
-    defer {
-        for (checked) |*map| map.deinit(allocator);
-        allocator.free(checked);
-    }
-    for (checked) |*map| map.* = .empty;
+    const state = try allocNullBlockState(allocator, num_blocks);
+    defer state.deinit(allocator);
 
     var nullable_ptrs: std.StringHashMapUnmanaged(void) = .empty;
     defer {
@@ -18602,12 +18712,19 @@ fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
         .lines = run.func.lines,
         .func_line = run.func.start,
         .file_path = run.file.file_path,
-        .checked = checked,
+        .checked = state.checked,
+        .polarity = state.polarity,
         .nullable_ptrs = &nullable_ptrs,
         .issues = &issues,
     };
     try collectNullChecksPerBlock(ctx);
-    try propagateNullChecks(allocator, run.cfg, checked, num_blocks);
+    const meet: NullMeetCtx = .{
+        .allocator = allocator,
+        .cfg = run.cfg,
+        .checked = state.checked,
+        .polarity = state.polarity,
+    };
+    try propagateNullChecks(meet);
     try scanBlocksForUnsafeUnwraps(ctx);
     return issues;
 }
@@ -19037,31 +19154,36 @@ fn extractVarFromNullCheck(after_paren: []const u8, pos: usize) ?[]const u8 {
     return null;
 }
 
-/// Extract variable name from null check pattern
-/// Patterns: "if (x != null)", "if (x) |_|", "while (x != null)"
-/// Also handles early return: "if (x == null) return" (negated check)
-fn extractNullCheckedVar(t: []const u8) ?[]const u8 {
+/// Extract the checked var and the edge the check holds on from a null
+/// check pattern (EPH-I0678). Patterns: "if (x != null)", "if (x) |_|",
+/// "while (x != null)" hold on the true edge. The early-return idiom
+/// "if (x == null) return" (also continue/break) holds on the
+/// fall-through edge, which the CFG models as the false edge.
+fn classifyNullCheck(t: []const u8) ?NullCheckFact {
     // Find opening paren
     const open_paren = mem.indexOf(u8, t, "(") orelse return null;
     const after_paren = t[open_paren + 1 ..];
 
-    // Pattern: x != null
+    // Pattern: x != null - true edge
     if (mem.indexOf(u8, after_paren, " != null")) |ne_pos|
-        if (extractVarFromNullCheck(after_paren, ne_pos)) |v| return v;
+        if (extractVarFromNullCheck(after_paren, ne_pos)) |v|
+            return .{ .var_name = v, .polarity = .true_edge };
 
-    // Pattern: x == null with early return/continue/break
+    // Pattern: x == null with early return/continue/break - fall-through
     // Zig idiom: if (x == null) return; guarantees x is non-null after
     if (mem.indexOf(u8, after_paren, " == null)")) |eq_pos| {
         const has_exit = mem.indexOf(u8, t, "return") != null or
             mem.indexOf(u8, t, "continue") != null or
             mem.indexOf(u8, t, "break") != null;
         if (has_exit)
-            if (extractVarFromNullCheck(after_paren, eq_pos)) |v| return v;
+            if (extractVarFromNullCheck(after_paren, eq_pos)) |v|
+                return .{ .var_name = v, .polarity = .false_edge };
     }
 
-    // Pattern: if (x) |_| - capture means x is non-null inside
+    // Pattern: if (x) |_| - capture means x is non-null inside, true edge
     if (mem.indexOf(u8, after_paren, ") |")) |pipe_pos|
-        if (extractVarFromNullCheck(after_paren, pipe_pos)) |v| return v;
+        if (extractVarFromNullCheck(after_paren, pipe_pos)) |v|
+            return .{ .var_name = v, .polarity = .true_edge };
 
     return null;
 }
@@ -30147,7 +30269,7 @@ test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Pins extractNullCheckedVar's `if (p) |v|` form through the re-gate.
+    // Pins classifyNullCheck's `if (p) |v|` form through the re-gate.
     const content =
         \\fn deref_capture(p: ?*u8) void {
         \\    if (p) |v| {
@@ -30581,6 +30703,281 @@ test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {
         run.issues.items,
         "test_za802_unexpected.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 fires on unwrap past a true-only null check join (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the `opt != null` fact leaks down the branch_false edge into
+    // the join block, so the post-join unwrap stays silent.
+    const content =
+        \\fn use_after_join(opt: ?u32) u32 {
+        \\    if (opt != null) {
+        \\        A();
+        \\    }
+        \\    return opt.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_join.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_join.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 fires on unwrap on the else path (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else block's only pred is the condition via branch_false: the
+    // true-only `opt != null` fact must not reach it.
+    const content =
+        \\fn use_on_else(opt: ?u32) void {
+        \\    if (opt != null) {
+        \\        A();
+        \\    } else {
+        \\        _ = opt.? + 1;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_else.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 fires on unwrap past a while null check exit (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The loop exit's only pred is the header via branch_false: `p != null`
+    // holds in the body, never past the loop.
+    const content =
+        \\fn use_after_loop(p: ?u32) void {
+        \\    while (p != null) {
+        \\        p = next(p);
+        \\    }
+        \\    _ = p.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_loop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_loop.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 silent on unwrap on the true path (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Polarity filtering must keep the true-edge fact on the true edge.
+    const content =
+        \\fn guarded_true(opt: ?u32) void {
+        \\    if (opt != null) {
+        \\        _ = opt.? + 1;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_true.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_true.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent past an early-return null guard (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `== null` + return holds on the fall-through edge: the fact must
+    // survive the polarity re-gate.
+    const content =
+        \\fn early_return_guard(opt: ?u32) void {
+        \\    if (opt == null) return;
+        \\    _ = opt.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_eqguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_eqguard.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past an early-return null guard (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The ZA802 polarity hazard: no textual backstop exists (EPH-I0488), so
+    // the fall-through fact must arrive through the CFG itself.
+    const content =
+        \\fn early_return_deref(p: ?*u32) void {
+        \\    if (p == null) return;
+        \\    p.* += 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_eqguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_eqguard.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent on unwrap inside a while null check body (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The body sits on the true edge of `p != null`: the fact must flow in.
+    const content =
+        \\fn guarded_in_loop(p: ?u32) void {
+        \\    while (p != null) {
+        \\        _ = p.? + 1;
+        \\        p = next(p);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_inloop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_inloop.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 braced early-return null guard stays as-is (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Known pre-existing FP, owned by EPH-I0488: classifyNullCheck only
+    // recognizes `== null` with the exit on the same line, so the braced
+    // guard generates no fact and ZA802 fires here before and after
+    // EPH-I0678. This test pins the boundary: the polarity fix must not
+    // change this verdict, and EPH-I0488 flips it to zero when it lands.
+    const content =
+        \\fn braced_return_deref(p: ?*u32) void {
+        \\    if (p == null) {
+        \\        return;
+        \\    }
+        \\    p.* += 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_braced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_braced.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 fires past a true-only check whose then-path returns (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Converse shape: `opt != null` holds on the true edge, which returns.
+    // The fall-through has no check, so the unwrap must fire.
+    const content =
+        \\fn true_edge_return(opt: ?u32) u32 {
+        \\    if (opt != null) return 1;
+        \\    return opt.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_trueret.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_trueret.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 silent on an outer-check var past a nested if join (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Only the var a block tests is polarity-gated: the outer `a != null`
+    // fact flows through the nested if's blocks on every edge.
+    const content =
+        \\fn nested_outer_fact(a: ?u32, b: ?u32) u32 {
+        \\    if (a != null) {
+        \\        if (b != null) {
+        \\            return a.? + b.? + 1;
+        \\        }
+        \\        return a.? + 1;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_nested.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 fires past a multi-line condition join (EPH-I0678)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The origin block spans the whole multi-line condition. Ownership must
+    // still land on it, not on the then block that starts at the `if` line.
+    const content =
+        \\fn multi_line_cond(opt: ?u32, flag: bool) u32 {
+        \\    if (opt != null and
+        \\        flag)
+        \\    {
+        \\        A();
+        \\    }
+        \\    return opt.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_multiline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_multiline.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
     ) == 1);
 }
 

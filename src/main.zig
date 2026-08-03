@@ -4943,7 +4943,8 @@ fn trackBlockDepth(t: []const u8, depth: usize) usize {
 }
 
 /// Per-keyword defer-block marking state: the per-line inside-block markers,
-/// the current open-brace depth, and the two keyword prefixes that open a block.
+/// the current open-brace depth, and the two keyword prefixes that start a
+/// defer/errdefer line.
 const DeferMarkCtx = struct {
     markers: []bool,
     depth: *usize,
@@ -4957,10 +4958,9 @@ fn markDeferLine(
     idx: usize,
     ctx: DeferMarkCtx,
 ) void {
-    const starts_block = mem.startsWith(u8, t, ctx.start_prefix1) or
+    const starts_defer_line = mem.startsWith(u8, t, ctx.start_prefix1) or
         mem.startsWith(u8, t, ctx.start_prefix2);
-    if (starts_block) {
-        ctx.depth.* += 1;
+    if (starts_defer_line) {
         ctx.depth.* = trackBlockDepth(t, ctx.depth.*);
         ctx.markers[idx] = true;
         return;
@@ -28642,6 +28642,83 @@ test "ZA106: errdefer free plus defer free stays silent" {
         "test_errdefer_defer.zig",
         RULE_DOUBLE_FREE,
     ) == 0);
+}
+
+test "ZA105: use after free in tail of single-line errdefer (EPH-I0680)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The direct free dominates the use. The single-line errdefer must mark
+    // only its own line, so the use still fires.
+    const content =
+        \\fn errdefer_tail_use(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    allocator.free(buf);
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_errdefer_tail_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_tail_uaf.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: use after free in tail of multi-line errdefer block (EPH-I0680)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The close brace of a braced errdefer block must return the depth to
+    // zero, so the freed tail stays visible to the UAF scan.
+    const content =
+        \\fn errdefer_block_tail_use(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer {
+        \\        allocator.free(buf);
+        \\    }
+        \\    allocator.free(buf);
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_errdefer_block_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_block_uaf.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA106: double free in tail of single-line errdefer (EPH-I0680)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // errdefer runs only on error paths, so the two direct frees on the
+    // success path are a definite double free.
+    const content =
+        \\fn errdefer_tail_df(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    allocator.free(buf);
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_errdefer_tail_df.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_tail_df.zig",
+        RULE_DOUBLE_FREE,
+    ) == 1);
 }
 
 test "ZA106: conditional defer plus direct free is a warning" {

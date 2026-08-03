@@ -5041,6 +5041,7 @@ fn analyzeOneAllocSafety(
         .issues = issues,
     };
     scanBlocksForFreeOps(&scan_ctx);
+    propagateFreeState(ctx.cfg, &bstate);
     try detectUseAfterFree(&scan_ctx);
     try detectDoubleFree(&scan_ctx);
     try detectDeferDoubleFree(ctx.allocator, &.{
@@ -5171,16 +5172,37 @@ fn collectAliases(
     return aliases;
 }
 
-/// Per-block free tracking state for memory safety analysis.
+/// One block's transfer effect on the tracked var's freed state: the last
+/// mutation wins. A free sets the state, a rebind resets it — the var then
+/// points at new memory — and a block with neither preserves whatever state
+/// flowed in. hasDirectReassignment also matches an initializer declaration
+/// (`const buf = try alloc(...)`), which is what lets a per-iteration
+/// binding inside a loop body reset the state on every pass.
+const BlockFreeOp = enum { preserves, sets, resets };
+
+/// Per-block free tracking state for memory safety analysis. The entry/exit
+/// arrays hold the propagated fixpoint (EPH-I0676): def_* is the MUST
+/// lattice (every reachable path freed), may_* the MAY lattice (some path
+/// freed). The exit arrays are work storage for the fixpoint sweep.
 const BlockFreeState = struct {
     freed_in_block: []bool,
     block_returns_after_free: []bool,
     freed_line_in_block: []usize,
+    free_op: []BlockFreeOp,
+    def_freed_entry: []bool,
+    def_freed_exit: []bool,
+    may_freed_entry: []bool,
+    may_freed_exit: []bool,
 
     fn deinit(self: *BlockFreeState, a: Allocator) void {
         a.free(self.freed_in_block);
         a.free(self.block_returns_after_free);
         a.free(self.freed_line_in_block);
+        a.free(self.free_op);
+        a.free(self.def_freed_entry);
+        a.free(self.def_freed_exit);
+        a.free(self.may_freed_entry);
+        a.free(self.may_freed_exit);
     }
 };
 
@@ -5192,9 +5214,19 @@ fn initBlockFreeState(
     s.freed_in_block = try a.alloc(bool, n);
     s.block_returns_after_free = try a.alloc(bool, n);
     s.freed_line_in_block = try a.alloc(usize, n);
+    s.free_op = try a.alloc(BlockFreeOp, n);
+    s.def_freed_entry = try a.alloc(bool, n);
+    s.def_freed_exit = try a.alloc(bool, n);
+    s.may_freed_entry = try a.alloc(bool, n);
+    s.may_freed_exit = try a.alloc(bool, n);
     @memset(s.freed_in_block, false);
     @memset(s.block_returns_after_free, false);
     @memset(s.freed_line_in_block, 0);
+    @memset(s.free_op, .preserves);
+    @memset(s.def_freed_entry, false);
+    @memset(s.def_freed_exit, false);
+    @memset(s.may_freed_entry, false);
+    @memset(s.may_freed_exit, false);
     return s;
 }
 
@@ -5260,6 +5292,7 @@ const BlockScanResult = struct {
     free_seen: bool = false,
     return_after: bool = false,
     free_line: usize = 0,
+    op: BlockFreeOp = .preserves,
 };
 
 /// Source-level scan state for one tracked allocation: the body lines, the
@@ -5288,6 +5321,27 @@ const FreeScanCtx = struct {
     issues: *std.ArrayListUnmanaged(Issue),
 };
 
+/// True when the line payload-captures var_name (`for (xs) |buf|`,
+/// `if (opt) |buf|`, `while (it.next()) |buf|`). On a loop header the
+/// capture rebinds the name to a fresh element on every iteration, so a
+/// free of that name inside the body never frees the tracked binding twice
+/// (EPH-I0676). The adjacent-pipe form matches isBindingNameAt: canonical
+/// spacing writes bitwise-or as `a | b | c`. Name-based and scope-blind:
+/// the general capture-conflation fix is EPH-I0748.
+fn hasCaptureBinding(t: []const u8, var_name: []const u8) bool {
+    var cls = LineClassifier.init(t);
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        if (cls.isInsideString(pos)) continue;
+        const end_i = pos + var_name.len;
+        if (pos > 0 and t[pos - 1] == '|' and end_i < t.len and t[end_i] == '|')
+            return true;
+    }
+    return false;
+}
+
 fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
     var r = BlockScanResult{};
     for (block.start_line..block.end_line + 1) |ln| {
@@ -5297,14 +5351,104 @@ fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResul
         const t = mem.trim(u8, scan.lines[idx], " \t\r");
         if (shouldSkipForFreeAnalysis(t, idx, scan.in_defer, scan.in_errdefer))
             continue;
-        if (hasRealFreePattern(t) and isDirectFreeOfVarOrAlias(t, scan.var_name, scan.aliases)) {
+        if (hasRealFreePattern(t) and
+            isDirectFreeOfVarOrAlias(t, scan.var_name, scan.aliases))
+        {
             r.free_seen = true;
             r.free_line = ln;
+            r.op = .sets;
+        } else if (hasDirectReassignment(t, scan.var_name)) {
+            // A rebind hands a live state to the block's successors: the
+            // var points at new memory, not the freed allocation.
+            r.op = .resets;
         }
         if (r.free_seen and mem.startsWith(u8, t, "return"))
             r.return_after = true;
     }
     return r;
+}
+
+/// The two entry verdicts one predecessor meet computes for a block.
+const FreedMeet = struct { def: bool, may: bool };
+
+/// Meet over one block's predecessors for both freed lattices. Preds that
+/// return after the free and is_return preds carry no reachable flow past
+/// the return, so neither lattice counts their vote (the I0677 discipline).
+/// Both lattices skip loop_back edges (mirrors computeBlockEntry): the
+/// pre-loop path grounds the loop header, and loop-carried free state is
+/// the targeted vote in loopCarriedFreeVote, not general back-edge flow —
+/// general flow conflates per-iteration rebinds with the tracked binding.
+/// A block with no counted forward pred is not definitely freed.
+fn meetFreedPreds(
+    cfg: *const ControlFlowGraph,
+    bstate: *const BlockFreeState,
+    bid: usize,
+) FreedMeet {
+    var def = true;
+    var may = false;
+    var has_forward_pred = false;
+    for (cfg.edges.items) |edge| {
+        if (edge.to != bid) continue;
+        if (edge.kind == .loop_back) continue;
+        const pred = edge.from;
+        if (pred >= cfg.blocks.items.len) continue;
+        if (bstate.block_returns_after_free[pred]) continue;
+        if (cfg.blocks.items[pred].is_return) continue;
+        has_forward_pred = true;
+        def = def and bstate.def_freed_exit[pred];
+        may = may or bstate.may_freed_exit[pred];
+    }
+    return .{ .def = has_forward_pred and def, .may = may };
+}
+
+fn applyFreeOp(op: BlockFreeOp, entry: bool) bool {
+    return switch (op) {
+        .preserves => entry,
+        .sets => true,
+        .resets => false,
+    };
+}
+
+/// One fixpoint step for a block: meet the predecessor exits into the entry
+/// states, then push both through the block's transfer op. Returns true
+/// when either lattice changed.
+fn updateFreeEntry(cfg: *const ControlFlowGraph, bstate: *BlockFreeState, bid: usize) bool {
+    const meet = meetFreedPreds(cfg, bstate, bid);
+    const new_def_exit = applyFreeOp(bstate.free_op[bid], meet.def);
+    const new_may_exit = applyFreeOp(bstate.free_op[bid], meet.may);
+    if (bstate.def_freed_entry[bid] == meet.def and
+        bstate.def_freed_exit[bid] == new_def_exit and
+        bstate.may_freed_entry[bid] == meet.may and
+        bstate.may_freed_exit[bid] == new_may_exit) return false;
+    bstate.def_freed_entry[bid] = meet.def;
+    bstate.def_freed_exit[bid] = new_def_exit;
+    bstate.may_freed_entry[bid] = meet.may;
+    bstate.may_freed_exit[bid] = new_may_exit;
+    return true;
+}
+
+/// Forward fixpoint for the per-block freed state (EPH-I0676): the local
+/// scan only sees a block's own lines, so a free two or more hops before a
+/// use and every loop-carried free stayed invisible (audit F1/F14). Two
+/// bool lattices share one sweep: def (MUST) inits optimistic-top and
+/// intersects down, may (MAY) inits bottom and unions up; both transfers
+/// are the same monotone free op, so the 2n+1 cap mirrors
+/// runDefiniteAssignmentWorklist's proven bound.
+fn propagateFreeState(cfg: *const ControlFlowGraph, bstate: *BlockFreeState) void {
+    const n = cfg.blocks.items.len;
+    @memset(bstate.def_freed_entry, true);
+    @memset(bstate.def_freed_exit, true);
+    @memset(bstate.may_freed_entry, false);
+    @memset(bstate.may_freed_exit, false);
+    const max_iters = @min(n, std.math.maxInt(usize) / 2 - 1) *| 2 +| 1;
+    var changed = true;
+    var iters: usize = 0;
+    while (changed and iters < max_iters) : (iters += 1) {
+        changed = false;
+        for (0..n) |bid| {
+            if (updateFreeEntry(cfg, bstate, bid)) changed = true;
+        }
+    }
 }
 
 fn scanBlocksForFreeOps(ctx: *const FreeScanCtx) void {
@@ -5315,6 +5459,7 @@ fn scanBlocksForFreeOps(ctx: *const FreeScanCtx) void {
         ctx.bstate.freed_in_block[bid] = r.free_seen;
         ctx.bstate.freed_line_in_block[bid] = r.free_line;
         ctx.bstate.block_returns_after_free[bid] = r.return_after;
+        ctx.bstate.free_op[bid] = r.op;
         if (r.free_seen and ctx.scan.alloc_info.freed_line == 0)
             ctx.scan.alloc_info.freed_line = r.free_line;
     }
@@ -5408,6 +5553,9 @@ fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
 const SameBlockFreeResult = struct {
     freed: bool,
     intervening_return: bool,
+    /// The var was rebound in the block before the scanned line, so the
+    /// propagated cross-block freed state is dead at that line (EPH-I0676).
+    rebound: bool,
 };
 
 fn checkSameBlockFree(
@@ -5417,6 +5565,7 @@ fn checkSameBlockFree(
 ) SameBlockFreeResult {
     var freed = false;
     var ret = false;
+    var rebound = false;
     for (block_start..actual_line) |cl| {
         if (cl < scan.func_line) continue;
         const ci = cl - scan.func_line;
@@ -5430,12 +5579,13 @@ fn checkSameBlockFree(
         }
         // Reassignment after free: `var_name = ...` resets freed state
         // (the variable now points to new memory, not the freed allocation)
-        if (freed and hasDirectReassignment(ct, scan.var_name)) {
+        if (hasDirectReassignment(ct, scan.var_name)) {
+            rebound = true;
             freed = false;
         }
         if (freed and mem.startsWith(u8, ct, "return")) ret = true;
     }
-    return .{ .freed = freed, .intervening_return = ret };
+    return .{ .freed = freed, .intervening_return = ret, .rebound = rebound };
 }
 
 /// freed_line always comes from the allocation record: every call site
@@ -5457,30 +5607,6 @@ fn appendUAFIssue(ctx: *const FreeScanCtx, var_name: []const u8, line: usize, co
         .message_owned = true,
         .help = "don't access freed memory",
     });
-}
-
-fn checkPredecessorsFreed(
-    allocator: Allocator,
-    cfg: *ControlFlowGraph,
-    bid: usize,
-    bstate: *const BlockFreeState,
-) !bool {
-    var preds = try getBlockPredecessors(cfg, bid, allocator);
-    defer preds.deinit(allocator);
-    if (preds.items.len == 0) return false;
-    var def_freed = true;
-    var any_normal = false;
-    for (preds.items) |pred| {
-        if (bstate.block_returns_after_free[pred]) continue;
-        // Return blocks wire a phantom sequential edge to the merge but are
-        // unreachable past the return, so they must not vote in the meet
-        // (mirrors the ZA607 skip in computeBlockEntry).
-        if (pred < cfg.blocks.items.len and
-            cfg.blocks.items[pred].is_return) continue;
-        any_normal = true;
-        if (!bstate.freed_in_block[pred]) def_freed = false;
-    }
-    return any_normal and def_freed;
 }
 
 /// Decide whether a line is irrelevant when scanning for uses of a freed var.
@@ -5511,9 +5637,14 @@ fn checkLineForUAF(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !
     const bid = findBlockForLine(ctx.cfg, actual_line) orelse return;
     const bs = ctx.cfg.blocks.items[bid].start_line;
     if (bs == 0 or bs > actual_line) return;
-    if (try checkSameBlockUAF(ctx, bs, actual_line, use_col)) return;
-    const preds_freed = try checkPredecessorsFreed(ctx.allocator, ctx.cfg, bid, ctx.bstate);
-    if (!preds_freed or ctx.scan.alloc_info.freed_line == 0) return;
+    const sbf = checkSameBlockFree(&ctx.scan, bs, actual_line);
+    if (try checkSameBlockUAF(ctx, sbf, actual_line, use_col)) return;
+    // A rebind in this block before the use kills the propagated freed
+    // state at this line.
+    if (sbf.rebound) return;
+    // MUST verdict only: a maybe-freed use stays silent (err severity
+    // requires every reachable path to carry the free — EPH-I0676).
+    if (!ctx.bstate.def_freed_entry[bid] or ctx.scan.alloc_info.freed_line == 0) return;
     // Check for reassignment between the free and this use
     const freed = ctx.scan.alloc_info.freed_line;
     const range: LineRange = .{ .from_line = freed, .to_line = actual_line };
@@ -5531,11 +5662,10 @@ fn checkLineForUAF(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !
 /// Check if a variable was freed in the same block; emit UAF if so.
 fn checkSameBlockUAF(
     ctx: *const FreeScanCtx,
-    block_start: usize,
+    sbf: SameBlockFreeResult,
     actual_line: usize,
     use_col: usize,
 ) !bool {
-    const sbf = checkSameBlockFree(&ctx.scan, block_start, actual_line);
     if (!sbf.freed or sbf.intervening_return) return false;
     // Inline switch arms share one CFG block: a free in a sibling arm never
     // executed on the use's path (indent-aware per hasExclusiveArmBetween).
@@ -5609,12 +5739,15 @@ const FreeIssueSink = struct {
 
 /// One observed second free: the source text (for the free-call column),
 /// its line, the first free's line, and the severity/help pair to report.
+/// loop_carried marks the F14 verdict: the prior free is this same
+/// statement on a previous iteration, so freed_line names site.line itself.
 const DoubleFreeSite = struct {
     t: []const u8,
     line: usize,
     freed_line: usize,
     severity: Severity,
     help: []const u8,
+    loop_carried: bool = false,
 };
 
 fn appendDoubleFreeIssue(sink: *const FreeIssueSink, site: DoubleFreeSite) !void {
@@ -5627,11 +5760,20 @@ fn appendDoubleFreeIssue(sink: *const FreeIssueSink, site: DoubleFreeSite) !void
         }
     }
     const pfx = if (site.severity == .warning) "conditional " else "";
-    const msg = try std.fmt.allocPrint(
-        sink.allocator,
-        "{s}double-free: '{s}' freed on {d}",
-        .{ pfx, sink.var_name, site.freed_line },
-    );
+    // A loop-carried verdict would name the flagged line as its own first
+    // free; state the prior-iteration cause instead (EPH-I0676 reviewer F3).
+    const msg = if (site.loop_carried)
+        try std.fmt.allocPrint(
+            sink.allocator,
+            "{s}double-free: '{s}' freed on a previous iteration of this loop",
+            .{ pfx, sink.var_name },
+        )
+    else
+        try std.fmt.allocPrint(
+            sink.allocator,
+            "{s}double-free: '{s}' freed on {d}",
+            .{ pfx, sink.var_name, site.freed_line },
+        );
     errdefer sink.allocator.free(msg);
     try sink.issues.append(sink.allocator, .{
         .file = sink.file_path,
@@ -5654,18 +5796,22 @@ fn checkLineForDoubleFree(ctx: *const FreeScanCtx, t: []const u8, actual_line: u
     const bid = findBlockForLine(ctx.cfg, actual_line) orelse return;
     const bs = ctx.cfg.blocks.items[bid].start_line;
     if (bs == 0 or bs > actual_line) return;
-    if (try checkSameBlockDoubleFree(ctx, bs, t, actual_line)) return;
+    const sbf = checkSameBlockFree(&ctx.scan, bs, actual_line);
+    if (try checkSameBlockDoubleFree(ctx, sbf, t, actual_line)) return;
+    // A rebind in this block before this free kills the propagated freed
+    // state: this free releases new memory (the per-iteration alloc/free
+    // loop idiom — EPH-I0676).
+    if (sbf.rebound) return;
     try detectCrossBlockDoubleFree(ctx, t, actual_line, bid);
 }
 
 /// Check same-block double free and emit issue if found; returns true if freed.
 fn checkSameBlockDoubleFree(
     ctx: *const FreeScanCtx,
-    block_start: usize,
+    sbf: SameBlockFreeResult,
     t: []const u8,
     actual_line: usize,
 ) !bool {
-    const sbf = checkSameBlockFree(&ctx.scan, block_start, actual_line);
     if (!sbf.freed) return false;
     const freed = ctx.scan.alloc_info.freed_line;
     const lines = ctx.scan.lines;
@@ -5700,7 +5846,6 @@ fn detectDoubleFree(ctx: *const FreeScanCtx) !void {
 const PredFreeAnalysis = struct {
     def_freed: bool,
     any_freed: bool,
-    any_normal: bool,
     freed_pred_line: usize,
 };
 
@@ -5912,35 +6057,239 @@ fn pairDirectFreeWithDefers(
     }
 }
 
-/// Analyze predecessor blocks to determine free state
+/// Free verdict at a block's entry from the propagated lattices
+/// (EPH-I0676): def_freed means every reachable path into the block freed
+/// the var, any_freed means some path did. freed_pred_line stays a local
+/// scan: it names the nearest predecessor free for the "freed on {d}"
+/// reference, so it reads immediate predecessors only.
 fn analyzePredFreeState(
     cfg: *ControlFlowGraph,
     preds: []const usize,
     bstate: *const BlockFreeState,
+    bid: usize,
 ) PredFreeAnalysis {
     var result = PredFreeAnalysis{
-        .def_freed = true,
-        .any_freed = false,
-        .any_normal = false,
+        .def_freed = bstate.def_freed_entry[bid],
+        .any_freed = bstate.may_freed_entry[bid],
         .freed_pred_line = 0,
     };
     for (preds) |pred| {
         if (bstate.block_returns_after_free[pred]) continue;
-        // Return blocks wire a phantom sequential edge to the merge but are
-        // unreachable past the return, so they must not vote in the meet
-        // (mirrors the ZA607 skip in computeBlockEntry).
+        // Return blocks are unreachable past the return, so a free inside
+        // one never flows here and must not name the reference free
+        // (mirrors the meet skip in meetFreedPreds).
         if (pred < cfg.blocks.items.len and
             cfg.blocks.items[pred].is_return) continue;
-        result.any_normal = true;
-        if (bstate.freed_in_block[pred]) {
-            result.any_freed = true;
-            const pl = bstate.freed_line_in_block[pred];
-            if (pl > result.freed_pred_line) result.freed_pred_line = pl;
-        } else {
-            result.def_freed = false;
-        }
+        if (!bstate.freed_in_block[pred]) continue;
+        const pl = bstate.freed_line_in_block[pred];
+        if (pl > result.freed_pred_line) result.freed_pred_line = pl;
     }
     return result;
+}
+
+/// True when a path of CFG edges leads from `from` to `to`. Bounded by the
+/// block count: the visited set caps the walk at one visit per block.
+fn cfgPathExists(allocator: Allocator, cfg: *const ControlFlowGraph, from: usize, to: usize) !bool {
+    if (from == to) return true;
+    var visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, cfg.blocks.items.len);
+    defer visited.deinit(allocator);
+    var stack: std.ArrayListUnmanaged(usize) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, from);
+    visited.set(from);
+    while (stack.pop()) |cur| {
+        for (cfg.edges.items) |edge| {
+            if (edge.from != cur) continue;
+            if (edge.to == to) return true;
+            if (edge.to >= cfg.blocks.items.len) continue;
+            if (visited.isSet(edge.to)) continue;
+            visited.set(edge.to);
+            try stack.append(allocator, edge.to);
+        }
+    }
+    return false;
+}
+
+/// The loop body's furthest line extent over every back-edge into the
+/// header: a mid-body `continue` source ends the region early, and the
+/// end_line=0 quirk on single-statement blocks carries no extent, so the
+/// maximum over all sources approximates the body tail. Zero means no
+/// source carries an extent.
+fn loopBodyEnd(cfg: *const ControlFlowGraph, header: usize) usize {
+    var end: usize = 0;
+    for (cfg.edges.items) |edge| {
+        if (edge.kind != .loop_back or edge.to != header) continue;
+        if (edge.from >= cfg.blocks.items.len) continue;
+        end = @max(end, cfg.blocks.items[edge.from].end_line);
+    }
+    return end;
+}
+
+/// True when the loop body region rebinds the var, killing the loop-carried
+/// free verdict: a reassignment anywhere in the body (a rebind after the
+/// free still means consecutive iterations free different memory) or a
+/// payload capture on the header line (rebinds every iteration). The region
+/// runs from the header line through the body end. An unknown extent stays
+/// silent rather than guessing.
+fn loopBodyRebinds(ctx: *const FreeScanCtx, header_line: usize, body_end: usize) bool {
+    if (body_end <= header_line) return true;
+    const lines = ctx.scan.lines;
+    if (header_line < ctx.scan.func_line) return true;
+    if (header_line >= ctx.scan.func_line + lines.len) return true;
+    const ht = mem.trim(u8, lines[header_line - ctx.scan.func_line], " \t\r");
+    if (hasCaptureBinding(ht, ctx.scan.var_name)) return true;
+    const range: LineRange = .{ .from_line = header_line, .to_line = body_end + 1 };
+    return hasReassignmentBetween(lines, ctx.scan.func_line, range, ctx.scan.var_name);
+}
+
+/// Position just past the close of the paren group opened at
+/// (start_idx, open_col), or null when the parens never balance. Mirrors
+/// fillCallEffectPos: quote-aware and multi-line through the carried depth.
+fn parenGroupEnd(
+    lines: []const []const u8,
+    start_idx: usize,
+    open_col: usize,
+) ?AssignEffect {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var idx = start_idx;
+    while (idx < lines.len) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const start: usize = if (idx == start_idx) open_col + 1 else 0;
+        const col = scanLineForParenClose(t, start, &depth, &mode) orelse continue;
+        return .{ .line = idx, .col = col };
+    }
+    return null;
+}
+
+/// computeBraceDepth from a start column: the loop header's `{` sits after
+/// the clause on the same line, so the scan must not count the clause's
+/// own brackets.
+fn braceDepthFrom(t: []const u8, start: usize, initial: usize) usize {
+    var depth = initial;
+    var mode: QuoteMode = .none;
+    var i: usize = start;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') depth += 1;
+        if (c == '}' and depth > 0) depth -= 1;
+    }
+    return depth;
+}
+
+/// The line index whose text closes the brace group opened at
+/// (start_idx, open_col), or null when the braces never balance.
+fn braceGroupEndLine(
+    lines: []const []const u8,
+    start_idx: usize,
+    open_col: usize,
+) ?usize {
+    var depth: usize = 0;
+    var idx = start_idx;
+    while (idx < lines.len) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code = stripLineComment(t);
+        const start: usize = if (idx == start_idx) open_col else 0;
+        depth = braceDepthFrom(code, start, depth);
+        if (depth == 0) return idx;
+    }
+    return null;
+}
+
+/// Inclusive actual-line span of a loop body's text.
+const BodyExtent = struct { first: usize, last: usize };
+
+/// The extent of a braced loop body whose `{` sits at (idx, base): the
+/// lines strictly between the braces. Null when the braces never balance or
+/// the body shares one line (`{ ... }` fused: no inner lines).
+fn bracedBodyExtent(
+    lines: []const []const u8,
+    func_line: usize,
+    idx: usize,
+    base: usize,
+) ?BodyExtent {
+    const close_idx = braceGroupEndLine(lines, idx, base) orelse return null;
+    if (close_idx <= idx) return null;
+    return .{ .first = func_line + idx + 1, .last = func_line + close_idx - 1 };
+}
+
+/// The textual line extent of the loop body whose header ends on
+/// header_line, or null when the extent cannot be bounded (the vote then
+/// stays silent rather than guessing). A braced body spans strictly between
+/// its brace lines; a brace-less body spans only its statement's line, so a
+/// statement after the loop never reads as loop-carried (EPH-I0676
+/// reviewer F1: the CFG merges that statement into the back-edge block).
+/// A while-continue tail (`: (expr)`) is unhandled by design: null.
+fn loopBodyLineExtent(
+    lines: []const []const u8,
+    func_line: usize,
+    header_line: usize,
+) ?BodyExtent {
+    if (header_line < func_line) return null;
+    const hidx = header_line - func_line;
+    if (hidx >= lines.len) return null;
+    const ht = mem.trim(u8, lines[hidx], " \t\r");
+    const open = mem.indexOfScalar(u8, ht, '(') orelse return null;
+    var pos = parenGroupEnd(lines, hidx, open) orelse return null;
+    var idx = pos.line;
+    while (idx < lines.len) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code = stripLineComment(t);
+        const start: usize = if (idx == pos.line) @min(pos.col, code.len) else 0;
+        const rest = mem.trimStart(u8, code[start..], " \t");
+        if (rest.len == 0) continue;
+        const base = code.len - rest.len;
+        if (rest[0] == '|') {
+            // Payload capture: skip to its closing pipe and re-scan the line.
+            // Field writes, not a struct literal: literal braces would read
+            // as depth 4 to ZA302's brace counter.
+            const q = mem.indexOfScalar(u8, rest[1..], '|') orelse return null;
+            pos.line = idx;
+            pos.col = base + q + 2;
+            idx -|= 1;
+            continue;
+        }
+        if (rest[0] == ':') return null; // while/for continue expression
+        if (rest[0] == '{') return bracedBodyExtent(lines, func_line, idx, base);
+        // Brace-less body: its statement shares this line (fused) or is this
+        // next-line statement; either way the body spans this line only.
+        return .{ .first = func_line + idx, .last = func_line + idx };
+    }
+    return null;
+}
+
+/// Loop-carried double-free vote (EPH-I0676, audit F14): a free inside a
+/// loop body may already have run on a prior iteration. True when the
+/// free's block sits on a CFG cycle through a loop_back edge — the header
+/// reaches the free and the free reaches the back-edge source — the free
+/// sits inside the body's textual line extent (the block model alone cannot
+/// exclude the statement after a brace-less body, reviewer F1), and the
+/// body carries no rebind. This is the F14 "maybe-freed on re-entry"
+/// verdict: a targeted vote, not general back-edge flow, so per-iteration
+/// rebinds stay precise.
+fn loopCarriedFreeVote(ctx: *const FreeScanCtx, bid: usize, actual_line: usize) !bool {
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.kind != .loop_back) continue;
+        if (edge.to >= ctx.cfg.blocks.items.len) continue;
+        const header_line = ctx.cfg.blocks.items[edge.to].end_line;
+        if (actual_line <= header_line) continue;
+        const extent = loopBodyLineExtent(ctx.scan.lines, ctx.scan.func_line, header_line) orelse
+            continue;
+        if (actual_line < extent.first or actual_line > extent.last) continue;
+        if (!try cfgPathExists(ctx.allocator, ctx.cfg, edge.to, bid)) continue;
+        if (!try cfgPathExists(ctx.allocator, ctx.cfg, bid, edge.from)) continue;
+        const body_end = loopBodyEnd(ctx.cfg, edge.to);
+        if (loopBodyRebinds(ctx, header_line, body_end)) continue;
+        return true;
+    }
+    return false;
 }
 
 fn detectCrossBlockDoubleFree(
@@ -5953,8 +6302,9 @@ fn detectCrossBlockDoubleFree(
     defer preds.deinit(ctx.allocator);
     if (preds.items.len == 0) return;
 
-    const pa = analyzePredFreeState(ctx.cfg, preds.items, ctx.bstate);
-    if (!pa.any_freed or !pa.any_normal) return;
+    const pa = analyzePredFreeState(ctx.cfg, preds.items, ctx.bstate, bid);
+    const loop_carried = try loopCarriedFreeVote(ctx, bid, actual_line);
+    if (!pa.any_freed and !loop_carried) return;
 
     const ref = if (pa.freed_pred_line > 0)
         pa.freed_pred_line
@@ -5967,7 +6317,16 @@ fn detectCrossBlockDoubleFree(
         .t = t,
         .line = actual_line,
         .freed_line = ref,
-        .pa = pa,
+        // The verdict is loop-carried only when the vote fired AND the
+        // reference line would name the flagged free itself.
+        .loop_carried = loop_carried and ref == actual_line,
+        .pa = .{
+            // The loop-carried vote is MAY-only: the first-iteration path
+            // grounds the MUST meet, so it never upgrades to err.
+            .def_freed = pa.def_freed,
+            .any_freed = true,
+            .freed_pred_line = pa.freed_pred_line,
+        },
     });
 }
 
@@ -5978,6 +6337,7 @@ const CrossFreeCandidate = struct {
     t: []const u8,
     line: usize,
     freed_line: usize,
+    loop_carried: bool = false,
     pa: PredFreeAnalysis,
 };
 
@@ -5995,8 +6355,11 @@ fn emitCrossBlockDoubleFree(ctx: *const FreeScanCtx, c: CrossFreeCandidate) !voi
         .severity = if (c.pa.def_freed) .err else .warning,
         .help = if (c.pa.def_freed)
             "remove duplicate free"
+        else if (c.loop_carried)
+            "move free outside the loop"
         else
             "move free outside conditional",
+        .loop_carried = c.loop_carried,
     };
     if (!c.pa.def_freed and !c.pa.any_freed) return;
     try appendDoubleFreeIssue(&sink, site);
@@ -28738,6 +29101,366 @@ test "ZA106: return arm without free upgrades cross-block double-free (EPH-I0677
         const help = issue.help orelse return error.MissingHelp;
         try std.testing.expectEqualStrings("remove duplicate free", help);
     }
+}
+
+test "ZA105: use two blocks past a dominating free fires (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free dominates the use but sits two block hops back: the if-body
+    // predecessor carries no local free, so the one-hop meet stayed silent
+    // (audit F1). The propagated MUST verdict must fire exactly once.
+    const content =
+        \\fn dist2_uaf(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        foo();
+        \\    }
+        \\    buf[0] = 1;
+        \\}
+        \\fn foo() void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_dist2_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_dist2_uaf.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: loop-body free double-frees on the next iteration (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The loop back-edge carries the body's freed state into the header, so
+    // the free may already have run when the body re-enters (audit F14).
+    // The verdict is MAY only (iteration one is clean), so the severity is
+    // warning, not err.
+    const content =
+        \\fn loop_df(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    while (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_loop_df.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_loop_df.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+        // The prior free is this same statement on a previous iteration, so
+        // the message names the iteration, not the flagged line itself
+        // (EPH-I0676 reviewer F3).
+        try std.testing.expect(mem.indexOf(u8, issue.message, "previous iteration") != null);
+    }
+}
+
+test "ZA106: free two blocks past a dominating free is a definite double-free (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same distance-2 shape as the ZA105 probe: every reachable path into
+    // the second free already freed buf, so the verdict upgrades from the
+    // one-hop conditional warning to a definite double-free (err).
+    const content =
+        \\fn dist2_df(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        foo();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn foo() void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_dist2_df.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_dist2_df.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA105: one-branch conditional free stays silent past the join (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The false edge reaches the join without freeing, so the MUST verdict
+    // stays false: a maybe-freed use is not an err-tier UAF.
+    const content =
+        \\fn one_branch(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    buf[0] = 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_one_branch.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_one_branch.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: reassignment on one arm keeps the post-join use silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The if-arm rebinds buf, so its exit state is live and the join's MUST
+    // verdict stays false. The hasReassignmentBetween net stays as backstop.
+    const content =
+        \\fn reassign_arm(allocator: std.mem.Allocator, c: bool) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        buf = try allocator.alloc(u8, 64);
+        \\    }
+        \\    buf[0] = 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_reassign_arm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_reassign_arm.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: free before a loop with a use in the body keeps firing (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // No-regression pin: the pre-loop free dominates the loop header, so the
+    // body use fired before the propagation existed and must keep firing.
+    const content =
+        \\fn free_before_loop(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (c) {
+        \\        buf[0] = 1;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_free_before_loop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_free_before_loop.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA106: per-iteration alloc and free in a loop stays silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // FP guard for the new back-edge state: each iteration rebinds buf from
+    // a fresh allocation before the free, so the prior iteration's free
+    // state is dead. The in-block rebind must kill the loop-carried verdict.
+    const content =
+        \\fn loop_realloc(allocator: std.mem.Allocator, c: bool) !void {
+        \\    while (c) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        buf[0] = 1;
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_loop_realloc.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_loop_realloc.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: freeing a loop capture each iteration stays silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // FP guard for the new back-edge state: the capture |item| rebinds the
+    // name to a fresh element on every iteration, so the free inside the
+    // body never frees the tracked outer item twice. (The pre-existing
+    // free-before-loop variant of this confusion is EPH-I0748.)
+    const content =
+        \\fn free_elements(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    const items = try allocator.alloc([]u8, 4);
+        \\    for (items) |item| {
+        \\        allocator.free(item);
+        \\    }
+        \\    allocator.free(items);
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_capture_loop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_capture_loop.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Severity-boundary pin: the iteration-2 use-after-free is MAY-only
+    // (the pre-loop path grounds the MUST meet, which skips back-edges), and
+    // ZA105 reports err on MUST state alone.
+    const content =
+        \\fn use_then_free_loop(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    while (c) {
+        \\        buf[0] = 1;
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_use_then_free_loop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_use_then_free_loop.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA106: free after a brace-less for body stays silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The ghostty coretext shape (reviewer F1): the CFG merges the statement
+    // after a brace-less body into the back-edge block, so cycle membership
+    // alone cannot exclude it. The textual body extent must.
+    const content =
+        \\fn end_frame(allocator: std.mem.Allocator) !void {
+        \\    const items = try allocator.alloc(*u8, 4);
+        \\    for (items) |ref| release(ref);
+        \\    allocator.free(items);
+        \\}
+        \\fn release(p: *u8) void {
+        \\    _ = p;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_after_braceless_for.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_after_braceless_for.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA106: free after a brace-less while body stays silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Reviewer F1 fp4: the loop never touches buf, and the only free sits
+    // after the loop — no iteration frees twice.
+    const content =
+        \\fn spin(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    while (c) touch();
+        \\    allocator.free(buf);
+        \\}
+        \\fn touch() void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_after_braceless_while.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_after_braceless_while.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA106: free of a var the loop never references stays silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Reviewer F1 fp5: the loop iterates a different slice and never names
+    // buf; the single free after the loop is correct cleanup.
+    const content =
+        \\fn spin3(allocator: std.mem.Allocator, items: []u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    for (items) |x| touch(x);
+        \\    allocator.free(buf);
+        \\}
+        \\fn touch(d: u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_loop_other_var.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_loop_other_var.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA106: free after a braced loop body stays silent (EPH-I0676)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The braced form of the reviewer F1 shapes: the free sits below the
+    // body's closing brace, outside the textual body extent.
+    const content =
+        \\fn spin4(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    while (c) {
+        \\        touch();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn touch() void {}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_after_braced_while.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_after_braced_while.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
 }
 
 test "ZA106: defer free plus direct free is a double-free" {

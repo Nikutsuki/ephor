@@ -5472,6 +5472,11 @@ fn checkPredecessorsFreed(
     var any_normal = false;
     for (preds.items) |pred| {
         if (bstate.block_returns_after_free[pred]) continue;
+        // Return blocks wire a phantom sequential edge to the merge but are
+        // unreachable past the return, so they must not vote in the meet
+        // (mirrors the ZA607 skip in computeBlockEntry).
+        if (pred < cfg.blocks.items.len and
+            cfg.blocks.items[pred].is_return) continue;
         any_normal = true;
         if (!bstate.freed_in_block[pred]) def_freed = false;
     }
@@ -5909,6 +5914,7 @@ fn pairDirectFreeWithDefers(
 
 /// Analyze predecessor blocks to determine free state
 fn analyzePredFreeState(
+    cfg: *ControlFlowGraph,
     preds: []const usize,
     bstate: *const BlockFreeState,
 ) PredFreeAnalysis {
@@ -5920,6 +5926,11 @@ fn analyzePredFreeState(
     };
     for (preds) |pred| {
         if (bstate.block_returns_after_free[pred]) continue;
+        // Return blocks wire a phantom sequential edge to the merge but are
+        // unreachable past the return, so they must not vote in the meet
+        // (mirrors the ZA607 skip in computeBlockEntry).
+        if (pred < cfg.blocks.items.len and
+            cfg.blocks.items[pred].is_return) continue;
         result.any_normal = true;
         if (bstate.freed_in_block[pred]) {
             result.any_freed = true;
@@ -5942,7 +5953,7 @@ fn detectCrossBlockDoubleFree(
     defer preds.deinit(ctx.allocator);
     if (preds.items.len == 0) return;
 
-    const pa = analyzePredFreeState(preds.items, ctx.bstate);
+    const pa = analyzePredFreeState(ctx.cfg, preds.items, ctx.bstate);
     if (!pa.any_freed or !pa.any_normal) return;
 
     const ref = if (pa.freed_pred_line > 0)
@@ -28544,6 +28555,67 @@ test "ZA105: free on both if and else arms then use still fires" {
         "test_uaf_both_arms.zig",
         RULE_USE_AFTER_FREE,
     ) == 1);
+}
+
+test "ZA105: return arm without free does not mask the else-arm free (EPH-I0677)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The return arm wires a phantom sequential edge into the merge, so the
+    // merge sees a non-freeing predecessor. That predecessor is unreachable
+    // past the return and must not vote in the UAF meet.
+    const content =
+        \\fn uaf_return_else(allocator: std.mem.Allocator, c: bool) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        return;
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    buf[0] = 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_uaf_return_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_uaf_return_else.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA106: return arm without free upgrades cross-block double-free (EPH-I0677)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same phantom predecessor as the ZA105 case: with the return block
+    // skipped, every reachable path to the second free already freed buf, so
+    // the report is a definite double-free (err), not a conditional warning.
+    const content =
+        \\fn df_return_else(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        return;
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_df_return_else.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_df_return_else.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+        const help = issue.help orelse return error.MissingHelp;
+        try std.testing.expectEqualStrings("remove duplicate free", help);
+    }
 }
 
 test "ZA106: defer free plus direct free is a double-free" {

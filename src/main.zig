@@ -624,7 +624,7 @@ const CFPattern = enum {
     while_start, // while (...) {
     for_start, // for (...) {
     switch_start, // switch (...) {
-    switch_arm, // .X => or else =>
+    switch_arm, // any prong line: .X, 1, "a", 0...9, _, else, ... (EPH-I0679)
     try_expr, // try ...
     catch_start, // catch |err| {
     return_stmt, // return ...
@@ -683,11 +683,41 @@ fn isUnbalancedCatchBlock(trimmed: []const u8) bool {
     return open > close;
 }
 
+/// Index of the first `=>` at a code position, or null when every arrow on
+/// the line is string/char-literal or comment text. The prong arrow appears
+/// only in switch prongs in Zig, but `=>` as text lives inside literals
+/// too: an arm body line like `s = "=>";` must not read as a prong
+/// (EPH-I0679). LiteralState masks all three non-code contexts (buildCFG
+/// already strips comments. Masking here keeps the helper correct for any
+/// caller).
+fn findProngArrow(line: []const u8) ?usize {
+    var lit = types.LiteralState.forLine(line) orelse return null;
+    var i: usize = 0;
+    while (i + 1 < line.len) : (i += 1) {
+        if (lit.updateForChar(line, i) == null) continue;
+        if (line[i] == '=' and line[i + 1] == '>') return i;
+    }
+    return null;
+}
+
+/// True when a trimmed line opens a switch prong. Every prong form opens an
+/// arm block: enum literals (`.a`), integer and range prongs (`1`, `-1`,
+/// `0...9`), char and string prongs (`'a'`, `"a"`), the discard prong
+/// (`_`), and keyword/const-identifier prongs (`else`, `true`, `false`,
+/// named constants). EPH-I0679: restricting arms to `.`/`else` shapes
+/// attributed integer- and `_`-prong bodies to the switch header, whose
+/// exit bit is unconditional, so ZA607 read a maybe-uninitialized var as
+/// defined. The old `, .` clause is absorbed: a multi-item prong
+/// (`1, 2 =>`) starts with its first item's token. The arrow must sit at a
+/// code position (findProngArrow), so string content like `"x => y"` opens
+/// no phantom arm. Parenthesized comptime prongs (`(1 + 2) =>`) stay
+/// invisible: no prong starts with `(`.
 fn isSwitchArmLine(trimmed: []const u8) bool {
-    if (mem.indexOf(u8, trimmed, "=>") == null) return false;
-    return mem.startsWith(u8, trimmed, ".") or
-        mem.startsWith(u8, trimmed, "else =>") or
-        mem.indexOf(u8, trimmed, ", .") != null;
+    if (trimmed.len == 0) return false;
+    const c = trimmed[0];
+    const prong_start = c == '.' or c == '-' or c == '\'' or c == '"' or isIdent(c);
+    if (!prong_start) return false;
+    return findProngArrow(trimmed) != null;
 }
 
 fn detectCFPattern(t: []const u8) CFPattern {
@@ -1421,7 +1451,7 @@ const CFGBuildCtx = struct {
         });
     }
 
-    fn handleSwitchArm(self: *CFGBuildCtx, line: usize) !void {
+    fn handleSwitchArm(self: *CFGBuildCtx, code: []const u8, line: usize) !void {
         for (self.block_stack.items, 0..) |entry, i| {
             if (entry.block_type != .switch_block) continue;
             const switch_entry = self.block_stack.items[i];
@@ -1438,6 +1468,18 @@ const CFGBuildCtx = struct {
             try self.cfg.addEdge(switch_header, arm_block, .branch_true);
             self.current_block = arm_block;
             self.setStartLine(line);
+            // The previous block's end_line already covers this prong line
+            // (the per-line end update runs before the event walk), so
+            // whole-line attribution hands the arm's fills and reads to the
+            // header or the previous arm — an unconditional-exit block.
+            // A full-line column span claims the line for the arm instead
+            // (EPH-I0679, the EPH-I0111 same-line-arm mechanism).
+            try self.cfg.col_spans.append(self.allocator, .{
+                .line = line,
+                .start_col = 0,
+                .end_col = code.len,
+                .block = arm_block,
+            });
             break;
         }
     }
@@ -1694,7 +1736,7 @@ const CFGBuildCtx = struct {
             .while_start => try self.handleBranch(.while_block, t, line),
             .for_start => try self.handleBranch(.for_block, t, line),
             .switch_start => try self.handleSwitchStart(),
-            .switch_arm => try self.handleSwitchArm(line),
+            .switch_arm => try self.handleSwitchArm(t, line),
             .else_start, .else_if => try self.handleElse(t, line),
             .return_stmt => try self.handleReturn(),
             .block_end => try self.handleBlockEnd(line),
@@ -1817,7 +1859,7 @@ const CFGBuildCtx = struct {
     fn walkLineEvents(self: *CFGBuildCtx, pattern: CFPattern, code: []const u8, line: usize) !void {
         switch (pattern) {
             .return_stmt => return self.handleReturn(),
-            .switch_arm => return self.handleSwitchArm(line),
+            .switch_arm => return self.handleSwitchArm(code, line),
             // An exact `break;`/`continue;` line carries no brace events —
             // wire the jump directly (EPH-I0094).
             .break_stmt => return self.handleJump(.loop_break),
@@ -33888,6 +33930,86 @@ test "buildCFG: switch arm block close does not pop switch entry" {
     try std.testing.expect(cfgHasEdge(&cfg, header, arm_b, .branch_true));
 }
 
+test "buildCFG: int, range, discard, and string prongs open arm blocks (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(x: u8, s: []const u8) void {", // 1
+        "    switch (x) {", // 2
+        "        1 => {", // 3
+        "            g();", // 4
+        "        },", // 5
+        "        0...9 => {", // 6
+        "            h();", // 7
+        "        },", // 8
+        "        _ => {", // 9
+        "            i();", // 10
+        "        },", // 11
+        "    }", // 12
+        "    switch (s) {", // 13
+        "        \"a\" => {", // 14
+        "            j();", // 15
+        "        },", // 16
+        "        else => {", // 17
+        "            k();", // 18
+        "        },", // 19
+        "    }", // 20
+        "}", // 21
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // EPH-I0679: every prong form branches from its switch header. Before
+    // the fix these bodies attributed to the header (or the previous arm),
+    // whose exit bit is unconditional.
+    const int_header = findBlockForLine(&cfg, 2) orelse return error.TestUnexpectedResult;
+    const str_header = findBlockForLine(&cfg, 13) orelse return error.TestUnexpectedResult;
+    for ([_]usize{ 4, 7, 10 }) |body_line| {
+        const arm = findBlockForLine(&cfg, body_line) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(cfgHasEdge(&cfg, int_header, arm, .branch_true));
+    }
+    for ([_]usize{ 15, 18 }) |body_line| {
+        const arm = findBlockForLine(&cfg, body_line) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(cfgHasEdge(&cfg, str_header, arm, .branch_true));
+    }
+}
+
+test "buildCFG: arrow text in a body string opens no phantom arm (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(x: u8) void {", // 1
+        "    switch (x) {", // 2
+        "        .a => {", // 3
+        "            s = \"=>\";", // 4: string data, not a prong
+        "        },", // 5
+        "        .b => {", // 6
+        "            g();", // 7
+        "        },", // 8
+        "    }", // 9
+        "}", // 10
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // EPH-I0679 quote-mask guard: exactly two arms branch from the header.
+    // An unmasked `=>` scan would read line 4 as a prong and open a third.
+    const header = findBlockForLine(&cfg, 2) orelse return error.TestUnexpectedResult;
+    var arm_count: usize = 0;
+    for (cfg.edges.items) |e| {
+        if (e.from == header and e.kind == .branch_true) arm_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), arm_count);
+}
+
 test "buildCFG: quoted braces do not corrupt depth; comment close counts" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -37640,6 +37762,219 @@ test "ZA607: multi-line switch header without else prong keeps fill conditional"
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_multiline_noelse.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: int prong fill does not cover the discard arm (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0679: integer and `_` prongs opened no arm block, so the fill
+    // attributed to the switch header (unconditional exit) and the read on
+    // the `_` path stayed silent. Both prongs must open real arm blocks.
+    const content =
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn f(v: u8) void {
+        \\    var x: u8 = undefined;
+        \\    switch (v) {
+        \\        1 => { x = 1; },
+        \\        _ => {},
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0679_int.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0679_int.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fills in int and discard arms stay silent (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0679 control: every arm fills x, so the read is safe before and
+    // after the prong-visibility fix.
+    const content =
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn f(v: u8) void {
+        \\    var x: u8 = undefined;
+        \\    switch (v) {
+        \\        1 => { x = 1; },
+        \\        _ => { x = 2; },
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0679_fill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0679_fill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: range prong and else fills stay silent (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0679 control: the range prong and the else arm both fill x.
+    const content =
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn f(v: u8) void {
+        \\    var x: u8 = undefined;
+        \\    switch (v) {
+        \\        0...9 => { x = 1; },
+        \\        else => { x = 2; },
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0679_range.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0679_range.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: range prong fill with empty else flags the read (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0679: the range prong was invisible, so its fill attributed to
+    // the switch header and hid the empty-else path from the meet.
+    const content =
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn f(v: u8) void {
+        \\    var x: u8 = undefined;
+        \\    switch (v) {
+        \\        0...9 => { x = 1; },
+        \\        else => {},
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0679_range_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0679_range_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string prong body does not fill the header (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0679: a string prong opened no arm block, so its fill passed as
+    // unconditional and the discard path's read stayed silent.
+    const content =
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn f(s: []const u8) void {
+        \\    var x: u8 = undefined;
+        \\    switch (s) {
+        \\        "a" => { x = 1; },
+        \\        _ => {},
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0679_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0679_string.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: arrow text inside an arm string stays silent (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0679 quote-mask guard: the `=>` inside the string literal is
+    // text, not a prong arrow. Both arms fill x, so the read stays silent.
+    const content =
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn f(v: u8) void {
+        \\    var x: u8 = undefined;
+        \\    var s: []const u8 = undefined;
+        \\    switch (v) {
+        \\        .a => { x = 1; s = "=>"; },
+        \\        .b => { x = 2; },
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0679_arrowstr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0679_arrowstr.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested int prongs pin the outer-switch attachment (EPH-I0679)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pins the documented approximation of EPH-I0318: handleSwitchArm scans
+    // the block stack outermost-first, so the inner switch's integer prongs
+    // attach as arm blocks to the OUTER switch header. Every path fills x,
+    // so the correct verdict is 0. The approximation flags 1 (a phantom
+    // path from the outer header reaches the merge unfilled). The I0318
+    // fix (innermost-first scan) must flip this pin deliberately.
+    const content =
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn f(a: u8, b: u8) void {
+        \\    var x: u8 = undefined;
+        \\    switch (a) {
+        \\        1 => {
+        \\            switch (b) {
+        \\                10 => { x = 1; },
+        \\                _ => { x = 2; },
+        \\            }
+        \\        },
+        \\        _ => { x = 3; },
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0679_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0679_nested.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

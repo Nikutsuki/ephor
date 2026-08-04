@@ -11444,34 +11444,6 @@ fn isBuiltinDest(t: []const u8, var_name: []const u8, builtin: []const u8) bool 
     return end >= t.len or !isIdent(t[end]);
 }
 
-/// Check for discarded error union results
-fn checkDiscardedResult(
-    t: []const u8,
-    path: []const u8,
-    line: usize,
-    type_ctx: ?*const TypeContext,
-) ?Issue {
-    const starts_discard = mem.startsWith(u8, t, "_ = ");
-    const has_call = mem.indexOf(u8, t, "()") != null;
-    if (!starts_discard or !has_call) return null;
-    if (compat.containsOptionalMethod(t)) return null;
-    if (isSafeToDiscard(t, type_ctx)) return null;
-    // _ = try func() propagates errors - only discards success value
-    if (mem.indexOf(u8, t, "try ") != null) return null;
-    const has_catch = mem.indexOf(u8, t, " catch ") != null;
-    const has_catch2 = mem.indexOf(u8, t, "catch ") != null;
-    if (has_catch or has_catch2) return null;
-    return .{
-        .file = path,
-        .line = line,
-        .col = 1,
-        .severity = .note,
-        .rule = RULE_IGNORED_ERROR,
-        .message = "function result discarded with '_ ='",
-        .help = "if error union, use try/catch; if intentional discard, this can be ignored",
-    };
-}
-
 /// State for error analysis of a single file
 const ErrorAnalysisState = struct {
     in_test_block: bool = false,
@@ -12256,7 +12228,6 @@ const ErrorLineCtx = struct {
     pending: *PendingUndefinedSet,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
-    type_ctx: ?*const TypeContext,
     func_name: []const u8,
     preceding_lines: ?[]const []const u8,
     next_lines: []const []const u8,
@@ -12322,8 +12293,8 @@ fn checkLineErrors(ctx: ErrorLineCtx) !void {
     if (!ctx.skip_undefined) {
         try trackNewUndefined(undef_ctx, ctx.pending, ctx.issues, ctx.allocator);
     }
-    const discarded = checkDiscardedResult(ctx.t, ctx.path, ctx.line, ctx.type_ctx);
-    if (discarded) |i| try ctx.issues.append(ctx.allocator, i);
+    // ZA205 emits only from analyzeIgnoredErrors (EPH-I0408). A second
+    // emitter here double-reported every zero-arg discard.
     // ZA208: @panic() detection — suppress in test blocks and test files
     if (!ctx.in_test and !isTestFilePath(ctx.path)) {
         if (checkPanic(ctx.t, ctx.path, ctx.line)) |i| {
@@ -12434,7 +12405,6 @@ const FileErrorScanCtx = struct {
     path: []const u8,
     all_lines: []const []const u8,
     state: *ErrorAnalysisState,
-    type_ctx: *const TypeContext,
 };
 
 /// Analyze one line for error issues within the per-file scan. Returns
@@ -12467,7 +12437,6 @@ fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: u
         .pending = &ctx.state.pending_undefined,
         .issues = ctx.issues,
         .allocator = ctx.allocator,
-        .type_ctx = ctx.type_ctx,
         .func_name = ctx.state.current_func_name,
         .preceding_lines = preceding,
         .next_lines = next_lines,
@@ -12490,10 +12459,6 @@ fn analyzeFileErrors(
     issues: *std.ArrayListUnmanaged(Issue),
     a: FileAnalysis,
 ) !void {
-    // Build type-aware context for this file (struct methods, var types, stdlib vars)
-    var type_ctx = try parseFileTypeContext(allocator, a.content);
-    defer type_ctx.deinit(allocator);
-
     // Collect all lines for preceding-line lookback (ZA202 multi-line suppression)
     var all_lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer all_lines_list.deinit(allocator);
@@ -12510,7 +12475,6 @@ fn analyzeFileErrors(
         .path = a.path,
         .all_lines = all_lines,
         .state = &state,
-        .type_ctx = &type_ctx,
     };
     for (all_lines, 0..) |line, line_idx| {
         try scanFileErrorLine(&ctx, line, line_idx);
@@ -18526,14 +18490,19 @@ const IgnoredErrorFileCtx = struct {
     type_ctx: *const TypeContext,
 };
 
-/// Check a single line for ignored error pattern
+/// Check a single line for the ignored-error pattern. Canonical ZA205
+/// implementation (EPH-I0408): the only emitter of RULE_IGNORED_ERROR. The
+/// any-call gate is deliberate — `_ = foo(x);` discards a result the same
+/// way `_ = foo();` does. isSafeToDiscard carries the cleanup-pattern and
+/// C-FFI suppressions the deleted line-based twin had.
 fn checkIgnoredError(
     ctx: IgnoredErrorFileCtx,
     t: []const u8,
     line_num: usize,
 ) !void {
     const is_discard = mem.startsWith(u8, t, "_ = ") and mem.indexOf(u8, t, "(") != null;
-    if (!is_discard or hasErrorHandling(t) or isSafeBuiltin(t, ctx.type_ctx)) return;
+    if (!is_discard or hasErrorHandling(t)) return;
+    if (isSafeBuiltin(t, ctx.type_ctx) or isSafeToDiscard(t, ctx.type_ctx)) return;
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.file_path,
         .line = line_num,
@@ -32804,6 +32773,156 @@ test "ZA205 type-aware: multiple user types in same file resolved independently"
         }
     }
     try std.testing.expectEqual(@as(usize, 1), za205_count);
+}
+
+// ============================================================================
+// ZA205 dedup tests (EPH-I0408): the check and errors commands merge the
+// analyzeErrors list with the analyzeIgnoredErrors list. One discard must
+// produce exactly one ZA205 across the merge.
+// ============================================================================
+
+/// Count ZA205 findings the way the check command reports them: the
+/// analyzeErrors list plus the analyzeIgnoredErrors list on the same graph.
+fn countCheckMergeZA205(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !usize {
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var err_issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&err_issues, allocator);
+    var ignored = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&ignored, allocator);
+    return countRuleIssues(err_issues.items, path, RULE_IGNORED_ERROR) +
+        countRuleIssues(ignored.items, path, RULE_IGNORED_ERROR);
+}
+
+/// Count ZA205 findings from the canonical analyzeIgnoredErrors alone.
+fn countAnalyzerZA205(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !usize {
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, path, content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, path), {});
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+    return countRuleIssues(issues.items, path, RULE_IGNORED_ERROR);
+}
+
+test "ZA205: check merge reports one finding per zero-arg discard (EPH-I0408)" {
+    const allocator = std.testing.allocator;
+    // Pre-fix the zero-arg shape matched both ZA205 implementations and the
+    // merge printed the same note twice.
+    const content =
+        \\fn riskyOp() !void {
+        \\    return;
+        \\}
+        \\fn use() void {
+        \\    _ = riskyOp();
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countCheckMergeZA205(allocator, "i0408_zeroarg.zig", content),
+    );
+}
+
+test "ZA205: check merge reports one finding per with-arg discard (EPH-I0408)" {
+    const allocator = std.testing.allocator;
+    // A call with arguments matched only the any-call gate before the fix,
+    // so this shape yielded one finding and must keep yielding one.
+    const content =
+        \\fn riskyOp(x: u32) !void {
+        \\    _ = x;
+        \\}
+        \\fn use() void {
+        \\    _ = riskyOp(42);
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countCheckMergeZA205(allocator, "i0408_witharg.zig", content),
+    );
+}
+
+test "ZA205: discard inside defer block stays silent (EPH-I0408)" {
+    const allocator = std.testing.allocator;
+    // Pre-fix the analyzeErrors line scan fired on zero-arg discards inside
+    // defer blocks (it never consulted the defer state) while
+    // analyzeIgnoredErrors skipped them. Only the skip behavior survives.
+    const content =
+        \\fn riskyOp() !void {
+        \\    return;
+        \\}
+        \\fn use() void {
+        \\    defer {
+        \\        _ = riskyOp();
+        \\    }
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countCheckMergeZA205(allocator, "i0408_defer.zig", content),
+    );
+}
+
+test "ZA205: cleanup-method discard stays silent (EPH-I0408)" {
+    const allocator = std.testing.allocator;
+    // `_ = list.deinit();` discards a void cleanup call, not an error. The
+    // surviving implementation keeps the deleted one's cleanup-pattern
+    // suppression, so an unknown receiver stays silent.
+    const content =
+        \\fn use(list: anytype) void {
+        \\    _ = list.deinit();
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countAnalyzerZA205(allocator, "i0408_cleanup.zig", content),
+    );
+}
+
+test "ZA205: try and catch discards stay silent (EPH-I0408)" {
+    const allocator = std.testing.allocator;
+    // try propagates the error and catch consumes it, so neither discard
+    // form is an ignored-error finding.
+    const content =
+        \\fn riskyOp() !void {
+        \\    return;
+        \\}
+        \\fn useTry() !void {
+        \\    _ = try riskyOp();
+        \\}
+        \\fn useCatch() void {
+        \\    _ = riskyOp() catch {};
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countAnalyzerZA205(allocator, "i0408_try_catch.zig", content),
+    );
+}
+
+test "ZA205: builtin discard stays silent (EPH-I0408)" {
+    const allocator = std.testing.allocator;
+    // @memcpy returns void, so discarding it is not an ignored error.
+    const content =
+        \\fn use(dst: []u8, src: []const u8) void {
+        \\    _ = @memcpy(dst, src);
+        \\}
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countAnalyzerZA205(allocator, "i0408_builtin.zig", content),
+    );
 }
 
 // ============================================================================

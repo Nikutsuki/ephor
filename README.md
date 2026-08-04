@@ -1078,7 +1078,7 @@ If no tier resolved the call, the discard is reported (conservative: better to f
 
 | Function | Used By | Tiers Used |
 |----------|---------|------------|
-| `isSafeToDiscard` | `checkDiscardedResult` (ZA205 in `analyzeFileErrors`) | 1→2→3→4 |
+| `isSafeToDiscard` | `checkIgnoredError` (ZA205 in `analyzeIgnoredErrorsInFile`) | 1→2→3→4 |
 | `isSafeBuiltin` | `checkIgnoredError` (ZA205 in `analyzeIgnoredErrorsInFile`) | builtins→2→3→fields→optionals |
 | `isKnownVoidFunction` | Error analysis (confirms void return) | 1→2→3→log patterns |
 | `checkMethodTransfer` | `processAllocTracking` (ZA101-106 memory) | stdlib_vars only (no Tier 2) |

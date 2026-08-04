@@ -1800,6 +1800,19 @@ const CFGBuildCtx = struct {
         span_mark: usize,
     };
 
+    /// Per-line event-walk state: the span prelude's recording flag and
+    /// rollback mark, the advancing span column, and the opener latch.
+    /// Bundled so one event step stays inside the param limit (EPH-I0761).
+    const EventWalkCtx = struct {
+        pattern: CFPattern,
+        code: []const u8,
+        line: usize,
+        record_spans: bool,
+        span_mark: usize,
+        span_col: usize = 0,
+        opener_dispatched: bool = false,
+    };
+
     /// Decide and start span recording for the line. A plain-else line
     /// (`else {`, not an else-if chain, not `else return`) records the
     /// column spans that split the line's ownership across the branch,
@@ -1871,39 +1884,56 @@ const CFGBuildCtx = struct {
         }
         const events = self.event_scratch.items;
         const prelude = try self.beginLineSpans(pattern, code, line);
-        var record_spans = prelude.record_spans;
-        var opener_dispatched = false;
-        var span_col: usize = 0;
+        var walk: EventWalkCtx = .{
+            .pattern = pattern,
+            .code = code,
+            .line = line,
+            .record_spans = prelude.record_spans,
+            .span_mark = prelude.span_mark,
+        };
         for (events, 0..) |event, idx| {
-            if (record_spans) try self.advanceSpan(line, &span_col, event);
-            switch (event.kind) {
-                .open_control => {
-                    if (opener_dispatched) continue;
-                    opener_dispatched = true;
-                    if (isControlOpener(pattern))
-                        try self.dispatchPattern(pattern, code, line);
-                },
-                .else_keyword => {
-                    if (record_spans and !self.elseClaimsIfEntry()) {
-                        self.cfg.col_spans.shrinkRetainingCapacity(prelude.span_mark);
-                        record_spans = false;
-                    }
-                    opener_dispatched = true;
-                    try self.handleElse(code, line);
-                },
-                .close_control, .close_virtual => {
-                    try self.closeBodyMarkers(event);
-                    if (idx + 1 < events.len and events[idx + 1].kind == .else_keyword)
-                        continue;
-                    try self.handleBlockEndOrDefer(line);
-                },
-            }
+            const next_is_else = idx + 1 < events.len and
+                events[idx + 1].kind == .else_keyword;
+            try self.walkOneEvent(&walk, event, next_is_else);
         }
-        if (record_spans) try self.recordTrailingSpan(line, span_col, code.len);
+        if (walk.record_spans) try self.recordTrailingSpan(line, walk.span_col, code.len);
         // Opener whose control `{` is on a later line (Allman / multi-line
         // condition): push the entry now; the pending mark claims that brace.
-        if (!opener_dispatched and isControlOpener(pattern))
+        if (!walk.opener_dispatched and isControlOpener(pattern))
             try self.dispatchPattern(pattern, code, line);
+    }
+
+    /// Advance the span to one event's boundary and dispatch its CFG
+    /// handler. A close directly before an `.else_keyword` defers to
+    /// handleElse. Every other close pops the block (EPH-I0761).
+    fn walkOneEvent(
+        self: *CFGBuildCtx,
+        walk: *EventWalkCtx,
+        event: ControlEvent,
+        next_is_else: bool,
+    ) !void {
+        if (walk.record_spans) try self.advanceSpan(walk.line, &walk.span_col, event);
+        switch (event.kind) {
+            .open_control => {
+                if (walk.opener_dispatched) return;
+                walk.opener_dispatched = true;
+                if (isControlOpener(walk.pattern))
+                    try self.dispatchPattern(walk.pattern, walk.code, walk.line);
+            },
+            .else_keyword => {
+                if (walk.record_spans and !self.elseClaimsIfEntry()) {
+                    self.cfg.col_spans.shrinkRetainingCapacity(walk.span_mark);
+                    walk.record_spans = false;
+                }
+                walk.opener_dispatched = true;
+                try self.handleElse(walk.code, walk.line);
+            },
+            .close_control, .close_virtual => {
+                try self.closeBodyMarkers(event);
+                if (next_is_else) return;
+                try self.handleBlockEndOrDefer(walk.line);
+            },
+        }
     }
 
     /// Consume same-line body classifications at a close event: a virtual
@@ -7886,18 +7916,20 @@ const ImportGraph = struct {
                 },
                 .directory => {
                     defer self.allocator.free(path);
-                    if (isScanSkipDir(entry.name)) continue;
-                    var subdir = dir.openDir(
-                        global_io.?,
-                        entry.name,
-                        .{ .iterate = true },
-                    ) catch continue;
+                    var subdir = openSubdir(dir, entry.name) orelse continue;
                     defer subdir.close(global_io.?);
                     try self.scanRecursive(subdir, path, depth + 1);
                 },
                 else => self.allocator.free(path),
             }
         }
+    }
+
+    /// Open one directory entry for descent, or null when the walk must
+    /// skip it (skip-list name) or cannot open it (EPH-I0761).
+    fn openSubdir(dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
+        if (isScanSkipDir(name)) return null;
+        return dir.openDir(global_io.?, name, .{ .iterate = true }) catch null;
     }
 
     /// Edge-triggered corpus-size warning (EPH-I0199). The graph holds
@@ -10531,12 +10563,27 @@ fn isInTestContext(path: []const u8, in_test_block: bool) bool {
     return false;
 }
 
+/// True when the text contains any of the patterns.
+fn containsAnyPattern(t: []const u8, patterns: []const []const u8) bool {
+    for (patterns) |pat| {
+        if (mem.indexOf(u8, t, pat) != null) return true;
+    }
+    return false;
+}
+
+/// True for a `_ = ExternalFunction(...)` discard: an uppercase callee after
+/// the `_ = ` prefix is C FFI or an extern symbol, whose result is ignorable.
+fn isCFFIDiscard(t: []const u8) bool {
+    if (t.len <= 4) return false;
+    // The guard leaves t[4..] non-empty, so index 0 always exists.
+    const after_discard = t[4..]; // Skip "_ = "
+    return after_discard[0] >= 'A' and after_discard[0] <= 'Z';
+}
+
 /// Check if a discarded result is safe (void/non-error return type)
 fn isSafeToDiscard(t: []const u8, type_ctx: ?*const TypeContext) bool {
     // Stdlib cleanup patterns (void methods: .free, .destroy, .deinit) — always safe
-    for (compat.getCleanupPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) return true;
-    }
+    if (containsAnyPattern(t, compat.getCleanupPatterns())) return true;
     // Return-type resolution (definitive when available)
     if (type_ctx) |ctx| {
         const rk = resolveReturnKind(ctx, t);
@@ -10555,18 +10602,8 @@ fn isSafeToDiscard(t: []const u8, type_ctx: ?*const TypeContext) bool {
         ".parseEscapeSequence(", // Parser returning parsed value
         "A(", // C FFI / Windows API (uppercase)
     };
-    for (non_stdlib_safe) |pattern| {
-        if (mem.indexOf(u8, t, pattern) != null) return true;
-    }
-    // C FFI: _ = ExternalFunction(...) - uppercase function name after _ =
-    if (t.len > 4) {
-        const after_discard = t[4..]; // Skip "_ = "
-        if (after_discard.len > 0 and after_discard[0] >= 'A' and after_discard[0] <= 'Z') {
-            // Starts with uppercase - likely C FFI or extern function
-            return true;
-        }
-    }
-    return false;
+    if (containsAnyPattern(t, &non_stdlib_safe)) return true;
+    return isCFFIDiscard(t);
 }
 
 const TestBlockState = struct {
@@ -21770,18 +21807,28 @@ fn countIndent(line: []const u8) usize {
     return indent;
 }
 
+/// C translation markers that identify auto-generated C import files.
+const cimport_markers = [_][]const u8{ "__builtin_", "enum_unnamed_", "@cImport" };
+
 /// Check if file is an auto-generated C import file (should be skipped)
 fn isCImportFile(file_path: []const u8, content: []const u8) bool {
     // Skip files ending in cimport.zig
     if (mem.endsWith(u8, file_path, "cimport.zig")) return true;
 
-    // Skip any file with C translation markers (not just /deps/)
-    // Auto-generated C bindings can be anywhere (e.g., capy's gtk.zig)
-    if (mem.indexOf(u8, content, "__builtin_") != null or
-        mem.indexOf(u8, content, "enum_unnamed_") != null or
-        mem.indexOf(u8, content, "@cImport") != null)
-    {
-        return true;
+    // Skip any file with C translation markers in code position (not just
+    // /deps/). Auto-generated C bindings can be anywhere (e.g., capy's
+    // gtk.zig). The raw substring pass is an absence pre-filter only
+    // (EPH-I0758): a marker inside string data, a comment, or a \\
+    // multiline body is text, not a marker. Ephor's own main.zig carries
+    // all three markers as string-literal data in this predicate and its
+    // test fixtures, so a raw match must not skip the file.
+    if (!containsAnyPattern(content, &cimport_markers)) return false;
+
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        for (cimport_markers) |marker| {
+            if (findTagInCode(line, marker, 0) != null) return true;
+        }
     }
     return false;
 }
@@ -26655,6 +26702,662 @@ fn scanPath(g: *ImportGraph, path: []const u8) !void {
 // Main
 // ============================================================================
 
+/// Per-run state shared by the command handlers. Handlers mutate the three
+/// flag fields through the ctx pointer; main reads them in the epilogue to
+/// pick the exit path. The bundle keeps every handler at one parameter.
+const RunCtx = struct {
+    alloc: Allocator,
+    cfg: *Config,
+    /// Display root for relative paths in findings output.
+    base_path: []const u8,
+    /// Suppression-fact cache, built lazily per (file, rule). main owns it.
+    ignore_cache: *IgnoreCache,
+    /// Run-wide suppression accounting (RED3-3). Every printIssues pass
+    /// funnels its dropped findings here.
+    suppression: SuppressionStats = .{},
+    /// Usage-error exit (missing entries, config/init/install failures).
+    should_exit_error: bool = false,
+    /// Strict CI gate: findings met the --strict/--fail-on level.
+    strict_fail: bool = false,
+    /// Runtime-prompt abort: return from main without the epilogue (no
+    /// update notification, no exit-code application).
+    abort_epilogue: bool = false,
+
+    /// Shape the run state for printIssues/exportIssues.
+    fn reportOut(self: *RunCtx, graph: ?*const ImportGraph) ReportOutCtx {
+        return .{
+            .base_path = self.base_path,
+            .allocator = self.alloc,
+            .cfg = self.cfg,
+            .graph = graph,
+            .ignore_cache = self.ignore_cache,
+            .suppression = &self.suppression,
+        };
+    }
+};
+
+/// Command handler signatures: analysis commands fail (OOM, IO), the
+/// help/version/init/install/upgrade commands cannot. The union keeps
+/// each handler's return type honest instead of forcing an impossible
+/// error union on the infallible five (ZA209).
+const CommandHandler = union(enum) {
+    infallible: *const fn (*RunCtx) void,
+    fallible: *const fn (*RunCtx) anyerror!void,
+};
+
+/// One command's dispatch slot: the handler plus whether the run checks
+/// for a newer ephor release first. Folding the update-check gate into the
+/// table removes the old gate switch (one switch per enum).
+const CommandEntry = struct {
+    check_updates: bool,
+    handler: CommandHandler,
+};
+
+/// Command dispatch table. The EnumArray lookup replaces the 14-prong
+/// command switch so main stays a flat shell: each prong is a branch
+/// (EPH-I0451), and the switch alone would break the branch budget main
+/// enforces everywhere else. EnumArray.init demands every Command tag, so
+/// adding a command without a slot is a compile error.
+const command_table = std.EnumArray(Command, CommandEntry).init(.{
+    .help = .{ .check_updates = false, .handler = .{ .infallible = handleHelp } },
+    .version = .{ .check_updates = false, .handler = .{ .infallible = handleVersion } },
+    .init = .{ .check_updates = false, .handler = .{ .infallible = handleInit } },
+    .install = .{ .check_updates = false, .handler = .{ .infallible = handleInstall } },
+    .upgrade = .{ .check_updates = false, .handler = .{ .infallible = handleUpgrade } },
+    .orphans = .{ .check_updates = true, .handler = .{ .fallible = handleOrphans } },
+    .memory = .{ .check_updates = true, .handler = .{ .fallible = handleMemory } },
+    .errors = .{ .check_updates = true, .handler = .{ .fallible = handleErrors } },
+    .unused = .{ .check_updates = true, .handler = .{ .fallible = handleUnused } },
+    .complexity = .{ .check_updates = true, .handler = .{ .fallible = handleComplexity } },
+    .fmt_check = .{ .check_updates = true, .handler = .{ .fallible = handleFmtCheck } },
+    .stats = .{ .check_updates = true, .handler = .{ .fallible = handleStats } },
+    .runtime = .{ .check_updates = true, .handler = .{ .fallible = handleRuntime } },
+    .check = .{ .check_updates = true, .handler = .{ .fallible = handleCheck } },
+});
+
+/// `help` command: print the usage text.
+fn handleHelp(_: *RunCtx) void {
+    printHelp();
+}
+
+/// `version` command: print the version banner.
+fn handleVersion(_: *RunCtx) void {
+    std.debug.print("Ephor v{s} - The overseer of your Zig code\n", .{EPHOR_VERSION});
+}
+
+/// `init` command: write a default ephor.json. --build also prints the
+/// build.zig integration snippet.
+fn handleInit(ctx: *RunCtx) void {
+    writeDefaultConfig() catch |err| {
+        std.debug.print("error: failed to create config: {}\n", .{err});
+        ctx.should_exit_error = true;
+    };
+    if (ctx.cfg.init_build and !ctx.should_exit_error) runInstallAfterInit(ctx);
+}
+
+/// The init --build follow-up: run the installer against the cwd project.
+fn runInstallAfterInit(ctx: *RunCtx) void {
+    runInstallCommand(ctx.alloc, std.Io.Dir.cwd(), ctx.cfg.install_version) catch |err| {
+        std.debug.print("error: failed to run install: {}\n", .{err});
+        ctx.should_exit_error = true;
+    };
+}
+
+/// `install` command: add ephor to the cwd project's build.zig.
+fn handleInstall(ctx: *RunCtx) void {
+    runInstallCommand(ctx.alloc, std.Io.Dir.cwd(), ctx.cfg.install_version) catch |err| {
+        std.debug.print("error: failed to install: {}\n", .{err});
+        ctx.should_exit_error = true;
+    };
+}
+
+/// `upgrade` command: update ephor to the latest (or --version=pinned) tag.
+fn handleUpgrade(ctx: *RunCtx) void {
+    runUpgradeCommand(
+        ctx.alloc,
+        std.Io.Dir.cwd(),
+        ctx.cfg.install_version,
+        ctx.cfg.force_upgrade,
+    ) catch |err| {
+        std.debug.print("error: failed to upgrade: {}\n", .{err});
+        ctx.should_exit_error = true;
+    };
+}
+
+/// Usage error shared by `orphans` and `check`: both need entry points.
+fn printNoEntriesError() void {
+    std.debug.print("error: no entry points found\n", .{});
+    std.debug.print("  hint: create ephor.json with 'entries' array\n", .{});
+    std.debug.print("  run: ephor init\n", .{});
+}
+
+/// ZA502 skipped files ride the structure list (EPH-I0150): same
+/// graph-owned lifetime, static messages. The merge moves items, so the
+/// skipped list frees only its array.
+fn mergeSkippedIssues(
+    alloc: Allocator,
+    g: *ImportGraph,
+    into: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var skipped_issues = try g.getSkippedFileIssues(alloc);
+    defer skipped_issues.deinit(alloc);
+    for (skipped_issues.items) |si| try into.append(alloc, si);
+}
+
+/// `orphans` command: report files no entry point can reach.
+fn handleOrphans(ctx: *RunCtx) !void {
+    if (ctx.cfg.entries.items.len == 0) {
+        printNoEntriesError();
+        ctx.should_exit_error = true;
+        return;
+    }
+    if (ctx.cfg.verbose) {
+        std.debug.print("Detected {d} entry points:\n", .{ctx.cfg.entries.items.len});
+        for (ctx.cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
+    }
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    for (ctx.cfg.entries.items) |e| try g.markReachable(e);
+    try g.markBuildPathReferences(ctx.cfg);
+    var issues = try g.getOrphanIssues(ctx.alloc, ctx.cfg);
+    defer deinitIssues(&issues, ctx.alloc);
+    try mergeSkippedIssues(ctx.alloc, &g, &issues);
+    sortIssuesByFile(issues.items);
+    const c = printIssues(issues.items, "orphans", ctx.reportOut(&g));
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+}
+
+/// `memory` command: CFG-based allocation checks plus the AST tier (ZA111).
+fn handleMemory(ctx: *RunCtx) !void {
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    var issues = try analyzeCFGMemory(ctx.alloc, &g);
+    defer deinitIssues(&issues, ctx.alloc);
+    // AST tier (ZA111) is a memory-family rule — include it here too.
+    // Stats stay null: check is the coverage surface (its summary carries
+    // the parsed/skipped counts, EPH-I0200). memory prints findings only.
+    var ast_issues = try analyzeAstTier(ctx.alloc, &g, null);
+    defer ast_issues.deinit(ctx.alloc);
+    for (ast_issues.items) |ai| try issues.append(ctx.alloc, ai);
+    ast_issues.items.len = 0; // ownership moved to issues
+    const c = printIssues(issues.items, "memory", ctx.reportOut(&g));
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+}
+
+/// `errors` command: error-handling findings plus discarded error unions.
+fn handleErrors(ctx: *RunCtx) !void {
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    var issues = try analyzeErrors(ctx.alloc, &g);
+    defer deinitIssues(&issues, ctx.alloc);
+    // ZA205: discarded error union results
+    var ignored = try analyzeIgnoredErrors(ctx.alloc, &g);
+    defer deinitIssues(&ignored, ctx.alloc);
+    // Merge ignored errors into issues for unified output
+    for (ignored.items) |item| {
+        try issues.append(ctx.alloc, item);
+    }
+    // Clear ignored without deiniting items (now owned by issues)
+    ignored.items.len = 0;
+    const c = printIssues(issues.items, "errors", ctx.reportOut(&g));
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+}
+
+/// `unused` command: dead-code findings.
+fn handleUnused(ctx: *RunCtx) !void {
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    var issues = try analyzeUnused(ctx.alloc, &g);
+    defer deinitIssues(&issues, ctx.alloc);
+    const c = printIssues(issues.items, "unused", ctx.reportOut(&g));
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+}
+
+/// `complexity` command: function-size and branch-metric findings.
+fn handleComplexity(ctx: *RunCtx) !void {
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    var issues = try analyzeComplexity(ctx.alloc, &g, ctx.cfg.thresholds);
+    defer deinitIssues(&issues, ctx.alloc);
+    const c = printIssues(issues.items, "complexity", ctx.reportOut(&g));
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+}
+
+/// `fmt-check` command: zig fmt compliance findings.
+fn handleFmtCheck(ctx: *RunCtx) !void {
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var issues = try runFmtCheck(ctx.alloc, ctx.cfg.path);
+    defer deinitIssues(&issues, ctx.alloc);
+    const c = printIssues(issues.items, "format", ctx.reportOut(null));
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+}
+
+/// `stats` command: project scan counters, no findings.
+fn handleStats(ctx: *RunCtx) !void {
+    var g = ImportGraph.init(ctx.alloc);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    printStats(g.getStats(), ctx.cfg.format);
+}
+
+/// Interactive gate for `runtime`: the analysis compiles and executes the
+/// target, so the user confirms unless --yes was passed. Returns false on
+/// any answer other than y/Y (EOF included).
+fn confirmRuntime(ctx: *const RunCtx) bool {
+    if (ctx.cfg.auto_approve) return true;
+    const cmd_str = ctx.cfg.runtime_command orelse "zig build test";
+    std.debug.print(
+        \\
+        \\WARNING: Runtime analysis will COMPILE AND EXECUTE code in:
+        \\  {s}
+        \\
+        \\Command: {s}
+        \\
+        \\This runs untrusted code with your user privileges.
+        \\Only run this on projects you trust.
+        \\
+        \\Proceed? [y/N]
+    , .{ ctx.base_path, cmd_str });
+    var read_buf: [16]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().reader(global_io.?, &read_buf);
+    const n = stdin_reader.interface.readSliceShort(&read_buf) catch 0;
+    if (n == 0 or (read_buf[0] != 'y' and read_buf[0] != 'Y')) {
+        std.debug.print("Aborted.\n", .{});
+        return false;
+    }
+    return true;
+}
+
+/// `runtime` command: dynamic analysis under the project's own test run.
+/// A declined prompt skips the epilogue (the pre-split bare return).
+fn handleRuntime(ctx: *RunCtx) !void {
+    if (!confirmRuntime(ctx)) {
+        ctx.abort_epilogue = true;
+        return;
+    }
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var issues = try runRuntimeAnalysis(
+        ctx.alloc,
+        ctx.cfg.path,
+        ctx.cfg.verbose,
+        ctx.cfg.runtime_command,
+    );
+    defer deinitIssues(&issues, ctx.alloc);
+    const c = printIssues(issues.items, "runtime", ctx.reportOut(null));
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+}
+
+/// Every findings list the `check` report consumes, plus the AST-tier
+/// coverage counters. deinit releases the item payloads the same way the
+/// pre-split per-list defers did.
+const CheckFindings = struct {
+    orphan_issues: std.ArrayListUnmanaged(Issue),
+    cfg_mem_issues: std.ArrayListUnmanaged(Issue),
+    err_issues: std.ArrayListUnmanaged(Issue),
+    ignored_err_issues: std.ArrayListUnmanaged(Issue),
+    unused_issues: std.ArrayListUnmanaged(Issue),
+    cx_issues: std.ArrayListUnmanaged(Issue),
+    fmt_issues: std.ArrayListUnmanaged(Issue),
+    style_issues: std.ArrayListUnmanaged(Issue),
+    naming_issues: std.ArrayListUnmanaged(Issue),
+    test_issues: std.ArrayListUnmanaged(Issue),
+    conc_issues: std.ArrayListUnmanaged(Issue),
+    ast_stats: ast_tier.Stats,
+
+    fn deinit(self: *CheckFindings, alloc: Allocator) void {
+        deinitIssues(&self.orphan_issues, alloc);
+        deinitIssues(&self.cfg_mem_issues, alloc);
+        deinitIssues(&self.err_issues, alloc);
+        deinitIssues(&self.ignored_err_issues, alloc);
+        deinitIssues(&self.unused_issues, alloc);
+        deinitIssues(&self.cx_issues, alloc);
+        deinitIssues(&self.fmt_issues, alloc);
+        deinitIssues(&self.style_issues, alloc);
+        deinitIssues(&self.naming_issues, alloc);
+        deinitIssues(&self.test_issues, alloc);
+        deinitIssues(&self.conc_issues, alloc);
+    }
+};
+
+/// The cfg_mem_issues list split by rule family: ZA8 → null-safety, ZA9 →
+/// panic, everything else → memory. ZA2 drops out (analyzeErrors owns those
+/// findings; printing both would duplicate them). The buckets hold copies,
+/// so deinit frees the bucket arrays only.
+const FilteredMemIssues = struct {
+    mem_only: std.ArrayListUnmanaged(Issue),
+    null_safety: std.ArrayListUnmanaged(Issue),
+    panic: std.ArrayListUnmanaged(Issue),
+
+    fn deinit(self: *FilteredMemIssues, alloc: Allocator) void {
+        self.mem_only.deinit(alloc);
+        self.null_safety.deinit(alloc);
+        self.panic.deinit(alloc);
+    }
+};
+
+/// Per-category print counts from one `check` run: the summary table reads
+/// the fields, the strict gate reads total().
+const CheckCounts = struct {
+    orphan: PrintCounts,
+    mem: PrintCounts,
+    ignored_err: PrintCounts,
+    err: PrintCounts,
+    null_safety: PrintCounts,
+    panic: PrintCounts,
+    unused: PrintCounts,
+    cx: PrintCounts,
+    fmt: PrintCounts,
+    naming: PrintCounts,
+    style: PrintCounts,
+    tests: PrintCounts,
+    conc: PrintCounts,
+
+    fn total(self: *const CheckCounts) PrintCounts {
+        return self.orphan
+            .add(self.mem).add(self.ignored_err)
+            .add(self.err).add(self.null_safety)
+            .add(self.panic).add(self.unused)
+            .add(self.cx).add(self.fmt)
+            .add(self.naming).add(self.style)
+            .add(self.tests).add(self.conc);
+    }
+};
+
+/// `check` command: run every analyzer over the import graph and print the
+/// merged report. The pipeline splits into scan → collect → report so each
+/// stage stays a flat orchestration.
+fn handleCheck(ctx: *RunCtx) !void {
+    if (ctx.cfg.entries.items.len == 0) {
+        printNoEntriesError();
+        ctx.should_exit_error = true;
+    }
+    if (ctx.should_exit_error) return;
+    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try buildCheckGraph(ctx, &g);
+    var findings = try collectCheckFindings(ctx, &g);
+    defer findings.deinit(ctx.alloc);
+    try reportCheckFindings(ctx, &g, &findings);
+}
+
+/// Build the check run's import graph: scan the configured path, pull in
+/// entry files outside it, then mark reachability.
+fn buildCheckGraph(ctx: *const RunCtx, g: *ImportGraph) !void {
+    try scanPath(g, ctx.cfg.path);
+    // Entry-point files outside the scanned path still feed orphan
+    // detection when checking subdirectories.
+    for (ctx.cfg.entries.items) |e| scanOutOfRootEntry(ctx, g, e);
+    for (ctx.cfg.entries.items) |e| try g.markReachable(e);
+    try g.markBuildPathReferences(ctx.cfg);
+}
+
+/// Scan one entry file that sits outside the scanned path. Boundary
+/// compare (RED4-3): entry "src-evil/x.zig" is outside path "src" and must
+/// still be scanned for orphans. EPH-I0195: this gate stays textual —
+/// ingest is the containment boundary, so out-of-root entries can only
+/// arrive here via operator channels (CLI --entry, trusted config), where
+/// outside reads are the documented RED4-3 orphan feature.
+fn scanOutOfRootEntry(ctx: *const RunCtx, g: *ImportGraph, entry: []const u8) void {
+    if (isPathAncestorOrEqual(ctx.cfg.path, entry)) return;
+    g.scanSingleFile(entry) catch |err| noteMissingEntry(ctx.cfg, entry, err);
+}
+
+/// Verbose-only note for an entry file that could not be scanned. A
+/// missing entry file is not an error.
+fn noteMissingEntry(cfg: *const Config, entry: []const u8, err: anyerror) void {
+    if (!cfg.verbose) return;
+    std.debug.print("note: entry {s} not found: {}\n", .{ entry, err });
+}
+
+/// Run every analyzer over the graph and merge the auxiliary lists
+/// (skipped files, int-cast guards, AST tier) into their report homes.
+/// errdefer mirrors the pre-split per-list defers on the error path.
+fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
+    const alloc = ctx.alloc;
+    var orphan_issues = try g.getOrphanIssues(alloc, ctx.cfg);
+    errdefer deinitIssues(&orphan_issues, alloc);
+    try mergeSkippedIssues(alloc, g, &orphan_issues);
+    sortIssuesByFile(orphan_issues.items);
+    var cfg_mem_issues = try analyzeCFGMemory(alloc, g);
+    errdefer deinitIssues(&cfg_mem_issues, alloc);
+    try mergeIntCastIssues(alloc, g, &cfg_mem_issues);
+    var err_issues = try analyzeErrors(alloc, g);
+    errdefer deinitIssues(&err_issues, alloc);
+    var unused_issues = try analyzeUnused(alloc, g);
+    errdefer deinitIssues(&unused_issues, alloc);
+    var cx_issues = try analyzeComplexity(alloc, g, ctx.cfg.thresholds);
+    errdefer deinitIssues(&cx_issues, alloc);
+    var fmt_issues = try runFmtCheck(alloc, ctx.cfg.path);
+    errdefer deinitIssues(&fmt_issues, alloc);
+    var style_issues = try analyzeStyle(alloc, g, ctx.cfg.thresholds);
+    errdefer deinitIssues(&style_issues, alloc);
+    var naming_issues = try analyzeNaming(alloc, g, ctx.cfg.error_naming);
+    errdefer deinitIssues(&naming_issues, alloc);
+    var test_issues = try analyzeTests(alloc, g);
+    errdefer deinitIssues(&test_issues, alloc);
+    var conc_issues = try analyzeConcurrency(alloc, g);
+    errdefer deinitIssues(&conc_issues, alloc);
+    var ast_stats = ast_tier.Stats{};
+    try mergeAstTierIssues(alloc, g, &ast_stats, &cfg_mem_issues);
+    noteAstTierSkips(ast_stats);
+    var ignored_err_issues = try analyzeIgnoredErrors(alloc, g);
+    errdefer deinitIssues(&ignored_err_issues, alloc);
+    return .{
+        .orphan_issues = orphan_issues,
+        .cfg_mem_issues = cfg_mem_issues,
+        .err_issues = err_issues,
+        .ignored_err_issues = ignored_err_issues,
+        .unused_issues = unused_issues,
+        .cx_issues = cx_issues,
+        .fmt_issues = fmt_issues,
+        .style_issues = style_issues,
+        .naming_issues = naming_issues,
+        .test_issues = test_issues,
+        .conc_issues = conc_issues,
+        .ast_stats = ast_stats,
+    };
+}
+
+/// ZA904 (opt-in note) rides the CFG list so it flows through the ZA9 →
+/// panic category filter and the export list. Messages are static (not
+/// owned), so the cast list frees only its array after the move.
+fn mergeIntCastIssues(
+    alloc: Allocator,
+    g: *ImportGraph,
+    into: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var cast_issues = try analyzeIntCastGuards(alloc, g);
+    defer cast_issues.deinit(alloc);
+    for (cast_issues.items) |ci| try into.append(alloc, ci);
+}
+
+/// AST tier (ZA111): merged into cfg_mem_issues so it flows through the
+/// ZA1 → memory category filter and the export list. Item ownership moves
+/// with the append, so the tier list frees only its array.
+fn mergeAstTierIssues(
+    alloc: Allocator,
+    g: *ImportGraph,
+    stats: *ast_tier.Stats,
+    into: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var ast_issues = try analyzeAstTier(alloc, g, stats);
+    defer ast_issues.deinit(alloc);
+    for (ast_issues.items) |ai| try into.append(alloc, ai);
+    ast_issues.items.len = 0;
+}
+
+/// Print every category's findings, the suppression note, the optional
+/// summary, and the footer, then apply the strict gate and export.
+fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) !void {
+    const out = ctx.reportOut(g);
+    var filtered = try filterMemIssues(ctx.alloc, findings.cfg_mem_issues.items);
+    defer filtered.deinit(ctx.alloc);
+    const counts = printCheckReports(out, findings, &filtered);
+    // RED3-3: the suppression note lands before STATUS/summary/footer so a
+    // suppressed repo never shows a bare clean status.
+    reportSuppression(&ctx.suppression, ctx.cfg);
+    if (ctx.cfg.show_summary) printCheckSummary(ctx, g, findings, &counts);
+    printResultFooter(counts.total());
+    // Findings are informational unless --strict/--fail-on gates them.
+    applyStrictGate(counts.total(), ctx.cfg.fail_on, &ctx.strict_fail);
+    try exportCheckIssues(ctx, out, findings, &filtered);
+}
+
+/// Split the merged CFG list into the memory, null-safety, and panic
+/// report buckets (dropping the ZA2 duplicates analyzeErrors owns).
+fn filterMemIssues(alloc: Allocator, items: []const Issue) !FilteredMemIssues {
+    var filtered = FilteredMemIssues{
+        .mem_only = .empty,
+        .null_safety = .empty,
+        .panic = .empty,
+    };
+    errdefer filtered.deinit(alloc);
+    for (items) |issue| {
+        if (mem.startsWith(u8, issue.rule, "ZA8")) {
+            try filtered.null_safety.append(alloc, issue);
+        } else if (mem.startsWith(u8, issue.rule, "ZA9")) {
+            try filtered.panic.append(alloc, issue);
+        } else if (mem.startsWith(u8, issue.rule, "ZA2")) {
+            continue;
+        } else {
+            try filtered.mem_only.append(alloc, issue);
+        }
+    }
+    return filtered;
+}
+
+/// Print all thirteen categories in the pinned report order.
+fn printCheckReports(
+    out: ReportOutCtx,
+    findings: *CheckFindings,
+    filtered: *FilteredMemIssues,
+) CheckCounts {
+    const orphan = printIssues(findings.orphan_issues.items, "orphans", out);
+    const mem_count = printIssues(filtered.mem_only.items, "memory", out);
+    const ignored_err = printIssues(findings.ignored_err_issues.items, "errors", out);
+    const err = printIssues(findings.err_issues.items, "errors", out);
+    const null_safety = printIssues(filtered.null_safety.items, "null-safety", out);
+    const panic = printIssues(filtered.panic.items, "panic", out);
+    const unused = printIssues(findings.unused_issues.items, "unused", out);
+    const cx = printIssues(findings.cx_issues.items, "complexity", out);
+    const fmt = printIssues(findings.fmt_issues.items, "format", out);
+    const naming = printIssues(findings.naming_issues.items, "naming", out);
+    const style = printIssues(findings.style_issues.items, "style", out);
+    const tests = printIssues(findings.test_issues.items, "tests", out);
+    const conc = printIssues(findings.conc_issues.items, "concurrency", out);
+    return .{
+        .orphan = orphan,
+        .mem = mem_count,
+        .ignored_err = ignored_err,
+        .err = err,
+        .null_safety = null_safety,
+        .panic = panic,
+        .unused = unused,
+        .cx = cx,
+        .fmt = fmt,
+        .naming = naming,
+        .style = style,
+        .tests = tests,
+        .conc = conc,
+    };
+}
+
+/// The --summary block: merge the AST-tier counters into the scan stats
+/// (EPH-I0200: getStats walks content only and cannot observe parse
+/// outcomes), then print in the configured format.
+fn printCheckSummary(
+    ctx: *const RunCtx,
+    g: *ImportGraph,
+    findings: *const CheckFindings,
+    counts: *const CheckCounts,
+) void {
+    var stats = g.getStats();
+    stats.ast_parsed = findings.ast_stats.parsed;
+    stats.ast_skipped = findings.ast_stats.skipped;
+    printSummary(.{
+        .orphan = counts.orphan.warnings,
+        .memory = counts.mem.warnings,
+        .err = counts.err.warnings + counts.ignored_err.warnings,
+        .unused = counts.unused.warnings,
+        .complexity = counts.cx.warnings,
+        .fmt = counts.fmt.warnings,
+        .style = counts.style.warnings + counts.naming.warnings,
+        .null_safety = counts.null_safety.warnings,
+        .panic = counts.panic.warnings,
+        .tests = counts.tests.warnings,
+        .concurrency = counts.conc.warnings,
+    }, stats, ctx.suppression, ctx.cfg.format);
+}
+
+/// --export=<file>: gather every printed finding into one list and write
+/// the export document. An export failure prints an error but does not
+/// fail the run (the pre-split behavior).
+fn exportCheckIssues(
+    ctx: *const RunCtx,
+    out: ReportOutCtx,
+    findings: *const CheckFindings,
+    filtered: *const FilteredMemIssues,
+) !void {
+    const export_path = ctx.cfg.export_path orelse return;
+    var all_issues = try collectAllIssues(ctx.alloc, findings, filtered);
+    defer all_issues.deinit(ctx.alloc);
+    if (exportIssues(ctx.alloc, export_path, all_issues.items, out)) |exported_count| {
+        std.debug.print("exported {d} issues to {s}\n", .{ exported_count, export_path });
+    } else |err| {
+        std.debug.print("error: failed to export issues: {}\n", .{err});
+    }
+}
+
+/// Gather every printed list into one slice for export, in report order.
+/// The lists differ only by source field, so an inline-for over the group
+/// tuple keeps the gather data-driven instead of thirteen hand copies.
+fn collectAllIssues(
+    alloc: Allocator,
+    findings: *const CheckFindings,
+    filtered: *const FilteredMemIssues,
+) !std.ArrayListUnmanaged(Issue) {
+    var all = std.ArrayListUnmanaged(Issue).empty;
+    errdefer all.deinit(alloc);
+    const groups = .{
+        findings.orphan_issues.items, filtered.mem_only.items,
+        findings.err_issues.items,    findings.ignored_err_issues.items,
+        findings.unused_issues.items, findings.cx_issues.items,
+        findings.fmt_issues.items,    findings.style_issues.items,
+        findings.naming_issues.items, filtered.null_safety.items,
+        filtered.panic.items,         findings.test_issues.items,
+        findings.conc_issues.items,
+    };
+    inline for (groups) |items| {
+        for (items) |issue| try all.append(alloc, issue);
+    }
+    return all;
+}
+
 pub fn main(init: std.process.Init) !void {
     global_io = init.io;
     initToolPaths(init.io, init.environ_map);
@@ -26665,19 +27368,13 @@ pub fn main(init: std.process.Init) !void {
     var cfg = try parseArgs(alloc, init.minimal.args);
     defer cfg.deinit(alloc);
 
-    // Track if we should exit with error (checked at end of main after defers)
-    var should_exit_error = false;
-    // Strict CI gate: findings met the --strict/--fail-on level
-    var strict_fail = false;
-
-    // Check for updates on analysis commands (not on help/version/init/install/upgrade)
-    switch (cfg.command) {
-        .help, .version, .init, .install, .upgrade => {},
-        else => checkForUpdates(
+    const entry = command_table.get(cfg.command);
+    if (entry.check_updates) {
+        checkForUpdates(
             alloc,
             init.environ_map.get("HOME"),
             init.environ_map.get("EPHOR_NO_UPDATE_CHECK"),
-        ),
+        );
     }
 
     // Get absolute base path for relative path calculation
@@ -26689,484 +27386,19 @@ pub fn main(init: std.process.Init) !void {
     var ignore_cache = IgnoreCache.init(alloc);
     defer ignore_cache.deinit();
 
-    // RED3-3: suppression accounting for the whole run. Every printIssues
-    // pass funnels its dropped findings here. Each command path reports the
-    // totals before its status line so suppression never stays silent.
-    var suppression = SuppressionStats{};
-
-    switch (cfg.command) {
-        .help => printHelp(),
-        .version => std.debug.print(
-            "Ephor v{s} - The overseer of your Zig code\n",
-            .{EPHOR_VERSION},
-        ),
-        .init => {
-            writeDefaultConfig() catch |err| {
-                std.debug.print("error: failed to create config: {}\n", .{err});
-                should_exit_error = true;
-            };
-            // If --build flag, also print build integration info
-            if (cfg.init_build and !should_exit_error) {
-                runInstallCommand(alloc, std.Io.Dir.cwd(), cfg.install_version) catch |err| {
-                    std.debug.print("error: failed to run install: {}\n", .{err});
-                    should_exit_error = true;
-                };
-            }
-        },
-
-        .install => runInstallCommand(alloc, std.Io.Dir.cwd(), cfg.install_version) catch |err| {
-            std.debug.print("error: failed to install: {}\n", .{err});
-            should_exit_error = true;
-        },
-
-        .upgrade => runUpgradeCommand(
-            alloc,
-            std.Io.Dir.cwd(),
-            cfg.install_version,
-            cfg.force_upgrade,
-        ) catch |err| {
-            std.debug.print("error: failed to upgrade: {}\n", .{err});
-            should_exit_error = true;
-        },
-
-        .orphans => {
-            if (cfg.entries.items.len == 0) {
-                std.debug.print("error: no entry points found\n", .{});
-                std.debug.print("  hint: create ephor.json with 'entries' array\n", .{});
-                std.debug.print("  run: ephor init\n", .{});
-                should_exit_error = true;
-            } else {
-                if (cfg.verbose) {
-                    std.debug.print("Detected {d} entry points:\n", .{cfg.entries.items.len});
-                    for (cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
-                }
-                try loadKnownIssues(alloc, &cfg);
-                var g = ImportGraph.init(alloc);
-                defer g.deinit();
-                g.scan_root = base_path;
-                try scanPath(&g, cfg.path);
-                for (cfg.entries.items) |e| try g.markReachable(e);
-                try g.markBuildPathReferences(&cfg);
-                var issues = try g.getOrphanIssues(alloc, &cfg);
-                defer deinitIssues(&issues, alloc);
-                // ZA502 skipped files ride the structure list (EPH-I0150):
-                // same graph-owned lifetime, static messages. The merge
-                // moves items, so the skipped list frees only its array.
-                var skipped_issues = try g.getSkippedFileIssues(alloc);
-                defer skipped_issues.deinit(alloc);
-                for (skipped_issues.items) |si| try issues.append(alloc, si);
-                sortIssuesByFile(issues.items);
-
-                const out = ReportOutCtx{
-                    .base_path = base_path,
-                    .allocator = alloc,
-                    .cfg = &cfg,
-                    .graph = &g,
-                    .ignore_cache = &ignore_cache,
-                    .suppression = &suppression,
-                };
-                const c = printIssues(issues.items, "orphans", out);
-                reportSuppression(&suppression, &cfg);
-                applyStrictGate(c, cfg.fail_on, &strict_fail);
-            }
-        },
-
-        .memory => {
-            try loadKnownIssues(alloc, &cfg);
-            var g = ImportGraph.init(alloc);
-            defer g.deinit();
-            g.scan_root = base_path;
-            try scanPath(&g, cfg.path);
-            var issues = try analyzeCFGMemory(alloc, &g);
-            defer deinitIssues(&issues, alloc);
-            // AST tier (ZA111) is a memory-family rule — include it here too.
-            // Stats stay null: check is the coverage surface (its summary
-            // carries the parsed/skipped counts, EPH-I0200). The memory
-            // command prints findings only.
-            var ast_issues = try analyzeAstTier(alloc, &g, null);
-            defer ast_issues.deinit(alloc);
-            for (ast_issues.items) |ai| try issues.append(alloc, ai);
-            ast_issues.items.len = 0; // ownership moved to issues
-            const out = ReportOutCtx{
-                .base_path = base_path,
-                .allocator = alloc,
-                .cfg = &cfg,
-                .graph = &g,
-                .ignore_cache = &ignore_cache,
-                .suppression = &suppression,
-            };
-            const c = printIssues(issues.items, "memory", out);
-            reportSuppression(&suppression, &cfg);
-            applyStrictGate(c, cfg.fail_on, &strict_fail);
-        },
-
-        .errors => {
-            try loadKnownIssues(alloc, &cfg);
-            var g = ImportGraph.init(alloc);
-            defer g.deinit();
-            g.scan_root = base_path;
-            try scanPath(&g, cfg.path);
-            var issues = try analyzeErrors(alloc, &g);
-            defer deinitIssues(&issues, alloc);
-            // ZA205: discarded error union results
-            var ignored = try analyzeIgnoredErrors(alloc, &g);
-            defer deinitIssues(&ignored, alloc);
-            // Merge ignored errors into issues for unified output
-            for (ignored.items) |item| {
-                try issues.append(alloc, item);
-            }
-            // Clear ignored without deiniting items (now owned by issues)
-            ignored.items.len = 0;
-            const out = ReportOutCtx{
-                .base_path = base_path,
-                .allocator = alloc,
-                .cfg = &cfg,
-                .graph = &g,
-                .ignore_cache = &ignore_cache,
-                .suppression = &suppression,
-            };
-            const c = printIssues(issues.items, "errors", out);
-            reportSuppression(&suppression, &cfg);
-            applyStrictGate(c, cfg.fail_on, &strict_fail);
-        },
-
-        .unused => {
-            try loadKnownIssues(alloc, &cfg);
-            var g = ImportGraph.init(alloc);
-            defer g.deinit();
-            g.scan_root = base_path;
-            try scanPath(&g, cfg.path);
-            var issues = try analyzeUnused(alloc, &g);
-            defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{
-                .base_path = base_path,
-                .allocator = alloc,
-                .cfg = &cfg,
-                .graph = &g,
-                .ignore_cache = &ignore_cache,
-                .suppression = &suppression,
-            };
-            const c = printIssues(issues.items, "unused", out);
-            reportSuppression(&suppression, &cfg);
-            applyStrictGate(c, cfg.fail_on, &strict_fail);
-        },
-
-        .complexity => {
-            try loadKnownIssues(alloc, &cfg);
-            var g = ImportGraph.init(alloc);
-            defer g.deinit();
-            g.scan_root = base_path;
-            try scanPath(&g, cfg.path);
-            var issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
-            defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{
-                .base_path = base_path,
-                .allocator = alloc,
-                .cfg = &cfg,
-                .graph = &g,
-                .ignore_cache = &ignore_cache,
-                .suppression = &suppression,
-            };
-            const c = printIssues(issues.items, "complexity", out);
-            reportSuppression(&suppression, &cfg);
-            applyStrictGate(c, cfg.fail_on, &strict_fail);
-        },
-
-        .fmt_check => {
-            try loadKnownIssues(alloc, &cfg);
-            var issues = try runFmtCheck(alloc, cfg.path);
-            defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{
-                .base_path = base_path,
-                .allocator = alloc,
-                .cfg = &cfg,
-                .graph = null,
-                .ignore_cache = &ignore_cache,
-                .suppression = &suppression,
-            };
-            const c = printIssues(issues.items, "format", out);
-            reportSuppression(&suppression, &cfg);
-            applyStrictGate(c, cfg.fail_on, &strict_fail);
-        },
-
-        .stats => {
-            var g = ImportGraph.init(alloc);
-            defer g.deinit();
-            g.scan_root = base_path;
-            try scanPath(&g, cfg.path);
-            printStats(g.getStats(), cfg.format);
-        },
-
-        .runtime => {
-            if (!cfg.auto_approve) {
-                const cmd_str = cfg.runtime_command orelse "zig build test";
-                std.debug.print(
-                    \\
-                    \\WARNING: Runtime analysis will COMPILE AND EXECUTE code in:
-                    \\  {s}
-                    \\
-                    \\Command: {s}
-                    \\
-                    \\This runs untrusted code with your user privileges.
-                    \\Only run this on projects you trust.
-                    \\
-                    \\Proceed? [y/N]
-                , .{ base_path, cmd_str });
-                var read_buf: [16]u8 = undefined;
-                var stdin_reader = std.Io.File.stdin().reader(global_io.?, &read_buf);
-                const n = stdin_reader.interface.readSliceShort(&read_buf) catch 0;
-                if (n == 0 or (read_buf[0] != 'y' and read_buf[0] != 'Y')) {
-                    std.debug.print("Aborted.\n", .{});
-                    return;
-                }
-            }
-            try loadKnownIssues(alloc, &cfg);
-            var issues = try runRuntimeAnalysis(alloc, cfg.path, cfg.verbose, cfg.runtime_command);
-            defer deinitIssues(&issues, alloc);
-            const out = ReportOutCtx{
-                .base_path = base_path,
-                .allocator = alloc,
-                .cfg = &cfg,
-                .graph = null,
-                .ignore_cache = &ignore_cache,
-                .suppression = &suppression,
-            };
-            const c = printIssues(issues.items, "runtime", out);
-            reportSuppression(&suppression, &cfg);
-            applyStrictGate(c, cfg.fail_on, &strict_fail);
-        },
-
-        .check => {
-            if (cfg.entries.items.len == 0) {
-                std.debug.print("error: no entry points found\n", .{});
-                std.debug.print("  hint: create ephor.json with 'entries' array\n", .{});
-                std.debug.print("  run: ephor init\n", .{});
-                should_exit_error = true;
-            }
-
-            if (!should_exit_error) {
-                // Load known issues for filtering
-                try loadKnownIssues(alloc, &cfg);
-
-                var g = ImportGraph.init(alloc);
-                defer g.deinit();
-                g.scan_root = base_path;
-
-                try scanPath(&g, cfg.path);
-
-                // Also scan entry point files to build complete import graph
-                // This ensures orphan detection works when checking subdirectories
-                for (cfg.entries.items) |e| {
-                    // Only scan if not already in scanned path. Boundary
-                    // compare (RED4-3): entry "src-evil/x.zig" is outside
-                    // path "src" and must still be scanned for orphans.
-                    // EPH-I0195: this gate stays textual — ingest is the
-                    // containment boundary, so out-of-root entries can only
-                    // arrive here via operator channels (CLI --entry,
-                    // trusted config), where outside reads are the
-                    // documented RED4-3 orphan feature.
-                    if (!isPathAncestorOrEqual(cfg.path, e)) {
-                        // Entry file may not exist, that's ok - just skip it
-                        g.scanSingleFile(e) catch |err| {
-                            if (cfg.verbose) {
-                                std.debug.print(
-                                    "note: entry {s} not found: {}\n",
-                                    .{ e, err },
-                                );
-                            }
-                        };
-                    }
-                }
-                for (cfg.entries.items) |e| try g.markReachable(e);
-                try g.markBuildPathReferences(&cfg);
-
-                var orphan_issues = try g.getOrphanIssues(alloc, &cfg);
-                defer deinitIssues(&orphan_issues, alloc);
-                // ZA502 skipped files ride the structure list (EPH-I0150):
-                // same graph-owned lifetime, static messages. The merge
-                // moves items, so the skipped list frees only its array.
-                var skipped_issues = try g.getSkippedFileIssues(alloc);
-                defer skipped_issues.deinit(alloc);
-                for (skipped_issues.items) |si| try orphan_issues.append(alloc, si);
-                sortIssuesByFile(orphan_issues.items);
-
-                // CFG-based memory analysis (ZA101-ZA106)
-                // Covers: alloc/create without defer, errdefer gaps, leaks, UAF, double-free
-                var cfg_mem_issues = try analyzeCFGMemory(alloc, &g);
-                defer deinitIssues(&cfg_mem_issues, alloc);
-
-                // ZA904 (opt-in note): appended into the CFG list so it flows
-                // through the ZA9 → panic category filter and the export list.
-                // Messages are static (not owned), so both lists deinit safely.
-                var cast_issues = try analyzeIntCastGuards(alloc, &g);
-                defer cast_issues.deinit(alloc);
-                for (cast_issues.items) |ci| try cfg_mem_issues.append(alloc, ci);
-
-                var err_issues = try analyzeErrors(alloc, &g);
-                defer deinitIssues(&err_issues, alloc);
-
-                var unused_issues = try analyzeUnused(alloc, &g);
-                defer deinitIssues(&unused_issues, alloc);
-
-                var cx_issues = try analyzeComplexity(alloc, &g, cfg.thresholds);
-                defer deinitIssues(&cx_issues, alloc);
-
-                var fmt_issues = try runFmtCheck(alloc, cfg.path);
-                defer deinitIssues(&fmt_issues, alloc);
-
-                var style_issues = try analyzeStyle(alloc, &g, cfg.thresholds);
-                defer deinitIssues(&style_issues, alloc);
-
-                var naming_issues = try analyzeNaming(alloc, &g, cfg.error_naming);
-                defer deinitIssues(&naming_issues, alloc);
-
-                // Test quality (ZT1xx): vacuous tests, trivially-true assertions
-                var test_issues = try analyzeTests(alloc, &g);
-                defer deinitIssues(&test_issues, alloc);
-
-                // Concurrency (ZC1xx): lock/unlock pairing defects
-                var conc_issues = try analyzeConcurrency(alloc, &g);
-                defer deinitIssues(&conc_issues, alloc);
-
-                // AST tier (ZA111): merged into cfg_mem_issues so it flows
-                // through the ZA1 → memory category filter and the export
-                // list. Item ownership moves with the append (same pattern
-                // as cast_issues above), so ast_issues only frees its array.
-                var ast_stats = ast_tier.Stats{};
-                var ast_issues = try analyzeAstTier(alloc, &g, &ast_stats);
-                defer ast_issues.deinit(alloc);
-                for (ast_issues.items) |ai| try cfg_mem_issues.append(alloc, ai);
-                ast_issues.items.len = 0;
-                // EPH-I0200: coverage gaps surface by default (the summary
-                // carries the counts, and this note fires on any skip).
-                noteAstTierSkips(ast_stats);
-
-                // Phase 5: Error and null safety (CFG-based, included in cfg_mem_issues)
-                var ignored_err_issues = try analyzeIgnoredErrors(alloc, &g);
-                defer deinitIssues(&ignored_err_issues, alloc);
-
-                // Note: Null safety (ZA801/ZA802) and Panic (ZA9xx) are now CFG-based
-                // and included in cfg_mem_issues. We filter them out for categorization.
-
-                var stats = g.getStats();
-                // EPH-I0200: getStats walks content only and cannot observe
-                // parse outcomes, so the .check arm merges the AST-tier
-                // counters here — the .stats command never runs the tier.
-                stats.ast_parsed = ast_stats.parsed;
-                stats.ast_skipped = ast_stats.skipped;
-
-                // Print all issues (returns filtered count)
-                const out = ReportOutCtx{
-                    .base_path = base_path,
-                    .allocator = alloc,
-                    .cfg = &cfg,
-                    .graph = &g,
-                    .ignore_cache = &ignore_cache,
-                    .suppression = &suppression,
-                };
-                const orphan_count = printIssues(orphan_issues.items, "orphans", out);
-                // Filter cfg_mem_issues by rule category
-                var mem_only_issues = std.ArrayListUnmanaged(Issue).empty;
-                defer mem_only_issues.deinit(alloc);
-                var null_safety_issues = std.ArrayListUnmanaged(Issue).empty;
-                defer null_safety_issues.deinit(alloc);
-                var panic_issues = std.ArrayListUnmanaged(Issue).empty;
-                defer panic_issues.deinit(alloc);
-
-                for (cfg_mem_issues.items) |issue| {
-                    if (mem.startsWith(u8, issue.rule, "ZA8")) {
-                        try null_safety_issues.append(alloc, issue);
-                    } else if (mem.startsWith(u8, issue.rule, "ZA9")) {
-                        try panic_issues.append(alloc, issue);
-                    } else if (mem.startsWith(u8, issue.rule, "ZA2")) {
-                        // ZA2xx covered by analyzeErrors — skip to avoid duplicates
-                        continue;
-                    } else {
-                        try mem_only_issues.append(alloc, issue);
-                    }
-                }
-
-                const mem_count = printIssues(mem_only_issues.items, "memory", out);
-                const ignored_err_count = printIssues(ignored_err_issues.items, "errors", out);
-                const err_count = printIssues(err_issues.items, "errors", out);
-                const null_safety_count = printIssues(null_safety_issues.items, "null-safety", out);
-                const panic_count = printIssues(panic_issues.items, "panic", out);
-                const unused_count = printIssues(unused_issues.items, "unused", out);
-                const cx_count = printIssues(cx_issues.items, "complexity", out);
-                const fmt_count = printIssues(fmt_issues.items, "format", out);
-                const naming_count = printIssues(naming_issues.items, "naming", out);
-                const style_count = printIssues(style_issues.items, "style", out);
-                const test_count = printIssues(test_issues.items, "tests", out);
-                const conc_count = printIssues(conc_issues.items, "concurrency", out);
-
-                // Accumulate totals
-                const total = orphan_count
-                    .add(mem_count).add(ignored_err_count)
-                    .add(err_count).add(null_safety_count)
-                    .add(panic_count).add(unused_count)
-                    .add(cx_count).add(fmt_count)
-                    .add(naming_count).add(style_count)
-                    .add(test_count).add(conc_count);
-
-                // RED3-3: the suppression note lands before STATUS/summary/
-                // footer so a suppressed repo never shows a bare clean status.
-                reportSuppression(&suppression, &cfg);
-
-                if (cfg.show_summary) {
-                    printSummary(.{
-                        .orphan = orphan_count.warnings,
-                        .memory = mem_count.warnings,
-                        .err = err_count.warnings + ignored_err_count.warnings,
-                        .unused = unused_count.warnings,
-                        .complexity = cx_count.warnings,
-                        .fmt = fmt_count.warnings,
-                        .style = style_count.warnings + naming_count.warnings,
-                        .null_safety = null_safety_count.warnings,
-                        .panic = panic_count.warnings,
-                        .tests = test_count.warnings,
-                        .concurrency = conc_count.warnings,
-                    }, stats, suppression, cfg.format);
-                }
-
-                // Print summary footer
-                printResultFooter(total);
-                applyStrictGate(total, cfg.fail_on, &strict_fail);
-
-                // Export issues to file if requested
-                if (cfg.export_path) |export_path| {
-                    // Collect all issues into one list for export
-                    var all_issues = std.ArrayListUnmanaged(Issue).empty;
-                    defer all_issues.deinit(alloc);
-
-                    for (orphan_issues.items) |i| try all_issues.append(alloc, i);
-                    for (mem_only_issues.items) |i| try all_issues.append(alloc, i);
-                    for (err_issues.items) |i| try all_issues.append(alloc, i);
-                    for (ignored_err_issues.items) |i| try all_issues.append(alloc, i);
-                    for (unused_issues.items) |i| try all_issues.append(alloc, i);
-                    for (cx_issues.items) |i| try all_issues.append(alloc, i);
-                    for (fmt_issues.items) |i| try all_issues.append(alloc, i);
-                    for (style_issues.items) |i| try all_issues.append(alloc, i);
-                    for (naming_issues.items) |i| try all_issues.append(alloc, i);
-                    for (null_safety_issues.items) |i| try all_issues.append(alloc, i);
-                    for (panic_issues.items) |i| try all_issues.append(alloc, i);
-                    for (test_issues.items) |i| try all_issues.append(alloc, i);
-                    for (conc_issues.items) |i| try all_issues.append(alloc, i);
-
-                    const slice = all_issues.items;
-                    if (exportIssues(alloc, export_path, slice, out)) |exported_count| {
-                        std.debug.print(
-                            "exported {d} issues to {s}\n",
-                            .{ exported_count, export_path },
-                        );
-                    } else |err| {
-                        std.debug.print("error: failed to export issues: {}\n", .{err});
-                    }
-                }
-
-                // Findings are informational unless --strict/--fail-on gates them
-            }
-        },
+    var ctx = RunCtx{
+        .alloc = alloc,
+        .cfg = &cfg,
+        .base_path = base_path,
+        .ignore_cache = &ignore_cache,
+    };
+    switch (entry.handler) {
+        .infallible => |h| h(&ctx),
+        .fallible => |h| try h(&ctx),
     }
+    // A declined runtime prompt returns before the epilogue, exactly like
+    // the pre-split bare return from main.
+    if (ctx.abort_epilogue) return;
 
     // Print update notification after all analysis output
     if (update_notification) |msg| {
@@ -27176,9 +27408,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Exit with error code AFTER all defers have run (cfg.deinit, gpa.deinit)
-    // This is at the end of main() so defers execute first, then we exit
     // ephor:disable-next-line ZA206
-    if (should_exit_error or strict_fail) std.process.exit(1);
+    if (ctx.should_exit_error or ctx.strict_fail) std.process.exit(1);
 }
 
 // ============================================================================
@@ -48377,6 +48608,105 @@ test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "isCImportFile: markers in string, comment, and multiline body do not skip (EPH-I0758)" {
+    // Every marker occurrence here is data, not code: a raw substring match
+    // must not classify the file as a C import.
+    const code =
+        \\const s1 = "@cImport";
+        \\const s2 = "__builtin_";
+        \\const s3 = "enum_unnamed_";
+        \\// @cImport __builtin_ enum_unnamed_ in a comment
+        \\const mline =
+        \\    \\@cImport body line
+        \\    \\__builtin_ body line
+        \\;
+    ;
+    try std.testing.expect(!isCImportFile("regular.zig", code));
+}
+
+test "isCImportFile: @cImport in code position skips (EPH-I0758)" {
+    const code =
+        \\const c = @cImport({
+        \\    @cInclude("x.h");
+        \\});
+    ;
+    try std.testing.expect(isCImportFile("bindings.zig", code));
+}
+
+test "isCImportFile: __builtin_ in code skips, in string does not (EPH-I0758)" {
+    const code_marker =
+        \\pub const __builtin_va_list = extern struct { data: u8 };
+    ;
+    try std.testing.expect(isCImportFile("translate_c.zig", code_marker));
+
+    const string_marker =
+        \\const help = "files with __builtin_ are skipped";
+    ;
+    try std.testing.expect(!isCImportFile("docs.zig", string_marker));
+}
+
+test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The markers live only in string data; the over-cap fn must be measured.
+    const code =
+        \\const s = "@cImport and __builtin_";
+        \\fn over_cap() void {
+        \\    _ = 1;
+        \\    _ = 2;
+        \\    _ = 3;
+        \\    _ = 4;
+        \\    _ = 5;
+        \\    _ = 6;
+        \\}
+    ;
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "stringy.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "stringy.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 5 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "stringy.zig", RULE_FUNC_TOO_LONG),
+    );
+}
+
+test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
+    global_io = std.testing.io;
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The real file carries the markers only as string-literal data (this
+    // predicate, its tests), so the dogfood target must be analyzed.
+    const max_main_bytes = 16 * 1024 * 1024;
+    const content = try Fs.cwd().readFileAlloc(allocator, "src/main.zig", max_main_bytes);
+    defer allocator.free(content);
+    try std.testing.expect(!isCImportFile("src/main.zig", content));
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "src/main.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "src/main.zig"), {});
+
+    // Durable basis for a positive count: the analyzer does not consult
+    // inline suppressions or the config disable list (the CLI filters
+    // those findings later), and main.zig's prong-heavy fns measure over
+    // the default ZA305/ZA306 limits — 130 findings on this file when this
+    // test was written. Those findings survive an I0760 main() split.
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expect(issues.items.len > 0);
 }
 
 // ============================================================================

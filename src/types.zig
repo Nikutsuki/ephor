@@ -856,6 +856,33 @@ pub fn isMultilineOpenerAt(t: []const u8, i: usize) bool {
     return i + 1 < t.len and t[i] == '\\' and t[i + 1] == '\\';
 }
 
+/// Scan mode for the string/char-literal classifiers. `mline` is sticky: a
+/// `\\` multiline opener swallows the rest of its line, so no later byte on
+/// the line can leave string data (EPH-I0671).
+const QuoteMode = enum { none, str, char, mline };
+
+/// Advance the quote scan past one char. A backslash inside a literal also
+/// skips the escaped char, so `i` can move two steps.
+fn stepQuoteMode(mode: *QuoteMode, line: []const u8, i: *usize) void {
+    const c = line[i.*];
+    switch (mode.*) {
+        .char => {
+            if (c == '\\') i.* += 1;
+            if (c == '\'') mode.* = .none;
+        },
+        .str => {
+            if (c == '\\') i.* += 1;
+            if (c == '"') mode.* = .none;
+        },
+        .mline => {},
+        .none => {
+            if (isMultilineOpenerAt(line, i.*)) mode.* = .mline;
+            if (c == '\'') mode.* = .char;
+            if (c == '"') mode.* = .str;
+        },
+    }
+}
+
 /// Check if position `col` is inside a string literal. Escape handling: an
 /// odd backslash run before a quote keeps the quote as character data, an
 /// even run keeps it as a delimiter. Char literal spans (`'...'`, with `\'`
@@ -864,26 +891,10 @@ pub fn isMultilineOpenerAt(t: []const u8, i: usize) bool {
 /// makes the rest of the line string data, so positions past the opener
 /// report inside-string (EPH-I0671).
 pub fn isInsideString(line: []const u8, col: usize) bool {
-    var mode: enum { none, str, char, mline } = .none;
+    var mode: QuoteMode = .none;
     var i: usize = 0;
     while (i < col and i < line.len) : (i += 1) {
-        const c = line[i];
-        switch (mode) {
-            .char => {
-                if (c == '\\') i += 1;
-                if (c == '\'') mode = .none;
-            },
-            .str => {
-                if (c == '\\') i += 1;
-                if (c == '"') mode = .none;
-            },
-            .mline => {},
-            .none => {
-                if (isMultilineOpenerAt(line, i)) mode = .mline;
-                if (c == '\'') mode = .char;
-                if (c == '"') mode = .str;
-            },
-        }
+        stepQuoteMode(&mode, line, &i);
     }
     return mode == .str or mode == .mline;
 }
@@ -902,10 +913,6 @@ pub const LineClassifier = struct {
     scanned: usize = 0,
     mode: QuoteMode = .none,
 
-    /// `mline` is sticky: a `\\` multiline opener swallows the rest of its
-    /// line, so no later byte on the line can leave string data (EPH-I0671).
-    const QuoteMode = enum { none, str, char, mline };
-
     pub fn init(line: []const u8) LineClassifier {
         return .{ .line = line };
     }
@@ -918,23 +925,7 @@ pub const LineClassifier = struct {
     pub fn isInsideString(self: *LineClassifier, col: usize) bool {
         std.debug.assert(col >= self.scanned);
         while (self.scanned < col and self.scanned < self.line.len) : (self.scanned += 1) {
-            const c = self.line[self.scanned];
-            switch (self.mode) {
-                .char => {
-                    if (c == '\\') self.scanned += 1;
-                    if (c == '\'') self.mode = .none;
-                },
-                .str => {
-                    if (c == '\\') self.scanned += 1;
-                    if (c == '"') self.mode = .none;
-                },
-                .mline => {},
-                .none => {
-                    if (isMultilineOpenerAt(self.line, self.scanned)) self.mode = .mline;
-                    if (c == '\'') self.mode = .char;
-                    if (c == '"') self.mode = .str;
-                },
-            }
+            stepQuoteMode(&self.mode, self.line, &self.scanned);
         }
         return self.mode == .str or self.mode == .mline;
     }

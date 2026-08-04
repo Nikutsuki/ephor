@@ -243,9 +243,7 @@ fn scanCodeChar(line: []const u8, i: *usize, scan: *NestingScan) void {
             // absorbed by the byte cap and the parse stack (EPH-I0268).
             scan.run += 1;
         },
-        ')', ']', '}' => {
-            if (scan.depth > 0) scan.depth -= 1;
-        },
+        ')', ']', '}' => scan.depth -|= 1,
         '!', '~', '&', '?', '*' => scan.run += 1,
         '-' => {
             // `-%` is one wrapping-negation token. Count it once.
@@ -434,6 +432,10 @@ const Walker = struct {
         try self.push(node.unwrap() orelse return);
     }
 
+    fn pushAll(self: *Walker, nodes: []const NodeIndex) !void {
+        for (nodes) |n| try self.push(n);
+    }
+
     /// DFS over one function body, recording var decls and returns.
     fn run(self: *Walker, body: NodeIndex) !void {
         try self.push(body);
@@ -481,14 +483,14 @@ const Walker = struct {
             },
             .for_simple, .@"for" => {
                 const f = tree.fullFor(node) orelse return true;
-                for (f.ast.inputs) |in| try self.push(in);
+                try self.pushAll(f.ast.inputs);
                 try self.push(f.ast.then_expr);
                 try self.pushOpt(f.ast.else_expr);
             },
             .@"switch", .switch_comma => {
                 const s = tree.fullSwitch(node) orelse return true;
                 try self.push(s.ast.condition);
-                for (s.ast.cases) |c| try self.push(c);
+                try self.pushAll(s.ast.cases);
             },
             .switch_case_one,
             .switch_case,
@@ -496,14 +498,12 @@ const Walker = struct {
             .switch_case_inline,
             => {
                 const c = tree.fullSwitchCase(node) orelse return true;
-                for (c.ast.values) |v| try self.push(v);
+                try self.pushAll(c.ast.values);
                 try self.push(c.ast.target_expr);
             },
             .block, .block_semicolon, .block_two, .block_two_semicolon => {
                 var buf: [2]NodeIndex = undefined;
-                for (tree.blockStatements(&buf, node) orelse return true) |s| {
-                    try self.push(s);
-                }
+                try self.pushAll(tree.blockStatements(&buf, node) orelse return true);
             },
             else => return false,
         }
@@ -512,24 +512,13 @@ const Walker = struct {
 
     /// Composite expression constructs, via the tree's typed helpers.
     fn pushCompositeExpr(self: *Walker, node: NodeIndex) !bool {
-        const tree = self.tree;
-        switch (tree.nodeTag(node)) {
-            .call, .call_comma, .call_one, .call_one_comma => {
-                var buf: [1]NodeIndex = undefined;
-                const c = tree.fullCall(&buf, node) orelse return true;
-                try self.push(c.ast.fn_expr);
-                for (c.ast.params) |p| try self.push(p);
-            },
+        switch (self.tree.nodeTag(node)) {
+            .call, .call_comma, .call_one, .call_one_comma => try self.pushCall(node),
             .builtin_call,
             .builtin_call_comma,
             .builtin_call_two,
             .builtin_call_two_comma,
-            => {
-                var buf: [2]NodeIndex = undefined;
-                for (tree.builtinCallParams(&buf, node) orelse return true) |p| {
-                    try self.push(p);
-                }
-            },
+            => try self.pushBuiltinCall(node),
             .struct_init,
             .struct_init_comma,
             .struct_init_dot,
@@ -538,12 +527,7 @@ const Walker = struct {
             .struct_init_dot_two_comma,
             .struct_init_one,
             .struct_init_one_comma,
-            => {
-                var buf: [2]NodeIndex = undefined;
-                const s = tree.fullStructInit(&buf, node) orelse return true;
-                try self.pushOpt(s.ast.type_expr);
-                for (s.ast.fields) |f| try self.push(f);
-            },
+            => try self.pushStructInit(node),
             .array_init,
             .array_init_comma,
             .array_init_dot,
@@ -552,28 +536,53 @@ const Walker = struct {
             .array_init_dot_two_comma,
             .array_init_one,
             .array_init_one_comma,
-            => {
-                var buf: [2]NodeIndex = undefined;
-                const ai = tree.fullArrayInit(&buf, node) orelse return true;
-                try self.pushOpt(ai.ast.type_expr);
-                for (ai.ast.elements) |e| try self.push(e);
-            },
-            .slice_open, .slice, .slice_sentinel => {
-                const s = tree.fullSlice(node) orelse return true;
-                try self.push(s.ast.sliced);
-                try self.push(s.ast.start);
-                try self.pushOpt(s.ast.end);
-                try self.pushOpt(s.ast.sentinel);
-            },
-            .array_type, .array_type_sentinel => {
-                const at = tree.fullArrayType(node) orelse return true;
-                try self.push(at.ast.elem_count);
-                try self.pushOpt(at.ast.sentinel);
-                try self.push(at.ast.elem_type);
-            },
+            => try self.pushArrayInit(node),
+            .slice_open, .slice, .slice_sentinel => try self.pushSlice(node),
+            .array_type, .array_type_sentinel => try self.pushArrayType(node),
             else => return false,
         }
         return true;
+    }
+
+    fn pushCall(self: *Walker, node: NodeIndex) !void {
+        var buf: [1]NodeIndex = undefined;
+        const c = self.tree.fullCall(&buf, node) orelse return;
+        try self.push(c.ast.fn_expr);
+        try self.pushAll(c.ast.params);
+    }
+
+    fn pushBuiltinCall(self: *Walker, node: NodeIndex) !void {
+        var buf: [2]NodeIndex = undefined;
+        try self.pushAll(self.tree.builtinCallParams(&buf, node) orelse return);
+    }
+
+    fn pushStructInit(self: *Walker, node: NodeIndex) !void {
+        var buf: [2]NodeIndex = undefined;
+        const s = self.tree.fullStructInit(&buf, node) orelse return;
+        try self.pushOpt(s.ast.type_expr);
+        try self.pushAll(s.ast.fields);
+    }
+
+    fn pushArrayInit(self: *Walker, node: NodeIndex) !void {
+        var buf: [2]NodeIndex = undefined;
+        const ai = self.tree.fullArrayInit(&buf, node) orelse return;
+        try self.pushOpt(ai.ast.type_expr);
+        try self.pushAll(ai.ast.elements);
+    }
+
+    fn pushSlice(self: *Walker, node: NodeIndex) !void {
+        const s = self.tree.fullSlice(node) orelse return;
+        try self.push(s.ast.sliced);
+        try self.push(s.ast.start);
+        try self.pushOpt(s.ast.end);
+        try self.pushOpt(s.ast.sentinel);
+    }
+
+    fn pushArrayType(self: *Walker, node: NodeIndex) !void {
+        const at = self.tree.fullArrayType(node) orelse return;
+        try self.push(at.ast.elem_count);
+        try self.pushOpt(at.ast.sentinel);
+        try self.push(at.ast.elem_type);
     }
 
     /// Simple expressions: children follow directly from the tag's fixed

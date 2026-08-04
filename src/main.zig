@@ -771,7 +771,9 @@ fn scanQuoteStep(mode: *QuoteMode, c: u8) ?usize {
 }
 
 /// Return the line with any trailing `//` comment removed (quote-aware:
-/// `//` inside string/char literals is kept).
+/// `//` inside string/char literals is kept). A `\\` multiline opener in
+/// code position cuts the line at the opener: its tail is string data, so
+/// no comment or code can follow it (EPH-I0671).
 fn stripLineComment(t: []const u8) []const u8 {
     var mode: QuoteMode = .none;
     var i: usize = 0;
@@ -781,6 +783,7 @@ fn stripLineComment(t: []const u8) []const u8 {
             i += skip;
             continue;
         }
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
     }
     return mem.trimEnd(u8, t[0..i], " \t\r");
@@ -12944,13 +12947,20 @@ fn reportTestBlock(ctx: *const TestScanCtx, state: *const TestFileScanState) !vo
 /// Copy `line` into `buf` with every string/char literal blanked to spaces,
 /// so brace tracking ignores literal braces: test names like
 /// `test "catch {}"` and fixtures like `"} || rlp.Error"` would otherwise
-/// corrupt the block depth and misplace the block boundary.
+/// corrupt the block depth and misplace the block boundary. A `\\` multiline
+/// opener's tail blanks to end of line for the same reason (EPH-I0671).
 /// Lines longer than `buf` fall back to the raw line.
 fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
     if (line.len > buf.len) return line;
     var i: usize = 0;
     while (i < line.len) {
         const c = line[i];
+        // A `\\` opener's tail is string data (EPH-I0671): blank to end of
+        // line so tail braces never reach brace tracking.
+        if (types.isMultilineOpenerAt(line, i)) {
+            while (i < line.len) : (i += 1) buf[i] = ' ';
+            break;
+        }
         if (c == '"' or c == '\'') {
             const end = if (c == '"') skipPastString(line, i) else skipPastChar(line, i);
             while (i < end) : (i += 1) buf[i] = ' ';
@@ -16369,17 +16379,13 @@ fn skipStringLiteral(t: []const u8, start: usize) usize {
     return if (i < t.len) i + 1 else i;
 }
 
-/// Index where a `//` line comment begins (outside string literals), or
-/// t.len when the line has none. `error.` text at or past it is prose,
-/// not a reference — same data-not-syntax rule as string literals.
+/// Index where a `//` line comment begins (outside string literals and `\\`
+/// multiline tails), or t.len when the line has none. `error.` text at or
+/// past it is prose, not a reference — same data-not-syntax rule as string
+/// literals. Routes through findCommentStart so the masking rule lives in
+/// one place (EPH-I0671).
 fn lineCommentStart(t: []const u8) usize {
-    var in_str = false;
-    var i: usize = 0;
-    while (i + 1 < t.len) : (i += 1) {
-        if (t[i] == '"' and !isEscapedQuote(t, i)) in_str = !in_str;
-        if (!in_str and t[i] == '/' and t[i + 1] == '/') return i;
-    }
-    return t.len;
+    return findCommentStart(t) orelse t.len;
 }
 
 /// A naming violation to report (bundled to keep param counts legal).
@@ -30729,6 +30735,57 @@ test "analyzeCFGMemory detects use-after-free (ZA105)" {
     try std.testing.expect(found_za105);
 }
 
+test "analyzeCFGMemory: free text in a multiline opener tail is not a free (EPH-I0671)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The tail's `allocator.free(buf);` is string data. Counting it would
+    // pair it with the real free on the line above and invent a double-free.
+    const content =
+        \\fn f(allocator: std.mem.Allocator) void {
+        \\    const buf = allocator.alloc(u8, 64) catch return;
+        \\    allocator.free(buf);
+        \\    const s = \\ allocator.free(buf);
+        \\    _ = s;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_mline_tail_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_mline_tail_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "analyzeCFGMemory: brace tail does not hide a real double-free (EPH-I0671)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The opener-line tail braces are string data: the CFG must stay intact
+    // and still see the real double-free below the string.
+    const content =
+        \\fn f(allocator: std.mem.Allocator) void {
+        \\    const s = \\ if (x) { } } }
+        \\        \\ body
+        \\    ;
+        \\    const buf = allocator.alloc(u8, 64) catch return;
+        \\    allocator.free(buf);
+        \\    allocator.free(buf);
+        \\    _ = s;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_mline_tail_cfg.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_mline_tail_cfg.zig",
+        RULE_DOUBLE_FREE,
+    ) == 1);
+}
+
 test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" {
     // KEY TEST: This was the original false positive that motivated CFG-based analysis
     // Pattern: catch { free(x); return; } - free only on error path, data still valid after
@@ -33201,6 +33258,60 @@ test "ephor:ignore-file inside a multiline string body does not suppress" {
     try std.testing.expect(!isInlineDisabled(content, 5, "ZA101"));
 }
 
+test "ephor:ignore-file in a multiline opener tail does not suppress (EPH-I0671)" {
+    // The `\\` opener swallows the rest of its line: the directive-shaped
+    // text is string data, not a comment, so the real ZA201 must survive.
+    const content =
+        \\const s = \\ // ephor:ignore-file ZA201
+        \\const a = foo() catch {};
+    ;
+    try expectSuppression(content, 2, false);
+}
+
+test "ephor:ignore same-line directive in a multiline opener tail does not suppress (EPH-I0671)" {
+    const content =
+        \\const s = \\ text // ephor:ignore ZA201
+        \\const a = foo() catch {};
+    ;
+    // A same-line ignore covers only its own line, so line 1 is the
+    // discriminating probe: pre-fix the tail directive suppresses it.
+    try expectSuppression(content, 1, false);
+    try expectSuppression(content, 2, false);
+}
+
+test "stripLineComment cuts a mid-line multiline opener tail (EPH-I0671)" {
+    // Target text: const s = \\ if (x) { } // not a comment
+    try std.testing.expectEqualStrings(
+        "const s =",
+        stripLineComment("const s = \\\\ if (x) { } // not a comment"),
+    );
+    // A whole-line `\\` body has no code at all.
+    try std.testing.expectEqualStrings("", stripLineComment("\\\\ body // x"));
+    // A comment before any opener still cuts at the comment.
+    try std.testing.expectEqualStrings("x();", stripLineComment("x(); // c"));
+}
+
+test "findCommentStart ignores comment text in a multiline opener tail (EPH-I0671)" {
+    const line = "const s = \\\\ // ephor:ignore-file ZA201";
+    try std.testing.expect(findCommentStart(line) == null);
+    // A comment before the opener still wins.
+    try std.testing.expectEqual(@as(?usize, 5), findCommentStart("x(); // real \\\\"));
+}
+
+test "lineCommentStart ignores comment text in a multiline opener tail (EPH-I0671)" {
+    const line = "const s = \\\\ // not a comment";
+    try std.testing.expectEqual(line.len, lineCommentStart(line));
+    // A comment after a closed char literal with an escape run still counts.
+    try std.testing.expectEqual(@as(usize, 16), lineCommentStart("const c = '\\\\'; // r"));
+}
+
+test "blankLiteralContents blanks a mid-line multiline opener tail (EPH-I0671)" {
+    var buf: [64]u8 = undefined;
+    // Target text: const s = \\ if (x) { }
+    const out = blankLiteralContents("const s = \\\\ if (x) { }", &buf);
+    try std.testing.expectEqualStrings("const s = " ++ (" " ** 13), out);
+}
+
 test "analyzeNaming: error{ in comments and strings does not open an error block" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -34035,6 +34146,48 @@ test "buildCFG: quoted braces do not corrupt depth; comment close counts" {
     try std.testing.expectEqual(if_block, findBlockForLine(&cfg, 6));
     // `} // comment` is comment-aware now: it pops the if block.
     const after = findBlockForLine(&cfg, 8);
+    try std.testing.expect(after != null);
+    try std.testing.expect(if_block.? != after.?);
+}
+
+test "buildCFG: multiline opener tail braces do not corrupt depth (EPH-I0671)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(cond: bool) void {", // 1
+        "    if (cond) {", // 2
+        "        const s = \\\\ }", // 3: the tail `}` is string data
+        "        x = 1;", // 4
+        "    }", // 5
+        "    x = 2;", // 6
+        "}", // 7
+    };
+    // No-string baseline: same line count, a plain statement in place of the
+    // multiline string.
+    const baseline = [_][]const u8{
+        "fn f(cond: bool) void {", // 1
+        "    if (cond) {", // 2
+        "        const s = 0;", // 3
+        "        x = 1;", // 4
+        "    }", // 5
+        "    x = 2;", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+    var base_cfg = try buildCFG(allocator, "f", 1, &baseline);
+    defer base_cfg.deinit();
+
+    // The tail `}` must not close the if body early: line 4 stays in the
+    // if-true block and the structure matches the no-string baseline.
+    try std.testing.expectEqual(base_cfg.blocks.items.len, cfg.blocks.items.len);
+    const if_block = findBlockForLine(&cfg, 4);
+    try std.testing.expect(if_block != null);
+    try std.testing.expectEqual(findBlockForLine(&base_cfg, 4), if_block);
+    const after = findBlockForLine(&cfg, 6);
     try std.testing.expect(after != null);
     try std.testing.expect(if_block.? != after.?);
 }

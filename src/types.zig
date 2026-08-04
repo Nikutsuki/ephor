@@ -846,13 +846,25 @@ pub fn isIdent(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+/// True when `t[i]` and `t[i + 1]` are both `\`, opening a multiline string.
+/// The opener swallows the rest of the line: every later byte is string
+/// data, so no code, comment, or directive can follow it on the line
+/// (EPH-I0671). Call in code context only. Escape runs exist inside `"..."`
+/// and `'...'` literals, so a `\` pair in code always opens a multiline
+/// string in valid Zig. A lone trailing `\` (invalid Zig) returns false.
+pub fn isMultilineOpenerAt(t: []const u8, i: usize) bool {
+    return i + 1 < t.len and t[i] == '\\' and t[i + 1] == '\\';
+}
+
 /// Check if position `col` is inside a string literal. Escape handling: an
 /// odd backslash run before a quote keeps the quote as character data, an
 /// even run keeps it as a delimiter. Char literal spans (`'...'`, with `\'`
 /// and `\\` escapes) never toggle string state: the `"` inside `'"'` stays
-/// character data (EPH-I0104).
+/// character data (EPH-I0104). A `\\` multiline opener in code position
+/// makes the rest of the line string data, so positions past the opener
+/// report inside-string (EPH-I0671).
 pub fn isInsideString(line: []const u8, col: usize) bool {
-    var mode: enum { none, str, char } = .none;
+    var mode: enum { none, str, char, mline } = .none;
     var i: usize = 0;
     while (i < col and i < line.len) : (i += 1) {
         const c = line[i];
@@ -865,13 +877,15 @@ pub fn isInsideString(line: []const u8, col: usize) bool {
                 if (c == '\\') i += 1;
                 if (c == '"') mode = .none;
             },
+            .mline => {},
             .none => {
+                if (isMultilineOpenerAt(line, i)) mode = .mline;
                 if (c == '\'') mode = .char;
                 if (c == '"') mode = .str;
             },
         }
     }
-    return mode == .str;
+    return mode == .str or mode == .mline;
 }
 
 /// Incremental per-line string/char-literal classifier (EPH-I0153).
@@ -888,16 +902,19 @@ pub const LineClassifier = struct {
     scanned: usize = 0,
     mode: QuoteMode = .none,
 
-    const QuoteMode = enum { none, str, char };
+    /// `mline` is sticky: a `\\` multiline opener swallows the rest of its
+    /// line, so no later byte on the line can leave string data (EPH-I0671).
+    const QuoteMode = enum { none, str, char, mline };
 
     pub fn init(line: []const u8) LineClassifier {
         return .{ .line = line };
     }
 
     /// True when column `col` sits inside a string literal. Matches
-    /// isInsideString exactly: the escape skip, and the EPH-I0104
-    /// char-literal spans where a `"` stays character data. `col` must be
-    /// at or after the previously queried column.
+    /// isInsideString exactly: the escape skip, the EPH-I0104 char-literal
+    /// spans where a `"` stays character data, and the EPH-I0671 `\\`
+    /// opener whose tail is string data. `col` must be at or after the
+    /// previously queried column.
     pub fn isInsideString(self: *LineClassifier, col: usize) bool {
         std.debug.assert(col >= self.scanned);
         while (self.scanned < col and self.scanned < self.line.len) : (self.scanned += 1) {
@@ -911,20 +928,24 @@ pub const LineClassifier = struct {
                     if (c == '\\') self.scanned += 1;
                     if (c == '"') self.mode = .none;
                 },
+                .mline => {},
                 .none => {
+                    if (isMultilineOpenerAt(self.line, self.scanned)) self.mode = .mline;
                     if (c == '\'') self.mode = .char;
                     if (c == '"') self.mode = .str;
                 },
             }
         }
-        return self.mode == .str;
+        return self.mode == .str or self.mode == .mline;
     }
 };
 
-/// State for masking string/char literals and comments while parsing a line
+/// State for masking string/char literals, `\\` multiline tails, and
+/// comments while parsing a line
 pub const LiteralState = struct {
     in_str: bool = false,
     in_chr: bool = false,
+    in_mline: bool = false,
     in_comment: bool = false,
 
     /// Start masking for one line. Returns null when the line is a
@@ -941,7 +962,7 @@ pub const LiteralState = struct {
     /// string/char-literal data or comment text (including the delimiters
     /// themselves).
     pub fn updateForChar(self: *LiteralState, t: []const u8, i: usize) ?usize {
-        if (self.in_comment) return null;
+        if (self.in_comment or self.in_mline) return null;
         const c = t[i];
         // `//` opens a comment only in code context — inside a string or char
         // literal it is data. A comment swallows the rest of the line.
@@ -949,6 +970,13 @@ pub const LiteralState = struct {
             i + 1 < t.len and t[i + 1] == '/')
         {
             self.in_comment = true;
+            return null;
+        }
+        // A `\\` opener in code position makes the rest of the line string
+        // data (EPH-I0671). The in_str/in_chr guards keep escape runs inside
+        // literals (`'\\'`, `"\\"`) from matching as openers.
+        if (!self.in_str and !self.in_chr and isMultilineOpenerAt(t, i)) {
+            self.in_mline = true;
             return null;
         }
         if (c == '\'' and !self.in_str) {
@@ -1080,9 +1108,9 @@ fn expectClassifierParity(line: []const u8) !void {
 }
 
 test "LineClassifier matches isInsideString on a shape battery" {
-    // The battery pins parity, including the shapes where isInsideString's
-    // quote-only state machine surprises: comments do not mask quotes, and
-    // a `\\` body does not either (callers mask those via LiteralState).
+    // The battery pins parity, including the shapes where the state machine
+    // surprises: comments do not mask quotes. A `\\` opener in code position
+    // marks its whole tail string data in both machines (EPH-I0671).
     const shapes = [_][]const u8{
         "",
         "const x = 42;",
@@ -1100,8 +1128,60 @@ test "LineClassifier matches isInsideString on a shape battery" {
         "'",
         "\"",
         "fn f() void { s.print(\"{d}\", .{x}); } // \"trailing",
+        "const s = \\\\ if (x) { foo(); }",
+        "x = 1; \\\\ // not a comment",
+        "const c = '\\\\'; const s = \\\\ tail",
     };
     for (shapes) |line| try expectClassifierParity(line);
+}
+
+test "isMultilineOpenerAt detects the two-backslash opener (EPH-I0671)" {
+    // Target text: const s = \\ tail
+    try std.testing.expect(isMultilineOpenerAt("const s = \\\\ tail", 10));
+    // The second backslash is not itself an opener start.
+    try std.testing.expect(!isMultilineOpenerAt("const s = \\\\ tail", 11));
+    // A lone backslash (invalid Zig) and a backslash at end-of-line stay code.
+    try std.testing.expect(!isMultilineOpenerAt("const s = \\x", 10));
+    try std.testing.expect(!isMultilineOpenerAt("trail \\", 6));
+    try std.testing.expect(!isMultilineOpenerAt("no backslash", 0));
+}
+
+test "isInsideString treats a mid-line multiline opener tail as string data (EPH-I0671)" {
+    // Target text: const s = \\ if (x) { foo(); }
+    const line = "const s = \\\\ if (x) { foo(); }";
+    try std.testing.expect(!isInsideString(line, 9));
+    try std.testing.expect(!isInsideString(line, 10));
+    try std.testing.expect(isInsideString(line, 12));
+    try std.testing.expect(isInsideString(line, line.len - 1));
+}
+
+test "LiteralState masks a mid-line multiline opener tail (EPH-I0671)" {
+    // Target text: const s = \\ free(); // not a comment
+    const line = "const s = \\\\ free(); // not a comment";
+    var lit = LiteralState.forLine(line) orelse unreachable;
+    try std.testing.expectEqual(@as(?usize, 0), lit.updateForChar(line, 0));
+    try std.testing.expectEqual(@as(?usize, 9), lit.updateForChar(line, 9));
+    try std.testing.expect(lit.updateForChar(line, 10) == null);
+    try std.testing.expect(lit.updateForChar(line, 15) == null);
+    // The `//` in the tail never opens a comment: it is string data.
+    try std.testing.expect(lit.updateForChar(line, 23) == null);
+    try std.testing.expect(!lit.in_comment);
+}
+
+test "LiteralState keeps escape runs inside char literals (EPH-I0671)" {
+    // Target text: const c = '\\'; x = 1; — the backslash pair inside the
+    // char literal is an escape run, not a multiline opener.
+    const line = "const c = '\\\\'; x = 1;";
+    var lit = LiteralState.forLine(line) orelse unreachable;
+    var i: usize = 0;
+    var tail_code = false;
+    while (i < line.len) : (i += 1) {
+        if (lit.updateForChar(line, i)) |pos| {
+            if (pos > 14) tail_code = true;
+        }
+    }
+    try std.testing.expect(!lit.in_mline);
+    try std.testing.expect(tail_code);
 }
 
 test "LineClassifier bounds work to one walk per line" {

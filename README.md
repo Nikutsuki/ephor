@@ -98,10 +98,11 @@ Ephor pins the installed version in `ephor.json` so your team always runs the sa
 <details>
 <summary>Click to expand manual steps</summary>
 
-Add the dependency:
+Add the dependency. Substitute the newest tag from the
+[tags page](https://codeberg.org/RhyosLabs/ephor/tags) for `v0.14.2`:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.3.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz
 ```
 
 Then add to `build.zig`:
@@ -1194,7 +1195,7 @@ Ephor uses three testing layers:
 
 ## Changelog
 
-### v0.14.3 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (2026-07-28)
+### v0.14.3 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (unreleased)
 
 **Changed (ZA703 default flip):** Error values and error set members now
 default to `TitleCase` (`error.FileNotFound`), matching the stdlib and

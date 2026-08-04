@@ -13,7 +13,10 @@ Files updated:
     - build.zig.zon      (the .version field)
     - src/main.zig       (EPHOR_VERSION const + help text examples)
     - install.sh         (EPHOR_TAG for Zig 0.16.0+)
-    - README.md          (install URL + JSON example only, NOT changelog)
+    - README.md          (JSON example only, NOT changelog. The install URL
+                          tracks the latest remote tag per check-version.sh
+                          section 3. Bump it manually in the first post-tag
+                          commit.)
 """
 
 import re
@@ -83,6 +86,10 @@ def bump_main_zig(old: str, new: str, dry_run: bool) -> None:
 
 
 def bump_install_sh(old: str, new: str, dry_run: bool) -> None:
+    # EPH-I0253: this rewrite is dead. install.sh computes EPHOR_TAG at
+    # runtime, so the pattern never matches. EPHOR_FALLBACK_TAG in
+    # install.sh and install.ps1 bumps manually in the first post-tag
+    # commit (mega-audit file-scripts.md finding 3).
     path = REPO_ROOT / "install.sh"
     old_re = re.escape(old)
     changed = replace_in_file(path, [
@@ -93,11 +100,18 @@ def bump_install_sh(old: str, new: str, dry_run: bool) -> None:
 
 
 def bump_readme(old: str, new: str, dry_run: bool) -> None:
+    """Bump the JSON example version only. Never rewrite the install URL.
+
+    EPH-I0702, EPH-I0188: the install URL tracks the latest remote tag
+    (check-version.sh section 3), not the zon version. Rewriting it here
+    re-creates a 404 on every release cycle. It bumps manually in the first
+    post-tag commit. verify_no_stale skips README.md for the same reason:
+    the changelog and the install URL legitimately keep older versions
+    (mega-audit file-scripts.md finding 2, EPH-I0656).
+    """
     path = REPO_ROOT / "README.md"
     old_re = re.escape(old)
     changed = replace_in_file(path, [
-        # Install URL: archive/vX.Y.Z.tar.gz
-        (rf'(archive/v){old_re}(\.tar\.gz)', rf'\g<1>{new}\g<2>'),
         # JSON example: "version": "X.Y.Z"
         (rf'("version": "){old_re}(")', rf'\g<1>{new}\g<2>'),
     ], dry_run)

@@ -7,7 +7,7 @@
 # Checked locations:
 #   1. build.zig.zon        .version field (source of truth)
 #   2. src/main.zig          EPHOR_VERSION constant
-#   3. README.md             manual install URL (v*.tar.gz)
+#   3. README.md             manual install URL matches the latest remote tag
 #   4. README.md             example config "version" field
 #   5. install.sh            EPHOR_FALLBACK_TAG matches the latest remote tag
 #   5b. install.ps1          EPHOR_FALLBACK_TAG matches install.sh's value
@@ -24,6 +24,26 @@ if [ -z "$EXPECTED" ]; then
     echo "error: could not determine version from build.zig.zon"
     exit 1
 fi
+
+# Read a Codeberg tags API response on stdin. Print the semver-highest
+# strict vX.Y.Z tag without the leading v. Print nothing when no tag matches.
+# EPH-I0193: the API orders tags by date, so limit=1 plus head -1 can select
+# a re-dated older tag. The numeric sort keys are the portable (BSD+GNU)
+# semver compare. sort -V is GNU-only.
+max_stable_version() {
+    grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
+}
+
+# Fetch the latest remote tag once. Sections 3, 5, and 6 use it.
+# Give the API 30s: observed 20s+ responses must not skip the gate.
+# EPH-I0156: clamp the fetch to the https scheme, redirects included, and
+# cap the body at 1 MiB. A hostile network cannot redirect the fetch into
+# a local file read or spew an unbounded body.
+TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10"
+REMOTE_TAG=$(curl -sL --max-time 30 --proto "=https" --proto-redir "=https" \
+    --max-filesize 1048576 "$TAGS_API" 2>/dev/null | max_stable_version)
 
 ERRORS=0
 
@@ -47,13 +67,18 @@ else
     echo "ok       src/main.zig EPHOR_VERSION: ${MAIN_VERSION}"
 fi
 
-# 3. README.md install URL
+# 3. README.md install URL matches the latest remote tag.
+# The manual install URL must name the newest existing tag, never the
+# untagged version under development. Bump it to the release version in the
+# first post-tag commit so the pre-push hook passes while the tag is in flight.
 README_URL_VERSION=$(grep 'ephor/archive/v' README.md | head -1 | sed 's/.*\/v\([0-9][0-9.]*\)\.tar\.gz.*/\1/')
 if [ -z "$README_URL_VERSION" ]; then
     echo "MISSING  README.md: no tagged install URL found"
     ERRORS=$((ERRORS + 1))
-elif [ "$README_URL_VERSION" != "$EXPECTED" ]; then
-    echo "MISMATCH README.md install URL: v${README_URL_VERSION} (expected v${EXPECTED})"
+elif [ -z "$REMOTE_TAG" ]; then
+    echo "SKIP     README.md install URL: Codeberg tags API unreachable"
+elif [ "$README_URL_VERSION" != "$REMOTE_TAG" ]; then
+    echo "MISMATCH README.md install URL: v${README_URL_VERSION} (latest remote tag v${REMOTE_TAG})"
     ERRORS=$((ERRORS + 1))
 else
     echo "ok       README.md install URL: v${README_URL_VERSION}"
@@ -70,26 +95,6 @@ elif [ "$README_CFG_VERSION" != "$EXPECTED" ]; then
 else
     echo "ok       README.md example config: ${README_CFG_VERSION}"
 fi
-
-# Read a Codeberg tags API response on stdin. Print the semver-highest
-# strict vX.Y.Z tag without the leading v. Print nothing when no tag matches.
-# EPH-I0193: the API orders tags by date, so limit=1 plus head -1 can select
-# a re-dated older tag. The numeric sort keys are the portable (BSD+GNU)
-# semver compare. sort -V is GNU-only.
-max_stable_version() {
-    grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 \
-        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-        | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
-}
-
-# Fetch the latest remote tag once. Sections 5 and 6 use it.
-# Give the API 30s: observed 20s+ responses must not skip the gate.
-# EPH-I0156: clamp the fetch to the https scheme, redirects included, and
-# cap the body at 1 MiB. A hostile network cannot redirect the fetch into
-# a local file read or spew an unbounded body.
-TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10"
-REMOTE_TAG=$(curl -sL --max-time 30 --proto "=https" --proto-redir "=https" \
-    --max-filesize 1048576 "$TAGS_API" 2>/dev/null | max_stable_version)
 
 # 5. install.sh EPHOR_FALLBACK_TAG matches the latest remote tag.
 # The fallback serves installs when the tags API fails. It must name the
@@ -137,7 +142,8 @@ fi
 echo ""
 if [ "$ERRORS" -gt 0 ]; then
     echo "FAILED: ${ERRORS} version mismatch(es) found"
-    echo "  All versions must be ${EXPECTED} before tagging v${EXPECTED}"
+    echo "  Sections 1, 2, and 4 must be ${EXPECTED} before tagging v${EXPECTED}."
+    echo "  Sections 3 and 5 must match the latest remote tag."
     exit 1
 else
     echo "All versions match: ${EXPECTED}"

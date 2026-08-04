@@ -15879,11 +15879,19 @@ fn isNewFunctionDef(t: []const u8) bool {
     return false;
 }
 
-/// Find real function definition position (not inside string)
+/// Find real function definition position (not inside string, not comment
+/// text). The comment bound is EPH-I0427: a trailing `// fn fake()` used to
+/// register a phantom def that hijacked the next real fn's span in this
+/// helper's consumers (the ZT101 call graph, the ZC101 span tracker, the
+/// complexity scan).
 fn findRealFnDef(t: []const u8) ?usize {
     const pos = mem.indexOf(u8, t, "fn ") orelse return null;
     // Skip if "fn " appears inside a string literal
     if (isInsideString(t, pos)) return null;
+    // Skip if "fn " sits at or past the line's real comment start
+    if (findCommentStart(t)) |comment_start| {
+        if (pos >= comment_start) return null;
+    }
     // Must be followed by identifier (function name)
     if (pos + 3 >= t.len or !isIdent(t[pos + 3])) return null;
     return pos;
@@ -15913,9 +15921,24 @@ fn resetsInFlightFn(view: LineView, state: *const ComplexityState) bool {
     return findRealFnDef(view.t) != null;
 }
 
+/// True when a fn-def line is a bodiless declaration (`extern fn ...;`):
+/// `;`-terminated with no body brace in code context. No body ever follows,
+/// so opening fn state on it accumulates phantom metrics under the decl
+/// name until the next real fn reports them (EPH-I0454). ZT101's
+/// updatePending drops the same shape when the `;` arrives.
+fn isBodilessFnDecl(t: []const u8) bool {
+    // Judge the terminator on the comment-stripped code: a trailing
+    // `// from gtk.h` must not hide the `;` (EPH-I0754).
+    const comment_start = findCommentStart(t) orelse t.len;
+    const code = mem.trimEnd(u8, t[0..comment_start], " \t");
+    if (!mem.endsWith(u8, code, ";")) return false;
+    return !hasCodeOpenBrace(t);
+}
+
 fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void {
     const t = view.t;
     const pos = findRealFnDef(t) orelse return;
+    if (isBodilessFnDecl(t)) return;
 
     // New top-level function definition resets state even if in_fn is true
     // This handles cases where brace counting didn't detect function end
@@ -16063,6 +16086,10 @@ fn analyzeFileComplexity(
     a: FileAnalysis,
     th: Thresholds,
 ) !void {
+    // Skip auto-generated C import files (EPH-I0454): their hundreds of
+    // `pub extern fn` decls would each detect a fn start. Mirrors the
+    // analyzeUnused skip.
+    if (isCImportFile(a.path, a.content)) return;
     var state = ComplexityState{};
     var line_num: usize = 1;
     var line_start: usize = 0;
@@ -47989,6 +48016,114 @@ test "ZA302: char-literal braces do not inflate nesting depth" {
 }
 
 // ============================================================================
+// Fn-def detection boundaries (EPH-I0427, EPH-I0454)
+// ============================================================================
+
+test "findRealFnDef: comment bound keeps real defs, drops comment text (EPH-I0427)" {
+    // A real def before a trailing comment still registers.
+    try std.testing.expectEqual(
+        @as(?usize, 0),
+        findRealFnDef("fn real() void { } // fn fake()"),
+    );
+    // The only `fn ` on the line is comment text — no def exists. Pre-fix
+    // this phantom def hijacked the next real fn's span (EPH-I0427).
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        findRealFnDef("const x = 1; // fn fake()"),
+    );
+}
+
+test "detectFnStart: bodiless extern decl opens no fn state (EPH-I0454)" {
+    // A `;`-terminated extern decl never gains a body — opening state on it
+    // accumulates phantom metrics under the decl name.
+    var state = ComplexityState{};
+    const decl = "pub extern fn c_thing(x: c_int) void;";
+    const decl_view: LineView = .{ .t = decl, .content = decl, .line_offset = 0 };
+    detectFnStart(decl_view, &state, 1);
+    try std.testing.expect(!state.in_fn);
+
+    // A real def on one line still opens state.
+    const def = "fn real() void {";
+    const def_view: LineView = .{ .t = def, .content = def, .line_offset = 0 };
+    detectFnStart(def_view, &state, 1);
+    try std.testing.expect(state.in_fn);
+}
+
+test "detectFnStart: extern decl with trailing comment opens no fn state (EPH-I0754)" {
+    // The `;` sits before the trailing comment — the decl is still
+    // bodiless. The raw-line `endsWith` check missed it (EPH-I0754).
+    var state = ComplexityState{};
+    const decl = "pub extern fn c_thing(x: c_int) void; // from gtk.h";
+    const view: LineView = .{ .t = decl, .content = decl, .line_offset = 0 };
+    detectFnStart(view, &state, 1);
+    try std.testing.expect(!state.in_fn);
+}
+
+test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // The extern decl never ends, so the 8 lines after it accumulate into
+    // its state; the real fn's arrival reports the phantom's verdict.
+    var content: []u8 = try aa.dupe(u8, "pub extern fn c_thing(x: c_int) void;\n");
+    for (0..8) |i| {
+        const line = try std.fmt.allocPrint(aa, "const v{d}: u32 = {d};\n", .{ i, i });
+        content = try mem.concat(aa, u8, &.{ content, line });
+    }
+    content = try mem.concat(aa, u8, &.{ content, "fn real() void {}\n" });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "extern_phantom.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "extern_phantom.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 5 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The @cImport marker makes isCImportFile true for any filename; the
+    // real fn would exceed the line cap if the file were analyzed.
+    const code =
+        \\const c = @cImport(@cInclude("x.h"));
+        \\pub extern fn c_a(x: c_int) void;
+        \\pub extern fn c_b(x: c_int) void;
+        \\fn real_inline() void {
+        \\    _ = 1;
+        \\    _ = 2;
+        \\    _ = 3;
+        \\    _ = 4;
+        \\    _ = 5;
+        \\    _ = 6;
+        \\}
+    ;
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "gtk_bindings.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "gtk_bindings.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 5 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+// ============================================================================
 // Test Quality Analysis Tests (ZT102, ZT103)
 // ============================================================================
 
@@ -49430,6 +49565,56 @@ test "ZT101: candidates passed as values are exercised" {
         @as(usize, 0),
         countRuleIssues(run.issues.items, "zt101_valueref.zig", RULE_TEST_LIE),
     );
+}
+
+test "ZT101: comment fn text does not hijack the next fn's span (EPH-I0427)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the comment's `fn fake()` registered as a pending def and
+    // stole the real fn's span: the graph held a phantom `fake` node and
+    // no `real` node at all.
+    const content =
+        \\const x = 1; // fn fake()
+        \\fn real() void {
+        \\    helper();
+        \\}
+        \\fn helper() void {}
+    ;
+    var facts = try collectFnCallFacts(allocator, content);
+    defer facts.deinit(allocator);
+
+    try std.testing.expect(facts.callees.get("real") != null);
+    try std.testing.expect(facts.callees.get("fake") == null);
+}
+
+test "ZT101: fn after a comment-def line stays a lie candidate (EPH-I0427)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The phantom `fake` def from the comment used to unregister the real
+    // fn, hiding the lie the test name promises to cover.
+    const content =
+        \\const x = 1; // fn fake()
+        \\fn checkWidget() void {}
+        \\test "checkWidget verifies nothing" {
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(allocator, "zt101_comment.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
+    );
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_TEST_LIE)) continue;
+        try std.testing.expect(mem.indexOf(u8, issue.message, "checkWidget") != null);
+    }
 }
 
 test "ZT104: defer cleanup catch is silent" {

@@ -15509,6 +15509,13 @@ const ComplexityState = struct {
     cognitive: usize = 0,
     cog_nest: usize = 0,
     cog_markers: u32 = 0,
+    // EPH-I0451: per-depth count of switch-prong open braces that
+    // updateBraceState skipped. The matching close at the same depth skips
+    // too, so a prong brace pair stays net-zero on nesting. usize, not u8:
+    // nested switch expressions in prong position each record at the SAME
+    // depth (nest never advances past skipped opens), so the count grows
+    // with the nesting depth of the input, not with anything bounded.
+    prong_opens: [32]usize = @splat(0),
 };
 
 /// Count function parameters by counting colons at depth 1.
@@ -16012,12 +16019,30 @@ fn updateBraceState(
     first: *bool,
     state: *ComplexityState,
 ) bool {
-    if (c == '{' and !(is_switch and first.*)) {
-        state.nest += 1;
-        if (state.nest > state.max_nest) state.max_nest = state.nest;
+    if (c == '{') {
+        // EPH-I0451: a switch prong's open brace adds no depth. Skipping
+        // only the open left every block prong at net -1 and ended fns
+        // mid-switch, so the skip is recorded per depth and the matching
+        // close skips too. Only the line's first `{` is the prong's; later
+        // opens on the line are inner braces and count. Depths >= 32
+        // cannot be recorded, so the brace counts there and stays balanced
+        // by its real close.
+        if (is_switch and first.* and state.nest < 32) {
+            state.prong_opens[state.nest] += 1;
+        } else {
+            state.nest += 1;
+            if (state.nest > state.max_nest) state.max_nest = state.nest;
+        }
         first.* = false;
     }
     if (c == '}' and state.nest > 0) {
+        // EPH-I0451: closes pair LIFO. A close at a depth with a pending
+        // skipped open matches that open and skips too; inner counted
+        // braces always balance before this close arrives.
+        if (state.nest < 32 and state.prong_opens[state.nest] > 0) {
+            state.prong_opens[state.nest] -= 1;
+            return false;
+        }
         // Decrement cognitive nesting if this depth was marked cognitive
         const marked = state.nest < 32 and
             (state.cog_markers & (@as(u32, 1) << @intCast(state.nest))) != 0;
@@ -47931,6 +47956,237 @@ test "trackBraceNesting still skips the brace of a real switch prong" {
     var state = ComplexityState{ .in_fn = true, .nest = 1 };
     try std.testing.expect(!trackBraceNesting("1 => {", &state));
     try std.testing.expectEqual(@as(usize, 1), state.nest);
+}
+
+// ============================================================================
+// Prong-brace open/close pairing (EPH-I0451, EPH-I0133)
+// ============================================================================
+
+test "trackBraceNesting skips both braces of a multi-line block prong (EPH-I0451)" {
+    // The prong open adds no depth, so its matching close must not remove
+    // one. Pre-fix the close decremented and ended fns mid-switch.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting(".catch_block => {", &state));
+    const body = "try self.cfg.addEdge(a, b, .sequential);";
+    try std.testing.expect(!trackBraceNesting(body, &state));
+    try std.testing.expect(!trackBraceNesting("},", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting nets zero on a same-line empty prong (EPH-I0133)" {
+    // `else => {},` skips its open, so the close skips too. Pre-fix the
+    // close dropped nest and ended the fn at the switch (EPH-I0133).
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting("else => {},", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting nets zero on a same-line struct-literal prong (EPH-I0451)" {
+    // The first `{` is the struct literal's open; its close pairs with the
+    // skip, leaving the enclosing switch depth untouched.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting("1 => .{ .x = 1 },", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting counts inner braces on a block prong line (EPH-I0451)" {
+    // The if's braces are inner: they count and balance, and neither close
+    // consumes the prong's skip. Pre-fix the fn ended on this line.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting("1 => { if (x) { foo(); } },", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting nets zero on a one-line switch expression (EPH-I0451)" {
+    // The prong heuristic skips the switch body open, so the body close on
+    // the same line must not drop the fn depth either.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    const line = "const f = switch (v) { .a => 1, .b => 2 };";
+    try std.testing.expect(!trackBraceNesting(line, &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+}
+
+test "trackBraceNesting counts a second open brace on a prong line (EPH-I0451)" {
+    // Only the line's first `{` is the prong's. A second open is an inner
+    // brace and counts, so its close balances and the prong close still
+    // pairs with the skip. Delta: pre-fix skipped the struct open too.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting("1 => { x = .{", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expect(!trackBraceNesting("} },", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting pairs nested skipped prongs at one depth (EPH-I0451)" {
+    // A one-line switch expression inside a block prong leaves two skipped
+    // opens pending at the same depth. The per-depth count pairs each close
+    // with its own skip; a single-bit marker would lose the outer one and
+    // end the fn at the switch close.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting("1 => {", &state));
+    const inner = "const x = switch (b) { .y => 1 };";
+    try std.testing.expect(!trackBraceNesting(inner, &state));
+    try std.testing.expect(!trackBraceNesting("},", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expect(!trackBraceNesting("}", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+}
+
+test "trackBraceNesting pairs 300 nested switch-expression prongs (EPH-I0451)" {
+    // A switch expression in prong position records its skipped open at the
+    // current depth, which never advances across the nested opens, so 300
+    // nested `N => switch (v) {` lines drive the per-depth count to 300.
+    // The u8 counter overflowed at 256 (review fixture
+    // .tmp/review-i0451/overflow.zig); the usize count pairs every close.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    var buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        const line = try std.fmt.bufPrint(&buf, "{d} => switch (v) {{", .{i});
+        try std.testing.expect(!trackBraceNesting(line, &state));
+        try std.testing.expectEqual(@as(usize, 2), state.nest);
+    }
+    try std.testing.expectEqual(@as(usize, 300), state.prong_opens[2]);
+    i = 0;
+    while (i < 300) : (i += 1) {
+        try std.testing.expect(!trackBraceNesting("},", &state));
+    }
+    // Every skip is consumed: the counter is empty and the next close
+    // decrements the depth again.
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expectEqual(@as(usize, 0), state.prong_opens[2]);
+    try std.testing.expect(!trackBraceNesting("}", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+}
+
+/// Run analyzeComplexity on one in-memory file and assert exactly one
+/// ZA301 fires, carrying the expected measured fn length in its message.
+/// The exact count pins "the fn measured its full body", not just "some
+/// finding fired" (EPH-I0451).
+fn expectMeasuredFnLines(
+    allocator: Allocator,
+    file: []const u8,
+    code: []const u8,
+    expect_lines: usize,
+) !void {
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    const analysis = try createTestFileAnalysis(allocator, file, code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, file), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, file, RULE_FUNC_TOO_LONG),
+    );
+    const needle = try std.fmt.allocPrint(allocator, "has {d} lines", .{expect_lines});
+    defer allocator.free(needle);
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        if (mem.indexOf(u8, issue.message, needle) != null) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "ZA301: two block prongs plus a trailing statement measure the full fn (EPH-I0451)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The true body is 56 lines. Pre-fix the second prong's close ended
+    // the measurement at fn line 14 and the trailing lines went unmeasured.
+    // The pad joins with an explicit newline: a multiline literal's last
+    // line carries no trailing one, so the first pad line would glue onto
+    // the switch close and the count drops by one.
+    const code =
+        \\fn two_prongs(v: u8) void {
+        \\    switch (v) {
+        \\        1 => {
+        \\            sink(1);
+        \\            sink(1);
+        \\            sink(1);
+        \\            sink(1);
+        \\        },
+        \\        2 => {
+        \\            sink(2);
+        \\            sink(2);
+        \\            sink(2);
+        \\            sink(2);
+        \\        },
+        \\        else => {},
+        \\    }
+    ++ "\n" ++ "    sink(9);\n" ** 39 ++
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    try expectMeasuredFnLines(allocator, "prongs.zig", code, 56);
+}
+
+test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // 61-line fn with `else => {},`. Pre-fix the fn ended at the switch
+    // close (6 measured lines) and the 55 trailing lines went unmeasured.
+    // Pad junction newline: see the two_prongs test above.
+    const code =
+        \\fn i0133_repro(v: u8) void {
+        \\    switch (v) {
+        \\        0 => sink(0),
+        \\        1 => sink(1),
+        \\        else => {},
+        \\    }
+    ++ "\n" ++ "    sink(2);\n" ** 54 ++
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    try expectMeasuredFnLines(allocator, "i0133.zig", code, 61);
+}
+
+test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I0451)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // handleBlockEnd-shaped: four block prongs, then work after the
+    // switch. True body 52 lines; pre-fix the second prong close ended
+    // the measurement at fn line 10.
+    const code =
+        \\fn handle_block_end_shaped(v: u8) void {
+        \\    switch (v) {
+        \\        .catch_block => {
+        \\            edge();
+        \\            set_line();
+        \\        },
+        \\        .while_block, .for_block => {
+        \\            edge();
+        \\            set_line();
+        \\        },
+        \\        .switch_block => {
+        \\            edge();
+        \\            set_line();
+        \\        },
+        \\        else => {
+        \\            edge();
+        \\            set_line();
+        \\        },
+        \\    }
+    ++ "\n" ++ "    after();\n" ** 32 ++
+        \\}
+        \\fn edge() void {}
+        \\fn set_line() void {}
+        \\fn after() void {}
+    ;
+    try expectMeasuredFnLines(allocator, "hbe.zig", code, 52);
 }
 
 test "ZA302: poisoned arrow line does not hide a deeply nested tail" {

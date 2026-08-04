@@ -22460,10 +22460,10 @@ fn tryLoadConfigFromDir(
     };
     if (!trusted and ignored_any) try noteSuppressionKeysIgnored(allocator, config_path);
 
-    if (cfg.path_owned) allocator.free(cfg.path);
-    cfg.path = saved_path;
-    cfg.path_owned = true;
-    const dropped_entries = try makeEntriesAbsolute(allocator, cfg, dir_copy, trusted);
+    // Commit saved_path only AFTER its fallible consumers: until then the
+    // caller's errdefer owns it, so a mid-load OOM frees it once (EPH-I0689).
+    const roots: EntriesRoots = .{ .base = dir_copy, .scan_root = saved_path };
+    const dropped_entries = try makeEntriesAbsolute(allocator, cfg, roots, trusted);
     if (dropped_entries > 0) try noteEntriesRejected(
         allocator,
         "note: ignoring {d} outside-root entries from untrusted {s} " ++
@@ -22471,6 +22471,9 @@ fn tryLoadConfigFromDir(
         config_path,
         dropped_entries,
     );
+    if (cfg.path_owned) allocator.free(cfg.path);
+    cfg.path = saved_path;
+    cfg.path_owned = true;
     return true;
 }
 
@@ -22522,6 +22525,17 @@ fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []c
     allocator.free(saved_path);
 }
 
+/// Root paths for makeEntriesAbsolute. scan_root travels as a parameter
+/// (not cfg.path) because the loader commits cfg.path only after the
+/// fallible absolutize, so mid-load cfg.path is not the scan root yet
+/// (EPH-I0689).
+const EntriesRoots = struct {
+    /// Config file's directory: relative entries absolutize against it.
+    base: []const u8,
+    /// Operator's scan root: the untrusted containment gate realpaths it.
+    scan_root: []const u8,
+};
+
 /// Convert relative entry paths to absolute paths based on config file
 /// location. Untrusted configs (EPH-I0195): every entry must realpath
 /// inside the realpath'd scan root — the textual ancestor test is
@@ -22535,24 +22549,28 @@ fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []c
 /// exists, so a failed slot keeps its original. Phase 2 gates and compacts
 /// without allocating (the realpath buffers are stack memory), so the
 /// shrink always runs and no stale slot survives inside len.
+///
+/// The containment root is roots.scan_root, never cfg.path: the loader
+/// commits cfg.path only after the fallible phase, so mid-load cfg.path
+/// does not hold the scan root yet (EPH-I0689).
 fn makeEntriesAbsolute(
     allocator: Allocator,
     cfg: *Config,
-    base_path: []const u8,
+    roots: EntriesRoots,
     trusted: bool,
 ) !usize {
-    if (base_path.len == 0) return 0;
+    if (roots.base.len == 0) return 0;
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
     const root_real: ?[]const u8 = if (trusted)
         null
     else
-        Fs.cwd().realpath(cfg.path, &root_buf) catch null;
+        Fs.cwd().realpath(roots.scan_root, &root_buf) catch null;
 
     // Phase 1 (fallible): absolutize each entry into its own slot. An OOM
     // here leaves the array owned 1:1, so Config.deinit frees each slot
     // exactly once.
     for (cfg.entries.items, 0..) |entry, i| {
-        cfg.entries.items[i] = try absolutizeEntry(allocator, base_path, entry);
+        cfg.entries.items[i] = try absolutizeEntry(allocator, roots.base, entry);
     }
 
     // Phase 2 (infallible): gate, then compact in place. kept never leads
@@ -54047,11 +54065,12 @@ fn runEntriesSweepIteration(root_path: []const u8, fail_at: usize, inner_allocs:
     var cfg = try buildEntriesSweepConfig(failing.allocator(), root_path);
     failing.fail_index = failing.allocations + fail_at;
     entries_reject_count = 0;
+    const roots: EntriesRoots = .{ .base = root_path, .scan_root = root_path };
     if (fail_at == inner_allocs) {
         // No induced failure: the gate must still land once phase 1
         // completes — the outside-root entry drops, the rest survive
         // absolutized.
-        const dropped = try makeEntriesAbsolute(failing.allocator(), &cfg, root_path, false);
+        const dropped = try makeEntriesAbsolute(failing.allocator(), &cfg, roots, false);
         try std.testing.expectEqual(@as(usize, 1), dropped);
         try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
         const want_b = try std.fmt.allocPrint(parent, "{s}/b.zig", .{root_path});
@@ -54065,7 +54084,7 @@ fn runEntriesSweepIteration(root_path: []const u8, fail_at: usize, inner_allocs:
         try std.testing.expectError(error.OutOfMemory, makeEntriesAbsolute(
             failing.allocator(),
             &cfg,
-            root_path,
+            roots,
             false,
         ));
     }
@@ -54104,7 +54123,8 @@ test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
     var probe = std.testing.FailingAllocator.init(parent, .{});
     var probe_cfg = try buildEntriesSweepConfig(probe.allocator(), root_path);
     const probe_base = probe.allocations;
-    _ = try makeEntriesAbsolute(probe.allocator(), &probe_cfg, root_path, false);
+    const probe_roots: EntriesRoots = .{ .base = root_path, .scan_root = root_path };
+    _ = try makeEntriesAbsolute(probe.allocator(), &probe_cfg, probe_roots, false);
     probe_cfg.deinit(probe.allocator());
     const inner_allocs = probe.allocations - probe_base;
 
@@ -54112,6 +54132,109 @@ test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
     while (fail_at <= inner_allocs) : (fail_at += 1) {
         try runEntriesSweepIteration(root_path, fail_at, inner_allocs);
     }
+}
+
+/// One EPH-I0689 sweep iteration: run loadConfigFromTargetPath under an
+/// allocator that fails on its fail_at-th allocation (fail_at == total
+/// induces none), then prove deinit releases every byte exactly once.
+fn runConfigLoadSweepIteration(root_path: []const u8, fail_at: usize, total: usize) !void {
+    const parent = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(parent, .{});
+    var cfg = testConfig();
+    try setOwnedPath(failing.allocator(), &cfg, root_path);
+    failing.fail_index = failing.allocations + fail_at;
+    entries_reject_count = 0;
+    entries_reject_note_count = 0;
+    if (fail_at == total) {
+        // No induced failure: the load commits saved_path, absolutizes the
+        // surviving entry, and drops the unresolvable one with one note.
+        try loadConfigFromTargetPath(failing.allocator(), &cfg, root_path);
+        try std.testing.expectEqualStrings(root_path, cfg.path);
+        try std.testing.expect(cfg.path_owned);
+        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+        const want_entry = try std.fmt.allocPrint(parent, "{s}/inside.zig", .{root_path});
+        defer parent.free(want_entry);
+        try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
+        try std.testing.expectEqual(@as(usize, 1), entries_reject_count);
+        try std.testing.expectEqual(@as(usize, 1), entries_reject_note_count);
+    } else {
+        // A readFileAlloc OOM reads as "no config" (catch return false), so
+        // the sweep tolerates a clean return here as well as OutOfMemory.
+        // Both outcomes must stay byte-balanced below.
+        loadConfigFromTargetPath(failing.allocator(), &cfg, root_path) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        };
+    }
+    cfg.deinit(failing.allocator());
+    // Byte balance is the leak proof. A double-free panics the parent
+    // DebugAllocator before this line runs.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I0689)" {
+    // Regression: tryLoadConfigFromDir consumed saved_path (path_owned =
+    // true) BEFORE makeEntriesAbsolute's fallible absolutize, so an OOM
+    // there freed saved_path through the caller's errdefer and again
+    // through Config.deinit. Pre-fix this test panics on that double-free
+    // at the first phase-1 allocPrint index.
+    global_io = std.testing.io;
+    const parent = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/inside.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(parent, &tmp);
+    defer parent.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(parent, "{s}/root", .{tmp_path});
+    defer parent.free(root_path);
+    // One surviving relative entry (its absolutize allocates) and one
+    // unresolvable entry (drops, so the rejection note also allocates).
+    try writeTestConfig(root_path, "{\"entries\": [\"inside.zig\", \"ghost.zig\"]}");
+
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    // Measure the allocation count inside loadConfigFromTargetPath so the
+    // sweep covers every induced failure point plus one no-failure run.
+    var probe = std.testing.FailingAllocator.init(parent, .{});
+    var probe_cfg = testConfig();
+    try setOwnedPath(probe.allocator(), &probe_cfg, root_path);
+    const probe_base = probe.allocations;
+    try loadConfigFromTargetPath(probe.allocator(), &probe_cfg, root_path);
+    probe_cfg.deinit(probe.allocator());
+    const total = probe.allocations - probe_base;
+
+    var fail_at: usize = 0;
+    while (fail_at <= total) : (fail_at += 1) {
+        try runConfigLoadSweepIteration(root_path, fail_at, total);
+    }
+}
+
+test "loadConfigFromTargetPath without a config frees saved_path once (EPH-I0689)" {
+    // No ephor.json in the target or its parent: saved_path is never
+    // consumed, so the loader frees it exactly once on the not-found path.
+    global_io = std.testing.io;
+    const parent = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    const tmp_path = try tmpDirPath(parent, &tmp);
+    defer parent.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(parent, "{s}/root", .{tmp_path});
+    defer parent.free(root_path);
+
+    var failing = std.testing.FailingAllocator.init(parent, .{});
+    var cfg = testConfig();
+    try setOwnedPath(failing.allocator(), &cfg, root_path);
+    try loadConfigFromTargetPath(failing.allocator(), &cfg, root_path);
+    try std.testing.expectEqualStrings(root_path, cfg.path);
+    try std.testing.expect(cfg.path_owned);
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+    cfg.deinit(failing.allocator());
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)" {

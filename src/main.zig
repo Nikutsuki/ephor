@@ -3763,7 +3763,18 @@ fn countChar(t: []const u8, ch: u8) usize {
     return n;
 }
 
-/// Check if a line assigns to a variable via array indexing: `var_name[...] = ...`
+/// True when the line assigns to the variable through an array subscript:
+/// `var_name[...] = ...`. The assignment must be a plain `=` after the
+/// matching `]`. Nested subscripts (`a[b[i]]`) balance. A bare read
+/// (`sum +%= buf[x]`), a comparison (`buf[i] == 0`), and compound ops
+/// (`+=`) do not count: they read the element first (EPH-I0327).
+/// Unbalanced brackets skip the occurrence, and the scan continues.
+/// Quote content is not masked: a `]` inside a string-literal index
+/// (`buf["]"]`) unbalances the bracket scan, and the occurrence is
+/// skipped.
+/// Residual: the gen-side fill sites keep the loop read class masked.
+/// ForLoopTracker.checkIndexedAssign and hasDirectFill Pattern 2 count
+/// any `vn[` occurrence as a fill, read or write (EPH-I0752).
 fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
     var pos: usize = 0;
     while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
@@ -3781,8 +3792,10 @@ fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
             pos = end;
             continue;
         }
-        // Check for `var_name[`
-        if (t[end] == '[') return true;
+        // `var_name[` must be an assignment target: a bare subscript read
+        // does not initialize the array (EPH-I0327).
+        if (t[end] == '[' and
+            (hasAssignmentAfterBracket(t[end..]) orelse false)) return true;
         pos = end;
     }
     return false;
@@ -37172,6 +37185,80 @@ test "ZA607: indexed assignment to different var in loop does not mask read" {
         1,
         countRuleIssues(run.issues.items, "da_loopidx.zig", RULE_DEFINITE_ASSIGNMENT),
     );
+}
+
+test "ZA607: plain subscript assignment in for loop stays silent (EPH-I0327)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Positive control: `buf[x] = 1` is the fill idiom the heuristic
+    // exists for. The fix must keep accepting the plain `=`.
+    const content =
+        \\fn writeInLoop(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        buf[x] = 1;
+        \\    }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0327_write.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0327_write.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: subscript read before same-loop assignment stays silent (EPH-I0327)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `buf[x] == 0` comparison does not initialize, but the later
+    // `buf[x] = 1` in the same loop does. The scan must skip the read
+    // occurrence and still find the genuine assignment.
+    const content =
+        \\fn readThenWriteInLoop(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        if (buf[x] == 0) {
+        \\            buf[x] = 1;
+        \\        }
+        \\    }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0327_readwrite.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0327_readwrite.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "isArrayIndexAssignment requires a plain assignment (EPH-I0327)" {
+    // Plain `=` past the matching `]` counts, nested subscripts balance.
+    try std.testing.expect(isArrayIndexAssignment("buf[x] = 1;", "buf"));
+    try std.testing.expect(isArrayIndexAssignment("a[b[i]] = 1;", "a"));
+    // Chained element writes count via hasAssignmentAfterBracket.
+    try std.testing.expect(isArrayIndexAssignment("buf[i].v = 1;", "buf"));
+    // Bare reads, comparisons, and compound ops read the element first.
+    try std.testing.expect(!isArrayIndexAssignment("sum +%= buf[x];", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("if (buf[i] == 0) {", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("buf[x] += 1;", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("buf[x] -= 1;", "buf"));
+    // A read must not hide a later genuine assignment on the same line.
+    try std.testing.expect(isArrayIndexAssignment(
+        "if (buf[i] == 0) { buf[i] = 1; }",
+        "buf",
+    ));
+    // Unbalanced brackets skip the occurrence; word boundaries hold.
+    try std.testing.expect(!isArrayIndexAssignment("buffer[i] = 1;", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("buf[s[..];", "buf"));
 }
 
 test "ZA607: field assignment on other var does not mask read" {

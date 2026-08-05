@@ -2516,10 +2516,9 @@ const BracketUse = enum { fill, read };
 /// initialize the buffer (EPH-I0752). The slice form keeps its fill
 /// verdict even as a read: that crudeness is load-bearing (EPH-I0102,
 /// ghostty/flow). An unclosed bracket keeps the historical fill verdict.
-/// A call-argument position (`func(buf[i])`) needs no arm here: a `vn[`
-/// inside any unmatched paren drops the var from tracking upstream
-/// (hasSlicePassToFunction via isInsideCallArg) before this discriminator
-/// runs (EPH-I0752 review, EPH-I0773).
+/// The call-argument position (`func(buf[i])`) needs no arm here:
+/// hasSlicePassToFunction combines this verdict with the address-of arm
+/// to adjudicate paren occurrences (EPH-I0773).
 fn classifyBracketUse(t: []const u8, open_pos: usize) BracketUse {
     const close = skipBracketed(t, open_pos) orelse return .fill;
     if (hasTopLevelRange(t[open_pos + 1 .. close - 1])) return .fill;
@@ -3959,10 +3958,34 @@ fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
     return false;
 }
 
+/// True when a `&` sits immediately before the `var_name[` occurrence at
+/// vpos (spaces allowed): an element address pass (`fill(&buf[i])`), where
+/// the callee can fill through the pointer. A binary `&`
+/// (`f(a & buf[i])`) reads the element, but the text scan cannot separate
+/// it from the unary form at this spot. Treating both as an address pass
+/// keeps the conservative direction: silence, never a false positive
+/// (EPH-I0773).
+fn hasAmpBeforeElem(t: []const u8, vpos: usize) bool {
+    var i = vpos;
+    while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) i -= 1;
+    return i > 0 and t[i - 1] == '&';
+}
+
 /// Check if a mutable slice of the variable is passed to a function call.
 /// Pattern: func(var_name[0..]) or func(var_name[0..N])
 /// Passing a mutable slice allows the callee to write into the array,
 /// effectively initializing it (e.g., reader.readSliceShort(buf[0..])).
+///
+/// Parens adjudication (EPH-I0773): an occurrence inside unmatched parens
+/// is an indirect init only when the callee can write through what it
+/// receives — a fill-verdict form (slice pass `send(buf[0..])`, element
+/// write-through `foo(buf[i].append(1))`, indexed assignment) or an
+/// element address pass (`fill(&buf[i])`). A by-value element occurrence
+/// COPIES the element: a condition read (`if (buf[i] == 1)`) or a copied
+/// call argument (`use(buf[i])`) is a genuine read of undefined memory and
+/// must stay visible to ZA607. Condition parens (`if (/while (/for (`)
+/// count as unmatched parens here, so the by-value arm also frees
+/// condition-position reads.
 fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
@@ -3994,19 +4017,26 @@ fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
             pos = end;
             continue;
         }
-        // Must NOT be an assignment target (var_name[i] = ...),
-        // which is a write, not a read-via-slice-pass.
-        // We specifically want var_name[...] passed as a function argument.
-        // Check if the enclosing context is a function call argument
-        // (var_name[...] passed as a slice, not an assignment target).
-        if (isInsideCallArg(t, vpos)) return true;
+        // Only an occurrence inside unmatched parens can be an indirect
+        // init here. Outside parens the gen-side fill sites adjudicate.
+        if (!isInsideCallArg(t, vpos)) {
+            pos = end;
+            continue;
+        }
+        // Fill-verdict and address-pass forms keep the drop (EPH-I0102).
+        // A by-value element occurrence in parens is a read (EPH-I0773).
+        if (classifyBracketUse(t, end) == .fill) return true;
+        if (hasAmpBeforeElem(t, vpos)) return true;
         pos = end;
     }
     return false;
 }
 
 /// Look backwards for a '(' at paren depth 0 — true when vpos is inside a
-/// function-call argument list.
+/// function-call argument list. Condition parens (`if (/while (/for (`)
+/// are unmatched parens too, so a condition occurrence also reads true
+/// here. Callers that need call-only adjudication discriminate further
+/// (hasSlicePassToFunction, EPH-I0773).
 fn isInsideCallArg(t: []const u8, vpos: usize) bool {
     return unmatchedOpenParenBefore(t, vpos) != null;
 }
@@ -38975,6 +39005,149 @@ test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_i0752_slicepass.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (flags[x] == 1)` reads the element inside the condition parens.
+    // The pre-fix isInsideCallArg treated the condition paren as a call
+    // argument and dropped flags from tracking before the read could flag.
+    const content =
+        \\fn condElemRead(xs: []const u8) u8 {
+        \\    var flags: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| {
+        \\        if (flags[x] == 1) {
+        \\            sum +%= 1;
+        \\        }
+        \\    }
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0773_condread.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0773_condread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: by-value call-arg element read of undefined buffer is detected (EPH-I0773)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `use(buf[x])` copies the element into the call: a genuine read of
+    // undefined memory, not an indirect init.
+    const content =
+        \\fn callArgElemRead(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| {
+        \\        use(buf[x]);
+        \\    }
+        \\    return sum;
+        \\}
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0773_callarg.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0773_callarg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: slice pass in call arg stays silent (EPH-I0773)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `send(buf[0..])` hands the callee a mutable slice it can fill
+    // through. The slice form keeps the indirect-init drop (EPH-I0102).
+    const content =
+        \\fn slicePassSilent(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        send(buf[0..], x);
+        \\    }
+        \\    return buf[0];
+        \\}
+        \\fn send(s: []u8, v: u8) void {
+        \\    s[0] = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0773_slicepass.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0773_slicepass.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: element address pass in call arg stays silent (EPH-I0773)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `fill(&buf[x])` hands the callee the element address. The callee
+    // fills through the pointer, so the indirect-init drop stays.
+    const content =
+        \\fn addrPassSilent(xs: []const u8) void {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        fill(&buf[x]);
+        \\    }
+        \\    use(buf[0]);
+        \\}
+        \\fn fill(p: *u8) void {
+        \\    p.* = 1;
+        \\}
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0773_addrpass.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0773_addrpass.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: slice-parameter fill still suppresses the read (EPH-I0773)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Control: `fillSlice(buf[0..])` is a genuine definite assignment
+    // through the slice parameter. The later read must stay silent.
+    const content =
+        \\fn sliceParamFill() u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    fillSlice(buf[0..]);
+        \\    return buf[0];
+        \\}
+        \\fn fillSlice(s: []u8) void {
+        \\    s[0] = 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0773_slicefill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0773_slicefill.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

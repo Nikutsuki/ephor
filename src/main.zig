@@ -21734,6 +21734,15 @@ fn classifyGPALine(
     const leak_pats = [_][]const u8{ "memory leak", "Memory leak", "leaked:" };
     if (matchesAnyPattern(t, &leak_pats))
         return handleMemoryLeak(ctx, line_iter, verbose, t);
+    if (isRunnerBlockHeader(t))
+        return handleRunnerBlock(ctx, line_iter, verbose, t);
+    return classifyGPATable(ctx, verbose, t);
+}
+
+/// Match one line against the GPA classification table. EPH-I0732 split
+/// this out of classifyGPALine so runner-block replay can reuse it without
+/// re-entering the leak or block paths.
+fn classifyGPATable(ctx: RuntimeEmitCtx, verbose: bool, t: []const u8) !void {
     for (gpa_classifications) |cls| {
         if (!matchesAnyPattern(t, cls.patterns)) continue;
         if (verbose) std.debug.print("GPA: {s}\n", .{t});
@@ -21745,6 +21754,172 @@ fn classifyGPALine(
         if (cls.located) return emitLocatedIssue(ctx, spec, t);
         return emitRuntimeIssue(ctx, spec);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0.16 runner stderr blocks (EPH-I0732)
+//
+// On 0.16 the pre-0.16 table texts never fire usefully for UAF or double
+// free. UAF prints no textual marker. The "double free" text matches only
+// test names and yields name-match artifacts instead of the call site. The
+// DebugAllocator either reports the double free as a test log error, or the
+// second free dies in the poison memset on an unmapped small-pool span. The
+// build runner wraps the child stderr in an indented block (Run.zig):
+//   error: 'NAME' terminated with signal SIG with stderr:   (crash)
+//   error: 'NAME' logged N errors:                          (log output)
+// This machinery consumes such a block, classifies the crash shape, and
+// emits one located finding. A block with no recognized shape replays
+// header and lines through the plain table, so pre-0.16 outputs and exotic
+// blocks keep the pre-fix behavior.
+// ---------------------------------------------------------------------------
+
+/// Cap on the lines one runner block may consume (EPH-I0732). The observed
+/// 0.16 blocks run under 30 lines (7 frames with source echoes). A cap of
+/// 64 leaves headroom without letting a malformed block swallow the stream.
+const max_runner_block_lines = 64;
+
+/// ZR102 content for the 0.16 shapes, mirroring the table entry so exports
+/// and known-issues files stay comparable across toolchain versions.
+const double_free_issue_spec = RuntimeIssueSpec{
+    .rule = RULE_RUNTIME_DOUBLE_FREE,
+    .message = "double free detected at runtime",
+    .help = "memory freed twice - check defer order and error paths",
+};
+
+/// ZR105 content for a located 0.16 segfault. 0.16 prints no textual UAF
+/// marker, so a crash without a free frame stays ZR105 (its help already
+/// names UAF) instead of claiming ZR103 on guesswork (EPH-I0732).
+const located_segfault_issue_spec = RuntimeIssueSpec{
+    .rule = RULE_RUNTIME_PANIC,
+    .message = "segmentation fault - invalid memory access",
+    .help = "check for null pointer dereference, use after free, or buffer overflow",
+};
+
+/// Trace symbols that mark a death inside the allocator free path
+/// (EPH-I0732). 0.16 prints generic instantiations as free__anon_NNNN.
+/// "in free (" pins the C free frame form. A bare "in free" would also
+/// match C symbols like freeaddrinfo.
+const free_frame_markers = [_][]const u8{ "Allocator.free", "free__anon", "in free (" };
+
+/// True when the line is a 0.16 build-runner header that wraps child
+/// stderr in an indented block (EPH-I0732). The signal name stays loose so
+/// ABRT and SIGSEGV forms both match.
+fn isRunnerBlockHeader(t: []const u8) bool {
+    if (mem.indexOf(u8, t, "terminated with signal ") != null) return true;
+    return mem.indexOf(u8, t, " logged ") != null and
+        mem.endsWith(u8, t, " errors:");
+}
+
+/// True for frames inside the Zig toolchain lib tree (EPH-I0732): std,
+/// compiler_rt, and the build/test runner. The /lib/zig/ needle covers
+/// packager layouts that nest the tree one level deeper (homebrew). POSIX
+/// separators only. Windows trace paths are unverified.
+fn isToolchainFramePath(path: []const u8) bool {
+    const needles = [_][]const u8{
+        ".zenv/", "/lib/std/", "/lib/compiler/", "/lib/compiler_rt", "/lib/zig/",
+    };
+    return matchesAnyPattern(path, &needles);
+}
+
+/// Markers and candidate frame lines gathered from one runner block.
+/// Frame candidates keep the whole line: emitLocatedIssue re-parses the
+/// location and dupes the file bytes (EPH-I0202).
+const RunnerBlockScan = struct {
+    saw_double_free_text: bool = false,
+    saw_segfault: bool = false,
+    has_free_frame: bool = false,
+    in_second_free: bool = false,
+    first_user_frame: ?[]const u8 = null,
+    second_free_frame: ?[]const u8 = null,
+};
+
+/// Fold one trimmed block line into the scan (EPH-I0732).
+fn scanRunnerBlockLine(scan: *RunnerBlockScan, t: []const u8) void {
+    if (mem.indexOf(u8, t, "Double free detected") != null)
+        scan.saw_double_free_text = true;
+    if (mem.indexOf(u8, t, "Segmentation fault") != null)
+        scan.saw_segfault = true;
+    if (mem.indexOf(u8, t, "Second free:") != null)
+        scan.in_second_free = true;
+    // The address column gates both checks below: frame lines carry
+    // " 0x<addr>", the echoed source lines under them do not. Without the
+    // gate a user call written Allocator.free(gpa, buf) would read as a
+    // death inside free.
+    const has_addr = mem.indexOf(u8, t, " 0x") != null;
+    if (has_addr and matchesAnyPattern(t, &free_frame_markers))
+        scan.has_free_frame = true;
+    const loc = extractFileLocation(t);
+    if (!has_addr or loc.line == 0 or isToolchainFramePath(loc.file)) return;
+    if (scan.first_user_frame == null) scan.first_user_frame = t;
+    if (scan.in_second_free and scan.second_free_frame == null)
+        scan.second_free_frame = t;
+}
+
+/// Consume the indented block after a runner header into buf, returning
+/// the count (EPH-I0732). The first non-blank, non-indented line ends the
+/// block and stays in the stream. Blank lines ride along so a spacer
+/// mid-block does not truncate the trace.
+fn collectRunnerBlock(
+    line_iter: *mem.SplitIterator(u8, .scalar),
+    buf: *[max_runner_block_lines][]const u8,
+) usize {
+    var n: usize = 0;
+    while (n < max_runner_block_lines) {
+        const raw = line_iter.peek() orelse break;
+        if (raw.len > 0 and raw[0] != ' ' and raw[0] != '\t') break;
+        buf[n] = mem.trim(u8, raw, " \t\r");
+        n += 1;
+        _ = line_iter.next();
+    }
+    return n;
+}
+
+/// Emit the finding for a recognized block shape (EPH-I0732), or return
+/// false so the caller replays the lines through the plain table. Death
+/// inside free means the double-free detection fired on the poison memset.
+/// The header serves as the no-frame anchor, which yields unknown:0 there.
+fn emitRunnerBlockFinding(
+    ctx: RuntimeEmitCtx,
+    scan: *const RunnerBlockScan,
+    header: []const u8,
+) !bool {
+    if (scan.saw_double_free_text) {
+        const frame = scan.second_free_frame orelse scan.first_user_frame orelse header;
+        try emitLocatedIssue(ctx, double_free_issue_spec, frame);
+        return true;
+    }
+    if (!scan.saw_segfault) return false;
+    if (scan.has_free_frame) {
+        try emitLocatedIssue(ctx, double_free_issue_spec, scan.first_user_frame orelse header);
+        return true;
+    }
+    if (scan.first_user_frame) |frame| {
+        try emitLocatedIssue(ctx, located_segfault_issue_spec, frame);
+    } else {
+        try emitRuntimeIssue(ctx, located_segfault_issue_spec);
+    }
+    return true;
+}
+
+/// Handle a 0.16 runner stderr block (EPH-I0732): consume the indented
+/// trace, classify the crash shape, and emit one located finding. An
+/// unrecognized block replays header and lines through the plain table so
+/// pre-0.16 outputs keep the pre-fix behavior.
+fn handleRunnerBlock(
+    ctx: RuntimeEmitCtx,
+    line_iter: *mem.SplitIterator(u8, .scalar),
+    verbose: bool,
+    t: []const u8,
+) !void {
+    if (verbose) std.debug.print("GPA: {s}\n", .{t});
+    var buf: [max_runner_block_lines][]const u8 = undefined;
+    const n = collectRunnerBlock(line_iter, &buf);
+    const lines = buf[0..n];
+    var scan: RunnerBlockScan = .{};
+    for (lines) |line| scanRunnerBlockLine(&scan, line);
+    if (try emitRunnerBlockFinding(ctx, &scan, t)) return;
+    try classifyGPATable(ctx, verbose, t);
+    for (lines) |line| try classifyGPATable(ctx, verbose, line);
 }
 
 /// Parse test output for failures and panics
@@ -28449,6 +28624,188 @@ test "parseGPADiagnostics findings own their file bytes after the source frees" 
     try std.testing.expect(issues.items[0].file_owned);
     // deinitIssues frees the owned file exactly once. The testing
     // allocator fails the test on a leak or an invalid free.
+}
+
+test "parseGPADiagnostics locates a 0.16 double-free crash block at the user frame" {
+    // EPH-I0732: on 0.16 the second small-pool free dies in the poison
+    // memset on the unmapped span, and the runner wraps the child stderr
+    // in an indented block (shape captured from .tmp/i0202-repro). One
+    // located finding at the top user frame replaces the pre-fix trio of
+    // a header name-match ZR102, an unlocated ZR105, and a trace-frame
+    // name-match ZR102.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source = try allocator.dupe(u8,
+        \\error: 'main.test.double free repro' terminated with signal ABRT with stderr:
+        \\       Segmentation fault at address 0x1044a0000
+        \\       /tool/zig/lib/compiler_rt.zig:684:14: 0x104b15a04 in memset (compiler_rt)
+        \\                   d[0] = c;
+        \\       /tool/zig/lib/std/mem/Allocator.zig:448:5: 0x104b099db in free__anon_19 (test)
+        \\           @memset(bytes, undefined);
+        \\       /x/proj/src/main.zig:7:19: 0x104b158a3 in test.double free repro (test)
+        \\           allocator.free(buf);
+        \\       /tool/zig/lib/compiler/test_runner.zig:140:68: 0x1 in mainServer (test)
+        \\       ???:?:?: 0x1841444e3 in start (/usr/lib/dyld)
+        \\failed command: ./test --listen=-
+    );
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    // Free before the reads, replicating runRuntimeAnalysis (EPH-I0202).
+    allocator.free(source);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("double free detected at runtime", issues.items[0].message);
+    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 7), issues.items[0].line);
+    try std.testing.expect(issues.items[0].file_owned);
+}
+
+test "parseGPADiagnostics locates a no-free-frame crash block as ZR105, never ZR103" {
+    // EPH-I0732: 0.16 prints no textual UAF marker, so a segfault trace
+    // without a free frame is a located ZR105 (its help names UAF). The
+    // SIGSEGV signal name covers the non-ABRT runner form.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source =
+        \\error: 'main.test.null deref repro' terminated with signal SIGSEGV with stderr:
+        \\       Segmentation fault at address 0x8
+        \\       /x/proj/src/main.zig:7:5: 0x104ca182c in test.null deref repro (test)
+        \\           p.* = 1;
+        \\       /tool/zig/lib/compiler/test_runner.zig:140:68: 0x1 in mainServer (test)
+        \\       ???:?:?: 0x1841444e3 in start (/usr/lib/dyld)
+        \\failed command: ./test --listen=-
+    ;
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings(
+        "segmentation fault - invalid memory access",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 7), issues.items[0].line);
+    try std.testing.expect(issues.items[0].file_owned);
+}
+
+test "parseGPADiagnostics locates a clean double-free log block at the second free" {
+    // EPH-I0732: the small-pool used-bit check catches the second free on
+    // the still-mapped page (debug_allocator.zig reportDoubleFree, a
+    // recoverable return), so the report lands as a test log error and the
+    // test passes. The useful location is the second free call site, not
+    // the allocation site.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source =
+        \\error: 'main.test.clean double free' logged 1 errors:
+        \\       [DebugAllocator] (err): Double free detected. Allocation:
+        \\       /x/proj/src/main.zig:7:34: 0x104991843 in test.clean double free (test)
+        \\       /tool/zig/lib/compiler/test_runner.zig:140:68: 0x1 in mainServer (test)
+        \\        First free:
+        \\       /x/proj/src/main.zig:9:19: 0x104991927 in test.clean double free (test)
+        \\        Second free:
+        \\       /x/proj/src/main.zig:10:19: 0x10499193b in test.clean double free (test)
+        \\       /tool/zig/lib/compiler/test_runner.zig:140:68: 0x1 in mainServer (test)
+        \\failed command: ./test --listen=-
+    ;
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 10), issues.items[0].line);
+    try std.testing.expect(issues.items[0].file_owned);
+}
+
+test "parseGPADiagnostics replays an unrecognized runner block through the table" {
+    // EPH-I0732: a block with no recognized crash shape falls back to the
+    // per-line table, header included, so exotic blocks keep the pre-fix
+    // behavior (here: a plain stack-overflow line classifies unlocated).
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source =
+        \\error: 'main.test.slow' terminated with signal ABRT with stderr:
+        \\       some exotic child output
+        \\       stack overflow while recursing
+        \\failed command: x
+    ;
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings("runtime", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 1), issues.items[0].line);
+}
+
+test "parseGPADiagnostics caps runner block consumption at 64 lines" {
+    // EPH-I0732: the block consumer is bounded. A user frame past the cap
+    // is outside the block, so this over-long segfault block stays an
+    // unlocated ZR105 instead of picking up the late frame.
+    const allocator = std.testing.allocator;
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    defer src.deinit(allocator);
+    try src.appendSlice(allocator, "error: 'main.test.huge trace' terminated" ++
+        " with signal ABRT with stderr:\n       Segmentation fault at address 0x1\n");
+    for (0..68) |_| try src.appendSlice(allocator, "       filler\n");
+    try src.appendSlice(allocator, "       /x/proj/src/main.zig:9:1: 0x1 in test.huge (test)\n" ++
+        "failed command: x\n");
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    try parseGPADiagnostics(allocator, &issues, src.items, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings("runtime", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 1), issues.items[0].line);
+}
+
+test "parseGPADiagnostics falls back to the first user frame without a Second free label" {
+    // EPH-I0732: allocator output without the three-trace layout still
+    // locates the clean double free, at the first user frame.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source =
+        \\error: 'main.test.double free repro' logged 1 errors:
+        \\       [DebugAllocator] (err): Double free detected. Allocation:
+        \\       /x/proj/src/main.zig:5:9: 0x104991843 in test.double free repro (test)
+        \\failed command: x
+    ;
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 5), issues.items[0].line);
+}
+
+test "parseGPADiagnostics reports unknown:0 for a crash block with only toolchain frames" {
+    // EPH-I0732: death inside free with no user frame in the trace keeps
+    // the pre-fix unknown:0 anchor rather than inventing a location.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source =
+        \\error: 'main.test.crash' terminated with signal ABRT with stderr:
+        \\       Segmentation fault at address 0x1044a0000
+        \\       /tool/zig/lib/std/mem/Allocator.zig:448:5: 0x1 in free__anon_19 (test)
+        \\       /tool/zig/lib/compiler/test_runner.zig:140:68: 0x1 in mainServer (test)
+        \\failed command: x
+    ;
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("unknown", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 0), issues.items[0].line);
+}
+
+test "scanRunnerBlockLine ignores free markers on source echo lines" {
+    // EPH-I0732: a trace echoes the faulting source under its frame, so a
+    // user call site written Allocator.free(gpa, buf) must not read as a
+    // death inside free. Only address-carrying frame lines count.
+    var scan: RunnerBlockScan = .{};
+    scanRunnerBlockLine(&scan, "           std.mem.Allocator.free(gpa, buf);");
+    try std.testing.expect(!scan.has_free_frame);
+    scanRunnerBlockLine(&scan, "/tool/Allocator.zig:448:5: 0x104b099db in free__anon_19 (test)");
+    try std.testing.expect(scan.has_free_frame);
 }
 
 test "parseTestOutput located findings own their file bytes after the source frees" {

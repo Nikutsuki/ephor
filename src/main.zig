@@ -19079,8 +19079,13 @@ fn intersectPredChecks(ctx: NullMeetCtx, bid: usize) !bool {
     var preds = std.ArrayListUnmanaged(NullPredInfo).empty;
     defer preds.deinit(ctx.allocator);
     for (ctx.cfg.edges.items) |edge| {
-        if (edge.to == bid)
-            try preds.append(ctx.allocator, .{ .block = edge.from, .kind = edge.kind });
+        if (edge.to != bid) continue;
+        // Return blocks wire a phantom sequential edge to the merge but are
+        // unreachable past the return, so they must not vote in the meet
+        // (mirrors the is_return skip in meetFreedPreds, EPH-I0677).
+        if (edge.from < ctx.cfg.blocks.items.len and
+            ctx.cfg.blocks.items[edge.from].is_return) continue;
+        try preds.append(ctx.allocator, .{ .block = edge.from, .kind = edge.kind });
     }
     if (preds.items.len == 0) return false;
 
@@ -32914,6 +32919,92 @@ test "analyzeCFGMemory ZA801 fires past a multi-line condition join (EPH-I0678)"
         run.issues.items,
         "test_za801_multiline.zig",
         RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 silent past a nested else-guard with a return arm (EPH-I0747)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `if (a)` return arm wires a phantom sequential edge into the
+    // outer merge but is unreachable there, so it must not vote in the
+    // null-check meet. ZA802 has no textual backstop (EPH-I0488): a voting
+    // return pred shrinks the intersection and fires a spurious warning.
+    const content =
+        \\fn nested_else_guard(p: ?*u32, a: bool) void {
+        \\    if (a) {
+        \\        return;
+        \\    } else {
+        \\        if (p == null) return;
+        \\    }
+        \\    p.* += 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_retguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_retguard.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent on the nested else-guard shape (EPH-I0747)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The issue's shape: every real path to the unwrap guarded x, so the
+    // verdict must stay silent. The braced inner guard generates no CFG
+    // fact (EPH-I0488), so the textual early-return backstop carries this
+    // verdict; the ZA802 companion pins the meet fix itself.
+    const content =
+        \\fn nested_else_guard_unwrap(x: ?u32, a: bool) void {
+        \\    if (a) {
+        \\        return;
+        \\    } else {
+        \\        if (x == null) {
+        \\            return;
+        \\        }
+        \\    }
+        \\    _ = x.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za801_retguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_retguard.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 still fires when the guard covers one branch only (EPH-I0747)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The a-false path reaches the deref with no p check, so the meet must
+    // keep intersecting the real preds: skipping return preds must not
+    // widen the checked set past what every reachable path proves.
+    const content =
+        \\fn one_branch_guard(p: ?*u32, a: bool) void {
+        \\    if (a) {
+        \\        if (p == null) return;
+        \\    }
+        \\    p.* += 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za802_onebranch.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_onebranch.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
     ) == 1);
 }
 

@@ -3924,6 +3924,8 @@ fn countChar(t: []const u8, ch: u8) usize {
 /// matching `]`. Nested subscripts (`a[b[i]]`) balance. A bare read
 /// (`sum +%= buf[x]`), a comparison (`buf[i] == 0`), and compound ops
 /// (`+=`) do not count: they read the element first (EPH-I0327).
+/// A dot-prefixed occurrence (`foo.buf[i] =`) writes the other object's
+/// field, not the local, so the scan skips it (EPH-I0753).
 /// Unbalanced brackets skip the occurrence, and the scan continues.
 /// Quote content is not masked: a `]` inside a string-literal index
 /// (`buf["]"]`) unbalances the bracket scan, and the occurrence is
@@ -3937,6 +3939,12 @@ fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
     while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
         // Word boundary check
         if (vpos > 0 and isIdent(t[vpos - 1])) {
+            pos = vpos + vn.len;
+            continue;
+        }
+        // The left-dot guard skips a field of another var: `foo.buf[i] =`
+        // writes foo's field, not the local buf (EPH-I0753).
+        if (vpos > 0 and t[vpos - 1] == '.') {
             pos = vpos + vn.len;
             continue;
         }
@@ -38713,6 +38721,33 @@ test "ZA607: plain subscript assignment in for loop stays silent (EPH-I0327)" {
     );
 }
 
+test "ZA607: loop field write on other var does not mask local read (EPH-I0753)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `foo.buf[x] = 1` writes foo's field, not the local buf. The pre-fix
+    // isArrayIndexAssignment lacked the left-dot guard its sibling fill
+    // sites keep, so the loop line dropped buf from tracking and masked
+    // the read.
+    const content =
+        \\fn loopFieldWrite(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        foo.buf[x] = 1;
+        \\    }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0753_fieldwrite.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0753_fieldwrite.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: subscript read before same-loop assignment stays silent (EPH-I0327)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -38760,6 +38795,22 @@ test "isArrayIndexAssignment requires a plain assignment (EPH-I0327)" {
     // Unbalanced brackets skip the occurrence; word boundaries hold.
     try std.testing.expect(!isArrayIndexAssignment("buffer[i] = 1;", "buf"));
     try std.testing.expect(!isArrayIndexAssignment("buf[s[..];", "buf"));
+}
+
+test "isArrayIndexAssignment skips dot-prefixed field writes (EPH-I0753)" {
+    // A field write on another object is not the local's fill:
+    // `foo.buf[i] = 1` writes foo's field, never the local buf. The
+    // left-dot guard matches checkIndexedAssign, hasDirectFill Pattern 2,
+    // and hasForLoopIndexedFill.
+    try std.testing.expect(!isArrayIndexAssignment("foo.buf[i] = 1;", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("foo.buf[i].v = 1;", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("a.b.buf[i] = 1;", "buf"));
+    // A range-end occurrence is dot-prefixed too: `..buf[i]` reads buf.
+    try std.testing.expect(!isArrayIndexAssignment("a[0..buf[i]] = 1;", "buf"));
+    // The direct fill the predicate exists for still counts, at line
+    // start (vpos == 0 has no left byte) and after other text.
+    try std.testing.expect(isArrayIndexAssignment("buf[i] = 1;", "buf"));
+    try std.testing.expect(isArrayIndexAssignment("if (c) { buf[i] = 1; }", "buf"));
 }
 
 test "classifyBracketUse splits write contexts from element reads (EPH-I0752)" {

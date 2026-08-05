@@ -2575,12 +2575,14 @@ fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
     const trimmed = mem.trimStart(u8, after, " \t");
     if (isAssignmentOp(trimmed)) return true;
 
-    // Field chain: name.field = value or name.field.sub = value
+    // Field chain: name.field = value or name.field.sub = value. The
+    // quoted form (`name.@"f" = v`) assigns through the chain the same
+    // as a plain field (EPH-I0778).
     if (mem.startsWith(u8, trimmed, ".")) {
         var j: usize = 0;
         while (j < trimmed.len and trimmed[j] == '.') {
             j += 1;
-            while (j < trimmed.len and isIdent(trimmed[j])) j += 1;
+            j = skipFieldName(trimmed, j);
         }
         const after_fields = mem.trimStart(u8, trimmed[j..], " \t");
         if (isAssignmentOp(after_fields)) return true;
@@ -38865,6 +38867,19 @@ test "classifyBracketUse quoted field chain assignment fills (EPH-I0777)" {
     try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].@\"list\".append(1);", 0));
     // A quoted field read does not fill.
     try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[x].@\"f\";", 0));
+}
+
+test "isAssignmentTarget quoted field chain assignment (EPH-I0778)" {
+    // The quoted field form assigns through the chain the same as a
+    // plain field: direct, chained-field, and chained-index shapes.
+    try std.testing.expect(isAssignmentTarget("name.@\"f\" = v;", "name", 0));
+    try std.testing.expect(isAssignmentTarget("name.@\"f\".g = v;", "name", 0));
+    try std.testing.expect(isAssignmentTarget("name.@\"f\"[0] = v;", "name", 0));
+    // Plain shapes keep their verdicts: assignment counts, a bare field
+    // read and a comparison do not.
+    try std.testing.expect(isAssignmentTarget("name.f = v;", "name", 0));
+    try std.testing.expect(!isAssignmentTarget("name.f;", "name", 0));
+    try std.testing.expect(!isAssignmentTarget("name.f == v;", "name", 0));
 }
 
 test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {

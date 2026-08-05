@@ -21598,11 +21598,17 @@ fn emitRuntimeIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec) !void {
     });
 }
 
-/// Emit a runtime issue with file location extracted from the line
+/// Emit a runtime issue with file location extracted from the line. The
+/// location borrows the child process output, which runRuntimeAnalysis
+/// frees before the findings print: dupe it and mark file_owned so
+/// deinitIssues frees it (EPH-I0202, the EPH-I0196 pattern).
 fn emitLocatedIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec, t: []const u8) !void {
     const loc = extractFileLocation(t);
+    const owned_file = try ctx.allocator.dupe(u8, loc.file);
+    errdefer ctx.allocator.free(owned_file);
     try ctx.issues.append(ctx.allocator, .{
-        .file = loc.file,
+        .file = owned_file,
+        .file_owned = true,
         .line = loc.line,
         .col = 1,
         .severity = .err,
@@ -28401,11 +28407,9 @@ test "handleMemoryLeak falls back to a static message without a location" {
     try std.testing.expect(!issues.items[0].message_owned);
 }
 
-test "emitLocatedIssue borrows the location slice from the input line" {
-    // EPH-I0202: the file slice borrows the input buffer (file_owned ==
-    // false) while the runtime band frees the child output after
-    // parsing. This pins the current ownership contract; the fix is
-    // tracked in EPH-I0202 and is out of scope here.
+test "emitLocatedIssue owns the location slice" {
+    // EPH-I0202: the file slice is duped (file_owned == true) because the
+    // runtime band frees the child output before the findings print.
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
@@ -28416,9 +28420,54 @@ test "emitLocatedIssue borrows the location slice from the input line" {
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings("/a/b.zig", issues.items[0].file);
     try std.testing.expectEqual(@as(usize, 12), issues.items[0].line);
-    try std.testing.expect(!issues.items[0].file_owned);
-    try std.testing.expect(issues.items[0].file.ptr == input[8..].ptr);
+    try std.testing.expect(issues.items[0].file_owned);
+    try std.testing.expect(issues.items[0].file.ptr != input[8..].ptr);
     try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+}
+
+test "parseGPADiagnostics findings own their file bytes after the source frees" {
+    // EPH-I0202: runRuntimeAnalysis frees the child stderr before the
+    // findings print, so a located finding must own its file slice.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    // A 0.16 crash trace line names the test, so a test whose name holds
+    // "double free" matches gpa_classifications and carries a location.
+    const source = try allocator.dupe(
+        u8,
+        "/x/proj/src/main.zig:7:19: 0xabc in test.double free repro (test)",
+    );
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    // Free the source before the reads, replicating runRuntimeAnalysis's
+    // free-then-print order. Safe builds poison freed bytes with 0xAA, so
+    // a borrowed file slice fails the comparison below.
+    allocator.free(source);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 7), issues.items[0].line);
+    try std.testing.expect(issues.items[0].file_owned);
+    // deinitIssues frees the owned file exactly once. The testing
+    // allocator fails the test on a leak or an invalid free.
+}
+
+test "parseTestOutput located findings own their file bytes after the source frees" {
+    // EPH-I0202: the same ownership bug through the stdout band. Panic
+    // lines emit located findings via handlePanicLine.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source = try allocator.dupe(
+        u8,
+        "thread 1 panic: boom at /x/proj/src/main.zig:42 now",
+    );
+    try parseTestOutput(allocator, &issues, source, false);
+    allocator.free(source);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 42), issues.items[0].line);
+    try std.testing.expect(issues.items[0].file_owned);
 }
 
 test "emitRuntimeIssue appends a file-less runtime finding" {

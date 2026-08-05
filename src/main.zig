@@ -11184,11 +11184,13 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
 
 /// Check if a same-line for loop assigns to var_name[...] (indexed fill).
 fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
-    // Heuristic only: full analysis requires tracking loop scope, so any
-    // same-line loop header plus var_name[...] counts as a fill.
-    // Residual (EPH-I0776): an element read on the loop-header line keeps
-    // the fill verdict here. classifyBracketUse covers the multi-line
-    // sites (checkIndexedAssign, hasDirectFill Pattern 2).
+    // Heuristic only: full analysis needs the loop scope, so a same-line
+    // loop header plus a var_name[...] fill counts as a fill. Each
+    // occurrence takes the classifyBracketUse verdict (EPH-I0772): a bare
+    // element read does not fill, so the scan continues past it. Slice
+    // forms and write contexts keep the fill verdict, the same boundary
+    // as the multi-line sites (checkIndexedAssign, hasDirectFill
+    // Pattern 2, EPH-I0752).
     if (mem.indexOf(u8, t, "for ") == null and mem.indexOf(u8, t, "for(") == null)
         return false;
     var s: usize = 0;
@@ -11199,7 +11201,8 @@ fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
         // and not a field of another var (foo.x[i]).
         if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) continue;
         const end = pos + var_name.len;
-        if (end < t.len and t[end] == '[') return true;
+        if (end < t.len and t[end] == '[' and
+            classifyBracketUse(t, end) == .fill) return true;
     }
     return false;
 }
@@ -39005,6 +39008,102 @@ test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_i0752_slicepass.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line loop element read of undefined buffer is detected (EPH-I0772)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The element read sits on the loop-header line. The pre-fix
+    // hasForLoopIndexedFill counted any same-line `buf[` as a fill and
+    // masked the read behind whole-line gen coverage.
+    const content =
+        \\fn oneLineLoopElemRead(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| { sum +%= buf[x]; }
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0772_elemread.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0772_elemread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line loop indexed fill stays silent (EPH-I0772)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[x] = 1` on the loop-header line is a genuine fill. The write
+    // context keeps the fill verdict.
+    const content =
+        \\fn oneLineLoopFill(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| { buf[x] = 1; }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0772_fill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0772_fill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line loop slice pass keeps the fill verdict (EPH-I0772)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `send(buf[0..])` on the loop-header line is the slice form. Slice
+    // reads keep the fill verdict (EPH-I0102 ghostty/flow).
+    const content =
+        \\fn oneLineLoopSlicePass(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| { send(buf[0..]); }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0772_slicepass.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0772_slicepass.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line loop read before same-line fill stays silent (EPH-I0772)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The first `buf[x]` reads, the second fills. The read verdict on the
+    // first occurrence must not end the scan: the loop fill replays every
+    // iteration and covers the whole header block (genLoopFill).
+    const content =
+        \\fn oneLineLoopMixed(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| { sum +%= buf[x]; buf[x] = 1; }
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0772_mixed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0772_mixed.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

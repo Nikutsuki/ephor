@@ -3056,7 +3056,9 @@ fn effectCoversRead(effect: AssignEffect, idx: usize, col: usize) bool {
 /// Scan one trimmed line for the statement-terminating `;`, starting at
 /// column `start`. Returns the column just past a depth-0 `;`, or null when
 /// the statement continues past this line. Bracket depth and quote mode
-/// carry across lines through the pointers.
+/// carry across lines through the pointers. A `\\` multiline opener cuts
+/// the scan: its tail is string data, so the statement continues on a later
+/// line (EPH-I0751).
 fn scanLineForStatementEnd(
     t: []const u8,
     start: usize,
@@ -3071,6 +3073,7 @@ fn scanLineForStatementEnd(
             continue;
         }
         if (mode.* != .none) continue;
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
         if (c == '(' or c == '[' or c == '{') depth.* += 1;
         if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
@@ -3105,7 +3108,9 @@ fn statementEffectPos(
 /// Scan one trimmed line for the closing bracket that brings `depth` to
 /// zero, starting at column `start`. Returns the column just past it, or
 /// null when the expression continues past this line. Bracket depth and
-/// quote mode carry across lines through the pointers.
+/// quote mode carry across lines through the pointers. A `\\` multiline
+/// opener cuts the scan: its tail is string data, so the group closes on a
+/// later line (EPH-I0751).
 fn scanLineForParenClose(
     t: []const u8,
     start: usize,
@@ -3120,6 +3125,7 @@ fn scanLineForParenClose(
             continue;
         }
         if (mode.* != .none) continue;
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
         if (c == '(' or c == '[' or c == '{') depth.* += 1;
         if (c == ')' or c == ']' or c == '}') {
@@ -3306,7 +3312,8 @@ const ForLoopTracker = struct {
     fn checkLoopEnd(self: *ForLoopTracker, t: []const u8) void {
         if (!self.in_loop or mem.indexOf(u8, t, "}") == null) return;
         // String and char content carries no braces: a '}' inside a
-        // literal must not end the loop early (EPH-I0107).
+        // literal must not end the loop early (EPH-I0107). A `\\` opener's
+        // tail is string data for the same reason (EPH-I0751).
         var brace_count: i32 = 0;
         var mode: QuoteMode = .none;
         var i: usize = 0;
@@ -3316,6 +3323,7 @@ const ForLoopTracker = struct {
                 i += skip;
                 continue;
             }
+            if (types.isMultilineOpenerAt(t, i)) break;
             if (c == '{') brace_count += 1;
             if (c == '}') brace_count -= 1;
         }
@@ -4242,7 +4250,8 @@ fn blockContainsAssignment(
 }
 
 /// Compute brace depth for a line given initial depth, returning new depth.
-/// String and char content carries no braces (EPH-I0107).
+/// String and char content carries no braces (EPH-I0107). A `\\` opener's
+/// tail is string data for the same reason (EPH-I0751).
 fn computeBraceDepth(t: []const u8, initial: usize) usize {
     var depth = initial;
     var mode: QuoteMode = .none;
@@ -4253,6 +4262,7 @@ fn computeBraceDepth(t: []const u8, initial: usize) usize {
             i += skip;
             continue;
         }
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '{') depth += 1;
         if (c == '}' and depth > 0) depth -= 1;
     }
@@ -4364,7 +4374,8 @@ const BackwardBraceResult = struct {
 /// unmatched '}' adds carried depth, and an unmatched '{' first pays the
 /// carried depth and opens an enclosing block only when none is left.
 /// String and char content carries no braces: a '{' inside a literal must
-/// not pay the depth a real '}' added (EPH-I0107).
+/// not pay the depth a real '}' added (EPH-I0107). A `\\` opener's tail is
+/// string data for the same reason (EPH-I0751).
 fn trackBackwardBraces(t: []const u8, initial_depth: usize) BackwardBraceResult {
     var unmatched_open: usize = 0;
     var unmatched_close: usize = 0;
@@ -4376,6 +4387,7 @@ fn trackBackwardBraces(t: []const u8, initial_depth: usize) BackwardBraceResult 
             i += skip;
             continue;
         }
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '{') unmatched_open += 1;
         if (c != '}') continue;
         if (unmatched_open > 0) {
@@ -4599,7 +4611,8 @@ const BraceZeroResult = struct {
 };
 
 /// Track braces through a line, detecting if depth passes through 0.
-/// String and char content carries no braces (EPH-I0107).
+/// String and char content carries no braces (EPH-I0107). A `\\` opener's
+/// tail is string data for the same reason (EPH-I0751).
 fn trackBracesWithZeroDetect(
     t: []const u8,
     initial_depth: usize,
@@ -4616,6 +4629,7 @@ fn trackBracesWithZeroDetect(
             i += skip;
             continue;
         }
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '{') {
             depth += 1;
             if (!found_open) found_open = true;
@@ -6490,7 +6504,7 @@ fn parenGroupEnd(
 
 /// computeBraceDepth from a start column: the loop header's `{` sits after
 /// the clause on the same line, so the scan must not count the clause's
-/// own brackets.
+/// own brackets. A `\\` opener's tail is string data (EPH-I0751).
 fn braceDepthFrom(t: []const u8, start: usize, initial: usize) usize {
     var depth = initial;
     var mode: QuoteMode = .none;
@@ -6501,6 +6515,7 @@ fn braceDepthFrom(t: []const u8, start: usize, initial: usize) usize {
             i += skip;
             continue;
         }
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '{') depth += 1;
         if (c == '}' and depth > 0) depth -= 1;
     }
@@ -12851,7 +12866,9 @@ fn identRunEnd(code: []const u8, start: usize) usize {
 
 /// Find the next call site at/after `from`, skipping string/char literals.
 /// A call site is an identifier run (dots allowed) immediately followed by
-/// `(` — distinguishes calls from same-named variables.
+/// `(` — distinguishes calls from same-named variables. A `\\` multiline
+/// opener ends the search: its tail is string data, so no call site can
+/// follow it on the line (EPH-I0751).
 fn nextCallSite(code: []const u8, from: usize) ?CallSite {
     var i = from;
     while (i < code.len) {
@@ -12863,6 +12880,7 @@ fn nextCallSite(code: []const u8, from: usize) ?CallSite {
             i = skipPastChar(code, i);
             continue;
         }
+        if (types.isMultilineOpenerAt(code, i)) return null;
         if (!isIdent(code[i])) {
             i += 1;
             continue;
@@ -17029,18 +17047,6 @@ fn skipOptionalComma(t: []const u8, start: usize) usize {
     return i;
 }
 
-/// Quote is escaped when preceded by an odd run of backslashes (`\\"` is an
-/// escaped backslash followed by a real quote).
-fn isEscapedQuote(t: []const u8, i: usize) bool {
-    var backslashes: usize = 0;
-    var j = i;
-    while (j > 0 and t[j - 1] == '\\') {
-        backslashes += 1;
-        j -= 1;
-    }
-    return backslashes % 2 == 1;
-}
-
 /// If position i starts `error{` (standalone keyword + optional ws + `{`),
 /// returns the index just past the `{`.
 fn matchesErrorSetOpen(t: []const u8, i: usize) ?usize {
@@ -17052,36 +17058,41 @@ fn matchesErrorSetOpen(t: []const u8, i: usize) ?usize {
     return null;
 }
 
-/// Does this code line open an error set? Text inside string literals and
-/// line comments is data, not syntax, so it cannot open one.
+/// Does this code line open an error set? Text inside string/char literals,
+/// `\\` multiline tails, and line comments is data, not syntax, so it
+/// cannot open one.
 fn lineOpensErrorBlock(t: []const u8) bool {
-    var in_str = false;
+    var mode: QuoteMode = .none;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
         const c = t[i];
-        if (c == '"' and !isEscapedQuote(t, i)) {
-            in_str = !in_str;
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
             continue;
         }
-        if (in_str) continue;
+        // A `\\` opener's tail is string data (EPH-I0751): no error-set
+        // open can follow it on this line.
+        if (types.isMultilineOpenerAt(t, i)) return false;
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return false;
         if (matchesErrorSetOpen(t, i) != null) return true;
     }
     return false;
 }
 
-/// Track error-set brace depth across one code line, ignoring string literals
-/// and line comments — their braces and `error{` text are data, not syntax.
+/// Track error-set brace depth across one code line, ignoring string/char
+/// literals, `\\` multiline tails, and line comments — their braces and
+/// `error{` text are data, not syntax.
 fn trackErrorBlockDepth(t: []const u8, depth: *usize) void {
-    var in_str = false;
+    var mode: QuoteMode = .none;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
         const c = t[i];
-        if (c == '"' and !isEscapedQuote(t, i)) {
-            in_str = !in_str;
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
             continue;
         }
-        if (in_str) continue;
+        // A `\\` opener's tail is string data (EPH-I0751).
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
         if (matchesErrorSetOpen(t, i)) |after_open| {
             depth.* += 1;
@@ -35714,6 +35725,128 @@ test "buildCFG: multiline opener tail braces do not corrupt depth (EPH-I0671)" {
     const after = findBlockForLine(&cfg, 6);
     try std.testing.expect(after != null);
     try std.testing.expect(if_block.? != after.?);
+}
+
+test "scanLineForStatementEnd stops at a multiline opener (EPH-I0751)" {
+    var depth: usize = 0;
+    var mode: QuoteMode = .none;
+    // Target text: const s = \\ foo(); bar(); — the tail semicolons are
+    // string data, so the statement continues on a later line.
+    try std.testing.expect(scanLineForStatementEnd("const s = \\\\ foo(); bar();", 0, &depth, &mode) == null);
+    try std.testing.expectEqual(@as(usize, 0), depth);
+    // A real depth-0 semicolon still terminates the statement.
+    depth = 0;
+    mode = .none;
+    try std.testing.expectEqual(@as(?usize, 6), scanLineForStatementEnd("foo();", 0, &depth, &mode));
+}
+
+test "scanLineForParenClose stops at a multiline opener (EPH-I0751)" {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    // Target text: a, \\ b); c); — the tail parens are string data, so the
+    // group closes on a later line.
+    try std.testing.expect(scanLineForParenClose("a, \\\\ b); c);", 0, &depth, &mode) == null);
+    try std.testing.expectEqual(@as(usize, 1), depth);
+    // A real close paren still balances the group.
+    depth = 1;
+    mode = .none;
+    try std.testing.expectEqual(@as(?usize, 5), scanLineForParenClose("a, b);", 0, &depth, &mode));
+}
+
+test "ForLoopTracker.checkLoopEnd ignores braces in a multiline opener tail (EPH-I0751)" {
+    // Target text: const s = \\ } — the tail `}` is string data and must
+    // not close the loop.
+    var tracker: ForLoopTracker = .{ .in_loop = true };
+    tracker.checkLoopEnd("const s = \\\\ }");
+    try std.testing.expect(tracker.in_loop);
+    // A real net-negative brace line still ends the loop.
+    tracker.checkLoopEnd("}");
+    try std.testing.expect(!tracker.in_loop);
+}
+
+test "computeBraceDepth ignores braces in a multiline opener tail (EPH-I0751)" {
+    // Target text: const s = \\ } — the tail `}` is string data and must
+    // not pay the caller's carried depth.
+    try std.testing.expectEqual(@as(usize, 1), computeBraceDepth("const s = \\\\ }", 1));
+    // A real close brace still pays it.
+    try std.testing.expectEqual(@as(usize, 0), computeBraceDepth("}", 1));
+}
+
+test "trackBackwardBraces ignores braces in a multiline opener tail (EPH-I0751)" {
+    // Target text: const s = \\ { — the tail `{` is string data and must
+    // not read as an enclosing block opener.
+    const r = trackBackwardBraces("const s = \\\\ {", 0);
+    try std.testing.expectEqual(@as(usize, 0), r.depth);
+    try std.testing.expect(!r.opens_enclosing_block);
+    // A real unmatched open still opens an enclosing block.
+    const real = trackBackwardBraces("{", 0);
+    try std.testing.expect(real.opens_enclosing_block);
+}
+
+test "trackBracesWithZeroDetect ignores braces in a multiline opener tail (EPH-I0751)" {
+    // Target text: const s = \\ } — the tail `}` is string data: no depth
+    // change, no zero crossing.
+    const r = trackBracesWithZeroDetect("const s = \\\\ }", 1, true);
+    try std.testing.expectEqual(@as(usize, 1), r.depth);
+    try std.testing.expect(!r.touched_zero);
+    // A real close brace still touches zero.
+    const real = trackBracesWithZeroDetect("}", 1, true);
+    try std.testing.expect(real.touched_zero);
+}
+
+test "braceDepthFrom ignores braces in a multiline opener tail (EPH-I0751)" {
+    // Target text: const s = \\ } — the tail `}` is string data and must
+    // not pay the caller's carried depth.
+    try std.testing.expectEqual(@as(usize, 1), braceDepthFrom("const s = \\\\ }", 0, 1));
+    // A real close brace still pays it.
+    try std.testing.expectEqual(@as(usize, 0), braceDepthFrom("}", 0, 1));
+}
+
+test "lineOpensErrorBlock ignores error-open text in a multiline opener tail (EPH-I0751)" {
+    // Target text: const s = \\ error{NotReal} — the tail is string data.
+    try std.testing.expect(!lineOpensErrorBlock("const s = \\\\ error{NotReal}"));
+    // A real error-set open still counts.
+    try std.testing.expect(lineOpensErrorBlock("const E = error{Real};"));
+}
+
+test "lineOpensErrorBlock ignores a backslash pair inside a char literal (EPH-I0751)" {
+    // Target text: const sep = '\\'; const E = error{Real}; — the `'\\'`
+    // char data is not a multiline opener, so the real error-set open counts.
+    try std.testing.expect(lineOpensErrorBlock("const sep = '\\\\'; const E = error{Real};"));
+}
+
+test "trackErrorBlockDepth ignores multiline opener tail text (EPH-I0751)" {
+    // Target text: const s = \\ } — the tail `}` is string data and must
+    // not close the error block.
+    var depth: usize = 1;
+    trackErrorBlockDepth("const s = \\\\ }", &depth);
+    try std.testing.expectEqual(@as(usize, 1), depth);
+    // Tail error-open text is string data too: no phantom block opens.
+    trackErrorBlockDepth("const s = \\\\ error{NotReal}", &depth);
+    try std.testing.expectEqual(@as(usize, 1), depth);
+    // A real close brace still pays the depth.
+    trackErrorBlockDepth("};", &depth);
+    try std.testing.expectEqual(@as(usize, 0), depth);
+}
+
+test "trackErrorBlockDepth ignores a backslash pair inside a char literal (EPH-I0751)" {
+    // Target text: const sep = '\\'; const E = error{ — the `'\\'` char data
+    // is not a multiline opener, so the scan reaches the real error-set open.
+    var depth: usize = 0;
+    trackErrorBlockDepth("const sep = '\\\\'; const E = error{", &depth);
+    try std.testing.expectEqual(@as(usize, 1), depth);
+    // A real close brace still pays the depth.
+    trackErrorBlockDepth("};", &depth);
+    try std.testing.expectEqual(@as(usize, 0), depth);
+}
+
+test "nextCallSite ignores call-shaped text in a multiline opener tail (EPH-I0751)" {
+    // Target text: const s = \\ foo() — the tail call is string data.
+    try std.testing.expect(nextCallSite("const s = \\\\ foo()", 0) == null);
+    // A real call still resolves.
+    const site = nextCallSite("const x = foo()", 0);
+    try std.testing.expect(site != null);
+    try std.testing.expectEqual(@as(usize, 10), site.?.start);
 }
 
 test "buildCFG: Allman if brace on next line pops correctly" {

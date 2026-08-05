@@ -55216,6 +55216,8 @@ test "CLI unknown flags are a hard usage error (EPH-I0234)" {
 test "CLI every documented flag still parses (EPH-I0234)" {
     // Guard against over-reach: the fail-closed else must not reject any
     // flag printHelp documents (including the -f=json/-f=text aliases).
+    // EPH-I0770: --version= pins a non-current version so the release.py
+    // help-text rewrite never matches and mutates this fixture.
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
@@ -55229,7 +55231,7 @@ test "CLI every documented flag still parses (EPH-I0234)" {
         "--strict",              "--fail-on=error",          "--trust-target-config",
         "--no-suppression",      "-b",                       "--build",
         "--export=issues.md",    "--known-issues=known.txt", "--command=zig build test",
-        "-y",                    "--yes",                    "--version=0.14.3",
+        "-y",                    "--yes",                    "--version=9.9.9",
         "--force",               "-f=text",
     };
     for (documented) |flag| try parseCliArg(allocator, flag, &cfg, &cli_entries);
@@ -55254,7 +55256,7 @@ test "CLI every documented flag still parses (EPH-I0234)" {
     try std.testing.expectEqualStrings("issues.md", cfg.export_path.?);
     try std.testing.expectEqualStrings("known.txt", cfg.known_issues_path.?);
     try std.testing.expectEqualStrings("zig build test", cfg.runtime_command.?);
-    try std.testing.expectEqualStrings("0.14.3", cfg.install_version.?);
+    try std.testing.expectEqualStrings("9.9.9", cfg.install_version.?);
 }
 
 test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {

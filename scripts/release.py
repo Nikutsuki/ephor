@@ -77,7 +77,9 @@ def bump_main_zig(old: str, new: str, dry_run: bool) -> None:
     changed = replace_in_file(path, [
         # EPHOR_VERSION constant
         (rf'(const EPHOR_VERSION = "){old_re}(")', rf'\g<1>{new}\g<2>'),
-        # --version=X.Y.Z in help text
+        # --version=X.Y.Z in help text. The rewrite targets the printHelp
+        # examples. Test fixtures pin non-current versions so this pattern
+        # never matches them (EPH-I0770).
         (rf'(--version=){old_re}', rf'\g<1>{new}'),
         # "version": "X.Y.Z" in JSON example
         (rf'("version": "){old_re}(")', rf'\g<1>{new}\g<2>'),

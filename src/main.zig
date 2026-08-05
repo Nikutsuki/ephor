@@ -5240,6 +5240,8 @@ fn analyzeOneAllocSafety(
 ) !void {
     var bstate = try initBlockFreeState(ctx.allocator, ctx.num_blocks);
     defer bstate.deinit(ctx.allocator);
+    const capture_shadowed = try computeCaptureShadowedLines(ctx.allocator, ctx, alloc_info.name);
+    defer ctx.allocator.free(capture_shadowed);
     const scan_ctx: FreeScanCtx = .{
         .allocator = ctx.allocator,
         .cfg = ctx.cfg,
@@ -5250,6 +5252,7 @@ fn analyzeOneAllocSafety(
             .alloc_info = alloc_info,
             .in_defer = ctx.in_defer,
             .in_errdefer = ctx.in_errdefer,
+            .capture_shadowed = capture_shadowed,
             .aliases = ctx.aliases,
         },
         .file_path = ctx.file_path,
@@ -5267,6 +5270,7 @@ fn analyzeOneAllocSafety(
         .var_name = alloc_info.name,
         .in_defer = ctx.in_defer,
         .in_errdefer = ctx.in_errdefer,
+        .capture_shadowed = capture_shadowed,
         .aliases = ctx.aliases,
     }, issues);
 }
@@ -5522,6 +5526,10 @@ const VarFreeCtx = struct {
     alloc_info: *CFGAllocation,
     in_defer: []const bool,
     in_errdefer: []const bool,
+    /// Per-line markers (parallel to lines): true where the line sits inside
+    /// a loop payload-capture scope that rebinds var_name, so frees of the
+    /// name on that line release the capture, never the tracked binding.
+    capture_shadowed: []const bool,
     aliases: *const std.StringHashMapUnmanaged([]const u8),
 };
 
@@ -5543,7 +5551,8 @@ const FreeScanCtx = struct {
 /// free of that name inside the body never frees the tracked binding twice
 /// (EPH-I0676). The adjacent-pipe form matches isBindingNameAt: canonical
 /// spacing writes bitwise-or as `a | b | c`. Name-based and scope-blind:
-/// the general capture-conflation fix is EPH-I0748.
+/// the scope-bound consumer for loop captures is computeCaptureShadowedLines
+/// (EPH-I0748).
 fn hasCaptureBinding(t: []const u8, var_name: []const u8) bool {
     var cls = LineClassifier.init(t);
     var s: usize = 0;
@@ -5558,6 +5567,49 @@ fn hasCaptureBinding(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
+/// Per-line capture-shadow map for one tracked var (EPH-I0748): true on every
+/// line inside the scope of a loop payload capture that rebinds var_name
+/// (`for (xs) |item| { ... }`). Within that region the name denotes the
+/// per-iteration element, so a free or rebind of the name there must not move
+/// the tracked alloc's state. The scope is CFG/brace-derived (loop_back edge
+/// to the header, loopBodyLineExtent for the body), never name-alone: nested
+/// loops each contribute their own extent, and the header line counts as
+/// inside the scope so a fused body (`for (xs) |item| free(item);`) is
+/// covered. Accepted bounds, mirrored from the EPH-I0676 machinery: a
+/// while-continue tail or an unbalanced/fused-single-line brace group yields
+/// no extent (the lines stay unshadowed, fail-open toward reporting), and
+/// non-loop captures (`if (opt) |item|`, switch prongs, `catch |e|`) are not
+/// mapped here. A multi-line condition header leaves the capture clause
+/// outside the derived header line, so the scope is not mapped (fail-open:
+/// the original false positive persists, no new false negative). A capture
+/// that binds an alias of var_name, not var_name itself, is likewise
+/// unmapped (EPH-I0781).
+fn computeCaptureShadowedLines(
+    allocator: Allocator,
+    ctx: *const AllocSafetyCtx,
+    var_name: []const u8,
+) ![]bool {
+    const shadowed = try allocator.alloc(bool, ctx.lines.len);
+    @memset(shadowed, false);
+    errdefer allocator.free(shadowed);
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.kind != .loop_back) continue;
+        if (edge.to >= ctx.cfg.blocks.items.len) continue;
+        const header_line = ctx.cfg.blocks.items[edge.to].end_line;
+        if (header_line < ctx.func_line) continue;
+        const hidx = header_line - ctx.func_line;
+        if (hidx >= ctx.lines.len) continue;
+        const ht = mem.trim(u8, ctx.lines[hidx], " \t\r");
+        if (!hasCaptureBinding(ht, var_name)) continue;
+        const extent = loopBodyLineExtent(ctx.lines, ctx.func_line, header_line) orelse
+            continue;
+        if (extent.last < ctx.func_line) continue;
+        const last_idx = @min(extent.last - ctx.func_line, ctx.lines.len - 1);
+        @memset(shadowed[hidx .. @max(hidx, last_idx) + 1], true);
+    }
+    return shadowed;
+}
+
 fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
     var r = BlockScanResult{};
     for (block.start_line..block.end_line + 1) |ln| {
@@ -5567,6 +5619,9 @@ fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResul
         const t = mem.trim(u8, scan.lines[idx], " \t\r");
         if (shouldSkipForFreeAnalysis(t, idx, scan.in_defer, scan.in_errdefer))
             continue;
+        // A free/rebind of the name inside a loop capture's scope releases
+        // the per-iteration element, not the tracked binding (EPH-I0748).
+        if (scan.capture_shadowed[idx]) continue;
         if (hasRealFreePattern(t) and
             isDirectFreeOfVarOrAlias(t, scan.var_name, scan.aliases))
         {
@@ -5789,6 +5844,9 @@ fn checkSameBlockFree(
         const ct = mem.trim(u8, scan.lines[ci], " \t\r");
         if (shouldSkipForFreeAnalysis(ct, ci, scan.in_defer, scan.in_errdefer))
             continue;
+        // A capture-scope free rebinds the name per iteration: it never
+        // frees the tracked binding, so it sets no freed state (EPH-I0748).
+        if (scan.capture_shadowed[ci]) continue;
         if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(ct, scan.var_name, scan.aliases)) {
             freed = true;
             scan.alloc_info.freed_line = cl;
@@ -6052,6 +6110,9 @@ fn detectDoubleFree(ctx: *const FreeScanCtx) !void {
     for (ctx.scan.lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
+        // A free inside a loop capture's scope releases the capture, never
+        // the tracked binding: it is not a second-free candidate (EPH-I0748).
+        if (ctx.scan.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
         if (!isDirectFreeOfVarOrAlias(t, ctx.scan.var_name, ctx.scan.aliases)) continue;
         try checkLineForDoubleFree(ctx, t, ctx.scan.func_line + idx);
@@ -6080,6 +6141,8 @@ const DeferPairCtx = struct {
     var_name: []const u8,
     in_defer: []const bool,
     in_errdefer: []const bool,
+    /// Per-line loop-capture shadow markers (see VarFreeCtx.capture_shadowed).
+    capture_shadowed: []const bool,
     aliases: *const std.StringHashMapUnmanaged([]const u8),
 };
 
@@ -6100,6 +6163,9 @@ fn collectDeferFrees(
         if (isCommentOrMultilineString(t)) continue;
         if (ctx.in_errdefer[idx] or mem.startsWith(u8, t, "errdefer ")) continue;
         if (!ctx.in_defer[idx] and !mem.startsWith(u8, t, "defer ")) continue;
+        // A defer inside a loop capture's scope frees the capture at scope
+        // exit each iteration, not the tracked binding (EPH-I0748).
+        if (ctx.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
         if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
         // Conditional defer (`defer if (c) free(x);`): may or may not run, so
@@ -6215,6 +6281,9 @@ fn detectDeferDoubleFree(
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
         if (ctx.in_defer[idx] or ctx.in_errdefer[idx]) continue;
+        // A direct free inside a loop capture's scope releases the capture,
+        // so it must not pair with a defer-registered free (EPH-I0748).
+        if (ctx.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
         if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
         try pairDirectFreeWithDefers(allocator, ctx, .{
@@ -30494,6 +30563,60 @@ test "ZA106: freeing a loop capture each iteration stays silent (EPH-I0676)" {
         "test_capture_loop.zig",
         RULE_DOUBLE_FREE,
     ) == 0);
+}
+
+test "ZA106: free before a capture loop does not pair with the capture free (EPH-I0748)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The capture |item| rebinds the name to a fresh element on every
+    // iteration, so the body free never frees the tracked outer item: the
+    // pair (outer free on 3, capture free on 6) is not a double-free.
+    const content =
+        \\fn free_elements(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    const items = try allocator.alloc([]u8, 4);
+        \\    for (items) |item| {
+        \\        allocator.free(item);
+        \\    }
+        \\    allocator.free(items);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_capture_free_before.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_capture_free_before.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: real double free fires despite a later capture loop (EPH-I0748)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The same-name capture loop must not mask a genuine double free of the
+    // tracked alloc: lines 3-4 free the outer item twice (report), the body
+    // free on 7 frees the per-iteration capture (silent).
+    const content =
+        \\fn free_elements(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    allocator.free(item);
+        \\    const items = try allocator.alloc([]u8, 4);
+        \\    for (items) |item| {
+        \\        allocator.free(item);
+        \\    }
+        \\    allocator.free(items);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_capture_real_double.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_capture_real_double.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
 }
 
 test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {

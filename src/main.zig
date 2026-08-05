@@ -2455,13 +2455,41 @@ fn skipBracketed(text: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Follow chained .field and [index] access to find assignment
+/// Skip one field-name segment at `start`: a plain identifier or the
+/// quoted `@"name"` form (EPH-I0777). Returns the index just past the
+/// segment.
+fn skipFieldName(text: []const u8, start: usize) usize {
+    if (start + 1 < text.len and text[start] == '@' and text[start + 1] == '"')
+        return skipQuotedIdent(text, start + 2);
+    var i = start;
+    while (i < text.len and isIdent(text[i])) i += 1;
+    return i;
+}
+
+/// Skip the body of a quoted identifier starting past the opening `@"`.
+/// A backslash escape stays inside the name, so `@"a\"b"` skips to its
+/// real closing quote. Returns the index just past the closing quote,
+/// or text.len when the quote never closes.
+fn skipQuotedIdent(text: []const u8, start: usize) usize {
+    var i = start;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (text[i] == '"') break;
+    }
+    return @min(i + 1, text.len);
+}
+
+/// Follow chained .field, .@"field", and [index] access to find
+/// assignment. The quoted field form (`buf[x].@"f" = v`) assigns through
+/// the chain the same as a plain field (EPH-I0777).
 fn hasAssignmentAfterChain(text: []const u8) ?bool {
     var pos: usize = 0;
     while (pos < text.len) {
         if (text[pos] == '.') {
-            pos += 1;
-            while (pos < text.len and isIdent(text[pos])) pos += 1;
+            pos = skipFieldName(text, pos + 1);
             continue;
         }
         if (text[pos] == '[') {
@@ -2472,6 +2500,74 @@ fn hasAssignmentAfterChain(text: []const u8) ?bool {
         return isAssignmentOp(after);
     }
     return null;
+}
+
+/// Fill/read verdict for one `var_name[...]` occurrence (EPH-I0752).
+const BracketUse = enum { fill, read };
+
+/// Classify the `var_name[...]` occurrence whose `[` sits at open_pos.
+/// Only write contexts count as fills: a plain `] =` assignment, a
+/// chained `.field`/`@"field"`/`[i]` assignment, a slice form
+/// (`buf[0..n]`), and an element write-through (`buf[i].append(1)`,
+/// `buf[i].list.append(1)`, `buf[i].* = v`).
+/// Anything else — a bare element read (`sum +%= buf[x]`), a comparison
+/// (`buf[i] == 0`), a compound op (`buf[x] += 1`), an aggregate-literal
+/// element (`.{ buf[x], 1 }`) — reads the element and does not
+/// initialize the buffer (EPH-I0752). The slice form keeps its fill
+/// verdict even as a read: that crudeness is load-bearing (EPH-I0102,
+/// ghostty/flow). An unclosed bracket keeps the historical fill verdict.
+/// A call-argument position (`func(buf[i])`) needs no arm here: a `vn[`
+/// inside any unmatched paren drops the var from tracking upstream
+/// (hasSlicePassToFunction via isInsideCallArg) before this discriminator
+/// runs (EPH-I0752 review, EPH-I0773).
+fn classifyBracketUse(t: []const u8, open_pos: usize) BracketUse {
+    const close = skipBracketed(t, open_pos) orelse return .fill;
+    if (hasTopLevelRange(t[open_pos + 1 .. close - 1])) return .fill;
+    if (hasAssignmentAfterBracket(t[open_pos..]) orelse false) return .fill;
+    const after = mem.trimStart(u8, t[close..], " \t");
+    if (after.len == 0) return .read;
+    if (after[0] == '.' and isElementWriteThrough(after)) return .fill;
+    return .read;
+}
+
+/// True when the bracket contents hold a range at the top level (`0..n`):
+/// the occurrence is a slice, not an element access. A range inside a
+/// nested subscript (`buf[a[0..1]]`) does not count.
+fn hasTopLevelRange(contents: []const u8) bool {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < contents.len) : (i += 1) {
+        if (contents[i] == '[') depth += 1;
+        if (contents[i] == ']') depth -|= 1;
+        if (depth == 0 and contents[i] == '.' and contents[i + 1] == '.')
+            return true;
+    }
+    return false;
+}
+
+/// True when `after` (the text past the `]`, starting at `.`) writes
+/// through the element: a method call anywhere on the field chain
+/// (`.append(`, `.list.append(`) or a segment-one dereference (`.*`).
+/// The method-call boundary covers the whole chain, not segment one: the
+/// receiver of `buf[i].list.append(1)` is `&buf[i].list`, the same
+/// write-through family the segment-one form protects (EPH-I0775). The
+/// dereference read (`const v = buf[i].*;`) shares the `.*` opener and
+/// keeps the fill verdict with it — splitting the two risks the
+/// ghostty/flow false-positive class (EPH-I0102). A non-mutating method
+/// read (`buf[i].len()`, `buf[i].list.len()`) shares the `.name(` shape
+/// at its depth and also keeps the fill verdict: text analysis cannot
+/// prove mutation from the name.
+fn isElementWriteThrough(after: []const u8) bool {
+    if (after.len > 1 and after[1] == '*') return true;
+    var i: usize = 1;
+    while (i < after.len) {
+        const seg_start = i;
+        i = skipFieldName(after, i);
+        if (i < after.len and after[i] == '(') return i > seg_start;
+        if (i >= after.len or after[i] != '.') return false;
+        i += 1;
+    }
+    return false;
 }
 
 fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
@@ -3110,10 +3206,11 @@ fn unmatchedOpenParenBefore(t: []const u8, pos: usize) ?usize {
 }
 
 /// True when var_name has a slice/index occurrence (`x[...]`) that is not
-/// an assignment target. hasDirectFill Pattern-2 counts these as fills
-/// even when they are reads, and that crudeness is load-bearing for
-/// slice-read silence (ghostty/flow, EPH-I0102): lines with one keep
-/// whole-line gen coverage.
+/// an assignment target. Slice forms keep their fill verdict even as
+/// reads — that crudeness is load-bearing for slice-read silence
+/// (ghostty/flow, EPH-I0102) — so lines with one keep whole-line gen
+/// coverage. Bare element reads fill no longer (EPH-I0752). They reach
+/// this net only through the coarser same-line for-loop heuristic.
 fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], var_name)) |rel| {
@@ -3242,8 +3339,12 @@ const ForLoopTracker = struct {
             if (pos > 0 and t[pos - 1] == '.') continue;
             const end_pos = pos + var_name.len;
             if (end_pos >= t.len) return;
-            // Pattern: var_name[...] = (direct indexed assignment)
+            // Pattern: var_name[...] — fills only in write contexts
+            // (EPH-I0752). An element read (`sum +%= buf[x]`) does not
+            // initialize the buffer, so the scan continues past it. A
+            // later genuine fill on the same line still counts.
             if (t[end_pos] == '[') {
+                if (classifyBracketUse(t, end_pos) == .read) continue;
                 if (self.start_bid) |bid| genLoopFill(gen, first_effect, bid, self.start_idx);
                 return;
             }
@@ -3343,9 +3444,9 @@ fn recordLineFills(
         }, gen_sets);
     }
     // A line with a non-assignment `x[...]` slice occurrence keeps the
-    // historical whole-line coverage: hasDirectFill Pattern-2 counts
-    // slice READS as fills and that crudeness is load-bearing
-    // (ghostty/flow FPs when tightened).
+    // historical whole-line coverage: slice READS still count as fills
+    // and that crudeness is load-bearing (ghostty/flow FPs when
+    // tightened, EPH-I0102). Element reads fill no longer (EPH-I0752).
     if (!any and hasSliceOccurrence(t, var_name))
         recordGenEffect(ctx, .{
             .idx = idx,
@@ -3828,9 +3929,10 @@ fn countChar(t: []const u8, ch: u8) usize {
 /// Quote content is not masked: a `]` inside a string-literal index
 /// (`buf["]"]`) unbalances the bracket scan, and the occurrence is
 /// skipped.
-/// Residual: the gen-side fill sites keep the loop read class masked.
-/// ForLoopTracker.checkIndexedAssign and hasDirectFill Pattern 2 count
-/// any `vn[` occurrence as a fill, read or write (EPH-I0752).
+/// The gen-side fill sites (ForLoopTracker.checkIndexedAssign and
+/// hasDirectFill Pattern 2) share the same read/write boundary through
+/// classifyBracketUse (EPH-I0752), which also keeps the slice-form
+/// crudeness this predicate does not need (EPH-I0102).
 fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
     var pos: usize = 0;
     while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
@@ -10969,8 +11071,11 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         // (foo.x[...], foo.x =).
         const self_match = i == 0 or (!isIdent(t[i - 1]) and t[i - 1] != '.');
 
-        // Pattern 2: var_name[...] = (slice assignment)
-        if (self_match and end_i < t.len and t[end_i] == '[') return true;
+        // Pattern 2: var_name[...] in a write context. Slice forms keep
+        // the load-bearing fill verdict (EPH-I0102). Bare element reads
+        // do not fill (EPH-I0752).
+        if (self_match and end_i < t.len and t[end_i] == '[' and
+            classifyBracketUse(t, end_i) == .fill) return true;
 
         // Pattern 3: var_name = ... (direct assignment)
         if (self_match and isAssignmentTarget(t, var_name, i)) return true;
@@ -10982,6 +11087,9 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
 fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
     // Heuristic only: full analysis requires tracking loop scope, so any
     // same-line loop header plus var_name[...] counts as a fill.
+    // Residual (EPH-I0776): an element read on the loop-header line keeps
+    // the fill verdict here. classifyBracketUse covers the multi-line
+    // sites (checkIndexedAssign, hasDirectFill Pattern 2).
     if (mem.indexOf(u8, t, "for ") == null and mem.indexOf(u8, t, "for(") == null)
         return false;
     var s: usize = 0;
@@ -38402,6 +38510,255 @@ test "isArrayIndexAssignment requires a plain assignment (EPH-I0327)" {
     // Unbalanced brackets skip the occurrence; word boundaries hold.
     try std.testing.expect(!isArrayIndexAssignment("buffer[i] = 1;", "buf"));
     try std.testing.expect(!isArrayIndexAssignment("buf[s[..];", "buf"));
+}
+
+test "classifyBracketUse splits write contexts from element reads (EPH-I0752)" {
+    // Write contexts fill: plain and chained assignments, slice forms,
+    // element write-through.
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[x] = 1;", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].v = 1;", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i][j] = 1;", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[0..n];", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[0..]);", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].append(1);", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].* = 1;", 0));
+    // An unclosed bracket keeps the historical fill verdict.
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[x;", 0));
+    // Bare element reads, comparisons, compound ops, field reads, and
+    // switch-prong arrows do not fill. Aggregate-literal and
+    // call-argument shapes read too: in-parens occurrences drop out of
+    // tracking upstream, so the deleted call-arg arm only ever masked
+    // paren-free tuple reads (EPH-I0752 review).
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[x];", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[x] == 0) {", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[x] += 1;", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[x] -= 1;", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[i].v;", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[i] => 1,", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[x], 1 };", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[i]);", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[i], 2);", 0));
+}
+
+test "classifyBracketUse nested method write-through fills (EPH-I0775)" {
+    // A method call at any chain depth writes through the element: the
+    // receiver of `buf[i].list.append(1)` is `&buf[i].list`.
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].list.append(1);", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].a.b.append(1);", 0));
+    // A non-mutating method read keeps the fill verdict at any depth.
+    // Text analysis cannot prove mutation from the name, so the
+    // segment-one over-approximation extends to the whole chain.
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].list.len();", 0));
+    // A non-call field chain reads the element.
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[i].list.len;", 0));
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[i].list.items;", 0));
+}
+
+test "classifyBracketUse quoted field chain assignment fills (EPH-I0777)" {
+    // The quoted field form assigns through the chain the same as a
+    // plain field: direct, chained-index, and chained-field shapes.
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[x].@\"f\" = v;", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[x].@\"f\"[0] = v;", 0));
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[x].@\"f\".g = v;", 0));
+    // A quoted segment on the write-through walk keeps the method call.
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[i].@\"list\".append(1);", 0));
+    // A quoted field read does not fill.
+    try std.testing.expectEqual(BracketUse.read, classifyBracketUse("[x].@\"f\";", 0));
+}
+
+test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `sum +%= buf[x]` reads an element. It never initializes buf. The
+    // pre-fix gen sites counted any `buf[` occurrence as a fill and
+    // masked the read behind the loop fill.
+    const content =
+        \\fn loopElemRead(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| {
+        \\        sum +%= buf[x];
+        \\    }
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0752_elemread.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0752_elemread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop compound-op element read of undefined buffer is detected (EPH-I0752)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[x] += 1` reads the element before writing it, so it cannot
+    // initialize an undefined buffer.
+    const content =
+        \\fn loopCompoundRead(xs: []const u8) void {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        buf[x] += 1;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0752_compound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0752_compound.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop tuple-init element read of undefined buffer is detected (EPH-I0752)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `.{ buf[x], 1 }` copies the element into the aggregate — a genuine
+    // read of undefined memory. A `,` past the bracket with no enclosing
+    // paren is an aggregate literal, not a call argument, and must not
+    // count as a fill (EPH-I0752 review: the in-parens call-arg surface
+    // never reaches the discriminator — hasSlicePassToFunction drops it
+    // upstream).
+    const content =
+        \\fn loopTupleRead(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var pair: [2]u8 = .{ 0, 0 };
+        \\    for (xs) |x| {
+        \\        pair = .{ buf[x], 1 };
+        \\    }
+        \\    return pair[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0752_tuple.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0752_tuple.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop element write-through stays silent (EPH-I0752)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[x].append(1)` writes through the element. The write-through
+    // class keeps the fill verdict (EPH-I0752).
+    const content =
+        \\fn loopWriteThrough(xs: []const u8) void {
+        \\    var buf: [16]std.ArrayList(u8) = undefined;
+        \\    for (xs) |x| {
+        \\        buf[x].append(1) catch return;
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn use(b: *const [16]std.ArrayList(u8)) void {
+        \\    _ = b;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0752_writethrough.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0752_writethrough.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop nested method write-through stays silent (EPH-I0775)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[x].list.append(1)` writes through a field of the element. The
+    // receiver is `&buf[x].list`, the same write-through family as the
+    // segment-one method form (EPH-I0775).
+    const content =
+        \\fn loopNestedWriteThrough(xs: []const u8) void {
+        \\    var buf: [16]Holder = undefined;
+        \\    for (xs) |x| {
+        \\        buf[x].list.append(1) catch return;
+        \\    }
+        \\    use(buf);
+        \\}
+        \\const Holder = struct { list: std.ArrayList(u8) };
+        \\fn use(b: *const [16]Holder) void {
+        \\    _ = b;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0775_writethrough.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0775_writethrough.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop quoted field chain assignment stays silent (EPH-I0777)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[x].@"f" = 1` assigns through the quoted field chain. The
+    // quoted form is the same fill as the plain field form (EPH-I0777).
+    // The second loop's element read detects the fill failure pre-fix.
+    const content =
+        \\fn loopQuotedFieldAssign(xs: []const u8) u8 {
+        \\    var buf: [16]Holder = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| {
+        \\        buf[x].@"f" = 1;
+        \\    }
+        \\    for (xs) |x| {
+        \\        sum +%= buf[x].@"f";
+        \\    }
+        \\    return sum;
+        \\}
+        \\const Holder = struct { f: u8 };
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0777_quoted.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0777_quoted.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `send(buf[0..])` is the slice form: slice reads keep their fill
+    // verdict — that crudeness is load-bearing (EPH-I0102 ghostty/flow).
+    const content =
+        \\fn loopSlicePass(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        send(buf[0..]);
+        \\    }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0752_slicepass.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0752_slicepass.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
 }
 
 test "ZA607: field assignment on other var does not mask read" {

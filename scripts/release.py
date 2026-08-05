@@ -105,7 +105,7 @@ def bump_readme(old: str, new: str, dry_run: bool) -> None:
     EPH-I0702, EPH-I0188: the install URL tracks the latest remote tag
     (check-version.sh section 3), not the zon version. Rewriting it here
     re-creates a 404 on every release cycle. It bumps manually in the first
-    post-tag commit. verify_no_stale skips README.md for the same reason:
+    post-tag commit. verify_bumped skips README.md for the same reason:
     the changelog and the install URL legitimately keep older versions
     (mega-audit file-scripts.md finding 2, EPH-I0656).
     """
@@ -118,25 +118,42 @@ def bump_readme(old: str, new: str, dry_run: bool) -> None:
     print(f"  {'✓' if changed else '○'} README.md")
 
 
-def verify_no_stale(old: str) -> None:
-    """Ensure the old version no longer appears in files we manage."""
-    files = [
-        REPO_ROOT / "build.zig.zon",
-        REPO_ROOT / "src" / "main.zig",
-        REPO_ROOT / "install.sh",
-    ]
-    stale = []
-    for f in files:
-        text = f.read_text()
-        if old in text:
-            # Find line numbers for context
-            for i, line in enumerate(text.splitlines(), 1):
-                if old in line:
-                    stale.append(f"  {f.name}:{i}: {line.strip()}")
+# Production locations that carry the release version. Only these lines
+# matter for a bump. Test fixtures and help-text examples elsewhere in
+# src/main.zig keep older versions by design (EPH-I0765). install.sh is
+# excluded: EPHOR_FALLBACK_TAG keeps the old tag until the first post-tag
+# commit (EPH-I0702). scripts/check-version.sh section 5 governs that
+# post-tag bump. EPH-I0253 tracks the dead EPHOR_TAG rewrite.
+VERSION_PATTERNS = [
+    (REPO_ROOT / "build.zig.zon", r'^\s*\.version\s*=\s*"{}"'),
+    (REPO_ROOT / "src" / "main.zig", r'const EPHOR_VERSION = "{}"'),
+]
+
+
+def verify_bumped(old: str, new: str) -> None:
+    """Verify the bump: the old version is gone and the new version is
+    present at every production pattern in VERSION_PATTERNS."""
+    stale: list[str] = []
+    missing: list[str] = []
+    for path, template in VERSION_PATTERNS:
+        text = path.read_text()
+        old_re = template.format(re.escape(old))
+        for i, line in enumerate(text.splitlines(), 1):
+            if re.search(old_re, line):
+                stale.append(f"  {path.name}:{i}: {line.strip()}")
+        new_re = template.format(re.escape(new))
+        if not re.search(new_re, text, re.MULTILINE):
+            missing.append(f"  {path.name}: no line matches {template.format(new)!r}")
     if stale:
         print(f"\nerror: stale references to {old} found:")
         for line in stale:
             print(line)
+    if missing:
+        print(f"\nerror: version {new} missing from a production location:")
+        for line in missing:
+            print(line)
+    if stale or missing:
+        print("Fix the files above, then run the bump again.")
         sys.exit(1)
 
 
@@ -172,7 +189,7 @@ def main() -> None:
         print("\nDry run complete. No files were modified.")
         sys.exit(0)
 
-    verify_no_stale(old_version)
+    verify_bumped(old_version, new_version)
 
     print("\nAll files updated and verified.")
     print("Next steps:")

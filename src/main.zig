@@ -13398,7 +13398,10 @@ const FnCallFacts = struct {
             }
         }
         if (!body_open) {
-            if (mem.endsWith(u8, forms.t, ";")) span.pending = null;
+            // Judge the terminator on the comment-stripped code: a trailing
+            // comment must not hide the `;` (EPH-I0755).
+            const tc = mem.trim(u8, forms.code, " \t\r");
+            if (mem.endsWith(u8, tc, ";")) span.pending = null;
             return;
         }
         span.current = span.pending;
@@ -51527,6 +51530,52 @@ test "ZT101: fn after a comment-def line stays a lie candidate (EPH-I0427)" {
         if (!mem.eql(u8, issue.rule, RULE_TEST_LIE)) continue;
         try std.testing.expect(mem.indexOf(u8, issue.message, "checkWidget") != null);
     }
+}
+
+test "ZT101: extern decl with trailing comment drops, real fn registers (EPH-I0755)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the raw-line `endsWith(t, ";")` missed the `;` hidden by the
+    // trailing comment: the decl stayed pending, the real fn's body span
+    // opened under the decl name, and `real` never registered — the
+    // EPH-I0427 graph corruption through the extern door.
+    const content =
+        \\pub extern fn c_thing(x: c_int) void; // from gtk.h
+        \\fn real() void {
+        \\    helper();
+        \\}
+        \\fn helper() void {}
+    ;
+    var facts = try collectFnCallFacts(allocator, content);
+    defer facts.deinit(allocator);
+
+    const real = facts.callees.get("real") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(containsName(real.items, "helper"));
+    // The body calls belong to `real`, not to the bodiless decl.
+    const decl = facts.callees.get("c_thing") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!containsName(decl.items, "helper"));
+}
+
+test "ZT101: extern decl without a comment still drops (EPH-I0755)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Over-strip guard: the plain `;`-terminated decl must keep dropping.
+    const content =
+        \\pub extern fn c_thing(x: c_int) void;
+        \\fn real() void {
+        \\    helper();
+        \\}
+        \\fn helper() void {}
+    ;
+    var facts = try collectFnCallFacts(allocator, content);
+    defer facts.deinit(allocator);
+
+    const real = facts.callees.get("real") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(containsName(real.items, "helper"));
 }
 
 test "ZT104: defer cleanup catch is silent" {

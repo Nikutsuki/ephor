@@ -22510,13 +22510,20 @@ fn noteEntriesRejected(
 /// Each candidate file gets its own trust decision: the target-dir file and
 /// the parent-fallback file are tested independently (RED3-8).
 fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []const u8) !void {
+    // Dupe target_path BEFORE any config parse: it aliases the cfg.path
+    // buffer in production (loadConfigFromTargetPath(cfg, cfg.path)), and a
+    // path_dir key frees that buffer mid-parse (EPH-I0763). The parent
+    // fallback below reads the dupe, never the aliased original.
+    const target_copy = try allocator.dupe(u8, target_path);
+    defer allocator.free(target_copy);
+
     const saved_path = try allocator.dupe(u8, cfg.path);
     errdefer allocator.free(saved_path);
 
     // Try target directory, then parent
     if (try tryLoadConfigFromDir(allocator, cfg, target_path, saved_path)) return;
 
-    if (std.fs.path.dirname(target_path)) |parent| {
+    if (std.fs.path.dirname(target_copy)) |parent| {
         const parent_copy = try allocator.dupe(u8, parent);
         defer allocator.free(parent_copy);
         if (try tryLoadConfigFromDir(allocator, cfg, parent_copy, saved_path)) return;
@@ -54210,6 +54217,73 @@ test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I068
     var fail_at: usize = 0;
     while (fail_at <= total) : (fail_at += 1) {
         try runConfigLoadSweepIteration(root_path, fail_at, total);
+    }
+}
+
+/// One EPH-I0763 sweep iteration: run loadConfigFromTargetPath with the
+/// production aliasing (target_path IS the owned cfg.path buffer) under an
+/// allocator that fails on its fail_at-th inner allocation. A clean return
+/// must leave cfg.path at the target dir: either the target config
+/// committed, or its parse failed non-fatally AFTER path_dir freed the
+/// aliased buffer and the parent fallback committed the parent config.
+/// Pre-fix the fallback's dirname(target_path) read the freed bytes, so the
+/// parent config was missed and cfg.path stayed at the path_dir value.
+fn runParentFallbackSweepIteration(root_path: []const u8, fail_at: usize) !void {
+    const parent = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(parent, .{});
+    var cfg = testConfig();
+    try setOwnedPath(failing.allocator(), &cfg, root_path);
+    failing.fail_index = failing.allocations + fail_at;
+    entries_reject_count = 0;
+    entries_reject_note_count = 0;
+    if (loadConfigFromTargetPath(failing.allocator(), &cfg, cfg.path)) {
+        try std.testing.expectEqualStrings(root_path, cfg.path);
+        try std.testing.expect(cfg.path_owned);
+    } else |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    }
+    cfg.deinit(failing.allocator());
+    // Byte balance is the leak proof. A double-free panics the parent
+    // DebugAllocator before this line runs.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+test "loadConfigFromTargetPath parent fallback never reads freed target_path (EPH-I0763)" {
+    // Regression: the target config below applies path_dir (setOwnedPath
+    // frees the cfg.path buffer that target_path aliases) and then fails
+    // non-fatally under an induced OOM at the entries key. Pre-fix the
+    // parent fallback read std.fs.path.dirname(target_path) on the freed
+    // buffer; the poisoned bytes hold no '/', so dirname returned null and
+    // the fallback was skipped, leaving cfg.path at "sub". The sweep
+    // asserts every clean return commits back to the target dir.
+    global_io = std.testing.io;
+    const parent = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "target/sub");
+    const tmp_path = try tmpDirPath(parent, &tmp);
+    defer parent.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(parent, "{s}/target", .{tmp_path});
+    defer parent.free(root_path);
+    try writeTestConfig(root_path, "{\"path_dir\": \"sub\", \"entries\": [\"x.zig\"]}");
+    try writeTestConfig(tmp_path, "{}");
+
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+
+    // Measure the allocation count inside loadConfigFromTargetPath so the
+    // sweep covers every induced failure point plus one no-failure run.
+    var probe = std.testing.FailingAllocator.init(parent, .{});
+    var probe_cfg = testConfig();
+    try setOwnedPath(probe.allocator(), &probe_cfg, root_path);
+    const probe_base = probe.allocations;
+    try loadConfigFromTargetPath(probe.allocator(), &probe_cfg, probe_cfg.path);
+    probe_cfg.deinit(probe.allocator());
+    const total = probe.allocations - probe_base;
+
+    var fail_at: usize = 0;
+    while (fail_at <= total) : (fail_at += 1) {
+        try runParentFallbackSweepIteration(root_path, fail_at);
     }
 }
 

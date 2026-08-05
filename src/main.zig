@@ -21178,6 +21178,85 @@ fn reportFmtFailure(
     });
 }
 
+/// First line that carries an "error:" marker, or null. zig fmt writes
+/// "error: ..." for IO failures and "path:line:col: error: ..." for
+/// parse failures. Both carry the marker.
+fn firstErrorLine(stderr: []const u8) ?[]const u8 {
+    var lines = mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (mem.indexOf(u8, t, "error:") != null) return t;
+    }
+    return null;
+}
+
+/// Owned message for a failed zig fmt termination: the first
+/// "error:"-shaped stderr line (sanitized, RED5) when the exit carries
+/// diagnostics, the exit code or termination kind otherwise.
+fn fmtTermMessage(
+    allocator: Allocator,
+    term: std.process.Child.Term,
+    stderr: []const u8,
+) ![]u8 {
+    switch (term) {
+        .exited => |code| {
+            if (firstErrorLine(stderr)) |line| {
+                var safe = try types.sanitizeTerminal(allocator, line);
+                defer safe.deinit(allocator);
+                return try allocator.dupe(u8, safe.slice);
+            }
+            return std.fmt.allocPrint(
+                allocator,
+                "zig fmt exited with code {d} and no diagnostics",
+                .{code},
+            );
+        },
+        .signal => |sig| return std.fmt.allocPrint(
+            allocator,
+            "zig fmt terminated by signal {d}",
+            .{sigNum(sig)},
+        ),
+        .stopped => |sig| return std.fmt.allocPrint(
+            allocator,
+            "zig fmt stopped on signal {d} before exiting",
+            .{sigNum(sig)},
+        ),
+        .unknown => |status| return std.fmt.allocPrint(
+            allocator,
+            "zig fmt ended with unknown termination status {d}",
+            .{status},
+        ),
+    }
+}
+
+/// ZR104 for a zig fmt child whose run failed (EPH-I0722). Two call
+/// shapes: an exit whose diagnostics the filename parser dropped in
+/// full (a missing path, a non-zig input, a syntax-only scan: an empty
+/// list would read as ran-clean), and a failure next to parsed names
+/// (a mixed scan's dropped parse error, a signal kill's truncated
+/// list). ZR104, not ZA601: a failed tool run is a command failure,
+/// not a format finding. The finding pins the real scanned path at
+/// 1:1, not a fictional build.zig (EPH-I0735).
+fn reportFmtTermFailure(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    path: []const u8,
+    result: std.process.RunResult,
+) !void {
+    const msg = try fmtTermMessage(allocator, result.term, result.stderr);
+    errdefer allocator.free(msg);
+    try issues.append(allocator, .{
+        .file = path,
+        .line = 1,
+        .col = 1,
+        .severity = .err,
+        .rule = RULE_RUNTIME_TEST_FAILURE,
+        .message = msg,
+        .help = "run zig fmt directly to see the full error",
+        .message_owned = true,
+    });
+}
+
 /// Run zig fmt --check on `path` and parse its output into ZA601
 /// findings. Different toolchains write the list to different
 /// streams. Both go through parseFmtOutput, which owns every name it
@@ -21206,6 +21285,28 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
     try issues.appendSlice(allocator, stderr_issues.items);
     // Item ownership moved with the append. Only the array frees here.
     stderr_issues.deinit(allocator);
+    // 0.16 deinit sets the list to undefined. Reset it so the armed
+    // errdefer above is a no-op when the fallible term check unwinds.
+    stderr_issues = .empty;
+    // A non-zero exit whose failure the parser dropped is a tool
+    // failure, not a clean run: a missing path, a non-zig input, and a
+    // syntax error all exit 1 with diagnostics the .zig-suffix gate
+    // drops (EPH-I0722). Zero parsed names means the parser dropped
+    // every diagnostic. A stderr error line next to parsed names means
+    // it dropped a mixed scan's parse error. A needs-format-only run
+    // keeps an empty stderr, so the normal path stays silent. 0.16
+    // Term is a tagged union. Only .exited carries a code.
+    switch (result.term) {
+        .exited => |code| {
+            const failure_hidden = issues.items.len == 0 or
+                firstErrorLine(result.stderr) != null;
+            if (code != 0 and failure_hidden)
+                try reportFmtTermFailure(allocator, &issues, path, result);
+        },
+        // A signal kill truncates the filename list, so the failure
+        // finding fires on top of any parsed names (ZR106 precedent).
+        .signal, .stopped, .unknown => try reportFmtTermFailure(allocator, &issues, path, result),
+    }
     return issues;
 }
 
@@ -21347,6 +21448,13 @@ fn reportCommandFailure(
     });
 }
 
+/// Numeric form of a signal for a finding message. std.posix.SIG is
+/// void on targets without signals (PSP and other bare targets), so the
+/// enum read stays behind this guard.
+fn sigNum(sig: std.posix.SIG) u32 {
+    return if (@TypeOf(sig) == void) 0 else @intFromEnum(sig);
+}
+
 /// ZR106: the child died by signal, not by exit code (EPH-I0231). Fires
 /// on top of any parsed diagnostics: the run did not complete.
 fn reportSignalDeath(
@@ -21354,9 +21462,7 @@ fn reportSignalDeath(
     issues: *std.ArrayListUnmanaged(Issue),
     sig: std.posix.SIG,
 ) !void {
-    // std.posix.SIG is void on targets without signals (PSP and other
-    // bare targets). The guard keeps the enum read off those targets.
-    const sig_num: u32 = if (@TypeOf(sig) == void) 0 else @intFromEnum(sig);
+    const sig_num = sigNum(sig);
     const msg = try std.fmt.allocPrint(
         allocator,
         "command terminated by signal {d}",
@@ -28409,6 +28515,161 @@ test "reportFmtFailure reports a missing zig as a command failure" {
     try std.testing.expectEqualStrings("cannot run zig fmt: FileNotFound", issues.items[0].message);
     try std.testing.expect(issues.items[0].message_owned);
     try std.testing.expectEqualStrings("check that zig is installed and on PATH", issues.items[0].help.?);
+}
+
+test "runFmtCheck reports ZR104 when the scanned path does not exist" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var issues = try runFmtCheck(allocator, "/nonexistent/ephor-i0722/x");
+    defer deinitIssues(&issues, allocator);
+
+    // Pre-fix the stderr diagnostic parsed to zero names and the
+    // failure read as ran-clean (EPH-I0722).
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
+    try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "FileNotFound") != null);
+}
+
+test "runFmtCheck reports ZR104 for a non-zig input path" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plain.txt", .data = "not zig\n" });
+    const path = try tmpFilePath(allocator, &tmp, "plain.txt");
+    defer allocator.free(path);
+
+    var issues = try runFmtCheck(allocator, path);
+    defer deinitIssues(&issues, allocator);
+
+    // zig fmt reads any input as zig source: the parse error exits
+    // non-zero and never names a file to format (EPH-I0722). The
+    // finding pins the real scanned path, not a fictional build.zig.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    const issue = issues.items[0];
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issue.rule);
+    try std.testing.expectEqual(Severity.err, issue.severity);
+    try std.testing.expectEqualStrings(path, issue.file);
+    try std.testing.expect(mem.indexOf(u8, issue.message, "error:") != null);
+}
+
+test "runFmtCheck reports ZR104 for a syntax-broken zig file" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "broken.zig",
+        .data = "fn broken( void {\n",
+    });
+    const path = try tmpFilePath(allocator, &tmp, "broken.zig");
+    defer allocator.free(path);
+
+    var issues = try runFmtCheck(allocator, path);
+    defer deinitIssues(&issues, allocator);
+
+    // The "path:line:col: error: ..." diagnostic fails the .zig-suffix
+    // gate, so pre-fix a broken build read as ran-clean (EPH-I0722).
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    const issue = issues.items[0];
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issue.rule);
+    try std.testing.expectEqual(Severity.err, issue.severity);
+    try std.testing.expectEqualStrings(path, issue.file);
+    try std.testing.expect(mem.indexOf(u8, issue.message, "error:") != null);
+}
+
+test "runFmtCheck keeps a needs-format file as a ZA601 warning" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "needsfmt.zig",
+        .data = "fn needs() void{}\n",
+    });
+    const path = try tmpFilePath(allocator, &tmp, "needsfmt.zig");
+    defer allocator.free(path);
+
+    var issues = try runFmtCheck(allocator, path);
+    defer deinitIssues(&issues, allocator);
+
+    // Regression pin (EPH-I0722): exit 1 with a parsed name stays a
+    // format warning, never an error-severity tool failure.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_NEEDS_FORMAT, issues.items[0].rule);
+    try std.testing.expectEqual(Severity.warning, issues.items[0].severity);
+}
+
+test "runFmtCheck reports nothing for a formatted file" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ok.zig", .data = "fn ok() void {}\n" });
+    const path = try tmpFilePath(allocator, &tmp, "ok.zig");
+    defer allocator.free(path);
+
+    var issues = try runFmtCheck(allocator, path);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "runFmtCheck reports the syntax error in a mixed directory" {
+    global_io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "needsfmt.zig",
+        .data = "fn needs() void{}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "broken.zig",
+        .data = "fn broken( void {\n",
+    });
+    const dir = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir);
+
+    var issues = try runFmtCheck(allocator, dir);
+    defer deinitIssues(&issues, allocator);
+
+    // The parsed needs-format name must not mask the dropped parse
+    // error: the run failed AND a file needs formatting (EPH-I0722 r1).
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_NEEDS_FORMAT, issues.items[0].rule);
+    try std.testing.expectEqual(Severity.warning, issues.items[0].severity);
+    const issue = issues.items[1];
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issue.rule);
+    try std.testing.expectEqual(Severity.err, issue.severity);
+    try std.testing.expectEqualStrings(dir, issue.file);
+    try std.testing.expect(mem.indexOf(u8, issue.message, "error:") != null);
+}
+
+test "fmtTermMessage names the termination kind for a signal death" {
+    const allocator = std.testing.allocator;
+    const msg = try fmtTermMessage(allocator, .{ .signal = std.posix.SIG.TERM }, "");
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("zig fmt terminated by signal 15", msg);
+}
+
+test "fmtTermMessage falls back to the exit code without diagnostics" {
+    const allocator = std.testing.allocator;
+    const msg = try fmtTermMessage(allocator, .{ .exited = 2 }, "note: no error here\n");
+    defer allocator.free(msg);
+    try std.testing.expectEqualStrings("zig fmt exited with code 2 and no diagnostics", msg);
+}
+
+test "fmtTermMessage sanitizes hostile bytes in the error line" {
+    const allocator = std.testing.allocator;
+    const stderr = "x.zig:1:1: error: bad \x1b[2J\x01 path\nlater line\n";
+    const msg = try fmtTermMessage(allocator, .{ .exited = 1 }, stderr);
+    defer allocator.free(msg);
+
+    // RED5: control bytes become visible '?' marks, never terminal
+    // sequences, and only the first error line reaches the message.
+    try std.testing.expectEqualStrings("x.zig:1:1: error: bad ?[2J? path", msg);
 }
 
 test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {

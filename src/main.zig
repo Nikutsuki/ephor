@@ -220,6 +220,32 @@ var corpus_bytes_warn_threshold: usize = 1024 * 1024 * 1024;
 /// the warning is edge-triggered, so tests reset it to re-arm.
 var corpus_warn_count: usize = 0;
 
+/// EPH-I0291 test-isolation seam. Restore the shared test-hook globals of
+/// the counter/io/diagnostic classes to their process-entry values. A test
+/// that touches any of these calls this at
+/// the start (in place of hand-resetting one counter each) and under defer
+/// at exit, so a missed restore fails the end-of-file canary instead of
+/// leaking state into the next test. corpus_bytes_warn_threshold is not
+/// reset here: its only writer saves and restores it inline. The fetch-seam
+/// globals (test_fetch_calls/test_fetch_result) reset at entry via
+/// resetFetchSeam on every consumer, so they carry no exit-restore here.
+fn resetTestGlobals() void {
+    global_io = null;
+    cli_diagnostics_enabled = true;
+    last_bad_fail_on = null;
+    untrusted_config_note_count = 0;
+    path_dir_reject_count = 0;
+    entries_reject_count = 0;
+    entries_reject_note_count = 0;
+    fmt_reject_count = 0;
+    threshold_clamp_count = 0;
+    suppression_note_count = 0;
+    known_issues_autoload_count = 0;
+    untrusted_ignore_skip_count = 0;
+    ast_skip_note_count = 0;
+    corpus_warn_count = 0;
+}
+
 /// Read cap for Zig SOURCE files (EPH-I0150): the import graph's per-file
 /// content read (analyzeFile) and the export path's snippet re-read
 /// (writeCodeSnippet) share this one cap, so a file the graph skipped can
@@ -27899,6 +27925,7 @@ test "markReachableResolved terminates on import cycles" {
 
 test "markZigFilesRecursive stops at the depth cap" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -27929,6 +27956,7 @@ test "markZigFilesRecursive stops at the depth cap" {
 
 test "scanForNestedBuildZig stops at the depth cap" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -27996,7 +28024,8 @@ test "summary JSON parses with the AST tier members" {
 }
 
 test "AST skip note fires only when files were skipped" {
-    ast_skip_note_count = 0;
+    resetTestGlobals();
+    defer resetTestGlobals();
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -28007,13 +28036,14 @@ test "AST skip note fires only when files were skipped" {
 }
 
 test "corpus warning fires once when resident bytes cross the threshold" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     const saved_threshold = corpus_bytes_warn_threshold;
     defer corpus_bytes_warn_threshold = saved_threshold;
     corpus_bytes_warn_threshold = 1024;
-    corpus_warn_count = 0;
-    defer corpus_warn_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -28053,6 +28083,7 @@ test "corpus warning fires once when resident bytes cross the threshold" {
 
 test "markAllZigFilesReachable memoizes overlapping roots" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28094,6 +28125,7 @@ test "markAllZigFilesReachable memoizes overlapping roots" {
 
 test "markZigFilesRecursive does not memoize a depth-capped dir" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28127,6 +28159,7 @@ fn hasOrphanIssue(issues: []const Issue, path: []const u8) bool {
 
 test "extractBareImports ignores @import in a multiline-string body (EPH-I0227)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28165,6 +28198,7 @@ test "extractBareImports ignores @import in a multiline-string body (EPH-I0227)"
 
 test "extractBareImports ignores @import inside a string literal (EPH-I0227)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28200,6 +28234,7 @@ test "extractBareImports ignores @import inside a string literal (EPH-I0227)" {
 
 test "extractBareImports still records a real bare @import (EPH-I0227)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28229,6 +28264,7 @@ test "extractBareImports still records a real bare @import (EPH-I0227)" {
 
 test "build-path scanners ignore refs inside strings (EPH-I0227)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28267,6 +28303,7 @@ test "build-path scanners ignore refs inside strings (EPH-I0227)" {
 
 test "build-path scanners still mark refs in real code (EPH-I0227)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28296,6 +28333,7 @@ test "build-path scanners still mark refs in real code (EPH-I0227)" {
 
 test "build.zig entry extractors ignore refs on multiline-string lines (EPH-I0227)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28925,6 +28963,7 @@ test "reportFmtFailure reports a missing zig as a command failure" {
 
 test "runFmtCheck reports ZR104 when the scanned path does not exist" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var issues = try runFmtCheck(allocator, "/nonexistent/ephor-i0722/x");
     defer deinitIssues(&issues, allocator);
@@ -28939,6 +28978,7 @@ test "runFmtCheck reports ZR104 when the scanned path does not exist" {
 
 test "runFmtCheck reports ZR104 for a non-zig input path" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28962,6 +29002,7 @@ test "runFmtCheck reports ZR104 for a non-zig input path" {
 
 test "runFmtCheck reports ZR104 for a syntax-broken zig file" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28987,6 +29028,7 @@ test "runFmtCheck reports ZR104 for a syntax-broken zig file" {
 
 test "runFmtCheck keeps a needs-format file as a ZA601 warning" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29009,6 +29051,7 @@ test "runFmtCheck keeps a needs-format file as a ZA601 warning" {
 
 test "runFmtCheck reports nothing for a formatted file" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29024,6 +29067,7 @@ test "runFmtCheck reports nothing for a formatted file" {
 
 test "runFmtCheck reports the syntax error in a mixed directory" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29081,6 +29125,7 @@ test "fmtTermMessage sanitizes hostile bytes in the error line" {
 test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29104,6 +29149,7 @@ test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {
 
 test "runRuntimeAnalysis reports ZR104 when the command cannot spawn" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var issues = try runRuntimeAnalysis(allocator, ".", false, "/nonexistent/ephor-i0232-x");
     defer deinitIssues(&issues, allocator);
@@ -29118,6 +29164,7 @@ test "runRuntimeAnalysis reports ZR104 when the command cannot spawn" {
 test "runRuntimeAnalysis reports ZR104 when output exceeds the capture limit" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     // `yes` writes unbounded output and trips the 10 MB cap fast.
     var issues = try runRuntimeAnalysis(allocator, ".", false, "yes");
@@ -29131,6 +29178,7 @@ test "runRuntimeAnalysis reports ZR104 when output exceeds the capture limit" {
 test "runRuntimeAnalysis returns no findings for a clean command" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var issues = try runRuntimeAnalysis(allocator, ".", false, "true");
     defer deinitIssues(&issues, allocator);
@@ -29140,6 +29188,7 @@ test "runRuntimeAnalysis returns no findings for a clean command" {
 test "runRuntimeAnalysis reports ZR104 for a nonzero exit with no diagnostics" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var issues = try runRuntimeAnalysis(allocator, ".", false, "false");
     defer deinitIssues(&issues, allocator);
@@ -41044,6 +41093,7 @@ test "resolveUpdateCachePath requires HOME" {
 
 test "update cache write/read round-trip" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41063,6 +41113,7 @@ test "update cache write/read round-trip" {
 test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41101,6 +41152,7 @@ test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
 
 test "resolveLatestVersion returns fresh cache without fetching" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41119,6 +41171,7 @@ test "resolveLatestVersion returns fresh cache without fetching" {
 
 test "resolveLatestVersion refetches stale cache and rewrites it" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41150,6 +41203,7 @@ test "resolveLatestVersion refetches stale cache and rewrites it" {
 
 test "resolveLatestVersion treats future-dated cache as stale" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41168,6 +41222,7 @@ test "resolveLatestVersion treats future-dated cache as stale" {
 
 test "resolveLatestVersion refetches corrupt cache" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41195,6 +41250,7 @@ test "resolveLatestVersion refetches corrupt cache" {
 
 test "resolveLatestVersion fetches when cache file is missing" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41218,6 +41274,7 @@ test "resolveLatestVersion fetches when cache file is missing" {
 
 test "resolveLatestVersion leaves cache untouched on fetch failure" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41506,6 +41563,7 @@ test "parseEphorHashFromZon skips a hash marker inside a string value (EPH-I0139
 
 test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41651,6 +41709,7 @@ test "buildIntegrationUpdate reports an already-canonical block (EPH-I0168)" {
 test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41820,6 +41879,7 @@ fn writeManifestFixture(tmp: *std.testing.TmpDir) !void {
 
 test "analysis path never writes project manifest files (EPH-I0271)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -46254,6 +46314,7 @@ test "ZA202 split form fires end-to-end via analyzeErrors (I0152)" {
 
 test "I0150: over-cap file records a ZA502 skipped-file warning" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -46294,6 +46355,7 @@ test "I0150: over-cap file records a ZA502 skipped-file warning" {
 
 test "I0150: exact-cap file also skips (boundary pin)" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -49374,6 +49436,7 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
 
 test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
     global_io = std.testing.io;
+    defer global_io = null;
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54177,6 +54240,9 @@ test "config fail_on beats strict regardless of key order" {
 }
 
 test "config invalid fail_on is a hard usage error" {
+    // The parse stashes the rejected value in last_bad_fail_on; do not let
+    // it outlive the test (EPH-I0291 isolation).
+    defer last_bad_fail_on = null;
     var cfg = testConfig();
     try std.testing.expectError(
         error.InvalidFailOnValue,
@@ -54457,6 +54523,7 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
 
 test "config trust: cwd and ancestors trusted, descendants untrusted" {
     global_io = std.testing.io;
+    defer global_io = null;
     try std.testing.expect(isConfigDirTrusted("."));
     try std.testing.expect(!isConfigDirTrusted("src"));
     // The working directory's parent is an ancestor, hence trusted.
@@ -54467,7 +54534,10 @@ test "config trust: cwd and ancestors trusted, descendants untrusted" {
 }
 
 test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54489,7 +54559,6 @@ test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)
     defer cfg.deinit(allocator);
     // Production shape: cfg.path IS the target dir (the containment root).
     try setOwnedPath(allocator, &cfg, dir_path);
-    untrusted_config_note_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -54520,7 +54589,10 @@ test "trusted config keeps full control of suppression and gates" {
 }
 
 test "untrusted target fail_on:never cannot lower a trusted gate (RED3-4)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54530,7 +54602,6 @@ test "untrusted target fail_on:never cannot lower a trusted gate (RED3-4)" {
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    untrusted_config_note_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -54562,7 +54633,10 @@ test "CLI --force sets force_upgrade" {
 }
 
 test "--trust-target-config honors a target config in full" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54573,7 +54647,6 @@ test "--trust-target-config honors a target config in full" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     cfg.trust_target_config = true;
-    untrusted_config_note_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -54585,11 +54658,14 @@ test "--trust-target-config honors a target config in full" {
 }
 
 test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // Layout: <tmp>/root is the scan root (ephor.json + inside.zig);
     // <tmp>/outside.zig is the traversal target one level up. The config
     // carries one entry per attack shape: inside (survives), absolute
     // outside, ".." traversal outside, and nonexistent (fail closed).
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54612,9 +54688,6 @@ test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, root_path);
-    entries_reject_count = 0;
-    entries_reject_note_count = 0;
-    untrusted_config_note_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -54633,9 +54706,12 @@ test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
 }
 
 test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // Operator intent: a config the trust model accepts may point entries
     // outside the scan root for orphan completeness (RED4-3).
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54654,8 +54730,6 @@ test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
     defer cfg.deinit(allocator);
     cfg.trust_target_config = true;
     try setOwnedPath(allocator, &cfg, root_path);
-    entries_reject_count = 0;
-    entries_reject_note_count = 0;
 
     try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
 
@@ -54666,10 +54740,13 @@ test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
 }
 
 test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // The scanned tree's own build.zig is attacker content: a .path("..")
     // entry must not steer reads outside the root, an in-tree entry must
     // pass untouched.
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54697,8 +54774,6 @@ test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, root_path);
-    entries_reject_count = 0;
-    entries_reject_note_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -54769,12 +54844,15 @@ fn runEntriesSweepIteration(root_path: []const u8, fail_at: usize, inner_allocs:
 }
 
 test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // Reviewer r1 trace: entries ["/etc/passwd", "b.zig", "c.zig"],
     // untrusted, allocPrint failing on a relative entry. The pre-fix fused
     // loop freed the rejected "/etc/passwd" and unwound with its stale
     // slot still inside len, so Config.deinit freed it a second time.
     // Pre-fix this test panics at fail_at == 0 on that double-free.
     global_io = std.testing.io;
+    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54846,12 +54924,15 @@ fn runConfigLoadSweepIteration(root_path: []const u8, fail_at: usize, total: usi
 }
 
 test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I0689)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // Regression: tryLoadConfigFromDir consumed saved_path (path_owned =
     // true) BEFORE makeEntriesAbsolute's fallible absolutize, so an OOM
     // there freed saved_path through the caller's errdefer and again
     // through Config.deinit. Pre-fix this test panics on that double-free
     // at the first phase-1 allocPrint index.
     global_io = std.testing.io;
+    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54916,6 +54997,8 @@ fn runParentFallbackSweepIteration(root_path: []const u8, fail_at: usize) !void 
 }
 
 test "loadConfigFromTargetPath parent fallback never reads freed target_path (EPH-I0763)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // Regression: the target config below applies path_dir (setOwnedPath
     // frees the cfg.path buffer that target_path aliases) and then fails
     // non-fatally under an induced OOM at the entries key. Pre-fix the
@@ -54924,6 +55007,7 @@ test "loadConfigFromTargetPath parent fallback never reads freed target_path (EP
     // the fallback was skipped, leaving cfg.path at "sub". The sweep
     // asserts every clean return commits back to the target dir.
     global_io = std.testing.io;
+    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -54958,6 +55042,7 @@ test "loadConfigFromTargetPath without a config frees saved_path once (EPH-I0689
     // No ephor.json in the target or its parent: saved_path is never
     // consumed, so the loader frees it exactly once on the not-found path.
     global_io = std.testing.io;
+    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -55002,13 +55087,15 @@ test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)
 }
 
 test "config path_dir outside the config directory is rejected (RED4-1)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // Assumes tests run from the project root: ".." and "/" resolve outside
     // it, while "src" resolves inside it.
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
-    path_dir_reject_count = 0;
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
@@ -55029,11 +55116,13 @@ test "config path_dir outside the config directory is rejected (RED4-1)" {
 }
 
 test "config path_dir rejection warning sanitizes hostile value bytes" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
-    path_dir_reject_count = 0;
 
     // An untrusted config whose path_dir carries ESC and CR bytes raw.
     // The value does not resolve, so the rejection warning fires
@@ -55064,6 +55153,8 @@ test "config path_dir rejection warning sanitizes hostile value bytes" {
 }
 
 test "target-dir config parse never aliases cfg.path (UAF regression)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     // Regression: ConfigSource.dir aliased the dir argument, which IS the
     // cfg.path buffer in production (loadConfigFromTargetPath(cfg, cfg.path)).
     // A two-alias config ({"path_dir": "sub", "src": "sub"}) freed that
@@ -55071,6 +55162,7 @@ test "target-dir config parse never aliases cfg.path (UAF regression)" {
     // Under the test allocator the freed bytes are poisoned, so key 2 warned
     // spuriously; the discriminating signal is zero rejections here.
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -55086,7 +55178,6 @@ test "target-dir config parse never aliases cfg.path (UAF regression)" {
 
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
-    path_dir_reject_count = 0;
 
     try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
     try std.testing.expectEqual(@as(usize, 0), path_dir_reject_count);
@@ -55123,10 +55214,11 @@ test "over-broad exclude patterns warn and are skipped (RED3-2)" {
 }
 
 test "config thresholds clamp at the documented maxima (RED3-6)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     const allocator = std.testing.allocator;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
-    threshold_clamp_count = 0;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try parseConfigJson(
@@ -55145,10 +55237,11 @@ test "config thresholds clamp at the documented maxima (RED3-6)" {
 }
 
 test "CLI threshold flags clamp at the documented maxima (RED3-6)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     const allocator = std.testing.allocator;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
-    threshold_clamp_count = 0;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
@@ -55339,6 +55432,7 @@ test "install without project files returns InstallFailed (EPH-I0235)" {
     // Regression: `ephor install` outside a Zig project printed help and
     // exited 0, so CI proceeded to `zig build ephor` on a failed install.
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     const allocator = std.testing.allocator;
@@ -55376,6 +55470,7 @@ test "install patch failure maps to InstallFailed (EPH-I0235)" {
     // A build.zig with no build function gives findBuildZigInsertionPoint
     // nothing to anchor to, so the patch stage must fail the install.
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     const allocator = std.testing.allocator;
@@ -55394,6 +55489,7 @@ test "install patch failure maps to InstallFailed (EPH-I0235)" {
 test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {
     // Regression: an explicit --version reached the fetch URL unvalidated.
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     const allocator = std.testing.allocator;
@@ -55409,6 +55505,7 @@ test "install with an invalid --version returns InvalidVersion (EPH-I0155)" {
     // Validation runs before the project-file gate: an empty directory
     // must report the version error, not InstallFailed.
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     const allocator = std.testing.allocator;
@@ -55424,6 +55521,7 @@ test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
     // Regression: the downgrade-floor refusal printed and exited 0, so a
     // script could not detect the refusal.
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     const allocator = std.testing.allocator;
@@ -55437,6 +55535,7 @@ test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
 
 test "upgrade without ephor dependency returns UpgradeFailed (EPH-I0235)" {
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     const allocator = std.testing.allocator;
@@ -55968,6 +56067,8 @@ const suppress_leak_source =
 ;
 
 test "suppression: ignore-file directive drops the finding and counts inline" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     const allocator = std.testing.allocator;
     const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
     var h = try initSuppressHarness(allocator, "src/sup_inline.zig", content);
@@ -55986,7 +56087,6 @@ test "suppression: ignore-file directive drops the finding and counts inline" {
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, formatSuppressionBreakdown(&buf, h.stats));
 
-    suppression_note_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     reportSuppression(&h.stats, &h.cfg);
@@ -56039,6 +56139,8 @@ test "suppression: config disable and exclude land in their own buckets" {
 }
 
 test "suppression: zero suppression emits no note" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     const allocator = std.testing.allocator;
     var h = try initSuppressHarness(allocator, "src/sup_none.zig", suppress_leak_source);
     defer h.deinit(allocator);
@@ -56048,7 +56150,6 @@ test "suppression: zero suppression emits no note" {
     try std.testing.expectEqual(h.run.issues.items.len, counts.warnings);
     try std.testing.expectEqual(@as(usize, 0), h.stats.total());
 
-    suppression_note_count = 0;
     reportSuppression(&h.stats, &h.cfg);
     try std.testing.expectEqual(@as(usize, 0), suppression_note_count);
 }
@@ -56183,7 +56284,10 @@ test "suppression: JSON member parses and the total stays consistent" {
 }
 
 test "suppression: known-issues load works outside check and only once" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56205,7 +56309,6 @@ test "suppression: known-issues load works outside check and only once" {
     try Fs.cwd().writeFile(ignore_path, content.items, .{});
 
     // Every finding command loads from cfg.path before reporting...
-    known_issues_autoload_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
     try setOwnedPath(allocator, &h.cfg, dir_path);
@@ -56229,7 +56332,10 @@ test "suppression: known-issues load works outside check and only once" {
 }
 
 test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56245,7 +56351,6 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
     // The tmpDir is outside the cwd tree: the trust flag honors the
     // auto-load (EPH-I0222). The explicit path below needs no flag.
     cfg.trust_target_config = true;
-    known_issues_autoload_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -56264,7 +56369,10 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
 }
 
 test "suppression: untrusted .ephor-ignore auto-load is refused (EPH-I0222)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56277,8 +56385,6 @@ test "suppression: untrusted .ephor-ignore auto-load is refused (EPH-I0222)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, dir_path);
-    known_issues_autoload_count = 0;
-    untrusted_ignore_skip_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -56296,7 +56402,10 @@ test "suppression: untrusted .ephor-ignore auto-load is refused (EPH-I0222)" {
 }
 
 test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56310,8 +56419,6 @@ test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
     defer cfg.deinit(allocator);
     cfg.trust_target_config = true;
     try setOwnedPath(allocator, &cfg, dir_path);
-    known_issues_autoload_count = 0;
-    untrusted_ignore_skip_count = 0;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
 
@@ -56328,6 +56435,7 @@ test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
 
 test "writeExportIssue neutralizes markdown metacharacters and control bytes" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     const issue = Issue{
         .file = "ev*il_[x].zig",
@@ -56358,6 +56466,7 @@ test "writeExportIssue neutralizes markdown metacharacters and control bytes" {
 
 test "writeCodeSnippet neutralizes fence sequences in source lines" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56434,6 +56543,7 @@ test "ZT101: control bytes in a test name are sanitized at print time" {
 
 test "Fs.openFile reads back bytes written to a tmp file" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56454,6 +56564,7 @@ test "Fs.openFile reads back bytes written to a tmp file" {
 
 test "Fs.createFile creates a tmp file that holds the written bytes" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56473,6 +56584,7 @@ test "Fs.createFile creates a tmp file that holds the written bytes" {
 
 test "Fs.statFile reports the size and kind of a tmp file" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56488,6 +56600,7 @@ test "Fs.statFile reports the size and kind of a tmp file" {
 
 test "Fs.realpathAlloc resolves a dot component to the canonical path" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56580,11 +56693,13 @@ fn makeTestIssue(file: []const u8) Issue {
 }
 
 test "parseFmtOutput findings own their file bytes after the source frees" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     global_io = std.testing.io;
-    fmt_reject_count = 0;
+    defer global_io = null;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56620,11 +56735,13 @@ test "parseFmtOutput findings own their file bytes after the source frees" {
 }
 
 test "parseFmtOutput rejects control and non-ASCII bytes" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     const allocator = std.testing.allocator;
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
-    fmt_reject_count = 0;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56648,8 +56765,9 @@ test "parseFmtOutput rejects control and non-ASCII bytes" {
 }
 
 test "parseFmtOutput silently skips zig fmt lines that are not file names" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     const allocator = std.testing.allocator;
-    fmt_reject_count = 0;
 
     // Parse errors and status lines never reach the safety gates, so a
     // broken build stays quiet and the reject counter does not move.
@@ -56663,11 +56781,13 @@ test "parseFmtOutput silently skips zig fmt lines that are not file names" {
 }
 
 test "parseFmtOutput rejects paths that resolve outside the scan root" {
+    resetTestGlobals();
+    defer resetTestGlobals();
     const allocator = std.testing.allocator;
     global_io = std.testing.io;
+    defer global_io = null;
     cli_diagnostics_enabled = false;
     defer cli_diagnostics_enabled = true;
-    fmt_reject_count = 0;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56706,6 +56826,7 @@ test "parseFmtOutput rejects paths that resolve outside the scan root" {
 
 test "writeCodeSnippet skips out-of-root and unresolvable paths" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56737,6 +56858,7 @@ test "writeCodeSnippet skips out-of-root and unresolvable paths" {
 
 test "writeCodeSnippet keeps an in-root snippet with the marker line" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56759,6 +56881,7 @@ test "writeCodeSnippet keeps an in-root snippet with the marker line" {
 
 test "scanRootRealpath roots a file scan at the file's directory" {
     global_io = std.testing.io;
+    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -56775,4 +56898,30 @@ test "scanRootRealpath roots a file scan at the file's directory" {
     const file_root = scanRootRealpath(file_path, &buf);
     try std.testing.expectEqualStrings(dir_path, file_root.?);
     try std.testing.expect(scanRootRealpath("/nonexistent-ephor-test", &buf) == null);
+}
+
+test "canary: no test leaks shared global state (EPH-I0291)" {
+    // This canary must stay the LAST test declaration in this file. The
+    // 0.16 runner executes tests in declaration order, so it observes the
+    // suite-wide exit state of every test above it. A failure here means a
+    // test above skipped its restore-at-exit (defer resetTestGlobals(), or
+    // the targeted defers for global_io and last_bad_fail_on). The failed
+    // assertion names the leaked global, not the test that leaked it.
+    // Limit: a missed restore is masked when a later test restores the
+    // same global first, so only leaks that survive to end-of-file fail
+    // here. The DiagCtx refactor (EPH-I0771) removes the class.
+    try std.testing.expectEqual(@as(usize, 0), untrusted_config_note_count);
+    try std.testing.expectEqual(@as(usize, 0), path_dir_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), entries_reject_note_count);
+    try std.testing.expectEqual(@as(usize, 0), fmt_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), threshold_clamp_count);
+    try std.testing.expectEqual(@as(usize, 0), suppression_note_count);
+    try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
+    try std.testing.expectEqual(@as(usize, 0), untrusted_ignore_skip_count);
+    try std.testing.expectEqual(@as(usize, 0), ast_skip_note_count);
+    try std.testing.expectEqual(@as(usize, 0), corpus_warn_count);
+    try std.testing.expect(global_io == null);
+    try std.testing.expect(cli_diagnostics_enabled);
+    try std.testing.expect(last_bad_fail_on == null);
 }

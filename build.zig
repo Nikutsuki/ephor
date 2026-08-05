@@ -5,6 +5,16 @@
 
 const std = @import("std");
 
+/// EPH-I0291 flake forensics: print the build graph seed at the start of
+/// every `zig build test` run. The runner prints the seed only on failure
+/// (the "failed command" replay line), so a hang or a protocol desync
+/// loses it. The seed labels the run. Test order is declaration order, so
+/// the seed does not change what executes.
+fn printTestSeed(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !void {
+    _ = options;
+    std.log.info("test run seed: 0x{x}", .{step.owner.graph.random_seed});
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -44,4 +54,15 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // EPH-I0291: record the per-run seed with every test run (see
+    // printTestSeed). Runs before the test binary as a test-step dependency.
+    const seed_step = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    seed_step.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "test-seed",
+        .owner = b,
+        .makeFn = printTestSeed,
+    });
+    test_step.dependOn(seed_step);
 }

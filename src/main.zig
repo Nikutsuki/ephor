@@ -2502,6 +2502,22 @@ fn hasAssignmentAfterChain(text: []const u8) ?bool {
     return null;
 }
 
+/// True when the first non-space/tab byte before `pos` is a `.`: the
+/// occurrence is a field of another var (`foo.buf[i] =`), never the
+/// local. The four left-dot guards checked only the one byte at
+/// `pos - 1`, so a spaced dot (`foo . buf[i] = 1`) masked the field
+/// access and the write read as a fill of a same-named local
+/// (EPH-I0786). The whitespace set is space and tab, the set the sibling
+/// scans trim. `pos == 0` has no left byte and returns false.
+fn hasLeftDot(t: []const u8, pos: usize) bool {
+    var i = pos;
+    while (i > 0) {
+        i -= 1;
+        if (t[i] != ' ' and t[i] != '\t') return t[i] == '.';
+    }
+    return false;
+}
+
 /// Fill/read verdict for one `var_name[...]` occurrence (EPH-I0752).
 const BracketUse = enum { fill, read };
 
@@ -3375,9 +3391,10 @@ const ForLoopTracker = struct {
             const pos = s + rel;
             s = pos + var_name.len;
             // The match must be the variable itself: not mid-identifier
-            // (box[i] =) and not a field of another var (foo.x[i] =).
+            // (box[i] =) and not a field of another var (foo.x[i] =, with
+            // any spacing around the dot — EPH-I0786).
             if (pos > 0 and isIdent(t[pos - 1])) continue;
-            if (pos > 0 and t[pos - 1] == '.') continue;
+            if (hasLeftDot(t, pos)) continue;
             const end_pos = pos + var_name.len;
             if (end_pos >= t.len) return;
             // Pattern: var_name[...] — fills only in write contexts
@@ -3989,8 +4006,10 @@ fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
             continue;
         }
         // The left-dot guard skips a field of another var: `foo.buf[i] =`
-        // writes foo's field, not the local buf (EPH-I0753).
-        if (vpos > 0 and t[vpos - 1] == '.') {
+        // writes foo's field, not the local buf (EPH-I0753). The scan
+        // skips whitespace, so a spaced dot (`foo . buf[i] =`) keeps the
+        // same verdict (EPH-I0786).
+        if (hasLeftDot(t, vpos)) {
             pos = vpos + vn.len;
             continue;
         }
@@ -11228,8 +11247,10 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
 
         // Patterns 2/3 require the match to be the variable itself: not
         // mid-identifier (box[...], box =) and not a field of another var
-        // (foo.x[...], foo.x =).
-        const self_match = i == 0 or (!isIdent(t[i - 1]) and t[i - 1] != '.');
+        // (foo.x[...], foo.x =). The identifier boundary stays on the
+        // immediate byte. The dot check skips whitespace, so a spaced dot
+        // (foo . x[...] =) keeps the field verdict (EPH-I0786).
+        const self_match = i == 0 or (!isIdent(t[i - 1]) and !hasLeftDot(t, i));
 
         // Pattern 2: var_name[...] in a write context. Slice forms keep
         // the load-bearing fill verdict (EPH-I0102). Bare element reads
@@ -11259,8 +11280,9 @@ fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
         const pos = s + rel;
         s = pos + var_name.len;
         // The match must be the variable itself: not mid-identifier (box[i])
-        // and not a field of another var (foo.x[i]).
-        if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) continue;
+        // and not a field of another var (foo.x[i], foo . x[i] —
+        // EPH-I0786). The identifier boundary stays on the immediate byte.
+        if (pos > 0 and (isIdent(t[pos - 1]) or hasLeftDot(t, pos))) continue;
         const end = pos + var_name.len;
         if (end < t.len and t[end] == '[' and
             classifyBracketUse(t, end) == .fill) return true;
@@ -39319,6 +39341,23 @@ test "isArrayIndexAssignment skips dot-prefixed field writes (EPH-I0753)" {
     try std.testing.expect(isArrayIndexAssignment("if (c) { buf[i] = 1; }", "buf"));
 }
 
+test "isArrayIndexAssignment skips whitespace-spaced dot field writes (EPH-I0786)" {
+    // The first non-space/tab byte left of the name decides the field
+    // verdict, so a spaced dot keeps the skip: `foo . buf[i] = 1` writes
+    // foo's field, never the local buf.
+    try std.testing.expect(!isArrayIndexAssignment("foo . buf[i] = 1;", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("foo .\tbuf[i] = 1;", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("foo  .  buf[i] = 1;", "buf"));
+    try std.testing.expect(!isArrayIndexAssignment("foo. buf[i] = 1;", "buf"));
+    // The no-space form keeps its skip, and a genuine local fill at line
+    // start still counts.
+    try std.testing.expect(!isArrayIndexAssignment("foo.buf[i] = 1;", "buf"));
+    try std.testing.expect(isArrayIndexAssignment("buf[i] = 1;", "buf"));
+    // A space-separated preceding token is no field access: the scan
+    // stops at the identifier, and the fill verdict stands.
+    try std.testing.expect(isArrayIndexAssignment("x = foo buf[i] = 1;", "buf"));
+}
+
 test "classifyBracketUse splits write contexts from element reads (EPH-I0752)" {
     // Write contexts fill: plain and chained assignments, slice forms,
     // element write-through.
@@ -39752,6 +39791,81 @@ test "ZA607: multi-line loop fill still covers a post-loop read (EPH-I0785)" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_i0785_multiline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: spaced-dot field write does not fill the local (EPH-I0786)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `foo . buf[0] = 1` writes foo's field through a spaced dot. The
+    // pre-fix hasDirectFill Pattern 2 checked only the one byte left of
+    // the name, so the space masked the field access and the write
+    // counted as a fill of the local buf.
+    const content =
+        \\fn directSpacedDotWrite() u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    foo . buf[0] = 1;
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0786_direct.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0786_direct.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop spaced-dot field write does not mask local read (EPH-I0786)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `foo . buf[x] = 1` writes foo's field through a spaced dot. The
+    // pre-fix checkIndexedAssign checked only the one byte left of the
+    // name, so the loop line filled the local buf and masked the read.
+    const content =
+        \\fn loopSpacedDotWrite(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        foo . buf[x] = 1;
+        \\    }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0786_loop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0786_loop.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line loop spaced-dot field write does not mask local read (EPH-I0786)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The spaced-dot field write sits on the loop-header line. The
+    // pre-fix hasForLoopIndexedFill checked only the one byte left of the
+    // name, so the write filled the local buf and masked the read.
+    const content =
+        \\fn oneLineLoopSpacedDot(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| { foo . buf[x] = 1; }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0786_oneline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0786_oneline.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

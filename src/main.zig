@@ -2375,7 +2375,8 @@ fn hasDirectReassignment(t: []const u8, var_name: []const u8) bool {
         // Word boundary checks
         if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) continue;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (pos > 0 and t[pos - 1] == '.') continue; // field access
+        // Field access, with any spacing around the dot (EPH-I0790).
+        if (hasLeftDot(t, pos)) continue;
         if (cls.isInsideString(pos)) continue;
         // Check for direct assignment (not ==, not subscript)
         if (isDirectAssignment(t, var_name, pos)) return true;
@@ -3180,7 +3181,8 @@ fn fillCallEffectPos(
 /// Next occurrence of var_name at or after s.* that is a direct assignment
 /// target (`x = ...`, `x.field = ...`, `x[i] = ...`), advancing s.* past
 /// the matched name. Word boundaries and a leading-dot guard keep `box =`
-/// and `foo.x =` from matching. Fill-style writes (x.init(), @memset(&x,
+/// and `foo.x =` from matching, with any spacing around the dot
+/// (`foo . x =`, EPH-I0790). Fill-style writes (x.init(), @memset(&x,
 /// ...), fill(&x)) are not targets — callers fall back to the statement
 /// start for those.
 fn nextAssignmentOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize {
@@ -3188,9 +3190,10 @@ fn nextAssignmentOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usi
         const pos = s.* + rel;
         s.* = pos + var_name.len;
         // The match must be the variable itself: not mid-identifier
-        // (box =) and not a field of another var (foo.x =).
+        // (box =) and not a field of another var (foo.x =, with any
+        // spacing around the dot — EPH-I0790).
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (pos > 0 and t[pos - 1] == '.') continue;
+        if (hasLeftDot(t, pos)) continue;
         if (pos + var_name.len < t.len and
             isIdent(t[pos + var_name.len])) continue;
         if (isAssignmentTarget(t, var_name, pos)) return pos;
@@ -3304,14 +3307,19 @@ fn genLoopFill(
     first_effect[bid] = minAssignEffect(first_effect[bid], header_effect);
 }
 
-/// True when a `for` line's braced body opens and closes within the
-/// line's code portion: a one-line loop. The quote-aware balance guards
-/// the multi-line shape whose trailing `}` leaves the body open
-/// (`for (xs) |x| { if (y) { foo(); }`).
+/// True when the `for` loop that starts on this line completes on the
+/// same line: its braced body closes within the line's code portion
+/// (statements after the close sit outside the loop), or its brace-less
+/// body statement ends at a `;` on the line (EPH-I0789). Paren and
+/// bracket depth keep header braces (`for (o.{ 1, 2 }) |x|`) and
+/// call-argument literals out of the body balance. A body that
+/// continues past the line returns false: the multi-line shapes keep
+/// the historical open-until-net-negative behavior.
 fn hasOnelineLoopClose(t: []const u8) bool {
-    const code = mem.trimEnd(u8, stripLineComment(t), " \t\r;");
-    if (code.len == 0 or code[code.len - 1] != '}') return false;
-    var depth: i32 = 0;
+    const code = mem.trimEnd(u8, stripLineComment(t), " \t\r");
+    var paren_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
     var mode: QuoteMode = .none;
     var i: usize = 0;
     while (i < code.len) : (i += 1) {
@@ -3320,10 +3328,19 @@ fn hasOnelineLoopClose(t: []const u8) bool {
             i += skip;
             continue;
         }
-        if (c == '{') depth += 1;
-        if (c == '}') depth -= 1;
+        if (c == '(') paren_depth += 1;
+        if (c == ')') paren_depth -|= 1;
+        if (c == '[') bracket_depth += 1;
+        if (c == ']') bracket_depth -|= 1;
+        if (paren_depth != 0 or bracket_depth != 0) continue;
+        if (c == '{') brace_depth += 1;
+        if (c == ';' and brace_depth == 0) return true;
+        if (c != '}') continue;
+        if (brace_depth == 0) return false;
+        brace_depth -= 1;
+        if (brace_depth == 0) return true;
     }
-    return depth == 0;
+    return false;
 }
 
 /// Compute gen set: which blocks assign a variable (includes loop fill patterns)
@@ -3348,7 +3365,19 @@ const ForLoopTracker = struct {
     }
 
     fn checkLoopEnd(self: *ForLoopTracker, t: []const u8, idx: usize) void {
-        if (!self.in_loop or mem.indexOf(u8, t, "}") == null) return;
+        if (!self.in_loop) return;
+        // A one-line loop completes on its start line, so the
+        // net-negative close below never fires for it. Close at the end
+        // of the start line instead: without it, a post-loop fill on a
+        // later line reads as loop-carried and genLoopFill covers the
+        // header line from column 0, masking an element read inside the
+        // loop (EPH-I0785). The check runs before the `}` gate: a
+        // brace-less one-line body carries no `}` at all (EPH-I0789).
+        if (idx == self.start_idx and hasOnelineLoopClose(t)) {
+            self.in_loop = false;
+            return;
+        }
+        if (mem.indexOf(u8, t, "}") == null) return;
         // String and char content carries no braces: a '}' inside a
         // literal must not end the loop early (EPH-I0107). A `\\` opener's
         // tail is string data for the same reason (EPH-I0751).
@@ -3365,17 +3394,7 @@ const ForLoopTracker = struct {
             if (c == '{') brace_count += 1;
             if (c == '}') brace_count -= 1;
         }
-        if (brace_count < 0) {
-            self.in_loop = false;
-            return;
-        }
-        // A one-line loop's braces balance on its start line, so the
-        // net-negative close above never fires for it. Close at the end
-        // of the start line instead: without it, a post-loop fill on a
-        // later line reads as loop-carried and genLoopFill covers the
-        // header line from column 0, masking an element read inside the
-        // loop (EPH-I0785).
-        if (idx == self.start_idx and hasOnelineLoopClose(t)) self.in_loop = false;
+        if (brace_count < 0) self.in_loop = false;
     }
 
     fn checkIndexedAssign(
@@ -4293,9 +4312,10 @@ fn blockContainsAssignment(
             const pos = s + rel;
             s = pos + var_name.len;
             // The match must be the variable itself: not mid-identifier
-            // (box =) and not a field of another var (foo.x =).
+            // (box =) and not a field of another var (foo.x =, with any
+            // spacing around the dot — EPH-I0790).
             if (pos > 0 and isIdent(inner[pos - 1])) continue;
-            if (pos > 0 and inner[pos - 1] == '.') continue;
+            if (hasLeftDot(inner, pos)) continue;
             if (pos + var_name.len < inner.len and
                 isIdent(inner[pos + var_name.len])) continue;
             if (isAssignmentTarget(inner, var_name, pos)) return true;
@@ -5200,7 +5220,8 @@ fn isBindingNameAt(t: []const u8, var_name: []const u8, i: usize) bool {
 }
 
 /// True when the occurrence at `i` never reads the variable's value:
-/// mid-identifier match, field of another var (`foo.x`), a binding
+/// mid-identifier match, field of another var (`foo.x`, `foo . x` — the
+/// left-dot scan skips whitespace, EPH-I0790), a binding
 /// introduction (`var x`, `const x`, `|x|`), `.len` compile-time
 /// property, string literal, line comment, fill destination (`&x` or a
 /// bare @memset/@memcpy dest — a fill statement must not "read" its own
@@ -5214,7 +5235,7 @@ fn isReadExemptOccurrence(
     const end_i = i + var_name.len;
     if (end_i < t.len and isIdent(t[end_i])) return true; // mid-word
     if (i > 0 and isIdent(t[i - 1])) return true; // mid-word
-    if (i > 0 and t[i - 1] == '.') return true; // field of another var
+    if (hasLeftDot(t, i)) return true; // field of another var
     if (isBindingNameAt(t, var_name, i)) return true;
     if (cls.isInsideString(i)) return true;
     if (mem.indexOf(u8, t[0..i], "//")) |_| return true;
@@ -11455,9 +11476,11 @@ fn hasModifyingMethodCall(t: []const u8, var_name: []const u8) bool {
             const var_pos = s + rel;
             s = var_pos + var_name.len;
             // The receiver must be the variable itself: not mid-identifier
-            // (box.append) and not a field of another var (foo.x.append).
+            // (box.append) and not a field of another var (foo.x.append,
+            // with any spacing around the dot — EPH-I0790). The identifier
+            // boundary stays on the immediate byte.
             if (var_pos > 0 and
-                (isIdent(t[var_pos - 1]) or t[var_pos - 1] == '.')) continue;
+                (isIdent(t[var_pos - 1]) or hasLeftDot(t, var_pos))) continue;
             const after_var = var_pos + var_name.len;
             if (after_var + method.len > t.len) continue;
             if (mem.startsWith(u8, t[after_var..], method)) return true;
@@ -36679,11 +36702,36 @@ test "hasOnelineLoopClose classifies one-line loop shapes (EPH-I0785)" {
     try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| { if (y) { foo(); }"));
     // A header anonymous struct with a brace-less body on later lines.
     try std.testing.expect(!hasOnelineLoopClose("for (o.{ 1, 2 }) |x|"));
-    // A brace-less body holds no code `}`: the tracker keeps the
-    // historical open-until-net-negative behavior.
-    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| foo();"));
-    // A net-negative line belongs to the general close path, not this one.
-    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| { foo(); } }"));
+    // A brace-less body that ends on the line completes the loop
+    // (EPH-I0789).
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| foo();"));
+    // The body closes mid-line. The extra `}` belongs to an outer block.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| { foo(); } }"));
+}
+
+test "hasOnelineLoopClose closes brace-less and trailing-statement loops (EPH-I0789)" {
+    // The probe shape: a brace-less body whose statement ends on the line.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| sum +%= buf[x];"));
+    // A trailing statement after the balanced body sits outside the loop.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| { foo(); } bar();"));
+    // The else block after the balanced close sits outside the loop. Its
+    // fills are not loop-carried.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| { foo(); } else {"));
+    // A nested brace-less loop completes on the line.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| for (ys) |y| foo();"));
+    // A `;` inside a char literal is data. The final `;` ends the body.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| c = ';';"));
+    // Call-argument braces stay out of the body balance.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| foo(.{ 1, 2 });"));
+    // A bare header leaves the body to later lines: the multi-line
+    // brace-less shape keeps the historical behavior.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x|"));
+    // A body expression that continues past the line is not one-line.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| sum +%="));
+    // A `;` in a multiline-string tail is string data, not the body end.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| s = \\\\x; y();"));
+    // An unclosed call paren holds the body open past the line.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| foo(a,"));
 }
 
 test "computeBraceDepth ignores braces in a multiline opener tail (EPH-I0751)" {
@@ -40408,6 +40456,162 @@ test "ZA607: one-line loop spaced-dot field write does not mask local read (EPH-
     );
 }
 
+test "ZA607: post-loop fill does not mask a brace-less one-line loop read (EPH-I0789)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The brace-less one-line loop completes at its line end, but the
+    // pre-fix tracker waited for a code `}` that never comes: the
+    // post-loop `buf[0] = 1` read as loop-carried and genLoopFill covered
+    // the header line from column 0, masking the in-loop element read.
+    const content =
+        \\fn bracelessLoopReadThenLaterFill(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| sum +%= buf[x];
+        \\    buf[0] = 1;
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0789_braceless.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0789_braceless.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: post-loop fill does not mask a trailing-statement one-line loop read (EPH-I0789)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The balanced body closes mid-line and a trailing statement follows.
+    // The pre-fix hasOnelineLoopClose required the line to end at the
+    // close, so both trackers held open and the later fill read as
+    // loop-carried, masking the in-loop element read.
+    const content =
+        \\fn trailingStmtLoopRead(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| { sum +%= buf[x]; } sum +%= 1;
+        \\    buf[0] = 1;
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0789_trailing.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0789_trailing.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: brace-less multi-line loop keeps the historical tracker behavior (EPH-I0789)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The scope boundary of the fix: a brace-less body that continues
+    // past the header line still holds the tracker open, so the later
+    // fill reads as loop-carried and masks the in-loop read.
+    const content =
+        \\fn bracelessMultiLine(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x|
+        \\        sum +%= buf[x];
+        \\    buf[0] = 1;
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0789_multiline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0789_multiline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: brace-less one-line loop fill still covers a post-loop read (EPH-I0789)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // checkIndexedAssign records the same-line fill before the line-end
+    // close runs, so the loop fill still covers the post-loop read.
+    const content =
+        \\fn bracelessOneLineFill(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| buf[x] = 1;
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0789_fillread.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0789_fillread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: spaced-dot field read does not read the local (EPH-I0790)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `foo . buf[0]` reads foo's field through a spaced dot. The pre-fix
+    // isReadExemptOccurrence checked only the one byte left of the name,
+    // so the space masked the field access and the occurrence counted as
+    // a read of the never-assigned local buf.
+    const content =
+        \\fn spacedDotFieldRead() u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    return foo . buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0790_read.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0790_read.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: spaced-dot plain field write does not fill the local (EPH-I0790)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `foo . buf = 1` writes foo's field through a spaced dot. The
+    // pre-fix nextAssignmentOccurrence checked only the one byte left of
+    // the name, so the write recorded a fill effect at its `;` and
+    // covered the same-line read before the genuine fill-call takes
+    // effect. The `&buf` gates the line into recordLineFills. The
+    // indexed form `foo . buf[0] = 1` is the EPH-I0786 hasDirectFill arm.
+    const content =
+        \\fn spacedDotEarlyEffect() u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    foo . buf = 1; sum = buf[0]; fillBuf(&buf);
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0790_write.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0790_write.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -40685,6 +40889,15 @@ test "hasModifyingMethodCall scans every occurrence" {
     try std.testing.expect(!hasModifyingMethodCall("foo.x.append(1);", "x"));
 }
 
+test "hasModifyingMethodCall skips whitespace-spaced dot receivers (EPH-I0790)" {
+    // `foo . list.append(1)` mutates foo's field through a spaced dot,
+    // not the local list. The identifier boundary stays on the immediate
+    // byte, so a space-separated preceding token keeps the local verdict.
+    try std.testing.expect(!hasModifyingMethodCall("foo . list.append(1);", "list"));
+    try std.testing.expect(!hasModifyingMethodCall("foo .\tlist.append(1);", "list"));
+    try std.testing.expect(hasModifyingMethodCall("list.append(1);", "list"));
+}
+
 test "hasForLoopIndexedFill scans every occurrence" {
     // EPH-I0082: same first-occurrence blindness as hasModifyingMethodCall.
     try std.testing.expect(hasForLoopIndexedFill("for (box) |b| x[b] = 1;", "x"));
@@ -40702,6 +40915,26 @@ test "blockContainsAssignment scans every occurrence with word boundaries" {
     try std.testing.expect(!blockContainsAssignment(&other, 0, 1, "x"));
     const field = [_][]const u8{"foo.x = 1;"};
     try std.testing.expect(!blockContainsAssignment(&field, 0, 1, "x"));
+}
+
+test "blockContainsAssignment skips whitespace-spaced dot field writes (EPH-I0790)" {
+    // `foo . x = 1` writes foo's field through a spaced dot, not the
+    // local x.
+    const spaced = [_][]const u8{"foo . x = 1;"};
+    try std.testing.expect(!blockContainsAssignment(&spaced, 0, 1, "x"));
+    const local = [_][]const u8{"x = 1;"};
+    try std.testing.expect(blockContainsAssignment(&local, 0, 1, "x"));
+}
+
+test "nextAssignmentOccurrence skips whitespace-spaced dot field writes (EPH-I0790)" {
+    // `foo . buf = 1` writes foo's field through a spaced dot, so the
+    // occurrence is no assignment target of the local buf.
+    var s: usize = 0;
+    try std.testing.expect(nextAssignmentOccurrence("foo . buf = 1;", "buf", &s) == null);
+    s = 0;
+    try std.testing.expect(nextAssignmentOccurrence("foo .\tbuf = 1;", "buf", &s) == null);
+    s = 0;
+    try std.testing.expect(nextAssignmentOccurrence("buf = 1;", "buf", &s) != null);
 }
 
 test "ZA607: or-guard read not suppressed by other-var assignment in body" {
@@ -48041,6 +48274,16 @@ test "hasDirectReassignment detects variable reassignment" {
     try std.testing.expect(!hasDirectReassignment("self.buf = data;", "buf"));
     // Not present at all
     try std.testing.expect(!hasDirectReassignment("other = 5;", "buf"));
+}
+
+test "hasDirectReassignment skips whitespace-spaced dot field writes (EPH-I0790)" {
+    // The first non-space/tab byte left of the name decides the field
+    // verdict: `foo . buf = 1` writes foo's field, never the local buf.
+    try std.testing.expect(!hasDirectReassignment("foo . buf = 1;", "buf"));
+    try std.testing.expect(!hasDirectReassignment("foo .\tbuf = 1;", "buf"));
+    try std.testing.expect(!hasDirectReassignment("foo  .  buf = 1;", "buf"));
+    // A genuine local reassignment at line start still counts.
+    try std.testing.expect(hasDirectReassignment("buf = 1;", "buf"));
 }
 
 // ============================================================================

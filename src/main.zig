@@ -20050,8 +20050,14 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
         depth += parenBalance(pl);
         if (depth > 0 and (mem.indexOf(u8, pl, "@TypeOf(") != null or
             mem.indexOf(u8, pl, "@typeOf(") != null)) return true;
-        // Stop at statement boundaries (no paren nesting left to resolve)
-        if (depth <= 0 and (mem.endsWith(u8, pl, ";") or mem.endsWith(u8, pl, "{"))) break;
+        // Stop at statement boundaries (no paren nesting left to resolve).
+        // Judge the boundary on the comment-stripped code. A trailing
+        // comment hides the terminator on the raw line. The walk then
+        // crosses a closed statement into an earlier @TypeOf opener
+        // (EPH-I0783).
+        const comment_start = findCommentStart(pl) orelse pl.len;
+        const code = mem.trimEnd(u8, pl[0..comment_start], " \t");
+        if (depth <= 0 and (mem.endsWith(u8, code, ";") or mem.endsWith(u8, code, "{"))) break;
     }
     return false;
 }
@@ -20121,9 +20127,14 @@ fn isDeferCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bo
         if (pl.len == 0) continue;
         if (isCommentOrMultilineString(pl)) continue;
         if (mem.startsWith(u8, pl, "defer ") or mem.startsWith(u8, pl, "errdefer ")) return true;
-        // Stop at statement boundaries — the defer can't be further back
-        if (mem.endsWith(u8, pl, ";") or mem.endsWith(u8, pl, "{") or
-            mem.endsWith(u8, pl, "}")) return false;
+        // Stop at statement boundaries: the defer cannot be further back.
+        // Judge the boundary on the comment-stripped code, or a trailing
+        // comment hides the terminator and the walk crosses the statement
+        // into an unrelated defer (EPH-I0783).
+        const comment_start = findCommentStart(pl) orelse pl.len;
+        const code = mem.trimEnd(u8, pl[0..comment_start], " \t");
+        if (mem.endsWith(u8, code, ";") or mem.endsWith(u8, code, "{") or
+            mem.endsWith(u8, code, "}")) return false;
     }
     return false;
 }
@@ -39943,6 +39954,16 @@ test "isAssignmentTarget quoted field chain assignment (EPH-I0778)" {
     try std.testing.expect(!isAssignmentTarget("name.f == v;", "name", 0));
 }
 
+test "isAssignmentTarget quoted field with escaped quote (EPH-I0787)" {
+    // The `\\` escape arm in skipQuotedIdent keeps the escaped quote inside
+    // the name, so the walk reaches the real closing quote and then sees
+    // the assignment. Without the arm the walk ends at the escaped quote
+    // and misreads the tail as a field read.
+    try std.testing.expect(isAssignmentTarget("name.@\"a\\\"b\" = v;", "name", 0));
+    // The sibling bracket walk routes through the same arm.
+    try std.testing.expectEqual(BracketUse.fill, classifyBracketUse("[x].@\"a\\\"b\" = v;", 0));
+}
+
 test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -49653,6 +49674,80 @@ test "isInsideTypeOf detects balanced-paren line inside @TypeOf" {
     try std.testing.expect(!isInsideTypeOf(line, col, &prev3));
 }
 
+test "isInsideTypeOf: trailing comment on a boundary cannot force a match (EPH-I0783)" {
+    // Verdict pin from the EPH-I0783 investigation. The pinned contract is
+    // narrow. At a depth-0 catch line the comment-stripped boundary check
+    // sees the `;` terminator and breaks. This trailing comment cannot
+    // force a match. A catch line at deeper paren depth (inside a call
+    // argument list) needs the same strip. The sibling test below pins
+    // that shape. Comment parens still corrupt parenBalance itself
+    // (EPH-I0794). That residual class stays out of scope for this pin.
+    const prev = [_][]const u8{
+        "const T = @TypeOf(",
+        "    foo,",
+        "); // trailing comment",
+    };
+    const line = "const x = risky() catch unreachable;";
+    const col = mem.indexOf(u8, line, "catch").?;
+    try std.testing.expect(!isInsideTypeOf(line, col, &prev));
+}
+
+test "isInsideTypeOf: comment-hidden boundary, catch at call-arg depth (EPH-I0783)" {
+    // The catch line sits at paren depth +1 inside the argument list of a
+    // multi-line call. The depth-0 pin above does not cover this shape.
+    // The trailing comment on the `);` closer hides the `;` boundary from
+    // a raw endsWith check. Without the strip the walk crosses the closed
+    // @TypeOf statement. Depth goes positive on its opener line. The check
+    // then suppresses a runtime catch unreachable (FN direction, fixed in
+    // EPH-I0783).
+    const prev = [_][]const u8{
+        "    const T = @TypeOf(",
+        "        u8,",
+        "    ); // keep for later",
+    };
+    const line = "    const x = foo(bar() catch unreachable,";
+    const col = mem.indexOf(u8, line, "catch").?;
+    try std.testing.expect(!isInsideTypeOf(line, col, &prev));
+    // Control without the comment: the raw boundary check sees the `;`
+    // terminator and breaks. The comment is load-bearing in the fixture.
+    const bare = [_][]const u8{
+        "    const T = @TypeOf(",
+        "        u8,",
+        "    );",
+    };
+    try std.testing.expect(!isInsideTypeOf(line, col, &bare));
+}
+
+test "isDeferCatchMultiline: trailing comment must not hide a boundary (EPH-I0783)" {
+    // Pre-fix the raw-line endsWith missed the terminator hidden by the
+    // trailing comment, the walk crossed the statement, and an earlier
+    // defer justified a catch {} that is not its continuation: a missed
+    // ZA201/ZT104 report (FN direction, fixed in EPH-I0783).
+    const prev = [_][]const u8{
+        "    defer cleanup();",
+        "    doWork(); // trailing comment",
+    };
+    try std.testing.expect(!isDeferCatchMultiline("    risky() catch {};", &prev));
+    // The same miss through the block-opener boundary.
+    const blk = [_][]const u8{
+        "    defer cleanup();",
+        "    if (x) { // trailing comment",
+    };
+    try std.testing.expect(!isDeferCatchMultiline("        risky() catch {};", &blk));
+    // The genuine multi-line defer continuation still suppresses.
+    const ok = [_][]const u8{
+        "    defer std.fs.cwd()",
+        "        .openFile(\"x\", .{})",
+    };
+    try std.testing.expect(isDeferCatchMultiline("        .close() catch {};", &ok));
+    // A boundary char inside the trailing comment is not a boundary.
+    const cont = [_][]const u8{
+        "    defer std.fs.cwd()",
+        "        .openFile(\"x\", .{}) // note: {",
+    };
+    try std.testing.expect(isDeferCatchMultiline("        .close() catch {};", &cont));
+}
+
 test "isBufPrintCatchUnreachable detects same-line pattern" {
     try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable", null));
     try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable", null));
@@ -53306,6 +53401,30 @@ test "ZT101: extern decl without a comment still drops (EPH-I0755)" {
     const content =
         \\pub extern fn c_thing(x: c_int) void;
         \\fn real() void {
+        \\    helper();
+        \\}
+        \\fn helper() void {}
+    ;
+    var facts = try collectFnCallFacts(allocator, content);
+    defer facts.deinit(allocator);
+
+    const real = facts.callees.get("real") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(containsName(real.items, "helper"));
+}
+
+test "ZT101: real fn def whose trailing comment ends in `;` keeps callees (EPH-I0782)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Inverse of the EPH-I0755 extern class: the pre-fix raw-line
+    // `endsWith(t, ";")` matched the `;` inside the trailing comment and
+    // dropped the pending real def, so the body span never opened and
+    // `helper` registered under no fn. RED by inspection against 290875e:
+    // pre-I0755 the drop fired on the comment's `;` and this assert fails.
+    const content =
+        \\fn real() void // ;
+        \\{
         \\    helper();
         \\}
         \\fn helper() void {}

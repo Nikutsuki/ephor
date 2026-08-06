@@ -15820,6 +15820,30 @@ const ComplexityState = struct {
     // depth (nest never advances past skipped opens), so the count grows
     // with the nesting depth of the input, not with anything bounded.
     prong_opens: [32]usize = @splat(0),
+    // EPH-I0756: a fn opener whose signature wrapped past its own line.
+    // The state opens when the body `{` arrives. A `;` first drops the
+    // pending def (a bodiless decl) without ever opening state.
+    pending: ?PendingFnStart = null,
+};
+
+/// A fn opener whose signature continued past its own line (parens left
+/// unbalanced). Opening the fn state defers until the body `{` arrives at
+/// paren depth 0. A `;` first means a bodiless decl (a wrapped extern) and
+/// drops the pending def, so no phantom metrics accumulate under the decl
+/// name (EPH-I0756). Mirrors ZT101's updatePending pending-def flow.
+const PendingFnStart = struct {
+    name: []const u8,
+    start_line: usize,
+    col: usize,
+    abs_start: usize,
+    is_type_factory: bool,
+    is_data_dispatch: bool,
+    sig_parens: usize,
+    // EPH-I0788: count of processed signature lines before the body opens.
+    // Starts at 1 for the keyword line. Full-line comments never reach
+    // updatePendingFnStart, so they stay out of the count — and the eager
+    // open never counted them, so the backfill matches the old count.
+    sig_lines: usize,
 };
 
 /// Count function parameters by counting colons at depth 1.
@@ -16232,21 +16256,92 @@ fn resetsInFlightFn(view: LineView, state: *const ComplexityState) bool {
     return findRealFnDef(view.t) != null;
 }
 
+/// True when the comment-stripped code of `t` ends with `;`. Judge the
+/// terminator on the code only: a trailing `// from gtk.h` must not hide
+/// the `;` (EPH-I0754, EPH-I0755).
+fn endsWithCodeSemicolon(t: []const u8) bool {
+    const comment_start = findCommentStart(t) orelse t.len;
+    const code = mem.trimEnd(u8, t[0..comment_start], " \t");
+    return mem.endsWith(u8, code, ";");
+}
+
 /// True when a fn-def line is a bodiless declaration (`extern fn ...;`):
 /// `;`-terminated with no body brace in code context. No body ever follows,
 /// so opening fn state on it accumulates phantom metrics under the decl
 /// name until the next real fn reports them (EPH-I0454). ZT101's
 /// updatePending drops the same shape when the `;` arrives.
 fn isBodilessFnDecl(t: []const u8) bool {
-    // Judge the terminator on the comment-stripped code: a trailing
-    // `// from gtk.h` must not hide the `;` (EPH-I0754).
-    const comment_start = findCommentStart(t) orelse t.len;
-    const code = mem.trimEnd(u8, t[0..comment_start], " \t");
-    if (!mem.endsWith(u8, code, ";")) return false;
+    if (!endsWithCodeSemicolon(t)) return false;
     return !hasCodeOpenBrace(t);
 }
 
+/// Scan one line of a fn signature from `start`, literal-masked: track the
+/// paren depth in `sig_parens` and report whether the body `{` arrived at
+/// depth 0. The first brace OUTSIDE the signature's parens is the body — a
+/// brace inside the param list (a `.{}` default value) is not.
+fn scanSignatureLine(line: []const u8, start: usize, sig_parens: *usize) bool {
+    var lit = types.LiteralState.forLine(line) orelse return false;
+    var i: usize = start;
+    while (i < line.len) : (i += 1) {
+        const pos = lit.updateForChar(line, i) orelse continue;
+        const c = line[pos];
+        if (c == '(') sig_parens.* += 1;
+        if (c == ')' and sig_parens.* > 0) sig_parens.* -= 1;
+        if (c == '{' and sig_parens.* == 0) return true;
+    }
+    return false;
+}
+
+/// Open fn complexity state for a def whose body brace arrived. The def's
+/// identity comes from `pending`, built on the fn keyword line. `fn_lines`
+/// backfills the processed signature lines from `pending`: full-line
+/// comments stay out, so a wrapped signature counts the same lines it
+/// counted when the state opened on the keyword line (EPH-I0756, EPH-I0788).
+fn openFnState(
+    view: LineView,
+    state: *ComplexityState,
+    pending: PendingFnStart,
+) void {
+    const sig_end = @min(pending.abs_start + max_signature_lookahead, view.content.len);
+    state.* = .{
+        .in_fn = true,
+        .fn_start = pending.start_line,
+        .fn_col = pending.col,
+        .is_type_factory = pending.is_type_factory,
+        .is_data_dispatch = pending.is_data_dispatch,
+        .params = countFnParams(view.content[pending.abs_start..sig_end]),
+        .fn_name = pending.name,
+        .fn_lines = pending.sig_lines,
+        .cyclomatic = 1,
+    };
+}
+
+/// Advance a deferred fn start across one signature-continuation line: the
+/// state opens when the body `{` arrives at paren depth 0, and the pending
+/// def drops when a `;` ends the decl first — a wrapped extern decl, whose
+/// phantom metrics under the decl name were EPH-I0756. Mirrors ZT101's
+/// updatePending pending-def flow.
+fn updatePendingFnStart(view: LineView, state: *ComplexityState) void {
+    var pending = state.pending orelse return;
+    if (scanSignatureLine(view.t, 0, &pending.sig_parens)) {
+        openFnState(view, state, pending);
+        return;
+    }
+    // A non-opening call is exactly one processed continuation line
+    // (EPH-I0788).
+    pending.sig_lines += 1;
+    if (endsWithCodeSemicolon(view.t)) {
+        state.pending = null;
+    } else {
+        state.pending = pending;
+    }
+}
+
 fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void {
+    if (state.pending != null) {
+        updatePendingFnStart(view, state);
+        return;
+    }
     const t = view.t;
     const pos = findRealFnDef(t) orelse return;
     if (isBodilessFnDecl(t)) return;
@@ -16261,20 +16356,30 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     var end = pos + 3;
     while (end < t.len and isIdent(t[end])) end += 1;
     const name = t[pos + 3 .. end];
-    // Params may span multiple lines — count over the full content from the
-    // fn keyword (bounded lookahead) so wrapped signatures are not undercounted.
-    const fn_abs_start = view.line_offset + pos;
-    const sig_end = @min(fn_abs_start + max_signature_lookahead, view.content.len);
-    state.* = .{
-        .in_fn = true,
-        .fn_start = line_num,
-        .fn_col = pos + 1,
+    var pending: PendingFnStart = .{
+        .name = name,
+        .start_line = line_num,
+        .col = pos + 1,
+        .abs_start = view.line_offset + pos,
         .is_type_factory = isTypeFactory(t),
         .is_data_dispatch = isDataDispatchFunction(name),
-        .params = countFnParams(view.content[fn_abs_start..sig_end]),
-        .fn_name = name,
-        .cyclomatic = 1,
+        .sig_parens = 0,
+        .sig_lines = 1,
     };
+    if (scanSignatureLine(t, pos, &pending.sig_parens)) {
+        // A same-line open has no backfill. The caller's fn_lines
+        // increment counts the keyword line, as the eager open did
+        // (EPH-I0788).
+        pending.sig_lines = 0;
+        openFnState(view, state, pending);
+        return;
+    }
+    // The signature wrapped past this line: defer the state open until the
+    // body `{` arrives. A `;` terminator means a bodiless decl — drop it.
+    // Only a code `{` inside the parens (a `.{}` default) reaches this
+    // drop; the plain one-line decl returned at isBodilessFnDecl.
+    if (endsWithCodeSemicolon(t)) return;
+    state.pending = pending;
 }
 
 /// True when `=>` appears at a code position (outside string literals, char
@@ -50343,6 +50448,193 @@ test "detectFnStart: extern decl with trailing comment opens no fn state (EPH-I0
     const view: LineView = .{ .t = decl, .content = decl, .line_offset = 0 };
     detectFnStart(view, &state, 1);
     try std.testing.expect(!state.in_fn);
+}
+
+test "ZA301: wrapped extern decl followed by a real fn reports no phantom (EPH-I0756)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // The wrapped extern decl never gains a body. isBodilessFnDecl matches
+    // only one-line `;` decls, so pre-fix the opener line opened fn state
+    // and the 8 lines after the decl accumulated into it. The real fn's
+    // arrival then reported the phantom's verdict (EPH-I0756).
+    var content: []u8 = try aa.dupe(u8, "pub extern fn c_thing(\n    x: c_int,\n) void;\n");
+    for (0..8) |i| {
+        const line = try std.fmt.allocPrint(aa, "const v{d}: u32 = {d};\n", .{ i, i });
+        content = try mem.concat(aa, u8, &.{ content, line });
+    }
+    content = try mem.concat(aa, u8, &.{ content, "fn real() void {}\n" });
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "extern_wrapped_phantom.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "extern_wrapped_phantom.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 5 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "detectFnStart: wrapped real fn def opens state with the def line's identity (EPH-I0756)" {
+    // A multi-line signature that ends in `{` still opens fn state: the
+    // opener defers until the body brace arrives, then opens with the fn
+    // keyword line's identity. Wrapped real defs must not regress.
+    const content = "fn wrapped(\n    a: u8,\n) void {";
+    var state = ComplexityState{};
+
+    const line1: LineView = .{ .t = "fn wrapped(", .content = content, .line_offset = 0 };
+    detectFnStart(line1, &state, 1);
+    const line2: LineView = .{ .t = "a: u8,", .content = content, .line_offset = 16 };
+    detectFnStart(line2, &state, 2);
+    const line3: LineView = .{ .t = ") void {", .content = content, .line_offset = 23 };
+    detectFnStart(line3, &state, 3);
+
+    try std.testing.expect(state.in_fn);
+    try std.testing.expectEqual(@as(usize, 1), state.fn_start);
+    try std.testing.expectEqual(@as(usize, 1), state.fn_col);
+    try std.testing.expectEqualStrings("wrapped", state.fn_name);
+    try std.testing.expectEqual(@as(usize, 1), state.params);
+}
+
+test "ZA301: wrapped real fn def counts its signature lines (EPH-I0756)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // 9 lines from the fn keyword to the close. The deferred open must
+    // backfill the 2 signature lines, so the fn reports 9 lines at the def
+    // line (cap 7) exactly as the eager open did.
+    const code =
+        \\fn wrapped(
+        \\    a: u8,
+        \\) void {
+        \\    _ = a;
+        \\    _ = a;
+        \\    _ = a;
+        \\    _ = a;
+        \\    _ = a;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "wrapped_def.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "wrapped_def.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 7 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var za301_count: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG) and
+            mem.eql(u8, issue.file, "wrapped_def.zig"))
+        {
+            za301_count += 1;
+            try std.testing.expectEqual(@as(usize, 1), issue.line);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), za301_count);
+}
+
+test "detectFnStart: one-line extern decl still opens no fn state (EPH-I0756)" {
+    // The one-line drop is the isBodilessFnDecl path, unchanged by the
+    // deferred-open flow. A following real def still opens cleanly.
+    var state = ComplexityState{};
+    const decl = "pub extern fn c_thing(x: c_int) void;";
+    const view: LineView = .{ .t = decl, .content = decl, .line_offset = 0 };
+    detectFnStart(view, &state, 1);
+    try std.testing.expect(!state.in_fn);
+
+    const def = "fn real() void {";
+    const def_view: LineView = .{ .t = def, .content = def, .line_offset = 0 };
+    detectFnStart(def_view, &state, 2);
+    try std.testing.expect(state.in_fn);
+    try std.testing.expectEqualStrings("real", state.fn_name);
+}
+
+// 12 raw lines, 9 processed: analyzeFileComplexity skips the 3 full-line
+// comment lines. The old eager open counted 9.
+const commented_sig_i0788 =
+    \\fn commented(
+    \\    a: u8,
+    \\    // full-line comment one
+    \\    // full-line comment two
+    \\    b: u8,
+    \\    // full-line comment three
+    \\) void {
+    \\    _ = a;
+    \\    _ = b;
+    \\    _ = a;
+    \\    _ = b;
+    \\}
+;
+
+// The comment-free twin: same 12-line span, comment lines replaced by code.
+// All 12 lines process, so it exceeds the cap pre-fix and post-fix.
+const plain_sig_i0788 =
+    \\fn uncommented(
+    \\    a: u8,
+    \\    b: u8,
+    \\    c: u8,
+    \\    d: u8,
+    \\    e: u8,
+    \\) void {
+    \\    _ = a;
+    \\    _ = b;
+    \\    _ = a;
+    \\    _ = b;
+    \\}
+;
+
+test "ZA301: full-line comments in a wrapped signature stay out of fn_lines (EPH-I0788)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator);
+    defer graph.deinit();
+
+    // Two-sided pin at cap 10. The commented twin processes 9 lines and
+    // stays silent. The comment-free twin processes 12 and fires. Pre-fix
+    // the fn_lines backfill subtracted raw line numbers, so the 3 skipped
+    // comment lines inflated the commented twin to 12 (EPH-I0788).
+    const commented = try createTestFileAnalysis(allocator, "i0788_commented.zig", commented_sig_i0788);
+    try graph.files.put(commented.path, commented);
+    try graph.reachable.put(try allocator.dupe(u8, "i0788_commented.zig"), {});
+
+    const plain = try createTestFileAnalysis(allocator, "i0788_plain.zig", plain_sig_i0788);
+    try graph.files.put(plain.path, plain);
+    try graph.reachable.put(try allocator.dupe(u8, "i0788_plain.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 10 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var commented_count: usize = 0;
+    var plain_count: usize = 0;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        if (mem.eql(u8, issue.file, "i0788_commented.zig")) {
+            commented_count += 1;
+        } else if (mem.eql(u8, issue.file, "i0788_plain.zig")) {
+            plain_count += 1;
+            try std.testing.expectEqual(@as(usize, 1), issue.line);
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 12 lines (max 10)") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), commented_count);
+    try std.testing.expectEqual(@as(usize, 1), plain_count);
 }
 
 test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {

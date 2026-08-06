@@ -20371,6 +20371,11 @@ fn collectPredecessors(
     var preds = std.ArrayListUnmanaged(PredInfo).empty;
     for (cfg.edges.items) |edge| {
         if (edge.to != bid) continue;
+        // Return blocks wire a phantom sequential edge to the merge but are
+        // unreachable past the return, so they must not vote in the meet
+        // (mirrors the is_return skip in intersectPredChecks, EPH-I0747).
+        if (edge.from < cfg.blocks.items.len and
+            cfg.blocks.items[edge.from].is_return) continue;
         try preds.append(allocator, .{
             .block = edge.from,
             .via_true_branch = edge.kind == .branch_true,
@@ -33554,6 +33559,118 @@ test "analyzeCFGMemory ZA802 still fires when the guard covers one branch only (
         run.issues.items,
         "test_za802_onebranch.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA901 silent past a nested else-guard with a return arm (EPH-I0779)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `if (a)` return arm wires a phantom sequential edge into the
+    // outer merge but is unreachable there, so it must not vote in the
+    // guard meet. The `>= 1` guard form registers in extractGuardedVar
+    // but trips no textual backstop (hasBreakGuardOnPriorLines matches
+    // `== 0)` only), so the CFG meet alone carries this verdict.
+    const content =
+        \\fn dec_nested_else_guard(n: usize, a: bool) usize {
+        \\    var m = n;
+        \\    if (a) {
+        \\        return 0;
+        \\    } else {
+        \\        if (m >= 1) {
+        \\            sink(m);
+        \\        } else {
+        \\            return 0;
+        \\        }
+        \\    }
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za901_retguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_retguard.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA903 silent past a nested else-guard with a return arm (EPH-I0779)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same phantom predecessor as the ZA901 case, pinned through the
+    // array-length guard fact: `if (arr.len >= 1)` seeds `arr.len` into
+    // the else block's guard set, and the `>= 1` form trips no textual
+    // backstop (hasEarlyReturnLengthGuard matches `<`, `<=`, `== 0`,
+    // `== 1`), so the CFG meet alone carries this verdict.
+    const content =
+        \\fn idx_nested_else_guard(arr: []const u8, a: bool) u8 {
+        \\    if (a) {
+        \\        return 0;
+        \\    } else {
+        \\        if (arr.len >= 1) {
+        \\            sink(arr[0]);
+        \\        } else {
+        \\            return 0;
+        \\        }
+        \\    }
+        \\    return arr[arr.len - 1];
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za903_retguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_retguard.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA901 still fires when the guard covers one branch only (EPH-I0779)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The a-false path reaches the decrement with no m guard, so the
+    // meet must keep intersecting the real preds: skipping return preds
+    // must not widen the guarded set past what every reachable path
+    // proves.
+    const content =
+        \\fn one_branch_guard(n: usize, a: bool) usize {
+        \\    var m = n;
+        \\    if (a) {
+        \\        if (m >= 1) {
+        \\            sink(m);
+        \\        } else {
+        \\            return 0;
+        \\        }
+        \\    }
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_za901_onebranch.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_onebranch.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
     ) == 1);
 }
 

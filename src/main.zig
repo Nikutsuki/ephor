@@ -5636,8 +5636,9 @@ const VarFreeCtx = struct {
     in_defer: []const bool,
     in_errdefer: []const bool,
     /// Per-line markers (parallel to lines): true where the line sits inside
-    /// a loop payload-capture scope that rebinds var_name, so frees of the
-    /// name on that line release the capture, never the tracked binding.
+    /// a payload-capture scope that rebinds var_name or one of its aliases
+    /// (loop, if, switch prong, catch), so frees of the name on that line
+    /// release the capture, never the tracked binding.
     capture_shadowed: []const bool,
     aliases: *const std.StringHashMapUnmanaged([]const u8),
 };
@@ -5660,8 +5661,7 @@ const FreeScanCtx = struct {
 /// free of that name inside the body never frees the tracked binding twice
 /// (EPH-I0676). The adjacent-pipe form matches isBindingNameAt: canonical
 /// spacing writes bitwise-or as `a | b | c`. Name-based and scope-blind:
-/// the scope-bound consumer for loop captures is computeCaptureShadowedLines
-/// (EPH-I0748).
+/// the scope-bound consumer is computeCaptureShadowedLines (EPH-I0748).
 fn hasCaptureBinding(t: []const u8, var_name: []const u8) bool {
     var cls = LineClassifier.init(t);
     var s: usize = 0;
@@ -5676,23 +5676,149 @@ fn hasCaptureBinding(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
-/// Per-line capture-shadow map for one tracked var (EPH-I0748): true on every
-/// line inside the scope of a loop payload capture that rebinds var_name
-/// (`for (xs) |item| { ... }`). Within that region the name denotes the
-/// per-iteration element, so a free or rebind of the name there must not move
-/// the tracked alloc's state. The scope is CFG/brace-derived (loop_back edge
-/// to the header, loopBodyLineExtent for the body), never name-alone: nested
-/// loops each contribute their own extent, and the header line counts as
-/// inside the scope so a fused body (`for (xs) |item| free(item);`) is
-/// covered. Accepted bounds, mirrored from the EPH-I0676 machinery: a
-/// while-continue tail or an unbalanced/fused-single-line brace group yields
-/// no extent (the lines stay unshadowed, fail-open toward reporting), and
-/// non-loop captures (`if (opt) |item|`, switch prongs, `catch |e|`) are not
-/// mapped here. A multi-line condition header leaves the capture clause
-/// outside the derived header line, so the scope is not mapped (fail-open:
-/// the original false positive persists, no new false negative). A capture
-/// that binds an alias of var_name, not var_name itself, is likewise
-/// unmapped (EPH-I0781).
+/// Position just past the closing pipe of the first `|name|` payload capture
+/// on the line at or after `from`, or null. String- and comment-aware:
+/// occurrences inside a string literal or after `//` never bind. The
+/// adjacent-pipe form matches isBindingNameAt (canonical spacing writes
+/// bitwise-or as `a | b | c`), so multi-name captures (`|a, b|`) and pointer
+/// captures (`|*p|`) never match, same as hasCaptureBinding.
+fn captureEndAfter(
+    t: []const u8,
+    name: []const u8,
+    from: usize,
+    cls: *LineClassifier,
+) ?usize {
+    var s = from;
+    const code_len = stripLineComment(t).len;
+    while (mem.indexOf(u8, t[s..], name)) |rel| {
+        const pos = s + rel;
+        s = pos + name.len;
+        if (cls.isInsideString(pos)) continue;
+        // An occurrence past the quote-aware comment cut is comment text,
+        // not a binding (EPH-I0793).
+        if (pos >= code_len) return null;
+        const end_i = pos + name.len;
+        if (pos > 0 and t[pos - 1] == '|' and end_i < t.len and t[end_i] == '|')
+            return end_i + 1;
+    }
+    return null;
+}
+
+/// The line whose scan first returns the brace depth to zero after the `{`
+/// at (start_idx, open_col), or null when the braces never balance. Unlike
+/// braceGroupEndLine the close registers mid-line, so an `} else {` tail
+/// ends an if-capture's body at the else boundary instead of at the else's
+/// own close (the else body never enters the capture scope).
+fn captureCloseLine(
+    lines: []const []const u8,
+    start_idx: usize,
+    open_col: usize,
+) ?usize {
+    var depth: usize = 0;
+    var idx = start_idx;
+    while (idx < lines.len) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code = stripLineComment(t);
+        var mode: QuoteMode = .none;
+        var i: usize = if (idx == start_idx) open_col else 0;
+        while (i < code.len) : (i += 1) {
+            const c = code[i];
+            // Quote data never reaches the brace counter: a brace inside a
+            // string or char literal would corrupt the depth walk. The flat
+            // form keeps ZA302 nesting at 3 here (EPH-I0792).
+            i += scanQuoteStep(&mode, c) orelse 0;
+            if (mode != .none) continue;
+            if (types.isMultilineOpenerAt(code, i)) break;
+            if (c == '{') depth += 1;
+            if (c != '}' or depth == 0) continue;
+            depth -= 1;
+            if (depth == 0) return idx;
+        }
+    }
+    return null;
+}
+
+/// The textual line extent of the body belonging to the payload capture
+/// whose closing pipe sits at (cap_idx, after_col), or null when the extent
+/// cannot be bounded (fail-open toward reporting, mirroring
+/// loopBodyLineExtent). A braced body spans strictly between its brace
+/// lines, ending at the capture scope's own close (captureCloseLine). A
+/// brace-less body spans only its statement's line. A while-continue tail
+/// (`: (expr)`) is unhandled by design: null.
+fn captureBodyExtent(
+    lines: []const []const u8,
+    func_line: usize,
+    cap_idx: usize,
+    after_col: usize,
+) ?BodyExtent {
+    var idx = cap_idx;
+    while (idx < lines.len) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code = stripLineComment(t);
+        const start: usize = if (idx == cap_idx) @min(after_col, code.len) else 0;
+        const rest = mem.trimStart(u8, code[start..], " \t");
+        if (rest.len == 0) continue;
+        const base = code.len - rest.len;
+        if (rest[0] == ':') return null; // while/for continue expression
+        if (rest[0] != '{') return .{ .first = func_line + idx, .last = func_line + idx };
+        const close = captureCloseLine(lines, idx, base) orelse return null;
+        if (close <= idx) return null; // fused single-line brace group
+        return .{ .first = func_line + idx + 1, .last = func_line + close - 1 };
+    }
+    return null;
+}
+
+/// Mark every line inside the scope of a `|name|` payload capture found on
+/// any line of the function body: loop, if, switch-prong, and catch captures
+/// alike (EPH-I0780). Idempotent OR into the shadow map.
+fn markCaptureScopes(
+    ctx: *const AllocSafetyCtx,
+    name: []const u8,
+    shadowed: []bool,
+) void {
+    for (ctx.lines, 0..) |_, idx| {
+        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        var cls = LineClassifier.init(t);
+        var from: usize = 0;
+        while (captureEndAfter(t, name, from, &cls)) |after| {
+            from = after;
+            const extent = captureBodyExtent(ctx.lines, ctx.func_line, idx, after) orelse
+                continue;
+            if (extent.last < ctx.func_line) continue;
+            const last_idx = @min(extent.last - ctx.func_line, ctx.lines.len - 1);
+            @memset(shadowed[idx .. @max(idx, last_idx) + 1], true);
+        }
+    }
+}
+
+/// Per-line capture-shadow map for one tracked var: true on every line
+/// inside the scope of a payload capture that rebinds var_name or one of its
+/// data-flow aliases (`for (xs) |item|`, `if (opt) |item|`, a switch-prong
+/// `.buf => |item|`, `catch |item|`). Within that region the name denotes
+/// the per-iteration element or the payload, so a free or rebind of the name
+/// there must not move the tracked alloc's state. Two passes build the map:
+/// loop scopes come from the CFG (loop_back edge to the header,
+/// loopBodyLineExtent for the body — EPH-I0748), and every capture form,
+/// loop or not, also comes from the capture text (captureEndAfter finds the
+/// binding, captureBodyExtent bounds the body — EPH-I0780). The textual pass
+/// also binds alias names from the data-flow alias map, so an alias-named
+/// capture scope is masked as well (EPH-I0781). The alias itself is
+/// assignment-derived, never a hardcoded name. The scope is brace-derived,
+/// never name-alone: nested scopes each contribute their own extent, and the
+/// capture line counts as inside the scope so a fused body
+/// (`for (xs) |item| free(item);`) is covered. Accepted bounds, mirrored
+/// from the EPH-I0676 machinery: a while-continue tail or an
+/// unbalanced/fused-single-line brace group yields no extent (the lines stay
+/// unshadowed, fail-open toward reporting). A multi-line condition header
+/// maps only from the capture line down. The mask is per line, not per
+/// binding, so a free of the root name inside an alias-capture scope (or of
+/// an alias inside a root-capture scope) is masked with the line. A
+/// brace-less if with a same-line `else` masks the whole line. A capture
+/// whose payload aliases the tracked alloc reads as freeing the payload, not
+/// the alloc — the EPH-I0748 shadow contract.
 fn computeCaptureShadowedLines(
     allocator: Allocator,
     ctx: *const AllocSafetyCtx,
@@ -5716,6 +5842,15 @@ fn computeCaptureShadowedLines(
         const last_idx = @min(extent.last - ctx.func_line, ctx.lines.len - 1);
         @memset(shadowed[hidx .. @max(hidx, last_idx) + 1], true);
     }
+    // Non-loop captures have no loop_back edge: their scopes come from the
+    // capture text (EPH-I0780). Loop captures re-mark here. The OR is
+    // idempotent. Aliases extend the name set for EPH-I0781.
+    markCaptureScopes(ctx, var_name, shadowed);
+    var alias_it = ctx.aliases.iterator();
+    while (alias_it.next()) |entry| {
+        if (!mem.eql(u8, entry.value_ptr.*, var_name)) continue;
+        markCaptureScopes(ctx, entry.key_ptr.*, shadowed);
+    }
     return shadowed;
 }
 
@@ -5728,8 +5863,9 @@ fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResul
         const t = mem.trim(u8, scan.lines[idx], " \t\r");
         if (shouldSkipForFreeAnalysis(t, idx, scan.in_defer, scan.in_errdefer))
             continue;
-        // A free/rebind of the name inside a loop capture's scope releases
-        // the per-iteration element, not the tracked binding (EPH-I0748).
+        // A free/rebind of the name inside a capture's scope releases the
+        // per-iteration element or payload, not the tracked binding
+        // (EPH-I0748, EPH-I0780).
         if (scan.capture_shadowed[idx]) continue;
         if (hasRealFreePattern(t) and
             isDirectFreeOfVarOrAlias(t, scan.var_name, scan.aliases))
@@ -5953,8 +6089,9 @@ fn checkSameBlockFree(
         const ct = mem.trim(u8, scan.lines[ci], " \t\r");
         if (shouldSkipForFreeAnalysis(ct, ci, scan.in_defer, scan.in_errdefer))
             continue;
-        // A capture-scope free rebinds the name per iteration: it never
-        // frees the tracked binding, so it sets no freed state (EPH-I0748).
+        // A capture-scope free rebinds the name to the element or payload:
+        // it never frees the tracked binding, so it sets no freed state
+        // (EPH-I0748, EPH-I0780).
         if (scan.capture_shadowed[ci]) continue;
         if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(ct, scan.var_name, scan.aliases)) {
             freed = true;
@@ -6219,8 +6356,9 @@ fn detectDoubleFree(ctx: *const FreeScanCtx) !void {
     for (ctx.scan.lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
-        // A free inside a loop capture's scope releases the capture, never
-        // the tracked binding: it is not a second-free candidate (EPH-I0748).
+        // A free inside a capture's scope releases the capture, never the
+        // tracked binding: it is not a second-free candidate (EPH-I0748,
+        // EPH-I0780).
         if (ctx.scan.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
         if (!isDirectFreeOfVarOrAlias(t, ctx.scan.var_name, ctx.scan.aliases)) continue;
@@ -6250,7 +6388,7 @@ const DeferPairCtx = struct {
     var_name: []const u8,
     in_defer: []const bool,
     in_errdefer: []const bool,
-    /// Per-line loop-capture shadow markers (see VarFreeCtx.capture_shadowed).
+    /// Per-line capture-shadow markers (see VarFreeCtx.capture_shadowed).
     capture_shadowed: []const bool,
     aliases: *const std.StringHashMapUnmanaged([]const u8),
 };
@@ -6272,8 +6410,8 @@ fn collectDeferFrees(
         if (isCommentOrMultilineString(t)) continue;
         if (ctx.in_errdefer[idx] or mem.startsWith(u8, t, "errdefer ")) continue;
         if (!ctx.in_defer[idx] and !mem.startsWith(u8, t, "defer ")) continue;
-        // A defer inside a loop capture's scope frees the capture at scope
-        // exit each iteration, not the tracked binding (EPH-I0748).
+        // A defer inside a capture's scope frees the capture at scope exit,
+        // not the tracked binding (EPH-I0748, EPH-I0780).
         if (ctx.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
         if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
@@ -6390,8 +6528,8 @@ fn detectDeferDoubleFree(
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
         if (ctx.in_defer[idx] or ctx.in_errdefer[idx]) continue;
-        // A direct free inside a loop capture's scope releases the capture,
-        // so it must not pair with a defer-registered free (EPH-I0748).
+        // A direct free inside a capture's scope releases the capture, so it
+        // must not pair with a defer-registered free (EPH-I0748, EPH-I0780).
         if (ctx.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
         if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
@@ -31048,6 +31186,269 @@ test "ZA106: real double free fires despite a later capture loop (EPH-I0748)" {
 
     const file = "test_capture_real_double.zig";
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: free before an if-capture scope does not pair with the capture free (EPH-I0780)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The if-capture |item| rebinds the name for the body scope, so the body
+    // free on 5 releases the optional payload, never the outer item: the pair
+    // (outer free on 3, capture free on 5) is not a double-free.
+    const content =
+        \\fn free_elements(allocator: std.mem.Allocator, opt: ?[]u8) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    if (opt) |item| {
+        \\        allocator.free(item);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_if_capture_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_if_capture_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: real double free fires despite a later if-capture scope (EPH-I0780)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The same-name if-capture must not mask a genuine double free of the
+    // tracked alloc: lines 3-4 free the outer item twice (report), the body
+    // free on 6 frees the payload capture (silent).
+    const content =
+        \\fn free_elements(allocator: std.mem.Allocator, opt: ?[]u8) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    allocator.free(item);
+        \\    if (opt) |item| {
+        \\        allocator.free(item);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_if_capture_real_double.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_if_capture_real_double.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: free before a switch-prong capture scope stays silent (EPH-I0780)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The prong capture |item| binds the union payload for the prong body:
+    // the free on 6 releases the payload, never the outer item.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, p: union(enum) { buf: []u8, empty }) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    switch (p) {
+        \\        .buf => |item| {
+        \\            allocator.free(item);
+        \\        },
+        \\        .empty => {},
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_switch_capture_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_switch_capture_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The catch capture |item| rebinds the name for the handler block, so a
+    // free of the name there cannot pair with the outer free on 3. Ephor is
+    // type-blind on the payload: the contract under test is the scope mask.
+    const content =
+        \\fn fetch(allocator: std.mem.Allocator, input: []const u8) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    fetchBuf(input) catch |item| {
+        \\        allocator.free(item);
+        \\    };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_catch_capture_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_catch_capture_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: an alias-named capture loop does not free the tracked root (EPH-I0781)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The loop captures the alias name tmp, not the tracked root: inside the
+    // body tmp denotes the per-iteration element, so the body free on 7 never
+    // frees the outer item and cannot pair with the free on 4.
+    const content =
+        \\fn f(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    const tmp = item;
+        \\    allocator.free(item);
+        \\    const items = try allocator.alloc([]u8, 4);
+        \\    for (items) |tmp| {
+        \\        allocator.free(tmp);
+        \\    }
+        \\    allocator.free(items);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_alias_capture_loop.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_alias_capture_loop.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: real double free via alias fires despite a later alias-capture loop (EPH-I0781)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The alias-capture loop must not mask a genuine double free: freeing the
+    // alias tmp on 5 releases the root item freed on 4 (report), while the
+    // body free on 8 frees the per-iteration capture (silent).
+    const content =
+        \\fn f(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    const tmp = item;
+        \\    allocator.free(item);
+        \\    allocator.free(tmp);
+        \\    const items = try allocator.alloc([]u8, 4);
+        \\    for (items) |tmp| {
+        \\        allocator.free(tmp);
+        \\    }
+        \\    allocator.free(items);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_alias_capture_real_double.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_alias_capture_real_double.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: brace in a string inside an if-capture body does not extend the mask (EPH-I0792)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The "{" on 4 is string data, not a brace. A close scan that counts
+    // it runs the depth one high: the mask then reaches the function close
+    // and silences the real double free on 7-8 (EPH-I0792).
+    const content =
+        \\fn f(allocator: std.mem.Allocator, opt: ?[]u8) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    if (opt) |item| {
+        \\        const s = "{";
+        \\        allocator.free(item);
+        \\    }
+        \\    allocator.free(item);
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_if_capture_quote_open.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_if_capture_quote_open.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: brace in a string inside a loop-capture body does not extend the mask (EPH-I0792)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The loop-capture form of the same pin (I0748 non-regression). The
+    // textual extent ORs into the CFG loop mask, so counting the "{" on 5
+    // there also silences the real double free on 8-9 (EPH-I0792).
+    const content =
+        \\fn f(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    const items = try allocator.alloc([]u8, 4);
+        \\    for (items) |item| {
+        \\        const s = "{";
+        \\        allocator.free(item);
+        \\    }
+        \\    allocator.free(item);
+        \\    allocator.free(item);
+        \\    allocator.free(items);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_loop_capture_quote_open.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_loop_capture_quote_open.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: close brace in a string inside an if-capture body does not truncate the mask (EPH-I0792)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The "}" on 4 is string data, not a brace. Counting it closes the
+    // capture scope early, so the body free on 5 pairs with the outer free
+    // on 7 for a false double-free report (EPH-I0792).
+    const content =
+        \\fn f(allocator: std.mem.Allocator, opt: ?[]u8) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    if (opt) |item| {
+        \\        const s = "}";
+        \\        allocator.free(item);
+        \\    }
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_if_capture_quote_close.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_if_capture_quote_close.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: a // inside a string before a catch capture does not defeat the binding (EPH-I0793)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The "//" on 4 sits inside a string literal, so it opens no comment.
+    // A raw "//" scan misses the |item| binding, and the payload free on 5
+    // then pairs with the outer free on 3 (EPH-I0793).
+    const content =
+        \\fn fetch(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    fetchBuf("https://x.example") catch |item| {
+        \\        allocator.free(item);
+        \\    };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_catch_capture_url.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_catch_capture_url.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
 }
 
 test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {

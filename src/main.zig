@@ -15670,7 +15670,9 @@ fn countIdentInCode(code: []const u8, name: []const u8) usize {
 /// `\\` multiline-string lines, drops everything after a trailing `//`
 /// comment, and ignores string-literal occurrences. The declaring line
 /// contributes one less than its raw count — the declaration itself
-/// (and, for imports, the filename string) is not a use.
+/// (and, for imports, the filename string) is not a use. analyzeUnused
+/// queries go through IdentUseIndex (EPH-I0762). This direct scan remains
+/// as the fallback for non-identifier names and as the test oracle.
 fn countRealIdentUses(content: []const u8, name: []const u8, decl_line: usize) usize {
     var count: usize = 0;
     var line_num: usize = 1;
@@ -15686,6 +15688,117 @@ fn countRealIdentUses(content: []const u8, name: []const u8, decl_line: usize) u
     return count;
 }
 
+/// True when name is a non-empty run of identifier bytes — the only shape
+/// IdentUseIndex can answer for. extractVarName splits import aliases on a
+/// wider byte set than identifier bytes, so an alias from text that is not
+/// valid Zig (a `-`, a quote) can carry non-identifier bytes.
+fn isIndexableName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!isIdent(c)) return false;
+    }
+    return true;
+}
+
+/// Key order for the occurrence-line binary search in IdentUseIndex.
+fn orderLine(key: usize, item: usize) std.math.Order {
+    return std.math.order(key, item);
+}
+
+/// Single-pass index of identifier occurrences in one file's content
+/// (EPH-I0762). analyzeUnused once ran countRealIdentUses per candidate
+/// declaration. Each call rescanned the whole file, so a file with d
+/// candidates and n lines cost O(d * n) — ~52 s of user time on this
+/// repo's own src/. The index walks the content once with the same
+/// masking (leading `//` and `\\` lines skipped, trailing `//` comments
+/// dropped, string literals and `\\` tails masked, word-boundary runs
+/// only) and answers each per-declaration count from the recorded lines.
+const IdentUseIndex = struct {
+    /// Distinct identifier -> ascending lines that hold a real occurrence.
+    /// One entry per occurrence, so the entry count equals the raw
+    /// countIdentInCode total summed over lines.
+    map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
+    arena: std.heap.ArenaAllocator,
+    /// Kept for the direct-scan fallback in countUses.
+    content: []const u8,
+
+    /// Empty index over content. Call build() to record the occurrences.
+    fn init(allocator: Allocator, content: []const u8) IdentUseIndex {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .content = content,
+        };
+    }
+
+    /// Wholesale teardown: the arena reclaims the map storage, the duped
+    /// keys, and every occurrence list in one step.
+    fn deinit(self: *IdentUseIndex) void {
+        self.arena.deinit();
+    }
+
+    /// Index every real identifier occurrence in the content, one pass.
+    /// Mirrors countRealIdentUses's per-line steps verbatim so the recorded
+    /// occurrences match the per-name scan exactly.
+    fn build(self: *IdentUseIndex) !void {
+        var line_num: usize = 1;
+        var lines = mem.splitScalar(u8, self.content, '\n');
+        while (lines.next()) |line| {
+            defer line_num += 1;
+            const t = mem.trim(u8, line, " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            const code_end = findCommentStart(line) orelse line.len;
+            try self.scanCode(&self.arena, line[0..code_end], line_num);
+        }
+    }
+
+    /// Tokenize one comment-free code slice into maximal identifier runs
+    /// and record each run whose start is not inside a string literal.
+    /// countIdentInCode counts a name exactly at the starts of maximal
+    /// runs equal to it (boundaries fail everywhere else), so recording
+    /// runs reproduces its counts. The LineClassifier matches its walk,
+    /// queried at ascending run starts. All allocations are arena-owned
+    /// and reclaimed wholesale by deinit.
+    fn scanCode(
+        self: *IdentUseIndex,
+        arena: *std.heap.ArenaAllocator,
+        code: []const u8,
+        line_num: usize,
+    ) !void {
+        const alloc = arena.allocator();
+        var cls = LineClassifier.init(code);
+        var i: usize = 0;
+        while (i < code.len) {
+            if (!isIdent(code[i])) {
+                i += 1;
+                continue;
+            }
+            const start = i;
+            while (i < code.len and isIdent(code[i])) i += 1;
+            if (cls.isInsideString(start)) continue;
+            // Dupe before getOrPut: a committed slot always holds an owned
+            // key. A redundant dupe for an existing key stays unreachable
+            // arena memory, reclaimed at deinit.
+            const owned = try alloc.dupe(u8, code[start..i]);
+            const gop = try self.map.getOrPut(alloc, owned);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(alloc, line_num);
+        }
+    }
+
+    /// Count real uses of name with countRealIdentUses's declaring-line
+    /// adjustment: the raw occurrence total, minus one when the declaring
+    /// line holds at least one occurrence (the declaration itself is not a
+    /// use). Non-identifier names fall back to the direct scan.
+    fn countUses(self: *const IdentUseIndex, name: []const u8, decl_line: usize) usize {
+        if (!isIndexableName(name)) return countRealIdentUses(self.content, name, decl_line);
+        const occs = self.map.get(name) orelse return 0;
+        var total = occs.items.len;
+        if (std.sort.binarySearch(usize, occs.items, decl_line, orderLine) != null)
+            total -= 1;
+        return total;
+    }
+};
+
 /// Extract variable name for unused detection (filters out _ prefix and short names)
 fn extractUnusedDeclName(t: []const u8, is_const: bool) ?[]const u8 {
     const prefix_len: usize = if (is_const) 6 else 4;
@@ -15700,12 +15813,13 @@ fn extractUnusedDeclName(t: []const u8, is_const: bool) ?[]const u8 {
 }
 
 /// Shared sink + file context for unused checks (ZA401-ZA403): the issue
-/// list with its allocator, plus the scanned file's path and full content.
+/// list with its allocator, plus the scanned file's path and occurrence
+/// index (built once per file, EPH-I0762).
 const UnusedFileCtx = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
     path: []const u8,
-    content: []const u8,
+    index: *const IdentUseIndex,
 };
 
 /// Check a single import for usage (ZA401)
@@ -15713,7 +15827,7 @@ fn checkUnusedImport(ctx: UnusedFileCtx, imp: ImportInfo) !void {
     if (imp.name.len > 0 and imp.name[0] == '_') return;
     // Skip public re-exports - they're intentional library API
     if (imp.is_pub) return;
-    if (countRealIdentUses(ctx.content, imp.name, imp.line) > 0) return;
+    if (ctx.index.countUses(imp.name, imp.line) > 0) return;
     const msg = try std.fmt.allocPrint(
         ctx.allocator,
         "unused import '{s}'",
@@ -15742,7 +15856,7 @@ fn checkUnusedDecl(ctx: UnusedFileCtx, t: []const u8, line_num: usize) !void {
     const is_var = mem.startsWith(u8, t, "var ");
     if (!is_const and !is_var) return;
     const name = extractUnusedDeclName(t, is_const) orelse return;
-    if (countRealIdentUses(ctx.content, name, line_num) > 0) return;
+    if (ctx.index.countUses(name, line_num) > 0) return;
     const rule = if (is_const) RULE_UNUSED_CONST else RULE_UNUSED_VAR;
     const kind = if (is_const) "const" else "var";
     const msg = try std.fmt.allocPrint(
@@ -15773,11 +15887,14 @@ fn analyzeUnused(
         const a = entry.value_ptr.*;
         // Skip auto-generated C import/translation files (many false positives)
         if (isCImportFile(a.path, a.content)) continue;
+        var index = IdentUseIndex.init(allocator, a.content);
+        defer index.deinit();
+        try index.build();
         const ctx: UnusedFileCtx = .{
             .issues = &issues,
             .allocator = allocator,
             .path = a.path,
-            .content = a.content,
+            .index = &index,
         };
         for (a.imports.items) |imp| {
             try checkUnusedImport(ctx, imp);
@@ -28097,6 +28214,95 @@ pub fn main(init: std.process.Init) !void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Shared fixture for the IdentUseIndex tests: one line per masking shape
+/// countRealIdentUses honors (string literals, escaped quotes, char
+/// literals, `\\` bodies and mid-line tails, full and trailing comments,
+/// word-boundary neighbors, a double occurrence on the declaring line).
+const ident_use_test_content =
+    "const a1 = 1;\n" ++ // 1
+    "const a2 = a1 + a1;\n" ++ // 2
+    "const a3 = a2;\n" ++ // 3
+    "const s1 = \"a3 in string\";\n" ++ // 4
+    "const c1 = 'a3';\n" ++ // 5
+    "const m1 =\n" ++ // 6
+    "    \\\\a3 multiline body\n" ++ // 7
+    ";\n" ++ // 8
+    "const t1 = a3; // trailing a1\n" ++ // 9
+    "const dbl = dbl;\n" ++ // 10
+    "const esc = \"a\\\"tail here\";\n" ++ // 11
+    "const tail = 1;\n" ++ // 12
+    "const fo = 1;\n" ++ // 13
+    "const foo = fo;\n" ++ // 14
+    "const food = fo;\n" ++ // 15
+    "const pre = 1; const mid = pre;\n" ++ // 16
+    "const solo = 1;\n" ++ // 17
+    "// solo full-line comment\n" ++ // 18
+    "const ml2 = 1;\n" ++ // 19
+    "f(); \\\\ ml2 tail masked\n"; // 20
+
+const ident_use_test_names = [_][]const u8{
+    "a1",  "a2",    "a3",     "s1",      "c1",   "m1",  "t1",  "dbl",
+    "esc", "tail",  "fo",     "foo",     "food", "pre", "mid", "solo",
+    "ml2", "const", "string", "missing",
+};
+
+test "IdentUseIndex matches countRealIdentUses across masked shapes" {
+    var index = IdentUseIndex.init(std.testing.allocator, ident_use_test_content);
+    defer index.deinit();
+    try index.build();
+    var decl_line: usize = 1;
+    while (decl_line <= 20) : (decl_line += 1) {
+        for (ident_use_test_names) |name| {
+            try std.testing.expectEqual(
+                countRealIdentUses(ident_use_test_content, name, decl_line),
+                index.countUses(name, decl_line),
+            );
+        }
+    }
+}
+
+test "IdentUseIndex exact counts on masking edge shapes" {
+    var index = IdentUseIndex.init(std.testing.allocator, ident_use_test_content);
+    defer index.deinit();
+    try index.build();
+    // A second occurrence on the declaring line counts as a use.
+    try std.testing.expectEqual(@as(usize, 1), index.countUses("dbl", 10));
+    // A char literal is not masked: 'a3' counts as a use of a3.
+    try std.testing.expectEqual(@as(usize, 2), index.countUses("a3", 3));
+    // Occurrences inside string literals stay masked, escapes included.
+    try std.testing.expectEqual(@as(usize, 0), index.countUses("tail", 12));
+    try std.testing.expectEqual(@as(usize, 0), index.countUses("s1", 4));
+    // A `\\` body line and a mid-line `\\` tail are string data.
+    try std.testing.expectEqual(@as(usize, 0), index.countUses("m1", 6));
+    try std.testing.expectEqual(@as(usize, 0), index.countUses("ml2", 19));
+    // A full-line comment mention is not a use.
+    try std.testing.expectEqual(@as(usize, 0), index.countUses("solo", 17));
+    // A trailing-comment mention is not a use, and a declaring line with
+    // no occurrence of the name subtracts nothing (a1 raw total is 3).
+    try std.testing.expectEqual(@as(usize, 3), index.countUses("a1", 9));
+    // Word boundaries: food is not a use of foo (raw total is the decl).
+    try std.testing.expectEqual(@as(usize, 1), index.countUses("foo", 1));
+    // The index answers for any name, even one its line never offered as
+    // a decl candidate (mid is the second const on line 16).
+    try std.testing.expectEqual(@as(usize, 0), index.countUses("mid", 16));
+    try std.testing.expectEqual(@as(usize, 1), index.countUses("mid", 1));
+    // Unknown names have no occurrences.
+    try std.testing.expectEqual(@as(usize, 0), index.countUses("missing", 1));
+}
+
+test "IdentUseIndex falls back to the direct scan for non-identifier names" {
+    const content = "const ab = 1;\ncall(a-b);\n";
+    var index = IdentUseIndex.init(std.testing.allocator, content);
+    defer index.deinit();
+    try index.build();
+    // "a-b" is not an identifier run, so the index cannot answer for it.
+    // The fallback keeps the direct scan's count.
+    try std.testing.expectEqual(countRealIdentUses(content, "a-b", 1), index.countUses("a-b", 1));
+    try std.testing.expectEqual(@as(usize, 1), index.countUses("a-b", 1));
+    // The empty name takes the same fallback.
+    try std.testing.expectEqual(countRealIdentUses(content, "", 2), index.countUses("", 2));
+}
 
 test "countOccurrences" {
     const input = "pub fn a() pub fn b() pub fn c()";

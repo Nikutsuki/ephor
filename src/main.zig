@@ -3288,6 +3288,28 @@ fn genLoopFill(
     first_effect[bid] = minAssignEffect(first_effect[bid], header_effect);
 }
 
+/// True when a `for` line's braced body opens and closes within the
+/// line's code portion: a one-line loop. The quote-aware balance guards
+/// the multi-line shape whose trailing `}` leaves the body open
+/// (`for (xs) |x| { if (y) { foo(); }`).
+fn hasOnelineLoopClose(t: []const u8) bool {
+    const code = mem.trimEnd(u8, stripLineComment(t), " \t\r;");
+    if (code.len == 0 or code[code.len - 1] != '}') return false;
+    var depth: i32 = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < code.len) : (i += 1) {
+        const c = code[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') depth += 1;
+        if (c == '}') depth -= 1;
+    }
+    return depth == 0;
+}
+
 /// Compute gen set: which blocks assign a variable (includes loop fill patterns)
 /// State for tracking for-loop scope during gen-set computation
 const ForLoopTracker = struct {
@@ -3309,7 +3331,7 @@ const ForLoopTracker = struct {
         }
     }
 
-    fn checkLoopEnd(self: *ForLoopTracker, t: []const u8) void {
+    fn checkLoopEnd(self: *ForLoopTracker, t: []const u8, idx: usize) void {
         if (!self.in_loop or mem.indexOf(u8, t, "}") == null) return;
         // String and char content carries no braces: a '}' inside a
         // literal must not end the loop early (EPH-I0107). A `\\` opener's
@@ -3327,7 +3349,17 @@ const ForLoopTracker = struct {
             if (c == '{') brace_count += 1;
             if (c == '}') brace_count -= 1;
         }
-        if (brace_count < 0) self.in_loop = false;
+        if (brace_count < 0) {
+            self.in_loop = false;
+            return;
+        }
+        // A one-line loop's braces balance on its start line, so the
+        // net-negative close above never fires for it. Close at the end
+        // of the start line instead: without it, a post-loop fill on a
+        // later line reads as loop-carried and genLoopFill covers the
+        // header line from column 0, masking an element read inside the
+        // loop (EPH-I0785).
+        if (idx == self.start_idx and hasOnelineLoopClose(t)) self.in_loop = false;
     }
 
     fn checkIndexedAssign(
@@ -3483,7 +3515,7 @@ fn computeGenSetForVar(
         const t = mem.trim(u8, line, " \t\r");
         tracker.checkForStart(t, ctx.cfg, actual_line, idx);
         tracker.checkIndexedAssign(t, var_name, gen, first_effect);
-        tracker.checkLoopEnd(t);
+        tracker.checkLoopEnd(t, idx);
 
         // isAssignmentTarget slices at pos without verifying the name is
         // there, so the caller must establish it (with a word boundary).
@@ -3908,7 +3940,11 @@ fn isIndirectlyInitialized(
         const opens_for = mem.startsWith(u8, t, "for ") or
             mem.startsWith(u8, t, "for(");
         if (opens_for) {
-            in_for_loop += countChar(t, '{');
+            // A one-line loop completes on its own line and carries no
+            // depth into later lines: without the guard, a post-loop fill
+            // reads as loop-carried and masks a genuine read inside the
+            // loop (EPH-I0785).
+            if (!hasOnelineLoopClose(t)) in_for_loop += countChar(t, '{');
             continue;
         }
         if (in_for_loop == 0) continue;
@@ -36068,11 +36104,35 @@ test "ForLoopTracker.checkLoopEnd ignores braces in a multiline opener tail (EPH
     // Target text: const s = \\ } — the tail `}` is string data and must
     // not close the loop.
     var tracker: ForLoopTracker = .{ .in_loop = true };
-    tracker.checkLoopEnd("const s = \\\\ }");
+    tracker.checkLoopEnd("const s = \\\\ }", 0);
     try std.testing.expect(tracker.in_loop);
     // A real net-negative brace line still ends the loop.
-    tracker.checkLoopEnd("}");
+    tracker.checkLoopEnd("}", 0);
     try std.testing.expect(!tracker.in_loop);
+}
+
+test "hasOnelineLoopClose classifies one-line loop shapes (EPH-I0785)" {
+    // The probe line: the braces balance within the code portion.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| { sum +%= buf[x]; }"));
+    // A trailing comment does not reopen the close.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| { foo(); } // done"));
+    // A stray semicolon after the body still closes on the line.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| { foo(); };"));
+    // A brace inside a string literal is data, not the body close.
+    try std.testing.expect(hasOnelineLoopClose("for (xs) |x| { s = \"}\"; }"));
+    // Multi-line header: the body brace stays open.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| {"));
+    // A comment hides the real close: the body continues on later lines.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| { foo(); // }"));
+    // A nested trailing close still leaves the body open.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| { if (y) { foo(); }"));
+    // A header anonymous struct with a brace-less body on later lines.
+    try std.testing.expect(!hasOnelineLoopClose("for (o.{ 1, 2 }) |x|"));
+    // A brace-less body holds no code `}`: the tracker keeps the
+    // historical open-until-net-negative behavior.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| foo();"));
+    // A net-negative line belongs to the general close path, not this one.
+    try std.testing.expect(!hasOnelineLoopClose("for (xs) |x| { foo(); } }"));
 }
 
 test "computeBraceDepth ignores braces in a multiline opener tail (EPH-I0751)" {
@@ -39614,6 +39674,84 @@ test "ZA607: one-line loop read before same-line fill stays silent (EPH-I0772)" 
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_i0772_mixed.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: post-loop fill does not mask a one-line loop element read (EPH-I0785)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The one-line loop's braces balance on the header line, so the
+    // pre-fix tracker never closed: `buf[0] = 1` read as loop-carried
+    // and genLoopFill covered the header line from column 0, masking the
+    // element read inside the loop.
+    const content =
+        \\fn oneLineLoopReadThenLaterFill(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    var sum: u8 = 0;
+        \\    for (xs) |x| { sum +%= buf[x]; }
+        \\    buf[0] = 1;
+        \\    return sum;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0785_afterfill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0785_afterfill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line loop fill still covers a post-loop read (EPH-I0785)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The same-line `buf[x] = 1` is a genuine fill. checkIndexedAssign
+    // runs before the end-of-line close, so genLoopFill still covers the
+    // header block and the read after the loop stays silent.
+    const content =
+        \\fn oneLineLoopFillThenLaterRead(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| { buf[x] = 1; }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0785_fillread.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0785_fillread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line loop fill still covers a post-loop read (EPH-I0785)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The balanced-close rule fires only on the tracker's start line. A
+    // multi-line header (`for (xs) |x| {`) is not balanced, so the loop
+    // still closes on its `}` line and the in-body fill stays
+    // loop-carried.
+    const content =
+        \\fn multiLineLoopFillThenLaterRead(xs: []const u8) u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    for (xs) |x| {
+        \\        buf[x] = 1;
+        \\    }
+        \\    return buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "da_i0785_multiline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0785_multiline.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

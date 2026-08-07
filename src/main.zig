@@ -9821,7 +9821,9 @@ fn extractCallName(content: []const u8, paren_pos: usize) ?CallName {
 /// Filter out candidates that cannot be plain function calls receiving a
 /// no-free allocator: method calls, type constructors, keywords, fn defs.
 fn isPlainCallName(content: []const u8, fn_start: usize, func_name: []const u8) bool {
-    if (fn_start > 0 and content[fn_start - 1] == '.') return false;
+    // A spaced dot (`foo . bar(`) is still a method call: the guard must
+    // skip whitespace or the receiver is masked (EPH-I0804).
+    if (hasLeftDot(content, fn_start)) return false;
     if (func_name[0] >= 'A' and func_name[0] <= 'Z') return false;
     if (isCallKeyword(func_name)) return false;
     if (fn_start >= 3 and mem.eql(u8, content[fn_start - 3 .. fn_start], "fn ")) return false;
@@ -10937,10 +10939,19 @@ fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
 }
 
 /// Look back over a dotted ident chain for a leading '&' (&Struct.var_name).
+/// Space and tab between chain tokens are transparent (`&opts . buf`,
+/// EPH-I0805): the fill verdict must not depend on fmt spacing. The walk
+/// stops at the first non-chain byte and checks it for '&', the same
+/// boundary as the immediate-byte scan.
 fn hasAmpBeforeChain(t: []const u8, i: usize) bool {
-    var j: usize = i - 2;
-    while (j > 0 and (isIdent(t[j]) or t[j] == '.')) : (j -= 1) {}
-    return j < t.len and t[j] == '&';
+    var j = i;
+    while (j > 0) {
+        j -= 1;
+        const c = t[j];
+        if (c == ' ' or c == '\t' or c == '.' or isIdent(c)) continue;
+        return c == '&';
+    }
+    return t[0] == '&';
 }
 
 /// Scan for `&var_name` anywhere in the line (pointer-to-buffer fills).
@@ -11425,10 +11436,9 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         if (mem.indexOf(u8, t[0..i], "//") != null) continue;
 
         // Pattern 1: &var_name or &Struct.var_name, with any spacing
-        // around the dot (`&opts. buf`, EPH-I0796). hasAmpBeforeChain
-        // walks the chain on immediate bytes, so a space before the dot
-        // (`&opts . buf`) stays uncovered — a disclosed residual zig fmt
-        // never produces.
+        // around the dot (`&opts. buf`, EPH-I0796). The chain walk treats
+        // inter-token whitespace as transparent, so a space before the dot
+        // (`&opts . buf`) keeps the fill verdict (EPH-I0805).
         if (i > 0 and t[i - 1] == '&') return true;
         if (i > 1 and hasLeftDot(t, i) and hasAmpBeforeChain(t, i)) return true;
 
@@ -42167,6 +42177,37 @@ test "hasDirectFill accepts a whitespace-spaced dot chain pointer (EPH-I0796)" {
     try std.testing.expect(hasDirectFill("fill(&opts.buf);", "buf"));
     try std.testing.expect(hasDirectFill("fill(&opts. buf);", "buf"));
     try std.testing.expect(!hasDirectFill("use(buf);", "buf"));
+}
+
+test "isPlainCallName rejects whitespace-spaced dot method calls (EPH-I0804)" {
+    // `foo . bar(` is a method call through a spaced dot: the immediate-
+    // byte guard read content[fn_start - 1], so the space masked the
+    // receiver and the call read as plain (EPH-I0804).
+    try std.testing.expect(!isPlainCallName("foo . bar(", 6, "bar"));
+    try std.testing.expect(!isPlainCallName("foo .\tbar(", 6, "bar"));
+    try std.testing.expect(!isPlainCallName("foo.bar(", 4, "bar"));
+    try std.testing.expect(isPlainCallName("plain(", 0, "plain"));
+}
+
+test "hasAmpBeforeChain reaches the amp across spaced chain dots (EPH-I0805)" {
+    // `&opts . buf` is a pointer to opts's field: the walk read immediate
+    // bytes only, so the space before the dot broke the chain and the
+    // fill pointer evaded Pattern 1 (EPH-I0805).
+    try std.testing.expect(hasAmpBeforeChain("&opts . buf", 8));
+    try std.testing.expect(hasAmpBeforeChain("&opts .\tbuf", 8));
+    try std.testing.expect(hasAmpBeforeChain("&opts. buf", 7));
+    try std.testing.expect(hasAmpBeforeChain("&opts.buf", 6));
+    try std.testing.expect(!hasAmpBeforeChain("opts . buf", 8));
+    try std.testing.expect(!hasAmpBeforeChain("call(&x, opts . buf)", 16));
+}
+
+test "hasDirectFill accepts a spaced-dot chain pointer with space before the dot (EPH-I0805)" {
+    // `&opts . buf` fills through the same spaced-dot chain as the
+    // EPH-I0796 forms: Pattern 1 must not depend on where the space sits.
+    try std.testing.expect(hasDirectFill("fill(&opts . buf);", "buf"));
+    try std.testing.expect(hasDirectFill("fill(&opts. buf);", "buf"));
+    try std.testing.expect(hasDirectFill("fill(&opts.buf);", "buf"));
+    try std.testing.expect(!hasDirectFill("use(opts . buf);", "buf"));
 }
 
 test "isStructFieldPattern accepts whitespace-spaced dot fields (EPH-I0796)" {

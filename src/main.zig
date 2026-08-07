@@ -6001,9 +6001,9 @@ fn hasElseBranchMarker(t: []const u8) bool {
 }
 
 /// True when the line carries an else/orelse arm separator: the arms the
-/// marker divides never execute together. Kept indent-blind — only the
-/// `=>` clause of hasExclusiveBranchBetween went indent-aware (EPH-I0791).
-/// A nested else marker between two dominating frees stays an accepted FN.
+/// marker divides never execute together. Per-line classifier only. The
+/// caller decides whether the marker sits shallow enough to separate the
+/// pair (EPH-I0791 for `=>`, EPH-I0806 for else/orelse).
 fn hasElseOrOrelseMarker(t: []const u8) bool {
     if (mem.indexOf(u8, t, "} orelse {") != null) return true;
     if (mem.indexOf(u8, t, "} orelse return") != null) return true;
@@ -6013,17 +6013,18 @@ fn hasElseOrOrelseMarker(t: []const u8) bool {
 }
 
 /// True when a branch separator between the frees at from_line and to_line
-/// proves the two sit on mutually exclusive paths. Else/orelse markers count
-/// wherever they appear. A `=>` arm header counts only at an indent no
-/// deeper than both frees — the hasSwitchArmBetween discipline: a header
-/// nested deeper than either free heads a prong whose switch the frees
-/// dominate or sidestep, so it cannot separate their paths (EPH-I0791: the
-/// indent-blind `=>` clause suppressed an outer free paired with a
-/// prong-body free of the same var — a real double-free on that prong's
-/// path). A switch that merely sits between the two frees at a
-/// shallow-enough indent still suppresses (accepted FN, same class as
-/// hasSwitchArmBetween's documented hole). Textual and fail-open toward
-/// reporting: out-of-range endpoints yield no separator.
+/// proves the two sit on mutually exclusive paths. A separator counts only
+/// at an indent no deeper than both frees — the hasSwitchArmBetween
+/// discipline: a marker nested deeper than either free heads an arm of a
+/// construct the frees dominate or sidestep, so it cannot separate their
+/// paths (EPH-I0791: the indent-blind `=>` clause suppressed an outer free
+/// paired with a prong-body free of the same var. EPH-I0806: the
+/// indent-blind else/orelse clause suppressed a dominating free paired
+/// with a later free across a nested `} else {` or `} orelse {`). A branch
+/// that merely sits between the two frees at a shallow-enough indent still
+/// suppresses (accepted FN, same class as hasSwitchArmBetween's documented
+/// hole). Textual and fail-open toward reporting: out-of-range endpoints
+/// yield no separator.
 fn hasExclusiveBranchBetween(
     lines: []const []const u8,
     from_line: usize,
@@ -6040,9 +6041,9 @@ fn hasExclusiveBranchBetween(
     // free's own line, leaving an empty exclusive range otherwise.
     for (from_line + 1..to_line + 1) |ln| {
         const idx = ln - func_line;
+        if (countIndent(lines[idx]) > min_indent) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (hasElseOrOrelseMarker(t)) return true;
-        if (countIndent(lines[idx]) > min_indent) continue;
         if (mem.indexOf(u8, t, "=>") != null) return true;
     }
     return false;
@@ -6514,22 +6515,30 @@ fn hasSwitchArmBetween(
 }
 
 /// Else/orelse branch separators between two frees (defer pairing only).
-/// `=>` arm headers are deliberately NOT matched here: for a defer/direct
-/// pair, arm exclusivity is decided by hasSwitchArmBetween, which accounts
-/// for the defer sitting OUTSIDE the switch — an arm header between such a
-/// pair means nothing, the defer runs on every path.
+/// A separator counts only at an indent no deeper than both frees — the
+/// hasSwitchArmBetween discipline: a marker nested deeper than either free
+/// heads an arm of a construct the frees dominate or sidestep, so it cannot
+/// separate their paths (EPH-I0806: the indent-blind else/orelse clause
+/// suppressed a defer-registered free paired with a later direct free of
+/// the same var across a nested `} else {` or `} orelse {`). A separator
+/// that merely sits between the two frees at a shallow-enough indent still
+/// suppresses (accepted FN, the hasSwitchArmBetween documented-hole class).
+/// `=>` arm headers are deliberately NOT matched here. For a defer/direct
+/// pair, hasSwitchArmBetween decides arm exclusivity and accounts for the
+/// defer outside the switch. An arm header between such a pair means
+/// nothing: the defer runs on every path.
 fn hasElseBranchBetween(
     lines: []const []const u8,
     func_line: usize,
-    first: usize,
-    second: usize,
+    span: FreeSpan,
 ) bool {
-    if (first < func_line or second <= first) return false;
+    if (span.first < func_line or span.second <= span.first) return false;
     // second inclusive: inline `} else { free(x); }` puts the separator on
     // the free's own line.
-    for (first + 1..second + 1) |ln| {
+    for (span.first + 1..span.second + 1) |ln| {
         const idx = ln - func_line;
         if (idx >= lines.len) break;
+        if (countIndent(lines[idx]) > span.min_indent) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (hasElseOrOrelseMarker(t)) return true;
     }
@@ -6598,13 +6607,14 @@ fn pairDirectFreeWithDefers(
         // an accepted heuristic FN (see hasReassignmentAfter).
         if (hasReassignmentAfter(ctx.lines, ctx.func_line, first, ctx.var_name)) continue;
         const second = @max(df.line, site.free_line);
-        if (hasElseBranchBetween(ctx.lines, ctx.func_line, first, second))
-            continue;
-        if (hasSwitchArmBetween(ctx.lines, ctx.func_line, .{
+        const span = FreeSpan{
             .first = first,
             .second = second,
             .min_indent = @min(df.indent, site.free_indent),
-        })) continue;
+        };
+        if (hasElseBranchBetween(ctx.lines, ctx.func_line, span))
+            continue;
+        if (hasSwitchArmBetween(ctx.lines, ctx.func_line, span)) continue;
         const severity: Severity = if (df.is_conditional) .warning else .err;
         try appendDoubleFreeIssue(&sink, .{
             .t = site.t,
@@ -32038,6 +32048,170 @@ test "ZA106: arm free then post-switch free is a conditional double-free (EPH-I0
         if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
         try std.testing.expect(issue.severity == .warning);
     }
+}
+
+test "ZA106: nested else between dominating frees does not separate them (EPH-I0806)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `} else {` on 7 heads an arm of the if nested in the bare block:
+    // deeper than both frees, it cannot split their paths. The free on 3
+    // dominates the free on 11, so the pair is a definite double-free (err).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    {
+        \\        if (c) {
+        \\            _ = c;
+        \\        } else {
+        \\            _ = !c;
+        \\        }
+        \\    }
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_else_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_nested_else_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: nested else between defer and direct free does not separate them (EPH-I0806)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `} else {` on 7 heads an arm of the if nested in the bare block:
+    // deeper than both frees, it cannot split their paths. The defer on 3
+    // runs at scope exit after the free on 11, so the pair is a definite
+    // double-free (err). The defer/direct pair reaches the else check
+    // through pairDirectFreeWithDefers, not hasExclusiveBranchBetween.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    defer allocator.free(item);
+        \\    {
+        \\        if (c) {
+        \\            _ = c;
+        \\        } else {
+        \\            _ = !c;
+        \\        }
+        \\    }
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_else_defer_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_nested_else_defer_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: nested orelse between dominating frees does not separate them (EPH-I0806)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `} orelse {` on 7 sits inside the bare block: nested deeper than
+    // both frees, it divides the catch and null arms of getValue, never the
+    // frees' paths. The free on 3 dominates the free on 12 (err).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    {
+        \\        const result = getValue() catch {
+        \\            return error.Failed;
+        \\        } orelse {
+        \\            return error.NullValue;
+        \\        };
+        \\        _ = result;
+        \\    }
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_orelse_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_nested_orelse_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: frees in if and else arms stay silent (EPH-I0806)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else marker at indent 4 sits no deeper than both frees (indent
+    // 8): the min-indent discipline keeps it a separator. The arms are
+    // mutually exclusive anyway, so the lattice stays silent before any
+    // textual guard runs.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    if (c) {
+        \\        allocator.free(item);
+        \\    } else {
+        \\        allocator.free(item);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_if_else_arms.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_if_else_arms.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: shallow else between dominating frees still separates (EPH-I0806)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else marker sits at the same indent as both frees, so the
+    // min-indent discipline keeps it a separator even though the if/else
+    // only sidesteps the pair. Accepted FN, the hasSwitchArmBetween
+    // documented-hole class: a tighter gate needs scope-tracked arm
+    // membership, which the textual layer does not carry.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    if (c) {
+        \\        _ = c;
+        \\    } else {
+        \\        _ = !c;
+        \\    }
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_shallow_else_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_shallow_else_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
 }
 
 test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {

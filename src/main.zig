@@ -2265,8 +2265,9 @@ fn isLocalVarOccurrence(t: []const u8, name: []const u8) bool {
         if (var_pos + name.len < t.len and isIdent(t[var_pos + name.len])) continue;
         if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
 
-        // If preceded by '.', it's a struct field access (self.field) - skip
-        if (var_pos > 0 and t[var_pos - 1] == '.') continue;
+        // If preceded by '.', it's a struct field access (self.field, with
+        // any spacing around the dot — EPH-I0796) - skip
+        if (hasLeftDot(t, var_pos)) continue;
 
         // Found a local variable occurrence
         return true;
@@ -2287,7 +2288,8 @@ fn isDirectFreeOfVar(t: []const u8, var_name: []const u8) bool {
         // Word boundary checks
         if (var_pos + var_name.len < t.len and isIdent(t[var_pos + var_name.len])) continue;
         if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
-        if (var_pos > 0 and t[var_pos - 1] == '.') continue; // struct field
+        // Struct field, with any spacing around the dot (EPH-I0796).
+        if (hasLeftDot(t, var_pos)) continue;
 
         const after_var = var_pos + var_name.len;
         // varname.field — intermediate access: never a direct free of varname,
@@ -3248,9 +3250,10 @@ fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
         const pos = s + rel;
         s = pos + var_name.len;
         // The match must be the variable itself: not mid-identifier
-        // (box[...]) and not a field of another var (foo.x[...]).
+        // (box[...]) and not a field of another var (foo.x[...], with any
+        // spacing around the dot — EPH-I0795).
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (pos > 0 and t[pos - 1] == '.') continue;
+        if (hasLeftDot(t, pos)) continue;
         const end = pos + var_name.len;
         if (end < t.len and isIdent(t[end])) continue;
         if (end < t.len and t[end] == '[' and !isAssignmentTarget(t, var_name, pos))
@@ -3273,9 +3276,12 @@ fn nextFillCallOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize
         const pos = s.* + rel;
         s.* = pos + var_name.len;
         // The match must be the variable itself: not mid-identifier
-        // (box) and not a field of another var (foo.x).
+        // (box) and not a field of another var (foo.x, with any spacing
+        // around the dot — EPH-I0795). The spacing never changes the
+        // verdict here: both return arms need '&' or '(' immediately left
+        // of the name, so a spaced-dot occurrence falls through either way.
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (pos > 0 and t[pos - 1] == '.') continue;
+        if (hasLeftDot(t, pos)) continue;
         if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) continue;
         // Slice-index occurrences are Pattern-2 — whole-line coverage.
         if (pos + var_name.len < t.len and t[pos + var_name.len] == '[') continue;
@@ -3816,8 +3822,9 @@ fn isStructFieldUndefined(t: []const u8, undefined_col: usize) bool {
     // Check for identifier characters
     while (i > 0 and isIdent(t[i - 1])) i -= 1;
 
-    // Check for leading `.` (struct field notation)
-    if (i > 0 and t[i - 1] == '.') return true;
+    // Check for leading `.` (struct field notation), with any spacing
+    // around the dot (`. field = undefined`, EPH-I0796).
+    if (hasLeftDot(t, i)) return true;
 
     return false;
 }
@@ -4404,7 +4411,8 @@ fn isGuardAssignment(t: []const u8, guard: []const u8) bool {
     const gpos = mem.indexOf(u8, t, guard) orelse return false;
     if (gpos > 0 and isIdent(t[gpos - 1])) return false;
     if (gpos + guard.len < t.len and isIdent(t[gpos + guard.len])) return false;
-    if (gpos > 0 and t[gpos - 1] == '.') return false;
+    // Field of another var, with any spacing around the dot (EPH-I0796).
+    if (hasLeftDot(t, gpos)) return false;
     return isAssignmentTarget(t, guard, gpos);
 }
 
@@ -4425,9 +4433,10 @@ fn isVarAssignedNearby(
             const pos = s + rel;
             s = pos + var_name.len;
             // The match must be the variable itself: not mid-identifier
-            // (box =) and not a field of another var (foo.x =).
+            // (box =) and not a field of another var (foo.x =, with any
+            // spacing around the dot — EPH-I0795).
             if (pos > 0 and isIdent(t[pos - 1])) continue;
-            if (pos > 0 and t[pos - 1] == '.') continue;
+            if (hasLeftDot(t, pos)) continue;
             if (pos + var_name.len < t.len and
                 isIdent(t[pos + var_name.len])) continue;
             if (isAssignmentTarget(t, var_name, pos)) return true;
@@ -6082,7 +6091,8 @@ fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
         if (pos + vn.len < t.len and isIdent(t[pos + vn.len]))
             continue;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (pos > 0 and t[pos - 1] == '.') continue;
+        // Field of another var, with any spacing around the dot (EPH-I0795).
+        if (hasLeftDot(t, pos)) continue;
         // Capture binding: |var| in for/while/switch/catch creates a new binding
         if (pos > 0 and t[pos - 1] == '|') continue;
         if (cls.isInsideString(pos)) continue;
@@ -10495,6 +10505,7 @@ const TupleElementRegion = struct {
 /// `name` used as a tuple ELEMENT within the region. A match must be:
 ///   - word-bounded, where a leading `.` is NOT a boundary — `x.buf` and
 ///     `.buf` are field/enum access on another value, never the local
+///     (with any spacing around the dot, EPH-I0795)
 ///   - outside string literals
 ///   - at the region's own paren level — a name inside a call (`wrap(buf, 0)`)
 ///     is a call arg, not an element (single- and multi-line alike)
@@ -10512,7 +10523,9 @@ fn isReturnTupleElement(t: []const u8, name: []const u8, region: TupleElementReg
         const rel = mem.indexOf(u8, t[s..region.to], name) orelse return false;
         const pos = s + rel;
         s = pos + name.len;
-        if (pos > 0 and (isIdent(t[pos - 1]) or t[pos - 1] == '.')) continue;
+        // The identifier boundary stays on the immediate byte. The dot
+        // scan skips whitespace (`foo . buf`, EPH-I0795).
+        if (pos > 0 and (isIdent(t[pos - 1]) or hasLeftDot(t, pos))) continue;
         if (cls.isInsideString(pos)) continue;
         if (parenDepthAt(t, region.from, pos, region.base_depth) != 0) continue;
         if (hasElementFollower(t, pos + name.len)) return true;
@@ -11405,9 +11418,13 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         if (cls.isInsideString(i)) continue;
         if (mem.indexOf(u8, t[0..i], "//") != null) continue;
 
-        // Pattern 1: &var_name or &Struct.var_name
+        // Pattern 1: &var_name or &Struct.var_name, with any spacing
+        // around the dot (`&opts. buf`, EPH-I0796). hasAmpBeforeChain
+        // walks the chain on immediate bytes, so a space before the dot
+        // (`&opts . buf`) stays uncovered — a disclosed residual zig fmt
+        // never produces.
         if (i > 0 and t[i - 1] == '&') return true;
-        if (i > 1 and t[i - 1] == '.' and hasAmpBeforeChain(t, i)) return true;
+        if (i > 1 and hasLeftDot(t, i) and hasAmpBeforeChain(t, i)) return true;
 
         // Patterns 2/3 require the match to be the variable itself: not
         // mid-identifier (box[...], box =) and not a field of another var
@@ -11650,13 +11667,14 @@ fn extractStructFieldName(t: []const u8) ?[]const u8 {
     return t[i..field_end];
 }
 
-/// Check if column is preceded by '.' (struct field pattern)
+/// Check if column is preceded by '.' (struct field pattern), with any
+/// spacing around the dot (`. field`, EPH-I0796).
 fn isStructFieldPattern(t: []const u8, col: usize) bool {
     if (col == 0) return false;
     var i: usize = col;
     while (i > 0 and t[i - 1] == ' ') i -= 1;
     while (i > 0 and isIdent(t[i - 1])) i -= 1;
-    return i > 0 and t[i - 1] == '.';
+    return hasLeftDot(t, i);
 }
 
 /// Bounded set of pending undefined vars per file. ZA204 previously tracked
@@ -41012,6 +41030,106 @@ test "nextAssignmentOccurrence skips whitespace-spaced dot field writes (EPH-I07
     try std.testing.expect(nextAssignmentOccurrence("foo .\tbuf = 1;", "buf", &s) == null);
     s = 0;
     try std.testing.expect(nextAssignmentOccurrence("buf = 1;", "buf", &s) != null);
+}
+
+test "hasSliceOccurrence skips whitespace-spaced dot field slices (EPH-I0795)" {
+    // `foo . x[i]` reads foo's field through a spaced dot, never the local x.
+    try std.testing.expect(!hasSliceOccurrence("foo . x[i]", "x"));
+    try std.testing.expect(!hasSliceOccurrence("foo .\tx[i]", "x"));
+    try std.testing.expect(!hasSliceOccurrence("foo.x[i]", "x"));
+    try std.testing.expect(hasSliceOccurrence("x[i]", "x"));
+}
+
+test "nextFillCallOccurrence keeps verdict parity on spaced-dot occurrences (EPH-I0795)" {
+    // The dot guard's spacing never changes this verdict: a return needs
+    // '&' (call arm) or '(' (builtin arm) immediately left of the name, so
+    // a spaced-dot occurrence always falls through. The guard converges on
+    // hasLeftDot for consistency. The pin locks the parity.
+    var s: usize = 0;
+    try std.testing.expect(nextFillCallOccurrence("foo . buf;", "buf", &s) == null);
+    s = 0;
+    try std.testing.expect(nextFillCallOccurrence("foo.buf;", "buf", &s) == null);
+    s = 0;
+    try std.testing.expect(nextFillCallOccurrence("fill(&buf);", "buf", &s) != null);
+}
+
+test "isVarAssignedNearby skips whitespace-spaced dot field writes (EPH-I0795)" {
+    // `foo . x = 1` writes foo's field through a spaced dot, never local x.
+    const spaced = [_][]const u8{"foo . x = 1;"};
+    try std.testing.expect(!isVarAssignedNearby(&spaced, 0, "x", 10));
+    const plain = [_][]const u8{"x = 1;"};
+    try std.testing.expect(isVarAssignedNearby(&plain, 0, "x", 10));
+}
+
+test "findVarUseOnLine skips whitespace-spaced dot field reads (EPH-I0795)" {
+    // `foo . item == 1` reads foo's field through a spaced dot, never the
+    // local item.
+    try std.testing.expect(findVarUseOnLine("foo . item == 1;", "item") == null);
+    try std.testing.expect(findVarUseOnLine("foo.item == 1;", "item") == null);
+    try std.testing.expect(findVarUseOnLine("item == 1;", "item") != null);
+}
+
+test "isReturnTupleElement skips whitespace-spaced dot field elements (EPH-I0795)" {
+    // `foo . buf` inside the tuple is foo's field through a spaced dot,
+    // never the local buf as an element.
+    const spaced = ".{ foo . buf, 0 }";
+    const spaced_region: TupleElementRegion = .{ .from = 0, .to = spaced.len };
+    try std.testing.expect(!isReturnTupleElement(spaced, "buf", spaced_region));
+    const immediate = ".{ foo.buf, 0 }";
+    const imm_region: TupleElementRegion = .{ .from = 0, .to = immediate.len };
+    try std.testing.expect(!isReturnTupleElement(immediate, "buf", imm_region));
+    const plain = ".{ buf, 0 }";
+    const plain_region: TupleElementRegion = .{ .from = 0, .to = plain.len };
+    try std.testing.expect(isReturnTupleElement(plain, "buf", plain_region));
+}
+
+test "isLocalVarOccurrence skips whitespace-spaced dot fields (EPH-I0796)" {
+    // `self . name` reads self's field through a spaced dot, never a local.
+    try std.testing.expect(!isLocalVarOccurrence("self . name", "name"));
+    try std.testing.expect(!isLocalVarOccurrence("self .\tname", "name"));
+    try std.testing.expect(!isLocalVarOccurrence("self.name", "name"));
+    try std.testing.expect(isLocalVarOccurrence("name = 1;", "name"));
+}
+
+test "isDirectFreeOfVar skips whitespace-spaced dot receivers (EPH-I0796)" {
+    // `foo . buf.free()` frees foo's field through a spaced dot, never the
+    // local buf.
+    try std.testing.expect(!isDirectFreeOfVar("foo . buf.free();", "buf"));
+    try std.testing.expect(!isDirectFreeOfVar("foo.buf.free();", "buf"));
+    try std.testing.expect(isDirectFreeOfVar("buf.free();", "buf"));
+    try std.testing.expect(isDirectFreeOfVar("alloc.free(buf);", "buf"));
+}
+
+test "isStructFieldUndefined accepts whitespace-spaced dot fields (EPH-I0796)" {
+    // `. field = undefined` inits a struct field through a spaced dot: the
+    // field is undefined, never a variable declaration.
+    try std.testing.expect(isStructFieldUndefined(". field = undefined", 8));
+    try std.testing.expect(isStructFieldUndefined(".field = undefined", 7));
+    try std.testing.expect(!isStructFieldUndefined("field = undefined", 6));
+}
+
+test "isGuardAssignment skips whitespace-spaced dot field writes (EPH-I0796)" {
+    // `foo . guard = true` writes foo's field through a spaced dot, never
+    // the guard local.
+    try std.testing.expect(!isGuardAssignment("foo . guard = true;", "guard"));
+    try std.testing.expect(!isGuardAssignment("foo .\tguard = true;", "guard"));
+    try std.testing.expect(!isGuardAssignment("foo.guard = true;", "guard"));
+    try std.testing.expect(isGuardAssignment("guard = true;", "guard"));
+}
+
+test "hasDirectFill accepts a whitespace-spaced dot chain pointer (EPH-I0796)" {
+    // `&opts. buf` passes a field pointer through a spaced dot: the
+    // call-fill heuristic fills through it the same as `&opts.buf`.
+    try std.testing.expect(hasDirectFill("fill(&opts.buf);", "buf"));
+    try std.testing.expect(hasDirectFill("fill(&opts. buf);", "buf"));
+    try std.testing.expect(!hasDirectFill("use(buf);", "buf"));
+}
+
+test "isStructFieldPattern accepts whitespace-spaced dot fields (EPH-I0796)" {
+    // `. field` through a spaced dot is still struct field notation.
+    try std.testing.expect(isStructFieldPattern(". field = undefined", 8));
+    try std.testing.expect(isStructFieldPattern(".field = undefined", 7));
+    try std.testing.expect(!isStructFieldPattern("field = undefined", 6));
 }
 
 test "ZA607: or-guard read not suppressed by other-var assignment in body" {

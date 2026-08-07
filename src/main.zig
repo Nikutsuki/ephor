@@ -4986,9 +4986,9 @@ fn isOrShortCircuitSafe(
 
 /// Net paren balance of one comment-stripped line (`(` minus `)`),
 /// quote-aware so parens inside string/char literals do not count. The
-/// file-wide parenBalance stays naive for its own callers (documented
-/// there); the guard walk needs the quote-aware form because if-conditions
-/// routinely hold string literals with parens.
+/// guard walk pre-strips comments (stripLineComment) before counting, so
+/// this form takes the stripped text. parenBalance composes the two steps
+/// for callers holding a raw line (EPH-I0794).
 fn parenBalanceOutsideQuotes(t: []const u8) i32 {
     var balance: i32 = 0;
     var mode: QuoteMode = .none;
@@ -19074,15 +19074,15 @@ fn countBraceDepth(t: []const u8, depth: usize) usize {
     return d;
 }
 
-/// Signed paren balance of a line (`(` minus `)`). Naive by design — string
-/// literals containing parens can skew it, consistent with countBraceBalance.
+/// Signed paren balance of one line (`(` minus `)`), masked: parens inside
+/// string/char literals, `\\` multiline tails, and `//` comments do not
+/// count (EPH-I0794). The naive count let a paren in a trailing comment or
+/// string literal skew the depth walks in isInsideTypeOf, findCallSiteLine,
+/// and joinParenContinuation — past the comment-stripped boundary arm
+/// (EPH-I0783) on the ZA202 paths. countBraceDepth stays naive for its own
+/// callers.
 fn parenBalance(t: []const u8) i32 {
-    var balance: i32 = 0;
-    for (t) |c| {
-        if (c == '(') balance += 1;
-        if (c == ')') balance -= 1;
-    }
-    return balance;
+    return parenBalanceOutsideQuotes(stripLineComment(t));
 }
 
 /// True if the line mentions any allocation call pattern (method or qualified).
@@ -50257,8 +50257,8 @@ test "isInsideTypeOf: trailing comment on a boundary cannot force a match (EPH-I
     // sees the `;` terminator and breaks. This trailing comment cannot
     // force a match. A catch line at deeper paren depth (inside a call
     // argument list) needs the same strip. The sibling test below pins
-    // that shape. Comment parens still corrupt parenBalance itself
-    // (EPH-I0794). That residual class stays out of scope for this pin.
+    // that shape. Comment parens corrupted parenBalance itself until
+    // EPH-I0794 masked the primitive; the EPH-I0794 pins cover that class.
     const prev = [_][]const u8{
         "const T = @TypeOf(",
         "    foo,",
@@ -50293,6 +50293,71 @@ test "isInsideTypeOf: comment-hidden boundary, catch at call-arg depth (EPH-I078
         "    );",
     };
     try std.testing.expect(!isInsideTypeOf(line, col, &bare));
+}
+
+test "isInsideTypeOf: comment parens on a boundary cannot carry the walk (EPH-I0794)" {
+    // The EPH-I0783 boundary arm breaks only at depth <= 0. The two `(`
+    // in the trailing comment push the naive parenBalance to +1, so the
+    // arm never fires and the walk crosses the closed `);` statement
+    // into the @TypeOf opener: a runtime catch unreachable is reported
+    // as compile-time-only and ZA202 stays silent (FN direction). The
+    // masked count reads the boundary line as -1 and the arm breaks.
+    const prev = [_][]const u8{
+        "const T = @TypeOf(",
+        "    foo,",
+        "); // reopen ((",
+    };
+    const line = "const x = risky() catch unreachable;";
+    const col = mem.indexOf(u8, line, "catch").?;
+    try std.testing.expect(!isInsideTypeOf(line, col, &prev));
+}
+
+test "isInsideTypeOf: string parens on a boundary cannot carry the walk (EPH-I0794)" {
+    // Same skew through a string literal. The naive count reads the two
+    // `(` inside "((" as real opens, defeats the depth-0 boundary arm,
+    // and lands on the @TypeOf opener with depth > 0 (ZA202 FN). The
+    // masked count skips string data and breaks at the boundary.
+    const prev = [_][]const u8{
+        "const T = @TypeOf(",
+        "    foo,",
+        "); const s = \"((\";",
+    };
+    const line = "const x = risky() catch unreachable;";
+    const col = mem.indexOf(u8, line, "catch").?;
+    try std.testing.expect(!isInsideTypeOf(line, col, &prev));
+}
+
+test "isInsideTypeOf: comment paren on the catch line keeps a genuine match (EPH-I0794)" {
+    // The catch sits inside @TypeOf( ... ), so suppression is correct.
+    // The naive count reads the `)` in the catch line's own trailing
+    // comment as a real close and starts the walk at depth -1. The
+    // opener then lifts depth only to 0, the genuine match is lost, and
+    // ZA202 fires on compile-time-only code. The masked count starts
+    // the walk at 0 and the opener matches at depth +1.
+    const prev = [_][]const u8{
+        "const T = @TypeOf(",
+    };
+    const line = "    foo() catch unreachable, // )";
+    const col = mem.indexOf(u8, line, "catch").?;
+    try std.testing.expect(isInsideTypeOf(line, col, &prev));
+}
+
+test "findCallSiteLine: comment parens cannot skip the real opener (EPH-I0794)" {
+    // Two skews stack. The `)` in the opener's trailing comment cancels
+    // its real `(` in the naive count, so the walk sails past the real
+    // call line. The `(` in the bufPrint line's trailing comment then
+    // lifts the naive depth to 0 and the walk returns that line, so the
+    // bufPrint suppression swallows a runtime catch unreachable (ZA202
+    // FN). The masked count balances on the real opener and returns it.
+    const prev = [_][]const u8{
+        "const a = std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable; // (",
+        "const b = riskyCall( // )",
+        "    y,",
+    };
+    const line = ") catch unreachable;";
+    const got = findCallSiteLine(line, &prev) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("const b = riskyCall( // )", got);
+    try std.testing.expect(!isBufPrintCatchUnreachable(line, &prev));
 }
 
 test "isDeferCatchMultiline: trailing comment must not hide a boundary (EPH-I0783)" {

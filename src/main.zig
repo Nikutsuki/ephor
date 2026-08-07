@@ -6026,8 +6026,11 @@ fn hasElseBranchMarker(t: []const u8) bool {
     return after >= t.len or !isIdent(t[after]);
 }
 
-fn isExclusiveBranchLine(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "=>") != null) return true;
+/// True when the line carries an else/orelse arm separator: the arms the
+/// marker divides never execute together. Kept indent-blind — only the
+/// `=>` clause of hasExclusiveBranchBetween went indent-aware (EPH-I0791).
+/// A nested else marker between two dominating frees stays an accepted FN.
+fn hasElseOrOrelseMarker(t: []const u8) bool {
     if (mem.indexOf(u8, t, "} orelse {") != null) return true;
     if (mem.indexOf(u8, t, "} orelse return") != null) return true;
     if (mem.startsWith(u8, t, "orelse {")) return true;
@@ -6035,6 +6038,18 @@ fn isExclusiveBranchLine(t: []const u8) bool {
     return false;
 }
 
+/// True when a branch separator between the frees at from_line and to_line
+/// proves the two sit on mutually exclusive paths. Else/orelse markers count
+/// wherever they appear. A `=>` arm header counts only at an indent no
+/// deeper than both frees — the hasSwitchArmBetween discipline: a header
+/// nested deeper than either free heads a prong whose switch the frees
+/// dominate or sidestep, so it cannot separate their paths (EPH-I0791: the
+/// indent-blind `=>` clause suppressed an outer free paired with a
+/// prong-body free of the same var — a real double-free on that prong's
+/// path). A switch that merely sits between the two frees at a
+/// shallow-enough indent still suppresses (accepted FN, same class as
+/// hasSwitchArmBetween's documented hole). Textual and fail-open toward
+/// reporting: out-of-range endpoints yield no separator.
 fn hasExclusiveBranchBetween(
     lines: []const []const u8,
     from_line: usize,
@@ -6042,14 +6057,19 @@ fn hasExclusiveBranchBetween(
     func_line: usize,
 ) bool {
     if (from_line == 0 or from_line >= to_line) return false;
+    if (from_line < func_line or to_line < func_line) return false;
+    const from_idx = from_line - func_line;
+    const to_idx = to_line - func_line;
+    if (from_idx >= lines.len or to_idx >= lines.len) return false;
+    const min_indent = @min(countIndent(lines[from_idx]), countIndent(lines[to_idx]));
     // to_line inclusive: inline switch arms put the `.b =>` marker on the
     // free's own line, leaving an empty exclusive range otherwise.
     for (from_line + 1..to_line + 1) |ln| {
-        if (ln < func_line) continue;
         const idx = ln - func_line;
-        if (idx >= lines.len) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isExclusiveBranchLine(t)) return true;
+        if (hasElseOrOrelseMarker(t)) return true;
+        if (countIndent(lines[idx]) > min_indent) continue;
+        if (mem.indexOf(u8, t, "=>") != null) return true;
     }
     return false;
 }
@@ -6537,10 +6557,7 @@ fn hasElseBranchBetween(
         const idx = ln - func_line;
         if (idx >= lines.len) break;
         const t = mem.trim(u8, lines[idx], " \t\r");
-        if (mem.indexOf(u8, t, "} orelse {") != null) return true;
-        if (mem.indexOf(u8, t, "} orelse return") != null) return true;
-        if (mem.startsWith(u8, t, "orelse {")) return true;
-        if (hasElseBranchMarker(t)) return true;
+        if (hasElseOrOrelseMarker(t)) return true;
     }
     return false;
 }
@@ -31392,6 +31409,128 @@ test "ZA106: free before a switch-prong capture scope stays silent (EPH-I0780)" 
     const file = "test_switch_capture_free.zig";
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // No capture rebinds the name: the prong body frees the tracked alloc
+    // itself. The free on 3 dominates the switch, so the free on 6 runs on a
+    // path that already freed item — a definite double-free (err).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, p: union(enum) { buf: []u8, empty }) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    switch (p) {
+        \\        .buf => {
+        \\            allocator.free(item);
+        \\        },
+        \\        .empty => {},
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_switch_prong_body_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_switch_prong_body_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: prong-body free does not pair with a sibling-scope free (EPH-I0791)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free on 4 runs only when c holds: it does not dominate the switch.
+    // The prong header sits at the same indent as that free, so the pair
+    // stays separated (the hasSwitchArmBetween discipline) and no verdict
+    // fires.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, c: bool, p: union(enum) { buf: []u8, empty }) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    if (c) {
+        \\        allocator.free(item);
+        \\    }
+        \\    switch (p) {
+        \\        .buf => {
+        \\            allocator.free(item);
+        \\        },
+        \\        .empty => {},
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_prong_sibling_scope.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_prong_sibling_scope.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: frees in different switch arms stay silent (EPH-I0791)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The arms are mutually exclusive: the .empty arm's only CFG predecessor
+    // is the switch header, so the .buf free never reaches it — the lattice
+    // stays silent before any textual guard runs.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, p: union(enum) { buf: []u8, empty }) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    switch (p) {
+        \\        .buf => {
+        \\            allocator.free(item);
+        \\        },
+        \\        .empty => {
+        \\            allocator.free(item);
+        \\        },
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_prong_two_arms.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_prong_two_arms.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: arm free then post-switch free is a conditional double-free (EPH-I0791)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The .buf path frees item twice (arm body, then the post-switch line),
+    // but the .empty path frees it once: the meet is MAY, so the verdict is
+    // a warning — the same tier the if-arm equivalent already produces.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, p: union(enum) { buf: []u8, empty }) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    switch (p) {
+        \\        .buf => {
+        \\            allocator.free(item);
+        \\        },
+        \\        .empty => {},
+        \\    }
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(allocator, "test_prong_arm_then_merge.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_prong_arm_then_merge.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
 }
 
 test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {

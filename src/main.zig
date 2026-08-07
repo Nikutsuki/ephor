@@ -21940,14 +21940,20 @@ fn reportFmtFailure(
     });
 }
 
-/// First line that carries an "error:" marker, or null. zig fmt writes
-/// "error: ..." for IO failures and "path:line:col: error: ..." for
-/// parse failures. Both carry the marker.
+/// First line that carries an "error:" diagnostic marker, or null. zig
+/// fmt writes "error: ..." for IO failures and "path:line:col: error: ..."
+/// for parse failures, so the marker is the line prefix or the
+/// ": error: " interior form (EPH-I0766). A bare substring match would
+/// read a needs-format list line whose path carries "error:" (legal on
+/// macOS/Linux) as a diagnostic on list-to-stderr toolchains. A relative
+/// scan path whose first component starts with "error:" still matches the
+/// prefix form, so ZR104 can still fire spuriously on that shape.
 fn firstErrorLine(stderr: []const u8) ?[]const u8 {
     var lines = mem.splitScalar(u8, stderr, '\n');
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        if (mem.indexOf(u8, t, "error:") != null) return t;
+        if (mem.startsWith(u8, t, "error:")) return t;
+        if (mem.indexOf(u8, t, ": error: ") != null) return t;
     }
     return null;
 }
@@ -22289,6 +22295,9 @@ fn runRuntimeAnalysis(
     custom_command: ?[]const u8,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    // Findings own heap payloads (EPH-I0196/I0202): an unwind mid-parse
+    // must free the partial list, not drop it (EPH-I0767).
+    errdefer deinitIssues(&issues, allocator);
     var argv_buf: [64][]const u8 = undefined;
     const argv_len = buildRuntimeArgv(custom_command, &argv_buf, verbose);
 
@@ -22574,11 +22583,15 @@ fn isRunnerBlockHeader(t: []const u8) bool {
 
 /// True for frames inside the Zig toolchain lib tree (EPH-I0732): std,
 /// compiler_rt, and the build/test runner. The /lib/zig/ needle covers
-/// packager layouts that nest the tree one level deeper (homebrew). POSIX
-/// separators only. Windows trace paths are unverified.
+/// packager layouts that nest the tree one level deeper (homebrew). Both
+/// separator forms match: the backslash needles contains-match any
+/// drive-letter prefix, so Windows traces filter too (EPH-I0768).
 fn isToolchainFramePath(path: []const u8) bool {
     const needles = [_][]const u8{
-        ".zenv/", "/lib/std/", "/lib/compiler/", "/lib/compiler_rt", "/lib/zig/",
+        ".zenv/",           "/lib/std/",         "/lib/compiler/",
+        "/lib/compiler_rt", "/lib/zig/",         ".zenv\\",
+        "\\lib\\std\\",     "\\lib\\compiler\\", "\\lib\\compiler_rt",
+        "\\lib\\zig\\",
     };
     return matchesAnyPattern(path, &needles);
 }
@@ -22636,23 +22649,48 @@ fn collectRunnerBlock(
     return n;
 }
 
+/// Emit a located finding from the best block anchor (EPH-I0769): the
+/// frame line when one exists, else the runner header when the header
+/// itself parses to a real path:line. A header without a line number
+/// mints file:0 from any ".zig" substring in a test step name, so those
+/// blocks keep the unknown:0 anchor.
+fn emitBlockAnchoredIssue(
+    ctx: RuntimeEmitCtx,
+    spec: RuntimeIssueSpec,
+    frame: ?[]const u8,
+    header: []const u8,
+) !void {
+    if (frame) |f| return emitLocatedIssue(ctx, spec, f);
+    if (extractFileLocation(header).line > 0) return emitLocatedIssue(ctx, spec, header);
+    try ctx.issues.append(ctx.allocator, .{
+        .file = "unknown",
+        .line = 0,
+        .col = 1,
+        .severity = .err,
+        .rule = spec.rule,
+        .message = spec.message,
+        .help = spec.help,
+    });
+}
+
 /// Emit the finding for a recognized block shape (EPH-I0732), or return
 /// false so the caller replays the lines through the plain table. Death
 /// inside free means the double-free detection fired on the poison memset.
-/// The header serves as the no-frame anchor, which yields unknown:0 there.
+/// The no-frame anchor is the header when it parses to a real path:line,
+/// unknown:0 otherwise (EPH-I0769).
 fn emitRunnerBlockFinding(
     ctx: RuntimeEmitCtx,
     scan: *const RunnerBlockScan,
     header: []const u8,
 ) !bool {
     if (scan.saw_double_free_text) {
-        const frame = scan.second_free_frame orelse scan.first_user_frame orelse header;
-        try emitLocatedIssue(ctx, double_free_issue_spec, frame);
+        const frame = scan.second_free_frame orelse scan.first_user_frame;
+        try emitBlockAnchoredIssue(ctx, double_free_issue_spec, frame, header);
         return true;
     }
     if (!scan.saw_segfault) return false;
     if (scan.has_free_frame) {
-        try emitLocatedIssue(ctx, double_free_issue_spec, scan.first_user_frame orelse header);
+        try emitBlockAnchoredIssue(ctx, double_free_issue_spec, scan.first_user_frame, header);
         return true;
     }
     if (scan.first_user_frame) |frame| {
@@ -29732,6 +29770,48 @@ test "parseGPADiagnostics reports unknown:0 for a crash block with only toolchai
     try std.testing.expectEqual(@as(usize, 0), issues.items[0].line);
 }
 
+test "parseGPADiagnostics keeps unknown:0 when the header names a zig step" {
+    // EPH-I0769: the runner header quotes the test step name. A step
+    // name holding a ".zig" substring minted file:0 through the header
+    // anchor pre-fix. The header anchors only when it parses to a real
+    // path:line form; otherwise the finding keeps unknown:0.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source =
+        \\error: 'build parser.zig' terminated with signal ABRT with stderr:
+        \\       Segmentation fault at address 0x1044a0000
+        \\       /tool/zig/lib/std/mem/Allocator.zig:448:5: 0x1 in free__anon_19 (test)
+        \\failed command: x
+    ;
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("unknown", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 0), issues.items[0].line);
+}
+
+test "parseGPADiagnostics filters Windows toolchain frames in a trace" {
+    // EPH-I0768: a Windows crash trace carries drive-letter, backslash
+    // paths. Pre-fix the POSIX-only needles read the std frame as the
+    // first user frame and mislocated the finding at the toolchain.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const source =
+        \\error: 'main.test.crash' terminated with signal ABRT with stderr:
+        \\       Segmentation fault at address 0x1044a0000
+        \\       C:\tool\zig\lib\std\mem\Allocator.zig:448:5: 0x1 in free__anon_19 (test)
+        \\       C:\proj\src\main.zig:10:19: 0x10499193b in test.crash (test)
+        \\failed command: x
+    ;
+    try parseGPADiagnostics(allocator, &issues, source, false);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
+    try std.testing.expectEqualStrings("C:\\proj\\src\\main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 10), issues.items[0].line);
+}
+
 test "scanRunnerBlockLine ignores free markers on source echo lines" {
     // EPH-I0732: a trace echoes the faulting source under its frame, so a
     // user call site written Allocator.free(gpa, buf) must not read as a
@@ -29741,6 +29821,17 @@ test "scanRunnerBlockLine ignores free markers on source echo lines" {
     try std.testing.expect(!scan.has_free_frame);
     scanRunnerBlockLine(&scan, "/tool/Allocator.zig:448:5: 0x104b099db in free__anon_19 (test)");
     try std.testing.expect(scan.has_free_frame);
+}
+
+test "isToolchainFramePath filters Windows toolchain paths" {
+    // EPH-I0768: Windows traces carry drive-letter, backslash paths.
+    // The \lib\ needles contains-match any drive prefix.
+    try std.testing.expect(isToolchainFramePath("C:\\zig\\lib\\std\\mem\\Allocator.zig"));
+    try std.testing.expect(isToolchainFramePath("C:\\tool\\zig\\lib\\compiler\\test_runner.zig"));
+    try std.testing.expect(isToolchainFramePath("D:\\lib\\compiler_rt.zig"));
+    try std.testing.expect(isToolchainFramePath("C:\\proj\\.zenv\\zig\\lib\\std\\array_list.zig"));
+    try std.testing.expect(isToolchainFramePath("C:\\tool\\lib\\zig\\build_runner.zig"));
+    try std.testing.expect(!isToolchainFramePath("C:\\proj\\src\\main.zig"));
 }
 
 test "parseTestOutput located findings own their file bytes after the source frees" {
@@ -29994,6 +30085,34 @@ test "runFmtCheck reports the syntax error in a mixed directory" {
     try std.testing.expect(mem.indexOf(u8, issue.message, "error:") != null);
 }
 
+test "runFmtCheck does not fire ZR104 for a needs-format path carrying error:" {
+    // ':' is not a legal path byte on Windows.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    defer global_io = null;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // EPH-I0766: ':' is a legal path byte on macOS/Linux. On a
+    // list-to-stderr toolchain the unanchored firstErrorLine read this
+    // needs-format list line as a diagnostic and fired a spurious ZR104
+    // next to the ZA601 warning.
+    try tmp.dir.createDirPath(std.testing.io, "error:dir");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "error:dir/needsfmt.zig",
+        .data = "fn needs() void{}\n",
+    });
+    const path = try tmpFilePath(allocator, &tmp, "error:dir/needsfmt.zig");
+    defer allocator.free(path);
+
+    var issues = try runFmtCheck(allocator, path);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_NEEDS_FORMAT, issues.items[0].rule);
+    try std.testing.expectEqual(Severity.warning, issues.items[0].severity);
+}
+
 test "fmtTermMessage names the termination kind for a signal death" {
     const allocator = std.testing.allocator;
     const msg = try fmtTermMessage(allocator, .{ .signal = std.posix.SIG.TERM }, "");
@@ -30017,6 +30136,30 @@ test "fmtTermMessage sanitizes hostile bytes in the error line" {
     // RED5: control bytes become visible '?' marks, never terminal
     // sequences, and only the first error line reaches the message.
     try std.testing.expectEqualStrings("x.zig:1:1: error: bad ?[2J? path", msg);
+}
+
+test "firstErrorLine anchors the error marker" {
+    // EPH-I0766: the marker is the line prefix (IO failures) or the
+    // ": error: " interior form (parse failures). A bare "error:"
+    // substring match read a needs-format list line whose path carried
+    // the substring as a diagnostic.
+    const io_failure = "error: unable to format '/x': FileNotFound\n";
+    try std.testing.expectEqualStrings(
+        "error: unable to format '/x': FileNotFound",
+        firstErrorLine(io_failure).?,
+    );
+    const parse_failure = "x.zig:1:1: error: expected ';'\n";
+    try std.testing.expectEqualStrings(
+        "x.zig:1:1: error: expected ';'",
+        firstErrorLine(parse_failure).?,
+    );
+    // A needs-format list line is a bare path: no marker, even when the
+    // path carries the "error:" substring.
+    try std.testing.expect(firstErrorLine("/x/proj/error:dir/needsfmt.zig\n") == null);
+    try std.testing.expect(firstErrorLine("note: no error here\n") == null);
+    // A list line above a real diagnostic does not mask the diagnostic.
+    const mixed = "/x/proj/error:dir/needsfmt.zig\nx.zig:1:1: error: bad\n";
+    try std.testing.expectEqualStrings("x.zig:1:1: error: bad", firstErrorLine(mixed).?);
 }
 
 test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {
@@ -30092,6 +30235,53 @@ test "runRuntimeAnalysis reports ZR104 for a nonzero exit with no diagnostics" {
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expectEqualStrings("command failed", issues.items[0].message);
+}
+
+test "runRuntimeAnalysis frees the partial findings list on a mid-parse failure" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    global_io = std.testing.io;
+    defer global_io = null;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // EPH-I0767: located findings on both streams force payload
+    // allocations in both parsers, so an allocation failure mid-parse
+    // unwinds holding a partial list of owned findings.
+    const script_body =
+        \\echo 'thread 1 panic: boom at /x/proj/src/main.zig:42 now'
+        \\echo 'double free at /y/proj/src/lib.zig:9:3' >&2
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "emit.sh", .data = script_body });
+    const script = try tmpFilePath(allocator, &tmp, "emit.sh");
+    defer allocator.free(script);
+    const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
+    defer allocator.free(cmd);
+
+    // Measure the cold-run allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run), the IgnoreCache
+    // sweep pattern.
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var issues = try runRuntimeAnalysis(probe.allocator(), ".", false, cmd);
+        deinitIssues(&issues, probe.allocator());
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        if (runRuntimeAnalysis(failing.allocator(), ".", false, cmd)) |issues| {
+            var list = issues;
+            deinitIssues(&list, failing.allocator());
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Byte balance at every failure point is the leak proof. Pre-fix
+        // the mid-parse indices drop the partial list (EPH-I0767).
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 // ============================================================================

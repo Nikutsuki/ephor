@@ -26040,12 +26040,42 @@ fn scanMultiEntryDirs(
     }
 }
 
+/// True when the scan target names a regular file. Mirrors scanPath's
+/// file/directory split so entry detection and the scan agree on the
+/// target shape. A stat failure reads as a directory, so a missing target
+/// keeps the clear-and-repopulate behavior (fail closed toward it).
+fn isFileTarget(diag: *DiagCtx, path: []const u8) bool {
+    const stat = Fs.cwd(diag.io).statFile(path) catch return false;
+    return stat.kind == .file;
+}
+
+/// True when dir realpaths to the invocation cwd. Its ephor.json is the
+/// config parseArgs already loaded, so a parent-fallback load from it can
+/// only re-parse entries the run already honors (EPH-I0801 shape 3).
+fn isCwdDir(diag: *DiagCtx, dir: []const u8) bool {
+    var dir_buf: [Fs.max_path_bytes]u8 = undefined;
+    var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
+    const dir_real = Fs.cwd(diag.io).realpath(dir, &dir_buf) catch return false;
+    const cwd_real = Fs.cwd(diag.io).realpath(".", &cwd_buf) catch return false;
+    return mem.eql(u8, dir_real, cwd_real);
+}
+
 fn detectTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
+    // EPH-I0801: a file target has no target tree to switch into, so it
+    // takes its own path below. A directory target switches project
+    // context: the target tree's own entries replace the cwd config's.
+    if (isFileTarget(diag, cfg.path)) return detectFileTargetEntries(diag, allocator, cfg);
     for (cfg.entries.items) |e| allocator.free(e);
     cfg.entries.clearRetainingCapacity();
     try loadConfigFromTargetPath(diag, allocator, cfg, cfg.path);
     if (cfg.entries.items.len > 0) return;
+    try scanTargetTreeEntries(diag, allocator, cfg);
+}
 
+/// Discover entries in the target tree: conventional entry files, the
+/// target's and parent's build.zig extractions, and the conventional
+/// multi-entry directories. Runs when no config produced entries.
+fn scanTargetTreeEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     var added = std.StringHashMap(void).init(allocator);
     defer added.deinit();
 
@@ -26073,6 +26103,64 @@ fn detectTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
         "note: ignoring {d} outside-root entries extracted from target tree {s}\n",
         .{ .path = cfg.path, .dropped = dropped_entries },
     );
+}
+
+/// True when entries already lists entry (textual).
+fn containsEntry(entries: []const []const u8, entry: []const u8) bool {
+    for (entries) |e| {
+        if (mem.eql(u8, e, entry)) return true;
+    }
+    return false;
+}
+
+/// EPH-I0801 file-target entry detection. A file target has no target
+/// tree to switch into, so the cwd config's entries stay honored (the
+/// I0784 scan is the CLI path UNION the honored entries — clearing them
+/// here errored a config-only project with "no entry points found"). The
+/// kept entries move OUT of cfg.entries while the parent-config load
+/// runs: makeEntriesAbsolute rebases and gates every listed entry against
+/// that config's directory and the scan root, a pass scoped to the
+/// config's own entries. Left in place, a kept entry rebased onto the
+/// parent dir or dropped against the file path (reviewer r1 shapes).
+fn detectFileTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
+    // The move gives `kept` the whole list buffer; cfg.entries starts
+    // empty, so the load owns every string it appends.
+    var kept = cfg.entries;
+    cfg.entries = .empty;
+    // Whatever survives in `kept` was re-discovered by the load. The
+    // buffer and its remaining strings die here, on success and on error.
+    defer {
+        for (kept.items) |e| allocator.free(e);
+        kept.deinit(allocator);
+    }
+    if (std.fs.path.dirname(cfg.path)) |parent| {
+        // A parent dir that IS the cwd carries the config parseArgs
+        // already loaded: re-parsing it only duplicates the kept entries
+        // under a rebased spelling.
+        if (!isCwdDir(diag, parent))
+            try loadConfigFromTargetPath(diag, allocator, cfg, cfg.path);
+    }
+    // Tree-scan discovery stays the no-entries fallback. Every candidate
+    // gates against the file path, so with honored entries in hand the
+    // scan yields only drop-notes.
+    if (cfg.entries.items.len == 0 and kept.items.len == 0)
+        try scanTargetTreeEntries(diag, allocator, cfg);
+    // Re-append the kept entries the load did not re-discover. Capacity
+    // first: one fallible call, so the move loop cannot fail with
+    // ownership half-moved.
+    try cfg.entries.ensureUnusedCapacity(allocator, kept.items.len);
+    var remaining: usize = 0;
+    for (kept.items) |e| {
+        if (containsEntry(cfg.entries.items, e)) {
+            kept.items[remaining] = e;
+            remaining += 1;
+            continue;
+        }
+        cfg.entries.appendAssumeCapacity(e);
+    }
+    // Moved entries sit past the new length, so the deferred cleanup
+    // frees only the duplicates.
+    kept.shrinkRetainingCapacity(remaining);
 }
 
 /// Extract entry points from build.zig by parsing common patterns.
@@ -26694,15 +26782,46 @@ fn parseFailOnArg(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
 }
 
 /// Shared context for CLI argument parsing (EPH-I0771): the run
-/// diagnostics context, the config under construction, and the latch that
-/// records whether any --entry flag arrived (the first one clears the
-/// config-file entries).
+/// diagnostics context, the config under construction, and the latches
+/// that record whether any --entry flag arrived (the first one clears the
+/// config-file entries) and whether a positional already set the scan
+/// path (a second one is a usage error, EPH-I0807).
 const CliParseCtx = struct {
     diag: *DiagCtx,
     allocator: Allocator,
     cfg: *Config,
     cli_entries: *bool,
+    cli_path: *bool,
 };
+
+/// Strip leading "./" components: "./x" and "x" name the same file, and
+/// one spelling keeps a config entry and the scan path from aliasing one
+/// file under two graph keys (EPH-I0801 shape 3). Only the leading chain
+/// sheds: "../x" and ".hidden" stay untouched. A bare "./" stays: the
+/// trailing-slash trim turns it into ".".
+fn stripDotSlashPrefix(path: []const u8) []const u8 {
+    var p = path;
+    while (p.len > 2 and p[0] == '.' and p[1] == '/') p = p[2..];
+    return p;
+}
+
+/// Accept one positional scan path. A second positional is a hard usage
+/// error (EPH-I0807): last-wins parsing silently dropped every earlier
+/// path, so `check a/ b/` scanned only b/. Fail closed like an unknown
+/// flag — one run scans one path. A config-file path_dir does NOT set the
+/// latch: the CLI path still takes priority over it.
+fn acceptPositionalPath(ctx: CliParseCtx, path: []const u8) !void {
+    if (ctx.cli_path.*) {
+        cliDiag(
+            ctx.diag,
+            "error: unexpected extra scan path '{s}': one path per run (see ephor --help)\n",
+            .{path},
+        );
+        return error.ExtraScanPath;
+    }
+    try setOwnedPath(ctx.allocator, ctx.cfg, stripDotSlashPrefix(path));
+    ctx.cli_path.* = true;
+}
 
 /// Parse one CLI argument. Fail closed on malformed input (EPH-I0233/34):
 /// an empty element is a hard usage error, never an index panic, and an
@@ -26722,7 +26841,7 @@ fn parseCliArg(ctx: CliParseCtx, arg: []const u8) !void {
     if (try handleListArg(ctx, arg)) return;
     if (try handleOptionalPathArg(ctx.allocator, arg, ctx.cfg)) return;
     if (arg[0] != '-') {
-        try setOwnedPath(ctx.allocator, ctx.cfg, arg);
+        try acceptPositionalPath(ctx, arg);
         return;
     }
     cliDiag(ctx.diag, "error: unknown flag '{s}' (see ephor --help)\n", .{arg});
@@ -26790,11 +26909,13 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     errdefer cfg.deinit(allocator);
     try loadConfigFile(diag, allocator, &cfg);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
@@ -26804,7 +26925,9 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
             // parser, which rejects what it cannot match (EPH-I0233/34).
             try parseCliArg(cli_ctx, cmd);
         } else {
-            try setOwnedPath(allocator, &cfg, cmd);
+            // A bare path implies the check command (ephor <path>). It goes
+            // through the same one-path latch as the flag-parser positionals.
+            try acceptPositionalPath(cli_ctx, cmd);
             cfg.command = .check;
         }
     }
@@ -58423,11 +58546,13 @@ test "CLI --strict sets the warning gate" {
     var diag = testDiagCtx();
     var cfg = testConfig();
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--strict");
     try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
@@ -58438,11 +58563,13 @@ test "CLI --fail-on overrides config strict" {
     var cfg = testConfig();
     try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--fail-on=error");
     try std.testing.expectEqual(FailOn.err, cfg.fail_on);
@@ -58453,11 +58580,13 @@ test "CLI --fail-on=never can override config strict off" {
     var cfg = testConfig();
     try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--fail-on=never");
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
@@ -58469,11 +58598,13 @@ test "CLI invalid --fail-on value is a hard usage error" {
     diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try std.testing.expectError(
         error.InvalidFailOnValue,
@@ -58513,11 +58644,13 @@ test "second config load (target dir) cannot clobber the CLI" {
     var cfg = testConfig();
     try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--fail-on=never");
     // Target-dir ephor.json loads AFTER CLI args in parseArgs
@@ -58547,11 +58680,13 @@ test "same source resolves last-wins" {
     try std.testing.expectEqual(FailOn.note, cfg.fail_on);
 
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--strict");
     try parseCliArg(cli_ctx, "--fail-on=error");
@@ -58822,12 +58957,14 @@ test "CLI --trust-target-config sets the trust flag" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     try std.testing.expect(!cfg.trust_target_config);
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--trust-target-config");
     try std.testing.expect(cfg.trust_target_config);
@@ -58839,12 +58976,14 @@ test "CLI --force sets force_upgrade" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     try std.testing.expect(!cfg.force_upgrade);
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--force");
     try std.testing.expect(cfg.force_upgrade);
@@ -58986,6 +59125,275 @@ test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
     // 1 drop from the extraction run produces exactly one note.
     try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_count);
     try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
+}
+
+test "file target keeps the cwd config's entries (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // Regression: detectTargetEntries cleared the cwd config's entries and
+    // repopulated only from the target tree. A file target has no tree, so
+    // a project whose only entries come from the cwd config errored
+    // "no entry points found" on `check sub/foo.zig`. The I0784 scan is the
+    // CLI path UNION the honored entries, so the file target keeps them.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "proj/sub");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "proj/sub/foo.zig",
+        .data = "pub fn foo() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const file_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/proj/sub/foo.zig",
+        .{tmp_path},
+    );
+    defer allocator.free(file_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, file_path);
+    // The cwd config's entry, as loadConfigFile leaves it (relative).
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
+    // The kept entry sits outside the file path, so the I0784
+    // entries-widen note fires downstream under its existing logic.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOutOfRootEntries(cfg.path, cfg.entries.items),
+    );
+}
+
+test "directory target still replaces the cwd config's entries (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // Contrast pin for the file-target fix: a directory target switches
+    // project context, so the target tree's entries replace the cwd
+    // config's (the cross-project scan semantic stays).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "target/src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "target/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const target_path = try std.fmt.allocPrint(allocator, "{s}/target", .{tmp_path});
+    defer allocator.free(target_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, target_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "stale.zig"));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    const want_entry = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{target_path});
+    defer allocator.free(want_entry);
+    try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
+}
+
+/// Build the EPH-I0801 reviewer sandbox in tmp: proj/main.zig,
+/// proj/sub/foo.zig, and (when given) proj/sub/ephor.json with the given
+/// content. Returns the owned absolute path of the file target.
+fn writeFileTargetSandbox(
+    allocator: Allocator,
+    tmp: *std.testing.TmpDir,
+    parent_config: ?[]const u8,
+) ![]u8 {
+    try tmp.dir.createDirPath(std.testing.io, "proj/sub");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "proj/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "proj/sub/foo.zig",
+        .data = "pub fn foo() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, tmp);
+    defer allocator.free(tmp_path);
+    const sub_path = try std.fmt.allocPrint(allocator, "{s}/proj/sub", .{tmp_path});
+    defer allocator.free(sub_path);
+    if (parent_config) |content| try writeTestConfig(sub_path, content);
+    return std.fmt.allocPrint(allocator, "{s}/proj/sub/foo.zig", .{tmp_path});
+}
+
+test "file target keeps the cwd config's entries past an untrusted parent config (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // Reviewer r1 shape 1: the kept entry rode through the parent config's
+    // makeEntriesAbsolute, rebased onto sub/ and dropped at the I0195 gate
+    // with the drop misattributed to the untrusted config. The run then
+    // errored "no entry points found" — the I0801 symptom undelivered.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file_path = try writeFileTargetSandbox(allocator, &tmp, "{}");
+    defer allocator.free(file_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, file_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
+    // The kept entry never entered the gate: nothing dropped, so no
+    // rejection note can misattribute it to the parent config.
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_note_count);
+}
+
+test "file target attributes only the parent config's own drops (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // The untrusted parent config's OWN entries still gate against the
+    // file path and drop with the note naming that config. The kept cwd
+    // entries stay out of that pass and survive.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file_path = try writeFileTargetSandbox(
+        allocator,
+        &tmp,
+        "{\"entries\": [\"evil.zig\"]}",
+    );
+    defer allocator.free(file_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, file_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
+}
+
+test "file target keeps the cwd config's entries past a trusted parent config (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // Reviewer r1 shape 2: with --trust-target-config the rebased phantom
+    // "sub/main.zig" survived the gate, so the scan silently narrowed to
+    // the file alone while the widen note claimed a join.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file_path = try writeFileTargetSandbox(allocator, &tmp, "{}");
+    defer allocator.free(file_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.trust_target_config = true;
+    try setOwnedPath(allocator, &cfg, file_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
+}
+
+test "file target unions a trusted parent config's entries (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // The union holds both ways: a trusted parent config's entries join
+    // the scan, and the kept cwd entries survive unchanged after them.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file_path = try writeFileTargetSandbox(
+        allocator,
+        &tmp,
+        "{\"entries\": [\"bar.zig\"]}",
+    );
+    defer allocator.free(file_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.trust_target_config = true;
+    try setOwnedPath(allocator, &cfg, file_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
+    const parent_dir = std.fs.path.dirname(file_path).?;
+    const want_parent = try std.fmt.allocPrint(allocator, "{s}/bar.zig", .{parent_dir});
+    defer allocator.free(want_parent);
+    try std.testing.expectEqualStrings(want_parent, cfg.entries.items[0]);
+    try std.testing.expectEqualStrings("main.zig", cfg.entries.items[1]);
+}
+
+test "file target survives a dot-slash-infix parent config load (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // Reviewer r1 shape 3 at the parse layer: a "./"-carrying parent dir
+    // makes the loader re-parse that dir's config with the kept entries
+    // still listed, rebasing and gating entries it does not own. The kept
+    // set must survive unchanged.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const plain_path = try writeFileTargetSandbox(allocator, &tmp, "{}");
+    defer allocator.free(plain_path);
+    const file_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/./foo.zig",
+        .{std.fs.path.dirname(plain_path).?},
+    );
+    defer allocator.free(file_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, file_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_count);
+}
+
+test "isCwdDir names the invocation cwd only (EPH-I0801)" {
+    var diag = testDiagCtx();
+    try std.testing.expect(isCwdDir(&diag, "."));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(tmp_path);
+    try std.testing.expect(!isCwdDir(&diag, tmp_path));
+}
+
+test "CLI positional path sheds a leading ./ (EPH-I0801)" {
+    var diag = testDiagCtx();
+    // "./x" and "x" name the same file. One spelling keeps a config entry
+    // and the scan path from aliasing one file under two graph keys (the
+    // shape-3 double-scan). Only the leading chain sheds: "../x" and
+    // ".hidden" stay untouched.
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    var cli_path = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+    };
+    try parseCliArg(cli_ctx, "./main.zig");
+    try std.testing.expectEqualStrings("main.zig", cfg.path);
 }
 
 /// Build the OOM-sweep fixture Config: one gate-rejecting absolute entry
@@ -59434,11 +59842,13 @@ test "CLI threshold flags clamp at the documented maxima (RED3-6)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--max-lines=999999999");
     try std.testing.expectEqual(@as(usize, 100_000), cfg.thresholds.max_function_lines);
@@ -59454,11 +59864,13 @@ test "CLI threshold flags beat config-file thresholds (RED3-6)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--max-lines=50");
     try parseConfigJson(
@@ -59485,11 +59897,13 @@ test "CLI empty argument is a hard usage error (EPH-I0233)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try std.testing.expectError(
         error.EmptyArgument,
@@ -59508,17 +59922,78 @@ test "CLI unknown flags are a hard usage error (EPH-I0234)" {
         var cfg = testConfig();
         defer cfg.deinit(allocator);
         var cli_entries = false;
+        var cli_path = false;
         const cli_ctx: CliParseCtx = .{
             .diag = &diag,
             .allocator = allocator,
             .cfg = &cfg,
             .cli_entries = &cli_entries,
+            .cli_path = &cli_path,
         };
         try std.testing.expectError(
             error.UnknownFlag,
             parseCliArg(cli_ctx, flag),
         );
     }
+}
+
+test "CLI a second positional path is a hard usage error (EPH-I0807)" {
+    var diag = testDiagCtx();
+    // Regression: every positional went through setOwnedPath, so the last
+    // path silently overwrote the earlier ones — `check swD/ two-arms/`
+    // scanned only two-arms/ and exited 0 while swD/ carried a ZA106.
+    // Both orders must fail closed: one run scans one path.
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    const orders = [_][2][]const u8{
+        .{ "swD/", "two-arms/" },
+        .{ "two-arms/", "swD/" },
+    };
+    for (orders) |order| {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var cli_entries = false;
+        var cli_path = false;
+        const cli_ctx: CliParseCtx = .{
+            .diag = &diag,
+            .allocator = allocator,
+            .cfg = &cfg,
+            .cli_entries = &cli_entries,
+            .cli_path = &cli_path,
+        };
+        try parseCliArg(cli_ctx, order[0]);
+        try std.testing.expectError(
+            error.ExtraScanPath,
+            parseCliArg(cli_ctx, order[1]),
+        );
+        // The rejected path must not clobber the accepted one.
+        try std.testing.expectEqualStrings(order[0], cfg.path);
+    }
+}
+
+test "CLI flags and config path_dir do not arm the one-path latch (EPH-I0807)" {
+    var diag = testDiagCtx();
+    // Guard against over-reach: a config-file path_dir must not arm the
+    // latch (the CLI path still takes priority over it), and flags after
+    // the positional still parse.
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"src\"}", &cfg);
+    var cli_entries = false;
+    var cli_path = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+    };
+    try parseCliArg(cli_ctx, "sub/foo.zig");
+    try std.testing.expectEqualStrings("sub/foo.zig", cfg.path);
+    try parseCliArg(cli_ctx, "--summary");
+    try std.testing.expect(cfg.show_summary);
 }
 
 test "CLI every documented flag still parses (EPH-I0234)" {
@@ -59531,6 +60006,7 @@ test "CLI every documented flag still parses (EPH-I0234)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     const documented = [_][]const u8{
         "--entry=src/main.zig",  "--format=text",            "-f=json",
         "--disable=ZA301",       "--enable=ZA305",           "--max-lines=60",
@@ -59548,6 +60024,7 @@ test "CLI every documented flag still parses (EPH-I0234)" {
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     for (documented) |flag| try parseCliArg(cli_ctx, flag);
     try std.testing.expect(cfg.verbose);
@@ -59583,11 +60060,13 @@ test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try std.testing.expectError(
         error.EmptyRulePattern,
@@ -59631,11 +60110,13 @@ test "CLI malformed threshold value is a hard usage error (EPH-I0237)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try std.testing.expectError(
         error.InvalidThresholdValue,
@@ -59656,11 +60137,13 @@ test "CLI valid threshold value parses and locks (EPH-I0237)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    var cli_path = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
     };
     try parseCliArg(cli_ctx, "--max-lines=80");
     try std.testing.expectEqual(@as(usize, 80), cfg.thresholds.max_function_lines);

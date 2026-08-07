@@ -248,6 +248,12 @@ note: ignoring <N> outside-root entries extracted from target tree <path>
 
 Operator channels stay exempt: `--entry`, a trusted config's `entries`, and the working directory's own build.zig may point outside the scan root. Orphan detection then stays complete for files the scan root does not cover.
 
+The `check` scan covers the CLI path and every honored entry point. An entry outside the CLI path joins the scan as an extra root. A targeted run such as `ephor check src/foo.zig` also scans those entry files. The summary's Files count reflects the union. Ephor prints one note when the entries widen the scan:
+
+```
+note: scan includes <N> entry points outside <path> (entry points always join the scan)
+```
+
 A target config's `path_dir` is containment-checked and then discarded. The scan root comes from the CLI path, the trusted working-directory config, or auto-detection.
 
 The `.ephor-ignore` auto-load honors the same trust decision. Ephor refuses an untrusted file with one skip note:

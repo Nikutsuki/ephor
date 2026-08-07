@@ -210,6 +210,10 @@ var untrusted_ignore_skip_count: usize = 0;
 /// assert the note fired when skipped > 0 (stderr is muted in tests).
 var ast_skip_note_count: usize = 0;
 
+/// Test hook: counts entries-widen-scan notes (EPH-I0784). Tests reset it
+/// to assert the note fired (or stayed silent) with stderr muted.
+var entries_widen_note_count: usize = 0;
+
 /// Resident-content budget for the corpus warning (EPH-I0199). Real
 /// monorepos sit far below 1 GiB of Zig source. Hostile amplification
 /// (thousands of near-10 MB files) crosses it. A var, not a const, so
@@ -243,6 +247,7 @@ fn resetTestGlobals() void {
     known_issues_autoload_count = 0;
     untrusted_ignore_skip_count = 0;
     ast_skip_note_count = 0;
+    entries_widen_note_count = 0;
     corpus_warn_count = 0;
 }
 
@@ -28143,6 +28148,7 @@ fn handleCheck(ctx: *RunCtx) !void {
 /// entry files outside it, then mark reachability.
 fn buildCheckGraph(ctx: *const RunCtx, g: *ImportGraph) !void {
     try scanPath(g, ctx.cfg.path);
+    try noteEntriesWidenScan(ctx.alloc, ctx.cfg.path, ctx.cfg.entries.items);
     // Entry-point files outside the scanned path still feed orphan
     // detection when checking subdirectories.
     for (ctx.cfg.entries.items) |e| scanOutOfRootEntry(ctx, g, e);
@@ -28166,6 +28172,42 @@ fn scanOutOfRootEntry(ctx: *const RunCtx, g: *ImportGraph, entry: []const u8) vo
 fn noteMissingEntry(cfg: *const Config, entry: []const u8, err: anyerror) void {
     if (!cfg.verbose) return;
     std.debug.print("note: entry {s} not found: {}\n", .{ entry, err });
+}
+
+/// Count the entry points the out-of-root scan pulls in (EPH-I0784): the
+/// .zig entries the scan path does not cover. Mirrors the two gates
+/// between an entry and the graph — scanOutOfRootEntry's textual boundary
+/// and scanSingleFile's .zig filter — so the count and the scan agree.
+fn countOutOfRootEntries(scan_path: []const u8, entries: []const []const u8) usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (isPathAncestorOrEqual(scan_path, entry)) continue;
+        if (!mem.endsWith(u8, entry, ".zig")) continue;
+        count += 1;
+    }
+    return count;
+}
+
+/// EPH-I0784 scan-shape note: the check scan is the CLI path UNION the
+/// entry points (the join is intended). Fires only when at least one .zig
+/// entry sits outside the scan path, so a run the CLI path already covers
+/// stays silent. The path crosses the terminal sanitizer: it can derive
+/// from a config file (EPH-I0147).
+fn noteEntriesWidenScan(
+    allocator: Allocator,
+    scan_path: []const u8,
+    entries: []const []const u8,
+) !void {
+    const widened = countOutOfRootEntries(scan_path, entries);
+    if (widened == 0) return;
+    entries_widen_note_count += 1;
+    var safe_path = try types.sanitizeTerminal(allocator, scan_path);
+    defer safe_path.deinit(allocator);
+    cliDiag(
+        "note: scan includes {d} entry point{s} outside {s} " ++
+            "(entry points always join the scan)\n",
+        .{ widened, if (widened == 1) @as([]const u8, "") else "s", safe_path.slice },
+    );
 }
 
 /// Run every analyzer over the graph and merge the auxiliary lists
@@ -28818,6 +28860,41 @@ test "AST skip note fires only when files were skipped" {
     try std.testing.expectEqual(@as(usize, 0), ast_skip_note_count);
     noteAstTierSkips(.{ .parsed = 3, .skipped = 2 });
     try std.testing.expectEqual(@as(usize, 1), ast_skip_note_count);
+}
+
+test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-I0784)" {
+    // The scan path covers its own tree: nothing joins.
+    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries("src", &.{}));
+    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries("src", &.{"src/main.zig"}));
+    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries(
+        "src/main.zig",
+        &.{"src/main.zig"},
+    ));
+    // Out-of-root .zig entries join. A non-.zig name never reaches the
+    // graph (scanSingleFile filter), so it does not count.
+    try std.testing.expectEqual(@as(usize, 2), countOutOfRootEntries(
+        "src",
+        &.{ "build.zig", "tools/gen.zig", "README.md" },
+    ));
+    // Component boundary (RED4-3): a sibling prefix is outside, not inside.
+    try std.testing.expectEqual(@as(usize, 1), countOutOfRootEntries("src", &.{"src-evil/x.zig"}));
+}
+
+test "entries-widen note fires only when entries add scan roots (EPH-I0784)" {
+    resetTestGlobals();
+    defer resetTestGlobals();
+    cli_diagnostics_enabled = false;
+    defer cli_diagnostics_enabled = true;
+    const allocator = std.testing.allocator;
+
+    // Entries the scan path already covers add nothing: the note stays
+    // silent.
+    try noteEntriesWidenScan(allocator, "src", &.{"src/main.zig"});
+    try std.testing.expectEqual(@as(usize, 0), entries_widen_note_count);
+    // Two out-of-root entries (the EPH-I0784 probe shape: check
+    // src/types.zig from the repo root) fire the note once.
+    try noteEntriesWidenScan(allocator, "src/types.zig", &.{ "src/main.zig", "build.zig" });
+    try std.testing.expectEqual(@as(usize, 1), entries_widen_note_count);
 }
 
 test "corpus warning fires once when resident bytes cross the threshold" {
@@ -59641,6 +59718,7 @@ test "canary: no test leaks shared global state (EPH-I0291)" {
     try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
     try std.testing.expectEqual(@as(usize, 0), untrusted_ignore_skip_count);
     try std.testing.expectEqual(@as(usize, 0), ast_skip_note_count);
+    try std.testing.expectEqual(@as(usize, 0), entries_widen_note_count);
     try std.testing.expectEqual(@as(usize, 0), corpus_warn_count);
     try std.testing.expect(global_io == null);
     try std.testing.expect(cli_diagnostics_enabled);

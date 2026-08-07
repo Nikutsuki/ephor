@@ -23,64 +23,71 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 
 /// Compatibility layer for std.fs APIs removed in Zig 0.16.0.
+/// The I/O handle arrives through cwd(): no file-scope global (EPH-I0771).
 const Fs = struct {
     pub const path = std.Io.Dir.path;
     pub const max_path_bytes = std.Io.Dir.max_path_bytes;
     pub const Dir = CompatDir;
 
-    pub fn cwd() CompatDir {
-        return .{};
+    pub fn cwd(io: std.Io) CompatDir {
+        return .{ .io = io };
     }
 
     pub const CompatDir = struct {
-        pub fn access(_: CompatDir, sub_path: []const u8, options: std.Io.Dir.AccessOptions) !void {
-            return std.Io.Dir.cwd().access(global_io.?, sub_path, options);
+        io: std.Io,
+
+        pub fn access(
+            self: CompatDir,
+            sub_path: []const u8,
+            options: std.Io.Dir.AccessOptions,
+        ) !void {
+            return std.Io.Dir.cwd().access(self.io, sub_path, options);
         }
         pub fn openFile(
-            _: CompatDir,
+            self: CompatDir,
             sub_path: []const u8,
             options: std.Io.Dir.OpenFileOptions,
         ) !std.Io.File {
-            return std.Io.Dir.cwd().openFile(global_io.?, sub_path, options);
+            return std.Io.Dir.cwd().openFile(self.io, sub_path, options);
         }
         pub fn openDir(
-            _: CompatDir,
+            self: CompatDir,
             sub_path: []const u8,
             options: std.Io.Dir.OpenOptions,
         ) !std.Io.Dir {
-            return std.Io.Dir.cwd().openDir(global_io.?, sub_path, options);
+            return std.Io.Dir.cwd().openDir(self.io, sub_path, options);
         }
         pub fn readFileAlloc(
-            _: CompatDir,
+            self: CompatDir,
             allocator: Allocator,
             sub_path: []const u8,
             max_bytes: usize,
         ) ![]u8 {
             const limit: std.Io.Limit = .limited(max_bytes);
-            return std.Io.Dir.cwd().readFileAlloc(global_io.?, sub_path, allocator, limit);
+            return std.Io.Dir.cwd().readFileAlloc(self.io, sub_path, allocator, limit);
         }
         pub fn createFile(
-            _: CompatDir,
+            self: CompatDir,
             sub_path: []const u8,
             flags: std.Io.Dir.CreateFileOptions,
         ) !std.Io.File {
-            return std.Io.Dir.cwd().createFile(global_io.?, sub_path, flags);
+            return std.Io.Dir.cwd().createFile(self.io, sub_path, flags);
         }
-        pub fn statFile(_: CompatDir, sub_path: []const u8) !std.Io.Dir.Stat {
-            return std.Io.Dir.cwd().statFile(global_io.?, sub_path, .{});
+        pub fn statFile(self: CompatDir, sub_path: []const u8) !std.Io.Dir.Stat {
+            return std.Io.Dir.cwd().statFile(self.io, sub_path, .{});
         }
-        pub fn realpath(_: CompatDir, sub_path: []const u8, out_buffer: []u8) ![]u8 {
-            const n = try std.Io.Dir.cwd().realPathFile(global_io.?, sub_path, out_buffer);
+        pub fn realpath(self: CompatDir, sub_path: []const u8, out_buffer: []u8) ![]u8 {
+            const n = try std.Io.Dir.cwd().realPathFile(self.io, sub_path, out_buffer);
             return out_buffer[0..n];
         }
-        pub fn realpathAlloc(_: CompatDir, allocator: Allocator, sub_path: []const u8) ![:0]u8 {
-            return std.Io.Dir.cwd().realPathFileAlloc(global_io.?, sub_path, allocator);
+        pub fn realpathAlloc(self: CompatDir, allocator: Allocator, sub_path: []const u8) ![:0]u8 {
+            return std.Io.Dir.cwd().realPathFileAlloc(self.io, sub_path, allocator);
         }
         pub fn iterate(_: CompatDir) std.Io.Dir.Iterator {
             return std.Io.Dir.cwd().iterate();
         }
         pub fn writeFile(
-            _: CompatDir,
+            self: CompatDir,
             sub_path: []const u8,
             data: []const u8,
             flags: std.Io.Dir.CreateFileOptions,
@@ -90,13 +97,10 @@ const Fs = struct {
                 .data = data,
                 .flags = flags,
             };
-            return std.Io.Dir.cwd().writeFile(global_io.?, opts);
+            return std.Io.Dir.cwd().writeFile(self.io, opts);
         }
     };
 };
-
-/// Global I/O handle for child process and file operations.
-var global_io: ?std.Io = null;
 
 /// Spawn paths for the external tools ephor executes (EPH-I0154). main
 /// resolves them once from the EPHOR_ZIG_PATH / EPHOR_CURL_PATH env
@@ -131,17 +135,19 @@ const ToolKind = enum {
 /// and PATH. The fallback is fail-open with a warning, not a hard error:
 /// the threat is a hostile environment, which the operator controls, and a
 /// path typo must not brick the run.
-fn resolveToolFromEnv(io: std.Io, tool: ToolKind, env_val: ?[]const u8) []const u8 {
+fn resolveToolFromEnv(diag: *const DiagCtx, tool: ToolKind, env_val: ?[]const u8) []const u8 {
     const val = env_val orelse return tool.bareName();
     if (!std.fs.path.isAbsolute(val)) {
         cliDiag(
+            diag,
             "warning: ignoring {s} value '{s}' (not an absolute path). Using PATH.\n",
             .{ tool.envVar(), val },
         );
         return tool.bareName();
     }
-    std.Io.Dir.cwd().access(io, val, .{}) catch {
+    std.Io.Dir.cwd().access(diag.io, val, .{}) catch {
         cliDiag(
+            diag,
             "warning: {s} path '{s}' does not resolve. Using PATH.\n",
             .{ tool.envVar(), val },
         );
@@ -151,104 +157,72 @@ fn resolveToolFromEnv(io: std.Io, tool: ToolKind, env_val: ?[]const u8) []const 
 }
 
 /// Resolve every tool spawn path once from the process environment.
-fn initToolPaths(io: std.Io, environ_map: *const std.process.Environ.Map) void {
-    tool_zig_path = resolveToolFromEnv(io, .zig, environ_map.get("EPHOR_ZIG_PATH"));
-    tool_curl_path = resolveToolFromEnv(io, .curl, environ_map.get("EPHOR_CURL_PATH"));
+fn initToolPaths(diag: *const DiagCtx, environ_map: *const std.process.Environ.Map) void {
+    tool_zig_path = resolveToolFromEnv(diag, .zig, environ_map.get("EPHOR_ZIG_PATH"));
+    tool_curl_path = resolveToolFromEnv(diag, .curl, environ_map.get("EPHOR_CURL_PATH"));
 }
 
-/// Test hook: zig build test's runner surfaces any stderr output as a step
-/// failure, so tests that exercise error paths mute parse diagnostics and
-/// assert on the resulting state instead of on the printed text.
-var cli_diagnostics_enabled = true;
+/// Diagnostics and I/O context for one ephor run (EPH-I0771). Replaces the
+/// file-scope test-hook globals: production main constructs one instance at
+/// startup and threads it. Tests construct a fresh instance per test and
+/// assert on the fields directly. No restore-at-exit and no canary: a
+/// per-instance value cannot leak across tests by construction.
+const DiagCtx = struct {
+    /// I/O handle for child-process and file operations.
+    io: std.Io,
+    /// Mutes cliDiag when false. zig build test's runner surfaces any
+    /// stderr output as a step failure, so tests that exercise error paths
+    /// mute parse diagnostics and assert on the resulting state instead of
+    /// on the printed text.
+    cli_diagnostics_enabled: bool = true,
+    /// Errno-style detail for error.InvalidFailOnValue out of config
+    /// parsing: the parse layer cannot know which ephor.json it is reading,
+    /// so it stashes the offending value here and the catch-site (which
+    /// knows the path) prints. Slice into the config content — valid until
+    /// that caller frees it.
+    last_bad_fail_on: ?[]const u8 = null,
+    /// "ignoring suppression/gate keys from untrusted" notes printed. One
+    /// per offending config file.
+    untrusted_config_note_count: usize = 0,
+    /// Rejected config path_dir values.
+    path_dir_reject_count: usize = 0,
+    /// Entries dropped by the EPH-I0195 containment gates (untrusted config
+    /// entries, target-tree build.zig extraction).
+    entries_reject_count: usize = 0,
+    /// Outside-root entry notes printed. The gates print one note per
+    /// config file or per extraction run, never per entry.
+    entries_reject_note_count: usize = 0,
+    /// zig fmt output lines the EPH-I0197 safety gates rejected (hostile
+    /// bytes, outside-root paths).
+    fmt_reject_count: usize = 0,
+    /// Threshold values clamped at the documented maxima.
+    threshold_clamp_count: usize = 0,
+    /// Suppression-accounting notes printed.
+    suppression_note_count: usize = 0,
+    /// ".ephor-ignore auto-load" notes. The explicit --known-issues path
+    /// stays silent by design (the user asked for it).
+    known_issues_autoload_count: usize = 0,
+    /// Refused untrusted .ephor-ignore auto-loads.
+    untrusted_ignore_skip_count: usize = 0,
+    /// AST-tier skip notes (EPH-I0200).
+    ast_skip_note_count: usize = 0,
+    /// Entries-widen-scan notes (EPH-I0784).
+    entries_widen_note_count: usize = 0,
+    /// Resident-content budget for the corpus warning (EPH-I0199). Real
+    /// monorepos sit far below 1 GiB of Zig source. Hostile amplification
+    /// (thousands of near-10 MB files) crosses it. A field, not a const, so
+    /// tests can shrink it on their own instance.
+    corpus_bytes_warn_threshold: usize = 1024 * 1024 * 1024,
+    /// Corpus-bytes warnings. Also the once-per-run guard: the warning is
+    /// edge-triggered, so a nonzero value means it already fired.
+    corpus_warn_count: usize = 0,
+};
 
-/// Errno-style detail for error.InvalidFailOnValue out of config parsing:
-/// the parse layer cannot know which ephor.json it is reading, so it stashes
-/// the offending value here and the catch-site (which knows the path) prints.
-/// Slice into the config content — valid until that caller frees it.
-var last_bad_fail_on: ?[]const u8 = null;
-
-/// Test hook: counts "ignoring suppression/gate keys from untrusted" notes
-/// printed this run. Tests reset it to assert the note fired exactly once
-/// per offending config file (stderr itself is muted in tests).
-var untrusted_config_note_count: usize = 0;
-
-/// Test hook: counts rejected config path_dir values. Tests reset it to
-/// assert a rejection fired (or stayed silent) without reading stderr.
-var path_dir_reject_count: usize = 0;
-
-/// Test hook: counts entries dropped by the EPH-I0195 containment gates
-/// (untrusted config entries, target-tree build.zig extraction). Tests
-/// reset it to assert rejections fired without reading stderr.
-var entries_reject_count: usize = 0;
-
-/// Test hook: counts outside-root entry notes printed this run. The gates
-/// print one note per config file or per extraction run, never per entry;
-/// tests reset it to pin that semantics with stderr muted.
-var entries_reject_note_count: usize = 0;
-
-/// Test hook: counts zig fmt output lines the EPH-I0197 safety gates
-/// rejected (hostile bytes, outside-root paths). Tests reset it to assert
-/// rejections fired without reading stderr.
-var fmt_reject_count: usize = 0;
-
-/// Test hook: counts threshold values clamped at the documented maxima.
-var threshold_clamp_count: usize = 0;
-
-/// Test hook: counts suppression-accounting notes printed this run. Tests
-/// reset it to assert the note fired (or stayed silent) with stderr muted.
-var suppression_note_count: usize = 0;
-
-/// Test hook: counts ".ephor-ignore auto-load" notes. The explicit
-/// --known-issues path stays silent by design (the user asked for it).
-var known_issues_autoload_count: usize = 0;
-
-/// Test hook: counts refused untrusted .ephor-ignore auto-loads. Tests
-/// reset it to assert the skip note fired (stderr is muted in tests).
-var untrusted_ignore_skip_count: usize = 0;
-
-/// Test hook: counts AST-tier skip notes (EPH-I0200). Tests reset it to
-/// assert the note fired when skipped > 0 (stderr is muted in tests).
-var ast_skip_note_count: usize = 0;
-
-/// Test hook: counts entries-widen-scan notes (EPH-I0784). Tests reset it
-/// to assert the note fired (or stayed silent) with stderr muted.
-var entries_widen_note_count: usize = 0;
-
-/// Resident-content budget for the corpus warning (EPH-I0199). Real
-/// monorepos sit far below 1 GiB of Zig source. Hostile amplification
-/// (thousands of near-10 MB files) crosses it. A var, not a const, so
-/// tests can shrink it — same pattern as the other test hooks.
-var corpus_bytes_warn_threshold: usize = 1024 * 1024 * 1024;
-
-/// Test hook: counts corpus-bytes warnings. Also the once-per-run guard:
-/// the warning is edge-triggered, so tests reset it to re-arm.
-var corpus_warn_count: usize = 0;
-
-/// EPH-I0291 test-isolation seam. Restore the shared test-hook globals of
-/// the counter/io/diagnostic classes to their process-entry values. A test
-/// that touches any of these calls this at
-/// the start (in place of hand-resetting one counter each) and under defer
-/// at exit, so a missed restore fails the end-of-file canary instead of
-/// leaking state into the next test. corpus_bytes_warn_threshold is not
-/// reset here: its only writer saves and restores it inline. The fetch-seam
-/// globals (test_fetch_calls/test_fetch_result) reset at entry via
-/// resetFetchSeam on every consumer, so they carry no exit-restore here.
-fn resetTestGlobals() void {
-    global_io = null;
-    cli_diagnostics_enabled = true;
-    last_bad_fail_on = null;
-    untrusted_config_note_count = 0;
-    path_dir_reject_count = 0;
-    entries_reject_count = 0;
-    entries_reject_note_count = 0;
-    fmt_reject_count = 0;
-    threshold_clamp_count = 0;
-    suppression_note_count = 0;
-    known_issues_autoload_count = 0;
-    untrusted_ignore_skip_count = 0;
-    ast_skip_note_count = 0;
-    entries_widen_note_count = 0;
-    corpus_warn_count = 0;
+/// Test seam: a fresh diagnostics context on the testing I/O (EPH-I0771).
+/// Every test that touches the diagnostics surface constructs its own and
+/// asserts on its fields. Nothing is shared, so nothing needs restoring.
+fn testDiagCtx() DiagCtx {
+    return .{ .io = std.testing.io };
 }
 
 /// Read cap for Zig SOURCE files (EPH-I0150): the import graph's per-file
@@ -268,9 +242,9 @@ fn resetTestGlobals() void {
 /// not source reads.
 const max_source_file_bytes = 10 * 1024 * 1024;
 
-/// Print a CLI/config diagnostic unless tests have muted the channel.
-fn cliDiag(comptime fmt: []const u8, args: anytype) void {
-    if (!cli_diagnostics_enabled) return;
+/// Print a CLI/config diagnostic unless the run has muted the channel.
+fn cliDiag(diag: *const DiagCtx, comptime fmt: []const u8, args: anytype) void {
+    if (!diag.cli_diagnostics_enabled) return;
     std.debug.print(fmt, args);
 }
 
@@ -8278,6 +8252,9 @@ fn analyzeCFGErrdeferCoverage(
 
 const ImportGraph = struct {
     allocator: Allocator,
+    /// Run diagnostics context: I/O handle plus the note/warn counters the
+    /// corpus-budget guard bumps (EPH-I0771).
+    diag: *DiagCtx,
     files: std.StringHashMap(FileAnalysis),
     reachable: std.StringHashMap(void),
     /// Reverse index: resolved (realpath) → `files` key.
@@ -8305,9 +8282,10 @@ const ImportGraph = struct {
     /// freed in deinit.
     skipped_files: std.ArrayListUnmanaged([]const u8),
 
-    fn init(allocator: Allocator) ImportGraph {
+    fn init(allocator: Allocator, diag: *DiagCtx) ImportGraph {
         return .{
             .allocator = allocator,
+            .diag = diag,
             .files = std.StringHashMap(FileAnalysis).init(allocator),
             .reachable = std.StringHashMap(void).init(allocator),
             .resolved_to_key = .empty,
@@ -8364,11 +8342,11 @@ const ImportGraph = struct {
     }
 
     fn scanDirectory(self: *ImportGraph, dir_path: []const u8) !void {
-        var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
+        var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch |err| {
             reportScanOpenError(self.allocator, dir_path, err);
             return err;
         };
-        defer dir.close(global_io.?);
+        defer dir.close(self.diag.io);
         try self.scanRecursive(dir, dir_path, 0);
     }
 
@@ -8399,7 +8377,7 @@ const ImportGraph = struct {
     fn scanRecursive(self: *ImportGraph, dir: std.Io.Dir, base: []const u8, depth: u16) !void {
         if (depth > 32) return;
         var iter = dir.iterate();
-        while (try iter.next(global_io.?)) |entry| {
+        while (try iter.next(self.diag.io)) |entry| {
             const path = try std.fmt.allocPrint(
                 self.allocator,
                 "{s}/{s}",
@@ -8414,8 +8392,8 @@ const ImportGraph = struct {
                 },
                 .directory => {
                     defer self.allocator.free(path);
-                    var subdir = openSubdir(dir, entry.name) orelse continue;
-                    defer subdir.close(global_io.?);
+                    var subdir = openSubdir(self.diag.io, dir, entry.name) orelse continue;
+                    defer subdir.close(self.diag.io);
                     try self.scanRecursive(subdir, path, depth + 1);
                 },
                 else => self.allocator.free(path),
@@ -8425,9 +8403,9 @@ const ImportGraph = struct {
 
     /// Open one directory entry for descent, or null when the walk must
     /// skip it (skip-list name) or cannot open it (EPH-I0761).
-    fn openSubdir(dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
+    fn openSubdir(io: std.Io, dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
         if (isScanSkipDir(name)) return null;
-        return dir.openDir(global_io.?, name, .{ .iterate = true }) catch null;
+        return dir.openDir(io, name, .{ .iterate = true }) catch null;
     }
 
     /// Edge-triggered corpus-size warning (EPH-I0199). The graph holds
@@ -8436,11 +8414,12 @@ const ImportGraph = struct {
     /// crossing. The long-term fix is a resident budget with streaming or
     /// LRU eviction. The warning is this issue's scope.
     fn warnIfCorpusBytesCrossed(self: *ImportGraph) void {
-        if (corpus_warn_count > 0) return;
-        if (self.resident_bytes <= corpus_bytes_warn_threshold) return;
-        corpus_warn_count += 1;
+        if (self.diag.corpus_warn_count > 0) return;
+        if (self.resident_bytes <= self.diag.corpus_bytes_warn_threshold) return;
+        self.diag.corpus_warn_count += 1;
         const gib = self.resident_bytes / (1024 * 1024 * 1024);
         cliDiag(
+            self.diag,
             "warning: corpus content exceeds {d} GiB resident. " ++
                 "ephor keeps all file content in memory. " ++
                 "Scan subtrees separately on huge trees.\n",
@@ -8449,7 +8428,7 @@ const ImportGraph = struct {
     }
 
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
-        const content = Fs.cwd().readFileAlloc(
+        const content = Fs.cwd(self.diag.io).readFileAlloc(
             self.allocator,
             file_path,
             max_source_file_bytes,
@@ -8467,7 +8446,7 @@ const ImportGraph = struct {
         const path_copy = try self.allocator.dupe(u8, file_path);
         const resolved_copy = blk: {
             var buf: [Fs.max_path_bytes]u8 = undefined;
-            const r = Fs.cwd().realpath(file_path, &buf) catch {
+            const r = Fs.cwd(self.diag.io).realpath(file_path, &buf) catch {
                 break :blk path_copy;
             };
             break :blk self.allocator.dupe(u8, r) catch path_copy;
@@ -8734,14 +8713,14 @@ const ImportGraph = struct {
 
         // Always resolve to absolute path for consistent comparison
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = Fs.cwd().realpath(full, &buf) catch return null;
+        const resolved = Fs.cwd(self.diag.io).realpath(full, &buf) catch return null;
         if (!self.isWithinScanRoot(resolved)) return null;
         return try self.allocator.dupe(u8, resolved);
     }
 
     fn markReachable(self: *ImportGraph, entry: []const u8) !void {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const norm = Fs.cwd().realpath(entry, &buf) catch return;
+        const norm = Fs.cwd(self.diag.io).realpath(entry, &buf) catch return;
         try self.markReachableResolved(norm);
     }
 
@@ -8781,7 +8760,7 @@ const ImportGraph = struct {
         for (cfg.entries.items) |e| {
             if (mem.endsWith(u8, e, "build.zig")) {
                 const dir = std.fs.path.dirname(e) orelse ".";
-                return Fs.cwd().realpath(dir, buf) catch continue;
+                return Fs.cwd(self.diag.io).realpath(dir, buf) catch continue;
             }
         }
         // 2. Try parent of target path
@@ -8806,8 +8785,8 @@ const ImportGraph = struct {
             .{dir},
         ) catch return null;
         defer self.allocator.free(check);
-        Fs.cwd().access(check, .{}) catch return null;
-        return Fs.cwd().realpath(dir, buf) catch null;
+        Fs.cwd(self.diag.io).access(check, .{}) catch return null;
+        return Fs.cwd(self.diag.io).realpath(dir, buf) catch null;
     }
 
     /// Scan already-loaded content for b.path("...zig") and pathJoin refs, marking reachable.
@@ -8884,7 +8863,7 @@ const ImportGraph = struct {
         ) catch return;
         defer self.allocator.free(full);
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
+        const resolved = Fs.cwd(self.diag.io).realpath(full, &rbuf) catch return;
         if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved)) {
             self.markReachableResolved(resolved) catch return;
@@ -8906,7 +8885,7 @@ const ImportGraph = struct {
         }
 
         for (to_scan.items) |path| {
-            const content = Fs.cwd().readFileAlloc(
+            const content = Fs.cwd(self.diag.io).readFileAlloc(
                 self.allocator,
                 path,
                 4 * 1024 * 1024,
@@ -8973,7 +8952,7 @@ const ImportGraph = struct {
         roots: *[2][]const u8,
         rc: *usize,
     ) void {
-        const r = Fs.cwd().realpath(dir, buf) catch return;
+        const r = Fs.cwd(self.diag.io).realpath(dir, buf) catch return;
         const o = self.allocator.dupe(u8, r) catch return;
         roots[rc.*] = o;
         rc.* += 1;
@@ -9026,13 +9005,13 @@ const ImportGraph = struct {
         depth: usize,
     ) !void {
         if (depth == 0) return;
-        var dir = Fs.cwd().openDir(
+        var dir = Fs.cwd(self.diag.io).openDir(
             search_dir,
             .{ .iterate = true },
         ) catch return;
-        defer dir.close(global_io.?);
+        defer dir.close(self.diag.io);
         var iter = dir.iterate();
-        while (try iter.next(global_io.?)) |entry| {
+        while (try iter.next(self.diag.io)) |entry| {
             if (entry.kind != .directory) continue;
             if (isSkippableDir(entry.name)) continue;
             const full = std.fmt.allocPrint(
@@ -9058,7 +9037,7 @@ const ImportGraph = struct {
     fn discoverNestedBuildFiles(self: *ImportGraph, cfg: *const Config) void {
         const trimmed = mem.trimEnd(u8, cfg.path, "/");
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const target_abs = Fs.cwd().realpath(trimmed, &rbuf) catch return;
+        const target_abs = Fs.cwd(self.diag.io).realpath(trimmed, &rbuf) catch return;
         const target_owned = self.allocator.dupe(u8, target_abs) catch return;
         defer self.allocator.free(target_owned);
 
@@ -9100,9 +9079,9 @@ const ImportGraph = struct {
         ) catch return;
         defer self.allocator.free(build_path);
 
-        if (Fs.cwd().access(build_path, .{})) |_| {
+        if (Fs.cwd(self.diag.io).access(build_path, .{})) |_| {
             var buf2: [Fs.max_path_bytes]u8 = undefined;
-            if (Fs.cwd().realpath(build_path, &buf2)) |resolved| {
+            if (Fs.cwd(self.diag.io).realpath(build_path, &buf2)) |resolved| {
                 if (!self.reachable.contains(resolved))
                     self.markReachableResolved(resolved) catch return;
             } else |_| {}
@@ -9115,10 +9094,10 @@ const ImportGraph = struct {
         // overflow the stack. 64 doubles scanRecursive's 32 so discovery
         // never truncates a tree the main walk can still scan.
         if (depth > 64) return;
-        var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close(global_io.?);
+        var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(self.diag.io);
         var iter = dir.iterate();
-        while (try iter.next(global_io.?)) |entry| {
+        while (try iter.next(self.diag.io)) |entry| {
             if (entry.kind != .directory) continue;
             if (isSkippableDir(entry.name)) continue;
             const subdir = std.fmt.allocPrint(
@@ -9137,7 +9116,7 @@ const ImportGraph = struct {
     /// Scan all reachable files under a sub-project directory for b.path() references
     fn scanSubprojectBuildPaths(self: *ImportGraph, subdir: []const u8) !void {
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const abs_subdir = Fs.cwd().realpath(subdir, &rbuf) catch return;
+        const abs_subdir = Fs.cwd(self.diag.io).realpath(subdir, &rbuf) catch return;
 
         // Snapshot reachable paths to check which are in this sub-project
         var to_scan: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -9168,7 +9147,7 @@ const ImportGraph = struct {
         ) catch return;
         defer self.allocator.free(full);
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
+        const resolved = Fs.cwd(self.diag.io).realpath(full, &rbuf) catch return;
         if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved))
             self.markReachableResolved(resolved) catch return;
@@ -9183,7 +9162,7 @@ const ImportGraph = struct {
         file_path: []const u8,
         base_dir: []const u8,
     ) void {
-        const content = Fs.cwd().readFileAlloc(
+        const content = Fs.cwd(self.diag.io).readFileAlloc(
             self.allocator,
             file_path,
             4 * 1024 * 1024,
@@ -9232,7 +9211,7 @@ const ImportGraph = struct {
         ) catch return;
         defer self.allocator.free(full);
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const resolved = Fs.cwd().realpath(full, &rbuf) catch return;
+        const resolved = Fs.cwd(self.diag.io).realpath(full, &rbuf) catch return;
         if (!self.reachable.contains(resolved))
             self.markReachableResolved(resolved) catch return;
     }
@@ -9243,7 +9222,7 @@ const ImportGraph = struct {
     /// (the walk then proceeds unmemoized, the pre-memo behavior).
     fn memoInsertMarkedDir(self: *ImportGraph, dir_path: []const u8) !bool {
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const resolved = Fs.cwd().realpath(dir_path, &rbuf) catch return false;
+        const resolved = Fs.cwd(self.diag.io).realpath(dir_path, &rbuf) catch return false;
         if (self.marked_dirs.contains(resolved)) return true;
         const key = try self.allocator.dupe(u8, resolved);
         errdefer self.allocator.free(key);
@@ -9260,10 +9239,10 @@ const ImportGraph = struct {
         // can still cover it — pre-memo coverage semantics preserved.
         if (depth > 64) return;
         if (try self.memoInsertMarkedDir(dir_path)) return;
-        var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close(global_io.?);
+        var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(self.diag.io);
         var iter = dir.iterate();
-        while (try iter.next(global_io.?)) |entry| {
+        while (try iter.next(self.diag.io)) |entry| {
             if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig"))
                 self.markSingleZigFile(dir_path, entry.name);
             if (entry.kind != .directory or isSkippableDir(entry.name))
@@ -22029,8 +22008,12 @@ fn reportFmtTermFailure(
 /// findings. Different toolchains write the list to different
 /// streams. Both go through parseFmtOutput, which owns every name it
 /// keeps and gates the untrusted bytes.
-fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(Issue) {
-    const result = std.process.run(allocator, global_io.?, .{
+fn runFmtCheck(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    path: []const u8,
+) !std.ArrayListUnmanaged(Issue) {
+    const result = std.process.run(allocator, diag.io, .{
         .argv = &.{ tool_zig_path, "fmt", "--check", path },
     }) catch |err| {
         std.debug.print("error: cannot run zig fmt: {}\n", .{err});
@@ -22042,13 +22025,13 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
     defer allocator.free(result.stderr);
 
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
-    const root_real = scanRootRealpath(path, &root_buf);
+    const root_real = scanRootRealpath(diag.io, path, &root_buf);
     // Different toolchains write the needs-format list to different
     // streams, so parse both. The defers above free both buffers at
     // return: the parse must own every name it keeps (EPH-I0196).
-    var issues = try parseFmtOutput(allocator, result.stdout, root_real);
+    var issues = try parseFmtOutput(diag, allocator, result.stdout, root_real);
     errdefer deinitIssues(&issues, allocator);
-    var stderr_issues = try parseFmtOutput(allocator, result.stderr, root_real);
+    var stderr_issues = try parseFmtOutput(diag, allocator, result.stderr, root_real);
     errdefer deinitIssues(&stderr_issues, allocator);
     try issues.appendSlice(allocator, stderr_issues.items);
     // Item ownership moved with the append. Only the array frees here.
@@ -22085,6 +22068,7 @@ fn runFmtCheck(allocator: Allocator, path: []const u8) !std.ArrayListUnmanaged(I
 /// suffix, resolution inside root_real (EPH-I0197). A null root_real
 /// fails closed. Each rejected hostile line prints one sanitized note.
 fn parseFmtOutput(
+    diag: *DiagCtx,
     allocator: Allocator,
     output_bytes: []const u8,
     root_real: ?[]const u8,
@@ -22097,14 +22081,14 @@ fn parseFmtOutput(
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
         if (!isPrintableAscii(t)) {
-            try rejectFmtLine(allocator, t, "control or non-ASCII bytes in the path");
+            try rejectFmtLine(diag, allocator, t, "control or non-ASCII bytes in the path");
             continue;
         }
         // Not a bare file name (zig fmt parse errors, status lines). The
         // pre-gate filter, kept silent so a broken build stays quiet.
         if (!mem.endsWith(u8, t, ".zig")) continue;
-        if (!resolvesInRoot(t, root_real)) {
-            try rejectFmtLine(allocator, t, "the path points outside the scan root");
+        if (!resolvesInRoot(diag.io, t, root_real)) {
+            try rejectFmtLine(diag, allocator, t, "the path points outside the scan root");
             continue;
         }
         const owned = try allocator.dupe(u8, t);
@@ -22126,11 +22110,11 @@ fn parseFmtOutput(
 /// Count and report one rejected zig fmt output line (EPH-I0197). The
 /// line failed a safety gate, so its bytes are hostile by definition and
 /// pass through sanitizeTerminal before they reach the terminal.
-fn rejectFmtLine(allocator: Allocator, line: []const u8, cause: []const u8) !void {
-    fmt_reject_count += 1;
+fn rejectFmtLine(diag: *DiagCtx, allocator: Allocator, line: []const u8, cause: []const u8) !void {
+    diag.fmt_reject_count += 1;
     var safe = try types.sanitizeTerminal(allocator, line);
     defer safe.deinit(allocator);
-    cliDiag("note: ignoring zig fmt output line {s}: {s}\n", .{ safe.slice, cause });
+    cliDiag(diag, "note: ignoring zig fmt output line {s}: {s}\n", .{ safe.slice, cause });
 }
 
 // ============================================================================
@@ -22288,26 +22272,33 @@ fn reportRunFailure(
 /// outputs fail with StreamTooLong instead of growing unbounded.
 const runtime_capture_limit_bytes = 10 * 1024 * 1024;
 
-fn runRuntimeAnalysis(
-    allocator: Allocator,
-    path: []const u8,
+/// Options for one runtime-analysis pass: verbosity plus an optional
+/// custom command replacing the default `zig build test`.
+const RuntimeOptions = struct {
     verbose: bool,
     custom_command: ?[]const u8,
+};
+
+fn runRuntimeAnalysis(
+    io: std.Io,
+    allocator: Allocator,
+    path: []const u8,
+    opts: RuntimeOptions,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     // Findings own heap payloads (EPH-I0196/I0202): an unwind mid-parse
     // must free the partial list, not drop it (EPH-I0767).
     errdefer deinitIssues(&issues, allocator);
     var argv_buf: [64][]const u8 = undefined;
-    const argv_len = buildRuntimeArgv(custom_command, &argv_buf, verbose);
+    const argv_len = buildRuntimeArgv(opts.custom_command, &argv_buf, opts.verbose);
 
-    const result = std.process.run(allocator, global_io.?, .{
+    const result = std.process.run(allocator, io, .{
         .argv = argv_buf[0..argv_len],
         .cwd = .{ .path = path },
         .stdout_limit = .limited(runtime_capture_limit_bytes),
         .stderr_limit = .limited(runtime_capture_limit_bytes),
     }) catch |err| {
-        const cmd_str = custom_command orelse "zig build test";
+        const cmd_str = opts.custom_command orelse "zig build test";
         std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
         try reportRunFailure(allocator, &issues, cmd_str, err);
         return issues;
@@ -22315,20 +22306,20 @@ fn runRuntimeAnalysis(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try parseGPADiagnostics(allocator, &issues, result.stderr, verbose);
-    try parseTestOutput(allocator, &issues, result.stdout, verbose);
+    try parseGPADiagnostics(allocator, &issues, result.stderr, opts.verbose);
+    try parseTestOutput(allocator, &issues, result.stdout, opts.verbose);
 
     // Term is a tagged union in 0.16: a signal-killed child is .signal,
     // and reading .exited on it is a safety-checked panic (EPH-I0231).
     switch (result.term) {
         .exited => |code| {
             if (code != 0 and issues.items.len == 0)
-                try reportCommandFailure(allocator, &issues, custom_command != null);
+                try reportCommandFailure(allocator, &issues, opts.custom_command != null);
         },
         .signal => |sig| try reportSignalDeath(allocator, &issues, sig),
         .stopped, .unknown => {
             if (issues.items.len == 0)
-                try reportCommandFailure(allocator, &issues, custom_command != null);
+                try reportCommandFailure(allocator, &issues, opts.custom_command != null);
         },
     }
 
@@ -23443,7 +23434,12 @@ const CONFIG_FILENAME = "ephor.json";
 /// Report a config parse failure. CI-gate and fail-closed validation errors
 /// are hard (propagated to the caller as usage errors); every other parse
 /// error warns + continues.
-fn reportConfigParseError(allocator: Allocator, err: anyerror, path: []const u8) !void {
+fn reportConfigParseError(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    err: anyerror,
+    path: []const u8,
+) !void {
     var safe_path = types.sanitizeTerminal(allocator, path) catch {
         // OOM must not flip the fail posture: propagate the gated errors,
         // warn-and-continue the rest, exactly as the sanitized path does.
@@ -23455,13 +23451,15 @@ fn reportConfigParseError(allocator: Allocator, err: anyerror, path: []const u8)
     };
     defer safe_path.deinit(allocator);
     switch (err) {
-        error.InvalidFailOnValue => reportBadFailOn(allocator, safe_path.slice),
+        error.InvalidFailOnValue => reportBadFailOn(diag, allocator, safe_path.slice),
         error.EmptyExcludePattern => cliDiag(
+            diag,
             "error: {s}: invalid exclude pattern '' — an empty pattern matches every path. " ++
                 "Use a specific prefix or remove the entry.\n",
             .{safe_path.slice},
         ),
         error.EmptyRulePattern => cliDiag(
+            diag,
             "error: {s}: invalid rule pattern '' — an empty pattern matches every rule. " ++
                 "Give a rule ID or prefix, or remove the entry.\n",
             .{safe_path.slice},
@@ -23479,9 +23477,10 @@ fn reportConfigParseError(allocator: Allocator, err: anyerror, path: []const u8)
 /// The InvalidFailOnValue diagnostic. The offending value is config file
 /// content, so it crosses the terminal sanitizer like the path does
 /// (EPH-I0147).
-fn reportBadFailOn(allocator: Allocator, safe_path: []const u8) void {
-    var safe = types.sanitizeTerminal(allocator, last_bad_fail_on orelse "?") catch {
+fn reportBadFailOn(diag: *DiagCtx, allocator: Allocator, safe_path: []const u8) void {
+    var safe = types.sanitizeTerminal(allocator, diag.last_bad_fail_on orelse "?") catch {
         cliDiag(
+            diag,
             "error: {s}: invalid fail_on value (expected: error, warning, note, never)\n",
             .{safe_path},
         );
@@ -23489,29 +23488,61 @@ fn reportBadFailOn(allocator: Allocator, safe_path: []const u8) void {
     };
     defer safe.deinit(allocator);
     cliDiag(
+        diag,
         "error: {s}: invalid fail_on '{s}' (expected: error, warning, note, never)\n",
         .{ safe_path, safe.slice },
     );
 }
 
-fn loadConfigFile(allocator: Allocator, cfg: *Config) !void {
+fn loadConfigFile(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // Try to load ephor.json config file from current directory
-    const content = Fs.cwd().readFileAlloc(allocator, CONFIG_FILENAME, 64 * 1024) catch return;
+    const content = Fs.cwd(diag.io).readFileAlloc(
+        allocator,
+        CONFIG_FILENAME,
+        64 * 1024,
+    ) catch return;
     defer allocator.free(content);
 
     // Simple JSON parsing for config format
-    parseConfigJson(allocator, content, cfg) catch |err| {
-        try reportConfigParseError(allocator, err, CONFIG_FILENAME);
+    parseConfigJson(diag, allocator, content, cfg) catch |err| {
+        try reportConfigParseError(diag, allocator, err, CONFIG_FILENAME);
     };
+}
+
+/// Parse one candidate config file's content and emit its parse
+/// diagnostics. Returns false on a parse error so the caller skips the
+/// candidate. The trust decision arrives computed: source.dir must already
+/// be alias-safe against cfg.path (EPH-I0763).
+fn parseCandidateConfig(
+    lctx: ConfigLoadCtx,
+    content: []const u8,
+    source: ConfigSource,
+) !bool {
+    parseConfigJsonSource(.{
+        .diag = lctx.diag,
+        .allocator = lctx.allocator,
+        .content = content,
+        .cfg = lctx.cfg,
+        .source = source,
+    }) catch |err| {
+        // The CI gate key must never fail open, no matter which config
+        // file carried it. Other parse errors stay warn-and-continue.
+        try reportConfigParseError(lctx.diag, lctx.allocator, err, source.path);
+        return false;
+    };
+    if (!source.trusted and source.ignored_any.*)
+        try noteSuppressionKeysIgnored(lctx.diag, lctx.allocator, source.path);
+    return true;
 }
 
 /// Try to load ephor.json config from a directory, returning true if found
 fn tryLoadConfigFromDir(
-    allocator: Allocator,
-    cfg: *Config,
+    lctx: ConfigLoadCtx,
     dir: []const u8,
     saved_path: []const u8,
 ) !bool {
+    const allocator = lctx.allocator;
+    const cfg = lctx.cfg;
     const config_path = try std.fmt.allocPrint(
         allocator,
         "{s}/{s}",
@@ -23524,7 +23555,11 @@ fn tryLoadConfigFromDir(
     const dir_copy = try allocator.dupe(u8, dir);
     defer allocator.free(dir_copy);
 
-    const content = Fs.cwd().readFileAlloc(allocator, config_path, 64 * 1024) catch return false;
+    const content = Fs.cwd(lctx.diag.io).readFileAlloc(
+        allocator,
+        config_path,
+        64 * 1024,
+    ) catch return false;
     defer allocator.free(content);
 
     // RED3-x trust boundary: only configs from the auditor's own tree (cwd
@@ -23532,31 +23567,26 @@ fn tryLoadConfigFromDir(
     // --trust-target-config declares the scanned target trusted.
     // dir_copy (not dir) backs every use: dir can alias cfg.path, which a
     // path_dir key frees mid-parse.
-    const trusted = cfg.trust_target_config or isConfigDirTrusted(dir_copy);
+    const trusted = cfg.trust_target_config or isConfigDirTrusted(lctx.diag.io, dir_copy);
     var ignored_any = false;
-    parseConfigJsonSource(allocator, content, cfg, .{
+    const source: ConfigSource = .{
         .trusted = trusted,
         .path = config_path,
         .dir = dir_copy,
         .ignored_any = &ignored_any,
-    }) catch |err| {
-        // The CI gate key must never fail open, no matter which config
-        // file carried it; other parse errors stay warn-and-continue.
-        try reportConfigParseError(allocator, err, config_path);
-        return false;
     };
-    if (!trusted and ignored_any) try noteSuppressionKeysIgnored(allocator, config_path);
+    if (!try parseCandidateConfig(lctx, content, source)) return false;
 
     // Commit saved_path only AFTER its fallible consumers: until then the
     // caller's errdefer owns it, so a mid-load OOM frees it once (EPH-I0689).
     const roots: EntriesRoots = .{ .base = dir_copy, .scan_root = saved_path };
-    const dropped_entries = try makeEntriesAbsolute(allocator, cfg, roots, trusted);
+    const dropped_entries = try makeEntriesAbsolute(lctx, roots, trusted);
     if (dropped_entries > 0) try noteEntriesRejected(
+        lctx.diag,
         allocator,
         "note: ignoring {d} outside-root entries from untrusted {s} " ++
             "(use --trust-target-config to honor)\n",
-        config_path,
-        dropped_entries,
+        .{ .path = config_path, .dropped = dropped_entries },
     );
     if (cfg.path_owned) allocator.free(cfg.path);
     cfg.path = saved_path;
@@ -23567,36 +23597,58 @@ fn tryLoadConfigFromDir(
 /// Print the per-file note for suppression/gate keys refused from an
 /// untrusted config (RED3-x). The path bytes come from the scanned tree,
 /// so they cross the terminal sanitizer.
-fn noteSuppressionKeysIgnored(allocator: Allocator, config_path: []const u8) !void {
-    untrusted_config_note_count += 1;
+fn noteSuppressionKeysIgnored(diag: *DiagCtx, allocator: Allocator, config_path: []const u8) !void {
+    diag.untrusted_config_note_count += 1;
     var safe_config = try types.sanitizeTerminal(allocator, config_path);
     defer safe_config.deinit(allocator);
     cliDiag(
+        diag,
         "note: ignoring suppression/gate keys from untrusted {s} " ++
             "(use --trust-target-config to honor)\n",
         .{safe_config.slice},
     );
 }
 
-/// Emit one EPH-I0195 rejection note (counted for the test hook). `path`
-/// crosses the terminal sanitizer: it may carry scanned-tree bytes
-/// (EPH-I0147).
-fn noteEntriesRejected(
-    allocator: Allocator,
-    comptime fmt: []const u8,
+/// One rejected-entries note's payload: the offending file and how many
+/// of its entries the containment gates dropped (EPH-I0195).
+const EntriesRejectNote = struct {
     path: []const u8,
     dropped: usize,
+};
+
+/// Emit one EPH-I0195 rejection note (counted on the diagnostics context).
+/// `note.path` crosses the terminal sanitizer: it may carry scanned-tree
+/// bytes (EPH-I0147).
+fn noteEntriesRejected(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    comptime fmt: []const u8,
+    note: EntriesRejectNote,
 ) !void {
-    entries_reject_note_count += 1;
-    var safe_path = try types.sanitizeTerminal(allocator, path);
+    diag.entries_reject_note_count += 1;
+    var safe_path = try types.sanitizeTerminal(allocator, note.path);
     defer safe_path.deinit(allocator);
-    cliDiag(fmt, .{ dropped, safe_path.slice });
+    cliDiag(diag, fmt, .{ note.dropped, safe_path.slice });
 }
+
+/// Shared context for the config-file load path (EPH-I0771): the run
+/// diagnostics context plus the allocator and the config under construction.
+const ConfigLoadCtx = struct {
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+};
 
 /// Loads entries from config (CLI path takes priority over config "path_dir").
 /// Each candidate file gets its own trust decision: the target-dir file and
 /// the parent-fallback file are tested independently (RED3-8).
-fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []const u8) !void {
+fn loadConfigFromTargetPath(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    target_path: []const u8,
+) !void {
+    const lctx: ConfigLoadCtx = .{ .diag = diag, .allocator = allocator, .cfg = cfg };
     // Dupe target_path BEFORE any config parse: it aliases the cfg.path
     // buffer in production (loadConfigFromTargetPath(cfg, cfg.path)), and a
     // path_dir key frees that buffer mid-parse (EPH-I0763). The parent
@@ -23608,12 +23660,12 @@ fn loadConfigFromTargetPath(allocator: Allocator, cfg: *Config, target_path: []c
     errdefer allocator.free(saved_path);
 
     // Try target directory, then parent
-    if (try tryLoadConfigFromDir(allocator, cfg, target_path, saved_path)) return;
+    if (try tryLoadConfigFromDir(lctx, target_path, saved_path)) return;
 
     if (std.fs.path.dirname(target_copy)) |parent| {
         const parent_copy = try allocator.dupe(u8, parent);
         defer allocator.free(parent_copy);
-        if (try tryLoadConfigFromDir(allocator, cfg, parent_copy, saved_path)) return;
+        if (try tryLoadConfigFromDir(lctx, parent_copy, saved_path)) return;
     }
 
     allocator.free(saved_path);
@@ -23648,17 +23700,18 @@ const EntriesRoots = struct {
 /// commits cfg.path only after the fallible phase, so mid-load cfg.path
 /// does not hold the scan root yet (EPH-I0689).
 fn makeEntriesAbsolute(
-    allocator: Allocator,
-    cfg: *Config,
+    lctx: ConfigLoadCtx,
     roots: EntriesRoots,
     trusted: bool,
 ) !usize {
+    const allocator = lctx.allocator;
+    const cfg = lctx.cfg;
     if (roots.base.len == 0) return 0;
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
     const root_real: ?[]const u8 = if (trusted)
         null
     else
-        Fs.cwd().realpath(roots.scan_root, &root_buf) catch null;
+        Fs.cwd(lctx.diag.io).realpath(roots.scan_root, &root_buf) catch null;
 
     // Phase 1 (fallible): absolutize each entry into its own slot. An OOM
     // here leaves the array owned 1:1, so Config.deinit frees each slot
@@ -23672,14 +23725,14 @@ fn makeEntriesAbsolute(
     var dropped: usize = 0;
     var kept: usize = 0;
     for (cfg.entries.items) |entry| {
-        if (entryPassesTrust(trusted, root_real, entry)) {
+        if (entryPassesTrust(lctx.diag.io, trusted, root_real, entry)) {
             cfg.entries.items[kept] = entry;
             kept += 1;
             continue;
         }
         allocator.free(entry);
         dropped += 1;
-        entries_reject_count += 1;
+        lctx.diag.entries_reject_count += 1;
     }
     cfg.entries.shrinkRetainingCapacity(kept);
     return dropped;
@@ -23701,17 +23754,17 @@ fn absolutizeEntry(allocator: Allocator, base_path: []const u8, entry: []const u
 /// completeness (RED4-3). Untrusted entries must realpath inside the
 /// scan-root realpath. A null root_real means the scan root itself did
 /// not resolve, which fails closed.
-fn entryPassesTrust(trusted: bool, root_real: ?[]const u8, abs: []const u8) bool {
+fn entryPassesTrust(io: std.Io, trusted: bool, root_real: ?[]const u8, abs: []const u8) bool {
     if (trusted) return true;
     const root = root_real orelse return false;
-    return realpathContained(root, abs);
+    return realpathContained(io, root, abs);
 }
 
 /// EPH-I0195 containment core: realpath the candidate and require it under
 /// the realpath'd root. Fails closed when the candidate does not resolve.
-fn realpathContained(root_real: []const u8, candidate: []const u8) bool {
+fn realpathContained(io: std.Io, root_real: []const u8, candidate: []const u8) bool {
     var cand_buf: [Fs.max_path_bytes]u8 = undefined;
-    const cand_real = Fs.cwd().realpath(candidate, &cand_buf) catch return false;
+    const cand_real = Fs.cwd(io).realpath(candidate, &cand_buf) catch return false;
     return isPathAncestorOrEqual(root_real, cand_real);
 }
 
@@ -23719,10 +23772,10 @@ fn realpathContained(root_real: []const u8, candidate: []const u8) bool {
 /// extraction). Both paths realpath per call: entry lists are small and
 /// EntryScanCtx passes by value, so the root cannot be cached there.
 /// Fails closed on any resolution failure.
-fn passTargetEntryGate(scan_root: []const u8, candidate: []const u8) bool {
+fn passTargetEntryGate(io: std.Io, scan_root: []const u8, candidate: []const u8) bool {
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
-    const root_real = Fs.cwd().realpath(scan_root, &root_buf) catch return false;
-    return realpathContained(root_real, candidate);
+    const root_real = Fs.cwd(io).realpath(scan_root, &root_buf) catch return false;
+    return realpathContained(io, root_real, candidate);
 }
 
 /// Index just past the closing quote of the JSON string whose opening quote
@@ -23854,15 +23907,22 @@ fn thresholdCliLocked(cli_mask: u8, key: []const u8) bool {
     return false;
 }
 
+/// A threshold's identity and documented cap, looked up once by the caller.
+const ThresholdClamp = struct {
+    key: []const u8,
+    cap: usize,
+};
+
 /// Clamp a threshold value at its documented cap, warning once per clamp.
-fn clampThreshold(source: []const u8, key: []const u8, num: usize, cap: usize) usize {
-    if (num <= cap) return num;
-    threshold_clamp_count += 1;
+fn clampThreshold(diag: *DiagCtx, source: []const u8, spec: ThresholdClamp, num: usize) usize {
+    if (num <= spec.cap) return num;
+    diag.threshold_clamp_count += 1;
     cliDiag(
+        diag,
         "warning: clamping threshold '{s}' from {d} to the maximum {d} ({s})\n",
-        .{ key, num, cap, source },
+        .{ spec.key, num, spec.cap, source },
     );
-    return cap;
+    return spec.cap;
 }
 
 fn applyThresholdField(th: *Thresholds, id: ThresholdFieldId, num: usize) void {
@@ -23909,7 +23969,12 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     const cap = thresholdCapFor(key_result.val) orelse return i;
     // A CLI-locked field discards this value; clamping it would warn falsely.
     if (thresholdCliLocked(ctx.cfg.threshold_cli_mask, key_result.val)) return i;
-    const num = clampThreshold(ctx.source.path, key_result.val, raw, cap);
+    const num = clampThreshold(
+        ctx.diag,
+        ctx.source.path,
+        .{ .key = key_result.val, .cap = cap },
+        raw,
+    );
     setThresholdValue(&ctx.cfg.thresholds, ctx.cfg.threshold_cli_mask, key_result.val, num);
     return i;
 }
@@ -23926,6 +23991,7 @@ const ConfigSource = struct {
 
 /// Context for JSON config parsing: source text plus the config being built
 const ConfigParseCtx = struct {
+    diag: *DiagCtx,
     allocator: Allocator,
     content: []const u8,
     cfg: *Config,
@@ -23954,6 +24020,7 @@ fn checkConfigListValue(ctx: ConfigParseCtx, key: []const u8, val: []const u8) !
     if (val.len == 0) return error.EmptyExcludePattern;
     if (!isOverbroadExcludePattern(val)) return true;
     cliDiag(
+        ctx.diag,
         "warning: ignoring over-broad exclude pattern '{s}' in {s}. " ++
             "Use a more specific pattern.\n",
         .{ val, ctx.source.path },
@@ -24041,16 +24108,16 @@ fn applyConfigPathDir(ctx: ConfigParseCtx, value: []const u8) !void {
 
     var dir_buf: [Fs.max_path_bytes]u8 = undefined;
     var val_buf: [Fs.max_path_bytes]u8 = undefined;
-    const dir_real = Fs.cwd().realpath(ctx.source.dir, &dir_buf) catch {
-        warnPathDirRejected(allocator, ctx.source.path, value, "path does not resolve");
+    const dir_real = Fs.cwd(ctx.diag.io).realpath(ctx.source.dir, &dir_buf) catch {
+        warnPathDirRejected(ctx, value, "path does not resolve");
         return;
     };
-    const val_real = Fs.cwd().realpath(joined, &val_buf) catch {
-        warnPathDirRejected(allocator, ctx.source.path, value, "path does not resolve");
+    const val_real = Fs.cwd(ctx.diag.io).realpath(joined, &val_buf) catch {
+        warnPathDirRejected(ctx, value, "path does not resolve");
         return;
     };
     if (!isPathAncestorOrEqual(dir_real, val_real)) {
-        warnPathDirRejected(allocator, ctx.source.path, value, "resolves outside config directory");
+        warnPathDirRejected(ctx, value, "resolves outside config directory");
         return;
     }
     try setOwnedPath(allocator, ctx.cfg, value);
@@ -24077,23 +24144,23 @@ fn formatPathDirRejected(
 }
 
 fn warnPathDirRejected(
-    allocator: Allocator,
-    config_path: []const u8,
+    ctx: ConfigParseCtx,
     value: []const u8,
     reason: []const u8,
 ) void {
-    path_dir_reject_count += 1;
-    var out = types.OutBuf{ .allocator = allocator };
+    ctx.diag.path_dir_reject_count += 1;
+    var out = types.OutBuf{ .allocator = ctx.allocator };
     defer out.deinit();
-    formatPathDirRejected(&out, config_path, value, reason) catch {
+    formatPathDirRejected(&out, ctx.source.path, value, reason) catch {
         // OOM: keep the warning but drop the untrusted values.
         cliDiag(
+            ctx.diag,
             "warning: ignoring path_dir in config: {s}. Fix the value or remove the key.\n",
             .{reason},
         );
         return;
     };
-    cliDiag("{s}", .{out.buf.items});
+    cliDiag(ctx.diag, "{s}", .{out.buf.items});
 }
 
 /// Handle a single config key-value pair
@@ -24137,6 +24204,7 @@ fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8)
     const result = parseJsonString(content, start);
     const mode = ErrorNaming.fromString(result.val) orelse {
         cliDiag(
+            ctx.diag,
             "warning: {s}: unknown error_naming '{s}' " ++
                 "(expected: TitleCase, PascalCase, snake_case) — using TitleCase\n",
             .{ CONFIG_FILENAME, result.val },
@@ -24163,7 +24231,7 @@ fn parseFailOnConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?us
         // Hard error, not warn-and-continue like other config keys: an
         // unparseable CI gate must never fail open (same policy as a bad
         // --fail-on CLI value). The catch-site prints path + value.
-        last_bad_fail_on = result.val;
+        ctx.diag.last_bad_fail_on = result.val;
         return error.InvalidFailOnValue;
     };
     setFailOn(cfg, level, .fail_on_key);
@@ -24231,10 +24299,10 @@ fn isPrintableAscii(s: []const u8) bool {
 /// is not contained. Shared by the gates that trust a subprocess path:
 /// the fmt finding parser (EPH-I0197), the export snippet reader
 /// (EPH-I0198), and later the ZR1xx located findings (EPH-I0202).
-fn resolvesInRoot(name: []const u8, root_real: ?[]const u8) bool {
+fn resolvesInRoot(io: std.Io, name: []const u8, root_real: ?[]const u8) bool {
     const root = root_real orelse return false;
     var buf: [Fs.max_path_bytes]u8 = undefined;
-    const resolved = Fs.cwd().realpath(name, &buf) catch return false;
+    const resolved = Fs.cwd(io).realpath(name, &buf) catch return false;
     return isPathAncestorOrEqual(root, resolved);
 }
 
@@ -24244,9 +24312,9 @@ fn resolvesInRoot(name: []const u8, root_real: ?[]const u8) bool {
 /// containment gate in ephor expects, and the scanned file still passes
 /// the ancestor test against its own directory. Returns null when the
 /// path does not resolve, so callers fail closed.
-fn scanRootRealpath(path: []const u8, buf: *[Fs.max_path_bytes]u8) ?[]const u8 {
-    const real = Fs.cwd().realpath(path, buf) catch return null;
-    const stat = Fs.cwd().statFile(path) catch return null;
+fn scanRootRealpath(io: std.Io, path: []const u8, buf: *[Fs.max_path_bytes]u8) ?[]const u8 {
+    const real = Fs.cwd(io).realpath(path, buf) catch return null;
+    const stat = Fs.cwd(io).statFile(path) catch return null;
     if (stat.kind != .file) return real;
     return std.fs.path.dirname(real) orelse real;
 }
@@ -24255,39 +24323,35 @@ fn scanRootRealpath(path: []const u8, buf: *[Fs.max_path_bytes]u8) ?[]const u8 {
 /// directory realpath equals the invocation cwd realpath or is an ancestor
 /// of it — the config then comes from the auditor's tree, not the scanned
 /// one. Fails closed: an unresolvable directory is untrusted.
-fn isConfigDirTrusted(config_dir: []const u8) bool {
+fn isConfigDirTrusted(io: std.Io, config_dir: []const u8) bool {
     var dir_buf: [Fs.max_path_bytes]u8 = undefined;
     var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
-    const dir_real = Fs.cwd().realpath(config_dir, &dir_buf) catch return false;
-    const cwd_real = Fs.cwd().realpath(".", &cwd_buf) catch return false;
+    const dir_real = Fs.cwd(io).realpath(config_dir, &dir_buf) catch return false;
+    const cwd_real = Fs.cwd(io).realpath(".", &cwd_buf) catch return false;
     return isPathAncestorOrEqual(dir_real, cwd_real);
 }
 
 /// Parse a config file's contents as a trusted source (cwd ephor.json and
 /// unit tests). Target-dir configs go through parseConfigJsonSource with a
 /// computed trust decision instead.
-fn parseConfigJson(allocator: Allocator, content: []const u8, cfg: *Config) !void {
+fn parseConfigJson(diag: *DiagCtx, allocator: Allocator, content: []const u8, cfg: *Config) !void {
     var ignored_any = false;
-    try parseConfigJsonSource(allocator, content, cfg, .{
-        .trusted = true,
-        .path = CONFIG_FILENAME,
-        .dir = ".",
-        .ignored_any = &ignored_any,
-    });
-}
-
-fn parseConfigJsonSource(
-    allocator: Allocator,
-    content: []const u8,
-    cfg: *Config,
-    source: ConfigSource,
-) !void {
-    const ctx = ConfigParseCtx{
+    try parseConfigJsonSource(.{
+        .diag = diag,
         .allocator = allocator,
         .content = content,
         .cfg = cfg,
-        .source = source,
-    };
+        .source = .{
+            .trusted = true,
+            .path = CONFIG_FILENAME,
+            .dir = ".",
+            .ignored_any = &ignored_any,
+        },
+    });
+}
+
+fn parseConfigJsonSource(ctx: ConfigParseCtx) !void {
+    const content = ctx.content;
     var i: usize = 0;
     while (i < content.len and content[i] != '{') i += 1;
     if (i >= content.len) return;
@@ -24324,7 +24388,7 @@ fn handleConfigCreateError(err: anyerror) !void {
     return err;
 }
 
-fn writeDefaultConfig() !void {
+fn writeDefaultConfig(io: std.Io) !void {
     const default_config =
         \\{
         \\  // Directory to analyze - auto-detected from build.zig during install
@@ -24409,7 +24473,7 @@ fn writeDefaultConfig() !void {
         "{{\n  \"version\": \"{s}\",{s}",
         .{ EPHOR_VERSION, default_config[1..] },
     );
-    Fs.cwd().writeFile(CONFIG_FILENAME, content, .{ .exclusive = true }) catch |err|
+    Fs.cwd(io).writeFile(CONFIG_FILENAME, content, .{ .exclusive = true }) catch |err|
         return handleConfigCreateError(err);
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
 }
@@ -24419,8 +24483,8 @@ fn writeDefaultConfig() !void {
 /// directory must realpath inside the cwd (RED4-2 backstop: a symlinked
 /// source directory passes the string checks yet resolves outside the
 /// project). A violation warns and falls back to the "." default.
-fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
-    const content = Fs.cwd().readFileAlloc(
+fn detectPathDirFromBuildZig(io: std.Io, allocator: Allocator) []const u8 {
+    const content = Fs.cwd(io).readFileAlloc(
         allocator,
         "build.zig",
         1024 * 1024,
@@ -24436,7 +24500,7 @@ fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
     defer allocator.free(content);
 
     const result = findPathDirInContent(content);
-    if (!detectedDirWithinCwd(result)) {
+    if (!detectedDirWithinCwd(io, result)) {
         std.debug.print(
             "warning: detected source directory '{s}' resolves outside the " ++
                 "project. Using \".\" as the scan root.\n",
@@ -24451,11 +24515,11 @@ fn detectPathDirFromBuildZig(allocator: Allocator) []const u8 {
 /// candidate must realpath inside the cwd realpath. Fails closed: the
 /// check rejects an unresolvable directory, the same policy as
 /// isConfigDirTrusted.
-fn detectedDirWithinCwd(dir: []const u8) bool {
+fn detectedDirWithinCwd(io: std.Io, dir: []const u8) bool {
     var dir_buf: [Fs.max_path_bytes]u8 = undefined;
     var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
-    const cwd_real = Fs.cwd().realpath(".", &cwd_buf) catch return false;
-    const dir_real = Fs.cwd().realpath(dir, &dir_buf) catch return false;
+    const cwd_real = Fs.cwd(io).realpath(".", &cwd_buf) catch return false;
+    const dir_real = Fs.cwd(io).realpath(dir, &dir_buf) catch return false;
     return isPathAncestorOrEqual(cwd_real, dir_real);
 }
 
@@ -24514,6 +24578,7 @@ fn findPathDirInContent(content: []const u8) []const u8 {
 /// Collect entry points from build.zig for the install config.
 /// Returns entries as a list of strings (caller frees with allocator).
 fn collectInstallEntries(
+    io: std.Io,
     allocator: Allocator,
     root_dir: []const u8,
 ) !std.ArrayListUnmanaged([]const u8) {
@@ -24533,7 +24598,7 @@ fn collectInstallEntries(
         try std.fmt.allocPrint(allocator, "{s}/main.zig", .{root_dir});
 
     const main_exists = blk: {
-        Fs.cwd().access(main_path, .{}) catch break :blk false;
+        Fs.cwd(io).access(main_path, .{}) catch break :blk false;
         break :blk true;
     };
 
@@ -24558,18 +24623,18 @@ fn collectInstallEntries(
 
 /// Create ephor.json during install with auto-detected path_dir and entries.
 /// Best-effort: prints a message but does not fail the install if config cannot be created.
-fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
-    if (Fs.cwd().access(CONFIG_FILENAME, .{})) {
+fn createInstallConfig(io: std.Io, allocator: Allocator, ver: []const u8) !void {
+    if (Fs.cwd(io).access(CONFIG_FILENAME, .{})) {
         // Config already exists - update version if needed
-        updateConfigVersion(allocator, ver);
+        updateConfigVersion(io, allocator, ver);
         std.debug.print("{s} already exists (skipped)\n", .{CONFIG_FILENAME});
         return;
     } else |_| {}
 
     // File doesn't exist - create it
-    const root_dir = detectPathDirFromBuildZig(allocator);
+    const root_dir = detectPathDirFromBuildZig(io, allocator);
     defer allocator.free(root_dir);
-    var entries = try collectInstallEntries(allocator, root_dir);
+    var entries = try collectInstallEntries(io, allocator, root_dir);
     defer {
         for (entries.items) |e| allocator.free(e);
         entries.deinit(allocator);
@@ -24627,7 +24692,7 @@ fn createInstallConfig(allocator: Allocator, ver: []const u8) !void {
     , .{ ver, root_dir, entries_json.items });
     defer allocator.free(config_content);
 
-    try writeFileAtomic(std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
+    try writeFileAtomic(io, std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
 
     std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
         CONFIG_FILENAME, ver, root_dir,
@@ -24646,8 +24711,9 @@ fn buildPackageUrl(allocator: Allocator, ver: ?[]const u8) ![]const u8 {
 }
 
 /// Print instructions when build.zig.zon is missing during install.
-fn printMissingProjectFileHelp(file: []const u8) void {
+fn printMissingProjectFileHelp(diag: *DiagCtx, file: []const u8) void {
     cliDiag(
+        diag,
         "error: no {s} found in current directory\n" ++
             "\n" ++
             "  Ephor requires a Zig project with build.zig and build.zig.zon.\n" ++
@@ -24663,8 +24729,8 @@ fn printMissingProjectFileHelp(file: []const u8) void {
 }
 
 /// Print fallback instructions when zig fetch fails.
-fn printFetchFailedHelp(package_url: []const u8) void {
-    cliDiag(
+fn printFetchFailedHelp(diag: *DiagCtx, package_url: []const u8) void {
+    cliDiag(diag,
         \\
         \\Failed to fetch ephor package. You can add it manually:
         \\
@@ -24679,24 +24745,35 @@ fn printFetchFailedHelp(package_url: []const u8) void {
 
 /// Check that build.zig and build.zig.zon exist in project_dir. Returns
 /// false and prints help if either is missing.
-fn checkProjectPrerequisites(project_dir: std.Io.Dir) bool {
+fn checkProjectPrerequisites(diag: *DiagCtx, project_dir: std.Io.Dir) bool {
     const has_build_zig = blk: {
-        project_dir.access(global_io.?, "build.zig", .{}) catch break :blk false;
+        project_dir.access(diag.io, "build.zig", .{}) catch break :blk false;
         break :blk true;
     };
     if (!has_build_zig) {
-        printMissingProjectFileHelp("build.zig");
+        printMissingProjectFileHelp(diag, "build.zig");
         return false;
     }
     const has_zon = blk: {
-        project_dir.access(global_io.?, "build.zig.zon", .{}) catch break :blk false;
+        project_dir.access(diag.io, "build.zig.zon", .{}) catch break :blk false;
         break :blk true;
     };
     if (!has_zon) {
-        printMissingProjectFileHelp("build.zig.zon");
+        printMissingProjectFileHelp(diag, "build.zig.zon");
         return false;
     }
     return true;
+}
+
+/// Spawn `zig fetch --save=ephor <url_z>` in project_dir and return the
+/// child's exit code. Install and upgrade share the one spawn (EPH-I0235).
+fn runZigFetchSave(diag: *DiagCtx, project_dir: std.Io.Dir, url_z: [:0]const u8) !u8 {
+    var child = try std.process.spawn(diag.io, .{
+        .argv = &.{ tool_zig_path, "fetch", "--save=ephor", url_z },
+        .cwd = .{ .dir = project_dir },
+    });
+    const term = try child.wait(diag.io);
+    return term.exited;
 }
 
 /// Run the install command: adds ephor to project's build system.
@@ -24711,14 +24788,15 @@ fn checkProjectPrerequisites(project_dir: std.Io.Dir) bool {
 /// (EPH-I0235): a CI step doing `ephor install && zig build ephor` must
 /// not proceed on a failed install.
 fn runInstallCommand(
+    diag: *DiagCtx,
     allocator: Allocator,
     project_dir: std.Io.Dir,
     install_version: ?[]const u8,
 ) !void {
-    try requireStrictExplicitVersion(install_version);
+    try requireStrictExplicitVersion(diag, install_version);
     const ver = install_version orelse EPHOR_VERSION;
 
-    if (!checkProjectPrerequisites(project_dir)) return error.InstallFailed;
+    if (!checkProjectPrerequisites(diag, project_dir)) return error.InstallFailed;
 
     const package_url = try buildPackageUrl(allocator, install_version);
     defer allocator.free(package_url);
@@ -24728,20 +24806,15 @@ fn runInstallCommand(
     const url_z = try allocator.dupeZ(u8, package_url);
     defer allocator.free(url_z);
 
-    var child = try std.process.spawn(global_io.?, .{
-        .argv = &.{ tool_zig_path, "fetch", "--save=ephor", url_z },
-        .cwd = .{ .dir = project_dir },
-    });
-    const term = try child.wait(global_io.?);
-    try installFetchOutcome(term.exited, package_url);
+    try installFetchOutcome(diag, try runZigFetchSave(diag, project_dir, url_z), package_url);
 
-    printRecordedHash(allocator, ver);
+    printRecordedHash(diag.io, allocator, ver);
     std.debug.print("\n", .{});
 
-    try patchBuildZigOrFail(allocator, project_dir);
+    try patchBuildZigOrFail(diag, allocator, project_dir);
 
-    createInstallConfig(allocator, ver) catch |err| {
-        cliDiag("error: could not create {s}: {}\n", .{ CONFIG_FILENAME, err });
+    createInstallConfig(diag.io, allocator, ver) catch |err| {
+        cliDiag(diag, "error: could not create {s}: {}\n", .{ CONFIG_FILENAME, err });
         return error.InstallFailed;
     };
 
@@ -24750,20 +24823,20 @@ fn runInstallCommand(
 
 /// Map a finished zig-fetch child to the install outcome (EPH-I0235). A
 /// nonzero exit prints the manual fallback, then fails the install.
-fn installFetchOutcome(exited: u8, package_url: []const u8) !void {
+fn installFetchOutcome(diag: *DiagCtx, exited: u8, package_url: []const u8) !void {
     if (exited == 0) return;
-    printFetchFailedHelp(package_url);
+    printFetchFailedHelp(diag, package_url);
     return error.InstallFailed;
 }
 
 /// Patch the project's build.zig after a successful fetch (EPH-I0235). A
 /// patch failure prints the manual integration block, then fails the
 /// install: the project is half-integrated, so the exit code must say so.
-fn patchBuildZigOrFail(allocator: Allocator, project_dir: std.Io.Dir) !void {
-    const patched = patchBuildZig(allocator, project_dir) catch |err| {
-        cliDiag("error: could not auto-patch build.zig: {}\n", .{err});
-        cliDiag("\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_BLOCK});
-        cliDiag("Then run: zig build ephor\n", .{});
+fn patchBuildZigOrFail(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) !void {
+    const patched = patchBuildZig(diag, allocator, project_dir) catch |err| {
+        cliDiag(diag, "error: could not auto-patch build.zig: {}\n", .{err});
+        cliDiag(diag, "\nAdd this to your build.zig manually:{s}\n", .{EPHOR_BUILD_BLOCK});
+        cliDiag(diag, "Then run: zig build ephor\n", .{});
         return error.InstallFailed;
     };
     if (patched) |line| {
@@ -24815,15 +24888,15 @@ fn updateBuildFnScanBraces(scan: *BuildFnScan, trimmed: []const u8, idx: usize) 
 
 /// Patch build.zig to add ephor step. Returns line number
 /// where inserted, or null if already exists.
-fn patchBuildZig(allocator: Allocator, project_dir: std.Io.Dir) !?usize {
+fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) !?usize {
     const content = project_dir.readFileAlloc(
-        global_io.?,
+        diag.io,
         "build.zig",
         allocator,
         .limited(1024 * 1024),
     ) catch |err| {
         if (err == error.FileNotFound)
-            cliDiag("error: no build.zig found in the project directory.\n", .{});
+            cliDiag(diag, "error: no build.zig found in the project directory.\n", .{});
         return err;
     };
     defer allocator.free(content);
@@ -24837,7 +24910,7 @@ fn patchBuildZig(allocator: Allocator, project_dir: std.Io.Dir) !?usize {
     while (line_iter.next()) |line| try line_list.append(allocator, line);
 
     const insert_after = findBuildZigInsertionPoint(line_list.items) orelse {
-        cliDiag("error: could not find an insertion point in build.zig.\n", .{});
+        cliDiag(diag, "error: could not find an insertion point in build.zig.\n", .{});
         return error.NoInsertionPoint;
     };
 
@@ -24849,14 +24922,14 @@ fn patchBuildZig(allocator: Allocator, project_dir: std.Io.Dir) !?usize {
         if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK);
     }
 
-    try writeFileAtomic(project_dir, "build.zig", new_content.items);
+    try writeFileAtomic(diag.io, project_dir, "build.zig", new_content.items);
     return insert_after + 2;
 }
 
 /// True when build.zig.zon exists and declares an ephor dependency.
-fn projectHasEphorDependency(allocator: Allocator, project_dir: std.Io.Dir) bool {
+fn projectHasEphorDependency(io: std.Io, allocator: Allocator, project_dir: std.Io.Dir) bool {
     const content = project_dir.readFileAlloc(
-        global_io.?,
+        io,
         "build.zig.zon",
         allocator,
         .limited(64 * 1024),
@@ -24955,8 +25028,8 @@ fn parseEphorHashFromZon(allocator: Allocator, content: []const u8) ?[]u8 {
 /// Read the ephor dependency hash recorded in the working directory's
 /// build.zig.zon. Caller frees the result. Returns null on any read or
 /// parse miss (EPH-I0139).
-fn readRecordedEphorHash(allocator: Allocator) ?[]u8 {
-    const content = Fs.cwd().readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch
+fn readRecordedEphorHash(io: std.Io, allocator: Allocator) ?[]u8 {
+    const content = Fs.cwd(io).readFileAlloc(allocator, "build.zig.zon", 64 * 1024) catch
         return null;
     defer allocator.free(content);
     return parseEphorHashFromZon(allocator, content);
@@ -24967,8 +25040,8 @@ fn readRecordedEphorHash(allocator: Allocator) ?[]u8 {
 /// download channel, so the printed hash is the user's comparison
 /// baseline for later upgrades (EPH-I0139). When the hash is unreadable,
 /// print the version alone and skip the note: no fabricated values.
-fn printRecordedHash(allocator: Allocator, ver: []const u8) void {
-    const hash = readRecordedEphorHash(allocator) orelse {
+fn printRecordedHash(io: std.Io, allocator: Allocator, ver: []const u8) void {
+    const hash = readRecordedEphorHash(io, allocator) orelse {
         std.debug.print("Installed ephor v{s}.\n", .{ver});
         return;
     };
@@ -25001,24 +25074,36 @@ fn printRecordedHash(allocator: Allocator, ver: []const u8) void {
 /// error.InvalidVersion before any fetch (EPH-I0155). Every other failure
 /// path returns error.UpgradeFailed (EPH-I0235): a script must see a
 /// nonzero exit.
-fn runUpgradeCommand(
-    allocator: Allocator,
-    project_dir: std.Io.Dir,
+/// CLI options for one upgrade run: an optional explicit version pin plus
+/// the downgrade-override latch (--force, EPH-I0193).
+const UpgradeOptions = struct {
     install_version: ?[]const u8,
     force: bool,
+};
+
+fn runUpgradeCommand(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    project_dir: std.Io.Dir,
+    opts: UpgradeOptions,
 ) !void {
+    const install_version = opts.install_version;
     // Validate before the fetch: an explicit version reaches the URL below
     // unchecked without this gate (EPH-I0155).
-    try requireStrictExplicitVersion(install_version);
+    try requireStrictExplicitVersion(diag, install_version);
     // If no explicit version, fetch the latest from Codeberg tags API
-    const fetched_ver = if (install_version == null) fetchLatestVersion(allocator) else null;
+    const fetched_ver = if (install_version == null)
+        fetchLatestVersion(diag.io, allocator)
+    else
+        null;
     defer if (fetched_ver) |fv| allocator.free(fv);
     const ver = install_version orelse (fetched_ver orelse EPHOR_VERSION);
 
     // Floor: a downgrade needs --force. Applies to an explicit --version
     // too (EPH-I0193). Refuse before any fetch or write.
-    if (!upgradeFloorAllows(EPHOR_VERSION, ver, force)) {
+    if (!upgradeFloorAllows(EPHOR_VERSION, ver, opts.force)) {
         cliDiag(
+            diag,
             "ERROR: refusing to downgrade ephor from v{s} to v{s}. Use --force to override.\n",
             .{ EPHOR_VERSION, ver },
         );
@@ -25028,8 +25113,8 @@ fn runUpgradeCommand(
     const package_url = try buildPackageUrl(allocator, ver);
     defer allocator.free(package_url);
 
-    if (!projectHasEphorDependency(allocator, project_dir)) {
-        cliDiag(
+    if (!projectHasEphorDependency(diag.io, allocator, project_dir)) {
+        cliDiag(diag,
             \\No ephor dependency found in build.zig.zon.
             \\
             \\Run 'ephor install' first to add ephor to your project.
@@ -25044,21 +25129,15 @@ fn runUpgradeCommand(
     defer allocator.free(url_z);
 
     // Run zig fetch --save to update the dependency
-    var child = try std.process.spawn(global_io.?, .{
-        .argv = &.{ tool_zig_path, "fetch", "--save=ephor", url_z },
-        .cwd = .{ .dir = project_dir },
-    });
+    try upgradeFetchOutcome(diag, try runZigFetchSave(diag, project_dir, url_z), ver);
 
-    const term = try child.wait(global_io.?);
-    try upgradeFetchOutcome(term.exited, ver);
-
-    printRecordedHash(allocator, ver);
+    printRecordedHash(diag.io, allocator, ver);
 
     // Update version in ephor.json if it exists
-    updateConfigVersion(allocator, ver);
+    updateConfigVersion(diag.io, allocator, ver);
 
     // Update build.zig integration to match current canonical block
-    updateBuildZigIntegration(allocator);
+    updateBuildZigIntegration(diag, allocator);
 
     std.debug.print(
         \\Done! Ephor updated to v{s}.
@@ -25070,9 +25149,9 @@ fn runUpgradeCommand(
 
 /// Map a finished zig-fetch child to the upgrade outcome (EPH-I0235). A
 /// nonzero exit reports the failure, then fails the upgrade.
-fn upgradeFetchOutcome(exited: u8, ver: []const u8) !void {
+fn upgradeFetchOutcome(diag: *DiagCtx, exited: u8, ver: []const u8) !void {
     if (exited == 0) return;
-    cliDiag("error: failed to upgrade ephor to v{s}.\n", .{ver});
+    cliDiag(diag, "error: failed to upgrade ephor to v{s}.\n", .{ver});
     return error.UpgradeFailed;
 }
 
@@ -25193,8 +25272,8 @@ fn migrateThresholds(allocator: Allocator, content: []const u8) ?[]const u8 {
 
 /// Update the "version" field in ephor.json if the file exists.
 /// Best-effort: silently does nothing if file is missing or cannot be updated.
-fn updateConfigVersion(allocator: Allocator, ver: []const u8) void {
-    const content = Fs.cwd().readFileAlloc(
+fn updateConfigVersion(io: std.Io, allocator: Allocator, ver: []const u8) void {
+    const content = Fs.cwd(io).readFileAlloc(
         allocator,
         CONFIG_FILENAME,
         64 * 1024,
@@ -25211,7 +25290,7 @@ fn updateConfigVersion(allocator: Allocator, ver: []const u8) void {
     }
     defer allocator.free(versioned);
 
-    writeConfigFile(versioned) catch return;
+    writeConfigFile(io, versioned) catch return;
     std.debug.print("Updated {s} (version: {s})\n", .{ CONFIG_FILENAME, ver });
 }
 
@@ -25273,16 +25352,16 @@ fn insertVersionField(
 /// in a hostile clone and truncates the victim file; rename replaces the
 /// link itself and never follows it (EPH-I0194). std's File.Atomic removes
 /// the temp file on failure.
-fn writeFileAtomic(dir: std.Io.Dir, sub_path: []const u8, contents: []const u8) !void {
-    var atomic = try dir.createFileAtomic(global_io.?, sub_path, .{ .replace = true });
-    defer atomic.deinit(global_io.?);
-    try atomic.file.writeStreamingAll(global_io.?, contents);
-    try atomic.replace(global_io.?);
+fn writeFileAtomic(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, contents: []const u8) !void {
+    var atomic = try dir.createFileAtomic(io, sub_path, .{ .replace = true });
+    defer atomic.deinit(io);
+    try atomic.file.writeStreamingAll(io, contents);
+    try atomic.replace(io);
 }
 
 /// Write content to the config file (ephor.json).
-fn writeConfigFile(content: []const u8) !void {
-    try writeFileAtomic(std.Io.Dir.cwd(), CONFIG_FILENAME, content);
+fn writeConfigFile(io: std.Io, content: []const u8) !void {
+    try writeFileAtomic(io, std.Io.Dir.cwd(), CONFIG_FILENAME, content);
 }
 
 /// Canonical ephor build.zig integration block.
@@ -25381,13 +25460,13 @@ const ast_check_capture_limit_bytes = 1024 * 1024;
 /// the file without publishing it. The spawn resolves zig through the
 /// I0154 tool resolver. Any defect (write, spawn, nonzero exit) reads as
 /// "does not parse": the caller keeps the live file.
-fn zigContentParses(allocator: Allocator, dir: std.Io.Dir, content: []const u8) bool {
-    var atomic = dir.createFileAtomic(global_io.?, "build.zig", .{ .replace = false }) catch
+fn zigContentParses(io: std.Io, allocator: Allocator, dir: std.Io.Dir, content: []const u8) bool {
+    var atomic = dir.createFileAtomic(io, "build.zig", .{ .replace = false }) catch
         return false;
-    defer atomic.deinit(global_io.?);
-    atomic.file.writeStreamingAll(global_io.?, content) catch return false;
+    defer atomic.deinit(io);
+    atomic.file.writeStreamingAll(io, content) catch return false;
     const tmp_name = std.fmt.hex(atomic.file_basename_hex);
-    const result = std.process.run(allocator, global_io.?, .{
+    const result = std.process.run(allocator, io, .{
         .argv = &.{ tool_zig_path, "ast-check", &tmp_name },
         .cwd = .{ .dir = dir },
         .stdout_limit = .limited(ast_check_capture_limit_bytes),
@@ -25404,8 +25483,8 @@ fn zigContentParses(allocator: Allocator, dir: std.Io.Dir, content: []const u8) 
 /// live file (EPH-I0168): a marker cut that landed mid-expression would
 /// leave the project unbuildable, so a parse failure aborts the replace
 /// and keeps the old content.
-fn updateBuildZigIntegration(allocator: Allocator) void {
-    const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
+fn updateBuildZigIntegration(diag: *DiagCtx, allocator: Allocator) void {
+    const content = Fs.cwd(diag.io).readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
     defer allocator.free(content);
 
     const update = buildIntegrationUpdate(allocator, content) catch return;
@@ -25415,15 +25494,16 @@ fn updateBuildZigIntegration(allocator: Allocator) void {
     };
     defer allocator.free(new_content);
 
-    if (!zigContentParses(allocator, std.Io.Dir.cwd(), new_content)) {
+    if (!zigContentParses(diag.io, allocator, std.Io.Dir.cwd(), new_content)) {
         cliDiag(
+            diag,
             "warning: composed build.zig failed zig ast-check. Keeping the current block.\n",
             .{},
         );
         return;
     }
 
-    writeFileAtomic(std.Io.Dir.cwd(), "build.zig", new_content) catch return;
+    writeFileAtomic(diag.io, std.Io.Dir.cwd(), "build.zig", new_content) catch return;
 
     std.debug.print("Updated build.zig (ephor build steps)\n", .{});
 }
@@ -25463,15 +25543,23 @@ const CachedCheck = struct {
 /// and left untouched when the fetch fails. Without HOME the cache is skipped
 /// and every check fetches live. Setting EPHOR_NO_UPDATE_CHECK (any value,
 /// including empty) skips the whole check: no fetch, no cache read, no warning.
-fn checkForUpdates(allocator: Allocator, home: ?[]const u8, no_check_env: ?[]const u8) void {
+fn checkForUpdates(
+    io: std.Io,
+    allocator: Allocator,
+    home: ?[]const u8,
+    no_check_env: ?[]const u8,
+) void {
     if (updateCheckDisabled(no_check_env)) return;
     const cache_path = resolveUpdateCachePath(allocator, home);
     defer if (cache_path) |p| allocator.free(p);
-    const now = std.Io.Clock.Timestamp.now(global_io.?, .real).raw.toSeconds();
+    const cache_ctx: UpdateCacheCtx = .{
+        .io = io,
+        .allocator = allocator,
+        .now = std.Io.Clock.Timestamp.now(io, .real).raw.toSeconds(),
+    };
     const latest = resolveLatestVersion(
-        allocator,
+        cache_ctx,
         cache_path,
-        now,
         fetchLatestVersion,
     ) orelse {
         std.debug.print(
@@ -25527,8 +25615,8 @@ fn resolveUpdateCachePath(allocator: Allocator, home: ?[]const u8) ?[]const u8 {
 /// unreadable, oversized, non-integer epoch, non-semver version) so callers
 /// fall through to a live fetch — fail-closed on weird input. On success the
 /// returned version is caller-owned.
-fn readUpdateCache(allocator: Allocator, path: []const u8) ?CachedCheck {
-    const content = Fs.cwd().readFileAlloc(allocator, path, UPDATE_CACHE_MAX_BYTES) catch
+fn readUpdateCache(io: std.Io, allocator: Allocator, path: []const u8) ?CachedCheck {
+    const content = Fs.cwd(io).readFileAlloc(allocator, path, UPDATE_CACHE_MAX_BYTES) catch
         return null;
     defer allocator.free(content);
     var lines = mem.splitScalar(u8, content, '\n');
@@ -25551,38 +25639,43 @@ const update_cache_file_mode = 0o600;
 /// publishes it. A crash mid-write leaves a corrupt file that
 /// readUpdateCache rejects, so the next run simply refetches — the format
 /// is self-healing.
-fn writeUpdateCache(
+/// I/O, allocator, and clock for the update-check cache (EPH-I0771). `now`
+/// travels with the context so the freshness read and the cache write stamp
+/// the same second.
+const UpdateCacheCtx = struct {
+    io: std.Io,
     allocator: Allocator,
-    path: []const u8,
-    version: []const u8,
     now: i64,
-) void {
-    const content = std.fmt.allocPrint(allocator, "{d}\n{s}\n", .{ now, version }) catch return;
+};
+
+fn writeUpdateCache(ctx: UpdateCacheCtx, path: []const u8, version: []const u8) void {
+    const allocator = ctx.allocator;
+    const content = std.fmt.allocPrint(allocator, "{d}\n{s}\n", .{ ctx.now, version }) catch return;
     defer allocator.free(content);
     const dir_path = std.fs.path.dirname(path) orelse return;
     const base = std.fs.path.basename(path);
     if (base.len == 0) return;
-    var dir = std.Io.Dir.cwd().openDir(global_io.?, dir_path, .{}) catch return;
-    defer dir.close(global_io.?);
-    var atomic = dir.createFileAtomic(global_io.?, base, .{ .replace = true }) catch return;
-    defer atomic.deinit(global_io.?);
-    atomic.file.writeStreamingAll(global_io.?, content) catch return;
+    var dir = std.Io.Dir.cwd().openDir(ctx.io, dir_path, .{}) catch return;
+    defer dir.close(ctx.io);
+    var atomic = dir.createFileAtomic(ctx.io, base, .{ .replace = true }) catch return;
+    defer atomic.deinit(ctx.io);
+    atomic.file.writeStreamingAll(ctx.io, content) catch return;
     // POSIX-only: the Windows permissions model has no mode_t.
     if (comptime std.posix.mode_t != u0) {
         atomic.file.setPermissions(
-            global_io.?,
+            ctx.io,
             std.Io.File.Permissions.fromMode(update_cache_file_mode),
         ) catch return;
     }
-    atomic.replace(global_io.?) catch return;
+    atomic.replace(ctx.io) catch return;
 }
 
 /// Return the cached version (ownership transferred to the caller) when a
 /// fresh cache exists at path; null when missing, corrupt, or stale.
-fn readFreshCachedVersion(allocator: Allocator, path: []const u8, now: i64) ?[]const u8 {
-    const cached = readUpdateCache(allocator, path) orelse return null;
-    if (isCacheFresh(cached.epoch, now)) return cached.version;
-    allocator.free(cached.version);
+fn readFreshCachedVersion(ctx: UpdateCacheCtx, path: []const u8) ?[]const u8 {
+    const cached = readUpdateCache(ctx.io, ctx.allocator, path) orelse return null;
+    if (isCacheFresh(cached.epoch, ctx.now)) return cached.version;
+    ctx.allocator.free(cached.version);
     return null;
 }
 
@@ -25591,16 +25684,15 @@ fn readFreshCachedVersion(allocator: Allocator, path: []const u8, now: i64) ?[]c
 /// successful result rewrites the cache (stamped with `now`). A failed fetch
 /// returns null and leaves any existing cache file untouched.
 fn resolveLatestVersion(
-    allocator: Allocator,
+    ctx: UpdateCacheCtx,
     cache_path: ?[]const u8,
-    now: i64,
-    fetch_fn: *const fn (Allocator) ?[]const u8,
+    fetch_fn: *const fn (std.Io, Allocator) ?[]const u8,
 ) ?[]const u8 {
     if (cache_path) |path| {
-        if (readFreshCachedVersion(allocator, path, now)) |v| return v;
+        if (readFreshCachedVersion(ctx, path)) |v| return v;
     }
-    const latest = fetch_fn(allocator) orelse return null;
-    if (cache_path) |path| writeUpdateCache(allocator, path, latest, now);
+    const latest = fetch_fn(ctx.io, ctx.allocator) orelse return null;
+    if (cache_path) |path| writeUpdateCache(ctx, path, latest);
     return latest;
 }
 
@@ -25629,16 +25721,16 @@ fn buildCurlFetchArgv(
 
 /// Fetch latest version from the Codeberg tags API (not cached raw files).
 /// Falls back to parsing build.zig.zon from main branch if tags API fails.
-fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
+fn fetchLatestVersion(io: std.Io, allocator: Allocator) ?[]const u8 {
     // Primary: tags API. The page is date-ordered and tag dates are
     // attacker-influenceable, so the parser takes the semver-max over the
     // page instead of the first entry (EPH-I0193).
     const api_url = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10";
     const api_argv = buildCurlFetchArgv(tool_curl_path, "5", api_url);
-    const api_result = std.process.run(allocator, global_io.?, .{
+    const api_result = std.process.run(allocator, io, .{
         .argv = &api_argv,
         .stdout_limit = .limited(version_fetch_stdout_limit_bytes),
-    }) catch return fetchVersionFromZon(allocator);
+    }) catch return fetchVersionFromZon(io, allocator);
     defer allocator.free(api_result.stdout);
     defer allocator.free(api_result.stderr);
 
@@ -25647,13 +25739,13 @@ fn fetchLatestVersion(allocator: Allocator) ?[]const u8 {
     }
 
     // Fallback: parse build.zig.zon from main branch
-    return fetchVersionFromZon(allocator);
+    return fetchVersionFromZon(io, allocator);
 }
 
 /// Fetch version by parsing build.zig.zon from the main branch (CDN-cached fallback).
-fn fetchVersionFromZon(allocator: Allocator) ?[]const u8 {
+fn fetchVersionFromZon(io: std.Io, allocator: Allocator) ?[]const u8 {
     const zon_argv = buildCurlFetchArgv(tool_curl_path, "3", EPHOR_VERSION_URL);
-    const result = std.process.run(allocator, global_io.?, .{
+    const result = std.process.run(allocator, io, .{
         .argv = &zon_argv,
         .stdout_limit = .limited(version_fetch_stdout_limit_bytes),
     }) catch return null;
@@ -25698,10 +25790,10 @@ fn isStrictSemverTag(ver: []const u8) bool {
 /// X.Y.Z, and buildPackageUrl splices the value into the URL unchecked, so
 /// anything else is a hard usage error, never a URL component. Null (no
 /// explicit version) always passes.
-fn requireStrictExplicitVersion(install_version: ?[]const u8) !void {
+fn requireStrictExplicitVersion(diag: *DiagCtx, install_version: ?[]const u8) !void {
     const ver = install_version orelse return;
     if (isStrictSemverTag(ver)) return;
-    cliDiag("error: invalid --version value '{s}' (expected X.Y.Z)\n", .{ver});
+    cliDiag(diag, "error: invalid --version value '{s}' (expected X.Y.Z)\n", .{ver});
     return error.InvalidVersion;
 }
 
@@ -25848,8 +25940,12 @@ fn parseThreshold(arg: []const u8, prefix: []const u8) ThresholdMatch {
 
 /// Hard usage error for a threshold flag whose value does not parse
 /// (EPH-I0237), matching the parseFailOnArg fail-closed policy.
-fn reportInvalidThreshold(arg: []const u8, prefix: []const u8) error{InvalidThresholdValue} {
-    cliDiag("error: invalid {s} value '{s}' (expected a positive integer)\n", .{
+fn reportInvalidThreshold(
+    diag: *DiagCtx,
+    arg: []const u8,
+    prefix: []const u8,
+) error{InvalidThresholdValue} {
+    cliDiag(diag, "error: invalid {s} value '{s}' (expected a positive integer)\n", .{
         prefix[0 .. prefix.len - 1], // strip the trailing '='
         arg[prefix.len..],
     });
@@ -25866,29 +25962,25 @@ fn buildPathWithPrefix(allocator: Allocator, prefix: []const u8, suffix: []const
 }
 
 /// Try to add entry files from a list of candidate paths (dedup via added map)
-fn tryAddEntryFiles(
-    allocator: Allocator,
-    cfg: *Config,
-    candidates: []const []const u8,
-    added: *std.StringHashMap(void),
-) !void {
+fn tryAddEntryFiles(ctx: EntryScanCtx, candidates: []const []const u8) !void {
     for (candidates) |f| {
-        const full = try buildPathWithPrefix(allocator, cfg.path, f);
-        Fs.cwd().access(full, .{}) catch {
-            allocator.free(full);
+        const full = try buildPathWithPrefix(ctx.allocator, ctx.cfg.path, f);
+        Fs.cwd(ctx.diag.io).access(full, .{}) catch {
+            ctx.allocator.free(full);
             continue;
         };
-        if (added.contains(full)) {
-            allocator.free(full);
+        if (ctx.added.contains(full)) {
+            ctx.allocator.free(full);
             continue;
         }
-        try cfg.entries.append(allocator, full);
-        try added.put(full, {});
+        try ctx.cfg.entries.append(ctx.allocator, full);
+        try ctx.added.put(full, {});
     }
 }
 
 /// Scan build.zig files in target and parent directories
 fn scanBuildZigEntries(
+    diag: *DiagCtx,
     allocator: Allocator,
     cfg: *Config,
     added: *std.StringHashMap(void),
@@ -25896,6 +25988,7 @@ fn scanBuildZigEntries(
     const build_zig_path = try buildPathWithPrefix(allocator, cfg.path, "build.zig");
     defer allocator.free(build_zig_path);
     var ctx = EntryScanCtx{
+        .diag = diag,
         .allocator = allocator,
         .cfg = cfg,
         .added = added,
@@ -25915,23 +26008,15 @@ fn scanBuildZigEntries(
     try extractBuildZigEntriesFromPath(ctx);
 }
 
-fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
-    for (cfg.entries.items) |e| allocator.free(e);
-    cfg.entries.clearRetainingCapacity();
-    try loadConfigFromTargetPath(allocator, cfg, cfg.path);
-    if (cfg.entries.items.len > 0) return;
-
-    var added = std.StringHashMap(void).init(allocator);
-    defer added.deinit();
-
-    const files = [_][]const u8{ "main.zig", "lib.zig", "root.zig" };
-    try tryAddEntryFiles(allocator, cfg, &files, &added);
-    const src_files = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig" };
-    try tryAddEntryFiles(allocator, cfg, &src_files, &added);
-
-    const rejects_before = entries_reject_count;
-    try scanBuildZigEntries(allocator, cfg, &added);
-
+/// Scan the conventional multi-entry directories under cfg.path for entry
+/// files. A target-tree dir walk, so the candidates are containment-gated
+/// (EPH-I0195).
+fn scanMultiEntryDirs(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    added: *std.StringHashMap(void),
+) !void {
     const multi_entry_dirs = [_][]const u8{
         "examples",  "example", "samples", "experiments",
         "tools",     "test",    "tests",   "fuzz",
@@ -25940,9 +26025,10 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
         "bin",       "ci",      "user",
     };
     const scan_ctx = EntryScanCtx{
+        .diag = diag,
         .allocator = allocator,
         .cfg = cfg,
-        .added = &added,
+        .added = added,
         .check_access = true,
         // EPH-I0195: dir walk over the scanned tree — containment-gate.
         .gate_containment = true,
@@ -25952,14 +26038,40 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
         defer allocator.free(dir_path);
         try scanDirForEntries(scan_ctx, dir_path);
     }
+}
+
+fn detectTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
+    for (cfg.entries.items) |e| allocator.free(e);
+    cfg.entries.clearRetainingCapacity();
+    try loadConfigFromTargetPath(diag, allocator, cfg, cfg.path);
+    if (cfg.entries.items.len > 0) return;
+
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+
+    const files_ctx: EntryScanCtx = .{
+        .diag = diag,
+        .allocator = allocator,
+        .cfg = cfg,
+        .added = &added,
+    };
+    const files = [_][]const u8{ "main.zig", "lib.zig", "root.zig" };
+    try tryAddEntryFiles(files_ctx, &files);
+    const src_files = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig" };
+    try tryAddEntryFiles(files_ctx, &src_files);
+
+    const rejects_before = diag.entries_reject_count;
+    try scanBuildZigEntries(diag, allocator, cfg, &added);
+
+    try scanMultiEntryDirs(diag, allocator, cfg, &added);
 
     // One note per extraction run, not per entry (EPH-I0195).
-    const dropped_entries = entries_reject_count - rejects_before;
+    const dropped_entries = diag.entries_reject_count - rejects_before;
     if (dropped_entries > 0) try noteEntriesRejected(
+        diag,
         allocator,
         "note: ignoring {d} outside-root entries extracted from target tree {s}\n",
-        cfg.path,
-        dropped_entries,
+        .{ .path = cfg.path, .dropped = dropped_entries },
     );
 }
 
@@ -25967,8 +26079,8 @@ fn detectTargetEntries(allocator: Allocator, cfg: *Config) !void {
 /// EPH-I0195 exempt: reads the working directory's own build.zig (the
 /// operator's tree); the target-tree extraction family carries the
 /// containment gate.
-fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
-    const content = Fs.cwd().readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return;
+fn extractBuildZigEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
+    const content = Fs.cwd(diag.io).readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return;
     defer allocator.free(content);
 
     // Track already-added entries to avoid duplicates
@@ -25978,12 +26090,18 @@ fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
         try added.put(e, {});
     }
 
+    const ctx: EntryScanCtx = .{
+        .diag = diag,
+        .allocator = allocator,
+        .cfg = cfg,
+        .added = &added,
+    };
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
         // Pattern 1: .root_source_file = b.path("path/to/file.zig")
         // Pattern 2: .root_source_file = .{ .path = "path/to/file.zig" }
         // Pattern 3: @import("src/something.zig")
-        try extractPathFromLine(allocator, cfg, line, &added);
+        try extractPathFromLine(ctx, line);
     }
 }
 
@@ -25991,19 +26109,14 @@ fn extractBuildZigEntries(allocator: Allocator, cfg: *Config) !void {
 /// positions (EPH-I0227): a pattern on a `\\` multiline-string body line or
 /// inside a string literal is text, not a reference, and must not add an
 /// entry.
-fn extractPathFromLine(
-    allocator: Allocator,
-    cfg: *Config,
-    line: []const u8,
-    added: *std.StringHashMap(void),
-) !void {
+fn extractPathFromLine(ctx: EntryScanCtx, line: []const u8) !void {
     if (types.LiteralState.forLine(line) == null) return;
     // Pattern: .path("...") - matches b.path("..."), dep.path("..."), dep.builder.path("...")
     if (mem.indexOf(u8, line, ".path(\"")) |idx| {
         if (!isStringDataPosition(line, idx)) {
             const start = idx + 7; // len of '.path("'
             if (extractQuotedPath(line, start)) |path|
-                try addEntryIfValid(allocator, cfg, path, added);
+                try addEntryIfValid(ctx, path);
         }
     }
     // Pattern: .path = "..." or .root_src = "..." or .root_source_file = "..."
@@ -26017,7 +26130,7 @@ fn extractPathFromLine(
         if (isStringDataPosition(line, idx)) continue;
         const start = idx + pat.len;
         if (extractQuotedPath(line, start)) |path|
-            try addEntryIfValid(allocator, cfg, path, added);
+            try addEntryIfValid(ctx, path);
     }
     // Pattern: @import("...") in build.zig (build module imports, entry points)
     var search_pos: usize = 0;
@@ -26026,7 +26139,7 @@ fn extractPathFromLine(
         const start = idx + 9; // len of '@import("'
         if (!isStringDataPosition(line, idx)) {
             if (extractQuotedPath(line, start)) |path|
-                try addEntryIfValid(allocator, cfg, path, added);
+                try addEntryIfValid(ctx, path);
         }
         search_pos = start;
     }
@@ -26122,17 +26235,12 @@ fn extractPathJoin(allocator: Allocator, line: []const u8, start: usize) ?[]cons
 }
 
 /// Add entry if the file exists and isn't already added
-fn addEntryIfValid(
-    allocator: Allocator,
-    cfg: *Config,
-    path: []const u8,
-    added: *std.StringHashMap(void),
-) !void {
-    if (added.contains(path)) return;
-    Fs.cwd().access(path, .{}) catch return;
-    const duped = try allocator.dupe(u8, path);
-    try cfg.entries.append(allocator, duped);
-    try added.put(duped, {});
+fn addEntryIfValid(ctx: EntryScanCtx, path: []const u8) !void {
+    if (ctx.added.contains(path)) return;
+    Fs.cwd(ctx.diag.io).access(path, .{}) catch return;
+    const duped = try ctx.allocator.dupe(u8, path);
+    try ctx.cfg.entries.append(ctx.allocator, duped);
+    try ctx.added.put(duped, {});
 }
 
 /// Shared context for entry-point detection scans (build.zig parsing and
@@ -26144,6 +26252,7 @@ fn addEntryIfValid(
 /// candidates derived from the scanned tree (attacker-controlled build.zig
 /// content); operator channels (cwd build.zig, cwd dir walk) leave it off.
 const EntryScanCtx = struct {
+    diag: *DiagCtx,
     allocator: Allocator,
     cfg: *Config,
     added: *std.StringHashMap(void),
@@ -26167,11 +26276,11 @@ fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
         try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.prefix, path });
     defer ctx.allocator.free(full_path);
     if (ctx.added.contains(full_path)) return;
-    if (ctx.gate_containment and !passTargetEntryGate(ctx.cfg.path, full_path)) {
-        entries_reject_count += 1;
+    if (ctx.gate_containment and !passTargetEntryGate(ctx.diag.io, ctx.cfg.path, full_path)) {
+        ctx.diag.entries_reject_count += 1;
         return;
     }
-    Fs.cwd().access(full_path, .{}) catch return;
+    Fs.cwd(ctx.diag.io).access(full_path, .{}) catch return;
     const duped = try ctx.allocator.dupe(u8, full_path);
     try ctx.cfg.entries.append(ctx.allocator, duped);
     try ctx.added.put(duped, {});
@@ -26240,8 +26349,8 @@ fn recurseNestedBuildModule(ctx: EntryScanCtx, imp_path: []const u8) Allocator.E
     const cur_dir = std.fs.path.dirname(ctx.build_path) orelse ".";
     const nested = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ cur_dir, imp_path });
     defer ctx.allocator.free(nested);
-    if (ctx.gate_containment and !passTargetEntryGate(ctx.cfg.path, nested)) {
-        entries_reject_count += 1;
+    if (ctx.gate_containment and !passTargetEntryGate(ctx.diag.io, ctx.cfg.path, nested)) {
+        ctx.diag.entries_reject_count += 1;
         return;
     }
     var child = ctx;
@@ -26270,7 +26379,11 @@ fn extractBuildZigEntriesFromPath(ctx: EntryScanCtx) !void {
     if (ctx.depth > 4) return;
 
     const max_bytes = 1024 * 1024;
-    const content = Fs.cwd().readFileAlloc(ctx.allocator, ctx.build_path, max_bytes) catch return;
+    const content = Fs.cwd(ctx.diag.io).readFileAlloc(
+        ctx.allocator,
+        ctx.build_path,
+        max_bytes,
+    ) catch return;
     defer ctx.allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -26304,13 +26417,13 @@ fn addDirEntry(ctx: EntryScanCtx, dir_path: []const u8, name: []const u8) !void 
         ctx.allocator.free(full);
         return;
     }
-    if (ctx.gate_containment and !passTargetEntryGate(ctx.cfg.path, full)) {
-        entries_reject_count += 1;
+    if (ctx.gate_containment and !passTargetEntryGate(ctx.diag.io, ctx.cfg.path, full)) {
+        ctx.diag.entries_reject_count += 1;
         ctx.allocator.free(full);
         return;
     }
     if (ctx.check_access) {
-        Fs.cwd().access(full, .{}) catch {
+        Fs.cwd(ctx.diag.io).access(full, .{}) catch {
             ctx.allocator.free(full);
             return;
         };
@@ -26324,10 +26437,10 @@ fn addDirEntry(ctx: EntryScanCtx, dir_path: []const u8, name: []const u8) !void 
 /// candidate is probed with access() before being added (target-path scans).
 fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
     if (ctx.depth > 16) return;
-    var dir = Fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close(global_io.?);
+    var dir = Fs.cwd(ctx.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(ctx.diag.io);
     var iter = dir.iterate();
-    while (try iter.next(global_io.?)) |entry| {
+    while (try iter.next(ctx.diag.io)) |entry| {
         if (entry.kind == .file and isEntryPointFile(entry.name)) {
             addDirEntry(ctx, dir_path, entry.name) catch continue;
         }
@@ -26340,21 +26453,21 @@ fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
     }
 }
 
-fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
+fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // Track already-added entries
     var added = std.StringHashMap(void).init(allocator);
     defer added.deinit();
 
     const entries = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig", "build.zig" };
     for (entries) |e| {
-        Fs.cwd().access(e, .{}) catch continue;
+        Fs.cwd(diag.io).access(e, .{}) catch continue;
         const duped = try allocator.dupe(u8, e);
         try cfg.entries.append(allocator, duped);
         try added.put(duped, {});
     }
 
     // Parse build.zig for additional entry points
-    try extractBuildZigEntries(allocator, cfg);
+    try extractBuildZigEntries(diag, allocator, cfg);
 
     // Update added set with build.zig entries
     for (cfg.entries.items) |e| try added.put(e, {});
@@ -26370,16 +26483,21 @@ fn detectStandardEntries(allocator: Allocator, cfg: *Config) !void {
     };
     // EPH-I0195 exempt: cwd dir walk over the operator's own tree, so
     // gate_containment stays off (default).
-    const scan_ctx = EntryScanCtx{ .allocator = allocator, .cfg = cfg, .added = &added };
+    const scan_ctx = EntryScanCtx{
+        .diag = diag,
+        .allocator = allocator,
+        .cfg = cfg,
+        .added = &added,
+    };
     for (multi_entry_dirs) |dir| {
         try scanDirForEntries(scan_ctx, dir);
     }
 
     // Auto-discover test files in src/
-    var dir = Fs.cwd().openDir("src", .{ .iterate = true }) catch return;
-    defer dir.close(global_io.?);
+    var dir = Fs.cwd(diag.io).openDir("src", .{ .iterate = true }) catch return;
+    defer dir.close(diag.io);
     var iter = dir.iterate();
-    while (try iter.next(global_io.?)) |entry| {
+    while (try iter.next(diag.io)) |entry| {
         const is_test_file = entry.kind == .file and mem.endsWith(u8, entry.name, "_test.zig");
         if (!is_test_file) continue;
         const path = try std.fmt.allocPrint(allocator, "src/{s}", .{entry.name});
@@ -26454,14 +26572,15 @@ const cli_threshold_flags = [_]CliThresholdFlag{
 /// cannot overwrite it (RED3-6: CLI thresholds always win). Values clamp at
 /// the documented maxima, same as config-file values. A matched flag with
 /// an unparseable value is a hard usage error (EPH-I0237).
-fn parseThresholdArg(arg: []const u8, cfg: *Config) !bool {
+fn parseThresholdArg(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
     for (cli_threshold_flags) |flag| {
+        const meta = thresholdFieldMeta(flag.field);
+        const spec: ThresholdClamp = .{ .key = flag.key, .cap = meta.cap };
         switch (parseThreshold(arg, flag.prefix)) {
             .no_match => continue,
-            .invalid => return reportInvalidThreshold(arg, flag.prefix),
+            .invalid => return reportInvalidThreshold(diag, arg, flag.prefix),
             .value => |num| {
-                const meta = thresholdFieldMeta(flag.field);
-                const clamped = clampThreshold(arg, flag.key, num, meta.cap);
+                const clamped = clampThreshold(diag, arg, spec, num);
                 applyThresholdField(&cfg.thresholds, flag.field, clamped);
                 cfg.threshold_cli_mask |= meta.bit;
                 return true;
@@ -26490,17 +26609,13 @@ fn handleEntryArg(
 }
 
 /// Handle --disable=, --enable=, list-appending CLI arguments
-fn handleListArg(
-    allocator: Allocator,
-    arg: []const u8,
-    cfg: *Config,
-) !bool {
+fn handleListArg(ctx: CliParseCtx, arg: []const u8) !bool {
     if (mem.startsWith(u8, arg, "--disable=")) {
-        try appendRuleListEntry(allocator, &cfg.disabled_rules, arg[10..], "--disable");
+        try appendRuleListEntry(ctx, &ctx.cfg.disabled_rules, arg[10..], "--disable");
         return true;
     }
     if (mem.startsWith(u8, arg, "--enable=")) {
-        try appendRuleListEntry(allocator, &cfg.enabled_rules, arg[9..], "--enable");
+        try appendRuleListEntry(ctx, &ctx.cfg.enabled_rules, arg[9..], "--enable");
         return true;
     }
     return false;
@@ -26510,16 +26625,16 @@ fn handleListArg(
 /// rule (EPH-I0236), so it is a hard usage error — the same fail-closed
 /// policy as an empty config exclude pattern (RED3-2).
 fn appendRuleListEntry(
-    allocator: Allocator,
+    ctx: CliParseCtx,
     list: *std.ArrayListUnmanaged([]const u8),
     entry: []const u8,
     flag: []const u8,
 ) !void {
     if (entry.len == 0) {
-        cliDiag("error: {s} requires a rule ID or prefix (see ephor --help)\n", .{flag});
+        cliDiag(ctx.diag, "error: {s} requires a rule ID or prefix (see ephor --help)\n", .{flag});
         return error.EmptyRulePattern;
     }
-    try list.append(allocator, try allocator.dupe(u8, entry));
+    try list.append(ctx.allocator, try ctx.allocator.dupe(u8, entry));
 }
 
 /// Replace cfg.path with an owned copy. Dupe BEFORE free: when the dupe
@@ -26564,10 +26679,11 @@ fn handleOptionalPathArg(
 /// Handle --fail-on=<level> (returns true if the arg matched).
 /// Fail closed on a typo: a silently ignored CI gate flag is worse
 /// than a hard usage error.
-fn parseFailOnArg(arg: []const u8, cfg: *Config) !bool {
+fn parseFailOnArg(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
     if (!mem.startsWith(u8, arg, "--fail-on=")) return false;
     const level = FailOn.fromString(arg[10..]) orelse {
         cliDiag(
+            diag,
             "error: invalid --fail-on value '{s}' (expected: error, warning, note, never)\n",
             .{arg[10..]},
         );
@@ -26577,33 +26693,39 @@ fn parseFailOnArg(arg: []const u8, cfg: *Config) !bool {
     return true;
 }
 
+/// Shared context for CLI argument parsing (EPH-I0771): the run
+/// diagnostics context, the config under construction, and the latch that
+/// records whether any --entry flag arrived (the first one clears the
+/// config-file entries).
+const CliParseCtx = struct {
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    cli_entries: *bool,
+};
+
 /// Parse one CLI argument. Fail closed on malformed input (EPH-I0233/34):
 /// an empty element is a hard usage error, never an index panic, and an
 /// unmatched -flag is a hard usage error, never a silently ignored typo
 /// (a dropped --strict would neuter a CI gate). Positional paths stay
 /// positional. Anything else starting with '-' must name a known flag.
-fn parseCliArg(
-    allocator: Allocator,
-    arg: []const u8,
-    cfg: *Config,
-    cli_entries: *bool,
-) !void {
+fn parseCliArg(ctx: CliParseCtx, arg: []const u8) !void {
     if (arg.len == 0) {
-        cliDiag("error: empty argument is not valid (see ephor --help)\n", .{});
+        cliDiag(ctx.diag, "error: empty argument is not valid (see ephor --help)\n", .{});
         return error.EmptyArgument;
     }
-    if (try parseFailOnArg(arg, cfg)) return;
+    if (try parseFailOnArg(ctx.diag, arg, ctx.cfg)) return;
     if (mem.startsWith(u8, arg, "--entry="))
-        return handleEntryArg(allocator, arg, cfg, cli_entries);
-    if (parseSimpleFlag(arg, cfg)) return;
-    if (try parseThresholdArg(arg, cfg)) return;
-    if (try handleListArg(allocator, arg, cfg)) return;
-    if (try handleOptionalPathArg(allocator, arg, cfg)) return;
+        return handleEntryArg(ctx.allocator, arg, ctx.cfg, ctx.cli_entries);
+    if (parseSimpleFlag(arg, ctx.cfg)) return;
+    if (try parseThresholdArg(ctx.diag, arg, ctx.cfg)) return;
+    if (try handleListArg(ctx, arg)) return;
+    if (try handleOptionalPathArg(ctx.allocator, arg, ctx.cfg)) return;
     if (arg[0] != '-') {
-        try setOwnedPath(allocator, cfg, arg);
+        try setOwnedPath(ctx.allocator, ctx.cfg, arg);
         return;
     }
-    cliDiag("error: unknown flag '{s}' (see ephor --help)\n", .{arg});
+    cliDiag(ctx.diag, "error: unknown flag '{s}' (see ephor --help)\n", .{arg});
     return error.UnknownFlag;
 }
 
@@ -26648,17 +26770,17 @@ fn stripTrailingSlashes(allocator: Allocator, cfg: *Config) !void {
 
 /// Auto-detect path from build.zig when neither config nor CLI set one
 /// (only for commands that analyze code, not install/upgrade/help/version).
-fn autoDetectPath(allocator: Allocator, cfg: *Config) void {
+fn autoDetectPath(io: std.Io, allocator: Allocator, cfg: *Config) void {
     const needs_path = switch (cfg.command) {
         .install, .upgrade, .help, .version => false,
         else => true,
     };
     if (!needs_path or cfg.path_owned) return;
-    cfg.path = detectPathDirFromBuildZig(allocator);
+    cfg.path = detectPathDirFromBuildZig(io, allocator);
     cfg.path_owned = true;
 }
 
-fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
+fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) !Config {
     var args = try proc_args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next();
@@ -26666,25 +26788,32 @@ fn parseArgs(allocator: Allocator, proc_args: std.process.Args) !Config {
     // Free the partially built config when a parse error aborts midway
     // (config-file allocations are already attached to cfg by then).
     errdefer cfg.deinit(allocator);
-    try loadConfigFile(allocator, &cfg);
+    try loadConfigFile(diag, allocator, &cfg);
     var cli_entries = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
             cfg.command = c;
         } else if (cmd.len == 0 or cmd[0] == '-') {
             // A flag — or the invalid empty element — goes through the flag
             // parser, which rejects what it cannot match (EPH-I0233/34).
-            try parseCliArg(allocator, cmd, &cfg, &cli_entries);
+            try parseCliArg(cli_ctx, cmd);
         } else {
             try setOwnedPath(allocator, &cfg, cmd);
             cfg.command = .check;
         }
     }
-    while (args.next()) |arg| try parseCliArg(allocator, arg, &cfg, &cli_entries);
+    while (args.next()) |arg| try parseCliArg(cli_ctx, arg);
     try stripTrailingSlashes(allocator, &cfg);
-    autoDetectPath(allocator, &cfg);
-    if (cfg.path_owned and !mem.eql(u8, cfg.path, "src")) try detectTargetEntries(allocator, &cfg);
-    if (cfg.entries.items.len == 0) try detectStandardEntries(allocator, &cfg);
+    autoDetectPath(diag.io, allocator, &cfg);
+    if (cfg.path_owned and !mem.eql(u8, cfg.path, "src"))
+        try detectTargetEntries(diag, allocator, &cfg);
+    if (cfg.entries.items.len == 0) try detectStandardEntries(diag, allocator, &cfg);
     return cfg;
 }
 
@@ -26905,7 +27034,7 @@ fn printHelp() void {
 
 /// Load known issues from file (file:line format, one per line)
 /// Supports .ephor-ignore auto-detection or --known-issues=<path>
-fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
+fn loadKnownIssues(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // Every finding command loads before reporting. The guard keeps a
     // second call from duplicating entries or the auto-load note.
     if (cfg.known_issues_loaded) return;
@@ -26914,9 +27043,9 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
     // explicit --known-issues path stays silent (the user asked for it).
     const explicit = cfg.known_issues_path != null;
     const path = cfg.known_issues_path orelse
-        (try detectKnownIssuesPath(allocator, cfg)) orelse return;
+        (try detectKnownIssuesPath(diag, allocator, cfg)) orelse return;
 
-    const content = Fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return;
+    const content = Fs.cwd(diag.io).readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return;
     defer allocator.free(content);
 
     // Track how many keys we've successfully added for cleanup on error
@@ -26943,11 +27072,11 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
     }
 
     if (!explicit) {
-        known_issues_autoload_count += 1;
+        diag.known_issues_autoload_count += 1;
         // path_dir can steer cfg.path into an attacker-named directory.
         var safe_path = try types.sanitizeTerminal(allocator, path);
         defer safe_path.deinit(allocator);
-        cliDiag("note: loaded {d} known-issue {s} from {s}\n", .{
+        cliDiag(diag, "note: loaded {d} known-issue {s} from {s}\n", .{
             keys_added,
             if (keys_added == 1) @as([]const u8, "entry") else "entries",
             safe_path.slice,
@@ -26960,17 +27089,18 @@ fn loadKnownIssues(allocator: Allocator, cfg: *Config) !void {
 /// adoption honors the ephor.json trust decision (EPH-I0222): an
 /// untrusted file is refused with one skip note and the path stays null.
 /// Returns null when no file exists or the file is untrusted.
-fn detectKnownIssuesPath(allocator: Allocator, cfg: *Config) !?[]const u8 {
+fn detectKnownIssuesPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !?[]const u8 {
     const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
     defer allocator.free(ignore_path);
-    Fs.cwd().access(ignore_path, .{}) catch return null; // No known issues file
-    const trusted = cfg.trust_target_config or isConfigDirTrusted(cfg.path);
+    Fs.cwd(diag.io).access(ignore_path, .{}) catch return null; // No known issues file
+    const trusted = cfg.trust_target_config or isConfigDirTrusted(diag.io, cfg.path);
     if (!trusted) {
-        untrusted_ignore_skip_count += 1;
+        diag.untrusted_ignore_skip_count += 1;
         // The scanned tree supplies the path bytes here: sanitize them.
         var safe_path = try types.sanitizeTerminal(allocator, ignore_path);
         defer safe_path.deinit(allocator);
         cliDiag(
+            diag,
             "note: ignoring untrusted .ephor-ignore at {s} " ++
                 "(use --trust-target-config to honor)\n",
             .{safe_path.slice},
@@ -27001,6 +27131,7 @@ fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
 /// canonical containment root for snippet reads (EPH-I0198). A null root
 /// fails closed: the export writes no snippet.
 const ExportPathCtx = struct {
+    io: std.Io,
     base_path: []const u8,
     scan_root_real: ?[]const u8,
 };
@@ -27019,12 +27150,12 @@ fn writeCodeSnippet(
     allocator: Allocator,
     output: *std.ArrayListUnmanaged(u8),
     issue: Issue,
-    scan_root_real: ?[]const u8,
+    paths: ExportPathCtx,
 ) !void {
-    if (!resolvesInRoot(issue.file, scan_root_real)) return;
+    if (!resolvesInRoot(paths.io, issue.file, paths.scan_root_real)) return;
     // max_source_file_bytes (EPH-I0150): the same cap the graph read
     // under, so a skipped file cannot re-enter through the snippet path.
-    const content = Fs.cwd().readFileAlloc(
+    const content = Fs.cwd(paths.io).readFileAlloc(
         allocator,
         issue.file,
         max_source_file_bytes,
@@ -27081,7 +27212,7 @@ fn writeExportIssue(
         defer safe_help.deinit(allocator);
         try output.print(allocator, "**Help**: {s}\n", .{safe_help.slice});
     }
-    try writeCodeSnippet(allocator, output, issue, paths.scan_root_real);
+    try writeCodeSnippet(allocator, output, issue, paths);
     try output.print(allocator, "---\n\n", .{});
 }
 
@@ -27186,6 +27317,7 @@ const SuppressionStats = struct {
 /// per-(file, rule) directive scans behind shouldPrintIssue. suppression
 /// accumulates the per-channel drop counts (RED3-3).
 const ReportOutCtx = struct {
+    diag: *DiagCtx,
     base_path: []const u8,
     allocator: Allocator,
     cfg: *const Config,
@@ -27197,11 +27329,12 @@ const ReportOutCtx = struct {
 /// Write the export document header: title, generation timestamp in UTC,
 /// and the filtered issue total.
 fn writeExportHeader(
+    io: std.Io,
     allocator: Allocator,
     output: *std.ArrayListUnmanaged(u8),
     filtered_count: usize,
 ) !void {
-    const ts: u64 = @intCast(std.Io.Clock.Timestamp.now(global_io.?, .real).raw.toSeconds());
+    const ts: u64 = @intCast(std.Io.Clock.Timestamp.now(io, .real).raw.toSeconds());
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = ts };
     const day_secs = epoch_secs.getDaySeconds();
     const year_day = epoch_secs.getEpochDay().calculateYearDay();
@@ -27224,8 +27357,8 @@ fn exportIssues(
     all_issues: []const Issue,
     out: ReportOutCtx,
 ) !usize {
-    var file = try Fs.cwd().createFile(export_path, .{});
-    defer file.close(global_io.?);
+    var file = try Fs.cwd(out.diag.io).createFile(export_path, .{});
+    defer file.close(out.diag.io);
 
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(allocator);
@@ -27234,15 +27367,16 @@ fn exportIssues(
     for (all_issues) |issue| {
         if (shouldPrintIssue(issue, out)) filtered_count += 1;
     }
-    try writeExportHeader(allocator, &output, filtered_count);
+    try writeExportHeader(out.diag.io, allocator, &output, filtered_count);
 
     // The display base stays the raw configured path. The snippet
     // containment root is the canonical scan root (EPH-I0198). A null
     // root fails closed and the export writes no snippets.
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
     const paths = ExportPathCtx{
+        .io = out.diag.io,
         .base_path = out.cfg.path,
-        .scan_root_real = scanRootRealpath(out.cfg.path, &root_buf),
+        .scan_root_real = scanRootRealpath(out.diag.io, out.cfg.path, &root_buf),
     };
     for (all_issues) |issue| {
         if (!shouldPrintIssue(issue, out)) continue;
@@ -27260,7 +27394,7 @@ fn exportIssues(
             formatSuppressionBreakdown(&buf, out.suppression.*),
         });
     }
-    try file.writeStreamingAll(global_io.?, output.items);
+    try file.writeStreamingAll(out.diag.io, output.items);
     return filtered_count;
 }
 
@@ -27374,14 +27508,14 @@ fn printSuppressedJsonObject(stats: SuppressionStats) void {
 /// any STATUS/summary/footer line, so a suppressed repo never shows a bare
 /// clean status. JSON mode also gets the standalone object whenever no
 /// summary object will carry the member (the summary object is check-only).
-fn reportSuppression(stats: *const SuppressionStats, cfg: *const Config) void {
+fn reportSuppression(diag: *DiagCtx, stats: *const SuppressionStats, cfg: *const Config) void {
     const summary_prints = cfg.command == .check and cfg.show_summary;
     if (cfg.format == .json and !summary_prints) printSuppressedJsonObject(stats.*);
     const n = stats.total();
     if (n == 0) return;
-    suppression_note_count += 1;
+    diag.suppression_note_count += 1;
     var buf: [160]u8 = undefined;
-    cliDiag("note: {d} finding{s} suppressed ({s})\n", .{
+    cliDiag(diag, "note: {d} finding{s} suppressed ({s})\n", .{
         n,
         if (n == 1) @as([]const u8, "") else "s",
         formatSuppressionBreakdown(&buf, stats.*),
@@ -27760,10 +27894,11 @@ fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
 /// Surface partial AST-tier coverage (EPH-I0200): a version-skew or
 /// over-cap file loses ZA111 coverage, and the line tier has no equivalent
 /// signal. Fires whenever the tier skipped at least one file.
-fn noteAstTierSkips(stats: ast_tier.Stats) void {
+fn noteAstTierSkips(diag: *DiagCtx, stats: ast_tier.Stats) void {
     if (stats.skipped == 0) return;
-    ast_skip_note_count += 1;
+    diag.ast_skip_note_count += 1;
     cliDiag(
+        diag,
         "note: {d} file{s} skipped by the AST tier (parse errors, byte " ++
             "cap, or grammar pre-scan). ZA111 coverage is partial for those files.\n",
         .{ stats.skipped, if (stats.skipped == 1) @as([]const u8, "") else "s" },
@@ -27800,7 +27935,7 @@ fn sortIssuesByFile(issues: []Issue) void {
 /// Scan a path (file or directory) into the import graph
 fn scanPath(g: *ImportGraph, path: []const u8) !void {
     const is_file = blk: {
-        const stat = Fs.cwd().statFile(path) catch break :blk false;
+        const stat = Fs.cwd(g.diag.io).statFile(path) catch break :blk false;
         break :blk stat.kind == .file;
     };
     if (is_file) {
@@ -27820,6 +27955,10 @@ fn scanPath(g: *ImportGraph, path: []const u8) !void {
 const RunCtx = struct {
     alloc: Allocator,
     cfg: *Config,
+    /// Run diagnostics context: I/O handle and the note/warn counters
+    /// (EPH-I0771). main constructs one at startup. Tests construct their
+    /// own per test.
+    diag: *DiagCtx,
     /// Display root for relative paths in findings output.
     base_path: []const u8,
     /// Suppression-fact cache, built lazily per (file, rule). main owns it.
@@ -27838,6 +27977,7 @@ const RunCtx = struct {
     /// Shape the run state for printIssues/exportIssues.
     fn reportOut(self: *RunCtx, graph: ?*const ImportGraph) ReportOutCtx {
         return .{
+            .diag = self.diag,
             .base_path = self.base_path,
             .allocator = self.alloc,
             .cfg = self.cfg,
@@ -27900,7 +28040,7 @@ fn handleVersion(_: *RunCtx) void {
 /// `init` command: write a default ephor.json. --build also prints the
 /// build.zig integration snippet.
 fn handleInit(ctx: *RunCtx) void {
-    writeDefaultConfig() catch |err| {
+    writeDefaultConfig(ctx.diag.io) catch |err| {
         std.debug.print("error: failed to create config: {}\n", .{err});
         ctx.should_exit_error = true;
     };
@@ -27909,7 +28049,7 @@ fn handleInit(ctx: *RunCtx) void {
 
 /// The init --build follow-up: run the installer against the cwd project.
 fn runInstallAfterInit(ctx: *RunCtx) void {
-    runInstallCommand(ctx.alloc, std.Io.Dir.cwd(), ctx.cfg.install_version) catch |err| {
+    runInstallCommand(ctx.diag, ctx.alloc, std.Io.Dir.cwd(), ctx.cfg.install_version) catch |err| {
         std.debug.print("error: failed to run install: {}\n", .{err});
         ctx.should_exit_error = true;
     };
@@ -27917,7 +28057,7 @@ fn runInstallAfterInit(ctx: *RunCtx) void {
 
 /// `install` command: add ephor to the cwd project's build.zig.
 fn handleInstall(ctx: *RunCtx) void {
-    runInstallCommand(ctx.alloc, std.Io.Dir.cwd(), ctx.cfg.install_version) catch |err| {
+    runInstallCommand(ctx.diag, ctx.alloc, std.Io.Dir.cwd(), ctx.cfg.install_version) catch |err| {
         std.debug.print("error: failed to install: {}\n", .{err});
         ctx.should_exit_error = true;
     };
@@ -27926,10 +28066,10 @@ fn handleInstall(ctx: *RunCtx) void {
 /// `upgrade` command: update ephor to the latest (or --version=pinned) tag.
 fn handleUpgrade(ctx: *RunCtx) void {
     runUpgradeCommand(
+        ctx.diag,
         ctx.alloc,
         std.Io.Dir.cwd(),
-        ctx.cfg.install_version,
-        ctx.cfg.force_upgrade,
+        .{ .install_version = ctx.cfg.install_version, .force = ctx.cfg.force_upgrade },
     ) catch |err| {
         std.debug.print("error: failed to upgrade: {}\n", .{err});
         ctx.should_exit_error = true;
@@ -27967,8 +28107,8 @@ fn handleOrphans(ctx: *RunCtx) !void {
         std.debug.print("Detected {d} entry points:\n", .{ctx.cfg.entries.items.len});
         for (ctx.cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
     }
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
@@ -27979,14 +28119,14 @@ fn handleOrphans(ctx: *RunCtx) !void {
     try mergeSkippedIssues(ctx.alloc, &g, &issues);
     sortIssuesByFile(issues.items);
     const c = printIssues(issues.items, "orphans", ctx.reportOut(&g));
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
 }
 
 /// `memory` command: CFG-based allocation checks plus the AST tier (ZA111).
 fn handleMemory(ctx: *RunCtx) !void {
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
@@ -28000,14 +28140,14 @@ fn handleMemory(ctx: *RunCtx) !void {
     for (ast_issues.items) |ai| try issues.append(ctx.alloc, ai);
     ast_issues.items.len = 0; // ownership moved to issues
     const c = printIssues(issues.items, "memory", ctx.reportOut(&g));
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
 }
 
 /// `errors` command: error-handling findings plus discarded error unions.
 fn handleErrors(ctx: *RunCtx) !void {
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
@@ -28023,51 +28163,51 @@ fn handleErrors(ctx: *RunCtx) !void {
     // Clear ignored without deiniting items (now owned by issues)
     ignored.items.len = 0;
     const c = printIssues(issues.items, "errors", ctx.reportOut(&g));
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
 }
 
 /// `unused` command: dead-code findings.
 fn handleUnused(ctx: *RunCtx) !void {
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
     var issues = try analyzeUnused(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "unused", ctx.reportOut(&g));
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
 }
 
 /// `complexity` command: function-size and branch-metric findings.
 fn handleComplexity(ctx: *RunCtx) !void {
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
     var issues = try analyzeComplexity(ctx.alloc, &g, ctx.cfg.thresholds);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "complexity", ctx.reportOut(&g));
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
 }
 
 /// `fmt-check` command: zig fmt compliance findings.
 fn handleFmtCheck(ctx: *RunCtx) !void {
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
-    var issues = try runFmtCheck(ctx.alloc, ctx.cfg.path);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var issues = try runFmtCheck(ctx.diag, ctx.alloc, ctx.cfg.path);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "format", ctx.reportOut(null));
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
 }
 
 /// `stats` command: project scan counters, no findings.
 fn handleStats(ctx: *RunCtx) !void {
-    var g = ImportGraph.init(ctx.alloc);
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
@@ -28093,7 +28233,7 @@ fn confirmRuntime(ctx: *const RunCtx) bool {
         \\Proceed? [y/N]
     , .{ ctx.base_path, cmd_str });
     var read_buf: [16]u8 = undefined;
-    var stdin_reader = std.Io.File.stdin().reader(global_io.?, &read_buf);
+    var stdin_reader = std.Io.File.stdin().reader(ctx.diag.io, &read_buf);
     const n = stdin_reader.interface.readSliceShort(&read_buf) catch 0;
     if (n == 0 or (read_buf[0] != 'y' and read_buf[0] != 'Y')) {
         std.debug.print("Aborted.\n", .{});
@@ -28109,16 +28249,16 @@ fn handleRuntime(ctx: *RunCtx) !void {
         ctx.abort_epilogue = true;
         return;
     }
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
     var issues = try runRuntimeAnalysis(
+        ctx.diag.io,
         ctx.alloc,
         ctx.cfg.path,
-        ctx.cfg.verbose,
-        ctx.cfg.runtime_command,
+        .{ .verbose = ctx.cfg.verbose, .custom_command = ctx.cfg.runtime_command },
     );
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "runtime", ctx.reportOut(null));
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
 }
 
@@ -28207,8 +28347,8 @@ fn handleCheck(ctx: *RunCtx) !void {
         ctx.should_exit_error = true;
     }
     if (ctx.should_exit_error) return;
-    try loadKnownIssues(ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc);
+    try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try buildCheckGraph(ctx, &g);
@@ -28221,7 +28361,7 @@ fn handleCheck(ctx: *RunCtx) !void {
 /// entry files outside it, then mark reachability.
 fn buildCheckGraph(ctx: *const RunCtx, g: *ImportGraph) !void {
     try scanPath(g, ctx.cfg.path);
-    try noteEntriesWidenScan(ctx.alloc, ctx.cfg.path, ctx.cfg.entries.items);
+    try noteEntriesWidenScan(ctx.diag, ctx.alloc, ctx.cfg.path, ctx.cfg.entries.items);
     // Entry-point files outside the scanned path still feed orphan
     // detection when checking subdirectories.
     for (ctx.cfg.entries.items) |e| scanOutOfRootEntry(ctx, g, e);
@@ -28267,16 +28407,18 @@ fn countOutOfRootEntries(scan_path: []const u8, entries: []const []const u8) usi
 /// stays silent. The path crosses the terminal sanitizer: it can derive
 /// from a config file (EPH-I0147).
 fn noteEntriesWidenScan(
+    diag: *DiagCtx,
     allocator: Allocator,
     scan_path: []const u8,
     entries: []const []const u8,
 ) !void {
     const widened = countOutOfRootEntries(scan_path, entries);
     if (widened == 0) return;
-    entries_widen_note_count += 1;
+    diag.entries_widen_note_count += 1;
     var safe_path = try types.sanitizeTerminal(allocator, scan_path);
     defer safe_path.deinit(allocator);
     cliDiag(
+        diag,
         "note: scan includes {d} entry point{s} outside {s} " ++
             "(entry points always join the scan)\n",
         .{ widened, if (widened == 1) @as([]const u8, "") else "s", safe_path.slice },
@@ -28301,7 +28443,7 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     errdefer deinitIssues(&unused_issues, alloc);
     var cx_issues = try analyzeComplexity(alloc, g, ctx.cfg.thresholds);
     errdefer deinitIssues(&cx_issues, alloc);
-    var fmt_issues = try runFmtCheck(alloc, ctx.cfg.path);
+    var fmt_issues = try runFmtCheck(ctx.diag, alloc, ctx.cfg.path);
     errdefer deinitIssues(&fmt_issues, alloc);
     var style_issues = try analyzeStyle(alloc, g, ctx.cfg.thresholds);
     errdefer deinitIssues(&style_issues, alloc);
@@ -28313,7 +28455,7 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     errdefer deinitIssues(&conc_issues, alloc);
     var ast_stats = ast_tier.Stats{};
     try mergeAstTierIssues(alloc, g, &ast_stats, &cfg_mem_issues);
-    noteAstTierSkips(ast_stats);
+    noteAstTierSkips(ctx.diag, ast_stats);
     var ignored_err_issues = try analyzeIgnoredErrors(alloc, g);
     errdefer deinitIssues(&ignored_err_issues, alloc);
     return .{
@@ -28369,7 +28511,7 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
     const counts = printCheckReports(out, findings, &filtered);
     // RED3-3: the suppression note lands before STATUS/summary/footer so a
     // suppressed repo never shows a bare clean status.
-    reportSuppression(&ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     if (ctx.cfg.show_summary) printCheckSummary(ctx, g, findings, &counts);
     printResultFooter(counts.total());
     // Findings are informational unless --strict/--fail-on gates them.
@@ -28508,18 +28650,19 @@ fn collectAllIssues(
 }
 
 pub fn main(init: std.process.Init) !void {
-    global_io = init.io;
-    initToolPaths(init.io, init.environ_map);
+    var diag = DiagCtx{ .io = init.io };
+    initToolPaths(&diag, init.environ_map);
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var cfg = try parseArgs(alloc, init.minimal.args);
+    var cfg = try parseArgs(&diag, alloc, init.minimal.args);
     defer cfg.deinit(alloc);
 
     const entry = command_table.get(cfg.command);
     if (entry.check_updates) {
         checkForUpdates(
+            diag.io,
             alloc,
             init.environ_map.get("HOME"),
             init.environ_map.get("EPHOR_NO_UPDATE_CHECK"),
@@ -28528,7 +28671,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Get absolute base path for relative path calculation
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base_path = Fs.cwd().realpath(cfg.path, &base_buf) catch cfg.path;
+    const base_path = Fs.cwd(diag.io).realpath(cfg.path, &base_buf) catch cfg.path;
 
     // Suppression-fact cache shared by every printIssues/exportIssues call in
     // this run; built lazily per (file, rule), freed at exit.
@@ -28538,6 +28681,7 @@ pub fn main(init: std.process.Init) !void {
     var ctx = RunCtx{
         .alloc = alloc,
         .cfg = &cfg,
+        .diag = &diag,
         .base_path = base_path,
         .ignore_cache = &ignore_cache,
     };
@@ -28769,6 +28913,7 @@ const ChainWalkRun = struct {
 };
 
 test "markReachableResolved walks a 30000-node chain on a 1 MB stack" {
+    var diag = testDiagCtx();
     // Arena over testing.allocator: 30k nodes x ~7 allocations each cost
     // ~40s under DebugAllocator bookkeeping. The arena bumps a pointer
     // and frees in bulk. The arena is not thread-safe, but spawn and
@@ -28776,7 +28921,7 @@ test "markReachableResolved walks a 30000-node chain on a 1 MB stack" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Recursion needs one stack frame per chain link. 30,000 frames
@@ -28788,7 +28933,7 @@ test "markReachableResolved walks a 30000-node chain on a 1 MB stack" {
 
     // Direct main-thread call: the threaded walk below is statically
     // invisible to ZT101's name-binding, so pin the direct path too.
-    var smoke = ImportGraph.init(allocator);
+    var smoke = ImportGraph.init(allocator, &diag);
     defer smoke.deinit();
     try addChainNode(&smoke, 0, 1);
     try addChainNode(&smoke, 1, null);
@@ -28810,8 +28955,9 @@ test "markReachableResolved walks a 30000-node chain on a 1 MB stack" {
 }
 
 test "markReachableResolved terminates on import cycles" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     try addChainNode(&graph, 0, 1);
@@ -28824,8 +28970,7 @@ test "markReachableResolved terminates on import cycles" {
 }
 
 test "markZigFilesRecursive stops at the depth cap" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28842,7 +28987,7 @@ test "markZigFilesRecursive stops at the depth cap" {
     defer allocator.free(deep_zig);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = deep_zig, .data = "" });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
@@ -28855,8 +29000,7 @@ test "markZigFilesRecursive stops at the depth cap" {
 }
 
 test "scanForNestedBuildZig stops at the depth cap" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28876,7 +29020,7 @@ test "scanForNestedBuildZig stops at the depth cap" {
     defer allocator.free(deep_build);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = deep_build, .data = "" });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
@@ -28924,15 +29068,12 @@ test "summary JSON parses with the AST tier members" {
 }
 
 test "AST skip note fires only when files were skipped" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
-    noteAstTierSkips(.{ .parsed = 3, .skipped = 0 });
-    try std.testing.expectEqual(@as(usize, 0), ast_skip_note_count);
-    noteAstTierSkips(.{ .parsed = 3, .skipped = 2 });
-    try std.testing.expectEqual(@as(usize, 1), ast_skip_note_count);
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 0 });
+    try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
+    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 });
+    try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
 }
 
 test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-I0784)" {
@@ -28954,34 +29095,25 @@ test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-
 }
 
 test "entries-widen note fires only when entries add scan roots (EPH-I0784)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
 
     // Entries the scan path already covers add nothing: the note stays
     // silent.
-    try noteEntriesWidenScan(allocator, "src", &.{"src/main.zig"});
-    try std.testing.expectEqual(@as(usize, 0), entries_widen_note_count);
+    try noteEntriesWidenScan(&diag, allocator, "src", &.{"src/main.zig"});
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_widen_note_count);
     // Two out-of-root entries (the EPH-I0784 probe shape: check
     // src/types.zig from the repo root) fire the note once.
-    try noteEntriesWidenScan(allocator, "src/types.zig", &.{ "src/main.zig", "build.zig" });
-    try std.testing.expectEqual(@as(usize, 1), entries_widen_note_count);
+    try noteEntriesWidenScan(&diag, allocator, "src/types.zig", &.{ "src/main.zig", "build.zig" });
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
 }
 
 test "corpus warning fires once when resident bytes cross the threshold" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    const saved_threshold = corpus_bytes_warn_threshold;
-    defer corpus_bytes_warn_threshold = saved_threshold;
-    corpus_bytes_warn_threshold = 1024;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.corpus_bytes_warn_threshold = 1024;
+    diag.cli_diagnostics_enabled = false;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const pad_a = try allocator.alloc(u8, 600);
@@ -28994,7 +29126,7 @@ test "corpus warning fires once when resident bytes cross the threshold" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.zig", .data = pad_b });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "c.zig", .data = pad_a });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const path_a = try tmpFilePath(allocator, &tmp, "a.zig");
     defer allocator.free(path_a);
@@ -29006,19 +29138,18 @@ test "corpus warning fires once when resident bytes cross the threshold" {
     // 600 < 1024: under the threshold, no warning.
     try graph.analyzeFile(path_a);
     try std.testing.expectEqual(@as(usize, 600), graph.resident_bytes);
-    try std.testing.expectEqual(@as(usize, 0), corpus_warn_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.corpus_warn_count);
     // 600 + 700 = 1300 > 1024: the crossing fires the warning once.
     try graph.analyzeFile(path_b);
     try std.testing.expectEqual(@as(usize, 1300), graph.resident_bytes);
-    try std.testing.expectEqual(@as(usize, 1), corpus_warn_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.corpus_warn_count);
     // Past the threshold the edge trigger holds: no second warning.
     try graph.analyzeFile(path_c);
-    try std.testing.expectEqual(@as(usize, 1), corpus_warn_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.corpus_warn_count);
 }
 
 test "markAllZigFilesReachable memoizes overlapping roots" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29031,7 +29162,7 @@ test "markAllZigFilesReachable memoizes overlapping roots" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/inner/build.zig", .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/inner/deep/x.zig", .data = "" });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
@@ -29059,14 +29190,13 @@ test "markAllZigFilesReachable memoizes overlapping roots" {
 }
 
 test "markZigFilesRecursive does not memoize a depth-capped dir" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "" });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
@@ -29093,8 +29223,7 @@ fn hasOrphanIssue(issues: []const Issue, path: []const u8) bool {
 }
 
 test "extractBareImports ignores @import in a multiline-string body (EPH-I0227)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29114,7 +29243,7 @@ test "extractBareImports ignores @import in a multiline-string body (EPH-I0227)"
         .data = "pub fn f() void {}\n",
     });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
     defer allocator.free(entry);
@@ -29132,8 +29261,7 @@ test "extractBareImports ignores @import in a multiline-string body (EPH-I0227)"
 }
 
 test "extractBareImports ignores @import inside a string literal (EPH-I0227)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29152,7 +29280,7 @@ test "extractBareImports ignores @import inside a string literal (EPH-I0227)" {
         .data = "pub fn f() void {}\n",
     });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
     defer allocator.free(entry);
@@ -29168,8 +29296,7 @@ test "extractBareImports ignores @import inside a string literal (EPH-I0227)" {
 }
 
 test "extractBareImports still records a real bare @import (EPH-I0227)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29185,7 +29312,7 @@ test "extractBareImports still records a real bare @import (EPH-I0227)" {
         .data = "pub fn g() void {}\n",
     });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
     defer allocator.free(entry);
@@ -29198,8 +29325,7 @@ test "extractBareImports still records a real bare @import (EPH-I0227)" {
 }
 
 test "build-path scanners ignore refs inside strings (EPH-I0227)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29215,7 +29341,7 @@ test "build-path scanners ignore refs inside strings (EPH-I0227)" {
         "    \\\\const m = b.pathJoin(&.{ \"src\", \"f_j.zig\" });\n" ++
         ";\n";
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
@@ -29237,8 +29363,7 @@ test "build-path scanners ignore refs inside strings (EPH-I0227)" {
 }
 
 test "build-path scanners still mark refs in real code (EPH-I0227)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29251,7 +29376,7 @@ test "build-path scanners still mark refs in real code (EPH-I0227)" {
         "    const m = b.pathJoin(&.{ \"src\", \"r_j.zig\" });\n" ++
         "}\n";
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
@@ -29267,8 +29392,7 @@ test "build-path scanners still mark refs in real code (EPH-I0227)" {
 }
 
 test "build.zig entry extractors ignore refs on multiline-string lines (EPH-I0227)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29296,6 +29420,7 @@ test "build.zig entry extractors ignore refs on multiline-string lines (EPH-I022
     // The pathTag extractor on a `\\` body line: pre-fix it pulled the doc
     // text into the entries.
     const ctx = EntryScanCtx{
+        .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .added = &added,
@@ -29950,10 +30075,9 @@ test "reportFmtFailure reports a missing zig as a command failure" {
 }
 
 test "runFmtCheck reports ZR104 when the scanned path does not exist" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var issues = try runFmtCheck(allocator, "/nonexistent/ephor-i0722/x");
+    var issues = try runFmtCheck(&diag, allocator, "/nonexistent/ephor-i0722/x");
     defer deinitIssues(&issues, allocator);
 
     // Pre-fix the stderr diagnostic parsed to zero names and the
@@ -29965,8 +30089,7 @@ test "runFmtCheck reports ZR104 when the scanned path does not exist" {
 }
 
 test "runFmtCheck reports ZR104 for a non-zig input path" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29974,7 +30097,7 @@ test "runFmtCheck reports ZR104 for a non-zig input path" {
     const path = try tmpFilePath(allocator, &tmp, "plain.txt");
     defer allocator.free(path);
 
-    var issues = try runFmtCheck(allocator, path);
+    var issues = try runFmtCheck(&diag, allocator, path);
     defer deinitIssues(&issues, allocator);
 
     // zig fmt reads any input as zig source: the parse error exits
@@ -29989,8 +30112,7 @@ test "runFmtCheck reports ZR104 for a non-zig input path" {
 }
 
 test "runFmtCheck reports ZR104 for a syntax-broken zig file" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30001,7 +30123,7 @@ test "runFmtCheck reports ZR104 for a syntax-broken zig file" {
     const path = try tmpFilePath(allocator, &tmp, "broken.zig");
     defer allocator.free(path);
 
-    var issues = try runFmtCheck(allocator, path);
+    var issues = try runFmtCheck(&diag, allocator, path);
     defer deinitIssues(&issues, allocator);
 
     // The "path:line:col: error: ..." diagnostic fails the .zig-suffix
@@ -30015,8 +30137,7 @@ test "runFmtCheck reports ZR104 for a syntax-broken zig file" {
 }
 
 test "runFmtCheck keeps a needs-format file as a ZA601 warning" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30027,7 +30148,7 @@ test "runFmtCheck keeps a needs-format file as a ZA601 warning" {
     const path = try tmpFilePath(allocator, &tmp, "needsfmt.zig");
     defer allocator.free(path);
 
-    var issues = try runFmtCheck(allocator, path);
+    var issues = try runFmtCheck(&diag, allocator, path);
     defer deinitIssues(&issues, allocator);
 
     // Regression pin (EPH-I0722): exit 1 with a parsed name stays a
@@ -30038,8 +30159,7 @@ test "runFmtCheck keeps a needs-format file as a ZA601 warning" {
 }
 
 test "runFmtCheck reports nothing for a formatted file" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30047,15 +30167,14 @@ test "runFmtCheck reports nothing for a formatted file" {
     const path = try tmpFilePath(allocator, &tmp, "ok.zig");
     defer allocator.free(path);
 
-    var issues = try runFmtCheck(allocator, path);
+    var issues = try runFmtCheck(&diag, allocator, path);
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 test "runFmtCheck reports the syntax error in a mixed directory" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30070,7 +30189,7 @@ test "runFmtCheck reports the syntax error in a mixed directory" {
     const dir = try tmpDirPath(allocator, &tmp);
     defer allocator.free(dir);
 
-    var issues = try runFmtCheck(allocator, dir);
+    var issues = try runFmtCheck(&diag, allocator, dir);
     defer deinitIssues(&issues, allocator);
 
     // The parsed needs-format name must not mask the dropped parse
@@ -30086,10 +30205,9 @@ test "runFmtCheck reports the syntax error in a mixed directory" {
 }
 
 test "runFmtCheck does not fire ZR104 for a needs-format path carrying error:" {
+    var diag = testDiagCtx();
     // ':' is not a legal path byte on Windows.
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30105,7 +30223,7 @@ test "runFmtCheck does not fire ZR104 for a needs-format path carrying error:" {
     const path = try tmpFilePath(allocator, &tmp, "error:dir/needsfmt.zig");
     defer allocator.free(path);
 
-    var issues = try runFmtCheck(allocator, path);
+    var issues = try runFmtCheck(&diag, allocator, path);
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -30164,8 +30282,6 @@ test "firstErrorLine anchors the error marker" {
 
 test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30177,7 +30293,15 @@ test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {
     const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
     defer allocator.free(cmd);
 
-    var issues = try runRuntimeAnalysis(allocator, ".", false, cmd);
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+
+        allocator,
+
+        ".",
+
+        .{ .verbose = false, .custom_command = cmd },
+    );
     defer deinitIssues(&issues, allocator);
 
     // Pre-fix the .exited read on a signal term was a safety panic.
@@ -30188,10 +30312,13 @@ test "runRuntimeAnalysis reports ZR106 when the child dies by signal" {
 }
 
 test "runRuntimeAnalysis reports ZR104 when the command cannot spawn" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
-    var issues = try runRuntimeAnalysis(allocator, ".", false, "/nonexistent/ephor-i0232-x");
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = "/nonexistent/ephor-i0232-x" },
+    );
     defer deinitIssues(&issues, allocator);
 
     // Pre-fix the catch returned a bare empty list: indistinguishable
@@ -30203,11 +30330,14 @@ test "runRuntimeAnalysis reports ZR104 when the command cannot spawn" {
 
 test "runRuntimeAnalysis reports ZR104 when output exceeds the capture limit" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     // `yes` writes unbounded output and trips the 10 MB cap fast.
-    var issues = try runRuntimeAnalysis(allocator, ".", false, "yes");
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = "yes" },
+    );
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -30217,20 +30347,26 @@ test "runRuntimeAnalysis reports ZR104 when output exceeds the capture limit" {
 
 test "runRuntimeAnalysis returns no findings for a clean command" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
-    var issues = try runRuntimeAnalysis(allocator, ".", false, "true");
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = "true" },
+    );
     defer deinitIssues(&issues, allocator);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 test "runRuntimeAnalysis reports ZR104 for a nonzero exit with no diagnostics" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
-    var issues = try runRuntimeAnalysis(allocator, ".", false, "false");
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = "false" },
+    );
     defer deinitIssues(&issues, allocator);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
@@ -30239,8 +30375,6 @@ test "runRuntimeAnalysis reports ZR104 for a nonzero exit with no diagnostics" {
 
 test "runRuntimeAnalysis frees the partial findings list on a mid-parse failure" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30262,7 +30396,12 @@ test "runRuntimeAnalysis frees the partial findings list on a mid-parse failure"
     // sweep pattern.
     var probe = std.testing.FailingAllocator.init(allocator, .{});
     {
-        var issues = try runRuntimeAnalysis(probe.allocator(), ".", false, cmd);
+        var issues = try runRuntimeAnalysis(
+            std.testing.io,
+            probe.allocator(),
+            ".",
+            .{ .verbose = false, .custom_command = cmd },
+        );
         deinitIssues(&issues, probe.allocator());
     }
     const total_allocs = probe.allocations;
@@ -30272,7 +30411,12 @@ test "runRuntimeAnalysis frees the partial findings list on a mid-parse failure"
         var failing = std.testing.FailingAllocator.init(allocator, .{
             .fail_index = fail_index,
         });
-        if (runRuntimeAnalysis(failing.allocator(), ".", false, cmd)) |issues| {
+        if (runRuntimeAnalysis(
+            std.testing.io,
+            failing.allocator(),
+            ".",
+            .{ .verbose = false, .custom_command = cmd },
+        )) |issues| {
             var list = issues;
             deinitIssues(&list, failing.allocator());
         } else |err| {
@@ -30319,11 +30463,12 @@ const CFGTestRun = struct {
 
 /// Test helper: build a one-file graph and run the full CFG memory pipeline.
 fn runCFGMemoryTest(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -30347,6 +30492,7 @@ fn countRuleIssues(
 }
 
 test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30364,7 +30510,7 @@ test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_wrapped_alloc.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_wrapped_alloc.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_wrapped_alloc.zig";
@@ -30374,6 +30520,7 @@ test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
 }
 
 test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30384,7 +30531,7 @@ test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
         \\    list.prepend(&node.link);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_prepend.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_prepend.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30395,6 +30542,7 @@ test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
 }
 
 test "ZA101: single-line .alloc( detection unchanged by line joining" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30405,7 +30553,7 @@ test "ZA101: single-line .alloc( detection unchanged by line joining" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_single_alloc.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_single_alloc.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30416,6 +30564,7 @@ test "ZA101: single-line .alloc( detection unchanged by line joining" {
 }
 
 test "ZA101: wrapped alloc with proper defer stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30430,7 +30579,7 @@ test "ZA101: wrapped alloc with proper defer stays silent" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_wrapped_ok.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_wrapped_ok.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_wrapped_ok.zig";
@@ -30445,6 +30594,7 @@ test "ZA101: wrapped alloc with proper defer stays silent" {
 // ============================================================================
 
 test "ZA101: multi-line enum param does not truncate body" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30464,7 +30614,7 @@ test "ZA101: multi-line enum param does not truncate body" {
         \\    _ = kind;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_enum.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_enum.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30474,6 +30624,7 @@ test "ZA101: multi-line enum param does not truncate body" {
 }
 
 test "ZA101: multi-line struct param does not truncate body" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30491,7 +30642,7 @@ test "ZA101: multi-line struct param does not truncate body" {
         \\    _ = opts;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_struct.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_struct.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30501,6 +30652,7 @@ test "ZA101: multi-line struct param does not truncate body" {
 }
 
 test "ZA101: error-set return on own line does not truncate body" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30518,7 +30670,7 @@ test "ZA101: error-set return on own line does not truncate body" {
         \\    _ = data;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_errset.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_errset.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30528,6 +30680,7 @@ test "ZA101: error-set return on own line does not truncate body" {
 }
 
 test "ZA101: default-param container on own line does not truncate body" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30546,7 +30699,7 @@ test "ZA101: default-param container on own line does not truncate body" {
         \\    _ = foo;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_default.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_default.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30556,6 +30709,7 @@ test "ZA101: default-param container on own line does not truncate body" {
 }
 
 test "ZA101: single-line container signature detection unchanged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30569,7 +30723,7 @@ test "ZA101: single-line container signature detection unchanged" {
         \\    _ = kind;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_sl_container.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_sl_container.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30579,6 +30733,7 @@ test "ZA101: single-line container signature detection unchanged" {
 }
 
 test "ZA101: nested fn-type param does not break body extraction" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30595,7 +30750,7 @@ test "ZA101: nested fn-type param does not break body extraction" {
         \\    g();
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_fntype.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_fntype.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30614,6 +30769,7 @@ test "ZA101: nested fn-type param does not break body extraction" {
 // ============================================================================
 
 test "ZA103: multi-line signature with error return on own line is checked" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30631,7 +30787,7 @@ test "ZA103: multi-line signature with error return on own line is checked" {
         \\    if (x > 0) return error.bad;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_errret_103.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_errret_103.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30641,6 +30797,7 @@ test "ZA103: multi-line signature with error return on own line is checked" {
 }
 
 test "ZA103: single-line error-return signature check unchanged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30654,7 +30811,7 @@ test "ZA103: single-line error-return signature check unchanged" {
         \\    if (x > 0) return error.bad;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_sl_errret_103.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_sl_errret_103.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30664,6 +30821,7 @@ test "ZA103: single-line error-return signature check unchanged" {
 }
 
 test "ZA103: multi-line plain-void signature stays unchecked" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30680,7 +30838,7 @@ test "ZA103: multi-line plain-void signature stays unchecked" {
         \\    if (x > 0) return error.bad;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_plainvoid_103.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_plainvoid_103.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30690,6 +30848,7 @@ test "ZA103: multi-line plain-void signature stays unchecked" {
 }
 
 test "ZA103: negation default on signature line does not fake error return" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30708,7 +30867,7 @@ test "ZA103: negation default on signature line does not fake error return" {
         \\}
         \\const flag_default = false;
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_negation_103.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_negation_103.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30718,6 +30877,7 @@ test "ZA103: negation default on signature line does not fake error return" {
 }
 
 test "ZA103: !bool negation on signature line trips the substring trap (pinned)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30738,7 +30898,7 @@ test "ZA103: !bool negation on signature line trips the substring trap (pinned)"
         \\}
         \\const bool_flag = false;
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_negtrap_103.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_negtrap_103.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30748,6 +30908,7 @@ test "ZA103: !bool negation on signature line trips the substring trap (pinned)"
 }
 
 test "ZA101: multi-line noreturn signature pins current no-gate behavior" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30766,7 +30927,7 @@ test "ZA101: multi-line noreturn signature pins current no-gate behavior" {
         \\    @panic("dead");
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_noreturn_101.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_noreturn_101.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -30805,6 +30966,7 @@ test "signature return-marker helpers: own-line shapes pin each marker" {
 }
 
 test "ZA105: free through alias then use root" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30821,7 +30983,7 @@ test "ZA105: free through alias then use root" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_free_alias_use.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_free_alias_use.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30832,6 +30994,7 @@ test "ZA105: free through alias then use root" {
 }
 
 test "ZA106: free through alias then free root" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30844,7 +31007,7 @@ test "ZA106: free through alias then free root" {
         \\    allocator.free(buf);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_alias_dfree.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_dfree.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30855,6 +31018,7 @@ test "ZA106: free through alias then free root" {
 }
 
 test "ZA105: free root then use alias (existing direction)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30870,7 +31034,7 @@ test "ZA105: free root then use alias (existing direction)" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_root_alias.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_root_alias.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30881,6 +31045,7 @@ test "ZA105: free root then use alias (existing direction)" {
 }
 
 test "ZA105: use inside new declaration after free (subscript)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30893,7 +31058,7 @@ test "ZA105: use inside new declaration after free (subscript)" {
         \\    _ = copy;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_decl_subscript.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_decl_subscript.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30904,6 +31069,7 @@ test "ZA105: use inside new declaration after free (subscript)" {
 }
 
 test "ZA105: use inside new declaration after free (field access)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30917,7 +31083,7 @@ test "ZA105: use inside new declaration after free (field access)" {
         \\    _ = field;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_decl_field.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_decl_field.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30928,6 +31094,7 @@ test "ZA105: use inside new declaration after free (field access)" {
 }
 
 test "ZA105: free then reassign then use stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30943,7 +31110,7 @@ test "ZA105: free then reassign then use stays silent" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_free_reassign.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_free_reassign.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30954,6 +31121,7 @@ test "ZA105: free then reassign then use stays silent" {
 }
 
 test "ZA105: free and use in different switch arms stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -30972,7 +31140,7 @@ test "ZA105: free and use in different switch arms stay silent" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_switch_arms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_switch_arms.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -30983,6 +31151,7 @@ test "ZA105: free and use in different switch arms stay silent" {
 }
 
 test "ZA105: free and use in different braced switch arms stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31000,7 +31169,7 @@ test "ZA105: free and use in different braced switch arms stay silent" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_braced_arms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_braced_arms.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31011,6 +31180,7 @@ test "ZA105: free and use in different braced switch arms stay silent" {
 }
 
 test "ZA105: use after free in the same switch arm fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31028,7 +31198,7 @@ test "ZA105: use after free in the same switch arm fires" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_same_arm.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_same_arm.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31039,6 +31209,7 @@ test "ZA105: use after free in the same switch arm fires" {
 }
 
 test "ZA105: free then use in a later sequential block fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31054,7 +31225,7 @@ test "ZA105: free then use in a later sequential block fires" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_sequential.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_sequential.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31065,6 +31236,7 @@ test "ZA105: free then use in a later sequential block fires" {
 }
 
 test "ZA105: free root in one switch arm then use alias in sibling arm stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31084,7 +31256,7 @@ test "ZA105: free root in one switch arm then use alias in sibling arm stays sil
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_alias_arm.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_alias_arm.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31095,6 +31267,7 @@ test "ZA105: free root in one switch arm then use alias in sibling arm stays sil
 }
 
 test "ZA105: switch expression between free and use still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31114,7 +31287,7 @@ test "ZA105: switch expression between free and use still fires" {
         \\    _ = buf.len;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_switch_expr.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_switch_expr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31125,6 +31298,7 @@ test "ZA105: switch expression between free and use still fires" {
 }
 
 test "ZA105: alias use after a switch that frees on one arm still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31145,7 +31319,7 @@ test "ZA105: alias use after a switch that frees on one arm still fires" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_alias_post.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_alias_post.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31156,6 +31330,7 @@ test "ZA105: alias use after a switch that frees on one arm still fires" {
 }
 
 test "ZA105: free on both if and else arms then use still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31173,7 +31348,7 @@ test "ZA105: free on both if and else arms then use still fires" {
         \\    _ = buf.len;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_both_arms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_both_arms.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31184,6 +31359,7 @@ test "ZA105: free on both if and else arms then use still fires" {
 }
 
 test "ZA105: return arm without free does not mask the else-arm free (EPH-I0677)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31202,7 +31378,7 @@ test "ZA105: return arm without free does not mask the else-arm free (EPH-I0677)
         \\    buf[0] = 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_uaf_return_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_uaf_return_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31213,6 +31389,7 @@ test "ZA105: return arm without free does not mask the else-arm free (EPH-I0677)
 }
 
 test "ZA106: return arm without free upgrades cross-block double-free (EPH-I0677)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31231,7 +31408,7 @@ test "ZA106: return arm without free upgrades cross-block double-free (EPH-I0677
         \\    allocator.free(buf);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_df_return_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_df_return_else.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_df_return_else.zig";
@@ -31245,6 +31422,7 @@ test "ZA106: return arm without free upgrades cross-block double-free (EPH-I0677
 }
 
 test "ZA105: use two blocks past a dominating free fires (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31263,7 +31441,7 @@ test "ZA105: use two blocks past a dominating free fires (EPH-I0676)" {
         \\}
         \\fn foo() void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_dist2_uaf.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_dist2_uaf.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_dist2_uaf.zig";
@@ -31275,6 +31453,7 @@ test "ZA105: use two blocks past a dominating free fires (EPH-I0676)" {
 }
 
 test "ZA106: loop-body free double-frees on the next iteration (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31291,7 +31470,7 @@ test "ZA106: loop-body free double-frees on the next iteration (EPH-I0676)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_loop_df.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_df.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_loop_df.zig";
@@ -31307,6 +31486,7 @@ test "ZA106: loop-body free double-frees on the next iteration (EPH-I0676)" {
 }
 
 test "ZA106: free two blocks past a dominating free is a definite double-free (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31325,7 +31505,7 @@ test "ZA106: free two blocks past a dominating free is a definite double-free (E
         \\}
         \\fn foo() void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_dist2_df.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_dist2_df.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_dist2_df.zig";
@@ -31337,6 +31517,7 @@ test "ZA106: free two blocks past a dominating free is a definite double-free (E
 }
 
 test "ZA105: one-branch conditional free stays silent past the join (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31352,7 +31533,7 @@ test "ZA105: one-branch conditional free stays silent past the join (EPH-I0676)"
         \\    buf[0] = 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_one_branch.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_one_branch.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31363,6 +31544,7 @@ test "ZA105: one-branch conditional free stays silent past the join (EPH-I0676)"
 }
 
 test "ZA105: reassignment on one arm keeps the post-join use silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31379,7 +31561,7 @@ test "ZA105: reassignment on one arm keeps the post-join use silent (EPH-I0676)"
         \\    buf[0] = 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_reassign_arm.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_reassign_arm.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31390,6 +31572,7 @@ test "ZA105: reassignment on one arm keeps the post-join use silent (EPH-I0676)"
 }
 
 test "ZA105: free before a loop with a use in the body keeps firing (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31405,7 +31588,7 @@ test "ZA105: free before a loop with a use in the body keeps firing (EPH-I0676)"
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_free_before_loop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_free_before_loop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31416,6 +31599,7 @@ test "ZA105: free before a loop with a use in the body keeps firing (EPH-I0676)"
 }
 
 test "ZA106: per-iteration alloc and free in a loop stays silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31432,7 +31616,7 @@ test "ZA106: per-iteration alloc and free in a loop stays silent (EPH-I0676)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_loop_realloc.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_realloc.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_loop_realloc.zig";
@@ -31441,6 +31625,7 @@ test "ZA106: per-iteration alloc and free in a loop stays silent (EPH-I0676)" {
 }
 
 test "ZA106: freeing a loop capture each iteration stays silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31460,7 +31645,7 @@ test "ZA106: freeing a loop capture each iteration stays silent (EPH-I0676)" {
         \\    allocator.free(item);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_capture_loop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_capture_loop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31471,6 +31656,7 @@ test "ZA106: freeing a loop capture each iteration stays silent (EPH-I0676)" {
 }
 
 test "ZA106: free before a capture loop does not pair with the capture free (EPH-I0748)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31489,7 +31675,7 @@ test "ZA106: free before a capture loop does not pair with the capture free (EPH
         \\    allocator.free(items);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_capture_free_before.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_capture_free_before.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_capture_free_before.zig";
@@ -31498,6 +31684,7 @@ test "ZA106: free before a capture loop does not pair with the capture free (EPH
 }
 
 test "ZA106: real double free fires despite a later capture loop (EPH-I0748)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31517,7 +31704,7 @@ test "ZA106: real double free fires despite a later capture loop (EPH-I0748)" {
         \\    allocator.free(items);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_capture_real_double.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_capture_real_double.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_capture_real_double.zig";
@@ -31525,6 +31712,7 @@ test "ZA106: real double free fires despite a later capture loop (EPH-I0748)" {
 }
 
 test "ZA106: free before an if-capture scope does not pair with the capture free (EPH-I0780)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31541,7 +31729,7 @@ test "ZA106: free before an if-capture scope does not pair with the capture free
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_if_capture_free.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_if_capture_free.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_if_capture_free.zig";
@@ -31550,6 +31738,7 @@ test "ZA106: free before an if-capture scope does not pair with the capture free
 }
 
 test "ZA106: real double free fires despite a later if-capture scope (EPH-I0780)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31567,7 +31756,7 @@ test "ZA106: real double free fires despite a later if-capture scope (EPH-I0780)
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_if_capture_real_double.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_if_capture_real_double.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_if_capture_real_double.zig";
@@ -31575,6 +31764,7 @@ test "ZA106: real double free fires despite a later if-capture scope (EPH-I0780)
 }
 
 test "ZA106: free before a switch-prong capture scope stays silent (EPH-I0780)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31593,7 +31783,7 @@ test "ZA106: free before a switch-prong capture scope stays silent (EPH-I0780)" 
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_switch_capture_free.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_switch_capture_free.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_switch_capture_free.zig";
@@ -31602,6 +31792,7 @@ test "ZA106: free before a switch-prong capture scope stays silent (EPH-I0780)" 
 }
 
 test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31621,7 +31812,7 @@ test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_switch_prong_body_free.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_switch_prong_body_free.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_switch_prong_body_free.zig";
@@ -31633,6 +31824,7 @@ test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
 }
 
 test "ZA106: prong-body free does not pair with a sibling-scope free (EPH-I0791)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31655,7 +31847,7 @@ test "ZA106: prong-body free does not pair with a sibling-scope free (EPH-I0791)
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_prong_sibling_scope.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_prong_sibling_scope.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_prong_sibling_scope.zig";
@@ -31664,6 +31856,7 @@ test "ZA106: prong-body free does not pair with a sibling-scope free (EPH-I0791)
 }
 
 test "ZA106: frees in different switch arms stay silent (EPH-I0791)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31684,7 +31877,7 @@ test "ZA106: frees in different switch arms stay silent (EPH-I0791)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_prong_two_arms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_prong_two_arms.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_prong_two_arms.zig";
@@ -31693,6 +31886,7 @@ test "ZA106: frees in different switch arms stay silent (EPH-I0791)" {
 }
 
 test "ZA106: arm free then post-switch free is a conditional double-free (EPH-I0791)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31712,7 +31906,7 @@ test "ZA106: arm free then post-switch free is a conditional double-free (EPH-I0
         \\    allocator.free(item);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_prong_arm_then_merge.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_prong_arm_then_merge.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_prong_arm_then_merge.zig";
@@ -31724,6 +31918,7 @@ test "ZA106: arm free then post-switch free is a conditional double-free (EPH-I0
 }
 
 test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31740,7 +31935,7 @@ test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {
         \\    };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_catch_capture_free.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_catch_capture_free.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_catch_capture_free.zig";
@@ -31749,6 +31944,7 @@ test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {
 }
 
 test "ZA106: an alias-named capture loop does not free the tracked root (EPH-I0781)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31768,7 +31964,7 @@ test "ZA106: an alias-named capture loop does not free the tracked root (EPH-I07
         \\    allocator.free(items);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_alias_capture_loop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_capture_loop.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_alias_capture_loop.zig";
@@ -31777,6 +31973,7 @@ test "ZA106: an alias-named capture loop does not free the tracked root (EPH-I07
 }
 
 test "ZA106: real double free via alias fires despite a later alias-capture loop (EPH-I0781)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31797,7 +31994,7 @@ test "ZA106: real double free via alias fires despite a later alias-capture loop
         \\    allocator.free(items);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_alias_capture_real_double.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_capture_real_double.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_alias_capture_real_double.zig";
@@ -31805,6 +32002,7 @@ test "ZA106: real double free via alias fires despite a later alias-capture loop
 }
 
 test "ZA106: brace in a string inside an if-capture body does not extend the mask (EPH-I0792)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31823,7 +32021,7 @@ test "ZA106: brace in a string inside an if-capture body does not extend the mas
         \\    allocator.free(item);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_if_capture_quote_open.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_if_capture_quote_open.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_if_capture_quote_open.zig";
@@ -31831,6 +32029,7 @@ test "ZA106: brace in a string inside an if-capture body does not extend the mas
 }
 
 test "ZA106: brace in a string inside a loop-capture body does not extend the mask (EPH-I0792)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31851,7 +32050,7 @@ test "ZA106: brace in a string inside a loop-capture body does not extend the ma
         \\    allocator.free(items);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_loop_capture_quote_open.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_capture_quote_open.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_loop_capture_quote_open.zig";
@@ -31859,6 +32058,7 @@ test "ZA106: brace in a string inside a loop-capture body does not extend the ma
 }
 
 test "ZA106: close brace in a string inside an if-capture body does not truncate the mask (EPH-I0792)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31876,7 +32076,7 @@ test "ZA106: close brace in a string inside an if-capture body does not truncate
         \\    allocator.free(item);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_if_capture_quote_close.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_if_capture_quote_close.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_if_capture_quote_close.zig";
@@ -31885,6 +32085,7 @@ test "ZA106: close brace in a string inside an if-capture body does not truncate
 }
 
 test "ZA106: a // inside a string before a catch capture does not defeat the binding (EPH-I0793)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31901,7 +32102,7 @@ test "ZA106: a // inside a string before a catch capture does not defeat the bin
         \\    };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_catch_capture_url.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_catch_capture_url.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_catch_capture_url.zig";
@@ -31910,6 +32111,7 @@ test "ZA106: a // inside a string before a catch capture does not defeat the bin
 }
 
 test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31926,7 +32128,7 @@ test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_use_then_free_loop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_use_then_free_loop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31937,6 +32139,7 @@ test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {
 }
 
 test "ZA106: free after a brace-less for body stays silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31954,7 +32157,7 @@ test "ZA106: free after a brace-less for body stays silent (EPH-I0676)" {
         \\    _ = p;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_after_braceless_for.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_after_braceless_for.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31965,6 +32168,7 @@ test "ZA106: free after a brace-less for body stays silent (EPH-I0676)" {
 }
 
 test "ZA106: free after a brace-less while body stays silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -31979,7 +32183,7 @@ test "ZA106: free after a brace-less while body stays silent (EPH-I0676)" {
         \\}
         \\fn touch() void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_after_braceless_while.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_after_braceless_while.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -31990,6 +32194,7 @@ test "ZA106: free after a brace-less while body stays silent (EPH-I0676)" {
 }
 
 test "ZA106: free of a var the loop never references stays silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32006,7 +32211,7 @@ test "ZA106: free of a var the loop never references stays silent (EPH-I0676)" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_loop_other_var.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_other_var.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32017,6 +32222,7 @@ test "ZA106: free of a var the loop never references stays silent (EPH-I0676)" {
 }
 
 test "ZA106: free after a braced loop body stays silent (EPH-I0676)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32033,7 +32239,7 @@ test "ZA106: free after a braced loop body stays silent (EPH-I0676)" {
         \\}
         \\fn touch() void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_after_braced_while.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_after_braced_while.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32044,6 +32250,7 @@ test "ZA106: free after a braced loop body stays silent (EPH-I0676)" {
 }
 
 test "ZA106: defer free plus direct free is a double-free" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32056,7 +32263,7 @@ test "ZA106: defer free plus direct free is a double-free" {
         \\    allocator.free(buf);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_defer_direct.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_direct.zig", content);
     defer run.deinit(allocator);
 
     const n = countRuleIssues(run.issues.items, "test_defer_direct.zig", RULE_DOUBLE_FREE);
@@ -32068,6 +32275,7 @@ test "ZA106: defer free plus direct free is a double-free" {
 }
 
 test "ZA106: direct free plus later defer free is a double-free" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32080,7 +32288,7 @@ test "ZA106: direct free plus later defer free is a double-free" {
         \\    defer allocator.free(buf);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_direct_defer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_direct_defer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32091,6 +32299,7 @@ test "ZA106: direct free plus later defer free is a double-free" {
 }
 
 test "ZA106: defer free with reassignment after direct free stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32106,7 +32315,7 @@ test "ZA106: defer free with reassignment after direct free stays silent" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_defer_reassign.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_reassign.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32117,6 +32326,7 @@ test "ZA106: defer free with reassignment after direct free stays silent" {
 }
 
 test "ZA106: errdefer free plus defer free stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32131,7 +32341,7 @@ test "ZA106: errdefer free plus defer free stays silent" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_errdefer_defer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_defer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32142,6 +32352,7 @@ test "ZA106: errdefer free plus defer free stays silent" {
 }
 
 test "ZA105: use after free in tail of single-line errdefer (EPH-I0680)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32156,7 +32367,7 @@ test "ZA105: use after free in tail of single-line errdefer (EPH-I0680)" {
         \\    _ = buf.len;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_errdefer_tail_uaf.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_tail_uaf.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32167,6 +32378,7 @@ test "ZA105: use after free in tail of single-line errdefer (EPH-I0680)" {
 }
 
 test "ZA105: use after free in tail of multi-line errdefer block (EPH-I0680)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32183,7 +32395,7 @@ test "ZA105: use after free in tail of multi-line errdefer block (EPH-I0680)" {
         \\    _ = buf.len;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_errdefer_block_uaf.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_block_uaf.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32194,6 +32406,7 @@ test "ZA105: use after free in tail of multi-line errdefer block (EPH-I0680)" {
 }
 
 test "ZA106: double free in tail of single-line errdefer (EPH-I0680)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32208,7 +32421,7 @@ test "ZA106: double free in tail of single-line errdefer (EPH-I0680)" {
         \\    allocator.free(buf);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_errdefer_tail_df.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_tail_df.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32219,6 +32432,7 @@ test "ZA106: double free in tail of single-line errdefer (EPH-I0680)" {
 }
 
 test "ZA106: conditional defer plus direct free is a warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32230,7 +32444,7 @@ test "ZA106: conditional defer plus direct free is a warning" {
         \\    allocator.free(buf);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_cond_defer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cond_defer.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_cond_defer.zig";
@@ -32242,6 +32456,7 @@ test "ZA106: conditional defer plus direct free is a warning" {
 }
 
 test "ZA106: defer free and direct free in different switch arms stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32263,7 +32478,7 @@ test "ZA106: defer free and direct free in different switch arms stay silent" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_switch_arms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_switch_arms.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32274,6 +32489,7 @@ test "ZA106: defer free and direct free in different switch arms stay silent" {
 }
 
 test "ZA106: defer outside switch plus direct free inside an arm fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32290,7 +32506,7 @@ test "ZA106: defer outside switch plus direct free inside an arm fires" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_defer_outside.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_outside.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_defer_outside.zig";
@@ -32302,6 +32518,7 @@ test "ZA106: defer outside switch plus direct free inside an arm fires" {
 }
 
 test "ZA106: defer in if-arm plus direct free in else-if arm stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32318,7 +32535,7 @@ test "ZA106: defer in if-arm plus direct free in else-if arm stays silent" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_else_if_arms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_else_if_arms.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32329,6 +32546,7 @@ test "ZA106: defer in if-arm plus direct free in else-if arm stays silent" {
 }
 
 test "ZA103: try inside a string literal is not a gap trigger" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32350,7 +32568,7 @@ test "ZA103: try inside a string literal is not a gap trigger" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_panic_string.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_panic_string.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32361,6 +32579,7 @@ test "ZA103: try inside a string literal is not a gap trigger" {
 }
 
 test "ZA103: struct field storage with colliding name transfers ownership" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32378,7 +32597,7 @@ test "ZA103: struct field storage with colliding name transfers ownership" {
         \\}
         \\fn ping() !void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_field_storage.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_field_storage.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32389,6 +32608,7 @@ test "ZA103: struct field storage with colliding name transfers ownership" {
 }
 
 test "ZA103: plain return of the alloc transfers ownership" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32406,7 +32626,7 @@ test "ZA103: plain return of the alloc transfers ownership" {
         \\    return other;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_plain_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_plain_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32417,6 +32637,7 @@ test "ZA103: plain return of the alloc transfers ownership" {
 }
 
 test "ZA103: single-line tuple return transfers ownership" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32432,7 +32653,7 @@ test "ZA103: single-line tuple return transfers ownership" {
         \\    return .{ other, 1 };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_tuple_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_tuple_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32443,6 +32664,7 @@ test "ZA103: single-line tuple return transfers ownership" {
 }
 
 test "ZA103: multi-line tuple return transfers ownership" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32460,7 +32682,7 @@ test "ZA103: multi-line tuple return transfers ownership" {
         \\    return .{ other, 1 };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_ml_tuple_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_tuple_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32471,6 +32693,7 @@ test "ZA103: multi-line tuple return transfers ownership" {
 }
 
 test "ZA103: named-field anon-struct return transfers ownership" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32486,7 +32709,7 @@ test "ZA103: named-field anon-struct return transfers ownership" {
         \\    return .{ .ptr = other, .n = 1 };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_named_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_named_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32497,6 +32720,7 @@ test "ZA103: named-field anon-struct return transfers ownership" {
 }
 
 test "ZA103: alloc never returned or stored still fires (TP lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32511,7 +32735,7 @@ test "ZA103: alloc never returned or stored still fires (TP lock)" {
         \\}
         \\fn ping() !void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_no_transfer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_no_transfer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32522,6 +32746,7 @@ test "ZA103: alloc never returned or stored still fires (TP lock)" {
 }
 
 test "ZA103: return of a call result does not transfer (TP lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32541,7 +32766,7 @@ test "ZA103: return of a call result does not transfer (TP lock)" {
         \\    return d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_call_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_call_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32552,6 +32777,7 @@ test "ZA103: return of a call result does not transfer (TP lock)" {
 }
 
 test "ZA103: comparison return does not transfer (TP lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32568,7 +32794,7 @@ test "ZA103: comparison return does not transfer (TP lock)" {
         \\    return other.len != 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_cmp_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cmp_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32579,6 +32805,7 @@ test "ZA103: comparison return does not transfer (TP lock)" {
 }
 
 test "ZA103: field access on another object inside tuple does not transfer (TP lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32598,7 +32825,7 @@ test "ZA103: field access on another object inside tuple does not transfer (TP l
         \\    return .{ other, 1 };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_field_mention.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_field_mention.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32609,6 +32836,7 @@ test "ZA103: field access on another object inside tuple does not transfer (TP l
 }
 
 test "ZA103: enum literal inside tuple does not transfer (TP lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32627,7 +32855,7 @@ test "ZA103: enum literal inside tuple does not transfer (TP lock)" {
         \\    return .{ .other, 1 };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_enum_mention.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_enum_mention.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32638,6 +32866,7 @@ test "ZA103: enum literal inside tuple does not transfer (TP lock)" {
 }
 
 test "ZA103: string mention inside tuple does not transfer (TP lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32655,7 +32884,7 @@ test "ZA103: string mention inside tuple does not transfer (TP lock)" {
         \\    return .{ other, 1 };
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_str_mention.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_str_mention.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32666,6 +32895,7 @@ test "ZA103: string mention inside tuple does not transfer (TP lock)" {
 }
 
 test "ZA101/ZA103: orelse-return try-alloc escapes to caller (EPH-I0009)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32683,7 +32913,7 @@ test "ZA101/ZA103: orelse-return try-alloc escapes to caller (EPH-I0009)" {
         \\    return str;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_orelse_return_alloc.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_orelse_return_alloc.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32699,6 +32929,7 @@ test "ZA101/ZA103: orelse-return try-alloc escapes to caller (EPH-I0009)" {
 }
 
 test "ZA101/ZA103: orelse-return try-alloc skips zig-fmt wrapped call" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32718,7 +32949,7 @@ test "ZA101/ZA103: orelse-return try-alloc skips zig-fmt wrapped call" {
         \\    return str;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_orelse_wrapped.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_orelse_wrapped.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32734,6 +32965,7 @@ test "ZA101/ZA103: orelse-return try-alloc skips zig-fmt wrapped call" {
 }
 
 test "ZA101/ZA103: plain try-alloc still fires (orelse positional lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32747,7 +32979,7 @@ test "ZA101/ZA103: plain try-alloc still fires (orelse positional lock)" {
         \\}
         \\fn ping() !void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_lock_plain.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_lock_plain.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32763,6 +32995,7 @@ test "ZA101/ZA103: plain try-alloc still fires (orelse positional lock)" {
 }
 
 test "ZA102: try-create still fires (orelse positional lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32775,7 +33008,7 @@ test "ZA102: try-create still fires (orelse positional lock)" {
         \\}
         \\fn ping() !void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_lock_create.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_lock_create.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32786,6 +33019,7 @@ test "ZA102: try-create still fires (orelse positional lock)" {
 }
 
 test "ZA101/ZA103: orelse-return inside string literal does not skip" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32801,7 +33035,7 @@ test "ZA101/ZA103: orelse-return inside string literal does not skip" {
         \\}
         \\fn ping() !void {}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_orelse_in_string.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_orelse_in_string.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32817,6 +33051,7 @@ test "ZA101/ZA103: orelse-return inside string literal does not skip" {
 }
 
 test "ZA106: plain defer with no direct free stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32828,7 +33063,7 @@ test "ZA106: plain defer with no direct free stays silent" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_plain_defer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_plain_defer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32839,6 +33074,7 @@ test "ZA106: plain defer with no direct free stays silent" {
 }
 
 test "ZA103: return error after alloc without errdefer is a gap" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32854,7 +33090,7 @@ test "ZA103: return error after alloc without errdefer is a gap" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_return_error.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_return_error.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32865,6 +33101,7 @@ test "ZA103: return error after alloc without errdefer is a gap" {
 }
 
 test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32880,7 +33117,7 @@ test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {
         \\}
         \\const State = struct { palette: []u8 = &.{} };
     ;
-    var run = try runCFGMemoryTest(allocator, "test_gap_before_transfer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_gap_before_transfer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32891,6 +33128,7 @@ test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {
 }
 
 test "ZA103: try before return-transfer is a gap (EPH-I0005)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32907,7 +33145,7 @@ test "ZA103: try before return-transfer is a gap (EPH-I0005)" {
         \\    if (s.len == 0) return error.Empty;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_try_before_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_try_before_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32918,6 +33156,7 @@ test "ZA103: try before return-transfer is a gap (EPH-I0005)" {
 }
 
 test "ZA103: immediate return-transfer stays silent (EPH-I0005 lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32929,7 +33168,7 @@ test "ZA103: immediate return-transfer stays silent (EPH-I0005 lock)" {
         \\    return buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_immediate_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_immediate_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32940,6 +33179,7 @@ test "ZA103: immediate return-transfer stays silent (EPH-I0005 lock)" {
 }
 
 test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32958,7 +33198,7 @@ test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)"
         \\    if (s.len == 0) return error.Empty;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_errdefer_covers.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_covers.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32969,6 +33209,7 @@ test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)"
 }
 
 test "ZA103: transfer before later try stays silent (EPH-I0005 lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -32986,7 +33227,7 @@ test "ZA103: transfer before later try stays silent (EPH-I0005 lock)" {
         \\    if (s.len == 0) return error.Empty;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_transfer_then_try.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_transfer_then_try.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -32997,6 +33238,7 @@ test "ZA103: transfer before later try stays silent (EPH-I0005 lock)" {
 }
 
 test "ZA103: try inside a string literal is not an exit (EPH-I0005)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33015,7 +33257,7 @@ test "ZA103: try inside a string literal is not an exit (EPH-I0005)" {
         \\    if (s.len == 0) return error.Empty;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_string_try_exit.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_string_try_exit.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33026,6 +33268,7 @@ test "ZA103: try inside a string literal is not an exit (EPH-I0005)" {
 }
 
 test "ZA103: bare error return before field-store transfer is a gap (EPH-I0005)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33053,7 +33296,7 @@ test "ZA103: bare error return before field-store transfer is a gap (EPH-I0005)"
         \\    if (s.len == 0) return error.Empty;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_bare_err_gap.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_bare_err_gap.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33064,6 +33307,7 @@ test "ZA103: bare error return before field-store transfer is a gap (EPH-I0005)"
 }
 
 test "ZA103: bare error return without a trigger stays silent (EPH-I0005 lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33088,7 +33332,7 @@ test "ZA103: bare error return without a trigger stays silent (EPH-I0005 lock)" 
         \\    return err == error.Empty;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_bare_err_lock.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_bare_err_lock.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33099,6 +33343,7 @@ test "ZA103: bare error return without a trigger stays silent (EPH-I0005 lock)" 
 }
 
 test "ZA103: errdefer before the alloc does not cover it" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33116,7 +33361,7 @@ test "ZA103: errdefer before the alloc does not cover it" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_errdefer_before.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_before.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33127,6 +33372,7 @@ test "ZA103: errdefer before the alloc does not cover it" {
 }
 
 test "ZA103: errdefer after alloc with later try stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33141,7 +33387,7 @@ test "ZA103: errdefer after alloc with later try stays silent" {
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_proper_errdefer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_proper_errdefer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33152,6 +33398,7 @@ test "ZA103: errdefer after alloc with later try stays silent" {
 }
 
 test "ZA103: plain defer covers error returns (ZA101's domain)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33166,7 +33413,7 @@ test "ZA103: plain defer covers error returns (ZA101's domain)" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_defer_ret_err.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_ret_err.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33177,6 +33424,7 @@ test "ZA103: plain defer covers error returns (ZA101's domain)" {
 }
 
 test "ZA103: catch-free-return idiom stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33196,7 +33444,7 @@ test "ZA103: catch-free-return idiom stays silent" {
         \\    return error.Oops;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_catch_free_ret.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_catch_free_ret.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33207,6 +33455,7 @@ test "ZA103: catch-free-return idiom stays silent" {
 }
 
 test "ZA103: alloc's own multi-line catch is not a gap trigger" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33222,7 +33471,7 @@ test "ZA103: alloc's own multi-line catch is not a gap trigger" {
         \\    _ = buf;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_alloc_own_catch.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alloc_own_catch.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33233,12 +33482,13 @@ test "ZA103: alloc's own multi-line catch is not a gap trigger" {
 }
 
 test "analyzeCFGMemory detects use-after-free (ZA105)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Create graph with a file containing use-after-free pattern
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -33268,6 +33518,7 @@ test "analyzeCFGMemory detects use-after-free (ZA105)" {
 }
 
 test "analyzeCFGMemory: free text in a multiline opener tail is not a free (EPH-I0671)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33282,7 +33533,7 @@ test "analyzeCFGMemory: free text in a multiline opener tail is not a free (EPH-
         \\    _ = s;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_mline_tail_free.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_mline_tail_free.zig", content);
     defer run.deinit(allocator);
 
     const file = "test_mline_tail_free.zig";
@@ -33291,6 +33542,7 @@ test "analyzeCFGMemory: free text in a multiline opener tail is not a free (EPH-
 }
 
 test "analyzeCFGMemory: brace tail does not hide a real double-free (EPH-I0671)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33308,7 +33560,7 @@ test "analyzeCFGMemory: brace tail does not hide a real double-free (EPH-I0671)"
         \\    _ = s;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_mline_tail_cfg.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_mline_tail_cfg.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33319,13 +33571,14 @@ test "analyzeCFGMemory: brace tail does not hide a real double-free (EPH-I0671)"
 }
 
 test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" {
+    var diag = testDiagCtx();
     // KEY TEST: This was the original false positive that motivated CFG-based analysis
     // Pattern: catch { free(x); return; } - free only on error path, data still valid after
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -33368,11 +33621,12 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
 }
 
 test "analyzeCFGMemory detects double-free (ZA106)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -33402,11 +33656,12 @@ test "analyzeCFGMemory detects double-free (ZA106)" {
 }
 
 test "analyzeCFGMemory no false positive for proper defer" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -33436,11 +33691,12 @@ test "analyzeCFGMemory no false positive for proper defer" {
 }
 
 test "analyzeCFGMemory no false positive for switch arm frees (ZA106)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Free in different switch arms is NOT double-free
@@ -33470,6 +33726,7 @@ test "analyzeCFGMemory no false positive for switch arm frees (ZA106)" {
 }
 
 test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
+    var diag = testDiagCtx();
     // This tests a standard Zig idiom for handling !?T (error union of optional).
     // When a function returns !?T, you need BOTH catch (error) and orelse (null).
     // These branches are MUTUALLY EXCLUSIVE by language design - only one executes.
@@ -33483,7 +33740,7 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -33525,6 +33782,7 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
 // ---------------------------------------------------------------------------
 
 test "analyzeCFGMemory ZA802 fires on nullable pointer decl deref (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33538,7 +33796,7 @@ test "analyzeCFGMemory ZA802 fires on nullable pointer decl deref (EPH-I0219)" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_decl.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_decl.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33549,6 +33807,7 @@ test "analyzeCFGMemory ZA802 fires on nullable pointer decl deref (EPH-I0219)" {
 }
 
 test "analyzeCFGMemory ZA802 silent on plain pointer with maybe_ name (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33562,7 +33821,7 @@ test "analyzeCFGMemory ZA802 silent on plain pointer with maybe_ name (EPH-I0219
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_plain.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_plain.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33573,6 +33832,7 @@ test "analyzeCFGMemory ZA802 silent on plain pointer with maybe_ name (EPH-I0219
 }
 
 test "analyzeCFGMemory ZA802 fires on nullable pointer param deref (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33584,7 +33844,7 @@ test "analyzeCFGMemory ZA802 fires on nullable pointer param deref (EPH-I0219)" 
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_param.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_param.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33595,6 +33855,7 @@ test "analyzeCFGMemory ZA802 fires on nullable pointer param deref (EPH-I0219)" 
 }
 
 test "analyzeCFGMemory ZA802 silent after null-equality guard (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33608,7 +33869,7 @@ test "analyzeCFGMemory ZA802 silent after null-equality guard (EPH-I0219)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_guarded.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_guarded.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33619,6 +33880,7 @@ test "analyzeCFGMemory ZA802 silent after null-equality guard (EPH-I0219)" {
 }
 
 test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33633,7 +33895,7 @@ test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_capture.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_capture.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33644,6 +33906,7 @@ test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
 }
 
 test "analyzeCFGMemory ZA802 fires on C pointer deref (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33656,7 +33919,7 @@ test "analyzeCFGMemory ZA802 fires on C pointer deref (EPH-I0219)" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_cptr.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_cptr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33667,6 +33930,7 @@ test "analyzeCFGMemory ZA802 fires on C pointer deref (EPH-I0219)" {
 }
 
 test "analyzeCFGMemory ZA802 fires on allowzero pointer deref (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33679,7 +33943,7 @@ test "analyzeCFGMemory ZA802 fires on allowzero pointer deref (EPH-I0219)" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_allowzero.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_allowzero.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33690,6 +33954,7 @@ test "analyzeCFGMemory ZA802 fires on allowzero pointer deref (EPH-I0219)" {
 }
 
 test "analyzeCFGMemory ZA802 silent on string literal lookalike decl (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33705,7 +33970,7 @@ test "analyzeCFGMemory ZA802 silent on string literal lookalike decl (EPH-I0219)
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_str_poison.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_str_poison.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33716,6 +33981,7 @@ test "analyzeCFGMemory ZA802 silent on string literal lookalike decl (EPH-I0219)
 }
 
 test "analyzeCFGMemory ZA802 silent on trailing-comment lookalike decl (EPH-I0219)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33731,7 +33997,7 @@ test "analyzeCFGMemory ZA802 silent on trailing-comment lookalike decl (EPH-I021
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_comment_poison.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_comment_poison.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33742,6 +34008,7 @@ test "analyzeCFGMemory ZA802 silent on trailing-comment lookalike decl (EPH-I021
 }
 
 test "analyzeCFGMemory ZA801 fires on unguarded optional unwrap (EPH-I0220)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33752,7 +34019,7 @@ test "analyzeCFGMemory ZA801 fires on unguarded optional unwrap (EPH-I0220)" {
         \\    return opt.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_unguarded.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_unguarded.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33763,6 +34030,7 @@ test "analyzeCFGMemory ZA801 fires on unguarded optional unwrap (EPH-I0220)" {
 }
 
 test "analyzeCFGMemory ZA801 silent on orelse unwrap (EPH-I0220)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33774,7 +34042,7 @@ test "analyzeCFGMemory ZA801 silent on orelse unwrap (EPH-I0220)" {
         \\    return v + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_orelse.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_orelse.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33785,6 +34053,7 @@ test "analyzeCFGMemory ZA801 silent on orelse unwrap (EPH-I0220)" {
 }
 
 test "analyzeCFGMemory ZA801 silent inside null-equality guard (EPH-I0220)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33799,7 +34068,7 @@ test "analyzeCFGMemory ZA801 silent inside null-equality guard (EPH-I0220)" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_null_eq_guard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_null_eq_guard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33810,6 +34079,7 @@ test "analyzeCFGMemory ZA801 silent inside null-equality guard (EPH-I0220)" {
 }
 
 test "analyzeCFGMemory ZA801 silent after early-return null guard (EPH-I0220)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33822,7 +34092,7 @@ test "analyzeCFGMemory ZA801 silent after early-return null guard (EPH-I0220)" {
         \\    return opt.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_early_return.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_early_return.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33833,6 +34103,7 @@ test "analyzeCFGMemory ZA801 silent after early-return null guard (EPH-I0220)" {
 }
 
 test "analyzeCFGMemory ZA801 silent inside payload-capture guard (EPH-I0220)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33846,7 +34117,7 @@ test "analyzeCFGMemory ZA801 silent inside payload-capture guard (EPH-I0220)" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_payload_capture.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_payload_capture.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33857,6 +34128,7 @@ test "analyzeCFGMemory ZA801 silent inside payload-capture guard (EPH-I0220)" {
 }
 
 test "analyzeCFGMemory ZA801 silent on bare unwrap statement (EPH-I0220)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33869,7 +34141,7 @@ test "analyzeCFGMemory ZA801 silent on bare unwrap statement (EPH-I0220)" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_bare_unwrap.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_bare_unwrap.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33880,6 +34152,7 @@ test "analyzeCFGMemory ZA801 silent on bare unwrap statement (EPH-I0220)" {
 }
 
 test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33892,7 +34165,7 @@ test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
         \\    return opt.? + n;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_mid_block.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_mid_block.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33903,6 +34176,7 @@ test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
 }
 
 test "analyzeCFGMemory ZA801 fires past unexpected_ identifier (EPH-I0224)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33914,7 +34188,7 @@ test "analyzeCFGMemory ZA801 fires past unexpected_ identifier (EPH-I0224)" {
         \\    return unexpected_total;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_unexpected.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_unexpected.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33925,6 +34199,7 @@ test "analyzeCFGMemory ZA801 fires past unexpected_ identifier (EPH-I0224)" {
 }
 
 test "analyzeCFGMemory ZA801 fires past attestation_ identifier (EPH-I0224)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33937,7 +34212,7 @@ test "analyzeCFGMemory ZA801 fires past attestation_ identifier (EPH-I0224)" {
         \\    return attestation_total;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_attestation.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_attestation.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33948,6 +34223,7 @@ test "analyzeCFGMemory ZA801 fires past attestation_ identifier (EPH-I0224)" {
 }
 
 test "analyzeCFGMemory ZA801 fires past testing.-substring identifier (EPH-I0224)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33960,7 +34236,7 @@ test "analyzeCFGMemory ZA801 fires past testing.-substring identifier (EPH-I0224
         \\    return n;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_protesting.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_protesting.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33971,6 +34247,7 @@ test "analyzeCFGMemory ZA801 fires past testing.-substring identifier (EPH-I0224
 }
 
 test "analyzeCFGMemory ZA801 silent on real std.testing call (EPH-I0224)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -33982,7 +34259,7 @@ test "analyzeCFGMemory ZA801 silent on real std.testing call (EPH-I0224)" {
         \\    _ = total;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_real_testing.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_real_testing.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -33993,6 +34270,7 @@ test "analyzeCFGMemory ZA801 silent on real std.testing call (EPH-I0224)" {
 }
 
 test "analyzeCFGMemory ZA801 fires past expect in trailing comment (EPH-I0224)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34005,7 +34283,7 @@ test "analyzeCFGMemory ZA801 fires past expect in trailing comment (EPH-I0224)" 
         \\    return v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_comment.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_comment.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34016,6 +34294,7 @@ test "analyzeCFGMemory ZA801 fires past expect in trailing comment (EPH-I0224)" 
 }
 
 test "analyzeCFGMemory ZA801 fires past orelse in string literal (EPH-I0224)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34027,7 +34306,7 @@ test "analyzeCFGMemory ZA801 fires past orelse in string literal (EPH-I0224)" {
         \\    return v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_orelse_str.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_orelse_str.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34038,6 +34317,7 @@ test "analyzeCFGMemory ZA801 fires past orelse in string literal (EPH-I0224)" {
 }
 
 test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34050,7 +34330,7 @@ test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {
         \\    _ = unexpected_total;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_unexpected.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_unexpected.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34061,6 +34341,7 @@ test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {
 }
 
 test "analyzeCFGMemory ZA801 fires on unwrap past a true-only null check join (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34075,7 +34356,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap past a true-only null check join (E
         \\    return opt.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_join.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_join.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34086,6 +34367,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap past a true-only null check join (E
 }
 
 test "analyzeCFGMemory ZA801 fires on unwrap on the else path (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34101,7 +34383,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap on the else path (EPH-I0678)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34112,6 +34394,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap on the else path (EPH-I0678)" {
 }
 
 test "analyzeCFGMemory ZA801 fires on unwrap past a while null check exit (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34126,7 +34409,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap past a while null check exit (EPH-I
         \\    _ = p.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_loop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_loop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34137,6 +34420,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap past a while null check exit (EPH-I
 }
 
 test "analyzeCFGMemory ZA801 silent on unwrap on the true path (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34149,7 +34433,7 @@ test "analyzeCFGMemory ZA801 silent on unwrap on the true path (EPH-I0678)" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_true.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_true.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34160,6 +34444,7 @@ test "analyzeCFGMemory ZA801 silent on unwrap on the true path (EPH-I0678)" {
 }
 
 test "analyzeCFGMemory ZA801 silent past an early-return null guard (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34172,7 +34457,7 @@ test "analyzeCFGMemory ZA801 silent past an early-return null guard (EPH-I0678)"
         \\    _ = opt.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_eqguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_eqguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34183,6 +34468,7 @@ test "analyzeCFGMemory ZA801 silent past an early-return null guard (EPH-I0678)"
 }
 
 test "analyzeCFGMemory ZA802 silent past an early-return null guard (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34195,7 +34481,7 @@ test "analyzeCFGMemory ZA802 silent past an early-return null guard (EPH-I0678)"
         \\    p.* += 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_eqguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_eqguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34206,6 +34492,7 @@ test "analyzeCFGMemory ZA802 silent past an early-return null guard (EPH-I0678)"
 }
 
 test "analyzeCFGMemory ZA801 silent on unwrap inside a while null check body (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34219,7 +34506,7 @@ test "analyzeCFGMemory ZA801 silent on unwrap inside a while null check body (EP
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_inloop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_inloop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34230,6 +34517,7 @@ test "analyzeCFGMemory ZA801 silent on unwrap inside a while null check body (EP
 }
 
 test "analyzeCFGMemory ZA802 braced early-return null guard stays as-is (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34247,7 +34535,7 @@ test "analyzeCFGMemory ZA802 braced early-return null guard stays as-is (EPH-I06
         \\    p.* += 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_braced.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_braced.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34258,6 +34546,7 @@ test "analyzeCFGMemory ZA802 braced early-return null guard stays as-is (EPH-I06
 }
 
 test "analyzeCFGMemory ZA801 fires past a true-only check whose then-path returns (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34270,7 +34559,7 @@ test "analyzeCFGMemory ZA801 fires past a true-only check whose then-path return
         \\    return opt.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_trueret.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_trueret.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34281,6 +34570,7 @@ test "analyzeCFGMemory ZA801 fires past a true-only check whose then-path return
 }
 
 test "analyzeCFGMemory ZA801 silent on an outer-check var past a nested if join (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34298,7 +34588,7 @@ test "analyzeCFGMemory ZA801 silent on an outer-check var past a nested if join 
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_nested.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_nested.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34309,6 +34599,7 @@ test "analyzeCFGMemory ZA801 silent on an outer-check var past a nested if join 
 }
 
 test "analyzeCFGMemory ZA801 fires past a multi-line condition join (EPH-I0678)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34325,7 +34616,7 @@ test "analyzeCFGMemory ZA801 fires past a multi-line condition join (EPH-I0678)"
         \\    return opt.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_multiline.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_multiline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34336,6 +34627,7 @@ test "analyzeCFGMemory ZA801 fires past a multi-line condition join (EPH-I0678)"
 }
 
 test "analyzeCFGMemory ZA802 silent past a nested else-guard with a return arm (EPH-I0747)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34354,7 +34646,7 @@ test "analyzeCFGMemory ZA802 silent past a nested else-guard with a return arm (
         \\    p.* += 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_retguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_retguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34365,6 +34657,7 @@ test "analyzeCFGMemory ZA802 silent past a nested else-guard with a return arm (
 }
 
 test "analyzeCFGMemory ZA801 silent on the nested else-guard shape (EPH-I0747)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34385,7 +34678,7 @@ test "analyzeCFGMemory ZA801 silent on the nested else-guard shape (EPH-I0747)" 
         \\    _ = x.? + 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za801_retguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_retguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34396,6 +34689,7 @@ test "analyzeCFGMemory ZA801 silent on the nested else-guard shape (EPH-I0747)" 
 }
 
 test "analyzeCFGMemory ZA802 still fires when the guard covers one branch only (EPH-I0747)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34411,7 +34705,7 @@ test "analyzeCFGMemory ZA802 still fires when the guard covers one branch only (
         \\    p.* += 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za802_onebranch.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_onebranch.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34422,6 +34716,7 @@ test "analyzeCFGMemory ZA802 still fires when the guard covers one branch only (
 }
 
 test "analyzeCFGMemory ZA901 silent past a nested else-guard with a return arm (EPH-I0779)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34450,7 +34745,7 @@ test "analyzeCFGMemory ZA901 silent past a nested else-guard with a return arm (
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za901_retguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_retguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34461,6 +34756,7 @@ test "analyzeCFGMemory ZA901 silent past a nested else-guard with a return arm (
 }
 
 test "analyzeCFGMemory ZA903 silent past a nested else-guard with a return arm (EPH-I0779)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34487,7 +34783,7 @@ test "analyzeCFGMemory ZA903 silent past a nested else-guard with a return arm (
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za903_retguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_retguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34498,6 +34794,7 @@ test "analyzeCFGMemory ZA903 silent past a nested else-guard with a return arm (
 }
 
 test "analyzeCFGMemory ZA901 still fires when the guard covers one branch only (EPH-I0779)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -34523,7 +34820,7 @@ test "analyzeCFGMemory ZA901 still fires when the guard covers one branch only (
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za901_onebranch.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_onebranch.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -34561,11 +34858,12 @@ test "isInSafeContext masks trailing comment text (EPH-I0224)" {
 }
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Missing errdefer before second try
@@ -34598,11 +34896,12 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
 }
 
 test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Proper errdefer immediately after allocation
@@ -34636,11 +34935,12 @@ test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" 
 // ============================================================================
 
 test "analyzeIgnoredErrors detects discarded error union (ZA205)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -34671,11 +34971,12 @@ test "analyzeIgnoredErrors detects discarded error union (ZA205)" {
 }
 
 test "analyzeIgnoredErrors no false positive for try" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -34703,11 +35004,12 @@ test "analyzeIgnoredErrors no false positive for try" {
 }
 
 test "analyzeIgnoredErrors no false positive for catch" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -34742,11 +35044,12 @@ test "analyzeIgnoredErrors no false positive for catch" {
 // ============================================================================
 
 test "ZA205 type-aware: user-defined void method NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -34779,11 +35082,12 @@ test "ZA205 type-aware: user-defined void method NOT flagged" {
 }
 
 test "ZA205 type-aware: user-defined error method IS flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -34818,11 +35122,12 @@ test "ZA205 type-aware: user-defined error method IS flagged" {
 }
 
 test "ZA205 type-aware: standalone void function NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -34848,11 +35153,12 @@ test "ZA205 type-aware: standalone void function NOT flagged" {
 }
 
 test "ZA205 type-aware: standalone error function IS flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -34882,11 +35188,12 @@ test "ZA205 type-aware: standalone error function IS flagged" {
 }
 
 test "ZA205 type-aware: value-returning method NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -34918,11 +35225,12 @@ test "ZA205 type-aware: value-returning method NOT flagged" {
 }
 
 test "ZA205 type-aware: optional-returning method NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -34955,11 +35263,12 @@ test "ZA205 type-aware: optional-returning method NOT flagged" {
 }
 
 test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -34986,11 +35295,12 @@ test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
 }
 
 test "ZA205 type-aware: mixed struct void and error methods" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Struct has both void and error-returning methods
@@ -35035,6 +35345,7 @@ test "ZA205 type-aware: mixed struct void and error methods" {
 }
 
 test "ZA205 type-aware: user .clear() returning !void IS flagged (overrides vocab)" {
+    var diag = testDiagCtx();
     // CRITICAL: This is the key test for TypeContext. The old code would NOT flag
     // this because .clear( matches safe_method_patterns vocab. The new code MUST
     // flag it because TypeContext resolves .clear() to error_union for this struct.
@@ -35042,7 +35353,7 @@ test "ZA205 type-aware: user .clear() returning !void IS flagged (overrides voca
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35078,12 +35389,13 @@ test "ZA205 type-aware: user .clear() returning !void IS flagged (overrides voca
 }
 
 test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
+    var diag = testDiagCtx();
     // Verify that stdlib containers' .clear() is still suppressed via vocab
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35110,11 +35422,12 @@ test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
 }
 
 test "ZA205 type-aware: unknown receiver falls through to legacy" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Variable type can't be determined (comes from function param)
@@ -35142,11 +35455,12 @@ test "ZA205 type-aware: unknown receiver falls through to legacy" {
 }
 
 test "ZA205 type-aware: enum void method NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35179,11 +35493,12 @@ test "ZA205 type-aware: enum void method NOT flagged" {
 }
 
 test "ZA205 type-aware: enum error method IS flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35219,11 +35534,12 @@ test "ZA205 type-aware: enum error method IS flagged" {
 }
 
 test "ZA205 type-aware: union void method NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35256,11 +35572,12 @@ test "ZA205 type-aware: union void method NOT flagged" {
 }
 
 test "ZA205 type-aware: union error method IS flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35298,12 +35615,13 @@ test "ZA205 type-aware: union error method IS flagged" {
 }
 
 test "ZA205 type-aware: enum value method NOT flagged" {
+    var diag = testDiagCtx();
     // Enum method that returns a value (not error union) — safe to discard
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35341,12 +35659,13 @@ test "ZA205 type-aware: enum value method NOT flagged" {
 }
 
 test "ZA205 type-aware: packed struct method works" {
+    var diag = testDiagCtx();
     // Packed structs are used in real code (hardware registers, protocol headers)
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35381,12 +35700,13 @@ test "ZA205 type-aware: packed struct method works" {
 }
 
 test "ZA205 type-aware: extern struct method works" {
+    var diag = testDiagCtx();
     // Extern structs used for C FFI
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35427,11 +35747,12 @@ test "ZA205 type-aware: extern struct method works" {
 }
 
 test "ZA205 type-aware: noreturn function NOT flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35464,12 +35785,13 @@ test "ZA205 type-aware: noreturn function NOT flagged" {
 }
 
 test "ZA205 type-aware: multiple user types in same file resolved independently" {
+    var diag = testDiagCtx();
     // Real Zig files define multiple types. Each type's methods must resolve independently.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -35532,11 +35854,12 @@ test "ZA205 type-aware: multiple user types in same file resolved independently"
 /// Count ZA205 findings the way the check command reports them: the
 /// analyzeErrors list plus the analyzeIgnoredErrors list on the same graph.
 fn countCheckMergeZA205(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !usize {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -35551,11 +35874,12 @@ fn countCheckMergeZA205(
 
 /// Count ZA205 findings from the canonical analyzeIgnoredErrors alone.
 fn countAnalyzerZA205(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !usize {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -35566,6 +35890,7 @@ fn countAnalyzerZA205(
 }
 
 test "ZA205: check merge reports one finding per zero-arg discard (EPH-I0408)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // Pre-fix the zero-arg shape matched both ZA205 implementations and the
     // merge printed the same note twice.
@@ -35579,11 +35904,12 @@ test "ZA205: check merge reports one finding per zero-arg discard (EPH-I0408)" {
     ;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try countCheckMergeZA205(allocator, "i0408_zeroarg.zig", content),
+        try countCheckMergeZA205(&diag, allocator, "i0408_zeroarg.zig", content),
     );
 }
 
 test "ZA205: check merge reports one finding per with-arg discard (EPH-I0408)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // A call with arguments matched only the any-call gate before the fix,
     // so this shape yielded one finding and must keep yielding one.
@@ -35597,11 +35923,12 @@ test "ZA205: check merge reports one finding per with-arg discard (EPH-I0408)" {
     ;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try countCheckMergeZA205(allocator, "i0408_witharg.zig", content),
+        try countCheckMergeZA205(&diag, allocator, "i0408_witharg.zig", content),
     );
 }
 
 test "ZA205: discard inside defer block stays silent (EPH-I0408)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // Pre-fix the analyzeErrors line scan fired on zero-arg discards inside
     // defer blocks (it never consulted the defer state) while
@@ -35618,11 +35945,12 @@ test "ZA205: discard inside defer block stays silent (EPH-I0408)" {
     ;
     try std.testing.expectEqual(
         @as(usize, 0),
-        try countCheckMergeZA205(allocator, "i0408_defer.zig", content),
+        try countCheckMergeZA205(&diag, allocator, "i0408_defer.zig", content),
     );
 }
 
 test "ZA205: cleanup-method discard stays silent (EPH-I0408)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // `_ = list.deinit();` discards a void cleanup call, not an error. The
     // surviving implementation keeps the deleted one's cleanup-pattern
@@ -35634,11 +35962,12 @@ test "ZA205: cleanup-method discard stays silent (EPH-I0408)" {
     ;
     try std.testing.expectEqual(
         @as(usize, 0),
-        try countAnalyzerZA205(allocator, "i0408_cleanup.zig", content),
+        try countAnalyzerZA205(&diag, allocator, "i0408_cleanup.zig", content),
     );
 }
 
 test "ZA205: try and catch discards stay silent (EPH-I0408)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // try propagates the error and catch consumes it, so neither discard
     // form is an ignored-error finding.
@@ -35655,11 +35984,12 @@ test "ZA205: try and catch discards stay silent (EPH-I0408)" {
     ;
     try std.testing.expectEqual(
         @as(usize, 0),
-        try countAnalyzerZA205(allocator, "i0408_try_catch.zig", content),
+        try countAnalyzerZA205(&diag, allocator, "i0408_try_catch.zig", content),
     );
 }
 
 test "ZA205: builtin discard stays silent (EPH-I0408)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // @memcpy returns void, so discarding it is not an ignored error.
     const content =
@@ -35669,7 +35999,7 @@ test "ZA205: builtin discard stays silent (EPH-I0408)" {
     ;
     try std.testing.expectEqual(
         @as(usize, 0),
-        try countAnalyzerZA205(allocator, "i0408_builtin.zig", content),
+        try countAnalyzerZA205(&diag, allocator, "i0408_builtin.zig", content),
     );
 }
 
@@ -36193,11 +36523,12 @@ test "blankLiteralContents blanks a mid-line multiline opener tail (EPH-I0671)" 
 }
 
 test "analyzeNaming: error{ in comments and strings does not open an error block" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // The comment and the string both mention error{ — neither may put the
@@ -36541,11 +36872,12 @@ test "checkSilentCatch skips defer context" {
 }
 
 test "analyzeErrors detects silent catch (ZA201)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -36724,11 +37056,12 @@ test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
 // These patterns compile but have subtle runtime issues.
 
 test "integration: use-after-free patterns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Use-after-free patterns that compile but are bugs
@@ -36769,11 +37102,12 @@ test "integration: use-after-free patterns" {
 }
 
 test "integration: double-free patterns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const df_code =
@@ -38411,6 +38745,7 @@ test "buildCFG: continue in a while-continue-expression loop edges to the header
 }
 
 test "ZA607: break before fill in while-else body is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38435,7 +38770,7 @@ test "ZA607: break before fill in while-else body is detected" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_we_break.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_we_break.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38445,6 +38780,7 @@ test "ZA607: break before fill in while-else body is detected" {
 }
 
 test "ZA607: fill before break in while-else stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38473,7 +38809,7 @@ test "ZA607: fill before break in while-else stays silent" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_we_fill_break.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_we_fill_break.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38483,6 +38819,7 @@ test "ZA607: fill before break in while-else stays silent" {
 }
 
 test "ZA607: continue before fill still flags the post-loop read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38505,7 +38842,7 @@ test "ZA607: continue before fill still flags the post-loop read" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_cont_fill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_cont_fill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38515,6 +38852,7 @@ test "ZA607: continue before fill still flags the post-loop read" {
 }
 
 test "ZA607: while-body fill alone does not cover the zero-trip path" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38536,7 +38874,7 @@ test "ZA607: while-body fill alone does not cover the zero-trip path" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_while_body.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_body.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38546,6 +38884,7 @@ test "ZA607: while-body fill alone does not cover the zero-trip path" {
 }
 
 test "ZA607: while-else with fills on both arms stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38571,7 +38910,7 @@ test "ZA607: while-else with fills on both arms stays silent" {
         \\    use(w);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_we_both.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_we_both.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38581,6 +38920,7 @@ test "ZA607: while-else with fills on both arms stays silent" {
 }
 
 test "ZA607: for-body fill alone does not cover the zero-trip path" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38599,7 +38939,7 @@ test "ZA607: for-body fill alone does not cover the zero-trip path" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_for_body.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_for_body.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38609,6 +38949,7 @@ test "ZA607: for-body fill alone does not cover the zero-trip path" {
 }
 
 test "ZA607: while(true) fill dominating the break stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38628,7 +38969,7 @@ test "ZA607: while(true) fill dominating the break stays silent" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_wt_break.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_wt_break.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38664,6 +39005,7 @@ test "buildCFG: while(true) wires no false exit" {
 }
 
 test "ZA607: switch-arm break does not poison the switch merge" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38699,7 +39041,7 @@ test "ZA607: switch-arm break does not poison the switch merge" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_switch_break.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_switch_break.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38709,6 +39051,7 @@ test "ZA607: switch-arm break does not poison the switch merge" {
 }
 
 test "ZA101: break path skipping the loop-body free is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38728,7 +39071,7 @@ test "ZA101: break path skipping the loop-body free is detected" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "leak_break.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_break.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -38738,6 +39081,7 @@ test "ZA101: break path skipping the loop-body free is detected" {
 }
 
 test "ZA101: defer free in loop body covers the break path" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -38756,7 +39100,7 @@ test "ZA101: defer free in loop body covers the break path" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "leak_break_defer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_break_defer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39244,6 +39588,7 @@ test "buildCFG: brace-less break body equals the braced form" {
 // ============================================================================
 
 test "ZA607: never-assigned undefined var is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39254,7 +39599,7 @@ test "ZA607: never-assigned undefined var is detected" {
         \\    return y;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_never.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_never.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39264,6 +39609,7 @@ test "ZA607: never-assigned undefined var is detected" {
 }
 
 test "ZA607: single-branch if assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39279,7 +39625,7 @@ test "ZA607: single-branch if assignment is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_single.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_single.zig", content);
     defer run.deinit(allocator);
 
     var found = false;
@@ -39294,6 +39640,7 @@ test "ZA607: single-branch if assignment is detected" {
 }
 
 test "ZA607: nested single-branch if assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39309,7 +39656,7 @@ test "ZA607: nested single-branch if assignment is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_nested.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nested.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39319,6 +39666,7 @@ test "ZA607: nested single-branch if assignment is detected" {
 }
 
 test "ZA607: both-branches if/else is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39334,7 +39682,7 @@ test "ZA607: both-branches if/else is silent" {
         \\    return z;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_both.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_both.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39344,6 +39692,7 @@ test "ZA607: both-branches if/else is silent" {
 }
 
 test "ZA607: else-arm-only assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39360,7 +39709,7 @@ test "ZA607: else-arm-only assignment is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_else_only.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_else_only.zig", content);
     defer run.deinit(allocator);
 
     var found = false;
@@ -39375,6 +39724,7 @@ test "ZA607: else-arm-only assignment is detected" {
 }
 
 test "ZA607: if-arm fill with empty else is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39391,7 +39741,7 @@ test "ZA607: if-arm fill with empty else is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_empty_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_empty_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39401,6 +39751,7 @@ test "ZA607: if-arm fill with empty else is detected" {
 }
 
 test "ZA607: if-arm fill with non-assigning else is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39418,7 +39769,7 @@ test "ZA607: if-arm fill with non-assigning else is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_else_nofill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_else_nofill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39428,6 +39779,7 @@ test "ZA607: if-arm fill with non-assigning else is detected" {
 }
 
 test "ZA607: else-if-arm-only assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39445,7 +39797,7 @@ test "ZA607: else-if-arm-only assignment is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_elseif.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_elseif.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39455,6 +39807,7 @@ test "ZA607: else-if-arm-only assignment is detected" {
 }
 
 test "ZA607: else-if assignment past struct-literal arm is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39475,7 +39828,7 @@ test "ZA607: else-if assignment past struct-literal arm is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_elseif_struct.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_elseif_struct.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39485,6 +39838,7 @@ test "ZA607: else-if assignment past struct-literal arm is detected" {
 }
 
 test "ZA607: if and else-if fills without final else are detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39502,7 +39856,7 @@ test "ZA607: if and else-if fills without final else are detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_elseif_noelse.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_elseif_noelse.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39512,6 +39866,7 @@ test "ZA607: if and else-if fills without final else are detected" {
 }
 
 test "ZA607: non-assigning final else does not cover earlier fills" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39531,7 +39886,7 @@ test "ZA607: non-assigning final else does not cover earlier fills" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_elseif_bareelse.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_elseif_bareelse.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39541,6 +39896,7 @@ test "ZA607: non-assigning final else does not cover earlier fills" {
 }
 
 test "ZA607: fills in every arm of if/else-if/else are silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39559,7 +39915,7 @@ test "ZA607: fills in every arm of if/else-if/else are silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_all_arms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_all_arms.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39569,6 +39925,7 @@ test "ZA607: fills in every arm of if/else-if/else are silent" {
 }
 
 test "ZA607: allman else-arm-only assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39588,7 +39945,7 @@ test "ZA607: allman else-arm-only assignment is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_allman_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_allman_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39598,6 +39955,7 @@ test "ZA607: allman else-arm-only assignment is detected" {
 }
 
 test "ZA607: braceless else-arm assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39612,7 +39970,7 @@ test "ZA607: braceless else-arm assignment is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_braceless_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_braceless_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39622,6 +39980,7 @@ test "ZA607: braceless else-arm assignment is detected" {
 }
 
 test "ZA607: three-link else-if chain without final else is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39641,7 +40000,7 @@ test "ZA607: three-link else-if chain without final else is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_chain3_gap.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_chain3_gap.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39651,6 +40010,7 @@ test "ZA607: three-link else-if chain without final else is detected" {
 }
 
 test "ZA607: braceless else-if statement body is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39665,7 +40025,7 @@ test "ZA607: braceless else-if statement body is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_braceless_elseif.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_braceless_elseif.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39675,6 +40035,7 @@ test "ZA607: braceless else-if statement body is detected" {
 }
 
 test "ZA607: unconditional assignment before read is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39686,7 +40047,7 @@ test "ZA607: unconditional assignment before read is silent" {
         \\    return u;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_uncond.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_uncond.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39696,6 +40057,7 @@ test "ZA607: unconditional assignment before read is silent" {
 }
 
 test "ZA607: early return on unassigned paths is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39714,7 +40076,7 @@ test "ZA607: early return on unassigned paths is silent" {
         \\    return k;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_early.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_early.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39724,6 +40086,7 @@ test "ZA607: early return on unassigned paths is silent" {
 }
 
 test "ZA607: correlated guard read is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39742,7 +40105,7 @@ test "ZA607: correlated guard read is silent" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_corr.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_corr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39752,6 +40115,7 @@ test "ZA607: correlated guard read is silent" {
 }
 
 test "ZA607: loop guard-continue before same-scope assignment is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39780,7 +40144,7 @@ test "ZA607: loop guard-continue before same-scope assignment is silent" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_guard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_guard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39790,6 +40154,7 @@ test "ZA607: loop guard-continue before same-scope assignment is silent" {
 }
 
 test "ZA607: braceless if with next-line body is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39804,7 +40169,7 @@ test "ZA607: braceless if with next-line body is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_nextline.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nextline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39814,6 +40179,7 @@ test "ZA607: braceless if with next-line body is detected" {
 }
 
 test "ZA607: multi-line condition with next-line body is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39829,7 +40195,7 @@ test "ZA607: multi-line condition with next-line body is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_mlcond.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_mlcond.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39839,6 +40205,7 @@ test "ZA607: multi-line condition with next-line body is detected" {
 }
 
 test "ZA607: nested braceless if bodies are detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39854,7 +40221,7 @@ test "ZA607: nested braceless if bodies are detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_nested_bl.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nested_bl.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39864,6 +40231,7 @@ test "ZA607: nested braceless if bodies are detected" {
 }
 
 test "ZA607: brace text in a header comment does not disarm the guard" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39878,7 +40246,7 @@ test "ZA607: brace text in a header comment does not disarm the guard" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_hdr_comment.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_hdr_comment.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39888,6 +40256,7 @@ test "ZA607: brace text in a header comment does not disarm the guard" {
 }
 
 test "ZA607: payload-capture if with next-line body is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39901,7 +40270,7 @@ test "ZA607: payload-capture if with next-line body is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_payload_nl.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_payload_nl.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39911,6 +40280,7 @@ test "ZA607: payload-capture if with next-line body is detected" {
 }
 
 test "ZA607: braceless else-if with next-line body is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39927,7 +40297,7 @@ test "ZA607: braceless else-if with next-line body is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_elseif_nl.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_elseif_nl.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39937,6 +40307,7 @@ test "ZA607: braceless else-if with next-line body is detected" {
 }
 
 test "ZA607: unguarded assignment after braceless if stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39952,7 +40323,7 @@ test "ZA607: unguarded assignment after braceless if stays silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_guarded_plain.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_guarded_plain.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39962,6 +40333,7 @@ test "ZA607: unguarded assignment after braceless if stays silent" {
 }
 
 test "ZA607: both braceless arms assigning is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -39978,7 +40350,7 @@ test "ZA607: both braceless arms assigning is silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_both_virtual.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_both_virtual.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -39988,6 +40360,7 @@ test "ZA607: both braceless arms assigning is silent" {
 }
 
 test "ZA607: same-line braced if keeps current verdict" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40001,7 +40374,7 @@ test "ZA607: same-line braced if keeps current verdict" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_sameline_braced.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_sameline_braced.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40011,6 +40384,7 @@ test "ZA607: same-line braced if keeps current verdict" {
 }
 
 test "ZA607: braceless while body keeps pre-B2 verdict" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40026,7 +40400,7 @@ test "ZA607: braceless while body keeps pre-B2 verdict" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_while_bl.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_bl.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40036,6 +40410,7 @@ test "ZA607: braceless while body keeps pre-B2 verdict" {
 }
 
 test "ZA607: sibling ifs with assignment only in first is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40055,7 +40430,7 @@ test "ZA607: sibling ifs with assignment only in first is detected" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_twoifs.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_twoifs.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40065,6 +40440,7 @@ test "ZA607: sibling ifs with assignment only in first is detected" {
 }
 
 test "ZA607: equal-length different var assignment does not mask undefined read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40079,7 +40455,7 @@ test "ZA607: equal-length different var assignment does not mask undefined read"
         \\    return z;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_eqlen.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_eqlen.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40089,6 +40465,7 @@ test "ZA607: equal-length different var assignment does not mask undefined read"
 }
 
 test "ZA607: one-char name not poisoned by other var field assignment" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40102,7 +40479,7 @@ test "ZA607: one-char name not poisoned by other var field assignment" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fieldpoison.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fieldpoison.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40112,6 +40489,7 @@ test "ZA607: one-char name not poisoned by other var field assignment" {
 }
 
 test "ZA607: one-char name not poisoned by other var subscript assignment" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40125,7 +40503,7 @@ test "ZA607: one-char name not poisoned by other var subscript assignment" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_subpoison.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_subpoison.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40135,6 +40513,7 @@ test "ZA607: one-char name not poisoned by other var subscript assignment" {
 }
 
 test "ZA607: direct assignment of tracked var stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40147,7 +40526,7 @@ test "ZA607: direct assignment of tracked var stays silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_direct.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_direct.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40157,6 +40536,7 @@ test "ZA607: direct assignment of tracked var stays silent" {
 }
 
 test "ZA607: field assignment of tracked var still counts as assignment" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40169,7 +40549,7 @@ test "ZA607: field assignment of tracked var still counts as assignment" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fieldgen.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fieldgen.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40179,6 +40559,7 @@ test "ZA607: field assignment of tracked var still counts as assignment" {
 }
 
 test "ZA607: longer-name prefix assignment does not count" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40191,7 +40572,7 @@ test "ZA607: longer-name prefix assignment does not count" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_prefix.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_prefix.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40201,6 +40582,7 @@ test "ZA607: longer-name prefix assignment does not count" {
 }
 
 test "ZA607: indexed assignment to different var in loop does not mask read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40216,7 +40598,7 @@ test "ZA607: indexed assignment to different var in loop does not mask read" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_loopidx.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_loopidx.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40226,6 +40608,7 @@ test "ZA607: indexed assignment to different var in loop does not mask read" {
 }
 
 test "ZA607: plain subscript assignment in for loop stays silent (EPH-I0327)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40241,7 +40624,7 @@ test "ZA607: plain subscript assignment in for loop stays silent (EPH-I0327)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0327_write.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0327_write.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40251,6 +40634,7 @@ test "ZA607: plain subscript assignment in for loop stays silent (EPH-I0327)" {
 }
 
 test "ZA607: loop field write on other var does not mask local read (EPH-I0753)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40268,7 +40652,7 @@ test "ZA607: loop field write on other var does not mask local read (EPH-I0753)"
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0753_fieldwrite.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0753_fieldwrite.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40278,6 +40662,7 @@ test "ZA607: loop field write on other var does not mask local read (EPH-I0753)"
 }
 
 test "ZA607: subscript read before same-loop assignment stays silent (EPH-I0327)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40296,7 +40681,7 @@ test "ZA607: subscript read before same-loop assignment stays silent (EPH-I0327)
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0327_readwrite.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0327_readwrite.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40437,6 +40822,7 @@ test "isAssignmentTarget quoted field with escaped quote (EPH-I0787)" {
 }
 
 test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40454,7 +40840,7 @@ test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0752_elemread.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0752_elemread.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40464,6 +40850,7 @@ test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
 }
 
 test "ZA607: loop compound-op element read of undefined buffer is detected (EPH-I0752)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40478,7 +40865,7 @@ test "ZA607: loop compound-op element read of undefined buffer is detected (EPH-
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0752_compound.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0752_compound.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40488,6 +40875,7 @@ test "ZA607: loop compound-op element read of undefined buffer is detected (EPH-
 }
 
 test "ZA607: loop tuple-init element read of undefined buffer is detected (EPH-I0752)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40508,7 +40896,7 @@ test "ZA607: loop tuple-init element read of undefined buffer is detected (EPH-I
         \\    return pair[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0752_tuple.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0752_tuple.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40518,6 +40906,7 @@ test "ZA607: loop tuple-init element read of undefined buffer is detected (EPH-I
 }
 
 test "ZA607: loop element write-through stays silent (EPH-I0752)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40536,7 +40925,7 @@ test "ZA607: loop element write-through stays silent (EPH-I0752)" {
         \\    _ = b;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0752_writethrough.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0752_writethrough.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40546,6 +40935,7 @@ test "ZA607: loop element write-through stays silent (EPH-I0752)" {
 }
 
 test "ZA607: loop nested method write-through stays silent (EPH-I0775)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40566,7 +40956,7 @@ test "ZA607: loop nested method write-through stays silent (EPH-I0775)" {
         \\    _ = b;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0775_writethrough.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0775_writethrough.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40576,6 +40966,7 @@ test "ZA607: loop nested method write-through stays silent (EPH-I0775)" {
 }
 
 test "ZA607: loop quoted field chain assignment stays silent (EPH-I0777)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40597,7 +40988,7 @@ test "ZA607: loop quoted field chain assignment stays silent (EPH-I0777)" {
         \\}
         \\const Holder = struct { f: u8 };
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0777_quoted.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0777_quoted.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40607,6 +40998,7 @@ test "ZA607: loop quoted field chain assignment stays silent (EPH-I0777)" {
 }
 
 test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40622,7 +41014,7 @@ test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0752_slicepass.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0752_slicepass.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40632,6 +41024,7 @@ test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
 }
 
 test "ZA607: one-line loop element read of undefined buffer is detected (EPH-I0772)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40647,7 +41040,7 @@ test "ZA607: one-line loop element read of undefined buffer is detected (EPH-I07
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0772_elemread.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0772_elemread.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40657,6 +41050,7 @@ test "ZA607: one-line loop element read of undefined buffer is detected (EPH-I07
 }
 
 test "ZA607: one-line loop indexed fill stays silent (EPH-I0772)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40670,7 +41064,7 @@ test "ZA607: one-line loop indexed fill stays silent (EPH-I0772)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0772_fill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0772_fill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40680,6 +41074,7 @@ test "ZA607: one-line loop indexed fill stays silent (EPH-I0772)" {
 }
 
 test "ZA607: one-line loop slice pass keeps the fill verdict (EPH-I0772)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40693,7 +41088,7 @@ test "ZA607: one-line loop slice pass keeps the fill verdict (EPH-I0772)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0772_slicepass.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0772_slicepass.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40703,6 +41098,7 @@ test "ZA607: one-line loop slice pass keeps the fill verdict (EPH-I0772)" {
 }
 
 test "ZA607: one-line loop read before same-line fill stays silent (EPH-I0772)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40718,7 +41114,7 @@ test "ZA607: one-line loop read before same-line fill stays silent (EPH-I0772)" 
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0772_mixed.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0772_mixed.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40728,6 +41124,7 @@ test "ZA607: one-line loop read before same-line fill stays silent (EPH-I0772)" 
 }
 
 test "ZA607: post-loop fill does not mask a one-line loop element read (EPH-I0785)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40745,7 +41142,7 @@ test "ZA607: post-loop fill does not mask a one-line loop element read (EPH-I078
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0785_afterfill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0785_afterfill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40755,6 +41152,7 @@ test "ZA607: post-loop fill does not mask a one-line loop element read (EPH-I078
 }
 
 test "ZA607: one-line loop fill still covers a post-loop read (EPH-I0785)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40769,7 +41167,7 @@ test "ZA607: one-line loop fill still covers a post-loop read (EPH-I0785)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0785_fillread.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0785_fillread.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40779,6 +41177,7 @@ test "ZA607: one-line loop fill still covers a post-loop read (EPH-I0785)" {
 }
 
 test "ZA607: multi-line loop fill still covers a post-loop read (EPH-I0785)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40796,7 +41195,7 @@ test "ZA607: multi-line loop fill still covers a post-loop read (EPH-I0785)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0785_multiline.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0785_multiline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40806,6 +41205,7 @@ test "ZA607: multi-line loop fill still covers a post-loop read (EPH-I0785)" {
 }
 
 test "ZA607: spaced-dot field write does not fill the local (EPH-I0786)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40821,7 +41221,7 @@ test "ZA607: spaced-dot field write does not fill the local (EPH-I0786)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0786_direct.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0786_direct.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40831,6 +41231,7 @@ test "ZA607: spaced-dot field write does not fill the local (EPH-I0786)" {
 }
 
 test "ZA607: loop spaced-dot field write does not mask local read (EPH-I0786)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40847,7 +41248,7 @@ test "ZA607: loop spaced-dot field write does not mask local read (EPH-I0786)" {
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0786_loop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0786_loop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40857,6 +41258,7 @@ test "ZA607: loop spaced-dot field write does not mask local read (EPH-I0786)" {
 }
 
 test "ZA607: one-line loop spaced-dot field write does not mask local read (EPH-I0786)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40871,7 +41273,7 @@ test "ZA607: one-line loop spaced-dot field write does not mask local read (EPH-
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0786_oneline.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0786_oneline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40881,6 +41283,7 @@ test "ZA607: one-line loop spaced-dot field write does not mask local read (EPH-
 }
 
 test "ZA607: post-loop fill does not mask a brace-less one-line loop read (EPH-I0789)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40898,7 +41301,7 @@ test "ZA607: post-loop fill does not mask a brace-less one-line loop read (EPH-I
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0789_braceless.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0789_braceless.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40908,6 +41311,7 @@ test "ZA607: post-loop fill does not mask a brace-less one-line loop read (EPH-I
 }
 
 test "ZA607: post-loop fill does not mask a trailing-statement one-line loop read (EPH-I0789)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40925,7 +41329,7 @@ test "ZA607: post-loop fill does not mask a trailing-statement one-line loop rea
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0789_trailing.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0789_trailing.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40935,6 +41339,7 @@ test "ZA607: post-loop fill does not mask a trailing-statement one-line loop rea
 }
 
 test "ZA607: brace-less multi-line loop keeps the historical tracker behavior (EPH-I0789)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40952,7 +41357,7 @@ test "ZA607: brace-less multi-line loop keeps the historical tracker behavior (E
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0789_multiline.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0789_multiline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40962,6 +41367,7 @@ test "ZA607: brace-less multi-line loop keeps the historical tracker behavior (E
 }
 
 test "ZA607: brace-less one-line loop fill still covers a post-loop read (EPH-I0789)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40975,7 +41381,7 @@ test "ZA607: brace-less one-line loop fill still covers a post-loop read (EPH-I0
         \\    return buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0789_fillread.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0789_fillread.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -40985,6 +41391,7 @@ test "ZA607: brace-less one-line loop fill still covers a post-loop read (EPH-I0
 }
 
 test "ZA607: spaced-dot field read does not read the local (EPH-I0790)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -40999,7 +41406,7 @@ test "ZA607: spaced-dot field read does not read the local (EPH-I0790)" {
         \\    return foo . buf[0];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0790_read.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0790_read.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41009,6 +41416,7 @@ test "ZA607: spaced-dot field read does not read the local (EPH-I0790)" {
 }
 
 test "ZA607: spaced-dot plain field write does not fill the local (EPH-I0790)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41027,7 +41435,7 @@ test "ZA607: spaced-dot plain field write does not fill the local (EPH-I0790)" {
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0790_write.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0790_write.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41037,6 +41445,7 @@ test "ZA607: spaced-dot plain field write does not fill the local (EPH-I0790)" {
 }
 
 test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41056,7 +41465,7 @@ test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)"
         \\    return sum;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0773_condread.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0773_condread.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41066,6 +41475,7 @@ test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)"
 }
 
 test "ZA607: by-value call-arg element read of undefined buffer is detected (EPH-I0773)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41085,7 +41495,7 @@ test "ZA607: by-value call-arg element read of undefined buffer is detected (EPH
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0773_callarg.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0773_callarg.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41095,6 +41505,7 @@ test "ZA607: by-value call-arg element read of undefined buffer is detected (EPH
 }
 
 test "ZA607: slice pass in call arg stays silent (EPH-I0773)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41113,7 +41524,7 @@ test "ZA607: slice pass in call arg stays silent (EPH-I0773)" {
         \\    s[0] = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0773_slicepass.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0773_slicepass.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41123,6 +41534,7 @@ test "ZA607: slice pass in call arg stays silent (EPH-I0773)" {
 }
 
 test "ZA607: element address pass in call arg stays silent (EPH-I0773)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41144,7 +41556,7 @@ test "ZA607: element address pass in call arg stays silent (EPH-I0773)" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0773_addrpass.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0773_addrpass.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41154,6 +41566,7 @@ test "ZA607: element address pass in call arg stays silent (EPH-I0773)" {
 }
 
 test "ZA607: slice-parameter fill still suppresses the read (EPH-I0773)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41170,7 +41583,7 @@ test "ZA607: slice-parameter fill still suppresses the read (EPH-I0773)" {
         \\    s[0] = 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0773_slicefill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0773_slicefill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41180,6 +41593,7 @@ test "ZA607: slice-parameter fill still suppresses the read (EPH-I0773)" {
 }
 
 test "ZA607: field assignment on other var does not mask read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41193,7 +41607,7 @@ test "ZA607: field assignment on other var does not mask read" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_otherfield.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_otherfield.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41203,6 +41617,7 @@ test "ZA607: field assignment on other var does not mask read" {
 }
 
 test "ZA607: mutating method call on other var does not mask read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41215,7 +41630,7 @@ test "ZA607: mutating method call on other var does not mask read" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_othermethod.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_othermethod.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41225,6 +41640,7 @@ test "ZA607: mutating method call on other var does not mask read" {
 }
 
 test "ZA607: builtin dest with longer prefix name does not mask read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41238,7 +41654,7 @@ test "ZA607: builtin dest with longer prefix name does not mask read" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_builtinprefix.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_builtinprefix.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41248,6 +41664,7 @@ test "ZA607: builtin dest with longer prefix name does not mask read" {
 }
 
 test "ZA607: fill call on longer prefix name does not mask read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41261,7 +41678,7 @@ test "ZA607: fill call on longer prefix name does not mask read" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fillcall.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fillcall.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41271,6 +41688,7 @@ test "ZA607: fill call on longer prefix name does not mask read" {
 }
 
 test "ZA607: init call on other var does not mask read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41284,7 +41702,7 @@ test "ZA607: init call on other var does not mask read" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_otherinit.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_otherinit.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41462,6 +41880,7 @@ test "isStructFieldPattern accepts whitespace-spaced dot fields (EPH-I0796)" {
 }
 
 test "ZA607: or-guard read not suppressed by other-var assignment in body" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41477,7 +41896,7 @@ test "ZA607: or-guard read not suppressed by other-var assignment in body" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_orguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_orguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41487,6 +41906,7 @@ test "ZA607: or-guard read not suppressed by other-var assignment in body" {
 }
 
 test "ZA607: or-guard read stays silent when body genuinely assigns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41501,7 +41921,7 @@ test "ZA607: or-guard read stays silent when body genuinely assigns" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_orguard_neg.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_orguard_neg.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41511,6 +41931,7 @@ test "ZA607: or-guard read stays silent when body genuinely assigns" {
 }
 
 test "ZA607: correlated-guard read not suppressed by other-var assignment" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41529,7 +41950,7 @@ test "ZA607: correlated-guard read not suppressed by other-var assignment" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_corrguard.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_corrguard.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41539,6 +41960,7 @@ test "ZA607: correlated-guard read not suppressed by other-var assignment" {
 }
 
 test "ZA607: correlated guard with genuine assignment stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41557,7 +41979,7 @@ test "ZA607: correlated guard with genuine assignment stays silent" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_corr_neg.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_corr_neg.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41583,6 +42005,7 @@ test "isVarAssignedNearby scans every occurrence with word boundaries" {
 }
 
 test "ZA607: null-guard correlation not suppressed by other-var field assignment" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41603,7 +42026,7 @@ test "ZA607: null-guard correlation not suppressed by other-var field assignment
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_nullguard_field.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nullguard_field.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41613,6 +42036,7 @@ test "ZA607: null-guard correlation not suppressed by other-var field assignment
 }
 
 test "ZA607: null-guard correlation keeps same-line second-occurrence assignment" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41641,7 +42065,7 @@ test "ZA607: null-guard correlation keeps same-line second-occurrence assignment
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_nullguard_second.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nullguard_second.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41651,6 +42075,7 @@ test "ZA607: null-guard correlation keeps same-line second-occurrence assignment
 }
 
 test "ZA607: comparison operators in or-condition are reads on every path" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41677,7 +42102,7 @@ test "ZA607: comparison operators in or-condition are reads on every path" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_cmp_ops.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_cmp_ops.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41687,6 +42112,7 @@ test "ZA607: comparison operators in or-condition are reads on every path" {
 }
 
 test "ZA607: switch prong arrow does not count as assignment" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41703,7 +42129,7 @@ test "ZA607: switch prong arrow does not count as assignment" {
         \\    return y;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_prong.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_prong.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41713,6 +42139,7 @@ test "ZA607: switch prong arrow does not count as assignment" {
 }
 
 test "ZA607: switch prong read of assigned var stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41730,7 +42157,7 @@ test "ZA607: switch prong read of assigned var stays silent" {
         \\    return y;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_prong_neg.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_prong_neg.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41740,6 +42167,7 @@ test "ZA607: switch prong read of assigned var stays silent" {
 }
 
 test "ZA607: switch expr struct prongs inside if keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41764,7 +42192,7 @@ test "ZA607: switch expr struct prongs inside if keeps fill conditional" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_swexpr2.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_swexpr2.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41774,6 +42202,7 @@ test "ZA607: switch expr struct prongs inside if keeps fill conditional" {
 }
 
 test "ZA607: switch expr scalar prongs inside if keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41798,7 +42227,7 @@ test "ZA607: switch expr scalar prongs inside if keeps fill conditional" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_swexpr3.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_swexpr3.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41808,6 +42237,7 @@ test "ZA607: switch expr scalar prongs inside if keeps fill conditional" {
 }
 
 test "ZA607: union(enum) decl inside if keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41832,7 +42262,7 @@ test "ZA607: union(enum) decl inside if keeps fill conditional" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_unionenum.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_unionenum.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41842,6 +42272,7 @@ test "ZA607: union(enum) decl inside if keeps fill conditional" {
 }
 
 test "ZA607: enum(u8) decl inside if keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41865,7 +42296,7 @@ test "ZA607: enum(u8) decl inside if keeps fill conditional" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_enumtagged.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_enumtagged.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41875,6 +42306,7 @@ test "ZA607: enum(u8) decl inside if keeps fill conditional" {
 }
 
 test "ZA607: switch expr else prong inside if keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41899,7 +42331,7 @@ test "ZA607: switch expr else prong inside if keeps fill conditional" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_swexpr_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_swexpr_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41909,6 +42341,7 @@ test "ZA607: switch expr else prong inside if keeps fill conditional" {
 }
 
 test "ZA607: top-level switch else prong does not leak conditional depth" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41932,7 +42365,7 @@ test "ZA607: top-level switch else prong does not leak conditional depth" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_swexpr_top.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_swexpr_top.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41942,6 +42375,7 @@ test "ZA607: top-level switch else prong does not leak conditional depth" {
 }
 
 test "ZA607: multi-line switch header inside if keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41969,7 +42403,7 @@ test "ZA607: multi-line switch header inside if keeps fill conditional" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_multiline_hdr.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_multiline_hdr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -41979,6 +42413,7 @@ test "ZA607: multi-line switch header inside if keeps fill conditional" {
 }
 
 test "ZA607: multi-line switch header with call args keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42007,7 +42442,7 @@ test "ZA607: multi-line switch header with call args keeps fill conditional" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_multiline_callargs.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_multiline_callargs.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42017,6 +42452,7 @@ test "ZA607: multi-line switch header with call args keeps fill conditional" {
 }
 
 test "ZA607: multi-line switch header without else prong keeps fill conditional" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42043,7 +42479,7 @@ test "ZA607: multi-line switch header without else prong keeps fill conditional"
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_multiline_noelse.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_multiline_noelse.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42053,6 +42489,7 @@ test "ZA607: multi-line switch header without else prong keeps fill conditional"
 }
 
 test "ZA607: int prong fill does not cover the discard arm (EPH-I0679)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42073,7 +42510,7 @@ test "ZA607: int prong fill does not cover the discard arm (EPH-I0679)" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0679_int.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0679_int.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42083,6 +42520,7 @@ test "ZA607: int prong fill does not cover the discard arm (EPH-I0679)" {
 }
 
 test "ZA607: fills in int and discard arms stay silent (EPH-I0679)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42102,7 +42540,7 @@ test "ZA607: fills in int and discard arms stay silent (EPH-I0679)" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0679_fill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0679_fill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42112,6 +42550,7 @@ test "ZA607: fills in int and discard arms stay silent (EPH-I0679)" {
 }
 
 test "ZA607: range prong and else fills stay silent (EPH-I0679)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42130,7 +42569,7 @@ test "ZA607: range prong and else fills stay silent (EPH-I0679)" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0679_range.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0679_range.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42140,6 +42579,7 @@ test "ZA607: range prong and else fills stay silent (EPH-I0679)" {
 }
 
 test "ZA607: range prong fill with empty else flags the read (EPH-I0679)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42159,7 +42599,7 @@ test "ZA607: range prong fill with empty else flags the read (EPH-I0679)" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0679_range_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0679_range_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42169,6 +42609,7 @@ test "ZA607: range prong fill with empty else flags the read (EPH-I0679)" {
 }
 
 test "ZA607: string prong body does not fill the header (EPH-I0679)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42188,7 +42629,7 @@ test "ZA607: string prong body does not fill the header (EPH-I0679)" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0679_string.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0679_string.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42198,6 +42639,7 @@ test "ZA607: string prong body does not fill the header (EPH-I0679)" {
 }
 
 test "ZA607: arrow text inside an arm string stays silent (EPH-I0679)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42218,7 +42660,7 @@ test "ZA607: arrow text inside an arm string stays silent (EPH-I0679)" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0679_arrowstr.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0679_arrowstr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42228,6 +42670,7 @@ test "ZA607: arrow text inside an arm string stays silent (EPH-I0679)" {
 }
 
 test "ZA607: nested int prongs pin the outer-switch attachment (EPH-I0679)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42256,7 +42699,7 @@ test "ZA607: nested int prongs pin the outer-switch attachment (EPH-I0679)" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i0679_nested.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0679_nested.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42266,6 +42709,7 @@ test "ZA607: nested int prongs pin the outer-switch attachment (EPH-I0679)" {
 }
 
 test "ZA607: self-assignment RHS read of undefined var is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42280,7 +42724,7 @@ test "ZA607: self-assignment RHS read of undefined var is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_self_rhs.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_self_rhs.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42290,6 +42734,7 @@ test "ZA607: self-assignment RHS read of undefined var is detected" {
 }
 
 test "ZA607: same-block assignment before read is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42307,7 +42752,7 @@ test "ZA607: same-block assignment before read is silent" {
         \\    return y;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_block_order_ok.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_block_order_ok.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42317,6 +42762,7 @@ test "ZA607: same-block assignment before read is silent" {
 }
 
 test "ZA607: same-block read before assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42334,7 +42780,7 @@ test "ZA607: same-block read before assignment is detected" {
         \\    return y;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_block_order_bad.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_block_order_bad.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42344,6 +42790,7 @@ test "ZA607: same-block read before assignment is detected" {
 }
 
 test "ZA607: initialized var self-assignment is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42357,7 +42804,7 @@ test "ZA607: initialized var self-assignment is silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_self_init.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_self_init.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42367,6 +42814,7 @@ test "ZA607: initialized var self-assignment is silent" {
 }
 
 test "ZA607: same-line assignment before read is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42383,7 +42831,7 @@ test "ZA607: same-line assignment before read is silent" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_sameline_ok.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_sameline_ok.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42393,6 +42841,7 @@ test "ZA607: same-line assignment before read is silent" {
 }
 
 test "ZA607: same-line read before assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42409,7 +42858,7 @@ test "ZA607: same-line read before assignment is detected" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_sameline_bad.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_sameline_bad.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42419,6 +42868,7 @@ test "ZA607: same-line read before assignment is detected" {
 }
 
 test "ZA607: var-decl RHS read of undefined var is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42435,7 +42885,7 @@ test "ZA607: var-decl RHS read of undefined var is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_decl_rhs.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_decl_rhs.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42445,6 +42895,7 @@ test "ZA607: var-decl RHS read of undefined var is detected" {
 }
 
 test "ZA607: undefined decl without reads is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42457,7 +42908,7 @@ test "ZA607: undefined decl without reads is silent" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_decl_alone.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_decl_alone.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42467,6 +42918,7 @@ test "ZA607: undefined decl without reads is silent" {
 }
 
 test "ZA607: initialized var read on decl RHS is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42481,7 +42933,7 @@ test "ZA607: initialized var read on decl RHS is silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_decl_init.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_decl_init.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42491,6 +42943,7 @@ test "ZA607: initialized var read on decl RHS is silent" {
 }
 
 test "ZA607: field read on decl RHS does not count as local read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42506,7 +42959,7 @@ test "ZA607: field read on decl RHS does not count as local read" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_decl_field.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_decl_field.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42516,6 +42969,7 @@ test "ZA607: field read on decl RHS does not count as local read" {
 }
 
 test "ZA607: multi-line assignment continuation self-read is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42534,7 +42988,7 @@ test "ZA607: multi-line assignment continuation self-read is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_ml_cont.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ml_cont.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42544,6 +42998,7 @@ test "ZA607: multi-line assignment continuation self-read is detected" {
 }
 
 test "ZA607: conditional multi-line self-read is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42564,7 +43019,7 @@ test "ZA607: conditional multi-line self-read is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_ml_cond.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ml_cond.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42574,6 +43029,7 @@ test "ZA607: conditional multi-line self-read is detected" {
 }
 
 test "ZA607: first-line self-read of multi-line assignment is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42592,7 +43048,7 @@ test "ZA607: first-line self-read of multi-line assignment is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_ml_first.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ml_first.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42602,6 +43058,7 @@ test "ZA607: first-line self-read of multi-line assignment is detected" {
 }
 
 test "ZA607: multi-line fill without self-read is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42621,7 +43078,7 @@ test "ZA607: multi-line fill without self-read is silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_ml_noread.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ml_noread.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42631,6 +43088,7 @@ test "ZA607: multi-line fill without self-read is silent" {
 }
 
 test "ZA607: read after multi-line fill completes is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42649,7 +43107,7 @@ test "ZA607: read after multi-line fill completes is silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_ml_after.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ml_after.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42659,6 +43117,7 @@ test "ZA607: read after multi-line fill completes is silent" {
 }
 
 test "ZA607: same-line read before fill-call is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42674,7 +43133,7 @@ test "ZA607: same-line read before fill-call is detected" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_read_first.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_read_first.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42684,6 +43143,7 @@ test "ZA607: same-line read before fill-call is detected" {
 }
 
 test "ZA607: same-line fill-call before read is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42698,7 +43158,7 @@ test "ZA607: same-line fill-call before read is silent" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_fill_first.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_fill_first.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42708,6 +43168,7 @@ test "ZA607: same-line fill-call before read is silent" {
 }
 
 test "ZA607: same-line read before @memset dest is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42720,7 +43181,7 @@ test "ZA607: same-line read before @memset dest is detected" {
         \\    use(x); @memset(&x, 0);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_memset_bad.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_memset_bad.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42730,6 +43191,7 @@ test "ZA607: same-line read before @memset dest is detected" {
 }
 
 test "ZA607: same-line @memset dest before read is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42741,7 +43203,7 @@ test "ZA607: same-line @memset dest before read is silent" {
         \\    @memset(&x, 0); use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_memset_ok.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_memset_ok.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42751,6 +43213,7 @@ test "ZA607: same-line @memset dest before read is silent" {
 }
 
 test "ZA607: same-line read before bare @memset slice dest is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42764,7 +43227,7 @@ test "ZA607: same-line read before bare @memset slice dest is detected" {
         \\    use(s); @memset(s, 0);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_bare_dest.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_bare_dest.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42774,6 +43237,7 @@ test "ZA607: same-line read before bare @memset slice dest is detected" {
 }
 
 test "ZA607: init-call vars keep their dropped verdict" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42799,7 +43263,7 @@ test "ZA607: init-call vars keep their dropped verdict" {
         \\    use(b); b.init();
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_init.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_init.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42809,6 +43273,7 @@ test "ZA607: init-call vars keep their dropped verdict" {
 }
 
 test "ZA607: same-line slice read keeps Pattern-2 whole-line cover" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42831,7 +43296,7 @@ test "ZA607: same-line slice read keeps Pattern-2 whole-line cover" {
         \\    use(d);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_slice_read.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_slice_read.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42841,6 +43306,7 @@ test "ZA607: same-line slice read keeps Pattern-2 whole-line cover" {
 }
 
 test "ZA607: read after multi-line fill-call completes is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42856,7 +43322,7 @@ test "ZA607: read after multi-line fill-call completes is silent" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_ml_fill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_ml_fill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42866,6 +43332,7 @@ test "ZA607: read after multi-line fill-call completes is silent" {
 }
 
 test "ZA607: same-line read before multi-line fill-call is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42879,7 +43346,7 @@ test "ZA607: same-line read before multi-line fill-call is detected" {
         \\        0);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_ml_read.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_ml_read.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42889,6 +43356,7 @@ test "ZA607: same-line read before multi-line fill-call is detected" {
 }
 
 test "ZA607: fill-call continuation self-read is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42903,7 +43371,7 @@ test "ZA607: fill-call continuation self-read is detected" {
         \\        x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_ml_cont.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_ml_cont.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42913,6 +43381,7 @@ test "ZA607: fill-call continuation self-read is detected" {
 }
 
 test "ZA607: fill-call then read on later lines is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42926,7 +43395,7 @@ test "ZA607: fill-call then read on later lines is silent" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_later_read.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_later_read.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42936,6 +43405,7 @@ test "ZA607: fill-call then read on later lines is silent" {
 }
 
 test "ZA607: address-escape var stays dropped" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42953,7 +43423,7 @@ test "ZA607: address-escape var stays dropped" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_escape.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_escape.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42963,6 +43433,7 @@ test "ZA607: address-escape var stays dropped" {
 }
 
 test "ZA607: fill-call in else-if condition covers the arm body" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -42986,7 +43457,7 @@ test "ZA607: fill-call in else-if condition covers the arm body" {
         \\    return 1;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_cond.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_cond.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -42996,6 +43467,7 @@ test "ZA607: fill-call in else-if condition covers the arm body" {
 }
 
 test "ZA607: slice read fed by same-line fill-call is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43014,7 +43486,7 @@ test "ZA607: slice read fed by same-line fill-call is silent" {
         \\    store(buf[0 .. fillRet(&buf)]);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_slice_fill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_slice_fill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43024,6 +43496,7 @@ test "ZA607: slice read fed by same-line fill-call is silent" {
 }
 
 test "ZA607: sibling-scope decl names of filled vars stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43048,7 +43521,7 @@ test "ZA607: sibling-scope decl names of filled vars stay silent" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_sibling.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_sibling.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43058,6 +43531,7 @@ test "ZA607: sibling-scope decl names of filled vars stay silent" {
 }
 
 test "ZA607: fill-call before same-line self-assignment is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43072,7 +43546,7 @@ test "ZA607: fill-call before same-line self-assignment is silent" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_min_ok.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_min_ok.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43082,6 +43556,7 @@ test "ZA607: fill-call before same-line self-assignment is silent" {
 }
 
 test "ZA607: self-assignment before same-line fill-call is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43095,7 +43570,7 @@ test "ZA607: self-assignment before same-line fill-call is detected" {
         \\    return x;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_min_bad.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_min_bad.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43123,6 +43598,7 @@ test "findFillCallOccurrence matches call-arg dests only" {
 }
 
 test "ZA607: payload capture of a filled same-name var is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43153,7 +43629,7 @@ test "ZA607: payload capture of a filled same-name var is silent" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_payload.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_payload.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43163,6 +43639,7 @@ test "ZA607: payload capture of a filled same-name var is silent" {
 }
 
 test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43183,7 +43660,7 @@ test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_overdrop.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_overdrop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43193,6 +43670,7 @@ test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
 }
 
 test "ZA607: if/else-if chain condition fills cover the post-chain read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43223,7 +43701,7 @@ test "ZA607: if/else-if chain condition fills cover the post-chain read" {
         \\        consume2(cmd, args);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_chain_cond.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_chain_cond.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43233,6 +43711,7 @@ test "ZA607: if/else-if chain condition fills cover the post-chain read" {
 }
 
 test "ZA607: bool guard without any fill is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43250,7 +43729,7 @@ test "ZA607: bool guard without any fill is detected" {
         \\        consume(cmd);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_boolguard_bad.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_boolguard_bad.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43260,6 +43739,7 @@ test "ZA607: bool guard without any fill is detected" {
 }
 
 test "ZA607: multi-line struct literal in if body keeps conditional fill detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43284,7 +43764,7 @@ test "ZA607: multi-line struct literal in if body keeps conditional fill detecte
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_ml.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_ml.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43294,6 +43774,7 @@ test "ZA607: multi-line struct literal in if body keeps conditional fill detecte
 }
 
 test "ZA607: single-line struct literal in if body keeps conditional fill detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43314,7 +43795,7 @@ test "ZA607: single-line struct literal in if body keeps conditional fill detect
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_sl.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_sl.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43324,6 +43805,7 @@ test "ZA607: single-line struct literal in if body keeps conditional fill detect
 }
 
 test "ZA607: nested struct literal in if body keeps conditional fill detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43346,7 +43828,7 @@ test "ZA607: nested struct literal in if body keeps conditional fill detected" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_nest.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_nest.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43356,6 +43838,7 @@ test "ZA607: nested struct literal in if body keeps conditional fill detected" {
 }
 
 test "ZA607: struct literal in call args in if body keeps conditional fill detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43380,7 +43863,7 @@ test "ZA607: struct literal in call args in if body keeps conditional fill detec
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_args.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_args.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43390,6 +43873,7 @@ test "ZA607: struct literal in call args in if body keeps conditional fill detec
 }
 
 test "ZA607: brace in string literal does not close conditional block" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43410,7 +43894,7 @@ test "ZA607: brace in string literal does not close conditional block" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_str.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_str.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43420,6 +43904,7 @@ test "ZA607: brace in string literal does not close conditional block" {
 }
 
 test "ZA607: brace in comment does not close conditional block" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43438,7 +43923,7 @@ test "ZA607: brace in comment does not close conditional block" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_com.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_com.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43448,6 +43933,7 @@ test "ZA607: brace in comment does not close conditional block" {
 }
 
 test "ZA607: struct literal before if block keeps conditional fill detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43468,7 +43954,7 @@ test "ZA607: struct literal before if block keeps conditional fill detected" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_before.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_before.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43478,6 +43964,7 @@ test "ZA607: struct literal before if block keeps conditional fill detected" {
 }
 
 test "ZA607: scalar const in if body keeps conditional fill detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43498,7 +43985,7 @@ test "ZA607: scalar const in if body keeps conditional fill detected" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_scalar_if.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_scalar_if.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43508,6 +43995,7 @@ test "ZA607: scalar const in if body keeps conditional fill detected" {
 }
 
 test "ZA607: struct literal in if branch with else fill stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43531,7 +44019,7 @@ test "ZA607: struct literal in if branch with else fill stays silent" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_lit_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_lit_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43541,6 +44029,7 @@ test "ZA607: struct literal in if branch with else fill stays silent" {
 }
 
 test "ZA607: nested while-else fill reaches the post-loop read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43570,7 +44059,7 @@ test "ZA607: nested while-else fill reaches the post-loop read" {
         \\    }
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_while_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43580,6 +44069,7 @@ test "ZA607: nested while-else fill reaches the post-loop read" {
 }
 
 test "ZA607: while-else without else fill still flags the unfilled path" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43604,7 +44094,7 @@ test "ZA607: while-else without else fill still flags the unfilled path" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_while_else_nofill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_else_nofill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43614,6 +44104,7 @@ test "ZA607: while-else without else fill still flags the unfilled path" {
 }
 
 test "ZA607: top-level while-else fill stays silent at the read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43638,7 +44129,7 @@ test "ZA607: top-level while-else fill stays silent at the read" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_while_else_top.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_else_top.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43652,6 +44143,7 @@ test "ZA607: top-level while-else fill stays silent at the read" {
 // ============================================================================
 
 test "ZA607: string-literal assignment text is not a fill" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43668,7 +44160,7 @@ test "ZA607: string-literal assignment text is not a fill" {
         "    _ = s;\n" ++
         "    use(y);\n" ++
         "}\n";
-    var run = try runCFGMemoryTest(allocator, "da_str_phantom.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_str_phantom.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43678,6 +44170,7 @@ test "ZA607: string-literal assignment text is not a fill" {
 }
 
 test "ZA607: multiline-string assignment text is not a fill" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43697,7 +44190,7 @@ test "ZA607: multiline-string assignment text is not a fill" {
         "    _ = s;\n" ++
         "    use(x);\n" ++
         "}\n";
-    var run = try runCFGMemoryTest(allocator, "da_mlstr_phantom.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_mlstr_phantom.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43707,6 +44200,7 @@ test "ZA607: multiline-string assignment text is not a fill" {
 }
 
 test "ZA607: fill assigning a string literal still counts" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43722,7 +44216,7 @@ test "ZA607: fill assigning a string literal still counts" {
         "    name = \"{\";\n" ++
         "    use(name);\n" ++
         "}\n";
-    var run = try runCFGMemoryTest(allocator, "da_str_real_fill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_str_real_fill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43732,6 +44226,7 @@ test "ZA607: fill assigning a string literal still counts" {
 }
 
 test "ZA607: escaped quotes around assignment text stay non-fill" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43748,7 +44243,7 @@ test "ZA607: escaped quotes around assignment text stay non-fill" {
         "    _ = s;\n" ++
         "    use(name);\n" ++
         "}\n";
-    var run = try runCFGMemoryTest(allocator, "da_str_escaped.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_str_escaped.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43758,6 +44253,7 @@ test "ZA607: escaped quotes around assignment text stay non-fill" {
 }
 
 test "ZA607: char literal quote does not suppress a real fill" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43775,7 +44271,7 @@ test "ZA607: char literal quote does not suppress a real fill" {
         "    use(x);\n" ++
         "    _ = q;\n" ++
         "}\n";
-    var run = try runCFGMemoryTest(allocator, "da_char_quote.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_char_quote.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43785,6 +44281,7 @@ test "ZA607: char literal quote does not suppress a real fill" {
 }
 
 test "ZA607: trailing-comment assignment text is not a fill" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43801,7 +44298,7 @@ test "ZA607: trailing-comment assignment text is not a fill" {
         "    _ = y;\n" ++
         "    use(x);\n" ++
         "}\n";
-    var run = try runCFGMemoryTest(allocator, "da_trailing_comment.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_trailing_comment.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43811,6 +44308,7 @@ test "ZA607: trailing-comment assignment text is not a fill" {
 }
 
 test "ZA607: fill assigning a multiline string still counts" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -43830,7 +44328,7 @@ test "ZA607: fill assigning a multiline string still counts" {
         "    ;\n" ++
         "    use(s);\n" ++
         "}\n";
-    var run = try runCFGMemoryTest(allocator, "da_mlstr_real_fill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_mlstr_real_fill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -43840,11 +44338,12 @@ test "ZA607: fill assigning a multiline string still counts" {
 }
 
 test "integration: no false positive for valid catch-free-return" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // This is VALID code - free in catch that returns does NOT affect main path
@@ -43948,7 +44447,7 @@ test "parseVersionFromZon returns null for missing version" {
 var test_fetch_calls: usize = 0;
 var test_fetch_result: ?[]const u8 = null;
 
-fn testFetchFn(allocator: Allocator) ?[]const u8 {
+fn testFetchFn(_: std.Io, allocator: Allocator) ?[]const u8 {
     test_fetch_calls += 1;
     const v = test_fetch_result orelse return null;
     return allocator.dupe(u8, v) catch null;
@@ -43996,8 +44495,6 @@ test "resolveUpdateCachePath requires HOME" {
 }
 
 test "update cache write/read round-trip" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44005,9 +44502,13 @@ test "update cache write/read round-trip" {
     defer allocator.free(path);
 
     const now: i64 = 1_800_000_000;
-    writeUpdateCache(allocator, path, "1.2.3", now);
+    writeUpdateCache(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        "1.2.3",
+    );
 
-    const cached = readUpdateCache(allocator, path) orelse
+    const cached = readUpdateCache(std.testing.io, allocator, path) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(cached.version);
     try std.testing.expectEqualStrings("1.2.3", cached.version);
@@ -44016,8 +44517,6 @@ test "update cache write/read round-trip" {
 
 test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44029,7 +44528,11 @@ test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
     defer allocator.free(path);
 
     const now: i64 = 1_800_000_000;
-    writeUpdateCache(allocator, path, "1.2.3", now);
+    writeUpdateCache(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        "1.2.3",
+    );
 
     // The victim keeps its bytes: the write must not have followed the link.
     const victim = try tmp.dir.readFileAlloc(std.testing.io, "victim", allocator, .limited(64));
@@ -44039,7 +44542,7 @@ test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
     // The cache path is now a regular file holding the entry.
     const stat = try tmp.dir.statFile(std.testing.io, "cache", .{ .follow_symlinks = false });
     try std.testing.expect(stat.kind == .file);
-    const cached = readUpdateCache(allocator, path) orelse
+    const cached = readUpdateCache(std.testing.io, allocator, path) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(cached.version);
     try std.testing.expectEqualStrings("1.2.3", cached.version);
@@ -44055,18 +44558,24 @@ test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
 }
 
 test "resolveLatestVersion returns fresh cache without fetching" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(allocator, &tmp, "cache");
     defer allocator.free(path);
     const now: i64 = 1_800_000_000;
-    writeUpdateCache(allocator, path, "1.2.3", now - 60);
+    writeUpdateCache(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now - 60 },
+        path,
+        "1.2.3",
+    );
 
     resetFetchSeam("9.9.9");
-    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+    const latest = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        testFetchFn,
+    ) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(latest);
     try std.testing.expectEqualStrings("1.2.3", latest);
@@ -44074,50 +44583,70 @@ test "resolveLatestVersion returns fresh cache without fetching" {
 }
 
 test "resolveLatestVersion refetches stale cache and rewrites it" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(allocator, &tmp, "cache");
     defer allocator.free(path);
     const now: i64 = 1_800_000_000;
-    writeUpdateCache(allocator, path, "1.2.3", now - UPDATE_CACHE_MAX_AGE_S);
+    writeUpdateCache(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now - UPDATE_CACHE_MAX_AGE_S },
+        path,
+        "1.2.3",
+    );
 
     resetFetchSeam("9.9.9");
-    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+    const latest = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        testFetchFn,
+    ) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(latest);
     try std.testing.expectEqualStrings("9.9.9", latest);
     try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
 
     // Cache rewritten with the fetched version, stamped with the injected now.
-    const cached = readUpdateCache(allocator, path) orelse
+    const cached = readUpdateCache(std.testing.io, allocator, path) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(cached.version);
     try std.testing.expectEqualStrings("9.9.9", cached.version);
     try std.testing.expectEqual(now, cached.epoch);
 
     // A second resolve now hits the fresh cache — no additional fetch.
-    const again = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+    const again = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        testFetchFn,
+    ) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(again);
     try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
 }
 
 test "resolveLatestVersion treats future-dated cache as stale" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmpFilePath(allocator, &tmp, "cache");
     defer allocator.free(path);
     const now: i64 = 1_800_000_000;
-    writeUpdateCache(allocator, path, "1.2.3", now + UPDATE_CACHE_FUTURE_SKEW_S + 1);
+    writeUpdateCache(
+        .{
+            .io = std.testing.io,
+            .allocator = allocator,
+            .now = now + UPDATE_CACHE_FUTURE_SKEW_S + 1,
+        },
+        path,
+        "1.2.3",
+    );
 
     resetFetchSeam("9.9.9");
-    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+    const latest = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        testFetchFn,
+    ) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(latest);
     try std.testing.expectEqualStrings("9.9.9", latest);
@@ -44125,8 +44654,6 @@ test "resolveLatestVersion treats future-dated cache as stale" {
 }
 
 test "resolveLatestVersion refetches corrupt cache" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44139,22 +44666,24 @@ test "resolveLatestVersion refetches corrupt cache" {
     });
 
     resetFetchSeam("9.9.9");
-    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+    const latest = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        testFetchFn,
+    ) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(latest);
     try std.testing.expectEqualStrings("9.9.9", latest);
     try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
 
     // Corrupt content replaced by a valid cache entry.
-    const cached = readUpdateCache(allocator, path) orelse
+    const cached = readUpdateCache(std.testing.io, allocator, path) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(cached.version);
     try std.testing.expectEqualStrings("9.9.9", cached.version);
 }
 
 test "resolveLatestVersion fetches when cache file is missing" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44163,22 +44692,24 @@ test "resolveLatestVersion fetches when cache file is missing" {
     const now: i64 = 1_800_000_000;
 
     resetFetchSeam("9.9.9");
-    const latest = resolveLatestVersion(allocator, path, now, testFetchFn) orelse
+    const latest = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        testFetchFn,
+    ) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(latest);
     try std.testing.expectEqualStrings("9.9.9", latest);
     try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
 
     // Fetch success creates the cache file.
-    const cached = readUpdateCache(allocator, path) orelse
+    const cached = readUpdateCache(std.testing.io, allocator, path) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(cached.version);
     try std.testing.expectEqualStrings("9.9.9", cached.version);
 }
 
 test "resolveLatestVersion leaves cache untouched on fetch failure" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44189,7 +44720,11 @@ test "resolveLatestVersion leaves cache untouched on fetch failure" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cache", .data = original });
 
     resetFetchSeam(null);
-    const result = resolveLatestVersion(allocator, path, now, testFetchFn);
+    const result = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        path,
+        testFetchFn,
+    );
     try std.testing.expect(result == null);
     try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
 
@@ -44209,7 +44744,11 @@ test "resolveLatestVersion without cache path always fetches" {
     const now: i64 = 1_800_000_000;
 
     resetFetchSeam("9.9.9");
-    const latest = resolveLatestVersion(allocator, null, now, testFetchFn) orelse
+    const latest = resolveLatestVersion(
+        .{ .io = std.testing.io, .allocator = allocator, .now = now },
+        null,
+        testFetchFn,
+    ) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(latest);
     try std.testing.expectEqualStrings("9.9.9", latest);
@@ -44285,17 +44824,18 @@ test "buildCurlFetchArgv pins the https clamp flags (EPH-I0156)" {
 }
 
 test "requireStrictExplicitVersion accepts null and strict X.Y.Z (EPH-I0155)" {
+    var diag = testDiagCtx();
     const good = [_]?[]const u8{ null, "0.14.3", "10.20.30" };
     for (good) |value| {
-        try requireStrictExplicitVersion(value);
+        try requireStrictExplicitVersion(&diag, value);
         // The gate's acceptance grammar is exactly the I0193 tag grammar.
         try std.testing.expect(value == null or isStrictSemverTag(value.?));
     }
 }
 
 test "requireStrictExplicitVersion rejects non-strict values (EPH-I0155)" {
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
     // "v1.2.3" fails: buildPackageUrl prepends the v itself. "1.2.3-beta.1"
     // fails: the I0193 tag grammar has no suffix. "" fails: no components.
     const bad = [_][]const u8{
@@ -44304,7 +44844,7 @@ test "requireStrictExplicitVersion rejects non-strict values (EPH-I0155)" {
     for (bad) |value| {
         try std.testing.expectError(
             error.InvalidVersion,
-            requireStrictExplicitVersion(value),
+            requireStrictExplicitVersion(&diag, value),
         );
     }
 }
@@ -44466,8 +45006,6 @@ test "parseEphorHashFromZon skips a hash marker inside a string value (EPH-I0139
 }
 
 test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194)" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44481,7 +45019,7 @@ test "writeFileAtomic replaces a planted symlink without following it (EPH-I0194
 
     const target_path = try tmpFilePath(allocator, &tmp, CONFIG_FILENAME);
     defer allocator.free(target_path);
-    try writeFileAtomic(std.Io.Dir.cwd(), target_path, "new-content");
+    try writeFileAtomic(std.testing.io, std.Io.Dir.cwd(), target_path, "new-content");
 
     // The victim keeps its bytes: the write must not have followed the link.
     const victim = try tmp.dir.readFileAlloc(
@@ -44612,14 +45150,12 @@ test "buildIntegrationUpdate reports an already-canonical block (EPH-I0168)" {
 
 test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try std.testing.expect(zigContentParses(allocator, tmp.dir, "pub fn build() void {}\n"));
-    try std.testing.expect(!zigContentParses(allocator, tmp.dir, "pub fn build( void {\n"));
+    try std.testing.expect(zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build() void {}\n"));
+    try std.testing.expect(!zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build( void {\n"));
 
     // Both runs cleaned their temp file: no litter in the project dir.
     var it = tmp.dir.iterate();
@@ -44627,36 +45163,38 @@ test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
 }
 
 test "resolveToolFromEnv falls back to the bare name when unset (EPH-I0154)" {
-    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(std.testing.io, .zig, null));
-    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(std.testing.io, .curl, null));
+    var diag = testDiagCtx();
+    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(&diag, .zig, null));
+    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, null));
 }
 
 test "resolveToolFromEnv accepts an absolute override that resolves (EPH-I0154)" {
+    var diag = testDiagCtx();
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     try std.testing.expectEqualStrings(
         "/bin/sh",
-        resolveToolFromEnv(std.testing.io, .zig, "/bin/sh"),
+        resolveToolFromEnv(&diag, .zig, "/bin/sh"),
     );
 }
 
 test "resolveToolFromEnv warns and falls back on a relative override (EPH-I0154)" {
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
     try std.testing.expectEqualStrings(
         "zig",
-        resolveToolFromEnv(std.testing.io, .zig, "tools/zig"),
+        resolveToolFromEnv(&diag, .zig, "tools/zig"),
     );
     // An empty value is not absolute either.
-    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(std.testing.io, .curl, ""));
+    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, ""));
 }
 
 test "resolveToolFromEnv warns and falls back on an unresolvable override (EPH-I0154)" {
+    var diag = testDiagCtx();
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     try std.testing.expectEqualStrings(
         "zig",
-        resolveToolFromEnv(std.testing.io, .zig, "/nonexistent/ephor-i0154/zig"),
+        resolveToolFromEnv(&diag, .zig, "/nonexistent/ephor-i0154/zig"),
     );
 }
 
@@ -44692,9 +45230,9 @@ const analysis_write_guard_config =
 /// probe, the scan, the orphan pass, then every file-touching analyzer.
 /// Excludes runFmtCheck: it spawns `zig fmt --check`, a read-only
 /// subprocess that needs a zig binary the test host does not guarantee.
-fn runCheckAnalysisBattery(allocator: Allocator, cfg: *Config) !void {
-    try loadKnownIssues(allocator, cfg);
-    var g = ImportGraph.init(allocator);
+fn runCheckAnalysisBattery(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
+    try loadKnownIssues(diag, allocator, cfg);
+    var g = ImportGraph.init(allocator, diag);
     defer g.deinit();
     g.scan_root = cfg.path;
     try scanPath(&g, cfg.path);
@@ -44782,8 +45320,7 @@ fn writeManifestFixture(tmp: *std.testing.TmpDir) !void {
 }
 
 test "analysis path never writes project manifest files (EPH-I0271)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44807,7 +45344,7 @@ test "analysis path never writes project manifest files (EPH-I0271)" {
         try std.fmt.allocPrint(allocator, "{s}/src/x.zig", .{dir_path}),
     );
 
-    try runCheckAnalysisBattery(allocator, &cfg);
+    try runCheckAnalysisBattery(&diag, allocator, &cfg);
 
     const after = try readManifestSnapshot(allocator, tmp.dir);
     defer after.deinit(allocator);
@@ -45731,8 +46268,9 @@ test "checkErrorNaming: TitleCase mode exempts std-lib and underscore names" {
 }
 
 test "analyzeNaming: TitleCase default flags snake_case error names in files" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const code =
@@ -46624,11 +47162,12 @@ test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101
 // ============================================================================
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -46658,11 +47197,12 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
 }
 
 test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -46690,11 +47230,12 @@ test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103
 }
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -46821,11 +47362,12 @@ test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -46895,11 +47437,12 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
 }
 
 test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Pattern: return list.toOwnedSlice(allocator) — ownership transferred to caller
@@ -46932,11 +47475,12 @@ test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)"
 }
 
 test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice (ZA101)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Pattern: const data = list.toOwnedSlice(alloc); return data
@@ -46974,11 +47518,12 @@ test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice 
 // ============================================================================
 
 test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47006,11 +47551,12 @@ test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
 }
 
 test "analyzeCFGDeferCoverage no false positive for create with defer destroy (ZA102)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47079,11 +47625,12 @@ test "analyzeCFGDeferCoverage no false positive for create with ownership transf
 }
 
 test "analyzeCFGDeferCoverage no false positive for create on arena allocator (ZA102)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47115,11 +47662,12 @@ test "analyzeCFGDeferCoverage no false positive for create on arena allocator (Z
 // ============================================================================
 
 test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47149,11 +47697,12 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)
 }
 
 test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47188,12 +47737,13 @@ test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" 
 // ============================================================================
 
 test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
+    var diag = testDiagCtx();
     // Tests direct UAF: free(data) then data[idx] = val
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47224,11 +47774,12 @@ test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
 }
 
 test "analyzeCFGMemory no false positive for defer free (ZA105)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47255,12 +47806,13 @@ test "analyzeCFGMemory no false positive for defer free (ZA105)" {
 }
 
 test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
+    var diag = testDiagCtx();
     // Tests alias UAF: const alias = data; free(data); use(alias);
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47292,13 +47844,14 @@ test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
 }
 
 test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
+    var diag = testDiagCtx();
     // Arena accessed through struct field: self.arena.allocator().alloc()
     // Type-based detection: field declared as std.heap.ArenaAllocator
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47331,12 +47884,13 @@ test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
 }
 
 test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
+    var diag = testDiagCtx();
     // FixedBufferAllocator accessed through struct field
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47372,6 +47926,7 @@ test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
 // ============================================================================
 
 test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
+    var diag = testDiagCtx();
     // Field named "arena" with type Allocator (not ArenaAllocator) should be
     // treated as no-free. This is the Zig compiler's pervasive pattern:
     // const Sema = struct { arena: Allocator, ... };
@@ -47379,7 +47934,7 @@ test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47412,13 +47967,14 @@ test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
 }
 
 test "no FP for function parameter arena: Allocator (ZA101)" {
+    var diag = testDiagCtx();
     // Function parameter named "arena" with type Allocator should be no-free.
     // Pattern: fn foo(arena: Allocator) !void { arena.alloc(...) }
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47445,12 +48001,13 @@ test "no FP for function parameter arena: Allocator (ZA101)" {
 }
 
 test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
+    var diag = testDiagCtx();
     // Deep chain: self.ctx.arena.alloc() where arena field is Allocator type
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47484,12 +48041,13 @@ test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
 }
 
 test "no FP for allocPrint with arena param (ZA101)" {
+    var diag = testDiagCtx();
     // std.fmt.allocPrint(arena, ...) where arena is a function parameter
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47516,13 +48074,14 @@ test "no FP for allocPrint with arena param (ZA101)" {
 }
 
 test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
+    var diag = testDiagCtx();
     // A parameter named "allocator" (not "arena") should still trigger warnings.
     // This verifies the heuristic is name-specific, not over-broad.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47556,12 +48115,13 @@ test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
 }
 
 test "arena param no FP for ZA103 errdefer (name-based)" {
+    var diag = testDiagCtx();
     // Arena-named parameter should not trigger ZA103 either
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47588,13 +48148,14 @@ test "arena param no FP for ZA103 errdefer (name-based)" {
 }
 
 test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
+    var diag = testDiagCtx();
     // var fba: std.heap.FixedBufferAllocator = .init(&buf);
     // Zig 0.15+ anonymous init syntax
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47623,13 +48184,14 @@ test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
 }
 
 test "no FP for arena param used as receiver and first-arg (ZA103)" {
+    var diag = testDiagCtx();
     // Reproduces git.zig pattern: fn init(arena: Allocator, ...) with
     // arena.dupe() and allocPrint(arena, ...)
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47660,12 +48222,13 @@ test "no FP for arena param used as receiver and first-arg (ZA103)" {
 }
 
 test "no FP for arena as non-first parameter (ZA103)" {
+    var diag = testDiagCtx();
     // Reproduces Value.zig pattern: fn sqrt(val, float_type, arena: Allocator, pt)
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47695,12 +48258,13 @@ test "no FP for arena as non-first parameter (ZA103)" {
 }
 
 test "no FP for multiline allocPrint with arena (ZA101)" {
+    var diag = testDiagCtx();
     // Reproduces glibc.zig pattern: allocPrint(\n    arena,\n    fmt, ...)
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47734,12 +48298,13 @@ test "no FP for multiline allocPrint with arena (ZA101)" {
 }
 
 test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
+    var diag = testDiagCtx();
     // Reproduces glibc.zig pattern: arena_allocator.allocator() alias used in allocPrint
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47769,13 +48334,14 @@ test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
 }
 
 test "no FP for local arena alias from struct field access (ZA101)" {
+    var diag = testDiagCtx();
     // Reproduces git.zig pattern: const arena = session.arena; arena.alloc(...)
     // where Session has arena: Allocator field
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47807,13 +48373,14 @@ test "no FP for local arena alias from struct field access (ZA101)" {
 }
 
 test "no FP for custom-receiver dupe with arena first arg (ZA101)" {
+    var diag = testDiagCtx();
     // zls analyser/completions.zig shape: `tuple_info.types.dupe(arena, ip)`
     // — a custom receiver whose dupe takes the allocator as first arg.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47840,12 +48407,13 @@ test "no FP for custom-receiver dupe with arena first arg (ZA101)" {
 }
 
 test "no FP for multiline custom-receiver dupe with arena first arg (ZA101)" {
+    var diag = testDiagCtx();
     // Multiline variant: the allocator first arg sits on the next line.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47875,13 +48443,14 @@ test "no FP for multiline custom-receiver dupe with arena first arg (ZA101)" {
 }
 
 test "no FP for replaceOwned with arena-named second arg (ZA101)" {
+    var diag = testDiagCtx();
     // std.mem.replaceOwned(comptime T, allocator, ...) is type-param-first;
     // the allocator is the second argument (verified against 0.15/0.16 stdlib).
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47908,13 +48477,14 @@ test "no FP for replaceOwned with arena-named second arg (ZA101)" {
 }
 
 test "no FP for replaceOwned with dotted arena field second arg (ZA101)" {
+    var diag = testDiagCtx();
     // zls features/code_actions.zig:163 shape:
     // `std.mem.replaceOwned(u8, builder.arena, parsed, ...)`.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47942,6 +48512,7 @@ test "no FP for replaceOwned with dotted arena field second arg (ZA101)" {
 }
 
 test "ZA101 fires for allocator-receiver dupe with arena-named source (lock)" {
+    var diag = testDiagCtx();
     // `allocator.dupe(u8, arena_str)` — the receiver is the allocator and the
     // arena-named value is the SOURCE string, not the allocator. Extraction
     // sees the type param `u8`, which must never suppress (EPH-I0008 FN lock).
@@ -47949,7 +48520,7 @@ test "ZA101 fires for allocator-receiver dupe with arena-named source (lock)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -47980,13 +48551,14 @@ test "ZA101 fires for allocator-receiver dupe with arena-named source (lock)" {
 }
 
 test "ZA101 fires for allocator-receiver dupe with plain source (lock)" {
+    var diag = testDiagCtx();
     // `allocator.dupe(u8, str)` — first-arg extraction returns the type param
     // `u8`, matching neither no-free names nor arena names: nothing suppressed.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48017,13 +48589,14 @@ test "ZA101 fires for allocator-receiver dupe with plain source (lock)" {
 }
 
 test "ZA101 fires for replaceOwned with real allocator second arg (lock)" {
+    var diag = testDiagCtx();
     // Type-first extraction must not over-suppress: a real (non-arena)
     // allocator as the second arg still requires a defer.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48054,13 +48627,14 @@ test "ZA101 fires for replaceOwned with real allocator second arg (lock)" {
 }
 
 test "ZA101 fires for custom-receiver dupe with non-arena first arg (lock)" {
+    var diag = testDiagCtx();
     // ghostty PageList.zig shape: `src_link.dupe(src_page, self.page)` — a
     // custom receiver whose first arg is neither no-free nor arena-named.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48097,13 +48671,14 @@ test "ZA101 fires for custom-receiver dupe with non-arena first arg (lock)" {
 }
 
 test "no FP for multiline replaceOwned with arena second arg (ZA101)" {
+    var diag = testDiagCtx();
     // zig-fmt split form: `std.mem.replaceOwned(\n    u8, arena, ...)` —
     // suppression must survive the call being split across lines.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48131,6 +48706,7 @@ test "no FP for multiline replaceOwned with arena second arg (ZA101)" {
 }
 
 test "no FP for replaceOwned with comma-bearing fn-pointer type param (ZA101)" {
+    var diag = testDiagCtx();
     // `*const fn (u8, u8) void` contains commas inside parens — the type-param
     // skip must be bracket-depth-aware. A naive comma-skip stops inside the fn
     // type, extracts `u8`, and regresses this to a false positive.
@@ -48138,7 +48714,7 @@ test "no FP for replaceOwned with comma-bearing fn-pointer type param (ZA101)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48186,6 +48762,7 @@ test "extractMultilineFirstArg skips type param for type-first patterns" {
 }
 
 test "no FP for non-memory alloc method (ZA103)" {
+    var diag = testDiagCtx();
     // Non-allocator structs can have .alloc() methods (e.g. SPIR-V register allocation).
     // These should NOT trigger ZA101/ZA103 since they don't allocate heap memory.
     // std.mem.Allocator.alloc() always takes a type as first arg (u8, MyStruct, etc.).
@@ -48194,7 +48771,7 @@ test "no FP for non-memory alloc method (ZA103)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48230,12 +48807,13 @@ test "no FP for non-memory alloc method (ZA103)" {
 }
 
 test "real alloc with type arg still triggers (ZA101)" {
+    var diag = testDiagCtx();
     // Ensure that real allocator.alloc(u8, 100) still triggers warnings
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48269,11 +48847,12 @@ test "real alloc with type arg still triggers (ZA101)" {
 // ============================================================================
 
 test "ZA204 fires for unfilled var undefined" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48304,11 +48883,12 @@ test "ZA204 fires for unfilled var undefined" {
 }
 
 test "ZA204 fires when only a different longer var is assigned" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // `box = 1;` must not drop x from the pending-undefined set —
@@ -48341,11 +48921,12 @@ test "ZA204 fires when only a different longer var is assigned" {
 }
 
 test "ZA204 no FP for memset after undefined" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48371,11 +48952,12 @@ test "ZA204 no FP for memset after undefined" {
 }
 
 test "ZA204 no FP when modifying method call follows other-var receiver" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // EPH-I0082: hasModifyingMethodCall checked only the first occurrence
@@ -48408,11 +48990,12 @@ test "ZA204 no FP when modifying method call follows other-var receiver" {
 // ============================================================================
 
 test "ZA202 catch unreachable fires via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48443,11 +49026,12 @@ test "ZA202 catch unreachable fires via analyzeErrors" {
 }
 
 test "ZA203 orelse unreachable fires via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48482,11 +49066,12 @@ test "ZA203 orelse unreachable fires via analyzeErrors" {
 // ============================================================================
 
 test "ZA207 catch undefined fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48516,11 +49101,12 @@ test "ZA207 catch undefined fires" {
 }
 
 test "ZA207 catch |_| undefined fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // `catch |_| undefined` discards the error AND yields undefined — the
@@ -48557,11 +49143,12 @@ test "ZA207 catch |_| undefined fires" {
 // ============================================================================
 
 test "ZA208 @panic fires in non-test context" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48590,11 +49177,12 @@ test "ZA208 @panic fires in non-test context" {
 }
 
 test "ZA208 @panic does NOT fire in test block" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48622,11 +49210,12 @@ test "ZA208 @panic does NOT fire in test block" {
 // ============================================================================
 
 test "ZA206 std.posix.exit fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -48656,11 +49245,12 @@ test "ZA206 std.posix.exit fires" {
 }
 
 test "ZA105: no false positive on variable reassignment after free" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Pattern: free(x); x = try alloc(); use(x) — NOT use-after-free
@@ -48695,11 +49285,12 @@ test "ZA105: no false positive on variable reassignment after free" {
 }
 
 test "ZA105: no false positive on for-loop capture variable" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Pattern: for (items) |item| { alloc.free(item); } — NOT use-after-free
@@ -48736,11 +49327,12 @@ test "ZA105: no false positive on for-loop capture variable" {
 }
 
 test "ZA105: still detects real use-after-free with reassignment check" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Real UAF: free(x); use(x) — no reassignment between
@@ -49067,11 +49659,12 @@ test "ZA201 silent when close sits past the probe window (I0151 bound)" {
 }
 
 test "ZT104 fires on comment-only catch body in test context (I0151)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49193,11 +49786,12 @@ test "ZA207 silent on split catch with real handling (I0152 pin)" {
 }
 
 test "ZA202 split form fires end-to-end via analyzeErrors (I0152)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49227,8 +49821,7 @@ test "ZA202 split form fires end-to-end via analyzeErrors (I0152)" {
 // ============================================================================
 
 test "I0150: over-cap file records a ZA502 skipped-file warning" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -49245,7 +49838,7 @@ test "I0150: over-cap file records a ZA502 skipped-file warning" {
         .data = "pub fn f() void {}\n",
     });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
@@ -49268,8 +49861,7 @@ test "I0150: over-cap file records a ZA502 skipped-file warning" {
 }
 
 test "I0150: exact-cap file also skips (boundary pin)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -49281,7 +49873,7 @@ test "I0150: exact-cap file also skips (boundary pin)" {
     @memset(exact, 'a');
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "exact.zig", .data = exact });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
@@ -49293,12 +49885,13 @@ test "I0150: exact-cap file also skips (boundary pin)" {
 }
 
 test "I0150: noteSkippedFile append failure frees the path copy" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // fail_index 1: the dupe (allocation 0) succeeds, the append's growth
     // allocation fails. Without the errdefer the copy leaks and the
     // testing allocator fails the test at deinit.
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
-    var graph = ImportGraph.init(failing.allocator());
+    var graph = ImportGraph.init(failing.allocator(), &diag);
     defer graph.deinit();
 
     try std.testing.expectError(error.OutOfMemory, graph.noteSkippedFile("big.zig"));
@@ -49310,11 +49903,12 @@ test "I0150: noteSkippedFile append failure frees the path copy" {
 // ============================================================================
 
 test "ZA202 suppressed in test block via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // catch unreachable inside a test block should NOT fire ZA202
@@ -49340,11 +49934,12 @@ test "ZA202 suppressed in test block via analyzeErrors" {
 }
 
 test "ZA203 suppressed in test block via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // orelse unreachable inside a test block should NOT fire ZA203
@@ -49370,11 +49965,12 @@ test "ZA203 suppressed in test block via analyzeErrors" {
 }
 
 test "ZA202 still fires outside test block" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49535,11 +50131,12 @@ fn createImportTestAnalysis(
 }
 
 test "ZA401 unused import flagged despite filename string match" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // The alias appears twice on its own line (declaration + "json.zig"
@@ -49567,11 +50164,12 @@ test "ZA401 unused import flagged despite filename string match" {
 }
 
 test "ZA401 silent when import has a real use" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49599,11 +50197,12 @@ test "ZA401 silent when import has a real use" {
 }
 
 test "ZA401 flagged when uses are only in strings and comments" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Mentions in a comment and in a string literal are not uses.
@@ -49634,11 +50233,12 @@ test "ZA401 flagged when uses are only in strings and comments" {
 }
 
 test "ZA401 another file importing same filename does not count as use" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // File B's @import("json.zig") string must not count as a use of file
@@ -49681,11 +50281,12 @@ test "ZA401 another file importing same filename does not count as use" {
 }
 
 test "ZA401 alias differing from filename stem still flagged" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49711,11 +50312,12 @@ test "ZA401 alias differing from filename stem still flagged" {
 }
 
 test "ZA402 unused const flagged despite string and comment mentions" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49740,11 +50342,12 @@ test "ZA402 unused const flagged despite string and comment mentions" {
 }
 
 test "ZA402 silent when const has a real use" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49767,11 +50370,12 @@ test "ZA402 silent when const has a real use" {
 }
 
 test "ZA403 unused var flagged despite string mention" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49798,11 +50402,12 @@ test "ZA403 unused var flagged despite string mention" {
 // ============================================================================
 
 test "ZA201 catch |err| {} fires via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49823,11 +50428,12 @@ test "ZA201 catch |err| {} fires via analyzeErrors" {
 }
 
 test "ZA201 catch{} without whitespace fires via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49848,11 +50454,12 @@ test "ZA201 catch{} without whitespace fires via analyzeErrors" {
 }
 
 test "ZA201 multi-line empty catch fires via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Bounded 2-line form: `catch {` ends the line, next line just closes it
@@ -49875,11 +50482,12 @@ test "ZA201 multi-line empty catch fires via analyzeErrors" {
 }
 
 test "ZA201 multi-line catch closes only on exact brace line" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Body is not empty — the next line does real work, so no ZA201.
@@ -49903,11 +50511,12 @@ test "ZA201 multi-line catch closes only on exact brace line" {
 }
 
 test "ZA201 one-line catch with handled body stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49930,11 +50539,12 @@ test "ZA201 one-line catch with handled body stays silent" {
 }
 
 test "ZA202 catch |e| unreachable fires via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49956,11 +50566,12 @@ test "ZA202 catch |e| unreachable fires via analyzeErrors" {
 }
 
 test "ZA202 catch unreachable with extra whitespace fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -49982,11 +50593,12 @@ test "ZA202 catch unreachable with extra whitespace fires" {
 }
 
 test "ZA207 catch |err| undefined fires via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -50012,11 +50624,12 @@ test "ZA207 catch |err| undefined fires via analyzeErrors" {
 // ============================================================================
 
 test "ZA201 silent in trailing comment via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -50037,11 +50650,12 @@ test "ZA201 silent in trailing comment via analyzeErrors" {
 }
 
 test "ZA202 silent in trailing comment via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -50062,11 +50676,12 @@ test "ZA202 silent in trailing comment via analyzeErrors" {
 }
 
 test "ZA203 silent in trailing comment via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -50087,11 +50702,12 @@ test "ZA203 silent in trailing comment via analyzeErrors" {
 }
 
 test "ZA207 silent in trailing comment via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -50112,11 +50728,12 @@ test "ZA207 silent in trailing comment via analyzeErrors" {
 }
 
 test "ZA208 silent in trailing comment via analyzeErrors" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const test_content =
@@ -50137,11 +50754,12 @@ test "ZA208 silent in trailing comment via analyzeErrors" {
 }
 
 test "ZA201 fires when double-slash is inside a string literal" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // The `//` inside "http://x" is string data, not a comment — the real
@@ -50199,11 +50817,12 @@ test "branchLimit applies 8x for data dispatch" {
 }
 
 test "ZA304 suppressed for fromJson with many branches" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // fromJson with 20 branches (20 > 12 default, but 20 < 48 dispatch limit)
@@ -50280,11 +50899,12 @@ test "countFnParams counts across multi-line signatures" {
 }
 
 test "ZA303 fires on multi-line signature with too many params" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const code =
@@ -50369,11 +50989,12 @@ test "visibleLengthExcludingStrings does not treat '\"' char literal as a string
 }
 
 test "ZA701 exempts lines over-length solely due to string literals" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const long_literal = "    \"" ++ "x" ** 113 ++ "\",";
@@ -50753,11 +51374,12 @@ test "opensCognitiveScope ignores a try in a string or comment (EPH-I0226)" {
 }
 
 test "ZA305: keyword-heavy trailing comment does not inflate CCN (EPH-I0226)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 14 real decision points (CCN 15, at the threshold). The trailing
@@ -50915,11 +51537,12 @@ fn expectNoCognitiveWarnings(issues: []const Issue, path: []const u8) !void {
 }
 
 test "ZA305: empty function has CCN 1, no warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const code =
@@ -50936,11 +51559,12 @@ test "ZA305: empty function has CCN 1, no warning" {
 }
 
 test "ZA305: 5-decision-point function no warning at default threshold" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 5 decision points (4 if + 1 while) → CCN = 6, below default 15
@@ -50965,11 +51589,12 @@ test "ZA305: 5-decision-point function no warning at default threshold" {
 }
 
 test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 20 flat if statements → CCN = 21, triggers at threshold 5
@@ -51017,11 +51642,12 @@ test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
 }
 
 test "ZA306: flat branches have low cognitive, no warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 10 flat if-else at top level → cognitive = ~10 (below 15)
@@ -51049,11 +51675,12 @@ test "ZA306: flat branches have low cognitive, no warning" {
 }
 
 test "ZA306: nested structures produce higher cognitive than flat" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // while(nest1) > for(nest2) > if(nest3) > if(nest4)
@@ -51082,11 +51709,12 @@ test "ZA306: nested structures produce higher cognitive than flat" {
 }
 
 test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 5 levels of nesting → 1+2+3+4+5 = 15, at threshold
@@ -51129,11 +51757,12 @@ test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
 }
 
 test "ZA305: try and catch contribute to cyclomatic" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 3 try + 1 catch = 4 decision points, CCN = 5, below 15
@@ -51154,11 +51783,12 @@ test "ZA305: try and catch contribute to cyclomatic" {
 }
 
 test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 20 orelse chains → cyclomatic high, cognitive moderate
@@ -51198,11 +51828,12 @@ test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
 }
 
 test "ZA305/ZA306: switch arms count as decision points" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const code =
@@ -51247,11 +51878,12 @@ test "ZA305/ZA306: switch arms count as decision points" {
 }
 
 test "ZA305/ZA306: simple function has CCN=1 cognitive=0" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const code =
@@ -51278,6 +51910,7 @@ test "ZA305/ZA306: simple function has CCN=1 cognitive=0" {
 // ============================================================================
 
 test "ZA901: unspaced and non-1 decrement forms fire" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51304,7 +51937,7 @@ test "ZA901: unspaced and non-1 decrement forms fire" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za901_forms.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_forms.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -51315,6 +51948,7 @@ test "ZA901: unspaced and non-1 decrement forms fire" {
 }
 
 test "ZA901: spaced decrement still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51329,7 +51963,7 @@ test "ZA901: spaced decrement still fires" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za901_spaced.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_spaced.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -51340,6 +51974,7 @@ test "ZA901: spaced decrement still fires" {
 }
 
 test "ZA901: guarded unspaced decrement stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51354,7 +51989,7 @@ test "ZA901: guarded unspaced decrement stays silent" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za901_guarded.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_guarded.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -51365,6 +52000,7 @@ test "ZA901: guarded unspaced decrement stays silent" {
 }
 
 test "ZA901: literal, increment, comment, and string forms stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51387,7 +52023,7 @@ test "ZA901: literal, increment, comment, and string forms stay silent" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za901_quiet.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_quiet.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -51420,6 +52056,7 @@ test "ZA903 matcher: unspaced bracket subtraction forms" {
 }
 
 test "ZA903: unspaced index subtraction fires end-to-end" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51429,7 +52066,7 @@ test "ZA903: unspaced index subtraction fires end-to-end" {
         \\    return a[i-1];
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za903_unspaced.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_unspaced.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -51440,6 +52077,7 @@ test "ZA903: unspaced index subtraction fires end-to-end" {
 }
 
 test "ZA903: guarded unspaced subtraction stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51450,7 +52088,7 @@ test "ZA903: guarded unspaced subtraction stays silent" {
         \\    return 0;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za903_guarded.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_guarded.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -51461,6 +52099,7 @@ test "ZA903: guarded unspaced subtraction stays silent" {
 }
 
 test "ZA903: trailing comment and string forms stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51477,7 +52116,7 @@ test "ZA903: trailing comment and string forms stay silent" {
         \\    _ = v;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "test_za903_comment.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_comment.zig", content);
     defer run.deinit(allocator);
 
     // Only the real subtraction on line 2 may fire — the comment and the
@@ -51490,6 +52129,7 @@ test "ZA903: trailing comment and string forms stay silent" {
 }
 
 test "ZA301: outer fn with local struct method is reported" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51510,7 +52150,7 @@ test "ZA301: outer fn with local struct method is reported" {
         "    const S = struct {\n        fn method() void {}\n    };\n    _ = S;\n}\n",
     });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, "outer_struct.zig", content);
     try graph.files.put(analysis.path, analysis);
@@ -51531,11 +52171,12 @@ test "ZA301: outer fn with local struct method is reported" {
 }
 
 test "ZA301: short outer fn with local struct stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const code =
@@ -51561,6 +52202,7 @@ test "ZA301: short outer fn with local struct stays silent" {
 }
 
 test "ZA304: outer fn branches reported despite local struct" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -51581,7 +52223,7 @@ test "ZA304: outer fn branches reported despite local struct" {
         "    const S = struct {\n        fn method() void {}\n    };\n    _ = S;\n    return 99;\n}\n",
     });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, "branchy_outer.zig", content);
     try graph.files.put(analysis.path, analysis);
@@ -51646,11 +52288,12 @@ test "opensCognitiveScope ignores keywords inside strings" {
 }
 
 test "ZA305: unspaced if-chain trips cyclomatic threshold" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 20 unspaced decision points -> CCN 21; previously undercounted to 1.
@@ -51699,11 +52342,12 @@ test "ZA305: unspaced if-chain trips cyclomatic threshold" {
 }
 
 test "ZA204: multiple pending undefined vars are all tracked" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -51731,11 +52375,12 @@ test "ZA204: multiple pending undefined vars are all tracked" {
 }
 
 test "ZA204: two undefined decls on one line are both tracked" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -51763,11 +52408,12 @@ test "ZA204: two undefined decls on one line are both tracked" {
 }
 
 test "ZA204: multi-line undefined declaration is tracked" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -51800,11 +52446,12 @@ test "ZA204: multi-line undefined declaration is tracked" {
 }
 
 test "ZA204: type-qualified const in decl does not shadow the var name" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // `[]const u8` contains "const " — the decl keyword scan must still find
@@ -51842,11 +52489,12 @@ test "extractVarDeclNameBefore skips type-qualifier const" {
 }
 
 test "ZA204: filled vars stay silent with multi-var tracking" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -51877,11 +52525,12 @@ test "ZA204: filled vars stay silent with multi-var tracking" {
 }
 
 test "ZA204: struct literal field default stays silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     const content =
@@ -52101,13 +52750,19 @@ test "trackBraceNesting pairs 300 nested switch-expression prongs (EPH-I0451)" {
 /// ZA301 fires, carrying the expected measured fn length in its message.
 /// The exact count pins "the fn measured its full body", not just "some
 /// finding fired" (EPH-I0451).
-fn expectMeasuredFnLines(
-    allocator: Allocator,
+/// One function-line measurement case: the file name, its source, and
+/// the expected measured line count.
+const FnLinesCase = struct {
     file: []const u8,
     code: []const u8,
     expect_lines: usize,
-) !void {
-    var graph = ImportGraph.init(allocator);
+};
+
+fn expectMeasuredFnLines(diag: *DiagCtx, allocator: Allocator, case: FnLinesCase) !void {
+    const file = case.file;
+    const code = case.code;
+    const expect_lines = case.expect_lines;
+    var graph = ImportGraph.init(allocator, diag);
     defer graph.deinit();
 
     const analysis = try createTestFileAnalysis(allocator, file, code);
@@ -52131,6 +52786,7 @@ fn expectMeasuredFnLines(
 }
 
 test "ZA301: two block prongs plus a trailing statement measure the full fn (EPH-I0451)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52163,10 +52819,11 @@ test "ZA301: two block prongs plus a trailing statement measure the full fn (EPH
         \\    _ = v;
         \\}
     ;
-    try expectMeasuredFnLines(allocator, "prongs.zig", code, 56);
+    try expectMeasuredFnLines(&diag, allocator, .{ .file = "prongs.zig", .code = code, .expect_lines = 56 });
 }
 
 test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52187,10 +52844,11 @@ test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
         \\    _ = v;
         \\}
     ;
-    try expectMeasuredFnLines(allocator, "i0133.zig", code, 61);
+    try expectMeasuredFnLines(&diag, allocator, .{ .file = "i0133.zig", .code = code, .expect_lines = 61 });
 }
 
 test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I0451)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52224,15 +52882,16 @@ test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I
         \\fn set_line() void {}
         \\fn after() void {}
     ;
-    try expectMeasuredFnLines(allocator, "hbe.zig", code, 52);
+    try expectMeasuredFnLines(&diag, allocator, .{ .file = "hbe.zig", .code = code, .expect_lines = 52 });
 }
 
 test "ZA302: poisoned arrow line does not hide a deeply nested tail" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // EPH-I0221: the string-literal `"=>"` on the first body line must not
@@ -52274,11 +52933,12 @@ test "ZA302: poisoned arrow line does not hide a deeply nested tail" {
 }
 
 test "ZA302: char-literal braces do not inflate nesting depth" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Real nesting is 3 (fn > if > for); the `'{'` char literal on a
@@ -52354,6 +53014,7 @@ test "detectFnStart: extern decl with trailing comment opens no fn state (EPH-I0
 }
 
 test "ZA301: wrapped extern decl followed by a real fn reports no phantom (EPH-I0756)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52373,7 +53034,7 @@ test "ZA301: wrapped extern decl followed by a real fn reports no phantom (EPH-I
     }
     content = try mem.concat(aa, u8, &.{ content, "fn real() void {}\n" });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, "extern_wrapped_phantom.zig", content);
     try graph.files.put(analysis.path, analysis);
@@ -52408,11 +53069,12 @@ test "detectFnStart: wrapped real fn def opens state with the def line's identit
 }
 
 test "ZA301: wrapped real fn def counts its signature lines (EPH-I0756)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // 9 lines from the fn keyword to the close. The deferred open must
@@ -52501,11 +53163,12 @@ const plain_sig_i0788 =
 ;
 
 test "ZA301: full-line comments in a wrapped signature stay out of fn_lines (EPH-I0788)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
     // Two-sided pin at cap 10. The commented twin processes 9 lines and
@@ -52541,6 +53204,7 @@ test "ZA301: full-line comments in a wrapped signature stay out of fn_lines (EPH
 }
 
 test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52558,7 +53222,7 @@ test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {
     }
     content = try mem.concat(aa, u8, &.{ content, "fn real() void {}\n" });
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, "extern_phantom.zig", content);
     try graph.files.put(analysis.path, analysis);
@@ -52572,6 +53236,7 @@ test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {
 }
 
 test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52591,7 +53256,7 @@ test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
         \\    _ = 6;
         \\}
     ;
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, "gtk_bindings.zig", code);
     try graph.files.put(analysis.path, analysis);
@@ -52642,6 +53307,7 @@ test "isCImportFile: __builtin_ in code skips, in string does not (EPH-I0758)" {
 }
 
 test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52658,7 +53324,7 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
         \\    _ = 6;
         \\}
     ;
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, "stringy.zig", code);
     try graph.files.put(analysis.path, analysis);
@@ -52675,8 +53341,7 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
 }
 
 test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52684,11 +53349,11 @@ test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
     // The real file carries the markers only as string-literal data (this
     // predicate, its tests), so the dogfood target must be analyzed.
     const max_main_bytes = 16 * 1024 * 1024;
-    const content = try Fs.cwd().readFileAlloc(allocator, "src/main.zig", max_main_bytes);
+    const content = try Fs.cwd(std.testing.io).readFileAlloc(allocator, "src/main.zig", max_main_bytes);
     defer allocator.free(content);
     try std.testing.expect(!isCImportFile("src/main.zig", content));
 
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, "src/main.zig", content);
     try graph.files.put(analysis.path, analysis);
@@ -52710,11 +53375,12 @@ test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
 
 /// Test helper: build a one-file graph and run the test-quality pipeline.
 fn runTestQualityCheck(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -52738,6 +53404,7 @@ fn countBySeverity(
 }
 
 test "ZT102: test with no assertions warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52746,7 +53413,7 @@ test "ZT102: test with no assertions warns" {
         \\fn foo() void {}
         \\test "x" { foo(); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_warn.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_warn.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52756,6 +53423,7 @@ test "ZT102: test with no assertions warns" {
 }
 
 test "ZT102: try-only smoke test is a note, not a warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52764,7 +53432,7 @@ test "ZT102: try-only smoke test is a note, not a warning" {
         \\fn foo() !void {}
         \\test "x" { try foo(); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_smoke.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_smoke.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52778,6 +53446,7 @@ test "ZT102: try-only smoke test is a note, not a warning" {
 }
 
 test "ZT102: try expectEqual counts as an assertion" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52787,7 +53456,7 @@ test "ZT102: try expectEqual counts as an assertion" {
     const content =
         \\test "x" { try expectEqual(1, 1); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_expect.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_expect.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52797,6 +53466,7 @@ test "ZT102: try expectEqual counts as an assertion" {
 }
 
 test "ZT102: std.debug.assert counts as an assertion" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52807,7 +53477,7 @@ test "ZT102: std.debug.assert counts as an assertion" {
         \\    std.debug.assert(ok);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_assert.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_assert.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52817,6 +53487,7 @@ test "ZT102: std.debug.assert counts as an assertion" {
 }
 
 test "ZT102: camelCase Assert helpers count as assertions" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52833,13 +53504,14 @@ test "ZT102: camelCase Assert helpers count as assertions" {
         \\    return 1;
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_fxassert.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_fxassert.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
 }
 
 test "ZT102: multi-line vacuous test warns at the test line" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52852,7 +53524,7 @@ test "ZT102: multi-line vacuous test warns at the test line" {
         \\    bar();
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_multi.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_multi.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52865,6 +53537,7 @@ test "ZT102: multi-line vacuous test warns at the test line" {
 }
 
 test "ZT102: expect text in strings and comments is not an assertion" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52876,7 +53549,7 @@ test "ZT102: expect text in strings and comments is not an assertion" {
         \\    const s = "expect(notreal)";
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_string.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_string.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52886,6 +53559,7 @@ test "ZT102: expect text in strings and comments is not an assertion" {
 }
 
 test "ZT102: FailingAllocator leak-sweep test is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52919,7 +53593,7 @@ test "ZT102: FailingAllocator leak-sweep test is silent" {
         \\    }
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_fa_sweep.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_fa_sweep.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52933,6 +53607,7 @@ test "ZT102: FailingAllocator leak-sweep test is silent" {
 }
 
 test "ZT102: direct std.testing.allocator use is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52948,7 +53623,7 @@ test "ZT102: direct std.testing.allocator use is silent" {
         \\    buf[0] = 1;
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_alloc_use.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_alloc_use.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52962,6 +53637,7 @@ test "ZT102: direct std.testing.allocator use is silent" {
 }
 
 test "ZT102: loop without allocator or assertions still warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52976,7 +53652,7 @@ test "ZT102: loop without allocator or assertions still warns" {
         \\    }
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_loop_warn.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_loop_warn.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -52986,6 +53662,7 @@ test "ZT102: loop without allocator or assertions still warns" {
 }
 
 test "ZT102: try-only smoke test without allocator stays a note" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -52996,7 +53673,7 @@ test "ZT102: try-only smoke test without allocator stays a note" {
         \\    try foo();
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_smoke_keep.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_smoke_keep.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53010,6 +53687,7 @@ test "ZT102: try-only smoke test without allocator stays a note" {
 }
 
 test "ZT102: allocator mention in the test name alone still warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53022,7 +53700,7 @@ test "ZT102: allocator mention in the test name alone still warns" {
         \\    foo();
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_name_only.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_name_only.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53032,6 +53710,7 @@ test "ZT102: allocator mention in the test name alone still warns" {
 }
 
 test "ZT103: expect(true) warns, including whitespace variant" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53040,7 +53719,7 @@ test "ZT103: expect(true) warns, including whitespace variant" {
         \\test "a" { try std.testing.expect(true); }
         \\test "b" { try std.testing.expect( true ); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt103_true.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt103_true.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53050,6 +53729,7 @@ test "ZT103: expect(true) warns, including whitespace variant" {
 }
 
 test "ZT103: expectEqual with identical args warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53060,7 +53740,7 @@ test "ZT103: expectEqual with identical args warns" {
         \\    try std.testing.expectEqual(x, x);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt103_eqeq.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt103_eqeq.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53070,6 +53750,7 @@ test "ZT103: expectEqual with identical args warns" {
 }
 
 test "ZT103: expect with identical comparison operands warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53084,7 +53765,7 @@ test "ZT103: expect with identical comparison operands warns" {
         \\    try std.testing.expect(a != a);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt103_operands.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt103_operands.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53094,6 +53775,7 @@ test "ZT103: expect with identical comparison operands warns" {
 }
 
 test "ZT103: real assertions with different args are silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53107,13 +53789,14 @@ test "ZT103: real assertions with different args are silent" {
         \\    try std.testing.expect(count == 3);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt103_real.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt103_real.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
 }
 
 test "ZT103: string-literal args are not split or misread" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53125,13 +53808,14 @@ test "ZT103: string-literal args are not split or misread" {
         \\    try std.testing.expectEqual("true", s);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt103_string.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt103_string.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
 }
 
 test "ZT103: trivially-true assertion outside a test block is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53141,13 +53825,14 @@ test "ZT103: trivially-true assertion outside a test block is silent" {
         \\    try std.testing.expect(true);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt103_outside.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt103_outside.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
 }
 
 test "ZT102: braces in test names and strings do not corrupt block tracking" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53164,13 +53849,14 @@ test "ZT102: braces in test names and strings do not corrupt block tracking" {
         \\    try std.testing.expect(n == 2);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_braces.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_braces.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
 }
 
 test "ZT102: test-reference blocks are not vacuous" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53193,13 +53879,14 @@ test "ZT102: test-reference blocks are not vacuous" {
         \\    @import("std").testing.refAllDecls(@This());
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_refs.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_refs.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
 }
 
 test "ZT102: vacuous test still warns next to a reference block" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53213,7 +53900,7 @@ test "ZT102: vacuous test still warns next to a reference block" {
         \\    foo();
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_mixed.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_mixed.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53227,6 +53914,7 @@ test "ZT102: vacuous test still warns next to a reference block" {
 // with the ZT105 tests below).
 
 test "ZT102: helper-mediated assertion via file-local helper is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53239,7 +53927,7 @@ test "ZT102: helper-mediated assertion via file-local helper is silent" {
         \\}
         \\test "x" { try check_thing(1); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_helper.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_helper.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53249,6 +53937,7 @@ test "ZT102: helper-mediated assertion via file-local helper is silent" {
 }
 
 test "ZT102: transitive helper-mediated assertion is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53263,7 +53952,7 @@ test "ZT102: transitive helper-mediated assertion is silent" {
         \\}
         \\test "x" { try outer(); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_transit.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_transit.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53273,6 +53962,7 @@ test "ZT102: transitive helper-mediated assertion is silent" {
 }
 
 test "ZT102: helper with no assertions anywhere still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53283,7 +53973,7 @@ test "ZT102: helper with no assertions anywhere still fires" {
         \\}
         \\test "x" { try check_thing(); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_noassert.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_noassert.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53293,6 +53983,7 @@ test "ZT102: helper with no assertions anywhere still fires" {
 }
 
 test "ZT102: call-graph cycle terminates with the correct verdict" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53308,7 +53999,7 @@ test "ZT102: call-graph cycle terminates with the correct verdict" {
         \\}
         \\test "x" { try a(); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_cycle.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_cycle.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53318,6 +54009,7 @@ test "ZT102: call-graph cycle terminates with the correct verdict" {
 }
 
 test "ZT102: cross-file asserting helper is silent (project-wide witness)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53335,7 +54027,7 @@ test "ZT102: cross-file asserting helper is silent (project-wide witness)" {
         \\}
         },
     };
-    var run = try runTestQualityCheckFiles(allocator, &specs);
+    var run = try runTestQualityCheckFiles(&diag, allocator, &specs);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53345,6 +54037,7 @@ test "ZT102: cross-file asserting helper is silent (project-wide witness)" {
 }
 
 test "ZT102: lowercase cross-file name collisions do not suppress" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53373,7 +54066,7 @@ test "ZT102: lowercase cross-file name collisions do not suppress" {
         \\}
         },
     };
-    var run = try runTestQualityCheckFiles(allocator, &specs);
+    var run = try runTestQualityCheckFiles(&diag, allocator, &specs);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53383,6 +54076,7 @@ test "ZT102: lowercase cross-file name collisions do not suppress" {
 }
 
 test "ZT102: asserting helper with brace literal in signature is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53411,7 +54105,7 @@ test "ZT102: asserting helper with brace literal in signature is silent" {
         \\}
         },
     };
-    var run = try runTestQualityCheckFiles(allocator, &specs);
+    var run = try runTestQualityCheckFiles(&diag, allocator, &specs);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53421,6 +54115,7 @@ test "ZT102: asserting helper with brace literal in signature is silent" {
 }
 
 test "ZT102: snapshot snap/diff_fmt assertion verbs are silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53435,7 +54130,7 @@ test "ZT102: snapshot snap/diff_fmt assertion verbs are silent" {
         \\    ).diff_fmt("balance = {d}", .{balance});
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_snap.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_snap.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53445,6 +54140,7 @@ test "ZT102: snapshot snap/diff_fmt assertion verbs are silent" {
 }
 
 test "ZT102: dotted diff method call counts as an assertion" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53452,7 +54148,7 @@ test "ZT102: dotted diff method call counts as an assertion" {
     const content =
         \\test "x" { try want.diff(got); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_diff.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_diff.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53462,6 +54158,7 @@ test "ZT102: dotted diff method call counts as an assertion" {
 }
 
 test "ZT102: snaplen-style data names are not snapshot assertions" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53475,7 +54172,7 @@ test "ZT102: snaplen-style data names are not snapshot assertions" {
         \\}
         \\test "x" { try initWithSnaplen(1, 65535); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_snaplen.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_snaplen.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53485,6 +54182,7 @@ test "ZT102: snaplen-style data names are not snapshot assertions" {
 }
 
 test "ZT102: print-only test still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53492,7 +54190,7 @@ test "ZT102: print-only test still fires" {
     const content =
         \\test "x" { std.debug.print("hi", .{}); }
     ;
-    var run = try runTestQualityCheck(allocator, "zt102_print.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_print.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53506,6 +54204,7 @@ test "ZT102: print-only test still fires" {
 // ============================================================================
 
 test "ZT101: warns when the fn a test is named after is never called" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53521,7 +54220,7 @@ test "ZT101: warns when the fn a test is named after is never called" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_lie.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_lie.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53534,6 +54233,7 @@ test "ZT101: warns when the fn a test is named after is never called" {
 }
 
 test "ZT101: silent when the body calls the named fn" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53546,7 +54246,7 @@ test "ZT101: silent when the body calls the named fn" {
         \\    try parseHeader("");
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_called.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_called.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53556,6 +54256,7 @@ test "ZT101: silent when the body calls the named fn" {
 }
 
 test "ZT101: prose-only test names have no candidates" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53569,7 +54270,7 @@ test "ZT101: prose-only test names have no candidates" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_prose.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_prose.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53579,6 +54280,7 @@ test "ZT101: prose-only test names have no candidates" {
 }
 
 test "ZT101: ident-form test calling its fn is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53589,7 +54291,7 @@ test "ZT101: ident-form test calling its fn is silent" {
         \\    fooBar();
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_ident.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_ident.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53599,6 +54301,7 @@ test "ZT101: ident-form test calling its fn is silent" {
 }
 
 test "ZT101: ident-form test that never calls its fn warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53610,7 +54313,7 @@ test "ZT101: ident-form test that never calls its fn warns" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_ident_lie.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_ident_lie.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53620,6 +54323,7 @@ test "ZT101: ident-form test that never calls its fn warns" {
 }
 
 test "ZT101: fns from other files are not candidates" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53632,7 +54336,7 @@ test "ZT101: fns from other files are not candidates" {
         \\    localHelper();
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_cross.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_cross.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53642,6 +54346,7 @@ test "ZT101: fns from other files are not candidates" {
 }
 
 test "ZT101: generic fns are not lie candidates" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53657,7 +54362,7 @@ test "ZT101: generic fns are not lie candidates" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_generic.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_generic.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53667,6 +54372,7 @@ test "ZT101: generic fns are not lie candidates" {
 }
 
 test "ZT101: type-factory fns are not lie candidates" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53680,7 +54386,7 @@ test "ZT101: type-factory fns are not lie candidates" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_factory.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_factory.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53690,6 +54396,7 @@ test "ZT101: type-factory fns are not lie candidates" {
 }
 
 test "ZT101: one of several candidates called is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53705,7 +54412,7 @@ test "ZT101: one of several candidates called is silent" {
         \\    try parseFooter("");
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_multi_ok.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_multi_ok.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53715,6 +54422,7 @@ test "ZT101: one of several candidates called is silent" {
 }
 
 test "ZT101: no candidate called warns once" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53731,7 +54439,7 @@ test "ZT101: no candidate called warns once" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_multi_lie.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_multi_lie.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53741,6 +54449,7 @@ test "ZT101: no candidate called warns once" {
 }
 
 test "ZT101: dotted calls satisfy the candidate" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53755,7 +54464,7 @@ test "ZT101: dotted calls satisfy the candidate" {
         \\    try parser.parseHeader("");
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_dotted.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_dotted.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53765,6 +54474,7 @@ test "ZT101: dotted calls satisfy the candidate" {
 }
 
 test "ZT101: helper-mediated calls satisfy the candidate" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53782,7 +54492,7 @@ test "ZT101: helper-mediated calls satisfy the candidate" {
         \\    try headerHelper();
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_helper.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_helper.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53792,6 +54502,7 @@ test "ZT101: helper-mediated calls satisfy the candidate" {
 }
 
 test "ZT101: lowercase prose words are not candidates" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53807,7 +54518,7 @@ test "ZT101: lowercase prose words are not candidates" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_shape.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_shape.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53817,6 +54528,7 @@ test "ZT101: lowercase prose words are not candidates" {
 }
 
 test "ZT104: empty catch in a test is a note" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53829,7 +54541,7 @@ test "ZT104: empty catch in a test is a note" {
         \\    foo() catch {};
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_empty.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_empty.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53839,6 +54551,7 @@ test "ZT104: empty catch in a test is a note" {
 }
 
 test "ZT104: payload forms of empty catch are notes" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53852,7 +54565,7 @@ test "ZT104: payload forms of empty catch are notes" {
         \\    foo() catch |_| {};
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_payload.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_payload.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53862,6 +54575,7 @@ test "ZT104: payload forms of empty catch are notes" {
 }
 
 test "ZT104: catch unreachable in a test is a note" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53872,7 +54586,7 @@ test "ZT104: catch unreachable in a test is a note" {
         \\    foo() catch unreachable;
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_unreach.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_unreach.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -53910,11 +54624,12 @@ const CombinedRun = struct {
 
 /// Test helper: build a one-file graph and run both analyzer pipelines.
 fn runBothPipelines(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !CombinedRun {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -53931,6 +54646,7 @@ fn runBothPipelines(
 }
 
 test "ZA201/ZT104 overlap: empty catch in a test reports exactly ZT104" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53941,7 +54657,7 @@ test "ZA201/ZT104 overlap: empty catch in a test reports exactly ZT104" {
         \\    failingCall() catch {};
         \\}
     ;
-    var run = try runBothPipelines(allocator, "overlap_empty.zig", content);
+    var run = try runBothPipelines(&diag, allocator, "overlap_empty.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.countRule(RULE_SILENT_CATCH));
@@ -53949,6 +54665,7 @@ test "ZA201/ZT104 overlap: empty catch in a test reports exactly ZT104" {
 }
 
 test "ZA202/ZT104 overlap: catch unreachable in a test reports exactly ZT104" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53959,7 +54676,7 @@ test "ZA202/ZT104 overlap: catch unreachable in a test reports exactly ZT104" {
         \\    failingCall() catch unreachable;
         \\}
     ;
-    var run = try runBothPipelines(allocator, "overlap_unreach.zig", content);
+    var run = try runBothPipelines(&diag, allocator, "overlap_unreach.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.countRule(RULE_CATCH_UNREACHABLE));
@@ -53967,6 +54684,7 @@ test "ZA202/ZT104 overlap: catch unreachable in a test reports exactly ZT104" {
 }
 
 test "ZA207/ZT104 overlap: catch undefined in a test reports exactly ZA207" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53979,7 +54697,7 @@ test "ZA207/ZT104 overlap: catch undefined in a test reports exactly ZA207" {
         \\    failingCall() catch undefined;
         \\}
     ;
-    var run = try runBothPipelines(allocator, "overlap_undef.zig", content);
+    var run = try runBothPipelines(&diag, allocator, "overlap_undef.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.countRule(RULE_TEST_SWALLOWED_ERROR));
@@ -53987,6 +54705,7 @@ test "ZA207/ZT104 overlap: catch undefined in a test reports exactly ZA207" {
 }
 
 test "ZA201 still fires outside test context" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -53997,7 +54716,7 @@ test "ZA201 still fires outside test context" {
         \\    failingCall() catch {};
         \\}
     ;
-    var run = try runBothPipelines(allocator, "overlap_outside.zig", content);
+    var run = try runBothPipelines(&diag, allocator, "overlap_outside.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), run.countRule(RULE_SILENT_CATCH));
@@ -54005,6 +54724,7 @@ test "ZA201 still fires outside test context" {
 }
 
 test "ZT104: two-line empty catch form is a note" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54016,7 +54736,7 @@ test "ZT104: two-line empty catch form is a note" {
         \\    };
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_twoline.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_twoline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54026,6 +54746,7 @@ test "ZT104: two-line empty catch form is a note" {
 }
 
 test "ZT104: handled catch is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54040,7 +54761,7 @@ test "ZT104: handled catch is silent" {
         \\    };
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_handled.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_handled.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54050,6 +54771,7 @@ test "ZT104: handled catch is silent" {
 }
 
 test "ZT104: catch outside test context is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54061,7 +54783,7 @@ test "ZT104: catch outside test context is silent" {
         \\    foo() catch {};
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_outside.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_outside.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54071,6 +54793,7 @@ test "ZT104: catch outside test context is silent" {
 }
 
 test "ZT104: test-file path is test context" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54083,7 +54806,7 @@ test "ZT104: test-file path is test context" {
         \\    foo() catch {};
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "helper_test.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "helper_test.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54093,6 +54816,7 @@ test "ZT104: test-file path is test context" {
 }
 
 test "ZT104: while-condition catch idiom is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54111,7 +54835,7 @@ test "ZT104: while-condition catch idiom is silent" {
         \\    }
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_while.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_while.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54121,6 +54845,7 @@ test "ZT104: while-condition catch idiom is silent" {
 }
 
 test "ZT101: candidates passed as values are exercised" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54139,7 +54864,7 @@ test "ZT101: candidates passed as values are exercised" {
         \\    try parseFuzzHarness(parse_flag_value);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_valueref.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_valueref.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54171,6 +54896,7 @@ test "ZT101: comment fn text does not hijack the next fn's span (EPH-I0427)" {
 }
 
 test "ZT101: fn after a comment-def line stays a lie candidate (EPH-I0427)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54185,7 +54911,7 @@ test "ZT101: fn after a comment-def line stays a lie candidate (EPH-I0427)" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_comment.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_comment.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54269,6 +54995,7 @@ test "ZT101: real fn def whose trailing comment ends in `;` keeps callees (EPH-I
 }
 
 test "ZT104: defer cleanup catch is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54284,7 +55011,7 @@ test "ZT104: defer cleanup catch is silent" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_defer.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_defer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54294,6 +55021,7 @@ test "ZT104: defer cleanup catch is silent" {
 }
 
 test "ZT104: defer-block cleanup catch is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54311,7 +55039,7 @@ test "ZT104: defer-block cleanup catch is silent" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_deferblk.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_deferblk.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54321,6 +55049,7 @@ test "ZT104: defer-block cleanup catch is silent" {
 }
 
 test "ZT104: catch unreachable in a defer still notes" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54335,7 +55064,7 @@ test "ZT104: catch unreachable in a defer still notes" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt104_deferunreach.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt104_deferunreach.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54357,10 +55086,11 @@ const TestQualityFile = struct {
 
 /// Test helper: build a multi-file graph and run the test-quality pipeline.
 fn runTestQualityCheckFiles(
+    diag: *DiagCtx,
     allocator: Allocator,
     files: []const TestQualityFile,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     for (files) |f| {
         const analysis = try createTestFileAnalysis(allocator, f.path, f.content);
@@ -54392,6 +55122,7 @@ fn countUntestedFnNotes(
 }
 
 test "ZT105: pub fn never called from any test is a note" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54405,7 +55136,7 @@ test "ZT105: pub fn never called from any test is a note" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_unused.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_unused.zig", content);
     defer run.deinit(allocator);
 
     // Exactly one ZT105 note: the private helper is not a candidate, and
@@ -54425,6 +55156,7 @@ test "ZT105: pub fn never called from any test is a note" {
 }
 
 test "ZT105: pub fn called from a test in another file is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54450,7 +55182,7 @@ test "ZT105: pub fn called from a test in another file is silent" {
             ,
         },
     };
-    var run = try runTestQualityCheckFiles(allocator, &files);
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54464,6 +55196,7 @@ test "ZT105: pub fn called from a test in another file is silent" {
 }
 
 test "ZT105: generic pub fns are not candidates" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54487,7 +55220,7 @@ test "ZT105: generic pub fns are not candidates" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_generic.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_generic.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54505,6 +55238,7 @@ test "ZT105: generic pub fns are not candidates" {
 }
 
 test "ZT105: type-factory pub fns are not candidates" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54519,7 +55253,7 @@ test "ZT105: type-factory pub fns are not candidates" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_factory.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_factory.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54533,6 +55267,7 @@ test "ZT105: type-factory pub fns are not candidates" {
 }
 
 test "ZT105: pub fn main is not a candidate" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54543,7 +55278,7 @@ test "ZT105: pub fn main is not a candidate" {
         \\pub fn main() void {}
         \\pub fn other_api() void {}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_main.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_main.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54557,6 +55292,7 @@ test "ZT105: pub fn main is not a candidate" {
 }
 
 test "ZT105: pub fn referenced as a value in a test is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54572,7 +55308,7 @@ test "ZT105: pub fn referenced as a value in a test is silent" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_valueref.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_valueref.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54586,6 +55322,7 @@ test "ZT105: pub fn referenced as a value in a test is silent" {
 }
 
 test "ZT105: pub fn exercised through a private helper is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54604,7 +55341,7 @@ test "ZT105: pub fn exercised through a private helper is silent" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_helper.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_helper.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54618,6 +55355,7 @@ test "ZT105: pub fn exercised through a private helper is silent" {
 }
 
 test "ZT105: re-export alias suppresses conservatively" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54630,7 +55368,7 @@ test "ZT105: re-export alias suppresses conservatively" {
         \\pub const public_fn = impl_fn;
         \\pub fn lonely_api() void {}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_alias.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_alias.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54644,6 +55382,7 @@ test "ZT105: re-export alias suppresses conservatively" {
 }
 
 test "ZT105: strings and comments are not evidence" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54665,7 +55404,7 @@ test "ZT105: strings and comments are not evidence" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt105_strings.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_strings.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54687,6 +55426,7 @@ test "ZT105: strings and comments are not evidence" {
 }
 
 test "ZT105: pub fn used only inside a test file is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54716,7 +55456,7 @@ test "ZT105: pub fn used only inside a test file is silent" {
             ,
         },
     };
-    var run = try runTestQualityCheckFiles(allocator, &files);
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -54735,11 +55475,12 @@ test "ZT105: pub fn used only inside a test file is silent" {
 
 /// Test helper: build a one-file graph and run the concurrency pipeline.
 fn runConcurrencyCheck(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -54768,6 +55509,7 @@ fn expectZC101Counts(
 }
 
 test "ZC101: lock with plain unlock is a note, not a warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54780,13 +55522,14 @@ test "ZC101: lock with plain unlock is a note, not a warning" {
         \\    mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_note.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_note.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 1);
 }
 
 test "ZC101: lock with no release at all is a warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54798,13 +55541,14 @@ test "ZC101: lock with no release at all is a warning" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_warn.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_warn.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 test "ZC101: lock with defer unlock is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54817,13 +55561,14 @@ test "ZC101: lock with defer unlock is silent" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_defer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_defer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: conditional and block-form defers count as coverage" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54845,13 +55590,14 @@ test "ZC101: conditional and block-form defers count as coverage" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_condefer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_condefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: tiny acquire wrapper is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54865,13 +55611,14 @@ test "ZC101: tiny acquire wrapper is silent" {
         \\}
         \\fn acquire_inline() void { mu.lock(); }
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_tiny.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_tiny.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: cross-fn acquire/release pair is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54888,13 +55635,14 @@ test "ZC101: cross-fn acquire/release pair is silent" {
         \\    pool.mutex.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_crossfn.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_crossfn.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: cross-fn release on a DIFFERENT receiver does not suppress" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54911,13 +55659,14 @@ test "ZC101: cross-fn release on a DIFFERENT receiver does not suppress" {
         \\    other.mutex.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_diffrecv.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_diffrecv.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 test "ZC101: 0.16 form lock(io) with defer unlock(io) is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54930,13 +55679,14 @@ test "ZC101: 0.16 form lock(io) with defer unlock(io) is silent" {
         \\    try doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_io.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_io.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: lockShared pairs with unlockShared, not plain unlock" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54959,13 +55709,14 @@ test "ZC101: lockShared pairs with unlockShared, not plain unlock" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_shared.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_shared.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 test "ZC101: semaphore wait/post is silent; WaitGroup wait is not an acquire" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -54984,13 +55735,14 @@ test "ZC101: semaphore wait/post is silent; WaitGroup wait is not an acquire" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_sem.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_sem.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: discarded tryLock result is not an acquire (file-lock idiom)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55005,13 +55757,14 @@ test "ZC101: discarded tryLock result is not an acquire (file-lock idiom)" {
         \\    try doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_discard.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_discard.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: strings and comments are neither acquires nor releases" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55030,13 +55783,14 @@ test "ZC101: strings and comments are neither acquires nor releases" {
         \\    // mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_strings.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_strings.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 test "ZC101: bare lock() calls and fn decls named lock are not acquires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55054,13 +55808,14 @@ test "ZC101: bare lock() calls and fn decls named lock are not acquires" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_bare.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_bare.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: errdefer unlock counts as deferred coverage" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55076,13 +55831,14 @@ test "ZC101: errdefer unlock counts as deferred coverage" {
         \\    mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_errdefer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_errdefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: each acquire is judged independently" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55097,13 +55853,14 @@ test "ZC101: each acquire is judged independently" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_two.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_two.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 test "ZC101: tryLock in an if-condition with defer inside is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55117,13 +55874,14 @@ test "ZC101: tryLock in an if-condition with defer inside is silent" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_trylock.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_trylock.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: acquires inside defer blocks are not evaluated" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55141,13 +55899,14 @@ test "ZC101: acquires inside defer blocks are not evaluated" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_deferblk.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_deferblk.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: lock calls inside test blocks are not attributed" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55161,13 +55920,14 @@ test "ZC101: lock calls inside test blocks are not attributed" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_test.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_test.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: failure-branch release with sibling unlock API is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55188,13 +55948,14 @@ test "ZC101: failure-branch release with sibling unlock API is silent" {
         \\    self.impl.mutex.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_branchapi.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_branchapi.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
 test "ZC101: lone branch-scoped release is a note (some paths leak)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55209,13 +55970,14 @@ test "ZC101: lone branch-scoped release is a note (some paths leak)" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_partial.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_partial.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 1);
 }
 
 test "ZC101: branch-scoped defer does not cover an outer-depth acquire" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55247,13 +56009,14 @@ test "ZC101: branch-scoped defer does not cover an outer-depth acquire" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_branchdefer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_branchdefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 test "ZC101: waitUncancelable is a semaphore acquire (0.16 Io.Semaphore)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55273,7 +56036,7 @@ test "ZC101: waitUncancelable is a semaphore acquire (0.16 Io.Semaphore)" {
         \\    sem2.post(io);
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc101_waitunc.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_waitunc.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 1);
@@ -55350,6 +56113,7 @@ fn expectZC102Counts(
 }
 
 test "ZC102: lock twice on the same receiver is a warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55362,13 +56126,14 @@ test "ZC102: lock twice on the same receiver is a warning" {
         \\    mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_warn.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_warn.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
 test "ZC102: lock;unlock;lock is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55380,13 +56145,14 @@ test "ZC102: lock;unlock;lock is silent" {
         \\    mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_relock.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_relock.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: acquires in sibling if/else arms are disjoint paths" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55405,13 +56171,14 @@ test "ZC102: acquires in sibling if/else arms are disjoint paths" {
         \\    mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_arms.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_arms.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: switch prong blocks are disjoint paths" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55431,13 +56198,14 @@ test "ZC102: switch prong blocks are disjoint paths" {
         \\    mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_switch.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_switch.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: lock;defer unlock;lock warns — the defer runs at scope exit" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55451,13 +56219,14 @@ test "ZC102: lock;defer unlock;lock warns — the defer runs at scope exit" {
         \\    mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_defer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_defer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
 test "ZC102: loop-body defer releases at each iteration's scope exit" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55474,13 +56243,14 @@ test "ZC102: loop-body defer releases at each iteration's scope exit" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_loopdefer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_loopdefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: tryLock guard-block defer covers the acquired paths" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55498,13 +56268,14 @@ test "ZC102: tryLock guard-block defer covers the acquired paths" {
         \\    mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_guarddefer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_guarddefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: branch-scoped defer leaves the non-branch path held" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55520,13 +56291,14 @@ test "ZC102: branch-scoped defer leaves the non-branch path held" {
         \\    mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_branchdefer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_branchdefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
 test "ZC102: sequential if-blocks holding the lock warn (paths overlap)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55543,13 +56315,14 @@ test "ZC102: sequential if-blocks holding the lock warn (paths overlap)" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_seqif.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_seqif.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
 test "ZC102: arm ends when the else chain ends — later if warns (F2)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55570,13 +56343,14 @@ test "ZC102: arm ends when the else chain ends — later if warns (F2)" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_armend.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_armend.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
 test "ZC102: arm ends after the last switch prong — later if warns (F2)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55600,13 +56374,14 @@ test "ZC102: arm ends after the last switch prong — later if warns (F2)" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_prongend.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_prongend.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
 test "ZC102: acquire-less middle prong does not break the arm chain (F2)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55630,13 +56405,14 @@ test "ZC102: acquire-less middle prong does not break the arm chain (F2)" {
         \\    mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_midprong.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_midprong.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: branch-scoped plain release leaves the non-branch path held (F4)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55653,13 +56429,14 @@ test "ZC102: branch-scoped plain release leaves the non-branch path held (F4)" {
         \\    mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_branchrel.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_branchrel.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
 test "ZC102: different receivers never interact" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55670,13 +56447,14 @@ test "ZC102: different receivers never interact" {
         \\    b.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_diff.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_diff.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: double lockShared is a note (recursive read lock)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55691,13 +56469,14 @@ test "ZC102: double lockShared is a note (recursive read lock)" {
         \\    rw.lockShared();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_shared.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_shared.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 1);
 }
 
 test "ZC102: tryLock as second acquire cannot block — silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55713,13 +56492,14 @@ test "ZC102: tryLock as second acquire cannot block — silent" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_try.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_try.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: semaphore wait twice is legal (counting semaphore)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55737,13 +56517,14 @@ test "ZC102: semaphore wait twice is legal (counting semaphore)" {
         \\    sem.post();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_sem.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_sem.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: lock() text in strings and comments is not an acquire" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55761,13 +56542,14 @@ test "ZC102: lock() text in strings and comments is not an acquire" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_strings.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_strings.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: type-factory method wrappers are independent fns (mach Objects)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55792,13 +56574,14 @@ test "ZC102: type-factory method wrappers are independent fns (mach Objects)" {
         \\    };
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_factory.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_factory.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 
 test "ZC102: double lock inside one nested method still warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55815,7 +56598,7 @@ test "ZC102: double lock inside one nested method still warns" {
         \\    };
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc102_nested.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_nested.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
@@ -55843,6 +56626,7 @@ fn expectZC103Counts(
 }
 
 test "ZC103: bare unlock with no acquire anywhere is a note" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55852,13 +56636,14 @@ test "ZC103: bare unlock with no acquire anywhere is a note" {
         \\    mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_note.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_note.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 1);
 }
 
 test "ZC103: cross-fn acquire/release idiom is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55873,13 +56658,14 @@ test "ZC103: cross-fn acquire/release idiom is silent" {
         \\    mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_crossfn.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_crossfn.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
 test "ZC103: fn-scope defer unlock after conditional tryLock is a warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55895,13 +56681,14 @@ test "ZC103: fn-scope defer unlock after conditional tryLock is a warning" {
         \\    defer mu.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_trydefer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_trydefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 1, 0);
 }
 
 test "ZC103: defer inside the tryLock guard block is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55917,13 +56704,14 @@ test "ZC103: defer inside the tryLock guard block is silent" {
         \\    }
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_tryguard.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_tryguard.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
 test "ZC103: normal lock with defer unlock is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55936,13 +56724,14 @@ test "ZC103: normal lock with defer unlock is silent" {
         \\    doWork();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_normal.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_normal.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
 test "ZC103: defer registered before the acquire is silent (fires at exit)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55956,13 +56745,14 @@ test "ZC103: defer registered before the acquire is silent (fires at exit)" {
         \\    mu.lock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_deferfirst.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_deferfirst.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
 test "ZC103: semaphore post without in-fn wait is the producer shape" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55974,13 +56764,14 @@ test "ZC103: semaphore post without in-fn wait is the producer shape" {
         \\    sem.post();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_producer.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_producer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
 test "ZC103: unlock with deferred re-lock is the borrow idiom" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -55997,13 +56788,14 @@ test "ZC103: unlock with deferred re-lock is the borrow idiom" {
         \\    slowPush();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_relock.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_relock.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);
 }
 
 test "ZC103: discarded tryLock satisfies the deferred unlock" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56017,7 +56809,7 @@ test "ZC103: discarded tryLock satisfies the deferred unlock" {
         \\    defer file.unlock();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc103_discard.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_discard.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);
@@ -56045,6 +56837,7 @@ fn expectZC104Counts(
 }
 
 test "ZC104: spawn with no join or detach is a warning" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56058,13 +56851,14 @@ test "ZC104: spawn with no join or detach is a warning" {
         \\    _ = t;
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_warn.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_warn.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 1, 0);
 }
 
 test "ZC104: immediate detach is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56077,13 +56871,14 @@ test "ZC104: immediate detach is silent" {
         \\    thread.detach();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_detach.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_detach.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: join later in the function is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56097,13 +56892,14 @@ test "ZC104: join later in the function is silent" {
         \\    t.join();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_join.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_join.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: field-stored handle joined elsewhere in the file is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56119,13 +56915,14 @@ test "ZC104: field-stored handle joined elsewhere in the file is silent" {
         \\    self.t.join();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_field.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_field.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: returned handle is silent (caller owns the obligation)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56137,13 +56934,14 @@ test "ZC104: returned handle is silent (caller owns the obligation)" {
         \\    return try std.Thread.spawn(.{}, work, .{});
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_return.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_return.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: spawn passed as a call argument is silent (ownership transfer)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56156,13 +56954,14 @@ test "ZC104: spawn passed as a call argument is silent (ownership transfer)" {
         \\    try pool.put(try std.Thread.spawn(.{}, work, .{}));
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_arg.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_arg.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: process spawn is not a thread spawn (child.spawn)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56178,13 +56977,14 @@ test "ZC104: process spawn is not a thread spawn (child.spawn)" {
         \\    thread.detach();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_proc.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_proc.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: spawns inside test blocks are not attributed" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56197,13 +56997,14 @@ test "ZC104: spawns inside test blocks are not attributed" {
         \\    _ = t;
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_test.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_test.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: join text in strings and comments is not evidence" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56220,13 +57021,14 @@ test "ZC104: join text in strings and comments is not evidence" {
         \\    _ = t;
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_strings.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_strings.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 1, 0);
 }
 
 test "ZC104: field handle joined through an alias copy is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56245,13 +57047,14 @@ test "ZC104: field handle joined through an alias copy is silent" {
         \\    self.signal.stop();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_alias.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_alias.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: field-stored handle never joined still warns" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56267,13 +57070,14 @@ test "ZC104: field-stored handle never joined still warns" {
         \\    self.running = false;
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_fieldwarn.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_fieldwarn.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 1, 0);
 }
 
 test "ZC104: optional handle joined with .?.join() is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56290,13 +57094,14 @@ test "ZC104: optional handle joined with .?.join() is silent" {
         \\    if (worker.spawned) worker.thread.?.join();
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_optjoin.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_optjoin.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
 }
 
 test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56312,7 +57117,7 @@ test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
         \\    };
         \\}
     ;
-    var run = try runConcurrencyCheck(allocator, "zc104_litfield.zig", content);
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_litfield.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
@@ -56324,11 +57129,12 @@ test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
 
 /// Test helper: build a one-file graph and run the errors pipeline.
 fn runErrorsCheck(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -56339,6 +57145,7 @@ fn runErrorsCheck(
 }
 
 test "ZA110: plain ownership-transfer idiom is silent (established pattern)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56353,7 +57160,7 @@ test "ZA110: plain ownership-transfer idiom is silent (established pattern)" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_basic.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_basic.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56363,6 +57170,7 @@ test "ZA110: plain ownership-transfer idiom is silent (established pattern)" {
 }
 
 test "ZA110: error-union form with armed defer fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56376,7 +57184,7 @@ test "ZA110: error-union form with armed defer fires" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_errunion.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_errunion.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56386,6 +57194,7 @@ test "ZA110: error-union form with armed defer fires" {
 }
 
 test "ZA110: errdefer deinit is silent (never runs on success path)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56399,7 +57208,7 @@ test "ZA110: errdefer deinit is silent (never runs on success path)" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_errdefer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_errdefer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56409,6 +57218,7 @@ test "ZA110: errdefer deinit is silent (never runs on success path)" {
 }
 
 test "ZA110: conditional defer deinit still fires (armed on some path)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56421,7 +57231,7 @@ test "ZA110: conditional defer deinit still fires (armed on some path)" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_conddefer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_conddefer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56431,6 +57241,7 @@ test "ZA110: conditional defer deinit still fires (armed on some path)" {
 }
 
 test "ZA110: trailing-comment defer text is not an armed defer (F1)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56445,7 +57256,7 @@ test "ZA110: trailing-comment defer text is not an armed defer (F1)" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_commentdefer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_commentdefer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56455,6 +57266,7 @@ test "ZA110: trailing-comment defer text is not an armed defer (F1)" {
 }
 
 test "ZA110: same-line errdefer is not an armed defer (F2)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56469,7 +57281,7 @@ test "ZA110: same-line errdefer is not an armed defer (F2)" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_samelineerrdefer.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_samelineerrdefer.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56479,6 +57291,7 @@ test "ZA110: same-line errdefer is not an armed defer (F2)" {
 }
 
 test "ZA110: deferred deinit makes the by-value return a certain dangle" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56491,7 +57304,7 @@ test "ZA110: deferred deinit makes the by-value return a certain dangle" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_dangle.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_dangle.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56501,6 +57314,7 @@ test "ZA110: deferred deinit makes the by-value return a certain dangle" {
 }
 
 test "ZA110: moveToOwnedSlice return is silent (slice, single owner)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56512,7 +57326,7 @@ test "ZA110: moveToOwnedSlice return is silent (slice, single owner)" {
         \\    return list.moveToOwnedSlice();
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_slice.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_slice.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56522,6 +57336,7 @@ test "ZA110: moveToOwnedSlice return is silent (slice, single owner)" {
 }
 
 test "ZA110: empty-init expression return is silent (no aliasing)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56532,7 +57347,7 @@ test "ZA110: empty-init expression return is silent (no aliasing)" {
         \\    return .init(a);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_initexpr.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_initexpr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56542,6 +57357,7 @@ test "ZA110: empty-init expression return is silent (no aliasing)" {
 }
 
 test "ZA110: pointer return type is silent (not a by-value copy)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56552,7 +57368,7 @@ test "ZA110: pointer return type is silent (not a by-value copy)" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_ptr.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_ptr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56562,6 +57378,7 @@ test "ZA110: pointer return type is silent (not a by-value copy)" {
 }
 
 test "ZA110: field of a local with armed defer fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56575,7 +57392,7 @@ test "ZA110: field of a local with armed defer fires" {
         \\    return w.list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_field.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_field.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56585,6 +57402,7 @@ test "ZA110: field of a local with armed defer fires" {
 }
 
 test "ZA110: self field return is silent (receiver owned by caller)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56598,7 +57416,7 @@ test "ZA110: self field return is silent (receiver owned by caller)" {
         \\    }
         \\};
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_selffield.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_selffield.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56608,6 +57426,7 @@ test "ZA110: self field return is silent (receiver owned by caller)" {
 }
 
 test "ZA110: inline-storage container (EnumSet) by value is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56622,7 +57441,7 @@ test "ZA110: inline-storage container (EnumSet) by value is silent" {
         \\    return s;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_enumset.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_enumset.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56632,6 +57451,7 @@ test "ZA110: inline-storage container (EnumSet) by value is silent" {
 }
 
 test "ZA110: multi-line signature with armed defer fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56646,7 +57466,7 @@ test "ZA110: multi-line signature with armed defer fires" {
         \\    return list;
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "za110_multiline.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_multiline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56660,6 +57480,7 @@ test "ZA110: multi-line signature with armed defer fires" {
 // ============================================================================
 
 test "ZA209: error-union fn that never fails fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56670,7 +57491,7 @@ test "ZA209: error-union fn that never fails fires" {
         \\    work();
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_basic.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_basic.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56680,6 +57501,7 @@ test "ZA209: error-union fn that never fails fires" {
 }
 
 test "ZA209: single-line body fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56688,7 +57510,7 @@ test "ZA209: single-line body fires" {
         \\fn work() void {}
         \\fn f() !void { work(); }
     ;
-    var run = try runErrorsCheck(allocator, "za209_oneline.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_oneline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56698,6 +57520,7 @@ test "ZA209: single-line body fires" {
 }
 
 test "ZA209: body with try is silent (real error path)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56710,7 +57533,7 @@ test "ZA209: body with try is silent (real error path)" {
         \\    try mayFail();
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_try.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_try.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56720,6 +57543,7 @@ test "ZA209: body with try is silent (real error path)" {
 }
 
 test "ZA209: body with return error is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56729,7 +57553,7 @@ test "ZA209: body with return error is silent" {
         \\    return error.Bogus;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_retErr.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_retErr.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56739,6 +57563,7 @@ test "ZA209: body with return error is silent" {
 }
 
 test "ZA209: non-error-union fn is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56749,7 +57574,7 @@ test "ZA209: non-error-union fn is silent" {
         \\    work();
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_plain.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_plain.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56759,6 +57584,7 @@ test "ZA209: non-error-union fn is silent" {
 }
 
 test "ZA209: catch-payload return propagation is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56771,7 +57597,7 @@ test "ZA209: catch-payload return propagation is silent" {
         \\    mayFail() catch |err| return err;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_catchret.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_catchret.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56781,6 +57607,7 @@ test "ZA209: catch-payload return propagation is silent" {
 }
 
 test "ZA209: multi-line catch block with payload return is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56797,7 +57624,7 @@ test "ZA209: multi-line catch block with payload return is silent" {
         \\    };
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_catchblock.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_catchblock.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56807,6 +57634,7 @@ test "ZA209: multi-line catch block with payload return is silent" {
 }
 
 test "ZA209: unreachable body is silent (assertion-style fn)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56816,7 +57644,7 @@ test "ZA209: unreachable body is silent (assertion-style fn)" {
         \\    unreachable;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_unreach.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_unreach.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56826,6 +57654,7 @@ test "ZA209: unreachable body is silent (assertion-style fn)" {
 }
 
 test "ZA209: unresolved call result return is silent (possible propagation)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56840,7 +57669,7 @@ test "ZA209: unresolved call result return is silent (possible propagation)" {
         \\    return g();
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_tailcall.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_tailcall.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56850,6 +57679,7 @@ test "ZA209: unresolved call result return is silent (possible propagation)" {
 }
 
 test "ZA209: multi-line signature with error-union return fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56863,7 +57693,7 @@ test "ZA209: multi-line signature with error-union return fires" {
         \\    work();
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_multiline.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_multiline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56873,6 +57703,7 @@ test "ZA209: multi-line signature with error-union return fires" {
 }
 
 test "ZA209: error-set member return is silent (return ErrSet.Member idiom)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56885,7 +57716,7 @@ test "ZA209: error-set member return is silent (return ErrSet.Member idiom)" {
         \\    if (c == 0) return ConnectorError.Timeout;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_errset.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_errset.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56895,6 +57726,7 @@ test "ZA209: error-set member return is silent (return ErrSet.Member idiom)" {
 }
 
 test "ZA209: namespaced error constant return is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56910,7 +57742,7 @@ test "ZA209: namespaced error constant return is silent" {
         \\    return Action.help_error;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_nsconst.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_nsconst.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56920,6 +57752,7 @@ test "ZA209: namespaced error constant return is silent" {
 }
 
 test "ZA209: interface shim with discards and constant return is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56934,7 +57767,7 @@ test "ZA209: interface shim with discards and constant return is silent" {
         \\    return .{};
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_shim.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_shim.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56944,6 +57777,7 @@ test "ZA209: interface shim with discards and constant return is silent" {
 }
 
 test "ZA209: single-line interface shim is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56955,7 +57789,7 @@ test "ZA209: single-line interface shim is silent" {
         \\}
         \\fn deinitShim(self: *T) !void { _ = self; }
     ;
-    var run = try runErrorsCheck(allocator, "za209_shim1.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_shim1.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56965,6 +57799,7 @@ test "ZA209: single-line interface shim is silent" {
 }
 
 test "ZA209: real infallible computation without discards still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -56981,7 +57816,7 @@ test "ZA209: real infallible computation without discards still fires" {
         \\    return version;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_parse.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_parse.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -56991,6 +57826,7 @@ test "ZA209: real infallible computation without discards still fires" {
 }
 
 test "ZA209: discards plus real call logic still fires (draw class)" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57011,7 +57847,7 @@ test "ZA209: discards plus real call logic still fires (draw class)" {
         \\    self.canvas.rect(y);
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_draw.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_draw.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -57021,6 +57857,7 @@ test "ZA209: discards plus real call logic still fires (draw class)" {
 }
 
 test "ZA209: discard of a call result is not a shim discard" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57033,7 +57870,7 @@ test "ZA209: discard of a call result is not a shim discard" {
         \\    _ = work();
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_calldisc.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_calldisc.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -57043,6 +57880,7 @@ test "ZA209: discard of a call result is not a shim discard" {
 }
 
 test "ZA209: discards with a computed return still fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57055,7 +57893,7 @@ test "ZA209: discards with a computed return still fires" {
         \\    return self.x;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za209_compret.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za209_compret.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -57091,6 +57929,7 @@ test "ZA210: try form produces no issue" {
 }
 
 test "ZA210: integration through analyzeErrors emits the note" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57101,7 +57940,7 @@ test "ZA210: integration through analyzeErrors emits the note" {
         \\    mayFail() catch |err| return err;
         \\}
     ;
-    var run = try runErrorsCheck(allocator, "za210_integ.zig", content);
+    var run = try runErrorsCheck(&diag, allocator, "za210_integ.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -57178,11 +58017,12 @@ fn testConfig() Config {
 
 /// Test helper: build a one-file graph and run analyzeIntCastGuards (ZA904).
 fn runIntCastTest(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator);
+    var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -57207,6 +58047,7 @@ test "ZA904: off via ZA9 prefix" {
 }
 
 test "ZA904: unguarded @intCast fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57216,7 +58057,7 @@ test "ZA904: unguarded @intCast fires" {
         \\    return @as(u8, @intCast(x));
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_cast.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_cast.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -57231,6 +58072,7 @@ test "ZA904: unguarded @intCast fires" {
 }
 
 test "ZA904: comparison guards stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57247,7 +58089,7 @@ test "ZA904: comparison guards stay silent" {
         \\    return @as(u8, @intCast(x));
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_guarded.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_guarded.zig", content);
     defer run.deinit(allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -57256,6 +58098,7 @@ test "ZA904: comparison guards stay silent" {
 }
 
 test "ZA904: @min clamp and std.math.cast stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57270,7 +58113,7 @@ test "ZA904: @min clamp and std.math.cast stay silent" {
         \\    return @as(u8, @intCast(x));
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_clamp.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_clamp.zig", content);
     defer run.deinit(allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -57279,6 +58122,7 @@ test "ZA904: @min clamp and std.math.cast stay silent" {
 }
 
 test "ZA904: comptime-known literals stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57294,7 +58138,7 @@ test "ZA904: comptime-known literals stay silent" {
         \\    return @as(u8, @intCast(x));
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_literal.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_literal.zig", content);
     defer run.deinit(allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -57303,6 +58147,7 @@ test "ZA904: comptime-known literals stay silent" {
 }
 
 test "ZA904: @truncate without proof fires with data-loss message" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57312,7 +58157,7 @@ test "ZA904: @truncate without proof fires with data-loss message" {
         \\    return @as(u8, @truncate(x));
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_trunc.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_trunc.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -57324,6 +58169,7 @@ test "ZA904: @truncate without proof fires with data-loss message" {
 }
 
 test "ZA904: string, comment, and expression forms stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57337,7 +58183,7 @@ test "ZA904: string, comment, and expression forms stay silent" {
         \\    return @as(u8, @intCast(x + 1));
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_forms.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_forms.zig", content);
     defer run.deinit(allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -57346,6 +58192,7 @@ test "ZA904: string, comment, and expression forms stay silent" {
 }
 
 test "ZA904: guard for a different variable does not suppress" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57358,7 +58205,7 @@ test "ZA904: guard for a different variable does not suppress" {
         \\    return 0;
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_other.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_other.zig", content);
     defer run.deinit(allocator);
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -57367,6 +58214,7 @@ test "ZA904: guard for a different variable does not suppress" {
 }
 
 test "ZA904: maxInt guard and testing.expect lines stay silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57381,7 +58229,7 @@ test "ZA904: maxInt guard and testing.expect lines stay silent" {
         \\    try testing.expectEqual(@as(u8, 3), @intCast(x));
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_maxint.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_maxint.zig", content);
     defer run.deinit(allocator);
     try std.testing.expectEqual(
         @as(usize, 0),
@@ -57390,6 +58238,7 @@ test "ZA904: maxInt guard and testing.expect lines stay silent" {
 }
 
 test "ZA904: range-for index casts stay silent, item casts still fire" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -57408,7 +58257,7 @@ test "ZA904: range-for index casts stay silent, item casts still fire" {
         \\    }
         \\}
     ;
-    var run = try runIntCastTest(allocator, "app_forloop.zig", content);
+    var run = try runIntCastTest(&diag, allocator, "app_forloop.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -57484,20 +58333,23 @@ test "FailOn.fromString round-trips and rejects garbage" {
 }
 
 test "config strict:true sets the warning gate" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
 }
 
 test "config strict:false leaves findings informational" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"strict\": false}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": false}", &cfg);
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
 }
 
 test "config fail_on parses the level" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"fail_on\": \"note\"}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"fail_on\": \"note\"}", &cfg);
     try std.testing.expectEqual(FailOn.note, cfg.fail_on);
 }
 
@@ -57507,33 +58359,37 @@ test "config error_naming defaults to TitleCase when absent" {
 }
 
 test "config error_naming parses snake_case" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"snake_case\"}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"snake_case\"}", &cfg);
     try std.testing.expectEqual(ErrorNaming.snake_case, cfg.error_naming);
 }
 
 test "config error_naming parses TitleCase and the PascalCase alias" {
+    var diag = testDiagCtx();
     var cfg_title = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"TitleCase\"}", &cfg_title);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"TitleCase\"}", &cfg_title);
     try std.testing.expectEqual(ErrorNaming.title_case, cfg_title.error_naming);
 
     var cfg_pascal = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"PascalCase\"}", &cfg_pascal);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"PascalCase\"}", &cfg_pascal);
     try std.testing.expectEqual(ErrorNaming.title_case, cfg_pascal.error_naming);
 }
 
 test "config error_naming unknown value warns and keeps the default" {
+    var diag = testDiagCtx();
     // Mute the warning print: zig's test runner surfaces stderr as failure.
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"error_naming\": \"kebab-case\"}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"kebab-case\"}", &cfg);
     try std.testing.expectEqual(ErrorNaming.title_case, cfg.error_naming);
 }
 
 test "config fail_on beats strict regardless of key order" {
+    var diag = testDiagCtx();
     var cfg_late = testConfig();
     try parseConfigJson(
+        &diag,
         std.testing.allocator,
         "{\"strict\": true, \"fail_on\": \"error\"}",
         &cfg_late,
@@ -57542,6 +58398,7 @@ test "config fail_on beats strict regardless of key order" {
 
     var cfg_early = testConfig();
     try parseConfigJson(
+        &diag,
         std.testing.allocator,
         "{\"fail_on\": \"error\", \"strict\": true}",
         &cfg_early,
@@ -57550,62 +58407,89 @@ test "config fail_on beats strict regardless of key order" {
 }
 
 test "config invalid fail_on is a hard usage error" {
-    // The parse stashes the rejected value in last_bad_fail_on; do not let
-    // it outlive the test (EPH-I0291 isolation).
-    defer last_bad_fail_on = null;
+    var diag = testDiagCtx();
     var cfg = testConfig();
     try std.testing.expectError(
         error.InvalidFailOnValue,
-        parseConfigJson(std.testing.allocator, "{\"fail_on\": \"warn\"}", &cfg),
+        parseConfigJson(&diag, std.testing.allocator, "{\"fail_on\": \"warn\"}", &cfg),
     );
     // fail closed: the rejected key must not leave a gate half-configured
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
     // error detail stashed so the catch-site can name path + value
-    try std.testing.expectEqualStrings("warn", last_bad_fail_on.?);
+    try std.testing.expectEqualStrings("warn", diag.last_bad_fail_on.?);
 }
 
 test "CLI --strict sets the warning gate" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
     var cli_entries = false;
-    try parseCliArg(std.testing.allocator, "--strict", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = std.testing.allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--strict");
     try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
 }
 
 test "CLI --fail-on overrides config strict" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
-    try parseCliArg(std.testing.allocator, "--fail-on=error", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = std.testing.allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--fail-on=error");
     try std.testing.expectEqual(FailOn.err, cfg.fail_on);
 }
 
 test "CLI --fail-on=never can override config strict off" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
-    try parseCliArg(std.testing.allocator, "--fail-on=never", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = std.testing.allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--fail-on=never");
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
 }
 
 test "CLI invalid --fail-on value is a hard usage error" {
+    var diag = testDiagCtx();
     // Mute the error print: zig's test runner surfaces child stderr as failure
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     var cli_entries = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = std.testing.allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
     try std.testing.expectError(
         error.InvalidFailOnValue,
-        parseCliArg(std.testing.allocator, "--fail-on=warn", &cfg, &cli_entries),
+        parseCliArg(cli_ctx, "--fail-on=warn"),
     );
     // fail closed: the rejected flag must not leave a gate half-configured
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
 }
 
 test "config fail_on:never beats strict in EITHER key order" {
+    var diag = testDiagCtx();
     // Regression: .never was both unset-sentinel and explicit level, so
     // key order changed the outcome (EPH-I0024 review bug 1)
     var cfg_a = testConfig();
     try parseConfigJson(
+        &diag,
         std.testing.allocator,
         "{\"strict\": true, \"fail_on\": \"never\"}",
         &cfg_a,
@@ -57614,6 +58498,7 @@ test "config fail_on:never beats strict in EITHER key order" {
 
     var cfg_b = testConfig();
     try parseConfigJson(
+        &diag,
         std.testing.allocator,
         "{\"fail_on\": \"never\", \"strict\": true}",
         &cfg_b,
@@ -57622,29 +58507,39 @@ test "config fail_on:never beats strict in EITHER key order" {
 }
 
 test "second config load (target dir) cannot clobber the CLI" {
+    var diag = testDiagCtx();
     // Regression: parse order was config → CLI → target-dir config, so a
     // target-dir "strict":true overrode CLI --fail-on=never (review bug 2)
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
-    try parseCliArg(std.testing.allocator, "--fail-on=never", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = std.testing.allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--fail-on=never");
     // Target-dir ephor.json loads AFTER CLI args in parseArgs
-    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
-    try parseConfigJson(std.testing.allocator, "{\"fail_on\": \"error\"}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"fail_on\": \"error\"}", &cfg);
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
 }
 
 test "target-dir config still applies when the CLI did not set the gate" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
-    try parseConfigJson(std.testing.allocator, "{}", &cfg);
-    try parseConfigJson(std.testing.allocator, "{\"strict\": true}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{}", &cfg);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
 }
 
 test "same source resolves last-wins" {
+    var diag = testDiagCtx();
     var cfg = testConfig();
     try parseConfigJson(
+        &diag,
         std.testing.allocator,
         "{\"fail_on\": \"error\", \"fail_on\": \"note\"}",
         &cfg,
@@ -57652,8 +58547,14 @@ test "same source resolves last-wins" {
     try std.testing.expectEqual(FailOn.note, cfg.fail_on);
 
     var cli_entries = false;
-    try parseCliArg(std.testing.allocator, "--strict", &cfg, &cli_entries);
-    try parseCliArg(std.testing.allocator, "--fail-on=error", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = std.testing.allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--strict");
+    try parseCliArg(cli_ctx, "--fail-on=error");
     try std.testing.expectEqual(FailOn.err, cfg.fail_on);
 }
 
@@ -57674,10 +58575,11 @@ fn writeTestConfig(dir_path: []const u8, content: []const u8) !void {
         .{ dir_path, CONFIG_FILENAME },
     );
     defer std.testing.allocator.free(config_path);
-    try Fs.cwd().writeFile(config_path, content, .{});
+    try Fs.cwd(std.testing.io).writeFile(config_path, content, .{});
 }
 
 test "truncated configs parse without panic (RED1-1)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     const inputs = [_][]const u8{
         "{\"strict",
@@ -57691,7 +58593,7 @@ test "truncated configs parse without panic (RED1-1)" {
     for (inputs) |content| {
         var cfg = testConfig();
         defer cfg.deinit(allocator);
-        try parseConfigJson(allocator, content, &cfg);
+        try parseConfigJson(&diag, allocator, content, &cfg);
         // A truncated-away value leaves gate and path at their defaults.
         try std.testing.expectEqual(FailOn.never, cfg.fail_on);
         try std.testing.expectEqualStrings("src", cfg.path);
@@ -57699,19 +58601,21 @@ test "truncated configs parse without panic (RED1-1)" {
 }
 
 test "truncated disable array keeps its partial entries" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(allocator, "{\"disable\": [\"ZA", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"disable\": [\"ZA", &cfg);
     try std.testing.expectEqual(@as(usize, 1), cfg.disabled_rules.items.len);
     try std.testing.expectEqualStrings("ZA", cfg.disabled_rules.items[0]);
 }
 
 test "config strings scan escaped quotes span-correctly (RED1-9)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(allocator, "{\"entries\": [\"a\\\"b.zig\", \"c.zig\"]}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"entries\": [\"a\\\"b.zig\", \"c.zig\"]}", &cfg);
     try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
     try std.testing.expectEqualStrings("a\\\"b.zig", cfg.entries.items[0]);
     try std.testing.expectEqualStrings("c.zig", cfg.entries.items[1]);
@@ -57733,7 +58637,8 @@ test "isPathAncestorOrEqual accepts trailing-separator root forms" {
 }
 
 test "isWithinScanRoot rejects sibling-prefix paths (RED4-3)" {
-    var g = ImportGraph.init(std.testing.allocator);
+    var diag = testDiagCtx();
+    var g = ImportGraph.init(std.testing.allocator, &diag);
     defer g.deinit();
     g.scan_root = "/tmp/repo";
     try std.testing.expect(!g.isWithinScanRoot("/tmp/repo-evil/x.zig"));
@@ -57832,22 +58737,17 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
 }
 
 test "config trust: cwd and ancestors trusted, descendants untrusted" {
-    global_io = std.testing.io;
-    defer global_io = null;
-    try std.testing.expect(isConfigDirTrusted("."));
-    try std.testing.expect(!isConfigDirTrusted("src"));
+    try std.testing.expect(isConfigDirTrusted(std.testing.io, "."));
+    try std.testing.expect(!isConfigDirTrusted(std.testing.io, "src"));
     // The working directory's parent is an ancestor, hence trusted.
     var buf: [Fs.max_path_bytes]u8 = undefined;
-    const cwd = try Fs.cwd().realpath(".", &buf);
+    const cwd = try Fs.cwd(std.testing.io).realpath(".", &buf);
     const parent = std.fs.path.dirname(cwd) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(isConfigDirTrusted(parent));
+    try std.testing.expect(isConfigDirTrusted(std.testing.io, parent));
 }
 
 test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -57869,10 +58769,8 @@ test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)
     defer cfg.deinit(allocator);
     // Production shape: cfg.path IS the target dir (the containment root).
     try setOwnedPath(allocator, &cfg, dir_path);
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
-    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
+    diag.cli_diagnostics_enabled = false;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
 
     // Suppression and CI-gate keys are ignored...
     try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
@@ -57881,17 +58779,18 @@ test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)
     try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
     try std.testing.expectEqual(ErrorNaming.title_case, cfg.error_naming);
     // ...with exactly one note for the whole file...
-    try std.testing.expectEqual(@as(usize, 1), untrusted_config_note_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_config_note_count);
     // ...while analysis keys stay honored (entries made absolute).
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expect(mem.startsWith(u8, cfg.entries.items[0], dir_path));
 }
 
 test "trusted config keeps full control of suppression and gates" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(allocator, "{\"disable\": [\"Z\"], \"fail_on\": \"never\"}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"disable\": [\"Z\"], \"fail_on\": \"never\"}", &cfg);
     try std.testing.expectEqual(@as(usize, 1), cfg.disabled_rules.items.len);
     try std.testing.expectEqualStrings("Z", cfg.disabled_rules.items[0]);
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
@@ -57899,10 +58798,7 @@ test "trusted config keeps full control of suppression and gates" {
 }
 
 test "untrusted target fail_on:never cannot lower a trusted gate (RED3-4)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -57912,41 +58808,50 @@ test "untrusted target fail_on:never cannot lower a trusted gate (RED3-4)" {
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     // The victim's own (trusted) config arms the gate first.
-    try parseConfigJson(allocator, "{\"strict\": true}", &cfg);
-    try loadConfigFromTargetPath(allocator, &cfg, dir_path);
+    try parseConfigJson(&diag, allocator, "{\"strict\": true}", &cfg);
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, dir_path);
     try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
-    try std.testing.expectEqual(@as(usize, 1), untrusted_config_note_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_config_note_count);
 }
 
 test "CLI --trust-target-config sets the trust flag" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
     try std.testing.expect(!cfg.trust_target_config);
-    try parseCliArg(allocator, "--trust-target-config", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--trust-target-config");
     try std.testing.expect(cfg.trust_target_config);
 }
 
 test "CLI --force sets force_upgrade" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
     try std.testing.expect(!cfg.force_upgrade);
-    try parseCliArg(allocator, "--force", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--force");
     try std.testing.expect(cfg.force_upgrade);
 }
 
 test "--trust-target-config honors a target config in full" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -57957,25 +58862,20 @@ test "--trust-target-config honors a target config in full" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     cfg.trust_target_config = true;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
-    try loadConfigFromTargetPath(allocator, &cfg, dir_path);
+    diag.cli_diagnostics_enabled = false;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, dir_path);
     try std.testing.expectEqual(@as(usize, 1), cfg.disabled_rules.items.len);
     try std.testing.expectEqualStrings("Z", cfg.disabled_rules.items[0]);
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
-    try std.testing.expectEqual(@as(usize, 0), untrusted_config_note_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.untrusted_config_note_count);
 }
 
 test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // Layout: <tmp>/root is the scan root (ephor.json + inside.zig);
     // <tmp>/outside.zig is the traversal target one level up. The config
     // carries one entry per attack shape: inside (survives), absolute
     // outside, ".." traversal outside, and nonexistent (fail closed).
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -57998,10 +58898,8 @@ test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, root_path);
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
-    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
+    diag.cli_diagnostics_enabled = false;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
 
     // Only the inside entry survives, made absolute (pre-fix: all 4 do).
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
@@ -58009,19 +58907,16 @@ test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
     defer allocator.free(want_entry);
     try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
     // 3 drops from one file produce exactly one note (per-file semantics).
-    try std.testing.expectEqual(@as(usize, 3), entries_reject_count);
-    try std.testing.expectEqual(@as(usize, 1), entries_reject_note_count);
+    try std.testing.expectEqual(@as(usize, 3), diag.entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
     // No suppression keys in the fixture: that note must not fire.
-    try std.testing.expectEqual(@as(usize, 0), untrusted_config_note_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.untrusted_config_note_count);
 }
 
 test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // Operator intent: a config the trust model accepts may point entries
     // outside the scan root for orphan completeness (RED4-3).
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58041,22 +58936,19 @@ test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
     cfg.trust_target_config = true;
     try setOwnedPath(allocator, &cfg, root_path);
 
-    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
 
     try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
     try std.testing.expectEqualStrings("/etc/passwd", cfg.entries.items[1]);
-    try std.testing.expectEqual(@as(usize, 0), entries_reject_count);
-    try std.testing.expectEqual(@as(usize, 0), entries_reject_note_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_note_count);
 }
 
 test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // The scanned tree's own build.zig is attacker content: a .path("..")
     // entry must not steer reads outside the root, an in-tree entry must
     // pass untouched.
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58084,18 +58976,16 @@ test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, root_path);
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
-    try detectTargetEntries(allocator, &cfg);
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     const want_entry = try std.fmt.allocPrint(allocator, "{s}/inside.zig", .{root_path});
     defer allocator.free(want_entry);
     try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
     // 1 drop from the extraction run produces exactly one note.
-    try std.testing.expectEqual(@as(usize, 1), entries_reject_count);
-    try std.testing.expectEqual(@as(usize, 1), entries_reject_note_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
 }
 
 /// Build the OOM-sweep fixture Config: one gate-rejecting absolute entry
@@ -58118,18 +59008,27 @@ fn buildEntriesSweepConfig(allocator: Allocator, root_path: []const u8) !Config 
 /// One OOM-sweep iteration: run makeEntriesAbsolute under an allocator
 /// that fails on its fail_at-th inner allocation (fail_at == inner_allocs
 /// induces no failure), then prove deinit releases every byte exactly once.
-fn runEntriesSweepIteration(root_path: []const u8, fail_at: usize, inner_allocs: usize) !void {
+fn runEntriesSweepIteration(
+    diag: *DiagCtx,
+    root_path: []const u8,
+    fail_at: usize,
+    inner_allocs: usize,
+) !void {
     const parent = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(parent, .{});
     var cfg = try buildEntriesSweepConfig(failing.allocator(), root_path);
     failing.fail_index = failing.allocations + fail_at;
-    entries_reject_count = 0;
+    diag.entries_reject_count = 0;
     const roots: EntriesRoots = .{ .base = root_path, .scan_root = root_path };
     if (fail_at == inner_allocs) {
         // No induced failure: the gate must still land once phase 1
         // completes — the outside-root entry drops, the rest survive
         // absolutized.
-        const dropped = try makeEntriesAbsolute(failing.allocator(), &cfg, roots, false);
+        const dropped = try makeEntriesAbsolute(
+            .{ .diag = diag, .allocator = failing.allocator(), .cfg = &cfg },
+            roots,
+            false,
+        );
         try std.testing.expectEqual(@as(usize, 1), dropped);
         try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
         const want_b = try std.fmt.allocPrint(parent, "{s}/b.zig", .{root_path});
@@ -58138,11 +59037,10 @@ fn runEntriesSweepIteration(root_path: []const u8, fail_at: usize, inner_allocs:
         defer parent.free(want_c);
         try std.testing.expectEqualStrings(want_b, cfg.entries.items[0]);
         try std.testing.expectEqualStrings(want_c, cfg.entries.items[1]);
-        try std.testing.expectEqual(@as(usize, 1), entries_reject_count);
+        try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_count);
     } else {
         try std.testing.expectError(error.OutOfMemory, makeEntriesAbsolute(
-            failing.allocator(),
-            &cfg,
+            .{ .diag = diag, .allocator = failing.allocator(), .cfg = &cfg },
             roots,
             false,
         ));
@@ -58154,15 +59052,12 @@ fn runEntriesSweepIteration(root_path: []const u8, fail_at: usize, inner_allocs:
 }
 
 test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // Reviewer r1 trace: entries ["/etc/passwd", "b.zig", "c.zig"],
     // untrusted, allocPrint failing on a relative entry. The pre-fix fused
     // loop freed the rejected "/etc/passwd" and unwound with its stale
     // slot still inside len, so Config.deinit freed it a second time.
     // Pre-fix this test panics at fail_at == 0 on that double-free.
-    global_io = std.testing.io;
-    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58186,44 +59081,53 @@ test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
     var probe_cfg = try buildEntriesSweepConfig(probe.allocator(), root_path);
     const probe_base = probe.allocations;
     const probe_roots: EntriesRoots = .{ .base = root_path, .scan_root = root_path };
-    _ = try makeEntriesAbsolute(probe.allocator(), &probe_cfg, probe_roots, false);
+    _ = try makeEntriesAbsolute(
+        .{ .diag = &diag, .allocator = probe.allocator(), .cfg = &probe_cfg },
+        probe_roots,
+        false,
+    );
     probe_cfg.deinit(probe.allocator());
     const inner_allocs = probe.allocations - probe_base;
 
     var fail_at: usize = 0;
     while (fail_at <= inner_allocs) : (fail_at += 1) {
-        try runEntriesSweepIteration(root_path, fail_at, inner_allocs);
+        try runEntriesSweepIteration(&diag, root_path, fail_at, inner_allocs);
     }
 }
 
 /// One EPH-I0689 sweep iteration: run loadConfigFromTargetPath under an
 /// allocator that fails on its fail_at-th allocation (fail_at == total
 /// induces none), then prove deinit releases every byte exactly once.
-fn runConfigLoadSweepIteration(root_path: []const u8, fail_at: usize, total: usize) !void {
+fn runConfigLoadSweepIteration(
+    diag: *DiagCtx,
+    root_path: []const u8,
+    fail_at: usize,
+    total: usize,
+) !void {
     const parent = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(parent, .{});
     var cfg = testConfig();
     try setOwnedPath(failing.allocator(), &cfg, root_path);
     failing.fail_index = failing.allocations + fail_at;
-    entries_reject_count = 0;
-    entries_reject_note_count = 0;
+    diag.entries_reject_count = 0;
+    diag.entries_reject_note_count = 0;
     if (fail_at == total) {
         // No induced failure: the load commits saved_path, absolutizes the
         // surviving entry, and drops the unresolvable one with one note.
-        try loadConfigFromTargetPath(failing.allocator(), &cfg, root_path);
+        try loadConfigFromTargetPath(diag, failing.allocator(), &cfg, root_path);
         try std.testing.expectEqualStrings(root_path, cfg.path);
         try std.testing.expect(cfg.path_owned);
         try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
         const want_entry = try std.fmt.allocPrint(parent, "{s}/inside.zig", .{root_path});
         defer parent.free(want_entry);
         try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
-        try std.testing.expectEqual(@as(usize, 1), entries_reject_count);
-        try std.testing.expectEqual(@as(usize, 1), entries_reject_note_count);
+        try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_count);
+        try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
     } else {
         // A readFileAlloc OOM reads as "no config" (catch return false), so
         // the sweep tolerates a clean return here as well as OutOfMemory.
         // Both outcomes must stay byte-balanced below.
-        loadConfigFromTargetPath(failing.allocator(), &cfg, root_path) catch |err| {
+        loadConfigFromTargetPath(diag, failing.allocator(), &cfg, root_path) catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
         };
     }
@@ -58234,15 +59138,12 @@ fn runConfigLoadSweepIteration(root_path: []const u8, fail_at: usize, total: usi
 }
 
 test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I0689)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // Regression: tryLoadConfigFromDir consumed saved_path (path_owned =
     // true) BEFORE makeEntriesAbsolute's fallible absolutize, so an OOM
     // there freed saved_path through the caller's errdefer and again
     // through Config.deinit. Pre-fix this test panics on that double-free
     // at the first phase-1 allocPrint index.
-    global_io = std.testing.io;
-    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58259,22 +59160,20 @@ test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I068
     // unresolvable entry (drops, so the rejection note also allocates).
     try writeTestConfig(root_path, "{\"entries\": [\"inside.zig\", \"ghost.zig\"]}");
 
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     // Measure the allocation count inside loadConfigFromTargetPath so the
     // sweep covers every induced failure point plus one no-failure run.
     var probe = std.testing.FailingAllocator.init(parent, .{});
     var probe_cfg = testConfig();
     try setOwnedPath(probe.allocator(), &probe_cfg, root_path);
     const probe_base = probe.allocations;
-    try loadConfigFromTargetPath(probe.allocator(), &probe_cfg, root_path);
+    try loadConfigFromTargetPath(&diag, probe.allocator(), &probe_cfg, root_path);
     probe_cfg.deinit(probe.allocator());
     const total = probe.allocations - probe_base;
 
     var fail_at: usize = 0;
     while (fail_at <= total) : (fail_at += 1) {
-        try runConfigLoadSweepIteration(root_path, fail_at, total);
+        try runConfigLoadSweepIteration(&diag, root_path, fail_at, total);
     }
 }
 
@@ -58286,15 +59185,15 @@ test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I068
 /// aliased buffer and the parent fallback committed the parent config.
 /// Pre-fix the fallback's dirname(target_path) read the freed bytes, so the
 /// parent config was missed and cfg.path stayed at the path_dir value.
-fn runParentFallbackSweepIteration(root_path: []const u8, fail_at: usize) !void {
+fn runParentFallbackSweepIteration(diag: *DiagCtx, root_path: []const u8, fail_at: usize) !void {
     const parent = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(parent, .{});
     var cfg = testConfig();
     try setOwnedPath(failing.allocator(), &cfg, root_path);
     failing.fail_index = failing.allocations + fail_at;
-    entries_reject_count = 0;
-    entries_reject_note_count = 0;
-    if (loadConfigFromTargetPath(failing.allocator(), &cfg, cfg.path)) {
+    diag.entries_reject_count = 0;
+    diag.entries_reject_note_count = 0;
+    if (loadConfigFromTargetPath(diag, failing.allocator(), &cfg, cfg.path)) {
         try std.testing.expectEqualStrings(root_path, cfg.path);
         try std.testing.expect(cfg.path_owned);
     } else |err| {
@@ -58307,8 +59206,7 @@ fn runParentFallbackSweepIteration(root_path: []const u8, fail_at: usize) !void 
 }
 
 test "loadConfigFromTargetPath parent fallback never reads freed target_path (EPH-I0763)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // Regression: the target config below applies path_dir (setOwnedPath
     // frees the cfg.path buffer that target_path aliases) and then fails
     // non-fatally under an induced OOM at the entries key. Pre-fix the
@@ -58316,8 +59214,6 @@ test "loadConfigFromTargetPath parent fallback never reads freed target_path (EP
     // buffer; the poisoned bytes hold no '/', so dirname returned null and
     // the fallback was skipped, leaving cfg.path at "sub". The sweep
     // asserts every clean return commits back to the target dir.
-    global_io = std.testing.io;
-    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58329,30 +59225,27 @@ test "loadConfigFromTargetPath parent fallback never reads freed target_path (EP
     try writeTestConfig(root_path, "{\"path_dir\": \"sub\", \"entries\": [\"x.zig\"]}");
     try writeTestConfig(tmp_path, "{}");
 
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     // Measure the allocation count inside loadConfigFromTargetPath so the
     // sweep covers every induced failure point plus one no-failure run.
     var probe = std.testing.FailingAllocator.init(parent, .{});
     var probe_cfg = testConfig();
     try setOwnedPath(probe.allocator(), &probe_cfg, root_path);
     const probe_base = probe.allocations;
-    try loadConfigFromTargetPath(probe.allocator(), &probe_cfg, probe_cfg.path);
+    try loadConfigFromTargetPath(&diag, probe.allocator(), &probe_cfg, probe_cfg.path);
     probe_cfg.deinit(probe.allocator());
     const total = probe.allocations - probe_base;
 
     var fail_at: usize = 0;
     while (fail_at <= total) : (fail_at += 1) {
-        try runParentFallbackSweepIteration(root_path, fail_at);
+        try runParentFallbackSweepIteration(&diag, root_path, fail_at);
     }
 }
 
 test "loadConfigFromTargetPath without a config frees saved_path once (EPH-I0689)" {
+    var diag = testDiagCtx();
     // No ephor.json in the target or its parent: saved_path is never
     // consumed, so the loader frees it exactly once on the not-found path.
-    global_io = std.testing.io;
-    defer global_io = null;
     const parent = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58365,7 +59258,7 @@ test "loadConfigFromTargetPath without a config frees saved_path once (EPH-I0689
     var failing = std.testing.FailingAllocator.init(parent, .{});
     var cfg = testConfig();
     try setOwnedPath(failing.allocator(), &cfg, root_path);
-    try loadConfigFromTargetPath(failing.allocator(), &cfg, root_path);
+    try loadConfigFromTargetPath(&diag, failing.allocator(), &cfg, root_path);
     try std.testing.expectEqualStrings(root_path, cfg.path);
     try std.testing.expect(cfg.path_owned);
     try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
@@ -58374,21 +59267,23 @@ test "loadConfigFromTargetPath without a config frees saved_path once (EPH-I0689
 }
 
 test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var ignored_any = false;
-    try parseConfigJsonSource(
-        allocator,
-        "{\"disable\": [\"x]y\"], \"entries\": [\"e.zig\"]}",
-        &cfg,
-        .{
+    try parseConfigJsonSource(.{
+        .diag = &diag,
+        .allocator = allocator,
+        .content = "{\"disable\": [\"x]y\"], \"entries\": [\"e.zig\"]}",
+        .cfg = &cfg,
+        .source = .{
             .trusted = false,
             .path = "test",
             .dir = ".",
             .ignored_any = &ignored_any,
         },
-    );
+    });
     try std.testing.expect(ignored_any);
     try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
     // The key after the skipped array still parses (no desync).
@@ -58397,61 +59292,52 @@ test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)
 }
 
 test "config path_dir outside the config directory is rejected (RED4-1)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // Assumes tests run from the project root: ".." and "/" resolve outside
     // it, while "src" resolves inside it.
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(allocator, "{\"path_dir\": \"..\"}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"..\"}", &cfg);
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(!cfg.path_owned);
 
-    try parseConfigJson(allocator, "{\"path_dir\": \"/\"}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"/\"}", &cfg);
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(!cfg.path_owned);
-    try std.testing.expectEqual(@as(usize, 2), path_dir_reject_count);
+    try std.testing.expectEqual(@as(usize, 2), diag.path_dir_reject_count);
 
     // A path inside the config directory is honored.
-    try parseConfigJson(allocator, "{\"path_dir\": \"src\"}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"src\"}", &cfg);
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(cfg.path_owned);
-    try std.testing.expectEqual(@as(usize, 2), path_dir_reject_count);
+    try std.testing.expectEqual(@as(usize, 2), diag.path_dir_reject_count);
 }
 
 test "config path_dir rejection warning sanitizes hostile value bytes" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     // An untrusted config whose path_dir carries ESC and CR bytes raw.
     // The value does not resolve, so the rejection warning fires
     // (EPH-I0147).
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var ignored_any = false;
-    try parseConfigJsonSource(
-        allocator,
-        "{\"path_dir\": \"ev\x1bil\r\"}",
-        &cfg,
-        .{
+    try parseConfigJsonSource(.{
+        .diag = &diag,
+        .allocator = allocator,
+        .content = "{\"path_dir\": \"ev\x1bil\r\"}",
+        .cfg = &cfg,
+        .source = .{
             .trusted = false,
             .path = "test",
             .dir = ".",
             .ignored_any = &ignored_any,
         },
-    );
-    try std.testing.expectEqual(@as(usize, 1), path_dir_reject_count);
+    });
+    try std.testing.expectEqual(@as(usize, 1), diag.path_dir_reject_count);
 
     // The emitted warning text contains none of the raw bytes.
     var out = types.OutBuf{ .allocator = allocator };
@@ -58463,16 +59349,13 @@ test "config path_dir rejection warning sanitizes hostile value bytes" {
 }
 
 test "target-dir config parse never aliases cfg.path (UAF regression)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     // Regression: ConfigSource.dir aliased the dir argument, which IS the
-    // cfg.path buffer in production (loadConfigFromTargetPath(cfg, cfg.path)).
+    // cfg.path buffer in production (loadConfigFromTargetPath(&diag, cfg, cfg.path)).
     // A two-alias config ({"path_dir": "sub", "src": "sub"}) freed that
     // buffer in key 1 (setOwnedPath) and read it in key 2 — a use-after-free.
     // Under the test allocator the freed bytes are poisoned, so key 2 warned
     // spuriously; the discriminating signal is zero rejections here.
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58486,20 +59369,19 @@ test "target-dir config parse never aliases cfg.path (UAF regression)" {
     // Owned cfg.path == the target dir buffer (the production aliasing).
     try setOwnedPath(allocator, &cfg, dir_path);
 
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
-    try loadConfigFromTargetPath(allocator, &cfg, cfg.path);
-    try std.testing.expectEqual(@as(usize, 0), path_dir_reject_count);
+    diag.cli_diagnostics_enabled = false;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
+    try std.testing.expectEqual(@as(usize, 0), diag.path_dir_reject_count);
 }
 
 test "empty exclude pattern is a hard usage error (RED3-2)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try std.testing.expectError(
         error.EmptyExcludePattern,
-        parseConfigJson(allocator, "{\"exclude\": [\"\"]}", &cfg),
+        parseConfigJson(&diag, allocator, "{\"exclude\": [\"\"]}", &cfg),
     );
     try std.testing.expectEqual(@as(usize, 0), cfg.exclude.items.len);
 
@@ -58507,31 +59389,30 @@ test "empty exclude pattern is a hard usage error (RED3-2)" {
     defer cfg_orphan.deinit(allocator);
     try std.testing.expectError(
         error.EmptyExcludePattern,
-        parseConfigJson(allocator, "{\"orphan_exclude\": [\"\"]}", &cfg_orphan),
+        parseConfigJson(&diag, allocator, "{\"orphan_exclude\": [\"\"]}", &cfg_orphan),
     );
 }
 
 test "over-broad exclude patterns warn and are skipped (RED3-2)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(allocator, "{\"exclude\": [\"/\", \".zig\", \"vendor\"]}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"exclude\": [\"/\", \".zig\", \"vendor\"]}", &cfg);
     // Only the specific pattern survives.
     try std.testing.expectEqual(@as(usize, 1), cfg.exclude.items.len);
     try std.testing.expectEqualStrings("vendor", cfg.exclude.items[0]);
 }
 
 test "config thresholds clamp at the documented maxima (RED3-6)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try parseConfigJson(
+        &diag,
         allocator,
         "{\"thresholds\": {\"max_function_lines\": 999999999, " ++
             "\"max_cognitive\": 99999, \"max_file_bytes\": 999999999999, " ++
@@ -58543,33 +59424,45 @@ test "config thresholds clamp at the documented maxima (RED3-6)" {
     try std.testing.expectEqual(@as(usize, 100_000_000), cfg.thresholds.max_file_bytes);
     // A value under the cap passes through untouched and unwarned.
     try std.testing.expectEqual(@as(usize, 5), cfg.thresholds.max_nesting_depth);
-    try std.testing.expectEqual(@as(usize, 3), threshold_clamp_count);
+    try std.testing.expectEqual(@as(usize, 3), diag.threshold_clamp_count);
 }
 
 test "CLI threshold flags clamp at the documented maxima (RED3-6)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
-    try parseCliArg(allocator, "--max-lines=999999999", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--max-lines=999999999");
     try std.testing.expectEqual(@as(usize, 100_000), cfg.thresholds.max_function_lines);
-    try std.testing.expectEqual(@as(usize, 1), threshold_clamp_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.threshold_clamp_count);
     // The clamped value still locks the field against config files.
-    try parseConfigJson(allocator, "{\"thresholds\": {\"max_lines\": 60}}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"thresholds\": {\"max_lines\": 60}}", &cfg);
     try std.testing.expectEqual(@as(usize, 100_000), cfg.thresholds.max_function_lines);
 }
 
 test "CLI threshold flags beat config-file thresholds (RED3-6)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
-    try parseCliArg(allocator, "--max-lines=50", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--max-lines=50");
     try parseConfigJson(
+        &diag,
         allocator,
         "{\"thresholds\": {\"max_function_lines\": 100, \"max_nesting\": 5}}",
         &cfg,
@@ -58584,39 +59477,52 @@ test "CLI threshold flags beat config-file thresholds (RED3-6)" {
 // ============================================================================
 
 test "CLI empty argument is a hard usage error (EPH-I0233)" {
+    var diag = testDiagCtx();
     // Regression: an empty argv element panicked index-out-of-bounds at the
     // positional-path check. It must be a usage error, never a panic.
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
     try std.testing.expectError(
         error.EmptyArgument,
-        parseCliArg(allocator, "", &cfg, &cli_entries),
+        parseCliArg(cli_ctx, ""),
     );
 }
 
 test "CLI unknown flags are a hard usage error (EPH-I0234)" {
+    var diag = testDiagCtx();
     // Regression: --bogusflag, --strictt, and --format=xml each exited 0
     // with a scan. --strictt silently dropped the CI gate.
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     const bad_flags = [_][]const u8{ "--bogusflag", "--strictt", "--format=xml" };
     for (bad_flags) |flag| {
         var cfg = testConfig();
         defer cfg.deinit(allocator);
         var cli_entries = false;
+        const cli_ctx: CliParseCtx = .{
+            .diag = &diag,
+            .allocator = allocator,
+            .cfg = &cfg,
+            .cli_entries = &cli_entries,
+        };
         try std.testing.expectError(
             error.UnknownFlag,
-            parseCliArg(allocator, flag, &cfg, &cli_entries),
+            parseCliArg(cli_ctx, flag),
         );
     }
 }
 
 test "CLI every documented flag still parses (EPH-I0234)" {
+    var diag = testDiagCtx();
     // Guard against over-reach: the fail-closed else must not reject any
     // flag printHelp documents (including the -f=json/-f=text aliases).
     // EPH-I0770: --version= pins a non-current version so the release.py
@@ -58637,7 +59543,13 @@ test "CLI every documented flag still parses (EPH-I0234)" {
         "-y",                    "--yes",                    "--version=9.9.9",
         "--force",               "-f=text",
     };
-    for (documented) |flag| try parseCliArg(allocator, flag, &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    for (documented) |flag| try parseCliArg(cli_ctx, flag);
     try std.testing.expect(cfg.verbose);
     try std.testing.expect(cfg.show_summary);
     try std.testing.expectEqual(OutputFormat.text, cfg.format);
@@ -58663,21 +59575,27 @@ test "CLI every documented flag still parses (EPH-I0234)" {
 }
 
 test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {
+    var diag = testDiagCtx();
     // Regression: an empty --disable= value prefix-matched every rule and
     // suppressed the whole report.
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
     try std.testing.expectError(
         error.EmptyRulePattern,
-        parseCliArg(allocator, "--disable=", &cfg, &cli_entries),
+        parseCliArg(cli_ctx, "--disable="),
     );
     try std.testing.expectError(
         error.EmptyRulePattern,
-        parseCliArg(allocator, "--enable=", &cfg, &cli_entries),
+        parseCliArg(cli_ctx, "--enable="),
     );
     // Fail closed: the rejected entries never joined the lists.
     try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
@@ -58685,12 +59603,13 @@ test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {
 }
 
 test "config empty disable/enable entry is a hard usage error (EPH-I0236)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try std.testing.expectError(
         error.EmptyRulePattern,
-        parseConfigJson(allocator, "{\"disable\": [\"\"]}", &cfg),
+        parseConfigJson(&diag, allocator, "{\"disable\": [\"\"]}", &cfg),
     );
     try std.testing.expectEqual(@as(usize, 0), cfg.disabled_rules.items.len);
 
@@ -58698,27 +59617,33 @@ test "config empty disable/enable entry is a hard usage error (EPH-I0236)" {
     defer cfg_enable.deinit(allocator);
     try std.testing.expectError(
         error.EmptyRulePattern,
-        parseConfigJson(allocator, "{\"enable\": [\"\"]}", &cfg_enable),
+        parseConfigJson(&diag, allocator, "{\"enable\": [\"\"]}", &cfg_enable),
     );
     try std.testing.expectEqual(@as(usize, 0), cfg_enable.enabled_rules.items.len);
 }
 
 test "CLI malformed threshold value is a hard usage error (EPH-I0237)" {
+    var diag = testDiagCtx();
     // Regression: --max-lines=abc silently reset the field to the factory
     // default and CLI-locked it, discarding the config-file value.
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
     try std.testing.expectError(
         error.InvalidThresholdValue,
-        parseCliArg(allocator, "--max-lines=abc", &cfg, &cli_entries),
+        parseCliArg(cli_ctx, "--max-lines=abc"),
     );
     try std.testing.expectError(
         error.InvalidThresholdValue,
-        parseCliArg(allocator, "--max-lines=", &cfg, &cli_entries),
+        parseCliArg(cli_ctx, "--max-lines="),
     );
     // Fail closed: the rejected flags neither set the field nor locked it.
     try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
@@ -58726,31 +59651,36 @@ test "CLI malformed threshold value is a hard usage error (EPH-I0237)" {
 }
 
 test "CLI valid threshold value parses and locks (EPH-I0237)" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
-    try parseCliArg(allocator, "--max-lines=80", &cfg, &cli_entries);
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+    };
+    try parseCliArg(cli_ctx, "--max-lines=80");
     try std.testing.expectEqual(@as(usize, 80), cfg.thresholds.max_function_lines);
     try std.testing.expectEqual(threshold_cli_max_lines, cfg.threshold_cli_mask);
     // The lock still holds: a later config load cannot clobber the CLI value.
-    try parseConfigJson(allocator, "{\"thresholds\": {\"max_function_lines\": 100}}", &cfg);
+    try parseConfigJson(&diag, allocator, "{\"thresholds\": {\"max_function_lines\": 100}}", &cfg);
     try std.testing.expectEqual(@as(usize, 80), cfg.thresholds.max_function_lines);
 }
 
 test "install without project files returns InstallFailed (EPH-I0235)" {
+    var diag = testDiagCtx();
     // Regression: `ephor install` outside a Zig project printed help and
     // exited 0, so CI proceeded to `zig build ephor` on a failed install.
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try std.testing.expectError(
         error.InstallFailed,
-        runInstallCommand(allocator, tmp.dir, null),
+        runInstallCommand(&diag, allocator, tmp.dir, null),
     );
 
     // A build.zig without a build.zig.zon fails the same gate.
@@ -58762,27 +59692,25 @@ test "install without project files returns InstallFailed (EPH-I0235)" {
     });
     try std.testing.expectError(
         error.InstallFailed,
-        runInstallCommand(allocator, tmp_half.dir, null),
+        runInstallCommand(&diag, allocator, tmp_half.dir, null),
     );
 }
 
 test "install zig-fetch failure maps to InstallFailed (EPH-I0235)" {
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
     try std.testing.expectError(
         error.InstallFailed,
-        installFetchOutcome(1, "https://example.invalid/ephor.tar.gz"),
+        installFetchOutcome(&diag, 1, "https://example.invalid/ephor.tar.gz"),
     );
-    try installFetchOutcome(0, "https://example.invalid/ephor.tar.gz");
+    try installFetchOutcome(&diag, 0, "https://example.invalid/ephor.tar.gz");
 }
 
 test "install patch failure maps to InstallFailed (EPH-I0235)" {
+    var diag = testDiagCtx();
     // A build.zig with no build function gives findBuildZigInsertionPoint
     // nothing to anchor to, so the patch stage must fail the install.
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58792,62 +59720,64 @@ test "install patch failure maps to InstallFailed (EPH-I0235)" {
     });
     try std.testing.expectError(
         error.InstallFailed,
-        patchBuildZigOrFail(allocator, tmp.dir),
+        patchBuildZigOrFail(&diag, allocator, tmp.dir),
     );
 }
 
 test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {
+    var diag = testDiagCtx();
     // Regression: an explicit --version reached the fetch URL unvalidated.
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try std.testing.expectError(
         error.InvalidVersion,
-        runUpgradeCommand(allocator, tmp.dir, "garbage", false),
+        runUpgradeCommand(
+            &diag,
+            allocator,
+            tmp.dir,
+            .{ .install_version = "garbage", .force = false },
+        ),
     );
 }
 
 test "install with an invalid --version returns InvalidVersion (EPH-I0155)" {
+    var diag = testDiagCtx();
     // Validation runs before the project-file gate: an empty directory
     // must report the version error, not InstallFailed.
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try std.testing.expectError(
         error.InvalidVersion,
-        runInstallCommand(allocator, tmp.dir, "1.2.3.4"),
+        runInstallCommand(&diag, allocator, tmp.dir, "1.2.3.4"),
     );
 }
 
 test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
+    var diag = testDiagCtx();
     // Regression: the downgrade-floor refusal printed and exited 0, so a
     // script could not detect the refusal.
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try std.testing.expectError(
         error.UpgradeFailed,
-        runUpgradeCommand(allocator, tmp.dir, "0.0.1", false),
+        runUpgradeCommand(
+            &diag,
+            allocator,
+            tmp.dir,
+            .{ .install_version = "0.0.1", .force = false },
+        ),
     );
 }
 
 test "upgrade without ephor dependency returns UpgradeFailed (EPH-I0235)" {
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -58857,18 +59787,23 @@ test "upgrade without ephor dependency returns UpgradeFailed (EPH-I0235)" {
     });
     try std.testing.expectError(
         error.UpgradeFailed,
-        runUpgradeCommand(allocator, tmp.dir, EPHOR_VERSION, false),
+        runUpgradeCommand(
+            &diag,
+            allocator,
+            tmp.dir,
+            .{ .install_version = EPHOR_VERSION, .force = false },
+        ),
     );
 }
 
 test "upgrade zig-fetch failure maps to UpgradeFailed (EPH-I0235)" {
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
     try std.testing.expectError(
         error.UpgradeFailed,
-        upgradeFetchOutcome(1, "0.14.3"),
+        upgradeFetchOutcome(&diag, 1, "0.14.3"),
     );
-    try upgradeFetchOutcome(0, "0.14.3");
+    try upgradeFetchOutcome(&diag, 0, "0.14.3");
 }
 
 test "setOwnedPath OOM keeps the old path freeable exactly once" {
@@ -58971,6 +59906,7 @@ test "buildCFG: multi-line condition continuations attribute to the origin block
 }
 
 test "ZA607: multi-line guard condition fills cover post-guard reads" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59000,7 +59936,7 @@ test "ZA607: multi-line guard condition fills cover post-guard reads" {
         \\    use(b);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_fc_guard_ml.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_guard_ml.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59010,6 +59946,7 @@ test "ZA607: multi-line guard condition fills cover post-guard reads" {
 }
 
 test "ZA607: string brace in a conditional body does not suppress the read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59030,7 +59967,7 @@ test "ZA607: string brace in a conditional body does not suppress the read" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i107_body.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i107_body.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59040,6 +59977,7 @@ test "ZA607: string brace in a conditional body does not suppress the read" {
 }
 
 test "ZA607: string brace in the if condition does not suppress the read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59062,7 +60000,7 @@ test "ZA607: string brace in the if condition does not suppress the read" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i107_cond.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i107_cond.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59072,6 +60010,7 @@ test "ZA607: string brace in the if condition does not suppress the read" {
 }
 
 test "ZA607: string brace after the fill does not suppress the read" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59092,7 +60031,7 @@ test "ZA607: string brace after the fill does not suppress the read" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i107_after.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i107_after.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59102,6 +60041,7 @@ test "ZA607: string brace after the fill does not suppress the read" {
 }
 
 test "ZA607: conditional fill without string content fires" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59120,7 +60060,7 @@ test "ZA607: conditional fill without string content fires" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i107_control.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i107_control.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59130,6 +60070,7 @@ test "ZA607: conditional fill without string content fires" {
 }
 
 test "ZA607: same-line if/else with else-arm fill only is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59146,7 +60087,7 @@ test "ZA607: same-line if/else with else-arm fill only is detected" {
         \\    if (c) {} else { x = 2; } use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i111_oneline.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i111_oneline.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59156,6 +60097,7 @@ test "ZA607: same-line if/else with else-arm fill only is detected" {
 }
 
 test "ZA607: if-arm close sharing a line with a statement before else is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59176,7 +60118,7 @@ test "ZA607: if-arm close sharing a line with a statement before else is detecte
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i111_stmtclose.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i111_stmtclose.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59186,6 +60128,7 @@ test "ZA607: if-arm close sharing a line with a statement before else is detecte
 }
 
 test "ZA607: same-line if/else with fills in both arms is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59201,7 +60144,7 @@ test "ZA607: same-line if/else with fills in both arms is silent" {
         \\    if (c) { x = 1; } else { x = 2; } use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i111_bothfill.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i111_bothfill.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59211,6 +60154,7 @@ test "ZA607: same-line if/else with fills in both arms is silent" {
 }
 
 test "ZA607: same-line braced if with same-line read is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59228,7 +60172,7 @@ test "ZA607: same-line braced if with same-line read is detected" {
         \\    if (c) { x = 1; } use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i111_ifonly.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i111_ifonly.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59238,6 +60182,7 @@ test "ZA607: same-line braced if with same-line read is detected" {
 }
 
 test "ZA607: if-arm close sharing a line with its last fill is detected" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59256,7 +60201,7 @@ test "ZA607: if-arm close sharing a line with its last fill is detected" {
         \\    use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i111_stmtclose_noelse.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i111_stmtclose_noelse.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59266,6 +60211,7 @@ test "ZA607: if-arm close sharing a line with its last fill is detected" {
 }
 
 test "ZA607: one-line switch with else prong is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59282,7 +60228,7 @@ test "ZA607: one-line switch with else prong is silent" {
         \\    switch (c) { 1 => { x = 1; }, else => { x = 2; } } use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i111_switch_else.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i111_switch_else.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59292,6 +60238,7 @@ test "ZA607: one-line switch with else prong is silent" {
 }
 
 test "ZA607: one-line enum switch without else prong is silent" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59308,7 +60255,7 @@ test "ZA607: one-line enum switch without else prong is silent" {
         \\    switch (e) { .a => { x = 1; }, .b => { x = 2; } } use(x);
         \\}
     ;
-    var run = try runCFGMemoryTest(allocator, "da_i111_switch_enum.zig", content);
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i111_switch_enum.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
@@ -59324,6 +60271,7 @@ test "ZA607: one-line enum switch without else prong is silent" {
 /// Test helper: one-file graph plus out-context wired to fresh suppression
 /// stats, ready for tallyIssues/classifyIssue assertions.
 const SuppressHarness = struct {
+    diag: *DiagCtx,
     run: CFGTestRun,
     cache: IgnoreCache,
     stats: SuppressionStats,
@@ -59331,6 +60279,7 @@ const SuppressHarness = struct {
 
     fn out(self: *SuppressHarness) ReportOutCtx {
         return .{
+            .diag = self.diag,
             .base_path = self.cfg.path,
             .allocator = std.testing.allocator,
             .cfg = &self.cfg,
@@ -59348,12 +60297,14 @@ const SuppressHarness = struct {
 };
 
 fn initSuppressHarness(
+    diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !SuppressHarness {
     return .{
-        .run = try runCFGMemoryTest(allocator, path, content),
+        .diag = diag,
+        .run = try runCFGMemoryTest(diag, allocator, path, content),
         .cache = IgnoreCache.init(allocator),
         .stats = .{},
         .cfg = testConfig(),
@@ -59377,11 +60328,10 @@ const suppress_leak_source =
 ;
 
 test "suppression: ignore-file directive drops the finding and counts inline" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
-    var h = try initSuppressHarness(allocator, "src/sup_inline.zig", content);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_inline.zig", content);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59397,15 +60347,15 @@ test "suppression: ignore-file directive drops the finding and counts inline" {
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, formatSuppressionBreakdown(&buf, h.stats));
 
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-    reportSuppression(&h.stats, &h.cfg);
-    try std.testing.expectEqual(@as(usize, 1), suppression_note_count);
+    diag.cli_diagnostics_enabled = false;
+    reportSuppression(&diag, &h.stats, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.suppression_note_count);
 }
 
 test "suppression: known-issues entry drops the finding and counts known_issues" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var h = try initSuppressHarness(allocator, "src/sup_known.zig", suppress_leak_source);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_known.zig", suppress_leak_source);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59428,8 +60378,9 @@ test "suppression: known-issues entry drops the finding and counts known_issues"
 }
 
 test "suppression: config disable and exclude land in their own buckets" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var h = try initSuppressHarness(allocator, "src/sup_cfg.zig", suppress_leak_source);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_cfg.zig", suppress_leak_source);
     defer h.deinit(allocator);
     const file = "src/sup_cfg.zig";
     const n_za101 = countRuleIssues(h.run.issues.items, file, RULE_ALLOC_NO_DEFER);
@@ -59449,10 +60400,9 @@ test "suppression: config disable and exclude land in their own buckets" {
 }
 
 test "suppression: zero suppression emits no note" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var h = try initSuppressHarness(allocator, "src/sup_none.zig", suppress_leak_source);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_none.zig", suppress_leak_source);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59460,14 +60410,15 @@ test "suppression: zero suppression emits no note" {
     try std.testing.expectEqual(h.run.issues.items.len, counts.warnings);
     try std.testing.expectEqual(@as(usize, 0), h.stats.total());
 
-    reportSuppression(&h.stats, &h.cfg);
-    try std.testing.expectEqual(@as(usize, 0), suppression_note_count);
+    reportSuppression(&diag, &h.stats, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 0), diag.suppression_note_count);
 }
 
 test "suppression: --no-suppression prints directive-hidden findings and counts them" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
-    var h = try initSuppressHarness(allocator, "src/sup_audit.zig", content);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_audit.zig", content);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59481,9 +60432,10 @@ test "suppression: --no-suppression prints directive-hidden findings and counts 
 }
 
 test "suppression: --no-suppression never waives a hard config disable" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
-    var h = try initSuppressHarness(allocator, "src/sup_hard_disable.zig", content);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_hard_disable.zig", content);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59498,9 +60450,10 @@ test "suppression: --no-suppression never waives a hard config disable" {
 }
 
 test "suppression: --no-suppression never prints an off-by-default rule" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
-    var h = try initSuppressHarness(allocator, "src/sup_hard_default.zig", content);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_hard_default.zig", content);
     defer h.deinit(allocator);
 
     // A bare ignore-file covers every rule, so a ZA305 finding (OFF by
@@ -59527,8 +60480,9 @@ test "suppression: --no-suppression never prints an off-by-default rule" {
 }
 
 test "suppression: --no-suppression never waives a hard config exclude" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var h = try initSuppressHarness(allocator, "src/sup_hard_exclude.zig", suppress_leak_source);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_hard_exclude.zig", suppress_leak_source);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59547,8 +60501,9 @@ test "suppression: --no-suppression never waives a hard config exclude" {
 }
 
 test "suppression: off-by-default rules are posture, not suppression" {
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var h = try initSuppressHarness(allocator, "src/sup_default.zig", suppress_leak_source);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_default.zig", suppress_leak_source);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59594,17 +60549,14 @@ test "suppression: JSON member parses and the total stays consistent" {
 }
 
 test "suppression: known-issues load works outside check and only once" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpDirPath(allocator, &tmp);
     defer allocator.free(dir_path);
 
-    var h = try initSuppressHarness(allocator, "src/sup_load.zig", suppress_leak_source);
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_load.zig", suppress_leak_source);
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -59616,17 +60568,16 @@ test "suppression: known-issues load works outside check and only once" {
     }
     const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
     defer allocator.free(ignore_path);
-    try Fs.cwd().writeFile(ignore_path, content.items, .{});
+    try Fs.cwd(std.testing.io).writeFile(ignore_path, content.items, .{});
 
     // Every finding command loads from cfg.path before reporting...
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
+    diag.cli_diagnostics_enabled = false;
     try setOwnedPath(allocator, &h.cfg, dir_path);
     // The tmpDir is outside the cwd tree, so the auto-load needs the
     // trust flag (EPH-I0222 gates untrusted .ephor-ignore files).
     h.cfg.trust_target_config = true;
-    try loadKnownIssues(allocator, &h.cfg);
-    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
+    try loadKnownIssues(&diag, allocator, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.known_issues_autoload_count);
     try std.testing.expectEqual(h.run.issues.items.len, h.cfg.known_issues.items.len);
 
     // ...and the loaded entries suppress the findings at report time.
@@ -59636,16 +60587,13 @@ test "suppression: known-issues load works outside check and only once" {
     try std.testing.expectEqual(h.run.issues.items.len, h.stats.known_issues);
 
     // The load-once guard: a second load adds no entries and no note.
-    try loadKnownIssues(allocator, &h.cfg);
-    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
+    try loadKnownIssues(&diag, allocator, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.known_issues_autoload_count);
     try std.testing.expectEqual(h.run.issues.items.len, h.cfg.known_issues.items.len);
 }
 
 test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59653,7 +60601,7 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
     defer allocator.free(dir_path);
     const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
     defer allocator.free(ignore_path);
-    try Fs.cwd().writeFile(ignore_path, "# comment\nsrc/a.zig:1\nsrc/b.zig:2\n", .{});
+    try Fs.cwd(std.testing.io).writeFile(ignore_path, "# comment\nsrc/a.zig:1\nsrc/b.zig:2\n", .{});
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
@@ -59661,28 +60609,23 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
     // The tmpDir is outside the cwd tree: the trust flag honors the
     // auto-load (EPH-I0222). The explicit path below needs no flag.
     cfg.trust_target_config = true;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
-    try loadKnownIssues(allocator, &cfg);
-    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
+    diag.cli_diagnostics_enabled = false;
+    try loadKnownIssues(&diag, allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.known_issues_autoload_count);
     try std.testing.expectEqual(@as(usize, 2), cfg.known_issues.items.len);
 
     // The explicit --known-issues path stays silent.
-    known_issues_autoload_count = 0;
+    diag.known_issues_autoload_count = 0;
     var cfg_explicit = testConfig();
     defer cfg_explicit.deinit(allocator);
     _ = try setOptionalPath(allocator, &cfg_explicit.known_issues_path, ignore_path);
-    try loadKnownIssues(allocator, &cfg_explicit);
-    try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
+    try loadKnownIssues(&diag, allocator, &cfg_explicit);
+    try std.testing.expectEqual(@as(usize, 0), diag.known_issues_autoload_count);
     try std.testing.expectEqual(@as(usize, 2), cfg_explicit.known_issues.items.len);
 }
 
 test "suppression: untrusted .ephor-ignore auto-load is refused (EPH-I0222)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59690,32 +60633,27 @@ test "suppression: untrusted .ephor-ignore auto-load is refused (EPH-I0222)" {
     defer allocator.free(dir_path);
     const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
     defer allocator.free(ignore_path);
-    try Fs.cwd().writeFile(ignore_path, "src/a.zig:1\nsrc/b.zig:2\n", .{});
+    try Fs.cwd(std.testing.io).writeFile(ignore_path, "src/a.zig:1\nsrc/b.zig:2\n", .{});
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, dir_path);
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     // The tmpDir is outside the cwd tree, so the auto-load is refused:
     // no entries, no adopted path, one skip note, no disclosure note.
-    try loadKnownIssues(allocator, &cfg);
+    try loadKnownIssues(&diag, allocator, &cfg);
     try std.testing.expectEqual(@as(usize, 0), cfg.known_issues.items.len);
     try std.testing.expect(cfg.known_issues_path == null);
-    try std.testing.expectEqual(@as(usize, 1), untrusted_ignore_skip_count);
-    try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_ignore_skip_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.known_issues_autoload_count);
 
     // The load-once guard keeps a second probe silent.
-    try loadKnownIssues(allocator, &cfg);
-    try std.testing.expectEqual(@as(usize, 1), untrusted_ignore_skip_count);
+    try loadKnownIssues(&diag, allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_ignore_skip_count);
 }
 
 test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
-    resetTestGlobals();
-    defer resetTestGlobals();
-    global_io = std.testing.io;
-    defer global_io = null;
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59723,20 +60661,18 @@ test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
     defer allocator.free(dir_path);
     const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{dir_path});
     defer allocator.free(ignore_path);
-    try Fs.cwd().writeFile(ignore_path, "src/a.zig:1\nsrc/b.zig:2\n", .{});
+    try Fs.cwd(std.testing.io).writeFile(ignore_path, "src/a.zig:1\nsrc/b.zig:2\n", .{});
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     cfg.trust_target_config = true;
     try setOwnedPath(allocator, &cfg, dir_path);
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     // The trust flag admits the same file: entries load and disclose.
-    try loadKnownIssues(allocator, &cfg);
+    try loadKnownIssues(&diag, allocator, &cfg);
     try std.testing.expectEqual(@as(usize, 2), cfg.known_issues.items.len);
-    try std.testing.expectEqual(@as(usize, 1), known_issues_autoload_count);
-    try std.testing.expectEqual(@as(usize, 0), untrusted_ignore_skip_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.known_issues_autoload_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.untrusted_ignore_skip_count);
 }
 
 // ============================================================================
@@ -59744,8 +60680,6 @@ test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
 // ============================================================================
 
 test "writeExportIssue neutralizes markdown metacharacters and control bytes" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     const issue = Issue{
         .file = "ev*il_[x].zig",
@@ -59761,6 +60695,7 @@ test "writeExportIssue neutralizes markdown metacharacters and control bytes" {
     // Null containment root fails closed: no snippet, and the test does
     // not touch the filesystem (EPH-I0198).
     try writeExportIssue(allocator, &output, issue, .{
+        .io = std.testing.io,
         .base_path = "/repo",
         .scan_root_real = null,
     });
@@ -59775,8 +60710,6 @@ test "writeExportIssue neutralizes markdown metacharacters and control bytes" {
 }
 
 test "writeCodeSnippet neutralizes fence sequences in source lines" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59801,7 +60734,11 @@ test "writeCodeSnippet neutralizes fence sequences in source lines" {
 
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(allocator);
-    try writeCodeSnippet(allocator, &output, issue, root);
+    try writeCodeSnippet(allocator, &output, issue, .{
+        .io = std.testing.io,
+        .base_path = "",
+        .scan_root_real = root,
+    });
 
     // The embedded fence line is stripped to placeholders: exactly the two
     // wrapper fences carry a backtick run.
@@ -59813,6 +60750,7 @@ test "writeCodeSnippet neutralizes fence sequences in source lines" {
 }
 
 test "ZT101: control bytes in a test name are sanitized at print time" {
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -59829,7 +60767,7 @@ test "ZT101: control bytes in a test name are sanitized at print time" {
         \\    try std.testing.expect(n == 0);
         \\}
     ;
-    var run = try runTestQualityCheck(allocator, "zt101_ctrl.zig", content);
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_ctrl.zig", content);
     defer run.deinit(allocator);
 
     var found: ?Issue = null;
@@ -59852,8 +60790,6 @@ test "ZT101: control bytes in a test name are sanitized at print time" {
 // ============================================================================
 
 test "Fs.openFile reads back bytes written to a tmp file" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59864,17 +60800,15 @@ test "Fs.openFile reads back bytes written to a tmp file" {
     const missing = try tmpFilePath(allocator, &tmp, "missing.txt");
     defer allocator.free(missing);
 
-    const file = try Fs.cwd().openFile(path, .{});
+    const file = try Fs.cwd(std.testing.io).openFile(path, .{});
     defer file.close(std.testing.io);
     var buf: [64]u8 = undefined;
     const n = try file.readPositionalAll(std.testing.io, &buf, 0);
     try std.testing.expectEqualStrings(content, buf[0..n]);
-    try std.testing.expectError(error.FileNotFound, Fs.cwd().openFile(missing, .{}));
+    try std.testing.expectError(error.FileNotFound, Fs.cwd(std.testing.io).openFile(missing, .{}));
 }
 
 test "Fs.createFile creates a tmp file that holds the written bytes" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59882,7 +60816,7 @@ test "Fs.createFile creates a tmp file that holds the written bytes" {
     defer allocator.free(path);
 
     const content = "written through createFile";
-    const file = try Fs.cwd().createFile(path, .{});
+    const file = try Fs.cwd(std.testing.io).createFile(path, .{});
     defer file.close(std.testing.io);
     try file.writePositionalAll(std.testing.io, content, 0);
 
@@ -59893,8 +60827,6 @@ test "Fs.createFile creates a tmp file that holds the written bytes" {
 }
 
 test "Fs.statFile reports the size and kind of a tmp file" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59903,14 +60835,12 @@ test "Fs.statFile reports the size and kind of a tmp file" {
     const path = try tmpFilePath(allocator, &tmp, "stat.txt");
     defer allocator.free(path);
 
-    const stat = try Fs.cwd().statFile(path);
+    const stat = try Fs.cwd(std.testing.io).statFile(path);
     try std.testing.expectEqual(@as(u64, content.len), stat.size);
     try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
 }
 
 test "Fs.realpathAlloc resolves a dot component to the canonical path" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -59920,7 +60850,7 @@ test "Fs.realpathAlloc resolves a dot component to the canonical path" {
     const dotted = try std.fmt.allocPrint(allocator, "{s}/./real.txt", .{dir_path});
     defer allocator.free(dotted);
 
-    const resolved = try Fs.cwd().realpathAlloc(allocator, dotted);
+    const resolved = try Fs.cwd(std.testing.io).realpathAlloc(allocator, dotted);
     defer allocator.free(resolved);
 
     // A real resolution never echoes the `/./` back: it returns the same
@@ -59950,8 +60880,13 @@ fn buildNestedParensSource(a: Allocator, n: usize) ![]u8 {
 }
 
 /// One-file graph holding `content`, ready for analyzeAstTier.
-fn buildOneFileGraph(a: Allocator, path: []const u8, content: []const u8) !ImportGraph {
-    var graph = ImportGraph.init(a);
+fn buildOneFileGraph(
+    diag: *DiagCtx,
+    a: Allocator,
+    path: []const u8,
+    content: []const u8,
+) !ImportGraph {
+    var graph = ImportGraph.init(a, diag);
     errdefer graph.deinit();
     const analysis = try createTestFileAnalysis(a, path, content);
     try graph.files.put(analysis.path, analysis);
@@ -59959,10 +60894,11 @@ fn buildOneFileGraph(a: Allocator, path: []const u8, content: []const u8) !Impor
 }
 
 test "EPH-I0191: analyzeAstTier skips over-budget nesting without crashing" {
+    var diag = testDiagCtx();
     const a = std.testing.allocator;
     const src = try buildNestedParensSource(a, ast_tier.max_nesting_depth + 1);
     defer a.free(src);
-    var graph = try buildOneFileGraph(a, "deep.zig", src);
+    var graph = try buildOneFileGraph(&diag, a, "deep.zig", src);
     defer graph.deinit();
     var stats = ast_tier.Stats{};
     var issues = try analyzeAstTier(a, &graph, &stats);
@@ -59973,10 +60909,11 @@ test "EPH-I0191: analyzeAstTier skips over-budget nesting without crashing" {
 }
 
 test "EPH-I0191: analyzeAstTier parses within-budget nesting" {
+    var diag = testDiagCtx();
     const a = std.testing.allocator;
     const src = try buildNestedParensSource(a, ast_tier.max_nesting_depth - 1);
     defer a.free(src);
-    var graph = try buildOneFileGraph(a, "shallow.zig", src);
+    var graph = try buildOneFileGraph(&diag, a, "shallow.zig", src);
     defer graph.deinit();
     var stats = ast_tier.Stats{};
     var issues = try analyzeAstTier(a, &graph, &stats);
@@ -60003,14 +60940,10 @@ fn makeTestIssue(file: []const u8) Issue {
 }
 
 test "parseFmtOutput findings own their file bytes after the source frees" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
-    global_io = std.testing.io;
-    defer global_io = null;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "fn a() void {}\n" });
@@ -60025,7 +60958,7 @@ test "parseFmtOutput findings own their file bytes after the source frees" {
     const source = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ a_path, b_path });
     // No defer: the test frees the source before the reads, replicating
     // runFmtCheck's free-then-print order (EPH-I0196).
-    var issues = try parseFmtOutput(allocator, source, root);
+    var issues = try parseFmtOutput(&diag, allocator, source, root);
     defer deinitIssues(&issues, allocator);
     allocator.free(source);
 
@@ -60039,20 +60972,15 @@ test "parseFmtOutput findings own their file bytes after the source frees" {
     defer out.deinit();
     for (issues.items) |issue| try issue.formatText(root, &out);
     try std.testing.expect(mem.indexOf(u8, out.buf.items, "a.zig: warning[ZA601]") != null);
-    try std.testing.expectEqual(@as(usize, 0), fmt_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.fmt_reject_count);
     // deinitIssues frees each owned name exactly once. The DebugAllocator
     // flags a borrow (invalid free) or a double free when this is wrong.
 }
 
 test "parseFmtOutput rejects control and non-ASCII bytes" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ok.zig", .data = "" });
@@ -60066,39 +60994,33 @@ test "parseFmtOutput rejects control and non-ASCII bytes" {
     });
     defer allocator.free(source);
 
-    var issues = try parseFmtOutput(allocator, source, root);
+    var issues = try parseFmtOutput(&diag, allocator, source, root);
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(ok_path, issues.items[0].file);
-    try std.testing.expectEqual(@as(usize, 3), fmt_reject_count);
+    try std.testing.expectEqual(@as(usize, 3), diag.fmt_reject_count);
 }
 
 test "parseFmtOutput silently skips zig fmt lines that are not file names" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
 
     // Parse errors and status lines never reach the safety gates, so a
     // broken build stays quiet and the reject counter does not move.
     const source = "src/main.zig:3:1: error: expected ';', found '}'\n" ++
         "note: 1 file did not parse\n";
-    var issues = try parseFmtOutput(allocator, source, null);
+    var issues = try parseFmtOutput(&diag, allocator, source, null);
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
-    try std.testing.expectEqual(@as(usize, 0), fmt_reject_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.fmt_reject_count);
 }
 
 test "parseFmtOutput rejects paths that resolve outside the scan root" {
-    resetTestGlobals();
-    defer resetTestGlobals();
+    var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    global_io = std.testing.io;
-    defer global_io = null;
-    cli_diagnostics_enabled = false;
-    defer cli_diagnostics_enabled = true;
-
+    diag.cli_diagnostics_enabled = false;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sub");
@@ -60117,7 +61039,7 @@ test "parseFmtOutput rejects paths that resolve outside the scan root" {
         escape, trav_out, trav_in,
     });
     defer allocator.free(source);
-    var issues = try parseFmtOutput(allocator, source, root);
+    var issues = try parseFmtOutput(&diag, allocator, source, root);
     defer deinitIssues(&issues, allocator);
 
     // The absolute outside path and the escaping traversal are rejected.
@@ -60125,18 +61047,16 @@ test "parseFmtOutput rejects paths that resolve outside the scan root" {
     // its original spelling: resolution is the gate, not the ".." text.
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(trav_in, issues.items[0].file);
-    try std.testing.expectEqual(@as(usize, 2), fmt_reject_count);
+    try std.testing.expectEqual(@as(usize, 2), diag.fmt_reject_count);
 
     // A null root fails closed, even for a plain in-root-looking name.
-    var closed = try parseFmtOutput(allocator, "src/ok.zig\n", null);
+    var closed = try parseFmtOutput(&diag, allocator, "src/ok.zig\n", null);
     defer deinitIssues(&closed, allocator);
     try std.testing.expectEqual(@as(usize, 0), closed.items.len);
-    try std.testing.expectEqual(@as(usize, 3), fmt_reject_count);
+    try std.testing.expectEqual(@as(usize, 3), diag.fmt_reject_count);
 }
 
 test "writeCodeSnippet skips out-of-root and unresolvable paths" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -60156,19 +61076,29 @@ test "writeCodeSnippet skips out-of-root and unresolvable paths" {
     defer output.deinit(allocator);
     // EPH-I0198: a forged finding path escapes the root and gets no
     // snippet, not even an empty fence.
-    try writeCodeSnippet(allocator, &output, makeTestIssue(forged), root);
+    try writeCodeSnippet(allocator, &output, makeTestIssue(forged), .{
+        .io = std.testing.io,
+        .base_path = "",
+        .scan_root_real = root,
+    });
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
     // A deleted file skips, preserving the old catch-return behavior.
-    try writeCodeSnippet(allocator, &output, makeTestIssue(missing), root);
+    try writeCodeSnippet(allocator, &output, makeTestIssue(missing), .{
+        .io = std.testing.io,
+        .base_path = "",
+        .scan_root_real = root,
+    });
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
     // A null root fails closed even for a real in-root file.
-    try writeCodeSnippet(allocator, &output, makeTestIssue(inside), null);
+    try writeCodeSnippet(allocator, &output, makeTestIssue(inside), .{
+        .io = std.testing.io,
+        .base_path = "",
+        .scan_root_real = null,
+    });
     try std.testing.expectEqual(@as(usize, 0), output.items.len);
 }
 
 test "writeCodeSnippet keeps an in-root snippet with the marker line" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -60183,15 +61113,17 @@ test "writeCodeSnippet keeps an in-root snippet with the marker line" {
     issue.line = 2;
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(allocator);
-    try writeCodeSnippet(allocator, &output, issue, root);
+    try writeCodeSnippet(allocator, &output, issue, .{
+        .io = std.testing.io,
+        .base_path = "",
+        .scan_root_real = root,
+    });
 
     try std.testing.expect(mem.indexOf(u8, output.items, "```zig\n") != null);
     try std.testing.expect(mem.indexOf(u8, output.items, ">>> 2: fn b() void {}") != null);
 }
 
 test "scanRootRealpath roots a file scan at the file's directory" {
-    global_io = std.testing.io;
-    defer global_io = null;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -60203,36 +61135,9 @@ test "scanRootRealpath roots a file scan at the file's directory" {
 
     var buf: [Fs.max_path_bytes]u8 = undefined;
     // Read dir_root before the second call overwrites the shared buffer.
-    const dir_root = scanRootRealpath(dir_path, &buf);
+    const dir_root = scanRootRealpath(std.testing.io, dir_path, &buf);
     try std.testing.expectEqualStrings(dir_path, dir_root.?);
-    const file_root = scanRootRealpath(file_path, &buf);
+    const file_root = scanRootRealpath(std.testing.io, file_path, &buf);
     try std.testing.expectEqualStrings(dir_path, file_root.?);
-    try std.testing.expect(scanRootRealpath("/nonexistent-ephor-test", &buf) == null);
-}
-
-test "canary: no test leaks shared global state (EPH-I0291)" {
-    // This canary must stay the LAST test declaration in this file. The
-    // 0.16 runner executes tests in declaration order, so it observes the
-    // suite-wide exit state of every test above it. A failure here means a
-    // test above skipped its restore-at-exit (defer resetTestGlobals(), or
-    // the targeted defers for global_io and last_bad_fail_on). The failed
-    // assertion names the leaked global, not the test that leaked it.
-    // Limit: a missed restore is masked when a later test restores the
-    // same global first, so only leaks that survive to end-of-file fail
-    // here. The DiagCtx refactor (EPH-I0771) removes the class.
-    try std.testing.expectEqual(@as(usize, 0), untrusted_config_note_count);
-    try std.testing.expectEqual(@as(usize, 0), path_dir_reject_count);
-    try std.testing.expectEqual(@as(usize, 0), entries_reject_count);
-    try std.testing.expectEqual(@as(usize, 0), entries_reject_note_count);
-    try std.testing.expectEqual(@as(usize, 0), fmt_reject_count);
-    try std.testing.expectEqual(@as(usize, 0), threshold_clamp_count);
-    try std.testing.expectEqual(@as(usize, 0), suppression_note_count);
-    try std.testing.expectEqual(@as(usize, 0), known_issues_autoload_count);
-    try std.testing.expectEqual(@as(usize, 0), untrusted_ignore_skip_count);
-    try std.testing.expectEqual(@as(usize, 0), ast_skip_note_count);
-    try std.testing.expectEqual(@as(usize, 0), entries_widen_note_count);
-    try std.testing.expectEqual(@as(usize, 0), corpus_warn_count);
-    try std.testing.expect(global_io == null);
-    try std.testing.expect(cli_diagnostics_enabled);
-    try std.testing.expect(last_bad_fail_on == null);
+    try std.testing.expect(scanRootRealpath(std.testing.io, "/nonexistent-ephor-test", &buf) == null);
 }

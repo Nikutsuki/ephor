@@ -144,10 +144,14 @@ fi
 # The newest changelog section names the next release. Release prep adds
 # the unreleased header and bumps build.zig.zon in one commit, so the two
 # versions match from one release prep to the next. A header behind
-# build.zig.zon is drift and fails. A header ahead is the skip-window
-# case: a skipped release (v0.14.3, user ruling 2026-08-05) retitles the
-# changelog before build.zig.zon bumps. The script reports PENDING until
-# release prep converges the two versions.
+# build.zig.zon is drift and fails. A header ahead routes on the caller.
+# With no argument the caller runs the local check, and a header ahead is
+# the skip-window case: a skipped release (v0.14.3, user ruling 2026-08-05)
+# retitles the changelog before build.zig.zon bumps. The script reports
+# PENDING until release prep converges the two versions. With an explicit
+# argument the caller names the tag being pushed. The tag is immutable.
+# A header ahead of the tag ships the wrong release notes forever. The
+# script fails MISMATCH.
 CHANGELOG_VERSION=$(grep '^### v' README.md | head -1 | sed 's/^### v\([0-9][0-9.]*\).*/\1/')
 if [ -z "$CHANGELOG_VERSION" ]; then
     echo "MISSING  README.md: no changelog header found"
@@ -157,7 +161,7 @@ elif [ "$CHANGELOG_VERSION" = "$EXPECTED" ]; then
 else
     NEWER_VERSION=$(printf '%s\n%s\n' "$EXPECTED" "$CHANGELOG_VERSION" \
         | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
-    if [ "$NEWER_VERSION" = "$CHANGELOG_VERSION" ]; then
+    if [ "$NEWER_VERSION" = "$CHANGELOG_VERSION" ] && [ -z "${1:-}" ]; then
         echo "PENDING  README.md changelog header: v${CHANGELOG_VERSION}" \
             "(awaits build.zig.zon bump at release prep, currently ${EXPECTED})"
     else

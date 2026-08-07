@@ -12,6 +12,7 @@
 #   5. install.sh            EPHOR_FALLBACK_TAG matches the latest remote tag
 #   5b. install.ps1          EPHOR_FALLBACK_TAG matches install.sh's value
 #   6. Codeberg tags API     latest remote tag matches
+#   7. README.md             changelog header names the in-development version
 
 set -e
 
@@ -139,10 +140,36 @@ else
     echo "PENDING  Codeberg latest tag: v${REMOTE_TAG} (will be v${EXPECTED} after push)"
 fi
 
+# 7. README.md changelog header against the in-development version.
+# The newest changelog section names the next release. Release prep adds
+# the unreleased header and bumps build.zig.zon in one commit, so the two
+# versions match from one release prep to the next. A header behind
+# build.zig.zon is drift and fails. A header ahead is the skip-window
+# case: a skipped release (v0.14.3, user ruling 2026-08-05) retitles the
+# changelog before build.zig.zon bumps. The script reports PENDING until
+# release prep converges the two versions.
+CHANGELOG_VERSION=$(grep '^### v' README.md | head -1 | sed 's/^### v\([0-9][0-9.]*\).*/\1/')
+if [ -z "$CHANGELOG_VERSION" ]; then
+    echo "MISSING  README.md: no changelog header found"
+    ERRORS=$((ERRORS + 1))
+elif [ "$CHANGELOG_VERSION" = "$EXPECTED" ]; then
+    echo "ok       README.md changelog header: v${CHANGELOG_VERSION}"
+else
+    NEWER_VERSION=$(printf '%s\n%s\n' "$EXPECTED" "$CHANGELOG_VERSION" \
+        | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+    if [ "$NEWER_VERSION" = "$CHANGELOG_VERSION" ]; then
+        echo "PENDING  README.md changelog header: v${CHANGELOG_VERSION}" \
+            "(awaits build.zig.zon bump at release prep, currently ${EXPECTED})"
+    else
+        echo "MISMATCH README.md changelog header: v${CHANGELOG_VERSION} (expected ${EXPECTED})"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
 echo ""
 if [ "$ERRORS" -gt 0 ]; then
     echo "FAILED: ${ERRORS} version mismatch(es) found"
-    echo "  Sections 1, 2, and 4 must be ${EXPECTED} before tagging v${EXPECTED}."
+    echo "  Sections 1, 2, 4, and 7 must be ${EXPECTED} before tagging v${EXPECTED}."
     echo "  Sections 3 and 5 must match the latest remote tag."
     exit 1
 else

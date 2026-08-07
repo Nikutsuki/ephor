@@ -1201,7 +1201,7 @@ Ephor uses three testing layers:
 
 ## Changelog
 
-### v0.14.3 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (unreleased)
+### v0.15.0 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (unreleased)
 
 **Changed (ZA703 default flip):** Error values and error set members now
 default to `TitleCase` (`error.FileNotFound`), matching the stdlib and

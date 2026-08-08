@@ -7149,24 +7149,229 @@ fn trackOwnerVariables(
     return owner_vars;
 }
 
-/// Check if ownership is transferred in a line using owner variables
+/// Check if ownership is transferred in a line using owner variables.
+/// `scan.managed_ptr` is the per-function managed-pointer signal: the
+/// owner is the receiver of a `.free(`/`.destroy(` call somewhere in the
+/// function, so passing it into another object's method is a handoff
+/// (EPH-I0066). The signal is per alloc name: every tracked owner var of
+/// the alloc shares it, a marginal over-credit when owner vars diverge
+/// (review Q3). `idx` locates the line in `scan.lines` for the
+/// wrapped-call backward join.
 fn checkOwnershipInLine(
     t: []const u8,
-    owner_vars: []const OwnerVar,
+    scan: DeferScanCtx,
+    idx: usize,
 ) bool {
-    for (owner_vars) |ov| {
+    for (scan.owner_vars) |ov| {
         if (!containsIdentifier(t, ov.name)) continue;
 
         // Direct return of owner variable
         if (mem.startsWith(u8, t, "return ")) return true;
 
+        // Guard-style embedded return: `if (cond) return ptr;` transfers
+        // ownership on that path (EPH-I0273).
+        if (hasEmbeddedReturnTransfer(t, ov.name)) return true;
+
         // Labeled break transfers ownership out of a block
         if (mem.startsWith(u8, t, "break :")) return true;
 
         if (isContainerTransfer(t, ov.name)) return true;
-        if (isReallocConsume(t, ov.name)) return true;
         if (isDerefTransfer(t, ov.name)) return true;
         if (isFieldOrGlobalStore(t, ov.name)) return true;
+        // Managed-pointer handoff into a container method (EPH-I0066)
+        if (scan.managed_ptr and isContainerArgHandoff(t, scan.lines, idx, ov.name))
+            return true;
+    }
+    return false;
+}
+
+/// Word-bounded `return <name>;` (bare-ident shape) anywhere in the line,
+/// outside strings and comments — the guard-style handoff `if (cond)
+/// return ptr;` transfers ownership on that path (EPH-I0273). Only the
+/// exact shape counts: reads (`return ptr.len;`), comparisons (`return
+/// ptr != null;`), and calls (`return wrap(ptr);`) read the value without
+/// transferring it. Comment text and string contents never transfer.
+fn hasEmbeddedReturnTransfer(t: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    const code_end = findCommentStart(t) orelse t.len;
+    var cls = LineClassifier.init(t);
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..code_end], "return ")) |rel| {
+        const pos = s + rel;
+        s = pos + "return ".len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (cls.isInsideString(pos)) continue;
+        const expr = t[pos + "return ".len .. code_end];
+        if (!mem.startsWith(u8, expr, name)) continue;
+        var end = name.len;
+        if (end < expr.len and isIdent(expr[end])) continue;
+        while (end < expr.len and (expr[end] == ' ' or expr[end] == '\t')) end += 1;
+        if (end < expr.len and expr[end] == ';') return true;
+    }
+    return false;
+}
+
+/// True when the function frees `name` through a custom free/destroy
+/// METHOD on the value itself (`dst_link.free(self.page)`) — the
+/// managed-pointer signal: the value's type owns its memory and hands it
+/// off through methods (EPH-I0066). `allocator.free(name)` never matches:
+/// the allocator is the receiver there. A dotted receiver (`x.link.free(
+/// p)`) never matches either: only a bare-identifier receiver proves the
+/// LOCAL value is managed, not a same-named field of another object
+/// (review Q1). Masked against strings and trailing comments.
+fn hasManagedFreeReceiver(lines: []const []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        const code_end = findCommentStart(t) orelse t.len;
+        var cls = LineClassifier.init(t);
+        var pos: usize = 0;
+        while (pos < code_end) {
+            const free_rel = mem.indexOf(u8, t[pos..code_end], ".free(") orelse code_end;
+            const destroy_rel = mem.indexOf(u8, t[pos..code_end], ".destroy(") orelse code_end;
+            const rel = @min(free_rel, destroy_rel);
+            if (rel == code_end) break;
+            const dot = pos + rel;
+            pos = dot + 1;
+            if (cls.isInsideString(dot)) continue;
+            var start = dot;
+            while (start > 0 and isIdent(t[start - 1])) start -= 1;
+            if (start == dot) continue;
+            // The receiver must be a bare identifier: a field access
+            // (`x.link.free(`) frees another object's field, which says
+            // nothing about the local's type (review Q1).
+            if (start > 0 and t[start - 1] == '.') continue;
+            if (mem.eql(u8, t[start..dot], name)) return true;
+        }
+    }
+    return false;
+}
+
+/// The container-store handoff: `name` sits as a DIRECT argument (not a
+/// receiver, not inside a tuple literal) of a method call on a dotted
+/// receiver: `self.page.hyperlink_set.addWithIdContext(..., name, ...)`.
+/// Wrapped calls open the method on an earlier line, so the masked
+/// preceding lines join the scan backward, bounded by the join buffer
+/// (EPH-I0066). Callers gate on hasManagedFreeReceiver: a value whose
+/// type carries a `.free(`/`.destroy(` method is owned, and passing it
+/// into another object's method is the transfer. A read-only method with
+/// the same shape (`self.hyperlink_set.contains(dst_link)`) also credits:
+/// the model cannot distinguish a store from a read on a dotted receiver
+/// (disclosed over-credit bound, review r2). Plain functions
+/// (`f(name)`) and single-ident receivers (`list.append(name)`) stay
+/// outside this detector; the stdlib container methods keep their own
+/// path. Runs on comment-stripped, string-blanked code.
+fn isContainerArgHandoff(
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+    name: []const u8,
+) bool {
+    if (name.len == 0) return false;
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var join_buf: [max_join_bytes]u8 = undefined;
+    // The masked line aliases blank_buf: re-mask after the join loop
+    // clobbers it with the preceding lines' masks.
+    const code = maskedCodeLine(t, &blank_buf);
+    if (handoffOccurrences("", code, name, &join_buf)) return true;
+    var acc: [max_join_bytes]u8 = undefined;
+    var prev_idx = [_]usize{0} ** max_join_lines;
+    var n: usize = 0;
+    var total: usize = 0;
+    var prev = idx;
+    while (prev > 0 and n < prev_idx.len) {
+        prev -= 1;
+        const prev_line = mem.trim(u8, lines[prev], " \t\r");
+        const code_prev = maskedCodeLine(prev_line, &blank_buf);
+        const cost = if (total > 0) 1 + code_prev.len else code_prev.len;
+        if (total + cost > acc.len) break;
+        prev_idx[n] = prev;
+        n += 1;
+        total += cost;
+    }
+    // Join in natural order (earliest line first): the backward walk from
+    // the occurrence must pass the call's later lines before the earlier
+    // ones, or an unrelated `(` from a preceding statement resolves first.
+    var acc_len: usize = 0;
+    for (0..n) |k| {
+        const li = prev_idx[n - 1 - k];
+        const prev_line = mem.trim(u8, lines[li], " \t\r");
+        const code_prev = maskedCodeLine(prev_line, &blank_buf);
+        if (acc_len > 0) {
+            acc[acc_len] = ' ';
+            acc_len += 1;
+        }
+        @memcpy(acc[acc_len..][0..code_prev.len], code_prev);
+        acc_len += code_prev.len;
+    }
+    return handoffOccurrences(acc[0..acc_len], maskedCodeLine(t, &blank_buf), name, &join_buf);
+}
+
+/// Test every word-bounded occurrence of `name` in `code` against the
+/// enclosing-call test. The occurrence's backward walk sees `prefix`
+/// prepended (the joined preceding lines plus a separator space), so a
+/// wrapped call's opener on an earlier line still resolves. Occurrences
+/// beyond the join buffer are skipped (documented bound).
+fn handoffOccurrences(
+    prefix: []const u8,
+    code: []const u8,
+    name: []const u8,
+    join_buf: []u8,
+) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, code[s..], name)) |rel| {
+        const rel_pos = s + rel;
+        s = rel_pos + name.len;
+        if (rel_pos > 0 and isIdent(code[rel_pos - 1])) continue;
+        if (rel_pos + name.len < code.len and isIdent(code[rel_pos + name.len])) continue;
+        const head_len = prefix.len + 1 + rel_pos;
+        if (head_len > join_buf.len) continue;
+        @memcpy(join_buf[0..prefix.len], prefix);
+        join_buf[prefix.len] = ' ';
+        @memcpy(join_buf[prefix.len + 1 ..][0..rel_pos], code[0..rel_pos]);
+        if (enclosesDottedMethodCall(join_buf[0..head_len], head_len)) return true;
+    }
+    return false;
+}
+
+/// True when the occurrence at `pos` sits in the argument list of a method
+/// call on a dotted receiver (`x.y.method(`), outside any `{...}` literal
+/// group. The backward walk finds the enclosing call opener: the first
+/// `(` whose depth returns to zero, preceded by `.method` with a dotted
+/// receiver chain. A `{` opening at depth zero before that opener means
+/// the occurrence lives in a tuple literal — no transfer.
+fn enclosesDottedMethodCall(t: []const u8, pos: usize) bool {
+    var paren: usize = 0;
+    var brace: usize = 0;
+    var i = pos;
+    while (i > 0) {
+        i -= 1;
+        if (t[i] == ')') {
+            paren += 1;
+            continue;
+        }
+        if (t[i] == '}') {
+            brace += 1;
+            continue;
+        }
+        if (t[i] == '{') {
+            if (brace == 0) return false;
+            brace -= 1;
+            continue;
+        }
+        if (t[i] != '(') continue;
+        if (paren > 0) {
+            paren -= 1;
+            continue;
+        }
+        var m = i;
+        while (m > 0 and isIdent(t[m - 1])) m -= 1;
+        if (m == i) return false;
+        if (m == 0 or t[m - 1] != '.') return false;
+        var r = m - 1;
+        while (r > 0 and (isIdent(t[r - 1]) or t[r - 1] == '.')) r -= 1;
+        if (r == m - 1) return false;
+        return mem.indexOf(u8, t[r .. m - 1], ".") != null;
     }
     return false;
 }
@@ -7182,14 +7387,6 @@ fn isContainerTransfer(t: []const u8, name: []const u8) bool {
         if (after_method < t.len and containsIdentifier(t[after_method..], name)) return true;
     }
     return false;
-}
-
-/// Realloc consumes the old pointer: .realloc(old, new_size)
-/// Owner var must be an argument to realloc, not the result
-fn isReallocConsume(t: []const u8, name: []const u8) bool {
-    const realloc_pos = mem.indexOf(u8, t, ".realloc(") orelse return false;
-    const after_paren = realloc_pos + ".realloc(".len;
-    return after_paren < t.len and containsIdentifier(t[after_paren..], name);
 }
 
 /// Pointer deref assignment: out.* = data (transfers to caller)
@@ -7354,12 +7551,14 @@ const BlockCoverageState = struct {
 };
 
 /// Per-allocation inputs for the defer-coverage block scan: the function
-/// lines, the allocation name being matched, and its tracked owner vars.
+/// lines, the allocation name being matched, its tracked owner vars, and
+/// the managed-pointer signal (EPH-I0066).
 const DeferScanCtx = struct {
     lines: []const []const u8,
     func_line: usize,
     alloc_name: []const u8,
     owner_vars: []const OwnerVar,
+    managed_ptr: bool,
 };
 
 /// Scan CFG blocks for defer, free, and ownership patterns
@@ -7425,7 +7624,8 @@ fn scanSingleBlock(
             state.has_direct_free[bid] = true;
         }
         if (freed and mem.startsWith(u8, t, "return")) return_after = true;
-        if (checkOwnershipInLine(t, scan.owner_vars)) state.ownership_transferred[bid] = true;
+        if (checkOwnershipInLine(t, scan, idx))
+            state.ownership_transferred[bid] = true;
     }
     if (freed and return_after) state.free_and_return[bid] = true;
 }
@@ -7520,12 +7720,17 @@ fn checkDeferCoverageForAlloc(
     var owner_vars = try trackOwnerVariables(ctx, alloc.name);
     defer owner_vars.deinit(allocator);
 
+    // Managed-pointer signal: the value is the receiver of a custom
+    // `.free(`/`.destroy(` call in this function (EPH-I0066).
+    const managed_ptr = hasManagedFreeReceiver(ctx.body.lines, alloc.name);
+
     const num_blocks = ctx.cfg.blocks.items.len;
     var state = try scanBlocksForPatterns(allocator, ctx.cfg, .{
         .lines = ctx.body.lines,
         .func_line = ctx.body.func_line,
         .alloc_name = alloc.name,
         .owner_vars = owner_vars.items,
+        .managed_ptr = managed_ptr,
     }, num_blocks);
     defer state.deinit(allocator);
 
@@ -7653,7 +7858,6 @@ const TryAlloc = struct {
     name: []const u8,
     line: usize,
     col: usize,
-    indent: usize = 0,
     has_errdefer: bool = false,
     is_create: bool,
 };
@@ -7661,25 +7865,8 @@ const TryAlloc = struct {
 /// Errdefer/defer statement info
 const ErrdeferInfo = struct {
     line: usize,
-    indent: usize = 0,
     content: []const u8,
 };
-
-/// Check if function uses any no-free allocator type (type-based detection).
-/// Scans for stdlib type initialization patterns — not variable names.
-fn hasNoFreeAllocatorType(lines: []const []const u8) bool {
-    // Check for no-free allocator TYPE initialization patterns (compat layer)
-    const no_free_pats = compat.getNoFreeInitPatterns();
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        for (no_free_pats) |pat| {
-            if (mem.indexOf(u8, t, pat) != null) return true;
-        }
-    }
-    // Also check for no-free allocator TYPE in parameter annotations
-    return hasNoFreeAllocatorParameter(lines);
-}
 
 /// Check if line contains a try allocation (not in no-free allocator)
 fn isTryAllocation(t: []const u8) bool {
@@ -7832,11 +8019,17 @@ const TransferBraceScan = struct {
     depth: usize = 0,
     pos: usize = 0,
     overflowed: bool = false,
+    /// Brace-kind classification for this scan: false (default) counts
+    /// control braces (isControlBrace — the transfer gate); true counts
+    /// scope braces (isScopeBrace — the span walk, labeled blocks
+    /// included, EPH-I0832). Additive: Set A's call sites keep the
+    /// default.
+    scope_braces: bool = false,
 };
 
 /// Advance `scan` over `code[scan.pos..col]` (ascending queries only).
-/// Returns the control-brace depth at `col`, or null once the stack
-/// overflowed — the caller stops crediting transfers (fail-safe).
+/// Returns the brace depth at `col`, or null once the stack overflowed —
+/// the caller stops crediting transfers (fail-safe).
 fn scanBraceDepth(scan: *TransferBraceScan, code: []const u8, col: usize) ?usize {
     while (scan.pos < col and scan.pos < code.len) : (scan.pos += 1) {
         if (!applyBraceChar(scan, code, scan.pos)) {
@@ -7854,7 +8047,10 @@ fn applyBraceChar(scan: *TransferBraceScan, code: []const u8, pos: usize) bool {
     const c = code[pos];
     if (c == '{') {
         if (scan.len >= max_brace_scan_depth) return false;
-        scan.stack[scan.len] = isControlBrace(code, pos);
+        scan.stack[scan.len] = if (scan.scope_braces)
+            isScopeBrace(code, pos)
+        else
+            isControlBrace(code, pos);
         scan.len += 1;
         if (scan.stack[scan.len - 1]) scan.depth += 1;
         return true;
@@ -7933,7 +8129,6 @@ fn errdeferTransferAnchor(t: []const u8, alloc_name: []const u8) ?usize {
 const BlockCollectState = struct {
     depth: usize = 0,
     start: usize = 0,
-    indent: usize = 0,
     content: std.ArrayListUnmanaged(u8) = .empty,
 
     fn deinit(self: *BlockCollectState, a: Allocator) void {
@@ -7952,10 +8147,10 @@ fn continueBlockCollection(
     if (bs.depth == 0) return false;
     try bs.content.appendSlice(allocator, t);
     try bs.content.append(allocator, ' ');
-    // bs.start/bs.indent are fixed when the block opens and never mutate
-    // during the char scan — hoist the invariant literal out of the loop so
-    // its braces don't count toward nesting depth (ZA302).
-    const site: StmtSite = .{ .line = bs.start, .indent = bs.indent };
+    // bs.start is fixed when the block opens and never mutates during
+    // the char scan — hoist the invariant literal out of the loop so its
+    // braces don't count toward nesting depth (ZA302).
+    const site: StmtSite = .{ .line = bs.start };
     for (t) |c| {
         if (c == '{') bs.depth += 1;
         if (c == '}' and bs.depth > 0) bs.depth -= 1;
@@ -8009,7 +8204,6 @@ fn collectTryAllocFromLine(
             .name = name,
             .line = site.line,
             .col = alloc_info.col + 1,
-            .indent = site.indent,
             .is_create = alloc_info.is_create,
         });
     }
@@ -8018,7 +8212,6 @@ fn collectTryAllocFromLine(
 /// Source position of a statement (param bundling: file line + indent).
 const StmtSite = struct {
     line: usize,
-    indent: usize,
 };
 
 /// Start collecting an errdefer/defer block.
@@ -8031,7 +8224,6 @@ fn tryAppendCleanupInfo(
     if (!hasRealCleanupPattern(items)) return;
     try errdefers.append(allocator, .{
         .line = site.line,
-        .indent = site.indent,
         .content = try allocator.dupe(u8, items),
     });
 }
@@ -8061,12 +8253,14 @@ fn collectDeferFromLine(
         return;
     }
     ctx.bs.start = site.line;
-    ctx.bs.indent = site.indent;
     ctx.bs.depth = 1;
     ctx.bs.content.clearRetainingCapacity();
-    try ctx.bs.content.appendSlice(ctx.allocator, content);
+    // Keep the statement prefix in the collected content so the cleanup
+    // record preserves the defer/errdefer kind (EPH-I0367); the depth
+    // scan skips the opening brace exactly like the prefix-stripped form.
+    try ctx.bs.content.appendSlice(ctx.allocator, t);
     try ctx.bs.content.append(ctx.allocator, ' ');
-    for (content[1..]) |c| {
+    for (t[prefix_len + 1 ..]) |c| {
         if (c == '{') ctx.bs.depth += 1;
         if (c == '}' and ctx.bs.depth > 0) ctx.bs.depth -= 1;
     }
@@ -8076,19 +8270,109 @@ fn collectDeferFromLine(
     }
 }
 
+/// A matched errdefer/defer plus the scope spans the trigger test needs:
+/// the errdefer's own block close and the alloc's scope close (both 0 =
+/// function end). The alloc's span bounds the trigger too: a trigger
+/// after the alloc's block closes cannot leak it (EPH-I0830).
+const MatchedCleanup = struct {
+    ed: ErrdeferInfo,
+    ed_scope_end: usize,
+    alloc_scope_end: usize,
+};
+
+/// True when the `{` at `pos` opens a BLOCK SCOPE for the span walk: a
+/// control brace (isControlBrace's semantics), a labeled block
+/// (`blk: {`), or a guard-keyword block. Value literals (`Type{`, `.{`)
+/// never open scopes. Dedicated to scopeEndOf — isControlBrace stays
+/// shared with the transfer gate (EPH-I0832).
+fn isScopeBrace(code: []const u8, pos: usize) bool {
+    if (pos == 0) return false;
+    var i = pos;
+    while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t')) i -= 1;
+    if (i == 0) return false;
+    const c = code[i - 1];
+    if (c == ')' or c == '|' or c == '>') return true;
+    if (c == ':') return true;
+    if (c == '.') return false;
+    if (!isIdent(c)) return false;
+    var start = i - 1;
+    while (start > 0 and isIdent(code[start - 1])) start -= 1;
+    const word = code[start..i];
+    for (control_brace_keywords) |kw| {
+        if (mem.eql(u8, word, kw)) return true;
+    }
+    return false;
+}
+
+/// Line where the scope containing `line` closes, or 0 when it runs to
+/// the function end: the first POSITION at or after `line` whose
+/// scope-brace depth drops below the depth at `line`'s start. The
+/// position-level sampling sees the mid-line `} else {` dip that
+/// line-end sampling misses, so an errdefer in an if-block never covers
+/// a chained else/else-if trigger (EPH-I0832). Uses TransferBraceScan's
+/// machinery with the isScopeBrace classification (labeled blocks
+/// included; value literals never open scopes). On a brace-stack
+/// overflow (nesting past 64) the walk returns 0 — for the alloc span
+/// that reads as unbounded (loud: every trigger counts); for the
+/// errdefer span it reads as in-force (quiet: covered) — the fail-open
+/// direction, reachable only past 64-deep nesting. The fn-body brace
+/// classifies non-scope under isScopeBrace (a return type precedes the
+/// `{`, e.g. `!void {`), so fn-level spans compute 0 — the correct "to
+/// function end" verdict either way, and the relative-depth comparisons
+/// are offset-neutral across the two walks.
+fn scopeEndOf(line: usize, lines: []const []const u8, func_line: usize) usize {
+    const idx = line - func_line;
+    if (idx >= lines.len) return 0;
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var scan = TransferBraceScan{ .scope_braces = true };
+    for (lines[0..idx]) |l| {
+        const code = maskedCodeLine(l, &blank_buf);
+        scan.pos = 0;
+        _ = scanBraceDepth(&scan, code, code.len) orelse return 0;
+    }
+    const depth = scan.depth;
+    for (idx..lines.len) |i| {
+        const code = maskedCodeLine(lines[i], &blank_buf);
+        scan.pos = 0;
+        var col: usize = 0;
+        while (col < code.len) : (col += 1) {
+            if (code[col] != '}') continue;
+            const d = scanBraceDepth(&scan, code, col + 1) orelse return 0;
+            if (d < depth) return func_line + i;
+        }
+        // Drain the remainder: an opener-only line (`if (d) {`) must
+        // still be applied, or its `}` pops the errdefer block's frame
+        // and the span closes early (EPH-I0833).
+        _ = scanBraceDepth(&scan, code, code.len) orelse return 0;
+    }
+    return 0;
+}
+
 /// Find an errdefer/defer that actually covers this allocation.
-/// Coverage heuristic (documented): the statement must appear AFTER the alloc
-/// line at the same or deeper indentation. A statement before the alloc can
-/// only be a coincidental name match (Zig forbids use-before-decl), and a
-/// shallower one cannot reference the alloc's variable either.
+/// Coverage heuristic (documented): the statement must appear AFTER the
+/// alloc line, and the trigger must sit inside BOTH the alloc's scope
+/// and the errdefer's scope. A statement before the alloc can only be a
+/// coincidental name match (Zig forbids use-before-decl). A nested
+/// errdefer cancels at its block's normal exit WITHOUT freeing, so it
+/// covers only triggers inside its own block span (EPH-I0367, band-B03
+/// F3; the spans come from scopeEndOf). A nested DEFER runs at the block
+/// close and frees there, so it covers everything after it; the
+/// non-dominating-branch shape (`if (c) { defer free(buf); }` with the
+/// if untaken) stays a disclosed line-order bound.
 fn findMatchingErrdefer(
     errdefers_list: []const ErrdeferInfo,
     alloc: *const TryAlloc,
-) ?usize {
+    lines: []const []const u8,
+    func_line: usize,
+) ?MatchedCleanup {
     for (errdefers_list) |ed| {
         if (ed.line <= alloc.line) continue;
-        if (ed.indent < alloc.indent) continue;
-        if (containsIdentifier(ed.content, alloc.name)) return ed.line;
+        if (!containsIdentifier(ed.content, alloc.name)) continue;
+        return .{
+            .ed = ed,
+            .ed_scope_end = scopeEndOf(ed.line, lines, func_line),
+            .alloc_scope_end = scopeEndOf(alloc.line, lines, func_line),
+        };
     }
     return null;
 }
@@ -8104,25 +8388,39 @@ const ErrdeferGapCtx = struct {
 };
 
 /// Per-trigger gap test: a trigger (try or error-return) after the alloc
-/// leaks unless a covering errdefer sits between the alloc and the trigger.
+/// leaks unless a covering errdefer/defer sits between the alloc and the
+/// trigger. A defer always covers (it runs at its block's close); an
+/// errdefer covers only while its own block is open AND the alloc is
+/// still alive — the block's normal exit cancels the errdefer without
+/// freeing (EPH-I0367, band-B03 F3; spans from scopeEndOf).
 fn isGapTrigger(
     alloc: *const TryAlloc,
-    errdefer_line: usize,
+    matched: ?MatchedCleanup,
     trigger_line: usize,
 ) bool {
     if (trigger_line <= alloc.line) return false;
-    if (alloc.has_errdefer and errdefer_line > alloc.line and
-        errdefer_line < trigger_line) return false;
-    return !alloc.has_errdefer or errdefer_line >= trigger_line;
+    const m = matched orelse return !alloc.has_errdefer;
+    if (alloc.has_errdefer and m.ed.line > alloc.line and m.ed.line < trigger_line) {
+        const is_errdefer = mem.startsWith(u8, m.ed.content, "errdefer");
+        if (!is_errdefer) return false;
+        const alive = m.alloc_scope_end == 0 or trigger_line < m.alloc_scope_end;
+        const in_force = m.ed_scope_end == 0 or trigger_line < m.ed_scope_end;
+        // Covered when the alloc is dead (its block closed) or the
+        // errdefer is still in force; the alive-with-closed-errdefer case
+        // is the gap.
+        if (!alive or in_force) return false;
+        return true;
+    }
+    return !alloc.has_errdefer or m.ed.line >= trigger_line;
 }
 
 fn hasErrdeferGap(
     alloc: *const TryAlloc,
-    errdefer_line: usize,
+    matched: ?MatchedCleanup,
     try_lines: []const usize,
 ) bool {
     for (try_lines) |try_line| {
-        if (isGapTrigger(alloc, errdefer_line, try_line)) return true;
+        if (isGapTrigger(alloc, matched, try_line)) return true;
     }
     return false;
 }
@@ -8151,7 +8449,7 @@ fn hasDirectFreeBetween(
 /// to free); an error return covered by a manual free is skipped (idiom).
 fn hasErrorReturnGap(
     alloc: *const TryAlloc,
-    errdefer_line: usize,
+    matched: ?MatchedCleanup,
     ctx: *const ErrdeferGapCtx,
 ) bool {
     const alloc_idx = alloc.line - ctx.func_line;
@@ -8159,7 +8457,7 @@ fn hasErrorReturnGap(
     const stmt_end = ctx.func_line + findAllocStatementEnd(ctx.lines, alloc_idx);
     for (ctx.error_returns) |er| {
         if (er <= stmt_end) continue;
-        if (!isGapTrigger(alloc, errdefer_line, er)) continue;
+        if (!isGapTrigger(alloc, matched, er)) continue;
         if (hasDirectFreeBetween(ctx, alloc, er)) continue;
         return true;
     }
@@ -8174,13 +8472,13 @@ fn checkErrdeferGaps(
 ) !void {
     for (try_allocs) |*alloc| {
         if (alloc.has_errdefer) continue;
-        var errdefer_line: usize = 0;
-        if (findMatchingErrdefer(ctx.errdefers, alloc)) |el| {
-            errdefer_line = el;
+        var matched: ?MatchedCleanup = null;
+        if (findMatchingErrdefer(ctx.errdefers, alloc, ctx.lines, ctx.func_line)) |m| {
+            matched = m;
             alloc.has_errdefer = true;
         }
-        const try_gap = hasErrdeferGap(alloc, errdefer_line, ctx.try_lines);
-        if (!try_gap and !hasErrorReturnGap(alloc, errdefer_line, ctx))
+        const try_gap = hasErrdeferGap(alloc, matched, ctx.try_lines);
+        if (!try_gap and !hasErrorReturnGap(alloc, matched, ctx))
             continue;
         try issues.append(allocator, .{
             .file = ctx.file_path,
@@ -8275,7 +8573,7 @@ fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !
         .idx = idx,
         .no_free_names = ctx.collect_ctx.no_free_names,
     };
-    const site: StmtSite = .{ .line = actual_line, .indent = countIndent(line) };
+    const site: StmtSite = .{ .line = actual_line };
     // Keyword matches must skip string literals/word fragments:
     // @panic("Retry transaction not found") is not a gap trigger.
     const has_try = hasRealKeyword(t, "try ");
@@ -8359,7 +8657,14 @@ fn analyzeCFGErrdeferCoverage(
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     if (!fn_returns_error) return issues;
-    if (hasNoFreeAllocatorType(body.lines)) return issues;
+
+    // No-free suppression is per call site (collectTryAllocFromLine /
+    // isNoFreeAllocLine), never a function-level bail: a no-free pattern
+    // anywhere in the body exempted every alloc in mixed functions and
+    // matched unmasked string contents (EPH-I0370, band-B03 F6). The
+    // call-site recognition covers .allocator() and .get() accessors on
+    // tracked no-free names plus inline stackFallback receivers
+    // (EPH-I0831).
 
     var state = try scanErrdeferLines(
         allocator,
@@ -9574,6 +9879,9 @@ const NoFreeAliasCtx = struct {
 };
 
 /// Scan one signature line for `arena: Allocator`-style parameters.
+/// The scan is unmasked: a default-value string containing
+/// `: *ArenaAllocator` can inject a phantom no-free name (pre-existing
+/// bound, contrived — review Q2).
 fn collectSigArenaParams(
     a: Allocator,
     t: []const u8,
@@ -9587,10 +9895,32 @@ fn collectSigArenaParams(
         while (pname_start > 0 and isIdent(t[pname_start - 1])) pname_start -= 1;
         const pname = t[pname_start..colon_pos];
         const type_str = mem.trim(u8, t[colon_pos + 2 ..], " \t,)");
-        if (pname.len > 0 and isArenaName(pname) and isAllocatorType(type_str))
+        if (pname.len == 0) {
+            search_start = colon_pos + 2;
+            continue;
+        }
+        if (isArenaName(pname) and isAllocatorType(type_str))
             try names.put(a, pname, {});
+        // Type-anchored no-free pointer params (`arena: *ArenaAllocator`):
+        // the type declares the allocator needs no per-allocation free,
+        // so allocs through the param are no-free call sites (EPH-I0370).
+        if (isNoFreePtrType(type_str)) try names.put(a, pname, {});
         search_start = colon_pos + 2;
     }
+}
+
+/// True when `type_str` names a no-free allocator pointer type from the
+/// compat vocabulary (`*ArenaAllocator`, `*std.heap.FixedBufferAllocator`,
+/// ...). Type-anchored, never name-based (EPH-I0370).
+fn isNoFreePtrType(type_str: []const u8) bool {
+    for (compat.getNoFreeTypePtrs()) |ptr_pat| {
+        if (!mem.startsWith(u8, type_str, ptr_pat)) continue;
+        if (type_str.len == ptr_pat.len) return true;
+        const next = type_str[ptr_pat.len];
+        if (next == ',' or next == ' ' or next == '=' or
+            next == ')' or next == '}' or next == ';') return true;
+    }
+    return false;
 }
 
 /// Bundle for trackNoFreeTypeInit (keeps param count legal).
@@ -9602,6 +9932,8 @@ const NoFreeInitCtx = struct {
 
 /// Track variables initialized with known no-free allocator types, including
 /// the anonymous-init form `var fba: std.heap.FixedBufferAllocator = .init(`.
+/// The pattern match is string-masked: `const s = "ArenaAllocator.init(";`
+/// must not mark `s` no-free (EPH-I0370, band-B03 F6).
 fn trackNoFreeTypeInit(
     a: Allocator,
     t: []const u8,
@@ -9609,7 +9941,8 @@ fn trackNoFreeTypeInit(
 ) !void {
     var matched = false;
     for (ctx.no_free_inits) |init_pat| {
-        if (mem.indexOf(u8, t, init_pat) == null) continue;
+        const pos = mem.indexOf(u8, t, init_pat) orelse continue;
+        if (isPatternInString(t, pos)) continue;
         matched = true;
         break;
     }
@@ -9629,15 +9962,18 @@ fn trackNoFreeTypeInit(
     if (type_match) try ctx.names.put(a, ctx.name, {});
 }
 
-/// Track .allocator() aliases: const X = Y.allocator() where Y (or the last
-/// field of a dotted Y) is a tracked no-free variable or file-level field.
+/// Track .allocator() and StackFallbackAllocator .get() aliases:
+/// const X = Y.allocator() / const X = Y.get() where Y (or the last
+/// field of a dotted Y) is a tracked no-free variable or file-level field
+/// (EPH-I0831).
 fn trackAllocatorAlias(
     a: Allocator,
     rhs: []const u8,
     name: []const u8,
     ctx: NoFreeAliasCtx,
 ) !void {
-    const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse return;
+    const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse
+        (mem.indexOf(u8, rhs, ".get()") orelse return);
     const source = rhs[0..dot_alloc];
     if (source.len == 0) return;
     if (isAllIdent(source) and ctx.names.contains(source)) {
@@ -10520,16 +10856,35 @@ fn isNoFreeCallChain(
 
 /// Check if allocation is through a no-free allocator call chain:
 /// X.allocator().method() where X is a tracked no-free variable or field.
+/// True when the allocation on `t` goes through a no-free allocator
+/// accessor chain: `.allocator().` on a tracked no-free source, or
+/// StackFallbackAllocator's `.get().` on a tracked no-free source. An
+/// inline init pattern in the receiver text (`std.heap.stackFallback(
+/// 4096, a).get().alloc(...)`) also anchors through the compat vocab
+/// (EPH-I0831). The names/fields sets keep the match type-anchored.
 fn isNoFreeCallChainFull(
     t: []const u8,
     no_free_names: *const std.StringHashMapUnmanaged(void),
     no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) bool {
-    const chain_marker = ".allocator().";
-    const pos = mem.indexOf(u8, t, chain_marker) orelse return false;
+    if (noFreeChainAt(t, no_free_names, no_free_fields, ".allocator().")) return true;
+    return noFreeChainAt(t, no_free_names, no_free_fields, ".get().");
+}
+
+/// The single-marker form of the no-free chain check: `marker` opens the
+/// accessor, an alloc method must follow, and the source name before the
+/// marker must be tracked; inline no-free init patterns in the receiver
+/// text also anchor (EPH-I0831).
+fn noFreeChainAt(
+    t: []const u8,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+    marker: []const u8,
+) bool {
+    const pos = mem.indexOf(u8, t, marker) orelse return false;
 
     // Verify what follows is an allocator method (short names from compat layer)
-    const after = t[pos + chain_marker.len ..];
+    const after = t[pos + marker.len ..];
     var is_alloc_method = false;
     for (compat.getAllocMethodShortNames()) |short_name| {
         // Check "methodName(" pattern after the chain marker
@@ -10543,25 +10898,31 @@ fn isNoFreeCallChainFull(
     }
     if (!is_alloc_method) return false;
 
-    // Extract source variable/field name before .allocator()
+    // Extract source variable/field name before the accessor marker
     var start = pos;
     while (start > 0 and isIdent(t[start - 1])) start -= 1;
-    if (start >= pos) return false;
-    const source = t[start..pos];
+    if (start < pos) {
+        const source = t[start..pos];
+        // Check local variable names (e.g. arena.allocator().alloc())
+        if (no_free_names.contains(source)) return true;
 
-    // Check local variable names (e.g. arena.allocator().alloc())
-    if (no_free_names.contains(source)) return true;
+        // Check struct field names (e.g. self.arena.allocator().alloc())
+        if (no_free_fields) |fields| {
+            if (fields.contains(source)) return true;
+        }
 
-    // Check struct field names (e.g. self.arena.allocator().alloc())
-    // The source before .allocator() is a field name in a dotted chain
-    if (no_free_fields) |fields| {
-        if (fields.contains(source)) return true;
+        // Name-based heuristic: if the immediate source before the
+        // accessor is named "arena" (or contains "arena"), treat as
+        // no-free (cross-file support).
+        if (isArenaName(source)) return true;
     }
 
-    // Name-based heuristic: if the immediate source before .allocator() is named
-    // "arena" (or contains "arena"), treat as no-free (cross-file support).
-    if (isArenaName(source)) return true;
-
+    // Inline no-free inits in the receiver (`std.heap.stackFallback(
+    // 4096, a).get().alloc(...)`): the stdlib type pattern is the
+    // anchor (EPH-I0831).
+    for (compat.getNoFreeInitPatterns()) |init_pat| {
+        if (mem.indexOf(u8, t[0..pos], init_pat) != null) return true;
+    }
     return false;
 }
 
@@ -10572,7 +10933,10 @@ const ownership_lang_patterns = [_][]const u8{
     "@ptrCast", // Pointer cast
     "@alignCast", // Alignment cast
     ".ptr", // Slice reassignment
-    ".realloc(", // Realloc consumes old pointer
+    // `.realloc(` is intentionally absent: realloc keeps ownership with
+    // the same local — success rebinds the (possibly moved) allocation,
+    // failure leaves the OLD buffer allocated, so the transfer scan must
+    // not credit it (EPH-I0366, band-B03 F2).
 };
 
 /// Check if ownership is transferred via cast, reassignment, or container
@@ -34844,6 +35208,806 @@ test "ZA103: real store after a string mention still transfers (EPH-I0369 lock)"
     try std.testing.expect(countRuleIssues(
         run.issues.items,
         "test_real_after_string.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA101: guard-style embedded return transfers ownership (EPH-I0273)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // messenger process_path shape: `if (cond) return ptr;` one-liner
+    // handoffs were invisible to checkOwnershipInLine (line-initial return
+    // only), so the guard drew a false ZA101 while its braced twin stayed
+    // silent. The embedded-return scan must match the braced verdict.
+    const content =
+        \\fn process_path(allocator: std.mem.Allocator, input: []const u8, keep: bool) ![]u8 {
+        \\    const path = try allocator.dupe(u8, input);
+        \\    if (keep) return path;
+        \\    return error.Invalid;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_guard_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_guard_return.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: embedded return in string or comment does not transfer (EPH-I0273 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Prose fakes no coverage: the guard shape inside a string literal and
+    // in a trailing comment must not suppress the real leak warning.
+    const content =
+        \\fn masked_guard(allocator: std.mem.Allocator) ![]u8 {
+        \\    const path = try allocator.dupe(u8, "x");
+        \\    const help = "if (keep) return path;";
+        \\    // if (keep) return path;
+        \\    _ = help;
+        \\    return error.Invalid;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_masked_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_masked_guard.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+
+    // The read shapes the detector's doc claims are non-transfers: field
+    // reads, comparisons, and calls with the alloc as an argument must
+    // not credit the handoff either (review r2).
+    const reads =
+        \\fn read_shapes(allocator: std.mem.Allocator, keep: bool, cond: bool) ![]u8 {
+        \\    const path = try allocator.dupe(u8, "x");
+        \\    if (keep) return path.len;
+        \\    if (cond) return path != null;
+        \\    if (cond) return wrap(path);
+        \\    return error.Invalid;
+        \\}
+        \\fn wrap(p: []u8) []u8 {
+        \\    return p;
+        \\}
+    ;
+    var run2 = try runCFGMemoryTest(&diag, allocator, "test_guard_reads.zig", reads);
+    defer run2.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run2.issues.items,
+        "test_guard_reads.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "hasManagedFreeReceiver rejects dotted receivers (review Q1)" {
+    const dotted = [_][]const u8{"    x.dst_link.free(self.page);"};
+    const bare = [_][]const u8{"    dst_link.free(self.page);"};
+    try std.testing.expect(!hasManagedFreeReceiver(&dotted, "dst_link"));
+    try std.testing.expect(hasManagedFreeReceiver(&bare, "dst_link"));
+}
+
+test "ZA101: managed-pointer handoff into a container method transfers (EPH-I0066)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ghostty PageList shape: the dupe result is stored into
+    // hyperlink_set.addWithIdContext (custom method, allocator unreachable
+    // via call args) and the error path frees manually inside the labeled
+    // catch. The managed-pointer signal — dst_link.free(self) — bounds the
+    // handoff credit: without it the model cannot know the call takes
+    // ownership and keeps warning (locked below).
+    const content =
+        \\const Link = struct {
+        \\    uri: []const u8,
+        \\    fn free(self: *const Link, page: anytype) void {
+        \\        _ = self;
+        \\        _ = page;
+        \\    }
+        \\};
+        \\const LinkSet = struct {
+        \\    fn addWithIdContext(self: *LinkSet, memory: anytype, link: *const Link, id: u32) !u32 {
+        \\        _ = self;
+        \\        _ = memory;
+        \\        _ = link;
+        \\        _ = id;
+        \\        return 0;
+        \\    }
+        \\};
+        \\const Page = struct { hyperlink_set: LinkSet };
+        \\const src_link = struct {
+        \\    fn dupe(src_page: anytype, page: anytype) !*const Link {
+        \\        _ = src_page;
+        \\        _ = page;
+        \\        return @constCast(&Link{ .uri = "" });
+        \\    }
+        \\};
+        \\fn copyCellHyperlink(self: *Page, src_page: anytype, src_id: u32, c: bool) !void {
+        \\    if (c) hyperlink: {
+        \\        const dst_link = src_link.dupe(src_page, self) catch |err| {
+        \\            _ = err;
+        \\            break :hyperlink;
+        \\        };
+        \\        const dst_id = self.hyperlink_set.addWithIdContext(0, dst_link, src_id, .{ .page = self }) catch |err| id: {
+        \\            dst_link.free(self);
+        \\            _ = err;
+        \\            break :id 0;
+        \\        } orelse src_id;
+        \\        _ = dst_id;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_container_handoff.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_container_handoff.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: wrapped container-call handoff still transfers (EPH-I0066 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The zig-fmt wrapped form of the ghostty shape: the argument sits on
+    // a later line than the method opener, so the handoff detector must
+    // join the preceding lines backward (review r2).
+    const content =
+        \\const Link = struct {
+        \\    uri: []const u8,
+        \\    fn free(self: *const Link, page: anytype) void {
+        \\        _ = self;
+        \\        _ = page;
+        \\    }
+        \\};
+        \\const LinkSet = struct {
+        \\    fn addWithIdContext(self: *LinkSet, memory: anytype, link: *const Link, id: u32) !u32 {
+        \\        _ = self;
+        \\        _ = memory;
+        \\        _ = link;
+        \\        _ = id;
+        \\        return 0;
+        \\    }
+        \\};
+        \\const Page = struct { hyperlink_set: LinkSet };
+        \\const src_link = struct {
+        \\    fn dupe(src_page: anytype, page: anytype) !*const Link {
+        \\        _ = src_page;
+        \\        _ = page;
+        \\        return @constCast(&Link{ .uri = "" });
+        \\    }
+        \\};
+        \\fn copyCellHyperlink(self: *Page, src_page: anytype, src_id: u32, c: bool) !void {
+        \\    if (c) hyperlink: {
+        \\        const dst_link = src_link.dupe(src_page, self) catch |err| {
+        \\            _ = err;
+        \\            break :hyperlink;
+        \\        };
+        \\        const dst_id = self.hyperlink_set.addWithIdContext(
+        \\            self.page.memory,
+        \\            dst_link,
+        \\            src_id,
+        \\            .{ .page = self },
+        \\        ) catch |err| id: {
+        \\            dst_link.free(self);
+        \\            _ = err;
+        \\            break :id 0;
+        \\        } orelse src_id;
+        \\        _ = dst_id;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_wrapped_handoff.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_wrapped_handoff.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: handoff without the managed-receiver signal still warns (EPH-I0066 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The lock side of the EPH-I0066 boundary: the same container call
+    // without `dst_link.free(...)` anywhere — the managed signal is
+    // absent, so the model cannot credit the handoff and stays loud.
+    const content =
+        \\const Link = struct {
+        \\    uri: []const u8,
+        \\    fn free(self: *const Link, page: anytype) void {
+        \\        _ = self;
+        \\        _ = page;
+        \\    }
+        \\};
+        \\const LinkSet = struct {
+        \\    fn addWithIdContext(self: *LinkSet, memory: anytype, link: *const Link, id: u32) !u32 {
+        \\        _ = self;
+        \\        _ = memory;
+        \\        _ = link;
+        \\        _ = id;
+        \\        return 0;
+        \\    }
+        \\};
+        \\const Page = struct { hyperlink_set: LinkSet };
+        \\const src_link = struct {
+        \\    fn dupe(src_page: anytype, page: anytype) !*const Link {
+        \\        _ = src_page;
+        \\        _ = page;
+        \\        return @constCast(&Link{ .uri = "" });
+        \\    }
+        \\};
+        \\fn copyCellHyperlink(self: *Page, src_page: anytype, src_id: u32, c: bool) !void {
+        \\    const dst_link = src_link.dupe(src_page, self) catch |err| {
+        \\        _ = err;
+        \\        return error.Failed;
+        \\    };
+        \\    _ = self.hyperlink_set.addWithIdContext(0, dst_link, src_id, .{ .page = self }) catch |err| id: {
+        \\        _ = err;
+        \\        break :id 0;
+        \\    };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_handoff_unmanaged.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_handoff_unmanaged.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA103: realloc-with-try is not a transfer (EPH-I0366)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B03 F2: `.realloc(` marked `buf = try allocator.realloc(buf, n);`
+    // as a transfer, but realloc failure leaves the OLD buffer owned by the
+    // local — with no errdefer the error path leaks. Both analyzers must
+    // stay loud on the grow-buffer idiom.
+    const content =
+        \\fn grow(allocator: std.mem.Allocator, n: usize) !void {
+        \\    var buf = try allocator.alloc(u8, 16);
+        \\    buf = try allocator.realloc(buf, n);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_realloc_grow.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_realloc_grow.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 1);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) == 1);
+}
+
+test "ZA103: realloc with errdefer stays silent (EPH-I0366 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The realloc line itself stays a try-exit for ZA103; a same-scope
+    // errdefer between the alloc and the realloc covers it.
+    const content =
+        \\fn grow(allocator: std.mem.Allocator, n: usize) !void {
+        \\    var buf = try allocator.alloc(u8, 16);
+        \\    errdefer allocator.free(buf);
+        \\    buf = try allocator.realloc(buf, n);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_realloc_ok.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_realloc_ok.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) == 0);
+}
+
+test "ZA103: nested-scope errdefer does not cover a later trigger (EPH-I0367)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B03 F3: the errdefer inside the if-block cancels at the block's
+    // normal exit, so the try after the block leaks on error. The
+    // block-span coverage model (scopeEndOf) closes the errdefer's span at
+    // the if-block's close, so the later trigger reads as a gap.
+    const content =
+        \\fn nested_ed(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        errdefer allocator.free(buf);
+        \\    }
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_ed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_nested_ed.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: same-scope errdefer covers (EPH-I0367 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The lock side: the errdefer at the alloc's own scope runs at the
+    // function's error exit, so the later try stays covered.
+    const content =
+        \\fn same_scope_ed(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_same_scope_ed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_same_scope_ed.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: nested defer still covers (EPH-I0367 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A nested DEFER runs at its block's close and frees there — unlike a
+    // nested errdefer, it covers triggers after the block (ephor's own
+    // scanRecursive shape: per-iteration path freed by the arm's defer).
+    const content =
+        \\fn nested_defer(allocator: std.mem.Allocator, kind: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (kind) {
+        \\        0 => {
+        \\            defer allocator.free(buf);
+        \\            try ping();
+        \\        },
+        \\        else => {
+        \\            defer allocator.free(buf);
+        \\            try ping();
+        \\        },
+        \\    }
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_nested_defer.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: nested errdefer covers in-block triggers (EPH-I0830)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review probe P16b: the switch-arm errdefer IS registered before the
+    // in-arm try, and the arm's error exit runs it — the trigger inside
+    // the block is covered. The normal-path free after the switch covers
+    // the rest, so no path leaks. The block-span model must not reject
+    // the nested errdefer wholesale (review r2).
+    const content =
+        \\fn arm_ed(allocator: std.mem.Allocator, kind: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (kind) {
+        \\        0 => {
+        \\            errdefer allocator.free(buf);
+        \\            try ping();
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arm_ed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_arm_ed.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: errdefer in an if-block does not cover a chained else trigger (EPH-I0832)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review S1: the errdefer cancels at the if-block's close, and the
+    // c=false path never registers it — the else-block's try leaks.
+    // Line-end depth sampling missed the mid-line `} else {` dip.
+    const content =
+        \\fn s1_else_chain(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        errdefer allocator.free(buf);
+        \\        try ping();
+        \\    } else {
+        \\        try ping2();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn ping() !void {}
+        \\fn ping2() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_s1_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_s1_else.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: errdefer in an if-arm does not cover a later else-if trigger (EPH-I0832)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review S2: the same mis-span through the `} else if (` chain.
+    const content =
+        \\fn s2_else_if(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        errdefer allocator.free(buf);
+        \\        try ping();
+        \\    } else if (d) {
+        \\        try ping2();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn ping() !void {}
+        \\fn ping2() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_s2_elseif.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_s2_elseif.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: errdefer in a labeled block does not cover a later trigger (EPH-I0832)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review S5: `blk: {` is a value brace under isControlBrace, but it
+    // OPENS a scope — break :blk exits it normally, canceling the
+    // errdefer. The span walk's isScopeBrace classification counts it.
+    const content =
+        \\fn s5_labeled(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const x = blk: {
+        \\        errdefer allocator.free(buf);
+        \\        try ping();
+        \\        break :blk @as(u32, 1);
+        \\    };
+        \\    try ping2();
+        \\    allocator.free(buf);
+        \\    _ = x;
+        \\}
+        \\fn ping() !void {}
+        \\fn ping2() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_s5_label.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_s5_label.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: errdefer covers a trigger in a nested block inside its span (EPH-I0832 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review S3 lock: the nested if inside the errdefer's block must not
+    // close the span early — the deeper trigger is still covered by the
+    // errdefer's block error exit.
+    const content =
+        \\fn s3_nested_if(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        errdefer allocator.free(buf);
+        \\        if (d) {
+        \\            try ping();
+        \\        }
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_s3_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_s3_nested.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: nested block inside the errdefer's span does not close it early (EPH-I0833)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review S8: the errdefer's block contains a nested multi-line block
+    // AND a later trigger at the errdefer's own level. The block error
+    // exit runs the errdefer, so the later trigger is covered. The
+    // forward walk must apply the nested block's opener line, or the
+    // nested close pops the errdefer's frame and the span ends early.
+    const content =
+        \\fn s8_nested_then_trigger(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        errdefer allocator.free(buf);
+        \\        if (d) {
+        \\            try ping();
+        \\        }
+        \\        try ping2();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn ping() !void {}
+        \\fn ping2() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_s8_drain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_s8_drain.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: while-loop inside the errdefer's span does not close it early (EPH-I0833)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review S9: the while-loop variant of the S8 drain shape.
+    const content =
+        \\fn s9_loop_then_trigger(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        errdefer allocator.free(buf);
+        \\        while (d) {
+        \\            try ping();
+        \\        }
+        \\        try ping2();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn ping() !void {}
+        \\fn ping2() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_s9_drain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_s9_drain.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: trigger after the alloc's own block close is not a gap (EPH-I0830 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The alloc is scoped to the if-block with its errdefer; a later
+    // function-level try cannot leak it (the block close ended the
+    // alloc's lifetime). The alloc's own scope span bounds the triggers.
+    const content =
+        \\fn scoped_alloc(allocator: std.mem.Allocator, c: bool) !void {
+        \\    if (c) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        errdefer allocator.free(buf);
+        \\        try ping();
+        \\    }
+        \\    try ping2();
+        \\}
+        \\fn ping() !void {}
+        \\fn ping2() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_scoped_alloc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_scoped_alloc.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: mixed no-free and real allocators both analyzed (EPH-I0370)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B03 F6: the function-level bail exempted every alloc in a
+    // function mentioning a no-free type. The fixture uses the FULL init
+    // form (`FixedBufferAllocator.init(`) so the old bail's substring
+    // matched and silenced the whole function pre-fix (the anonymous
+    // `.init(...)` form evaded it — review r2). The fba-backed alloc is
+    // still suppressed per call site, but the real allocator's alloc now
+    // gets its gap analysis.
+    const content =
+        \\fn mixed(allocator: std.mem.Allocator) !void {
+        \\    var storage: [1024]u8 = undefined;
+        \\    var fba = std.heap.FixedBufferAllocator.init(&storage);
+        \\    const via_fba = try fba.allocator().alloc(u8, 8);
+        \\    _ = via_fba;
+        \\    const real = try allocator.alloc(u8, 16);
+        \\    try ping();
+        \\    _ = real;
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_mixed_nofree.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_mixed_nofree.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: string containing a no-free pattern does not bail (EPH-I0370)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The old bail matched the raw pattern inside a string literal and
+    // silenced the whole function (audit example: `const s =
+    // "ArenaAllocator.init(";`). With the bail gone and the decl tracking
+    // string-masked, the real alloc gets its gap analysis.
+    const content =
+        \\fn str_fn(allocator: std.mem.Allocator) !void {
+        \\    const s = "ArenaAllocator.init(";
+        \\    const buf = try allocator.alloc(u8, 16);
+        \\    try ping();
+        \\    _ = s;
+        \\    _ = buf;
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_string_nofree.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_string_nofree.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: no-free pointer-typed param suppresses per call site (EPH-I0370 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The type-anchored param replacement for the deleted bail: a
+    // `*ArenaAllocator`-typed parameter is a no-free call site, so allocs
+    // through it stay silent without a function-level bail.
+    const content =
+        \\fn param_free(arena: *std.heap.ArenaAllocator) !void {
+        \\    const buf = try arena.alloc(u8, 16);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ptr_param_nofree.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_ptr_param_nofree.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: StackFallbackAllocator .get() chains stay no-free (EPH-I0831)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The deleted bail silenced every stackFallback shape; the per-call
+    // site machinery must now cover all three: the aliased form
+    // (`const a = sfa.get(); a.alloc(`), the named accessor form
+    // (`sfa.get().alloc(`), and the fully inline form
+    // (`std.heap.stackFallback(4096, a).get().alloc(`) — review P25/P26.
+    const content =
+        \\fn alias_sfa(allocator: std.mem.Allocator) !void {
+        \\    var sfa = std.heap.stackFallback(4096, allocator);
+        \\    const a = sfa.get();
+        \\    const buf = try a.alloc(u8, 16);
+        \\    try ping();
+        \\    _ = buf;
+        \\}
+        \\fn named_sfa(allocator: std.mem.Allocator) !void {
+        \\    var sfa = std.heap.stackFallback(4096, allocator);
+        \\    const buf = try sfa.get().alloc(u8, 16);
+        \\    try ping();
+        \\    _ = buf;
+        \\}
+        \\fn inline_sfa(allocator: std.mem.Allocator) !void {
+        \\    const buf = try std.heap.stackFallback(4096, allocator).get().alloc(u8, 16);
+        \\    try ping();
+        \\    _ = buf;
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_sfa_get.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_sfa_get.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
 }

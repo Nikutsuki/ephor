@@ -7204,20 +7204,80 @@ fn isDerefTransfer(t: []const u8, name: []const u8) bool {
         !containsIdentifier(lhs, name);
 }
 
-/// Stored in any struct field (identifier.field = value) or module-level var
+/// Stored into a struct field (identifier.field = value) or a module-level
+/// var — a transfer only when the store TARGET can own the allocation.
+/// A write whose LHS root IS the tracked owner (`buf[0] = v`, `buf.field =
+/// v`, `buf.* = v`, `buf = v`) initializes or rebinds the allocation:
+/// ownership stays in this scope (EPH-I0346, band-B02 F7; EPH-I0825). A
+/// `_` target discards the value, never transfers. The owner value must
+/// sit on the RHS — a store of some other value (`x.buf = y`) moves
+/// nothing. `self.buf = buf` (root `self`) still transfers.
 fn isFieldOrGlobalStore(t: []const u8, name: []const u8) bool {
     const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
     // Skip const/var declarations (those are local)
     if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return false;
-    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-    // Pointer dereference init: name.* = .{...} writes TO allocated memory
-    if (mem.endsWith(u8, lhs, ".*") and containsIdentifier(lhs, name)) return false;
-    // LHS with a dot = struct field storage (e.g., self.x, ctx.y, result.z, node.data)
-    if (mem.indexOf(u8, lhs, ".") != null) return true;
-    // Skip discard patterns: _ = value
-    if (mem.eql(u8, lhs, "_")) return false;
-    // Simple identifier = module-level variable assignment
-    return lhs.len > 0;
+    const root = assignmentTargetRoot(t[0..eq_pos]);
+    if (root.len == 0) return false;
+    if (mem.eql(u8, root, name)) return false;
+    if (mem.eql(u8, root, "_")) return false;
+    return containsIdentifier(t[eq_pos + 3 ..], name);
+}
+
+/// Root identifier of an assignment's store target: the base of the LHS
+/// tail after trailing field accesses, derefs, and subscript groups.
+/// `self.buf` → `self`, `buf[0]` → `buf`, `buf.*` → `buf`,
+/// `if (a) { _` → `_`. Empty when the LHS has no identifier tail
+/// (unbalanced brackets, `(`-led expressions) — no store, no transfer.
+fn assignmentTargetRoot(lhs: []const u8) []const u8 {
+    var end = lhs.len;
+    var root: []const u8 = "";
+    while (end > 0) {
+        end = skipLhsTailSpaces(lhs, end);
+        if (end == 0) break;
+        if (isIdent(lhs[end - 1])) {
+            const start = rootIdentStartBefore(lhs, end);
+            root = lhs[start..end];
+            end = start;
+            continue;
+        }
+        if (lhs[end - 1] == ']') {
+            end = bracketOpenBefore(lhs, end - 1) orelse return "";
+            continue;
+        }
+        if (lhs[end - 1] != '.' and lhs[end - 1] != '*') return root;
+        end -= 1;
+    }
+    return root;
+}
+
+/// Index of the first byte of the identifier whose last byte precedes
+/// `end`.
+fn rootIdentStartBefore(lhs: []const u8, end: usize) usize {
+    var start = end;
+    while (start > 0 and isIdent(lhs[start - 1])) start -= 1;
+    return start;
+}
+
+/// Index of the `[` matching the `]` at `bracket_pos`, or null when the
+/// group is unbalanced (no root, no transfer).
+fn bracketOpenBefore(lhs: []const u8, bracket_pos: usize) ?usize {
+    var depth: usize = 1;
+    var i = bracket_pos;
+    while (i > 0 and depth > 0) {
+        i -= 1;
+        if (lhs[i] == ']') depth += 1;
+        if (lhs[i] == '[') depth -= 1;
+    }
+    if (depth != 0) return null;
+    return i;
+}
+
+/// Index after the trailing spaces of an LHS tail, walking back from
+/// `end`.
+fn skipLhsTailSpaces(lhs: []const u8, end: usize) usize {
+    var i = end;
+    while (i > 0 and (lhs[i - 1] == ' ' or lhs[i - 1] == '\t')) i -= 1;
+    return i;
 }
 
 /// CFG-based defer coverage analysis (ZA101/ZA102).
@@ -7679,7 +7739,20 @@ fn isUncoveredErrorExit(t: []const u8) bool {
     return hasBareIdentReturn(t);
 }
 
-/// Check ownership transfer for errdefer analysis
+/// Check ownership transfer for errdefer analysis. A transfer covers the
+/// alloc only when it sits at brace depth <= the alloc's own depth: a
+/// transfer inside a deeper block covers only its branch path, so a later
+/// trigger on the fall-through is conservatively treated as a gap
+/// (EPH-I0368, band-B03 F4). The bound over-warns: a conditional whose
+/// EVERY branch transfers (both-arms field stores) still reads as a gap
+/// after the block closes — the line-order scan never joins branches (review
+/// r1 fix 2). Comment and multiline-string lines never transfer, and
+/// string contents never match — prose fakes no coverage (EPH-I0369,
+/// band-B03 F5). The scan is line-order; the first dominating transfer or
+/// uncovered exit decides. Residual bound: the alloc and the transfer
+/// share one block, so a transfer that covers the alloc's own paths and a
+/// later exit in another block of the same depth is credited
+/// conservatively.
 fn checkErrdeferOwnershipTransfer(
     alloc: *TryAlloc,
     lines: []const []const u8,
@@ -7693,39 +7766,167 @@ fn checkErrdeferOwnershipTransfer(
     // on the alloc line would falsely match container_ownership_methods)
     const start = alloc_idx + 1;
     if (start >= lines.len) return;
+
+    // Control-brace depth at the alloc's own line, counted from the
+    // function signature line on masked code (strings, char literals,
+    // `\\` tails, and comments never carry braces — EPH-I0369). The scan
+    // position resets per line: scanBraceDepth advances cumulatively and
+    // must see each line from its start (review r1 fix 1).
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var scan = TransferBraceScan{};
+    for (lines[0 .. alloc_idx + 1]) |line| {
+        const code = maskedCodeLine(line, &blank_buf);
+        scan.pos = 0;
+        _ = scanBraceDepth(&scan, code, code.len) orelse return;
+    }
+    const alloc_depth = scan.depth;
+
     var tuple_scan: ReturnTupleScan = .{};
     for (lines[start..]) |line| {
-        const lt = mem.trim(u8, line, " \t\r");
-        // Check for break :label ownership transfer
-        if (mem.indexOf(u8, lt, "break :") != null and containsIdentifier(lt, alloc.name)) {
+        const code = maskedCodeLine(line, &blank_buf);
+        scan.pos = 0;
+        const line_depth = scan.depth;
+        // A transfer inside a conditional block does not dominate the
+        // alloc's fall-through — keep scanning (EPH-I0368).
+        if (dominatingTransferAt(&scan, code, alloc.name, alloc_depth)) {
             alloc.has_errdefer = true;
             return;
         }
-        // Check other ownership transfer patterns
-        if (isOwnershipTransfer(lt, alloc.name)) {
+        // Multi-line `return .{ ... };` tuple: the element transfers at
+        // the depth of the line that carries it (bounded scan).
+        if (checkReturnTupleLine(code, alloc.name, &tuple_scan) and line_depth <= alloc_depth) {
             alloc.has_errdefer = true;
             return;
         }
-        // Check for struct field storage (self.field = alloc_name)
-        if (isStructFieldStorage(lt, alloc.name)) {
-            alloc.has_errdefer = true;
-            return;
-        }
-        // Check for ownership transfer via return (plain + single-line tuple)
-        if (isReturnTransfer(lt, alloc.name)) {
-            alloc.has_errdefer = true;
-            return;
-        }
-        // Check inside a multi-line `return .{ ... };` tuple (bounded scan)
-        if (checkReturnTupleLine(lt, alloc.name, &tuple_scan)) {
-            alloc.has_errdefer = true;
-            return;
-        }
+        _ = scanBraceDepth(&scan, code, code.len) orelse return;
         // Error-path exit BEFORE any transfer: ownership has not moved on
         // this path, so a later transfer cannot cover it. Stop without
         // marking coverage — ZA103 emission decides from real triggers.
-        if (isUncoveredErrorExit(lt)) return;
+        if (isUncoveredErrorExit(mem.trim(u8, line, " \t\r"))) return;
     }
+}
+
+/// Comment-stripped, string-blanked code form of `line`: prose in
+/// comments and literals never carries ownership transfers or braces
+/// (EPH-I0369, band-B03 F5). Lines longer than the mask buffer fall back
+/// to the comment-stripped raw line (documented bound, same as ZC104's
+/// blanking callers).
+fn maskedCodeLine(line: []const u8, buf: []u8) []const u8 {
+    const code_end = findCommentStart(line) orelse line.len;
+    const code = blankLiteralContents(line[0..code_end], buf);
+    return mem.trim(u8, code, " \t\r");
+}
+
+/// Bound on the brace-kind stack: legitimate control nesting (fn, if,
+/// while, switch, catch, and nested if-else) stays far below it. Deeper
+/// input overflows the stack and the scan fails fail-safe: no transfer
+/// covers, the warning direction (EPH-I0368).
+const max_brace_scan_depth: usize = 64;
+
+/// Brace scan state carried across the lines of the transfer walk: the
+/// kind stack (true = control brace), the control depth, and the scan
+/// position within the current line.
+const TransferBraceScan = struct {
+    stack: [max_brace_scan_depth]bool = undefined,
+    len: usize = 0,
+    depth: usize = 0,
+    pos: usize = 0,
+    overflowed: bool = false,
+};
+
+/// Advance `scan` over `code[scan.pos..col]` (ascending queries only).
+/// Returns the control-brace depth at `col`, or null once the stack
+/// overflowed — the caller stops crediting transfers (fail-safe).
+fn scanBraceDepth(scan: *TransferBraceScan, code: []const u8, col: usize) ?usize {
+    while (scan.pos < col and scan.pos < code.len) : (scan.pos += 1) {
+        if (!applyBraceChar(scan, code, scan.pos)) {
+            scan.overflowed = true;
+            return null;
+        }
+    }
+    if (scan.overflowed) return null;
+    return scan.depth;
+}
+
+/// Apply one brace char: push a kind on `{`, pop on `}`. False only when
+/// the kind stack overflowed (fail-safe: transfers stop crediting).
+fn applyBraceChar(scan: *TransferBraceScan, code: []const u8, pos: usize) bool {
+    const c = code[pos];
+    if (c == '{') {
+        if (scan.len >= max_brace_scan_depth) return false;
+        scan.stack[scan.len] = isControlBrace(code, pos);
+        scan.len += 1;
+        if (scan.stack[scan.len - 1]) scan.depth += 1;
+        return true;
+    }
+    if (c == '}' and scan.len > 0) {
+        scan.len -= 1;
+        if (scan.stack[scan.len]) scan.depth -= 1;
+    }
+    return true;
+}
+
+/// True when the `{` at `pos` opens a control-structure block: it follows
+/// a condition close (`)`), a payload bar (`|`), an arrow (`>`), or a
+/// guard keyword (`else`/`orelse`/`catch`/`defer`/`errdefer`). Struct
+/// literals (`Type{`), labeled blocks (`blk: {`), and tuple literals
+/// (`.{`) are value expressions — their braces are not blocks and never
+/// gate a transfer (EPH-I0368). Bound: the look-back stays within this
+/// line, so an Allman-style `{` on its own line after a condition reads
+/// as neutral and the transfer inside still credits (review r1 note;
+/// zig fmt tolerates the form after a multi-line condition, so fmt-clean
+/// files can carry it).
+fn isControlBrace(code: []const u8, pos: usize) bool {
+    if (pos == 0) return false;
+    var i = pos;
+    while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t')) i -= 1;
+    if (i == 0) return false;
+    const c = code[i - 1];
+    if (c == ')' or c == '|' or c == '>') return true;
+    if (c == ':' or c == '.') return false;
+    if (!isIdent(c)) return false;
+    var start = i - 1;
+    while (start > 0 and isIdent(code[start - 1])) start -= 1;
+    const word = code[start..i];
+    for (control_brace_keywords) |kw| {
+        if (mem.eql(u8, word, kw)) return true;
+    }
+    return false;
+}
+
+/// Guard keywords whose `{` opener starts a conditional block.
+const control_brace_keywords = [_][]const u8{
+    "else", "orelse", "catch", "defer",  "errdefer",
+    "if",   "while",  "for",   "switch",
+};
+
+/// True when the line carries an ownership transfer anchored at control
+/// depth no deeper than the alloc's, so it dominates the alloc's
+/// fall-through (EPH-I0368). A brace overflow never credits.
+fn dominatingTransferAt(
+    scan: *TransferBraceScan,
+    code: []const u8,
+    alloc_name: []const u8,
+    alloc_depth: usize,
+) bool {
+    const anchor = errdeferTransferAnchor(code, alloc_name) orelse return false;
+    const anchor_depth = scanBraceDepth(scan, code, anchor) orelse return false;
+    return anchor_depth <= alloc_depth;
+}
+
+/// Byte offset within the masked code line where an ownership transfer
+/// fires, or null: the `break :` label position, the first ownership
+/// pattern position, the struct-field store's `=` position, or the
+/// leading `return` keyword. Detector order mirrors the original scan
+/// (break, pattern, field store, return).
+fn errdeferTransferAnchor(t: []const u8, alloc_name: []const u8) ?usize {
+    if (mem.indexOf(u8, t, "break :")) |pos| {
+        if (containsIdentifier(t, alloc_name)) return pos;
+    }
+    if (ownershipTransferPos(t, alloc_name)) |pos| return pos;
+    if (structFieldStorePos(t, alloc_name)) |pos| return pos;
+    if (isReturnTransfer(t, alloc_name)) return 0;
+    return null;
 }
 
 /// State for multi-line errdefer/defer block collection
@@ -10374,26 +10575,28 @@ const ownership_lang_patterns = [_][]const u8{
     ".realloc(", // Realloc consumes old pointer
 };
 
-/// Check if ownership is transferred via cast, reassignment, or container method
-fn isOwnershipTransfer(t: []const u8, alloc_name: []const u8) bool {
-    if (mem.indexOf(u8, t, alloc_name) == null) return false;
+/// Check if ownership is transferred via cast, reassignment, or container
+/// method, returning the first matching pattern's byte offset (callers
+/// pass comment-stripped, string-blanked code — EPH-I0369).
+fn ownershipTransferPos(t: []const u8, alloc_name: []const u8) ?usize {
+    if (mem.indexOf(u8, t, alloc_name) == null) return null;
     // Check Zig language construct patterns
     for (ownership_lang_patterns) |pattern| {
-        if (mem.indexOf(u8, t, pattern) == null) continue;
+        const pos = mem.indexOf(u8, t, pattern) orelse continue;
         // ".* = " is only an ownership transfer when alloc_name is on the RHS.
         // When alloc_name is on the LHS (e.g., node.* = .{...}), it's
         // initialization of allocated memory, not a transfer.
         if (mem.eql(u8, pattern, ".* = ")) {
-            if (isAllocOnRhs(t, alloc_name)) return true;
+            if (isAllocOnRhs(t, alloc_name)) return pos;
             continue;
         }
-        return true;
+        return pos;
     }
     // Check stdlib container methods (compat layer)
     for (compat.getContainerOwnershipMethods()) |pattern| {
-        if (mem.indexOf(u8, t, pattern) != null) return true;
+        if (mem.indexOf(u8, t, pattern)) |pos| return pos;
     }
-    return false;
+    return null;
 }
 
 /// ".* = " is only an ownership transfer when alloc_name is on the RHS.
@@ -10404,22 +10607,24 @@ fn isAllocOnRhs(t: []const u8, alloc_name: []const u8) bool {
     return mem.indexOf(u8, t[eq_pos + 3 ..], alloc_name) != null;
 }
 
-/// Check if allocation is stored in a struct field (ownership transferred to struct)
-/// Patterns: self.field = alloc_name, this.field = alloc_name, identifier.field = alloc_name
-fn isStructFieldStorage(t: []const u8, alloc_name: []const u8) bool {
-    if (mem.indexOf(u8, t, alloc_name) == null) return false;
+/// Check if allocation is stored in a struct field (ownership transferred to
+/// struct), returning the `=` position. Patterns: self.field = alloc_name,
+/// this.field = alloc_name, identifier.field = alloc_name. Callers pass
+/// comment-stripped, string-blanked code — prose stores nothing
+/// (EPH-I0369).
+fn structFieldStorePos(t: []const u8, alloc_name: []const u8) ?usize {
+    if (mem.indexOf(u8, t, alloc_name) == null) return null;
 
     // Check for any struct.field = alloc_name (not just self.)
-    if (mem.indexOf(u8, t, " = ")) |eq_pos| {
-        // LHS must have a dot (struct field access)
-        const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-        if (mem.indexOf(u8, lhs, ".") == null) return false;
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
+    // LHS must have a dot (struct field access)
+    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
+    if (mem.indexOf(u8, lhs, ".") == null) return null;
 
-        // alloc_name must appear on the RHS — searching from the start would
-        // match the LHS first when the field shares the name (self.buf = buf)
-        if (containsIdentifier(t[eq_pos + 3 ..], alloc_name)) return true;
-    }
-    return false;
+    // alloc_name must appear on the RHS — searching from the start would
+    // match the LHS first when the field shares the name (self.buf = buf)
+    if (containsIdentifier(t[eq_pos + 3 ..], alloc_name)) return eq_pos;
+    return null;
 }
 
 /// Ownership transfer via RETURN (ZA103 suppression). Matches:
@@ -15747,7 +15952,7 @@ fn findSpawnResolution(
         const blanked = blankLiteralContents(line[0..code_end], blank_buf);
         if (hasJoinOrDetach(blanked, name, needle_buf)) return true;
         if (hasReturnOf(blanked, name)) return true;
-        if (isStructFieldStorage(blanked, name)) return true;
+        if (structFieldStorePos(blanked, name) != null) return true;
         if (isFunctionArgTransfer(blanked, name)) return true;
     }
     return false;
@@ -31165,6 +31370,192 @@ test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
     ) == 0);
 }
 
+test "ZA101: indexed write through the owner is not a transfer (EPH-I0825)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // isFieldOrGlobalStore's fallthrough read the indexed LHS `buf[0]` as
+    // a module-level store and suppressed ZA101 with no free anywhere.
+    const content =
+        \\fn indexed_write(allocator: std.mem.Allocator, a: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 16);
+        \\    if (a) { buf[0] = 1; }
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_indexed_write.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_indexed_write.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: same-line-if discard of the owner is not a transfer (EPH-I0825)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `_`-discard guard sliced the LHS as `if (a) { _` on the
+    // same-line if form, so the fallthrough read it as a store.
+    const content =
+        \\fn in_if_discard(allocator: std.mem.Allocator, a: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 16);
+        \\    if (a) { _ = buf[0]; }
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_in_if_discard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_in_if_discard.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA102: create plus pointee field init without destroy warns (EPH-I0346)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B02 F7: `node.data = v` on a create()-allocated node is
+    // pointee init, not a transfer — the dotted LHS root IS the owner.
+    const content =
+        \\const Node = struct {
+        \\    data: u8,
+        \\    next: ?*Node,
+        \\};
+        \\fn field_init(allocator: std.mem.Allocator) !void {
+        \\    const node = try allocator.create(Node);
+        \\    node.data = 1;
+        \\    node.next = null;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_field_init.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_field_init.zig",
+        RULE_CREATE_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: store into another object's field still transfers (EPH-I0346 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `self.buf = buf` — the LHS root is `self`, a different object that
+    // now owns the allocation. The ownership-capability rule must keep
+    // this credit.
+    const content =
+        \\const Holder = struct {
+        \\    buf: []u8,
+        \\};
+        \\fn store(self: *Holder, allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    self.buf = buf;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_store_other_field.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_store_other_field.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: module-level store of the owner still transfers (EPH-I0346 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The plain-identifier LHS with the owner on the RHS is the
+    // module-level store the fallthrough exists for.
+    const content =
+        \\var g_buf: []u8 = &.{};
+        \\fn store_global(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    g_buf = buf;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_store_global.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_store_global.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: array-element store of the owner still transfers (EPH-I0346 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `roots[0] = buf` stores the owner into another object's array: the
+    // LHS root `roots` differs from the owner, the owner value is on the
+    // RHS — the credit survives the ownership-capability rule.
+    const content =
+        \\fn store_array(allocator: std.mem.Allocator, roots: *[2][]u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    roots[0] = buf;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_store_array.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_store_array.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: owner rebind is not a transfer (EPH-I0346)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf = other` rebinds the local: the original allocation is
+    // abandoned, not transferred to an ownership-capable target.
+    const content =
+        \\fn rebind(allocator: std.mem.Allocator) !void {
+        \\    var buf = try allocator.alloc(u8, 16);
+        \\    var other: []u8 = &.{};
+        \\    buf = other;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_rebind.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_rebind.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
 test "ZA101: single-line .alloc( detection unchanged by line joining" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -34207,6 +34598,252 @@ test "ZA103: plain defer covers error returns (ZA101's domain)" {
     try std.testing.expect(countRuleIssues(
         run.issues.items,
         "test_defer_ret_err.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: braced return in a non-dominating branch is a gap (EPH-I0368)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B03 F4: the multi-line `return buf;` sits inside an if that
+    // does not dominate the later try — the fall-through leaks.
+    const content =
+        \\fn braced_return(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        return buf;
+        \\    }
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_braced_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_braced_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: braced field store in a non-dominating branch is a gap (EPH-I0368)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The multi-line field store inside the if covers only its branch
+    // path; the fall-through try still leaks.
+    const content =
+        \\const State = struct { f: []u8 = &.{} };
+        \\fn braced_store(allocator: std.mem.Allocator, state: *State, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        state.f = buf;
+        \\    }
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_braced_store.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_braced_store.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: same-line braced field store is a gap (EPH-I0368)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The one-line `if (c) { state.f = buf; }` form: the transfer fires
+    // at brace depth 1 (inside the if), so it does not cover the later
+    // try either — formatting must not change the verdict.
+    const content =
+        \\const State = struct { f: []u8 = &.{} };
+        \\fn oneline_store(allocator: std.mem.Allocator, state: *State, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) { state.f = buf; }
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_oneline_store.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_oneline_store.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: single-line if-return stays loud (EPH-I0368 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The brace-free twin is caught by hasBareIdentReturn as an exit —
+    // the verdict must match the braced form (both loud).
+    const content =
+        \\fn oneline_return(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) return buf;
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_oneline_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_oneline_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: transfer inside the alloc's own block stays silent (EPH-I0368 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle shape: the alloc and the transfer share the if-block.
+    // The transfer covers every path where the alloc exists, so the
+    // later try-alloc line must not read as a gap.
+    const content =
+        \\fn self_path(allocator: std.mem.Allocator, fallback: bool) ![]u8 {
+        \\    if (fallback) {
+        \\        const path = try allocator.dupe(u8, "x");
+        \\        return path;
+        \\    }
+        \\    const other = try allocator.dupe(u8, "y");
+        \\    return other;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_own_block_transfer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_own_block_transfer.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: comment field-store does not transfer (EPH-I0369)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B03 F5: prose in a comment faked coverage for the field-store
+    // detector; the try after it is a real gap.
+    const content =
+        \\const State = struct { f: []u8 = &.{} };
+        \\fn comment_store(allocator: std.mem.Allocator, state: *State) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    // state.f = buf;
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_store.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_comment_store.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: string field-store does not transfer (EPH-I0369)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A string literal carrying the store shape must not fake coverage.
+    const content =
+        \\const State = struct { f: []u8 = &.{}, help: []const u8 = "" };
+        \\fn string_store(allocator: std.mem.Allocator, state: *State) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    state.help = "state.f = buf;";
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_string_store.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_string_store.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: comment break-label does not transfer (EPH-I0369)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The raw `break :` indexOf matched comment text.
+    const content =
+        \\fn comment_break(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    // break :done buf
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_break.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_comment_break.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: real store after a string mention still transfers (EPH-I0369 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Masking must not kill the genuine credit: the real field store
+    // after the string line transfers ownership before the try.
+    const content =
+        \\const State = struct { f: []u8 = &.{}, help: []const u8 = "" };
+        \\fn real_after_string(allocator: std.mem.Allocator, state: *State) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    state.help = "state.f = buf;";
+        \\    state.f = buf;
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_real_after_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_real_after_string.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
 }

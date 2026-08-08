@@ -3239,7 +3239,8 @@ fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
 /// Next occurrence of var_name at or after s.* that is a fill-CALL target,
 /// advancing s.* past the matched name. Two classes: `&var` passed as a
 /// call argument (`fill(&x)`, `foo.read(&x)` — the call-fill heuristic
-/// writes through the pointer), and the bare `@memset(var` / `@memcpy(var`
+/// writes through the pointer; the grouping-paren form `&(x)` matches the
+/// same arm, EPH-I0822), and the bare `@memset(var` / `@memcpy(var`
 /// destination. Slice-index forms (`&x[0]`, `@memset(x[0..], v)`) and
 /// plain slice occurrences (`x[0..n]`) are hasDirectFill Pattern-2
 /// territory and deliberately do NOT match — they keep whole-line coverage
@@ -3260,8 +3261,12 @@ fn nextFillCallOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize
         // Slice-index occurrences are Pattern-2 — whole-line coverage.
         if (pos + var_name.len < t.len and t[pos + var_name.len] == '[') continue;
         // `&var` call argument: the call-fill heuristic writes through the
-        // pointer. Outside a call the address escapes untracked.
-        if (pos > 0 and t[pos - 1] == '&') {
+        // pointer. The grouping-paren form `&(x)` is the same address-of
+        // (EPH-I0822): the amp-paren bridge carries the verdict. Outside a
+        // call the address escapes untracked.
+        if (pos > 0 and
+            (t[pos - 1] == '&' or (t[pos - 1] == '(' and hasAmpBeforeChain(t, pos))))
+        {
             if (unmatchedOpenParenBefore(t, pos - 1)) |open| return open;
             continue;
         }
@@ -5041,7 +5046,8 @@ fn isBindingNameAt(t: []const u8, var_name: []const u8, i: usize) bool {
 /// introduction (`var x`, `const x`, `|x|`), `.len` compile-time
 /// property, string literal, line comment, fill destination (`&x` or a
 /// bare @memset/@memcpy dest — a fill statement must not "read" its own
-/// destination, EPH-I0102), or an assignment target.
+/// destination, EPH-I0102; the grouping-paren form `&(x)` is the same
+/// address-of, EPH-I0822), or an assignment target.
 fn isReadExemptOccurrence(
     t: []const u8,
     var_name: []const u8,
@@ -5057,6 +5063,7 @@ fn isReadExemptOccurrence(
     if (mem.indexOf(u8, t[0..i], "//")) |_| return true;
     if (end_i + 4 <= t.len and mem.eql(u8, t[end_i .. end_i + 4], ".len")) return true;
     if (i > 0 and t[i - 1] == '&') return true; // fill destination
+    if (i > 0 and t[i - 1] == '(' and hasAmpBeforeChain(t, i)) return true;
     if (isBuiltinDestAt(t, i)) return true;
     return isAssignmentTarget(t, var_name, i);
 }
@@ -11352,7 +11359,8 @@ fn hasPointerToVar(t: []const u8, pos: usize, var_name: []const u8) bool {
 }
 
 /// Check if any occurrence of var_name is directly filled on this line:
-/// &var, &Struct.var, var[...] =, or var as an assignment target.
+/// &var, &(var) (grouping parens, EPH-I0822), &Struct.var, var[...] =, or
+/// var as an assignment target.
 /// String and comment content never fills a var: the check skips full-line
 /// comments and multiline-string lines, and ignores occurrences inside
 /// string literals and after a mid-line `//` (EPH-I0104 — mirrors
@@ -11375,8 +11383,12 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         // Pattern 1: &var_name or &Struct.var_name, with any spacing
         // around the dot (`&opts. buf`, EPH-I0796). The chain walk treats
         // inter-token whitespace as transparent, so a space before the dot
-        // (`&opts . buf`) keeps the fill verdict (EPH-I0805).
+        // (`&opts . buf`) keeps the fill verdict (EPH-I0805). A grouping
+        // paren on the bare name (`use(&(x))`, EPH-I0822) takes the same
+        // bridge as the chain form: the walk crosses the paren only when
+        // the byte immediately left of it is '&' or '('.
         if (i > 0 and t[i - 1] == '&') return true;
+        if (i > 0 and t[i - 1] == '(' and hasAmpBeforeChain(t, i)) return true;
         if (i > 1 and hasLeftDot(t, i) and hasAmpBeforeChain(t, i)) return true;
 
         // Patterns 2/3 require the match to be the variable itself: not
@@ -42973,6 +42985,119 @@ test "hasDirectFill credits the amp-paren chain pointer (EPH-I0816)" {
     try std.testing.expect(hasDirectFill("use((&opts.buf));", "buf"));
     try std.testing.expect(!hasDirectFill("use(foo(opts.buf));", "buf"));
     try std.testing.expect(!hasDirectFill("const m = flags & (opts.buf);", "buf"));
+}
+
+test "hasDirectFill credits the amp-paren bare name (EPH-I0822)" {
+    // `use(&(x))` groups the bare name the same as the chain form: the
+    // amp still prefixes it, so Pattern 1 must give the fill credit
+    // `use(&x)` receives (EPH-I0822). The bare-name arm crosses the paren
+    // through the same bridge — `&` or `(` immediately left — so a call
+    // paren (`use(foo(x))`), a plain grouping read (`use((x))`), and the
+    // fmt-clean infix shape (`flags & (x)`) still stop it.
+    try std.testing.expect(hasDirectFill("use(&(x));", "x"));
+    try std.testing.expect(hasDirectFill("use(&((x)));", "x"));
+    try std.testing.expect(hasDirectFill("return &(x);", "x"));
+    try std.testing.expect(hasDirectFill("use(foo(&(x)));", "x"));
+    try std.testing.expect(hasDirectFill("use((&x));", "x"));
+    try std.testing.expect(!hasDirectFill("use(foo(x));", "x"));
+    try std.testing.expect(!hasDirectFill("use((x));", "x"));
+    try std.testing.expect(!hasDirectFill("use(&x, (y));", "y"));
+    try std.testing.expect(!hasDirectFill("const m = flags & (x);", "x"));
+}
+
+test "nextFillCallOccurrence bridges the amp-paren bare name (EPH-I0822)" {
+    // The walk-level fill-call arm needs '&' immediately left of the
+    // name, so `use(&(x))` evaded the statement-precise credit. The
+    // grouping paren bridges through the same walk as the line-level
+    // Pattern 1 arm; the non-call forms stay unmatched (EPH-I0822).
+    var s: usize = 0;
+    try std.testing.expect(nextFillCallOccurrence("use(&(x));", "x", &s) != null);
+    s = 0;
+    try std.testing.expect(nextFillCallOccurrence("use(&((x)));", "x", &s) != null);
+    s = 0;
+    try std.testing.expect(nextFillCallOccurrence("return &(x);", "x", &s) == null);
+    s = 0;
+    try std.testing.expect(nextFillCallOccurrence("const p = &(x);", "x", &s) == null);
+    s = 0;
+    try std.testing.expect(nextFillCallOccurrence("use(foo(x));", "x", &s) == null);
+    s = 0;
+    try std.testing.expect(nextFillCallOccurrence("use((x));", "x", &s) == null);
+    s = 0;
+    // The bridge must not shadow the bare @memset/@memcpy dest arm.
+    try std.testing.expect(nextFillCallOccurrence("@memset(x, 0);", "x", &s) != null);
+}
+
+test "ZA607: parenthesized bare-name amp fill stays silent (EPH-I0822)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // End-to-end parity: `use(&(x))` and `use(&((x)))` silence the read
+    // the same as `use(&x)`, while the plain grouping read `use((x))` and
+    // the by-value call read `use(foo(x))` keep the ZA607 report. The
+    // conditional forms exercise the gen-set path: the fill sits inside an
+    // if-block, so the collection-time fill-before-use scan cannot drop
+    // the var — the statement-precise gen and the fill-line read
+    // exemption must carry the parity (EPH-I0822).
+    const content =
+        \\fn parenFill() u32 {
+        \\    var x: u32 = undefined;
+        \\    use(&(x));
+        \\    return x;
+        \\}
+        \\fn nestedFill() u32 {
+        \\    var x: u32 = undefined;
+        \\    use(&((x)));
+        \\    return x;
+        \\}
+        \\fn plainFill() u32 {
+        \\    var x: u32 = undefined;
+        \\    use(&x);
+        \\    return x;
+        \\}
+        \\fn plainRead() u32 {
+        \\    var x: u32 = undefined;
+        \\    use((x));
+        \\    return x;
+        \\}
+        \\fn callRead() u32 {
+        \\    var x: u32 = undefined;
+        \\    use(foo(x));
+        \\    return x;
+        \\}
+        \\fn parenFillCond(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        use(&(x));
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn plainFillCond(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        use(&x);
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn plainReadCond(cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (cond) {
+        \\        use((x));
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_parenfill_bare.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        3,
+        countRuleIssues(run.issues.items, "da_parenfill_bare.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
 }
 
 test "isStructFieldPattern accepts whitespace-spaced dot fields (EPH-I0796)" {

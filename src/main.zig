@@ -4166,7 +4166,10 @@ const ReadScanCtx = struct {
 /// True when the read of var_name on body-line idx is potentially
 /// uninitialized: the block's entry is not definitely assigned, no
 /// same-block assignment takes effect before the read, and no guard
-/// suppressor applies.
+/// suppressor applies. The CFG is the only path model: the textual
+/// dominance suppressor (hasDominatingScopeAssignment) was retired when
+/// the virtual-body machinery made the CFG model brace-less guard ifs
+/// correctly (EPH-I0681, mega-audit design-cfg-soundness F7).
 fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) bool {
     const al = sc.da.func_line + idx;
     const t = mem.trim(u8, sc.da.lines[idx], " \t\r");
@@ -4192,10 +4195,6 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     // e.g., if (param_group_t == null or i > param_group_end) {
     //            param_group_end = ...; }
     if (isOrShortCircuitSafe(sc.da.lines, idx, var_name)) return false;
-    // Check if a same-scope plain assignment textually dominates the
-    // read; the CFG mis-models brace-less guard ifs (`if (x) continue;`)
-    // and would otherwise blame reads the assignment always precedes.
-    if (hasDominatingScopeAssignment(sc.da.lines, idx, var_name)) return false;
     return true;
 }
 
@@ -4977,177 +4976,6 @@ fn parenBalanceOutsideQuotes(t: []const u8) i32 {
         if (c == ')') balance -= 1;
     }
     return balance;
-}
-
-/// True when `s` starts with the whole-word keyword `kw` — the char right
-/// after it is a non-identifier char or the end of the text.
-fn startsWithKeyword(s: []const u8, kw: []const u8) bool {
-    if (!mem.startsWith(u8, s, kw)) return false;
-    return s.len == kw.len or !isIdent(s[kw.len]);
-}
-
-/// True when the text after a closed condition holds only an optional
-/// `|payload|` capture and whitespace — no `{` and no same-line body, so
-/// the body is pending on a later line (EPH-I0095).
-fn onlyPayloadRemains(rest: []const u8) bool {
-    const s = mem.trimStart(u8, rest, " \t");
-    if (s.len == 0) return true;
-    if (s[0] != '|') return false;
-    const close = mem.indexOfScalarPos(u8, s, 1, '|') orelse return false;
-    return mem.trimStart(u8, s[close + 1 ..], " \t").len == 0;
-}
-
-/// Scan one comment-stripped condition line from `start`, tracking paren
-/// `depth` and quote `mode` across calls. Returns the index just past the
-/// paren that closes the condition, or null when it closes on a later
-/// line (EPH-I0095).
-fn scanConditionLine(
-    line: []const u8,
-    start: usize,
-    depth: *usize,
-    mode: *QuoteMode,
-) ?usize {
-    var i = start;
-    while (i < line.len) : (i += 1) {
-        const c = line[i];
-        if (scanQuoteStep(mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (c == '(') {
-            depth.* += 1;
-            continue;
-        }
-        if (c != ')') continue;
-        depth.* -= 1;
-        if (depth.* == 0) return i + 1;
-    }
-    return null;
-}
-
-/// True when the condition opened at `open` on the header line closes
-/// before `body_idx` with only an optional `|payload|` after it — the
-/// brace-less body is pending on line `body_idx` (EPH-I0095).
-fn conditionLeavesBodyPending(
-    lines: []const []const u8,
-    header_idx: usize,
-    body_idx: usize,
-    open: usize,
-) bool {
-    var depth: usize = 1;
-    var mode: QuoteMode = .none;
-    var idx = header_idx;
-    while (idx < body_idx) : (idx += 1) {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const line = stripLineComment(t);
-        const start: usize = if (idx == header_idx) open + 1 else 0;
-        const after = scanConditionLine(line, start, &depth, &mode) orelse continue;
-        return onlyPayloadRemains(line[after..]);
-    }
-    return false;
-}
-
-/// True when the stripped line at `header_idx` opens an if/else whose body
-/// is pending on line `body_idx`: a bare `else` with nothing after it, or
-/// an if/else-if whose condition leaves the body pending (EPH-I0095).
-fn guardHeaderIsPending(
-    t: []const u8,
-    lines: []const []const u8,
-    header_idx: usize,
-    body_idx: usize,
-) bool {
-    var rest = t;
-    while (rest.len > 0 and rest[0] == '}') rest = mem.trimStart(u8, rest[1..], " \t");
-    if (startsWithKeyword(rest, "else")) {
-        rest = mem.trimStart(u8, rest[4..], " \t");
-        if (!startsWithKeyword(rest, "if")) return rest.len == 0;
-    }
-    if (!startsWithKeyword(rest, "if")) return false;
-    const open = mem.indexOfScalar(u8, t, '(') orelse return false;
-    return conditionLeavesBodyPending(lines, header_idx, body_idx, open);
-}
-
-/// True when line `idx` is the guarded virtual body of a brace-less
-/// if/else-if/else: walking back over blank lines, comment lines, and
-/// multi-line condition text lands on a header whose body is pending on
-/// this line, so the line runs only on the guarded path (EPH-I0095).
-/// Brace-less loop headers are excluded on purpose: they stay outside the
-/// CFG's virtual-body modeling (EPH-I0079 B2 scope).
-fn isGuardedVirtualBodyLine(lines: []const []const u8, idx: usize) bool {
-    var balance: i32 = 0;
-    var j = idx;
-    while (j > 0) {
-        j -= 1;
-        const t = mem.trim(u8, lines[j], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const stripped = stripLineComment(t);
-        if (stripped.len == 0) continue;
-        balance += parenBalanceOutsideQuotes(stripped);
-        // A positive balance means the candidate line closes a group this
-        // line opened — the candidate sits inside parens, not at pos 0 of
-        // a statement. A negative balance means the condition text is
-        // still open, so the header sits on an earlier line.
-        if (balance > 0) return false;
-        if (balance < 0) continue;
-        return guardHeaderIsPending(stripped, lines, j, idx);
-    }
-    return false;
-}
-
-/// Check whether a plain `var_name = ...` statement unconditionally executes
-/// before the read on every path that reaches it: the assignment line starts
-/// with the bare name, its statement terminates before the read line (a
-/// continuation-line read inside a multi-line assignment observes the
-/// pre-assignment value — EPH-I0103), it is nested no deeper than the read
-/// (the read may sit deeper inside the assignment's scope), and no
-/// intervening line closes the assignment's scope (a close would mean the
-/// assignment sat in a sibling conditional block).
-///
-/// The pos-0 bare-name shortcut predates the B-series CFG work: same-line
-/// guard ifs (`if (x) y = 1;`) keep the assignment mid-line, but a
-/// next-line virtual body (`if (x)\n    y = 1;`) places a guarded
-/// assignment at pos 0, so "starts with the bare name" no longer proves
-/// "unguarded". isGuardedVirtualBodyLine rejects those candidates: an
-/// assignment that runs only on the guarded path cannot dominate the read
-/// (EPH-I0095).
-fn hasDominatingScopeAssignment(
-    lines: []const []const u8,
-    read_idx: usize,
-    var_name: []const u8,
-) bool {
-    var depth: usize = 0;
-    var assign_depth: usize = 0;
-    var min_since: usize = 0;
-    var found = false;
-    for (0..read_idx) |i| {
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        // Comment text is never code: brace depth must not count it, and an
-        // assignment candidate lives before any trailing comment.
-        const code = stripLineComment(t);
-        // isDirectAssignment does not verify the name at pos 0, so the
-        // caller must establish it (with a word boundary) first. The
-        // statement must also terminate before the read line — a read on a
-        // continuation line of the assignment itself is not covered
-        // (EPH-I0103). A pos-0 assignment that is the guarded virtual body
-        // of a brace-less if/else runs only on the guarded path, so it
-        // cannot dominate the read (EPH-I0095).
-        if (mem.startsWith(u8, code, var_name) and
-            (code.len == var_name.len or !isIdent(code[var_name.len])) and
-            isDirectAssignment(code, var_name, 0) and
-            statementEffectPos(lines, i, 0).line < read_idx and
-            !isGuardedVirtualBodyLine(lines, i))
-        {
-            assign_depth = depth;
-            min_since = depth;
-            found = true;
-        }
-        depth = computeBraceDepth(code, depth);
-        if (depth < min_since) min_since = depth;
-    }
-    if (!found) return false;
-    return assign_depth <= depth and min_since >= assign_depth;
 }
 
 fn runDefiniteAssignmentWorklist(
@@ -7138,6 +6966,68 @@ fn isDeferOrErrdefer(t: []const u8) bool {
         mem.startsWith(u8, t, "errdefer{") or mem.startsWith(u8, t, "defer{");
 }
 
+/// True when a comment-stripped line carries a defer/errdefer keyword as a
+/// guard's body or inside a guarded block: `if (a) defer free(buf);` and
+/// `if (a) { defer free(buf); }`. A conditional defer covers only its
+/// branch path, so it must not mark the owning block as directly freed
+/// (EPH-I0682, design-cfg-soundness F6b).
+///
+/// The keyword counts only when a guard opener (`if `/`else`/`while `/`for `
+/// or `=>`) sits in the same statement segment — the text since the
+/// previous `;` or `}` boundary. `} defer free(buf);` and
+/// `stmt; defer free(buf);` hold no guard in their segment, so their defer
+/// is a plain unconditional statement (review r1 fix 2). Both shapes are
+/// fmt-unreachable: zig fmt splits mid-line defers onto their own line,
+/// and a guard-led one-liner defer is a Zig compile error, so the
+/// discriminator decides nothing in fmt-canonical code. The warning on the
+/// `} defer` shape after an if-body close is structural and pre-existing:
+/// the close-line tail attributes to the body block, so the false-branch
+/// merge stays uncovered (pinned bound, review r1 fix 2).
+fn hasGuardedDeferKeyword(t: []const u8) bool {
+    return hasGuardedKeyword(t, "defer ") or hasGuardedKeyword(t, "errdefer ") or
+        hasGuardedKeyword(t, "defer{") or hasGuardedKeyword(t, "errdefer{");
+}
+
+/// True when one word-bounded, string-free occurrence of `kw` sits in a
+/// statement segment that holds a guard opener (segmentHasGuard).
+fn hasGuardedKeyword(t: []const u8, kw: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], kw)) |rel| {
+        const pos = s + rel;
+        s = pos + kw.len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (segmentHasGuard(t, pos)) return true;
+    }
+    return false;
+}
+
+/// True when the text before `end` holds a guard opener since the previous
+/// statement boundary: the segment after the last `;` or `}` outside a
+/// string is scanned for the opener tokens. Boundary chars inside string
+/// literals do not count.
+fn segmentHasGuard(t: []const u8, end: usize) bool {
+    var cls = LineClassifier.init(t);
+    var start: usize = 0;
+    for (t[0..end], 0..) |c, i| {
+        if (cls.isInsideString(i)) continue;
+        if (c == ';' or c == '}') start = i + 1;
+    }
+    return hasGuardToken(t[start..end]);
+}
+
+/// True when the segment opens with an if/else/while/for or a switch-arm
+/// arrow. All forms are word-bounded and string-aware.
+fn hasGuardToken(seg: []const u8) bool {
+    return hasRealKeyword(seg, "if ") or hasRealKeyword(seg, "if(") or
+        hasRealKeyword(seg, "else ") or hasRealKeyword(seg, "else{") or
+        hasRealKeyword(seg, "while ") or hasRealKeyword(seg, "while(") or
+        hasRealKeyword(seg, "for ") or hasRealKeyword(seg, "for(") or
+        hasRealKeyword(seg, "=>");
+}
+
 /// Scan for a defer/errdefer at an OUTER scope that frees this variable
 fn hasOuterScopeDefer(lines: []const []const u8, alloc_indent: usize, name: []const u8) bool {
     for (0..lines.len) |check_idx| {
@@ -7323,8 +7213,13 @@ fn isFieldOrGlobalStore(t: []const u8, name: []const u8) bool {
     return lhs.len > 0;
 }
 
-/// CFG-based defer coverage analysis (ZA101/ZA102)
-/// Detects allocations where defer only exists on some paths
+/// CFG-based defer coverage analysis (ZA101/ZA102).
+/// Detects allocations where defer only exists on some paths. Backward
+/// coverage ANDs over all successors; the loop cycle deadlock (header
+/// needs body, body needs header) is a documented FP-lean bound, and the
+/// linear fallback hasDeferFreeInFunction masks it for defers at the
+/// alloc's indent or shallower (EPH-I0682, F6a). A guarded single-line
+/// defer never marks its owning block directly freed (EPH-I0682, F6b).
 fn analyzeCFGDeferCoverage(
     ctx: DeferCoverageCtx,
 ) !std.ArrayListUnmanaged(Issue) {
@@ -7453,7 +7348,12 @@ fn scanSingleBlock(
         const in_defer_block = is_defer or defer_depth > 0;
 
         if (in_defer_block and has_free) state.has_defer[bid] = true;
-        if (!in_defer_block and !mem.startsWith(u8, t, "errdefer ") and has_free) {
+        // A guarded defer keyword on the comment-stripped line means the
+        // free is a conditional defer: it covers only the branch path, so
+        // the block must not read as directly freed. Comment text is
+        // stripped first — a trailing comment mentioning `defer` must not
+        // flip the verdict (EPH-I0682, F6b; review r1 fix 1).
+        if (!in_defer_block and !hasGuardedDeferKeyword(stripLineComment(t)) and has_free) {
             freed = true;
             state.has_direct_free[bid] = true;
         }
@@ -7493,7 +7393,16 @@ fn propagateCoverageBackward(
     return covered;
 }
 
-/// Check if a block should be marked covered based on successor coverage
+/// Check if a block should be marked covered based on successor coverage.
+/// The backward AND over all successors deadlocks on a loop cycle with no
+/// covered member: the header needs the body, the body needs the header,
+/// and neither flips. The least fixpoint then models the infinite path and
+/// reads a loop with a post-loop defer as uncovered — a deliberate
+/// FP-lean bound, documented (EPH-I0682, design-cfg-soundness F6a): a
+/// return inside the body bypasses a post-loop direct free, so the cycle
+/// verdict cannot be relaxed for non-defer coverage without per-exit-kind
+/// analysis. The linear fallback hasDeferFreeInFunction masks the FP for
+/// defers at the alloc's indent or shallower.
 fn tryPropagateCoverage(cfg: *ControlFlowGraph, covered: []bool, bid: usize) bool {
     var all_succs_covered = true;
     var has_succ = false;
@@ -7564,7 +7473,11 @@ fn checkDeferCoverageForAlloc(
         return null;
 
     // Fallback: linear scan for defer free anywhere in the function.
-    // The CFG block analysis can miss multi-line defers that span block boundaries.
+    // The CFG block analysis can miss multi-line defers that span block
+    // boundaries. The scan never matches conditional defers (a line that
+    // carries a defer keyword without starting with it), so a same-indent
+    // `if (a) defer free(buf);` cannot suppress the partial-coverage
+    // warning (EPH-I0682, design-cfg-soundness F6b).
     if (hasDeferFreeInFunction(ctx.body.lines, alloc.name))
         return null;
 
@@ -7663,7 +7576,9 @@ fn hasDeferFreeInFunction(
 }
 
 // ============================================================================
-// CFG Errdefer Coverage Analysis Helpers
+// Errdefer Coverage Analysis Helpers (line-interval model, not CFG:
+// alloc/trigger/errdefer line arithmetic with indent gates — EPH-I0682,
+// design-cfg-soundness F15)
 // ============================================================================
 
 /// Allocation info for errdefer analysis
@@ -8222,7 +8137,12 @@ fn scanErrdeferLines(
     return state;
 }
 
-/// CFG-based errdefer coverage analysis (ZA103)
+/// Errdefer coverage analysis (ZA103). Line-interval model, not CFG: the
+/// alloc line, the trigger lines (try / error return), and the errdefer
+/// line sit between them at the alloc's indent or deeper (findMatchingErrdefer,
+/// isGapTrigger). The CFG contributes nothing to the verdict — the function
+/// name keeps the historical analyzeCFG* prefix (EPH-I0682,
+/// design-cfg-soundness F15).
 fn analyzeCFGErrdeferCoverage(
     allocator: Allocator,
     body: FuncBodyCtx,
@@ -39887,6 +39807,171 @@ test "ZA101: defer free in loop body covers the break path" {
     );
 }
 
+test "ZA101: loop then post-loop defer stays silent (F6 probe)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0682 F6a: the backward coverage AND over the loop cycle
+    // (body needs header, header needs body) deadlocks into the least
+    // fixpoint of the infinite path. The cycle rule is documented, and the
+    // linear fallback masks the resulting FP for a defer at the alloc's
+    // indent — the loop-then-defer shape stays silent.
+    const content =
+        \\fn loopThenDefer(allocator: std.mem.Allocator, xs: []const u32) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    for (xs) |x| {
+        \\        _ = x;
+        \\    }
+        \\    defer allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_loop_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "leak_loop_defer.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: return inside loop with post-loop direct free still warns (F6 divergence pin)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The cycle deadlock is deliberate: a return inside the body bypasses
+    // the post-loop direct free, so relaxing the cycle (loop-exit witness
+    // rule) would read this real leak as covered (EPH-I0682, F6a
+    // divergence). The fallback does not mask it — there is no defer.
+    const content =
+        \\fn returnInLoop(allocator: std.mem.Allocator, c: bool, x: bool) void {
+        \\    const buf = allocator.alloc(u8, 10) catch return;
+        \\    while (c) {
+        \\        if (x) return;
+        \\        _ = buf[0];
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_loop_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "leak_loop_return.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: same-indent conditional defer still warns (F6 probe)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0682 F6b: `if (a) defer free(buf);` runs the defer only on the
+    // a-true path. The block scan must not read the line as a direct free
+    // of the entry block — the allocation leaks on the a-false path. The
+    // shape is a Zig compile error (defer cannot be a guard body,
+    // verified with zig ast-check 0.16), but the audit's probe contract
+    // and the guard-token classifier keep the warning.
+    const content =
+        \\fn condDefer(a: bool, allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    if (a) defer allocator.free(buf);
+        \\    _ = buf[0];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_cond_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "leak_cond_defer.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: trailing comment mentioning defer keeps the direct free (r1 pin)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review r1 fix 1: the keyword scan runs on the comment-stripped line,
+    // so a `defer ` mention in a trailing comment cannot flip the direct
+    // free into a conditional defer. The free covers every path — silent.
+    const content =
+        \\fn commentMention(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    _ = buf[0];
+        \\    allocator.free(buf); // no defer needed: freed directly here
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_comment_mention.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "leak_comment_mention.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: trailing comment mentioning errdefer keeps the direct free (r1 pin)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review r1 fix 1, errdefer needle: same mechanism as the defer
+    // variant, pinned for the second keyword form.
+    const content =
+        \\fn commentErrdefer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    _ = buf[0];
+        \\    allocator.free(buf); // errdefer handles the error path
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_comment_errdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "leak_comment_errdefer.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: block-close then defer on one line keeps the structural warning (r1 pin)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Review r1 fix 2, documented bound: `} defer free(buf);` holds no
+    // guard opener in its segment, so the classifier treats it as a plain
+    // statement — but the verdict is structural and pre-existing (verified
+    // on HEAD 4962373 before the F6b work): the `}`-line tail attributes to
+    // the if-body block, the false-branch merge stays uncovered, and the
+    // alloc warns. The shape is fmt-unreachable (zig fmt splits the close
+    // and the defer), so the bound never fires on canonical code.
+    const content =
+        \\fn braceCloseDefer(a: bool, allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    if (a) {
+        \\        _ = buf[0];
+        \\    } defer allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_brace_close_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "leak_brace_close_defer.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
 // ============================================================================
 // CFG brace-less same-line body tests (EPH-I0079 B1)
 // ============================================================================
@@ -40978,6 +41063,87 @@ test "ZA607: loop guard-continue before same-scope assignment is silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line return guard before dominating assignment is silent" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The brace-less `if (a) return 1;` guard block is return-terminal; the
+    // definite-assignment meet drops its phantom fall-through predecessor,
+    // and the unconditional `x = 5` covers the read (EPH-I0681, F7 shape:
+    // the CFG alone decides — no textual dominance suppressor).
+    const content =
+        \\fn returnGuard(a: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) return 1;
+        \\    x = 5;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_retguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_retguard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: chained same-line return guards before dominating assignment are silent" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Two brace-less return guards in a row: every path reaching the read
+    // passes the unconditional `x = 5`. The meet drops both return blocks'
+    // phantom edges (EPH-I0681, F7 shape).
+    const content =
+        \\fn chainedReturnGuards(a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) return 1;
+        \\    if (b) return 2;
+        \\    x = 5;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_chain_guards.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_chain_guards.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line guarded assignment keeps the locked verdict" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The mid-line `y = 1;` virtual body runs only on the a-true path, but
+    // later-line reads keep the locked same-line-if verdict: the entry
+    // block's gen bit covers them, exactly like the braced one-line form
+    // (EPH-I0111). The CFG alone decides — no textual dominance suppressor
+    // (EPH-I0681, F7 shape).
+    const content =
+        \\fn sameLineGuardedAssign(a: bool) u32 {
+        \\    var y: u32 = undefined;
+        \\    if (a) y = 1;
+        \\    return y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_same_line_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_same_line_guard.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

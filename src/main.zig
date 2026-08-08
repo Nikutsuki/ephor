@@ -16205,6 +16205,15 @@ const ComplexityState = struct {
     // depth (nest never advances past skipped opens), so the count grows
     // with the nesting depth of the input, not with anything bounded.
     prong_opens: [32]usize = @splat(0),
+    // EPH-I0811: per-depth count of anonymous struct/array literal open
+    // braces (`.{`) that updateBraceState skipped. The matching close at
+    // the same depth skips too (LIFO, checked before the prong counter — a
+    // literal is always the innermost open while pending). usize, not u8:
+    // nested literals inside one literal record at the SAME depth (nest
+    // never advances past skipped opens), so the count grows with the
+    // nesting depth of the input, not with anything bounded (mirrors
+    // prong_opens, EPH-I0451).
+    lit_opens: [32]usize = @splat(0),
     // EPH-I0756: a fn opener whose signature wrapped past its own line.
     // The state opens when the body `{` arrives. A `;` first drops the
     // pending def (a bodiless decl) without ever opening state.
@@ -16792,44 +16801,101 @@ fn hasCodeArrow(t: []const u8) bool {
     return false;
 }
 
+/// Per-line brace-scan state threaded through updateBraceState (keeps
+/// ≤4 params, mirrors the ComplexityReporter pattern).
+const BraceScan = struct {
+    /// First `{` of an arrow line is the switch prong's open (EPH-I0451).
+    first: bool = true,
+    /// Previous code char: a `{` right after a code `.` opens an anonymous
+    /// struct/array literal, not a block (EPH-I0811). Only code chars land
+    /// here — the literal state machine masks string/char/comment data.
+    prev_c: u8 = 0,
+    /// A real (non-masked) `{` open landed on this line. Gates the
+    /// cognitive-scope marker: a keyword line whose opens are all masked
+    /// literals opens no scope (EPH-I0818).
+    real_open: bool = false,
+};
+
 /// Track brace nesting, returns true if function ended.
 /// Also updates cognitive nesting via cog_markers and cog_nest.
 fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     const is_switch = hasCodeArrow(t);
     var lit = types.LiteralState.forLine(t) orelse return false;
-    var first = true;
+    var scan = BraceScan{};
+    // EPH-I0818: the line's scope marker is valid only while a real open
+    // lands on it. A keyword line whose only `{` is a masked literal
+    // (`try take(.{...});`) opens no scope — a marker and cog_nest bump
+    // left in place would leak into every later line's cognitive cost
+    // (EPH-I0452's marker sub-class). The undo below fires only when no
+    // real open landed, so a real block's marker survives untouched.
+    const scope_open = opensCognitiveScope(t);
+    const scope_depth = state.nest + 1;
+    if (scope_open) {
+        state.cog_nest += 1;
+        if (scope_depth < 32) state.cog_markers |= @as(u32, 1) << @intCast(scope_depth);
+    }
+    var fn_ended = false;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
         const pos = lit.updateForChar(t, i) orelse continue;
-        if (updateBraceState(t[pos], is_switch, &first, state))
-            return true;
+        const c = t[pos];
+        if (updateBraceState(c, is_switch, &scan, state)) {
+            fn_ended = true;
+            break;
+        }
+        scan.prev_c = c;
     }
-    return false;
+    if (scope_open and !scan.real_open) {
+        if (state.cog_nest > 0) state.cog_nest -= 1;
+        if (scope_depth < 32) state.cog_markers &= ~(@as(u32, 1) << @intCast(scope_depth));
+    }
+    return fn_ended;
 }
 
 fn updateBraceState(
     c: u8,
     is_switch: bool,
-    first: *bool,
+    scan: *BraceScan,
     state: *ComplexityState,
 ) bool {
     if (c == '{') {
-        // EPH-I0451: a switch prong's open brace adds no depth. Skipping
-        // only the open left every block prong at net -1 and ended fns
-        // mid-switch, so the skip is recorded per depth and the matching
-        // close skips too. Only the line's first `{` is the prong's; later
-        // opens on the line are inner braces and count. Depths >= 32
-        // cannot be recorded, so the brace counts there and stays balanced
-        // by its real close.
-        if (is_switch and first.* and state.nest < 32) {
+        // EPH-I0811: a `{` right after a code `.` opens an anonymous
+        // struct/array literal — data, not a control-flow block. It adds no
+        // depth; its paired close skips too (LIFO, below). The adjacency is
+        // exact: `.` + `{` is the one literal token, and scan.prev_c only
+        // ever holds code chars. Depths >= 32 cannot be recorded, so the
+        // brace counts there and stays balanced by its real close (mirrors
+        // the prong guard).
+        // EPH-I0820: a named-type literal (Type{ ... }) still counts as a
+        // real open. Adjacency cannot separate it from a block: `else{`
+        // and `catch{` are real blocks whose `{` follows an identifier
+        // char, so a prev_c-is-identifier mask would be unsafe.
+        if (scan.prev_c == '.' and state.nest < 32) {
+            state.lit_opens[state.nest] += 1;
+        } else if (is_switch and scan.first and state.nest < 32) {
+            // EPH-I0451: a switch prong's open brace adds no depth. Skipping
+            // only the open left every block prong at net -1 and ended fns
+            // mid-switch, so the skip is recorded per depth and the matching
+            // close skips too. Only the line's first `{` is the prong's; later
+            // opens on the line are inner braces and count. Depths >= 32
+            // cannot be recorded, so the brace counts there and stays balanced
+            // by its real close.
             state.prong_opens[state.nest] += 1;
         } else {
             state.nest += 1;
             if (state.nest > state.max_nest) state.max_nest = state.nest;
+            scan.real_open = true;
         }
-        first.* = false;
+        scan.first = false;
     }
     if (c == '}' and state.nest > 0) {
+        // EPH-I0811: a pending literal open pairs first — a literal is
+        // always the innermost open at its depth, so its close arrives
+        // before any prong or control close.
+        if (state.nest < 32 and state.lit_opens[state.nest] > 0) {
+            state.lit_opens[state.nest] -= 1;
+            return false;
+        }
         // EPH-I0451: closes pair LIFO. A close at a depth with a pending
         // skipped open matches that open and skips too; inner counted
         // braces always balance before this close arrives.
@@ -16883,13 +16949,6 @@ fn processComplexityLine(
     state.branches += countLineBranches(t);
     state.cyclomatic += countLineCyclomatic(t);
     state.cognitive += countLineCognitive(t, state.cog_nest);
-
-    // Track cognitive nesting: control structures open new scopes
-    if (opensCognitiveScope(t)) {
-        state.cog_nest += 1;
-        const next_nest = state.nest + 1;
-        if (next_nest < 32) state.cog_markers |= @as(u32, 1) << @intCast(next_nest);
-    }
     if (!trackBraceNesting(t, state)) return;
 
     // Function ended — unwind cognitive nesting, then report
@@ -53156,10 +53215,23 @@ test "trackBraceNesting nets zero on a one-line switch expression (EPH-I0451)" {
 test "trackBraceNesting counts a second open brace on a prong line (EPH-I0451)" {
     // Only the line's first `{` is the prong's. A second open is an inner
     // brace and counts, so its close balances and the prong close still
-    // pairs with the skip. Delta: pre-fix skipped the struct open too.
+    // pairs with the skip. The pre-I0451 skip swallowed every brace on the
+    // arrow line; the pin uses a real control brace (a literal second open
+    // skips as data since EPH-I0811, pinned separately).
     var state = ComplexityState{ .in_fn = true, .nest = 2 };
-    try std.testing.expect(!trackBraceNesting("1 => { x = .{", &state));
+    try std.testing.expect(!trackBraceNesting("1 => { if (x) {", &state));
     try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expect(!trackBraceNesting("} },", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting skips a literal second open on a prong line (EPH-I0811)" {
+    // `1 => { x = .{` — the prong's brace skips, the literal's braces skip
+    // as data; neither counts. Pre-fix the literal counted (nest peaked 3).
+    var state = ComplexityState{ .in_fn = true, .nest = 2, .max_nest = 2 };
+    try std.testing.expect(!trackBraceNesting("1 => { x = .{", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expectEqual(@as(usize, 2), state.max_nest);
     try std.testing.expect(!trackBraceNesting("} },", &state));
     try std.testing.expectEqual(@as(usize, 2), state.nest);
 }
@@ -53204,6 +53276,112 @@ test "trackBraceNesting pairs 300 nested switch-expression prongs (EPH-I0451)" {
     try std.testing.expectEqual(@as(usize, 0), state.prong_opens[2]);
     try std.testing.expect(!trackBraceNesting("}", &state));
     try std.testing.expectEqual(@as(usize, 1), state.nest);
+}
+
+// ============================================================================
+// Struct/array literal braces are data, not nesting (EPH-I0811, EPH-I0026)
+// ============================================================================
+
+test "trackBraceNesting skips same-line struct-literal braces (EPH-I0811)" {
+    // `.{` opens an anonymous struct/array literal — data, not a
+    // control-flow block. Its braces must not raise the depth or the peak.
+    // Pre-fix the open counted and max_nest peaked one level higher.
+    var state = ComplexityState{ .in_fn = true, .nest = 3, .max_nest = 3 };
+    try std.testing.expect(!trackBraceNesting("const s: Spec = .{ .a = 1, .b = 2 };", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expectEqual(@as(usize, 3), state.max_nest);
+}
+
+test "trackBraceNesting skips multiline literal braces across lines (EPH-I0811)" {
+    // The literal's `{` opens on its own line and its close arrives lines
+    // later (a literal table inside fn>loop>if). Both braces stay invisible
+    // to nesting: the enclosing depth never moves and the fn never ends at
+    // the literal's close.
+    var state = ComplexityState{ .in_fn = true, .nest = 3, .max_nest = 3 };
+    try std.testing.expect(!trackBraceNesting("t = .{", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expectEqual(@as(usize, 3), state.max_nest);
+    try std.testing.expect(!trackBraceNesting(".a = 1,", &state));
+    try std.testing.expect(!trackBraceNesting(".b = 2,", &state));
+    try std.testing.expect(!trackBraceNesting("};", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+}
+
+test "trackBraceNesting counts a control brace next to a literal (EPH-I0811)" {
+    // `if (x) { const t = .{` — the if opens a real level, the literal does
+    // not. Pre-fix both counted and max_nest peaked at 4.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting("if (x) { const t = .{", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expectEqual(@as(usize, 3), state.max_nest);
+    try std.testing.expect(!trackBraceNesting("};", &state));
+    try std.testing.expect(!trackBraceNesting("}", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+}
+
+test "trackBraceNesting keeps a prong-block literal at the prong depth (EPH-I0811)" {
+    // A literal table built inside a prong block: pre-fix the literal open
+    // counted and peaked at the prong depth plus one.
+    var state = ComplexityState{ .in_fn = true, .nest = 2, .max_nest = 2 };
+    try std.testing.expect(!trackBraceNesting("1 => {", &state));
+    try std.testing.expect(!trackBraceNesting("const t = .{", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expect(!trackBraceNesting("};", &state));
+    try std.testing.expect(!trackBraceNesting("},", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expectEqual(@as(usize, 2), state.max_nest);
+}
+
+test "trackBraceNesting attributes an arrow-line literal to the literal mask (EPH-I0811)" {
+    // d4 shape: the literal's `{` is the first brace on the arrow line.
+    // Pre-fix the prong skip swallowed it (recorded as a prong open); the
+    // literal mask claims it, so the prong counter never moves and the
+    // literal pairs its own close.
+    var state = ComplexityState{ .in_fn = true, .nest = 2 };
+    try std.testing.expect(!trackBraceNesting(".y => |n| total += take(.{", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expectEqual(@as(usize, 0), state.prong_opens[2]);
+    try std.testing.expectEqual(@as(usize, 1), state.lit_opens[2]);
+    try std.testing.expect(!trackBraceNesting("}),", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expectEqual(@as(usize, 0), state.lit_opens[2]);
+}
+
+test "trackBraceNesting ends a fn at the body close, not a default-value close (EPH-I0811)" {
+    // A `.{}` default in the signature is data: pre-fix its close dropped
+    // nest to 0 mid-line and reported the fn ended before the body brace.
+    var state = ComplexityState{ .in_fn = true, .nest = 0 };
+    try std.testing.expect(!trackBraceNesting("fn foo(x: S = .{ .a = 1 }) void {", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+    try std.testing.expectEqual(@as(usize, 1), state.max_nest);
+    try std.testing.expect(!trackBraceNesting("sink();", &state));
+    try std.testing.expect(trackBraceNesting("}", &state));
+    try std.testing.expectEqual(@as(usize, 0), state.nest);
+}
+
+test "trackBraceNesting still counts real if/while nesting (EPH-I0811)" {
+    // The literal mask must not blunt real control flow: while>if>if from
+    // the fn body still peaks at 4.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(!trackBraceNesting("while (c) {", &state));
+    try std.testing.expect(!trackBraceNesting("if (a) {", &state));
+    try std.testing.expect(!trackBraceNesting("if (b) {", &state));
+    try std.testing.expectEqual(@as(usize, 4), state.max_nest);
+    try std.testing.expect(!trackBraceNesting("sink();", &state));
+    try std.testing.expect(!trackBraceNesting("}", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+}
+
+test "trackBraceNesting counts a literal at depth >= 32 (EPH-I0811)" {
+    // The per-depth skip arrays hold 32 slots. A literal opened at depth
+    // >= 32 cannot be recorded, so it counts and balances by its real
+    // close (mirrors the prong guard, EPH-I0451).
+    var state = ComplexityState{ .in_fn = true, .nest = 33, .max_nest = 33 };
+    try std.testing.expect(!trackBraceNesting("const t = .{", &state));
+    try std.testing.expectEqual(@as(usize, 34), state.nest);
+    try std.testing.expectEqual(@as(usize, 34), state.max_nest);
+    try std.testing.expect(!trackBraceNesting("};", &state));
+    try std.testing.expectEqual(@as(usize, 33), state.nest);
 }
 
 /// Run analyzeComplexity on one in-memory file and assert exactly one
@@ -53427,6 +53605,207 @@ test "ZA302: char-literal braces do not inflate nesting depth" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
         }
     }
+}
+
+test "ZA302: same-line struct literals do not inflate nesting depth (EPH-I0811)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Real nesting is 3 (fn > if > if); the same-line `.{ ... }` literal
+    // must not add a phantom fourth level (probe_d3 shape).
+    const code =
+        \\const Spec = struct { a: u32, b: u32 };
+        \\fn take(s: Spec) u32 {
+        \\    return s.a + s.b;
+        \\}
+        \\fn probe(a: bool, b: bool) u32 {
+        \\    var total: u32 = 0;
+        \\    if (a) {
+        \\        if (b) {
+        \\            const s: Spec = .{ .a = 1, .b = 2 };
+        \\            total += take(s);
+        \\        }
+        \\    }
+        \\    return total;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "lit.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "lit.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "lit.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
+        }
+    }
+}
+
+test "ZA302: multiline initializers do not inflate nesting depth (EPH-I0811, EPH-I0026)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Real nesting is 3 (fn > while > if). The table literal opens on its
+    // own line, stays open across lines, and the `return .{...}` adds no
+    // level either (probe_m1 / probe_i0026 shape).
+    const code =
+        \\const Table = struct { a: u32, b: u32 };
+        \\fn probe(cond: bool) Table {
+        \\    var t: Table = undefined;
+        \\    while (cond) {
+        \\        if (cond) {
+        \\            t = .{
+        \\                .a = 1,
+        \\                .b = 2,
+        \\            };
+        \\            return .{ .a = 1, .b = 2 };
+        \\        }
+        \\    }
+        \\    return t;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "mlit.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "mlit.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "mlit.zig")) {
+            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
+        }
+    }
+}
+
+test "ZA302: genuine control-flow nesting at depth 4 still fires (EPH-I0811)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // fn > if > if > if: real control-flow nesting of 4, no literals. The
+    // literal mask must not blunt this direction.
+    const code =
+        \\fn probe(a: bool, b: bool, c: bool) void {
+        \\    if (a) {
+        \\        if (b) {
+        \\            if (c) {
+        \\                sink();
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\fn sink() void {}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "deep.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "deep.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var nesting_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "deep.zig") and
+            mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP))
+        {
+            nesting_findings += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), nesting_findings);
+}
+
+test "ZA306: keyword+literal lines do not leak cognitive nesting (EPH-I0818)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Reviewer shape (EPH-I0818): two `try take(.{ ... })` lines plus four
+    // nested ifs. The try's only `{` is a masked literal, so it opens no
+    // persistent scope. True cognitive: try(1) + try(1) + if(1) + if(2) +
+    // if(3) + if(4) = 12. Pre-fix the leaked nesting made the try lines
+    // cost 1+2 and the ifs 3+4+5+6 = 21 (EPH-I0452 marker sub-class).
+    const code =
+        \\fn take(s: anytype) !void {
+        \\    _ = s;
+        \\}
+        \\fn sink() void {}
+        \\fn probeCogLeak(x: bool, y: bool, z: bool, w: bool) !void {
+        \\    try take(.{ .a = 1 });
+        \\    try take(.{ .a = 2 });
+        \\    if (x) {
+        \\        if (y) {
+        \\            if (z) {
+        \\                if (w) {
+        \\                    sink();
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "cog_leak.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "cog_leak.zig"), {});
+
+    // The no-literal twin: four nested ifs, true cognitive 1+2+3+4 = 10.
+    // At the 10 limit it stays silent — the gate must not blunt real
+    // control-flow nesting.
+    const ctl_code =
+        \\fn sink() void {}
+        \\fn probeControl(x: bool, y: bool, z: bool, w: bool) void {
+        \\    if (x) {
+        \\        if (y) {
+        \\            if (z) {
+        \\                if (w) {
+        \\                    sink();
+        \\                }
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    ;
+    const ctl = try createTestFileAnalysis(allocator, "cog_ctl.zig", ctl_code);
+    try graph.files.put(ctl.path, ctl);
+    try graph.reachable.put(try allocator.dupe(u8, "cog_ctl.zig"), {});
+
+    const th = Thresholds{ .max_cognitive = 10 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var cog_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cog_leak.zig")) {
+            cog_findings += 1;
+            // Pin the measured value, not just rule silence: 12 is the
+            // true cognitive weight of the shape, 21 the leaked one.
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 12 cognitive complexity (max 10)") != null);
+        }
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cog_ctl.zig")) {
+            try std.testing.expect(false);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cog_findings);
 }
 
 // ============================================================================

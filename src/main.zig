@@ -28583,13 +28583,32 @@ fn buildCheckGraph(ctx: *const RunCtx, g: *ImportGraph) !void {
 
 /// Scan one entry file that sits outside the scanned path. Boundary
 /// compare (RED4-3): entry "src-evil/x.zig" is outside path "src" and must
-/// still be scanned for orphans. EPH-I0195: this gate stays textual —
-/// ingest is the containment boundary, so out-of-root entries can only
-/// arrive here via operator channels (CLI --entry, trusted config), where
-/// outside reads are the documented RED4-3 orphan feature.
+/// still be scanned for orphans. The coverage test is realpath-normalized
+/// (EPH-I0812), so an entry spelling the scanned file differently does not
+/// scan it a second time. EPH-I0195: ingest is the containment boundary,
+/// so out-of-root entries can only arrive here via operator channels (CLI
+/// --entry, trusted config), where outside reads are the documented RED4-3
+/// orphan feature.
 fn scanOutOfRootEntry(ctx: *const RunCtx, g: *ImportGraph, entry: []const u8) void {
-    if (isPathAncestorOrEqual(ctx.cfg.path, entry)) return;
+    if (entryCoveredByScan(ctx.diag.io, ctx.cfg.path, entry)) return;
     g.scanSingleFile(entry) catch |err| noteMissingEntry(ctx.cfg, entry, err);
+}
+
+/// True when `entry` sits inside the scan path's tree. When both sides
+/// realpath-resolve, the physical tree decides: equal realpaths mean one
+/// physical file, so alternate spellings (absolute, infix-./) count as
+/// covered. A symlink escape reads as outside, and two distinct files
+/// never collide. When either side fails to resolve, the textual test
+/// decides, exactly as before (EPH-I0812).
+fn entryCoveredByScan(io: std.Io, scan_path: []const u8, entry: []const u8) bool {
+    var scan_buf: [Fs.max_path_bytes]u8 = undefined;
+    var entry_buf: [Fs.max_path_bytes]u8 = undefined;
+    const scan_real = Fs.cwd(io).realpath(scan_path, &scan_buf) catch null;
+    const entry_real = Fs.cwd(io).realpath(entry, &entry_buf) catch null;
+    if (scan_real) |sr| {
+        if (entry_real) |er| return isPathAncestorOrEqual(sr, er);
+    }
+    return isPathAncestorOrEqual(scan_path, entry);
 }
 
 /// Verbose-only note for an entry file that could not be scanned. A
@@ -28600,20 +28619,19 @@ fn noteMissingEntry(cfg: *const Config, entry: []const u8, err: anyerror) void {
 }
 
 /// Count the out-of-root .zig entry strings for the scan-shape note
-/// (EPH-I0784): the entries passing both textual gates — outside the scan
-/// path (scanOutOfRootEntry's boundary) and .zig-suffixed (scanSingleFile's
-/// filter). The count is a textual upper bound on joins, not the join
-/// count itself: analyzeFile skips missing or unreadable reads silently,
-/// and the --entry and config appends do not dedup, so a stale or
-/// duplicated entry counts here but never joins the graph. Predict the
-/// note's N from (scan_path, entries) alone: every entry passing both
-/// gates counts once per occurrence. Genuine widening is never missed —
-/// every joined entry passed both gates, so the count can only over-report
-/// (EPH-I0802).
-fn countOutOfRootEntries(scan_path: []const u8, entries: []const []const u8) usize {
+/// (EPH-I0784): the entries passing both gates — outside the scan path
+/// (scanOutOfRootEntry's boundary, realpath-normalized per EPH-I0812) and
+/// .zig-suffixed (scanSingleFile's filter). The count is an upper bound on
+/// joins, not the join count itself: analyzeFile skips missing or
+/// unreadable reads silently, and the --entry and config appends do not
+/// dedup, so a stale or duplicated entry counts here but never joins the
+/// graph. Every entry passing both gates counts once per occurrence.
+/// Genuine widening is never missed — every joined entry passed both
+/// gates, so the count can only over-report (EPH-I0802).
+fn countOutOfRootEntries(io: std.Io, scan_path: []const u8, entries: []const []const u8) usize {
     var count: usize = 0;
     for (entries) |entry| {
-        if (isPathAncestorOrEqual(scan_path, entry)) continue;
+        if (entryCoveredByScan(io, scan_path, entry)) continue;
         if (!mem.endsWith(u8, entry, ".zig")) continue;
         count += 1;
     }
@@ -28623,16 +28641,18 @@ fn countOutOfRootEntries(scan_path: []const u8, entries: []const []const u8) usi
 /// EPH-I0784 scan-shape note: the check scan is the CLI path UNION the
 /// entry points (the join is intended). Fires only when at least one .zig
 /// entry sits outside the scan path, so a run the CLI path already covers
-/// stays silent. N is countOutOfRootEntries' textual upper bound, not the
-/// joined-file count (EPH-I0802). The path crosses the terminal sanitizer:
-/// it can derive from a config file (EPH-I0147).
+/// stays silent. The coverage test is realpath-normalized (EPH-I0812): an
+/// entry spelling the scanned file differently does not count. N is
+/// countOutOfRootEntries' upper bound, not the joined-file count
+/// (EPH-I0802). The path crosses the terminal sanitizer: it can derive
+/// from a config file (EPH-I0147).
 fn noteEntriesWidenScan(
     diag: *DiagCtx,
     allocator: Allocator,
     scan_path: []const u8,
     entries: []const []const u8,
 ) !void {
-    const widened = countOutOfRootEntries(scan_path, entries);
+    const widened = countOutOfRootEntries(diag.io, scan_path, entries);
     if (widened == 0) return;
     diag.entries_widen_note_count += 1;
     var safe_path = try types.sanitizeTerminal(allocator, scan_path);
@@ -29297,27 +29317,53 @@ test "AST skip note fires only when files were skipped" {
 }
 
 test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-I0784)" {
+    const diag = testDiagCtx();
     // The scan path covers its own tree: nothing joins.
-    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries("src", &.{}));
-    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries("src", &.{"src/main.zig"}));
+    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries(diag.io, "src", &.{}));
+    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries(diag.io, "src", &.{"src/main.zig"}));
     try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries(
+        diag.io,
         "src/main.zig",
         &.{"src/main.zig"},
     ));
     // Out-of-root .zig entries join. A non-.zig name never reaches the
     // graph (scanSingleFile filter), so it does not count.
     try std.testing.expectEqual(@as(usize, 2), countOutOfRootEntries(
+        diag.io,
         "src",
         &.{ "build.zig", "tools/gen.zig", "README.md" },
     ));
     // Component boundary (RED4-3): a sibling prefix is outside, not inside.
-    try std.testing.expectEqual(@as(usize, 1), countOutOfRootEntries("src", &.{"src-evil/x.zig"}));
+    try std.testing.expectEqual(@as(usize, 1), countOutOfRootEntries(diag.io, "src", &.{"src-evil/x.zig"}));
     // Duplicates count once per occurrence: the --entry and config appends
     // do not dedup, so a doubled entry over-reports (never under-reports).
     try std.testing.expectEqual(@as(usize, 2), countOutOfRootEntries(
+        diag.io,
         "src",
         &.{ "tools/gen.zig", "tools/gen.zig" },
     ));
+}
+
+test "entryCoveredByScan folds alternate spellings of one file (EPH-I0812)" {
+    const diag = testDiagCtx();
+    // Real-file pairs: the absolute and infix-dot spellings resolve to the
+    // relative form's realpath, so all three count as covered.
+    var buf: [Fs.max_path_bytes]u8 = undefined;
+    const abs = try Fs.cwd(diag.io).realpath("src/main.zig", &buf);
+    var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
+    const cwd = try Fs.cwd(diag.io).realpath(".", &cwd_buf);
+    const infix = try std.fmt.allocPrint(std.testing.allocator, "{s}/./src/main.zig", .{cwd});
+    defer std.testing.allocator.free(infix);
+    try std.testing.expect(entryCoveredByScan(diag.io, "src/main.zig", "src/main.zig"));
+    try std.testing.expect(entryCoveredByScan(diag.io, abs, "src/main.zig"));
+    try std.testing.expect(entryCoveredByScan(diag.io, infix, "src/main.zig"));
+    // A different physical file is not covered.
+    try std.testing.expect(!entryCoveredByScan(diag.io, abs, "src/types.zig"));
+    // Both sides resolve here: the realpath pair decides (src covers
+    // src/main.zig).
+    try std.testing.expect(entryCoveredByScan(diag.io, "src", "src/main.zig"));
+    // Unresolvable paths fall back to the textual test.
+    try std.testing.expect(!entryCoveredByScan(diag.io, "main.zig", "other.zig"));
 }
 
 test "entries-widen note fires only when entries add scan roots (EPH-I0784)" {
@@ -29382,6 +29428,151 @@ test "buildCheckGraph wires the entries-widen note (EPH-I0803)" {
     try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
     // The out-of-root entry actually joined: the graph holds both files.
     try std.testing.expectEqual(@as(usize, 2), graph.files.count());
+}
+
+/// EPH-I0812 run fixture: run context and graph wired around a configured
+/// cfg. The caller owns the cfg (path and entries), its deinit, and the
+/// cache (the EPH-I0803 pattern at the buildCheckGraph tests). The
+/// spelling tests read the repo's real src/main.zig and src/types.zig
+/// from the invocation cwd, so they run from the project root.
+const SpellingRun = struct {
+    ctx: RunCtx,
+    graph: ImportGraph,
+
+    fn init(
+        diag: *DiagCtx,
+        allocator: Allocator,
+        cfg: *Config,
+        cache: *IgnoreCache,
+    ) SpellingRun {
+        return .{
+            .ctx = RunCtx{
+                .alloc = allocator,
+                .cfg = cfg,
+                .diag = diag,
+                .base_path = cfg.path,
+                .ignore_cache = cache,
+            },
+            .graph = ImportGraph.init(allocator, diag),
+        };
+    }
+
+    fn deinit(self: *SpellingRun) void {
+        self.graph.deinit();
+    }
+};
+
+test "relative CLI path keeps one graph key for a covered entry (EPH-I0812)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // The repo's own src/main.zig stands in for the sandbox project's
+    // main.zig: a real file a relative path resolves against from the
+    // invocation cwd. The kept entry shares the scan path's spelling, so
+    // the join must stay silent (Files: 1, no widen note).
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, "src/main.zig");
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
+    defer run.deinit();
+    try buildCheckGraph(&run.ctx, &run.graph);
+    try std.testing.expectEqual(@as(usize, 1), run.graph.files.count());
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_widen_note_count);
+}
+
+test "dot-slash CLI path keeps one graph key for a covered entry (EPH-I0812)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    var cli_path = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+    };
+    // The parse layer sheds the leading ./ (acceptPositionalPath), so the
+    // run sees the same spelling as the kept entry.
+    try parseCliArg(cli_ctx, "./src/main.zig");
+    try std.testing.expectEqualStrings("src/main.zig", cfg.path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
+    defer run.deinit();
+    try buildCheckGraph(&run.ctx, &run.graph);
+    try std.testing.expectEqual(@as(usize, 1), run.graph.files.count());
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_widen_note_count);
+}
+
+test "absolute CLI path keeps one graph key for a covered entry (EPH-I0812)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // The absolute spelling of the same physical file: the kept relative
+    // entry must not join under a second key, and the widen note must not
+    // fire for it.
+    var buf: [Fs.max_path_bytes]u8 = undefined;
+    const abs = try Fs.cwd(diag.io).realpath("src/main.zig", &buf);
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, abs);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
+    defer run.deinit();
+    try buildCheckGraph(&run.ctx, &run.graph);
+    try std.testing.expectEqual(@as(usize, 1), run.graph.files.count());
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_widen_note_count);
+}
+
+test "infix-dot CLI path keeps one graph key for a covered entry (EPH-I0812)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
+    const cwd = try Fs.cwd(diag.io).realpath(".", &cwd_buf);
+    const infix = try std.fmt.allocPrint(allocator, "{s}/./src/main.zig", .{cwd});
+    defer allocator.free(infix);
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, infix);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
+    defer run.deinit();
+    try buildCheckGraph(&run.ctx, &run.graph);
+    try std.testing.expectEqual(@as(usize, 1), run.graph.files.count());
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_widen_note_count);
+}
+
+test "distinct entry files stay distinct graph keys (EPH-I0812)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // A genuinely different physical file stays outside the scan path: it
+    // joins (two keys) and the widen note counts it (the RED4-3 orphan
+    // feature).
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, "src/main.zig");
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/types.zig"));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
+    defer run.deinit();
+    try buildCheckGraph(&run.ctx, &run.graph);
+    try std.testing.expectEqual(@as(usize, 2), run.graph.files.count());
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
 }
 
 test "corpus warning fires once when resident bytes cross the threshold" {
@@ -59881,7 +60072,7 @@ test "file target keeps the cwd config's entries (EPH-I0801)" {
     // entries-widen note fires downstream under its existing logic.
     try std.testing.expectEqual(
         @as(usize, 1),
-        countOutOfRootEntries(cfg.path, cfg.entries.items),
+        countOutOfRootEntries(diag.io, cfg.path, cfg.entries.items),
     );
 }
 

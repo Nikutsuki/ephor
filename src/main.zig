@@ -10940,19 +10940,26 @@ fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
 
 /// Look back over a dotted ident chain for a leading '&' (&Struct.var_name).
 /// Space and tab between chain tokens are transparent (`&opts . buf`,
-/// EPH-I0805): the fill verdict must not depend on fmt spacing. The walk
-/// stops at the first non-chain byte; a '&' there starts the chain only
-/// when the byte right of it is not space/tab. The discrimination rests on
-/// zig fmt's symmetric-whitespace enforcement for binary operators: on
+/// EPH-I0805): the fill verdict must not depend on fmt spacing. A grouping
+/// paren between the amp and the chain (`&(opts.buf)`, EPH-I0816) bridges
+/// the walk when the byte left of it is '&' or '(': the paren belongs to
+/// the address-of expression, and zig fmt keeps the form. The walk stops
+/// at the first non-chain byte; a '&' there starts the chain only when the
+/// byte right of it is not space/tab. The discrimination rests on zig
+/// fmt's symmetric-whitespace enforcement for binary operators: on
 /// fmt-clean code an infix bitwise-and (`flags & opts.buf`) always has
-/// space/tab right, a prefix `&` never does (EPH-I0814). On fmt-dirty
-/// input the verdict degrades to the pre-widening walk (EPH-I0815).
+/// space/tab right, a prefix `&` never does (EPH-I0814). A call paren
+/// (`use(foo(opts.buf))`) and the fmt-clean infix shape (`flags &
+/// (opts.buf)`) stop the walk before it reaches the amp. On fmt-dirty
+/// input the verdict degrades to the pre-widening walk (EPH-I0815): a
+/// space-less infix `&(` also bridges and reads as a prefix amp.
 fn hasAmpBeforeChain(t: []const u8, i: usize) bool {
     var j = i;
     while (j > 0) {
         j -= 1;
         const c = t[j];
         if (c == ' ' or c == '\t' or c == '.' or isIdent(c)) continue;
+        if (c == '(' and j > 0 and (t[j - 1] == '&' or t[j - 1] == '(')) continue;
         if (c != '&') return false;
         // The amp starts the chain only when the byte right of it is not
         // space/tab (EPH-I0815). j + 1 is in bounds: j < i and i is a
@@ -40368,6 +40375,56 @@ test "ZA607: else-arm-only assignment is detected" {
     try std.testing.expect(found);
 }
 
+test "ZA607: parenthesized chain amp keeps the fill credit (EPH-I0816)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `use(&(opts.buf))` groups the chain operand: the call still fills
+    // buf through the pointer, the same as `use(&opts.buf)`. The fill
+    // credit must not depend on the paren (EPH-I0816).
+    const content =
+        \\const Opts = struct { buf: u8 };
+        \\fn use(p: *u8) void {
+        \\    p.* = 1;
+        \\}
+        \\pub fn f(opts: *Opts) u8 {
+        \\    var buf: u8 = undefined;
+        \\    use(&(opts.buf));
+        \\    return buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_parenfill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "da_parenfill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+
+    // The no-amp control keeps the report: without the pointer fill, the
+    // read on the return line is a genuine read-before-assign.
+    const control =
+        \\const Opts = struct { buf: u8 };
+        \\fn use(p: *u8) void {
+        \\    p.* = 1;
+        \\}
+        \\pub fn f(opts: *Opts) u8 {
+        \\    var buf: u8 = undefined;
+        \\    use(opts.buf);
+        \\    return buf;
+        \\}
+    ;
+    var run2 = try runCFGMemoryTest(&diag, allocator, "da_parenfill_ctrl.zig", control);
+    defer run2.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run2.issues.items, "da_parenfill_ctrl.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: if-arm fill with empty else is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -42595,6 +42652,35 @@ test "hasDirectFill takes the right-side amp verdict (EPH-I0815)" {
     try std.testing.expect(!hasDirectFill("const m = 'a' & opts.buf;", "buf"));
     try std.testing.expect(hasDirectFill("const p = if (flag) &opts.buf else null;", "buf"));
     try std.testing.expect(hasDirectFill("const v = blk: { if (flag) break :blk &opts.buf; };", "buf"));
+}
+
+test "hasAmpBeforeChain bridges the amp-paren shape (EPH-I0816)" {
+    // `use(&(opts.buf))` groups the chain operand: the walk stopped at
+    // the `(` before reaching the amp, so the fill credit the plain
+    // `use(&opts.buf)` form receives was denied (EPH-I0816). The bridge
+    // crosses the paren only when `&` (or a nested paren) sits
+    // immediately left. A call paren (`use(foo(opts.buf))`) and the
+    // fmt-clean infix shape (`flags & (opts.buf)`) still stop the walk.
+    const paren = "use(&(opts.buf));";
+    try std.testing.expect(hasAmpBeforeChain(paren, mem.indexOf(u8, paren, "buf").?));
+    const nested = "use(&((opts.buf)));";
+    try std.testing.expect(hasAmpBeforeChain(nested, mem.indexOf(u8, nested, "buf").?));
+    const call = "use(foo(opts.buf));";
+    try std.testing.expect(!hasAmpBeforeChain(call, mem.indexOf(u8, call, "buf").?));
+    const infix = "const m = flags & (opts.buf);";
+    try std.testing.expect(!hasAmpBeforeChain(infix, mem.indexOf(u8, infix, "buf").?));
+}
+
+test "hasDirectFill credits the amp-paren chain pointer (EPH-I0816)" {
+    // Pattern 1 gives `use(&(opts.buf))` the same fill credit as
+    // `use(&opts.buf)`: the paren groups the chain operand, the amp
+    // still prefixes it. The fmt-clean infix shape (`flags & (opts.buf)`)
+    // keeps the EPH-I0814 rejection through the consumer (EPH-I0816).
+    try std.testing.expect(hasDirectFill("use(&(opts.buf));", "buf"));
+    try std.testing.expect(hasDirectFill("return &(opts.buf);", "buf"));
+    try std.testing.expect(hasDirectFill("use((&opts.buf));", "buf"));
+    try std.testing.expect(!hasDirectFill("use(foo(opts.buf));", "buf"));
+    try std.testing.expect(!hasDirectFill("const m = flags & (opts.buf);", "buf"));
 }
 
 test "isStructFieldPattern accepts whitespace-spaced dot fields (EPH-I0796)" {

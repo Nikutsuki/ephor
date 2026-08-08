@@ -28597,20 +28597,57 @@ fn buildCheckGraph(ctx: *const RunCtx, g: *ImportGraph) !void {
     try scanPath(g, ctx.cfg.path);
     try noteEntriesWidenScan(ctx.diag, ctx.alloc, ctx.cfg.path, ctx.cfg.entries.items);
     // Entry-point files outside the scanned path still feed orphan
-    // detection when checking subdirectories.
-    for (ctx.cfg.entries.items) |e| scanOutOfRootEntry(ctx, g, e);
+    // detection when checking subdirectories. One physical file scans
+    // once: a repeated occurrence (duplicate string, alternate spelling)
+    // handed to analyzeFile a second time overwrites the first graph
+    // entry and leaks the replaced value and the stored key (EPH-I0817).
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var iter = seen.keyIterator();
+        while (iter.next()) |key| ctx.alloc.free(key.*);
+        seen.deinit(ctx.alloc);
+    }
+    for (ctx.cfg.entries.items) |e| {
+        if (try markEntryScanned(ctx.diag.io, ctx.alloc, &seen, e)) continue;
+        scanOutOfRootEntry(ctx, g, e);
+    }
     for (ctx.cfg.entries.items) |e| try g.markReachable(e);
     try g.markBuildPathReferences(ctx.cfg);
+}
+
+/// Insert `entry` into the out-of-root scan set and return true when a
+/// previous occurrence already scanned the same physical file (EPH-I0817).
+/// The key is the entry's realpath when it resolves, the raw text
+/// otherwise: duplicate strings and alternate spellings of one file
+/// collapse to one scan, while unresolvable entries still dedupe by their
+/// text. The set owns its keys; buildCheckGraph frees them at teardown.
+fn markEntryScanned(
+    io: std.Io,
+    allocator: Allocator,
+    seen: *std.StringHashMapUnmanaged(void),
+    entry: []const u8,
+) !bool {
+    var buf: [Fs.max_path_bytes]u8 = undefined;
+    const resolved = Fs.cwd(io).realpath(entry, &buf) catch null;
+    const owned = try allocator.dupe(u8, resolved orelse entry);
+    errdefer allocator.free(owned);
+    const gop = try seen.getOrPut(allocator, owned);
+    if (gop.found_existing) {
+        allocator.free(owned);
+        return true;
+    }
+    return false;
 }
 
 /// Scan one entry file that sits outside the scanned path. Boundary
 /// compare (RED4-3): entry "src-evil/x.zig" is outside path "src" and must
 /// still be scanned for orphans. The coverage test is realpath-normalized
 /// (EPH-I0812), so an entry spelling the scanned file differently does not
-/// scan it a second time. EPH-I0195: ingest is the containment boundary,
-/// so out-of-root entries can only arrive here via operator channels (CLI
-/// --entry, trusted config), where outside reads are the documented RED4-3
-/// orphan feature.
+/// scan it a second time. Repeated occurrences of one physical file among
+/// the entries dedupe at the caller before this gate (EPH-I0817). EPH-I0195:
+/// ingest is the containment boundary, so out-of-root entries can only
+/// arrive here via operator channels (CLI --entry, trusted config), where
+/// outside reads are the documented RED4-3 orphan feature.
 fn scanOutOfRootEntry(ctx: *const RunCtx, g: *ImportGraph, entry: []const u8) void {
     if (entryCoveredByScan(ctx.diag.io, ctx.cfg.path, entry)) return;
     g.scanSingleFile(entry) catch |err| noteMissingEntry(ctx.cfg, entry, err);
@@ -29593,6 +29630,95 @@ test "distinct entry files stay distinct graph keys (EPH-I0812)" {
     var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
     defer run.deinit();
     try buildCheckGraph(&run.ctx, &run.graph);
+    try std.testing.expectEqual(@as(usize, 2), run.graph.files.count());
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
+}
+
+test "duplicate out-of-root entry scans once and deinits leak-free (EPH-I0817)" {
+    // A repeated entry string (--entry twice, a config list with a
+    // repeat) must scan the file once: a second analyzeFile overwrites
+    // the first graph entry and leaks the replaced value and the stored
+    // key. std.testing.allocator turns every leak into a FAIL.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const src_path = try std.fmt.allocPrint(allocator, "{s}/src", .{tmp_path});
+    defer allocator.free(src_path);
+    const entry_path = try std.fmt.allocPrint(allocator, "{s}/entry.zig", .{tmp_path});
+    defer allocator.free(entry_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, src_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, entry_path));
+    try cfg.entries.append(allocator, try allocator.dupe(u8, entry_path));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
+    defer run.deinit();
+
+    try buildCheckGraph(&run.ctx, &run.graph);
+
+    // One join per physical file: the repeat never adds a graph entry.
+    try std.testing.expectEqual(@as(usize, 2), run.graph.files.count());
+    // The widen note still counts occurrences (EPH-I0802 upper bound):
+    // the dedupe changes joins, not the note's count semantics.
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
+}
+
+test "alternate out-of-root entry spellings scan once (EPH-I0817)" {
+    // Two spellings of one physical file outside the scan path collapse
+    // to one scan. Pre-fix the second analyzeFile joined the file under
+    // a second graph key (duplicate analysis, stale resolved_to_key
+    // value); the realpath-keyed dedupe pins the graph to one entry.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const src_path = try std.fmt.allocPrint(allocator, "{s}/src", .{tmp_path});
+    defer allocator.free(src_path);
+    const entry_path = try std.fmt.allocPrint(allocator, "{s}/entry.zig", .{tmp_path});
+    defer allocator.free(entry_path);
+    const infix_entry_path = try std.fmt.allocPrint(allocator, "{s}/./entry.zig", .{tmp_path});
+    defer allocator.free(infix_entry_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, src_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, entry_path));
+    try cfg.entries.append(allocator, try allocator.dupe(u8, infix_entry_path));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
+    defer run.deinit();
+
+    try buildCheckGraph(&run.ctx, &run.graph);
+
     try std.testing.expectEqual(@as(usize, 2), run.graph.files.count());
     try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
 }

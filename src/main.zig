@@ -28540,10 +28540,17 @@ fn noteMissingEntry(cfg: *const Config, entry: []const u8, err: anyerror) void {
     std.debug.print("note: entry {s} not found: {}\n", .{ entry, err });
 }
 
-/// Count the entry points the out-of-root scan pulls in (EPH-I0784): the
-/// .zig entries the scan path does not cover. Mirrors the two gates
-/// between an entry and the graph — scanOutOfRootEntry's textual boundary
-/// and scanSingleFile's .zig filter — so the count and the scan agree.
+/// Count the out-of-root .zig entry strings for the scan-shape note
+/// (EPH-I0784): the entries passing both textual gates — outside the scan
+/// path (scanOutOfRootEntry's boundary) and .zig-suffixed (scanSingleFile's
+/// filter). The count is a textual upper bound on joins, not the join
+/// count itself: analyzeFile skips missing or unreadable reads silently,
+/// and the --entry and config appends do not dedup, so a stale or
+/// duplicated entry counts here but never joins the graph. Predict the
+/// note's N from (scan_path, entries) alone: every entry passing both
+/// gates counts once per occurrence. Genuine widening is never missed —
+/// every joined entry passed both gates, so the count can only over-report
+/// (EPH-I0802).
 fn countOutOfRootEntries(scan_path: []const u8, entries: []const []const u8) usize {
     var count: usize = 0;
     for (entries) |entry| {
@@ -28557,8 +28564,9 @@ fn countOutOfRootEntries(scan_path: []const u8, entries: []const []const u8) usi
 /// EPH-I0784 scan-shape note: the check scan is the CLI path UNION the
 /// entry points (the join is intended). Fires only when at least one .zig
 /// entry sits outside the scan path, so a run the CLI path already covers
-/// stays silent. The path crosses the terminal sanitizer: it can derive
-/// from a config file (EPH-I0147).
+/// stays silent. N is countOutOfRootEntries' textual upper bound, not the
+/// joined-file count (EPH-I0802). The path crosses the terminal sanitizer:
+/// it can derive from a config file (EPH-I0147).
 fn noteEntriesWidenScan(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -29245,6 +29253,12 @@ test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-
     ));
     // Component boundary (RED4-3): a sibling prefix is outside, not inside.
     try std.testing.expectEqual(@as(usize, 1), countOutOfRootEntries("src", &.{"src-evil/x.zig"}));
+    // Duplicates count once per occurrence: the --entry and config appends
+    // do not dedup, so a doubled entry over-reports (never under-reports).
+    try std.testing.expectEqual(@as(usize, 2), countOutOfRootEntries(
+        "src",
+        &.{ "tools/gen.zig", "tools/gen.zig" },
+    ));
 }
 
 test "entries-widen note fires only when entries add scan roots (EPH-I0784)" {
@@ -29260,6 +29274,55 @@ test "entries-widen note fires only when entries add scan roots (EPH-I0784)" {
     // src/types.zig from the repo root) fire the note once.
     try noteEntriesWidenScan(&diag, allocator, "src/types.zig", &.{ "src/main.zig", "build.zig" });
     try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
+}
+
+test "buildCheckGraph wires the entries-widen note (EPH-I0803)" {
+    // Pin the call site itself: the note-wiring line inside buildCheckGraph
+    // has no other test (deleting it kept the suite green). The fixture
+    // runs the real scan: src/ is the CLI path, entry.zig sits outside it,
+    // so the note must fire and the entry must join the graph.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const src_path = try std.fmt.allocPrint(allocator, "{s}/src", .{tmp_path});
+    defer allocator.free(src_path);
+    const entry_path = try std.fmt.allocPrint(allocator, "{s}/entry.zig", .{tmp_path});
+    defer allocator.free(entry_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, src_path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, entry_path));
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = src_path,
+        .ignore_cache = &cache,
+    };
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    try buildCheckGraph(&ctx, &graph);
+
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
+    // The out-of-root entry actually joined: the graph holds both files.
+    try std.testing.expectEqual(@as(usize, 2), graph.files.count());
 }
 
 test "corpus warning fires once when resident bytes cross the threshold" {

@@ -10941,17 +10941,27 @@ fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
 /// Look back over a dotted ident chain for a leading '&' (&Struct.var_name).
 /// Space and tab between chain tokens are transparent (`&opts . buf`,
 /// EPH-I0805): the fill verdict must not depend on fmt spacing. The walk
-/// stops at the first non-chain byte and checks it for '&', the same
-/// boundary as the immediate-byte scan.
+/// stops at the first non-chain byte; a '&' there starts the chain only
+/// when the byte right of it is not space/tab. The discrimination rests on
+/// zig fmt's symmetric-whitespace enforcement for binary operators: on
+/// fmt-clean code an infix bitwise-and (`flags & opts.buf`) always has
+/// space/tab right, a prefix `&` never does (EPH-I0814). On fmt-dirty
+/// input the verdict degrades to the pre-widening walk (EPH-I0815).
 fn hasAmpBeforeChain(t: []const u8, i: usize) bool {
     var j = i;
     while (j > 0) {
         j -= 1;
         const c = t[j];
         if (c == ' ' or c == '\t' or c == '.' or isIdent(c)) continue;
-        return c == '&';
+        if (c != '&') return false;
+        // The amp starts the chain only when the byte right of it is not
+        // space/tab (EPH-I0815). j + 1 is in bounds: j < i and i is a
+        // var-name position with at least one byte right of it.
+        return t[j + 1] != ' ' and t[j + 1] != '\t';
     }
-    return t[0] == '&';
+    // The loop returns on every non-chain byte, so only a chain byte can
+    // end the walk at t[0] — never the '&' the fill needs (EPH-I0815).
+    return false;
 }
 
 /// Scan for `&var_name` anywhere in the line (pointer-to-buffer fills).
@@ -42208,6 +42218,55 @@ test "hasDirectFill accepts a spaced-dot chain pointer with space before the dot
     try std.testing.expect(hasDirectFill("fill(&opts. buf);", "buf"));
     try std.testing.expect(hasDirectFill("fill(&opts.buf);", "buf"));
     try std.testing.expect(!hasDirectFill("use(opts . buf);", "buf"));
+}
+
+test "hasDirectFill rejects an infix bitwise-and chain (EPH-I0814)" {
+    // `flags & opts.buf` is bitwise-and, not a chain prefix: the widened
+    // walk crossed the space and read the infix amp as the leading '&',
+    // masking the ZA607 read-before-undefined report (EPH-I0814).
+    try std.testing.expect(!hasDirectFill("const m = flags & opts.buf;", "buf"));
+    try std.testing.expect(!hasAmpBeforeChain("flags & opts.buf", 13));
+}
+
+test "hasAmpBeforeChain keeps prefix address-of positions (EPH-I0814)" {
+    // The infix rejection must not eat genuine prefix address-of: after a
+    // keyword, an operator, `(`, `,`, `;`, `=` — the amp starts the chain.
+    try std.testing.expect(hasAmpBeforeChain("return &opts . buf", 15));
+    try std.testing.expect(hasAmpBeforeChain("x = &opts . buf", 12));
+    try std.testing.expect(hasAmpBeforeChain("f(&opts.buf)", 8));
+    try std.testing.expect(hasAmpBeforeChain("( &opts.buf )", 8));
+}
+
+test "hasDirectFill keeps prefix address-of shapes (EPH-I0814)" {
+    // The same prefix positions through the consumer: a keyword, `=`, or
+    // `(` before the amp keeps the fill verdict (EPH-I0814).
+    try std.testing.expect(hasDirectFill("const p = &opts . buf;", "buf"));
+    try std.testing.expect(hasDirectFill("return &opts . buf;", "buf"));
+    try std.testing.expect(hasDirectFill("use(&opts.buf);", "buf"));
+    try std.testing.expect(hasDirectFill("use( &opts.buf );", "buf"));
+}
+
+test "hasAmpBeforeChain discriminates by the byte right of the amp (EPH-I0815)" {
+    // zig fmt pads binary operators symmetrically, so an infix '&' has
+    // space/tab right on fmt-clean code and a prefix `&` never does. The
+    // left-side enumeration cannot see past `)`, `*`, `?`, and block
+    // labels (EPH-I0815).
+    try std.testing.expect(!hasAmpBeforeChain("p.* & opts.buf", 11));
+    try std.testing.expect(!hasAmpBeforeChain("p.? & opts.buf", 11));
+    try std.testing.expect(!hasAmpBeforeChain("'a' & opts.buf", 11));
+    try std.testing.expect(hasAmpBeforeChain("if (flag) &opts.buf else null", 16));
+    try std.testing.expect(hasAmpBeforeChain("break :blk &opts.buf", 17));
+}
+
+test "hasDirectFill takes the right-side amp verdict (EPH-I0815)" {
+    // The same discrimination through the consumer: deref, unwrap, and
+    // char-literal operands keep the ZA607 read-before-undefined report;
+    // an if-else value and a labeled break value still fill (EPH-I0815).
+    try std.testing.expect(!hasDirectFill("const m = p.* & opts.buf;", "buf"));
+    try std.testing.expect(!hasDirectFill("const m = p.? & opts.buf;", "buf"));
+    try std.testing.expect(!hasDirectFill("const m = 'a' & opts.buf;", "buf"));
+    try std.testing.expect(hasDirectFill("const p = if (flag) &opts.buf else null;", "buf"));
+    try std.testing.expect(hasDirectFill("const v = blk: { if (flag) break :blk &opts.buf; };", "buf"));
 }
 
 test "isStructFieldPattern accepts whitespace-spaced dot fields (EPH-I0796)" {

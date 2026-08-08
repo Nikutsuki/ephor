@@ -16214,6 +16214,11 @@ const ComplexityState = struct {
     // nesting depth of the input, not with anything bounded (mirrors
     // prong_opens, EPH-I0451).
     lit_opens: [32]usize = @splat(0),
+    // EPH-I0819: last non-whitespace code char, carried across the per-line
+    // BraceScan reset so a `.` at end of line still masks the literal `{`
+    // on the next line. Every state reset zeroes it (fn end, fn start,
+    // pending open), so no dot survives a fn boundary.
+    prev_code_char: u8 = 0,
     // EPH-I0756: a fn opener whose signature wrapped past its own line.
     // The state opens when the body `{` arrives. A `;` first drops the
     // pending def (a bodiless decl) without ever opening state.
@@ -16806,9 +16811,12 @@ fn hasCodeArrow(t: []const u8) bool {
 const BraceScan = struct {
     /// First `{` of an arrow line is the switch prong's open (EPH-I0451).
     first: bool = true,
-    /// Previous code char: a `{` right after a code `.` opens an anonymous
-    /// struct/array literal, not a block (EPH-I0811). Only code chars land
-    /// here — the literal state machine masks string/char/comment data.
+    /// Previous NON-WHITESPACE code char: a `{` right after a code `.`
+    /// opens an anonymous struct/array literal, not a block (EPH-I0811).
+    /// Whitespace between tokens is not adjacency, so `' '`/`'\t'` never
+    /// land here (EPH-I0819). Seeds from state.prev_code_char, so a dot at
+    /// end of line survives the per-line reset. Only code chars land here
+    /// — the literal state machine masks string/char/comment data.
     prev_c: u8 = 0,
     /// A real (non-masked) `{` open landed on this line. Gates the
     /// cognitive-scope marker: a keyword line whose opens are all masked
@@ -16821,7 +16829,10 @@ const BraceScan = struct {
 fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     const is_switch = hasCodeArrow(t);
     var lit = types.LiteralState.forLine(t) orelse return false;
-    var scan = BraceScan{};
+    // EPH-I0819: the scan starts from the previous line's last
+    // non-whitespace code char — a `.` at end of line still masks the
+    // literal `{` on the next line.
+    var scan = BraceScan{ .prev_c = state.prev_code_char };
     // EPH-I0818: the line's scope marker is valid only while a real open
     // lands on it. A keyword line whose only `{` is a masked literal
     // (`try take(.{...});`) opens no scope — a marker and cog_nest bump
@@ -16843,12 +16854,16 @@ fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
             fn_ended = true;
             break;
         }
-        scan.prev_c = c;
+        // EPH-I0819: whitespace between tokens is not adjacency. `. {` is
+        // the same literal token as `.{`, so a space must not hide the dot
+        // from the literal mask. The caller already trimmed '\r'.
+        if (c != ' ' and c != '\t') scan.prev_c = c;
     }
     if (scope_open and !scan.real_open) {
         if (state.cog_nest > 0) state.cog_nest -= 1;
         if (scope_depth < 32) state.cog_markers &= ~(@as(u32, 1) << @intCast(scope_depth));
     }
+    state.prev_code_char = scan.prev_c;
     return fn_ended;
 }
 
@@ -53573,6 +53588,52 @@ test "trackBraceNesting counts a literal at depth >= 32 (EPH-I0811)" {
     try std.testing.expectEqual(@as(usize, 34), state.max_nest);
     try std.testing.expect(!trackBraceNesting("};", &state));
     try std.testing.expectEqual(@as(usize, 33), state.nest);
+}
+
+test "trackBraceNesting skips a literal brace after a spaced dot (EPH-I0819)" {
+    // `. {` — the space between the dot and the brace is token whitespace,
+    // not a break in the `.{` literal token (zig ast-check). Pre-fix the
+    // space landed in scan.prev_c, so the open counted and max_nest peaked
+    // one higher.
+    var state = ComplexityState{ .in_fn = true, .nest = 3, .max_nest = 3 };
+    try std.testing.expect(!trackBraceNesting("const t = . { .x = 1 };", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expectEqual(@as(usize, 3), state.max_nest);
+}
+
+test "trackBraceNesting skips a literal whose brace opens on the next line (EPH-I0819)" {
+    // `const t = .` + `{` — the dot at end of line survives the per-line
+    // BraceScan reset via state.prev_code_char (zig ast-check). Pre-fix the
+    // fresh-line scan saw no dot and counted the open.
+    var state = ComplexityState{ .in_fn = true, .nest = 3, .max_nest = 3 };
+    try std.testing.expect(!trackBraceNesting("const t = .", &state));
+    try std.testing.expect(!trackBraceNesting("{", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+    try std.testing.expectEqual(@as(usize, 3), state.max_nest);
+    try std.testing.expect(!trackBraceNesting(".x = 1,", &state));
+    try std.testing.expect(!trackBraceNesting("};", &state));
+    try std.testing.expectEqual(@as(usize, 3), state.nest);
+}
+
+test "trackBraceNesting keeps later real blocks counted after a dot-masked literal (EPH-I0819)" {
+    // The cross-line carry must not desync later statements (the I0818
+    // class): once the literal closes, a real if-block still opens, counts,
+    // and closes at the same depth. A stale dot would mask the if's brace,
+    // and that block's close would end the fn early.
+    var state = ComplexityState{ .in_fn = true, .nest = 1, .max_nest = 1 };
+    try std.testing.expect(!trackBraceNesting("const t = .", &state));
+    try std.testing.expect(!trackBraceNesting("{", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+    try std.testing.expectEqual(@as(usize, 1), state.max_nest);
+    try std.testing.expect(!trackBraceNesting(".x = 1,", &state));
+    try std.testing.expect(!trackBraceNesting("};", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
+    try std.testing.expect(!trackBraceNesting("if (c) {", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    try std.testing.expectEqual(@as(usize, 2), state.max_nest);
+    try std.testing.expect(!trackBraceNesting("sink();", &state));
+    try std.testing.expect(!trackBraceNesting("}", &state));
+    try std.testing.expectEqual(@as(usize, 1), state.nest);
 }
 
 /// Run analyzeComplexity on one in-memory file and assert exactly one

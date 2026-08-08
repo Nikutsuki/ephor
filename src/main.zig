@@ -725,6 +725,36 @@ fn isSwitchArmLine(trimmed: []const u8) bool {
     return findProngArrow(trimmed) != null;
 }
 
+/// True when the line's first code `=>` opens a switch prong, so the line
+/// separates mutually exclusive arms. An inline switch expression assigned
+/// on the same line (`const y = switch (x) { .a => 1, .b => 2 };`) carries
+/// real `=>` tokens, but they are expression arms: statements that dominate
+/// the switch are not exclusive on its arms, so such a line is no branch
+/// separator (EPH-I0062 probe13 class, EPH-I0343). The `switch` keyword
+/// test is word-bounded: `my_switch => x` is a prong whose name contains
+/// the keyword text and stays an arm header. String and comment arrows
+/// never reach the prong test (findProngArrow masks literals), which makes
+/// this the hasCodeArrow-equivalent gate for the exclusivity scans.
+/// Residual (EPH-I0834): a single-line switch expression used as a comptime
+/// case item of an outer switch hides the outer prong header: the first
+/// code arrow belongs to the inner expression, so the line reads as
+/// expression data and the outer arm loses suppression. Zero occurrences in
+/// the 3000-project corpus.
+fn isArmHeaderLine(t: []const u8) bool {
+    const arrow = findProngArrow(t) orelse return false;
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < arrow) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (!mem.startsWith(u8, t[pos..], "switch")) continue;
+        const before_ident = pos > 0 and isIdent(t[pos - 1]);
+        const after_ident = pos + "switch".len < t.len and
+            isIdent(t[pos + "switch".len]);
+        if (!before_ident and !after_ident) return false;
+    }
+    return true;
+}
+
 fn detectCFPattern(t: []const u8) CFPattern {
     const trimmed = mem.trim(u8, t, " \t\r");
 
@@ -5825,26 +5855,47 @@ fn scanBlocksForFreeOps(ctx: *const FreeScanCtx) void {
     }
 }
 
-/// True if the line contains an `} else` branch separator — both `} else {`
-/// and `} else if (...) {` arms are mutually exclusive with the if-arm. The
-/// char after "else" must not be an identifier char (`} elsewhere` is a
-/// variable name, not a branch).
+/// True when `token` appears at a code position in `t`: outside string and
+/// char literals, comments, and multiline-string bodies. LiteralState masks
+/// all three contexts, so `"} else {"` inside a string or a `// } else {`
+/// comment cannot fabricate a branch separator (EPH-I0342).
+fn hasCodeToken(t: []const u8, token: []const u8) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (mem.startsWith(u8, t[pos..], token)) return true;
+    }
+    return false;
+}
+
+/// True when `} else` appears at a code position. The char after "else"
+/// must not be an identifier char (`} elsewhere` is a variable name, not a
+/// branch). String and comment occurrences are masked (EPH-I0342).
 fn hasElseBranchMarker(t: []const u8) bool {
-    const pos = mem.indexOf(u8, t, "} else") orelse return false;
-    const after = pos + "} else".len;
-    return after >= t.len or !isIdent(t[after]);
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (!mem.startsWith(u8, t[pos..], "} else")) continue;
+        const after = pos + "} else".len;
+        if (after >= t.len or !isIdent(t[after])) return true;
+    }
+    return false;
 }
 
 /// True when the line carries an else/orelse arm separator: the arms the
 /// marker divides never execute together. Per-line classifier only. The
 /// caller decides whether the marker sits shallow enough to separate the
-/// pair (EPH-I0791 for `=>`, EPH-I0806 for else/orelse).
+/// pair (EPH-I0791 for `=>`, EPH-I0806 for else/orelse). A line-starting
+/// `orelse {` cannot sit inside a literal or comment (the first char of a
+/// masked region would have to open it); the `} orelse` and `} else` forms
+/// scan code positions only (EPH-I0342).
 fn hasElseOrOrelseMarker(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "} orelse {") != null) return true;
-    if (mem.indexOf(u8, t, "} orelse return") != null) return true;
     if (mem.startsWith(u8, t, "orelse {")) return true;
-    if (hasElseBranchMarker(t)) return true;
-    return false;
+    if (hasCodeToken(t, "} orelse {")) return true;
+    if (hasCodeToken(t, "} orelse return")) return true;
+    return hasElseBranchMarker(t);
 }
 
 /// True when a branch separator between the frees at from_line and to_line
@@ -5855,11 +5906,15 @@ fn hasElseOrOrelseMarker(t: []const u8) bool {
 /// paths (EPH-I0791: the indent-blind `=>` clause suppressed an outer free
 /// paired with a prong-body free of the same var. EPH-I0806: the
 /// indent-blind else/orelse clause suppressed a dominating free paired
-/// with a later free across a nested `} else {` or `} orelse {`). A branch
-/// that merely sits between the two frees at a shallow-enough indent still
-/// suppresses (accepted FN, same class as hasSwitchArmBetween's documented
-/// hole). Textual and fail-open toward reporting: out-of-range endpoints
-/// yield no separator.
+/// with a later free across a nested `} else {` or `} orelse {`). The
+/// `=>` clause counts arm-header lines only: an inline switch expression
+/// between the frees carries real arrows, but its arms are expression data
+/// and cannot separate statements that dominate the switch (EPH-I0062
+/// probe13). Comments and string literals never fabricate either marker
+/// class (EPH-I0342). An arm header that merely sits between the two frees
+/// at a shallow-enough indent still suppresses (accepted FN, same class as
+/// hasSwitchArmBetween's documented hole). Textual and fail-open toward
+/// reporting: out-of-range endpoints yield no separator.
 fn hasExclusiveBranchBetween(
     lines: []const []const u8,
     from_line: usize,
@@ -5879,7 +5934,7 @@ fn hasExclusiveBranchBetween(
         if (countIndent(lines[idx]) > min_indent) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (hasElseOrOrelseMarker(t)) return true;
-        if (mem.indexOf(u8, t, "=>") != null) return true;
+        if (isArmHeaderLine(t)) return true;
     }
     return false;
 }
@@ -5890,9 +5945,12 @@ fn hasExclusiveBranchBetween(
 /// Mirror of ZA106's hasSwitchArmBetween discipline. Arm headers nested
 /// DEEPER than either statement do not separate them: switch-expression arms
 /// (F1) and a switch whose join precedes the use (F2) are not exclusive
-/// regions. Textual and fail-open toward reporting: a switch that merely
-/// sits between free and use at a shallow-enough indent also suppresses
-/// (accepted FN — same class as hasSwitchArmBetween's documented hole).
+/// regions, and an inline switch expression on one line at the statement
+/// indent is no separator either (its arrows are expression data —
+/// isArmHeaderLine). Textual and fail-open toward reporting: a genuine arm
+/// header that merely sits between free and use at a shallow-enough indent
+/// still suppresses (accepted FN — same class as hasSwitchArmBetween's
+/// documented hole; pinned by the EPH-I0062 residual test).
 fn hasExclusiveArmBetween(
     lines: []const []const u8,
     func_line: usize,
@@ -6326,12 +6384,20 @@ const FreeSpan = struct {
 };
 
 /// True when the two frees sit in different switch arms: a `=>` arm header
-/// appears in the inclusive span at an indent no deeper than both statements.
-/// Same-arm pairs have no arm header between them; a defer OUTSIDE the switch
-/// is shallower than any arm header (still reported). Like
-/// hasExclusiveBranchBetween, this is textual: a switch that merely sits
-/// between the two frees also suppresses (accepted FN, consistent with the
-/// existing direct/direct double-free heuristic).
+/// appears in the span (first, second] at an indent no deeper than both
+/// statements. Same-arm pairs have no arm header between them; a defer
+/// OUTSIDE the switch is shallower than any arm header (still reported).
+/// The span excludes the first statement's own line, so an inline arm free
+/// `.b => free(buf),` cannot self-match its own header when a post-join
+/// statement sits at the arm indent (EPH-I0343); the second line stays in,
+/// because `.b => use(buf)` proves sibling-arm exclusivity with the use's
+/// own header (EPH-I0010). Markers must be arm-header lines: the arrows of
+/// an inline switch expression and the `=>` inside strings or comments are
+/// not separators (EPH-I0062 probe13, EPH-I0342). Like
+/// hasExclusiveBranchBetween, this is textual: a genuine arm header that
+/// merely sits between the two frees at a shallow-enough indent also
+/// suppresses (accepted FN, consistent with the existing direct/direct
+/// double-free heuristic).
 fn hasSwitchArmBetween(
     lines: []const []const u8,
     func_line: usize,
@@ -6339,12 +6405,12 @@ fn hasSwitchArmBetween(
 ) bool {
     if (span.first < func_line or span.second <= span.first) return false;
     const end = @min(span.second, func_line + lines.len - 1);
-    for (span.first..end + 1) |ln| {
+    for (span.first + 1..end + 1) |ln| {
         const idx = ln - func_line;
         if (idx >= lines.len) break;
         if (countIndent(lines[idx]) > span.min_indent) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
-        if (mem.indexOf(u8, t, "=>") != null) return true;
+        if (isArmHeaderLine(t)) return true;
     }
     return false;
 }
@@ -6361,7 +6427,8 @@ fn hasSwitchArmBetween(
 /// `=>` arm headers are deliberately NOT matched here. For a defer/direct
 /// pair, hasSwitchArmBetween decides arm exclusivity and accounts for the
 /// defer outside the switch. An arm header between such a pair means
-/// nothing: the defer runs on every path.
+/// nothing: the defer runs on every path. Markers are code-position scans
+/// (hasElseOrOrelseMarker masks strings and comments — EPH-I0342).
 fn hasElseBranchBetween(
     lines: []const []const u8,
     func_line: usize,
@@ -33458,6 +33525,391 @@ test "ZA106: shallow else between dominating frees still separates (EPH-I0806)" 
     const file = "test_shallow_else_sep.zig";
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: comment `=>` line between frees does not separate them (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `// =>` line is comment text, not a switch arm: the second free
+    // double-frees on every path (F2 evasion shape 1).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    // => fake switch arm between the frees
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_arrow_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_comment_arrow_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: trailing `=>` comment on the second free does not separate (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // hasExclusiveBranchBetween scans to_line inclusive, so the second
+    // free's own trailing comment used to self-suppress the pair (F2
+    // evasion shape 2). The comment is not an arm header.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    allocator.free(item); // => fake arm marker in the comment
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_trailing_arrow_comment.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_trailing_arrow_comment.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: string `} else {` between frees does not separate them (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `"} else {"` line is string data, not a branch separator (F2
+    // evasion shape 3): the second free double-frees.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    const s = "} else {";
+        \\    _ = s;
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_string_else_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_string_else_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: multiline-string body `=>` between frees does not separate (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `\\` body line is string data (LiteralState.forLine returns
+    // null): its `=>` must not read as an arm header (F2 multiline shape).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    \\\\ => fake arm in a multiline string
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_mline_arrow_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_mline_arrow_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA105: string `=>` between free and use does not suppress (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `"=>"` line is string data: the same-block use stays a genuine
+    // UAF (F2 string shape on the UAF path).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    const s = "=>";
+        \\    _ = s;
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_string_arrow_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_string_arrow_uaf.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+}
+
+test "ZA106: comment `} else {` between frees does not separate them (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `// } else {` line is comment text, not a branch separator (F2
+    // evasion shape 1 on the else scan): the second free double-frees.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    // } else { fake branch separator
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_else_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_comment_else_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: string `} orelse return` between frees does not separate (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `"} orelse return"` line is string data, not a separator (F2
+    // string shape on the orelse scan): the second free double-frees.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    const s = "} orelse return";
+        \\    _ = s;
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_string_orelse_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_string_orelse_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA105: comment `} else {` between free and use still fires (EPH-I0342)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Else markers never suppress the UAF path (hasExclusiveArmBetween
+    // checks switch arms only), so the comment cannot hide the use. Pins
+    // the behavior boundary the F2 else evasion targets.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    // } else { fake branch marker
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_else_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_comment_else_uaf.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+}
+
+test "ZA105: inline-arm free does not self-match its own arm header (EPH-I0343)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free sits in the LAST arm, so the only `=>` in the free..use
+    // span used to be the free's own header. The post-join alias use
+    // nested one level (at the arm indent) is a genuine UAF on the .b
+    // path: the span now excludes the first statement's own line.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, k: enum { a, b }, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const alias = buf;
+        \\    switch (k) {
+        \\        .a => {},
+        \\        .b => allocator.free(buf),
+        \\    }
+        \\    if (c) {
+        \\        use(alias);
+        \\    }
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arm_free_self_match.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_arm_free_self_match.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+}
+
+test "ZA105: inline-arm free then direct post-join use fires (EPH-I0343)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The audit's literal F3 regression shape: the free's own arm header
+    // used to self-match because the nested post-join use sits at the arm
+    // indent. The direct use is a genuine UAF on the .b path.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, k: enum { a, b }, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (k) {
+        \\        .a => {},
+        \\        .b => allocator.free(buf),
+        \\    }
+        \\    if (c) {
+        \\        _ = buf.len;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arm_free_direct_use.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_arm_free_direct_use.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+}
+
+test "ZA106: inline-arm direct free pairs with a post-join defer (EPH-I0343)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The direct free sits in the LAST arm, so its own `=>` used to
+    // suppress the pair. On the .b path the defer registered inside the
+    // if frees the same buffer at scope exit: the pair must fire (the
+    // defer/direct side of the F3 self-match, same (first, second] fix).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, k: enum { a, b }, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (k) {
+        \\        .a => {},
+        \\        .b => allocator.free(buf),
+        \\    }
+        \\    if (c) {
+        \\        defer allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arm_free_defer_pair.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_arm_free_defer_pair.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA106: switch expression between frees does not separate them (EPH-I0062)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The inline switch expression carries real `=>` tokens, but they are
+    // expression arms, not a branch separator: the frees dominate the
+    // switch, so the second free double-frees on every path (the I0062
+    // probe13 class, fixed by the arm-header gate).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, x: u8) !void {
+        \\    const item = try allocator.alloc(u8, 32);
+        \\    allocator.free(item);
+        \\    const y = switch (x) { 1 => 10, else => 20 };
+        \\    _ = y;
+        \\    allocator.free(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_switch_expr_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_switch_expr_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+}
+
+test "ZA105: single-line switch expression between free and use fires (EPH-I0062)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The shallow single-line switch expression at statement indent used
+    // to suppress the same-block UAF (I0062 class 1): its `=>` tokens are
+    // expression data and no longer count as arm headers.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, x: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    const y = switch (x) { 1 => 10, else => 20 };
+        \\    _ = y;
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_switch_expr_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_switch_expr_uaf.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+}
+
+test "ZA105: arm header of an intervening switch still separates (EPH-I0062 residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free sits in a NON-last arm, so the `.b => {}` header on the
+    // middle line is a genuine arm-header line at the arm indent. The
+    // textual layer cannot tell it belongs to a switch whose join
+    // precedes the nested use: documented accepted FN (the
+    // hasSwitchArmBetween documented-hole class), pinned to keep the
+    // helper doc truthful.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, k: enum { a, b }, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => {},
+        \\    }
+        \\    if (c) {
+        \\        _ = buf.len;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_intervening_arm_sep.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_intervening_arm_sep.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA106: frees in inline sibling arms stay silent (EPH-I0062 probe18)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `.b =>` marker on the second free's own line stays in the span
+    // (second inclusive), so the sibling-arm double-free stays silent
+    // after the (first, second] narrowing (EPH-I0343 regression pin).
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, k: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => allocator.free(buf),
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_inline_sibling_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_inline_sibling_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
 }
 
 test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {

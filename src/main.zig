@@ -8213,6 +8213,18 @@ const ImportGraph = struct {
     /// re-walk once per root (64 roots × 50k files ≈ 3.2M realpath
     /// syscalls). Keys are owned dupes, freed in deinit.
     marked_dirs: std.StringHashMapUnmanaged(void),
+    /// Hardlink gate for the walk channel (EPH-I0823): inodes of .zig
+    /// files the walk already joined. The directory iterator reports a
+    /// hardlink pair as two .file entries with one inode, so the first
+    /// spelling joins and the rest are skipped — one graph entry per
+    /// physical file, no duplicate analysis, no duplicate findings. The
+    /// inode is unique within one filesystem, so only aliases of one
+    /// file collide; a tree spanning devices can in principle reuse an
+    /// inode number (residual risk, cross-device aliases are
+    /// indistinguishable here — std.Io exposes no device identity).
+    /// Entries with inode 0 bypass the gate: filesystems that report 0
+    /// for every entry would otherwise collapse distinct files.
+    walked_file_inodes: std.AutoHashMapUnmanaged(std.Io.File.INode, void),
     /// Paths skipped because the source read hit max_source_file_bytes
     /// (EPH-I0150). Without the record an over-cap file vanishes from
     /// every analyzer and orphan detection with no warning. Owned dupes,
@@ -8229,6 +8241,7 @@ const ImportGraph = struct {
             .scan_root = null,
             .resident_bytes = 0,
             .marked_dirs = .empty,
+            .walked_file_inodes = .empty,
             .skipped_files = .empty,
         };
     }
@@ -8245,6 +8258,8 @@ const ImportGraph = struct {
         // resolved_to_key aliases entries owned by self.files — just
         // drop the table, don't free the slices.
         self.resolved_to_key.deinit(self.allocator);
+
+        self.walked_file_inodes.deinit(self.allocator);
 
         for (self.skipped_files.items) |path| self.allocator.free(path);
         self.skipped_files.deinit(self.allocator);
@@ -8324,7 +8339,8 @@ const ImportGraph = struct {
             switch (entry.kind) {
                 .file => {
                     defer self.allocator.free(path);
-                    if (mem.endsWith(u8, entry.name, ".zig"))
+                    if (mem.endsWith(u8, entry.name, ".zig") and
+                        !try self.walkFileAlreadyScanned(entry.inode))
                         try self.analyzeFile(path);
                 },
                 .directory => {
@@ -8336,6 +8352,15 @@ const ImportGraph = struct {
                 else => self.allocator.free(path),
             }
         }
+    }
+
+    /// Insert `inode` into the walk gate and return true when a previous
+    /// spelling of the same physical file already joined the graph
+    /// (EPH-I0823). See `walked_file_inodes` for the identity contract.
+    fn walkFileAlreadyScanned(self: *ImportGraph, inode: std.Io.File.INode) !bool {
+        if (inode == 0) return false;
+        const gop = try self.walked_file_inodes.getOrPut(self.allocator, inode);
+        return gop.found_existing;
     }
 
     /// Open one directory entry for descent, or null when the walk must
@@ -8411,8 +8436,14 @@ const ImportGraph = struct {
     /// Record a file skipped at the source read cap (EPH-I0150). Without
     /// the record the file vanishes from every analyzer and orphan
     /// detection with no warning: the read fails before files.put, so no
-    /// downstream pass can observe the loss.
+    /// downstream pass can observe the loss. One record per path: a
+    /// repeated read of one over-cap path must not emit duplicate ZA502
+    /// warnings (EPH-I0309). The linear scan is fine — skipped files are
+    /// rare, so the list stays short.
     fn noteSkippedFile(self: *ImportGraph, file_path: []const u8) !void {
+        for (self.skipped_files.items) |path| {
+            if (mem.eql(u8, path, file_path)) return;
+        }
         const copy = try self.allocator.dupe(u8, file_path);
         errdefer self.allocator.free(copy);
         try self.skipped_files.append(self.allocator, copy);
@@ -29653,6 +29684,53 @@ test "alternate out-of-root entry spellings scan once (EPH-I0817)" {
 
     try std.testing.expectEqual(@as(usize, 2), run.graph.files.count());
     try std.testing.expectEqual(@as(usize, 1), diag.entries_widen_note_count);
+}
+
+test "walk joins one graph entry per physical hardlink (EPH-I0823)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // One physical file under two names: a hardlink pair. The walk sees
+    // two .file entries with one inode; the pair must join the graph
+    // once. Duplicate analysis and duplicate findings are the bug.
+    try tmp.dir.createDirPath(std.testing.io, "a/link");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "a/x.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.hardLink("a/x.zig", tmp.dir, "a/link/x.zig", std.testing.io, .{});
+    // A symlinked dir adds no joins: the walk skips .sym_link entries.
+    // Pinning the no-duplicate contract for the alternate shape too.
+    try tmp.dir.symLink(std.testing.io, "a", "linkdir", .{ .is_directory = true });
+    try tmp.dir.createDirPath(std.testing.io, "b");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "b/y.zig",
+        .data = "pub fn g() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.scanDirectory(root);
+
+    // Two physical files join once each.
+    try std.testing.expectEqual(@as(usize, 2), graph.files.count());
+    // The hardlink pair contributes exactly one graph key.
+    var x_keys: usize = 0;
+    var iter = graph.files.keyIterator();
+    while (iter.next()) |key| {
+        if (mem.endsWith(u8, key.*, "x.zig")) x_keys += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), x_keys);
+
+    // Findings stay one per physical file: two orphan rows, not three.
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var issues = try graph.getOrphanIssues(allocator, &cfg);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
 }
 
 test "corpus warning fires once when resident bytes cross the threshold" {
@@ -51124,6 +51202,28 @@ test "I0150: noteSkippedFile append failure frees the path copy" {
 
     try std.testing.expectError(error.OutOfMemory, graph.noteSkippedFile("big.zig"));
     try std.testing.expectEqual(@as(usize, 0), graph.skipped_files.items.len);
+}
+
+test "I0309: repeated over-cap path records one skipped-file entry" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Two failed reads of one over-cap path (entry plus path overlap,
+    // repeated commands sharing the graph) must record the skip once:
+    // duplicate ZA502 warnings are the bug (EPH-I0309).
+    try graph.noteSkippedFile("big.zig");
+    try graph.noteSkippedFile("big.zig");
+    try std.testing.expectEqual(@as(usize, 1), graph.skipped_files.items.len);
+
+    var issues = try graph.getSkippedFileIssues(allocator);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+
+    // A distinct over-cap path still records: dedupe is per path.
+    try graph.noteSkippedFile("other.zig");
+    try std.testing.expectEqual(@as(usize, 2), graph.skipped_files.items.len);
 }
 
 // ============================================================================

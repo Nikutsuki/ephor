@@ -2317,10 +2317,17 @@ fn isFreeMethodCall(t: []const u8, after_var: usize) bool {
         mem.startsWith(u8, rest, "deinit(");
 }
 
-/// Pattern 2: allocator.free(varname) or allocator.destroy(varname)
+/// Pattern 2: allocator.free(varname) or allocator.destroy(varname).
+/// Whitespace between `(` and the var is tolerated: the joined logical
+/// line of a zig-fmt wrapped free puts the argument on its own line
+/// (`allocator.free(\n    buf,\n);` joins to `allocator.free( buf, );` —
+/// EPH-I0351).
 fn isFreeFnArg(t: []const u8, var_pos: usize) bool {
-    if (var_pos < 1 or t[var_pos - 1] != '(') return false;
-    const before_paren = mem.trimEnd(u8, t[0 .. var_pos - 1], " ");
+    if (var_pos < 1) return false;
+    var prev = var_pos - 1;
+    while (prev > 0 and (t[prev] == ' ' or t[prev] == '\t')) prev -= 1;
+    if (t[prev] != '(') return false;
+    const before_paren = mem.trimEnd(u8, t[0..prev], " ");
     return mem.endsWith(u8, before_paren, ".free") or
         mem.endsWith(u8, before_paren, ".destroy");
 }
@@ -5737,6 +5744,9 @@ fn computeCaptureShadowedLines(
 
 fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
     var r = BlockScanResult{};
+    // Join buffer for zig-fmt wrapped frees: the argument of a wrapped
+    // free sits on a continuation line (EPH-I0351).
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (block.start_line..block.end_line + 1) |ln| {
         if (ln < scan.func_line) continue;
         const idx = ln - scan.func_line;
@@ -5749,7 +5759,11 @@ fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResul
         // (EPH-I0748, EPH-I0780).
         if (scan.capture_shadowed[idx]) continue;
         if (hasRealFreePattern(t) and
-            isDirectFreeOfVarOrAlias(t, scan.var_name, scan.aliases))
+            isDirectFreeOfVarOrAlias(
+                joinParenContinuation(scan.lines, idx, &join_buf),
+                scan.var_name,
+                scan.aliases,
+            ))
         {
             r.free_seen = true;
             r.free_line = ln;
@@ -6024,6 +6038,8 @@ fn checkSameBlockFree(
     var ret = false;
     var rebound = false;
     var freed_line: usize = 0;
+    // Join buffer for zig-fmt wrapped frees (EPH-I0351).
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (block_start..actual_line) |cl| {
         if (cl < scan.func_line) continue;
         const ci = cl - scan.func_line;
@@ -6035,7 +6051,11 @@ fn checkSameBlockFree(
         // it never frees the tracked binding, so it sets no freed state
         // (EPH-I0748, EPH-I0780).
         if (scan.capture_shadowed[ci]) continue;
-        if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(ct, scan.var_name, scan.aliases)) {
+        if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(
+            joinParenContinuation(scan.lines, ci, &join_buf),
+            scan.var_name,
+            scan.aliases,
+        )) {
             freed = true;
             freed_line = cl;
         }
@@ -6070,6 +6090,8 @@ fn checkAliasBlockFree(
     var freed = false;
     var ret = false;
     var freed_line: usize = 0;
+    // Join buffer for zig-fmt wrapped frees (EPH-I0351).
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (block_start..actual_line) |cl| {
         if (cl < scan.func_line) continue;
         const ci = cl - scan.func_line;
@@ -6082,7 +6104,11 @@ fn checkAliasBlockFree(
             continue;
         }
         if (hasRealFreePattern(ct) and
-            isDirectFreeOfVarOrAlias(ct, scan.var_name, scan.aliases))
+            isDirectFreeOfVarOrAlias(
+                joinParenContinuation(scan.lines, ci, &join_buf),
+                scan.var_name,
+                scan.aliases,
+            ))
         {
             if (isDirectFreeOfVar(ct, scan.var_name) and root_rebound) continue;
             freed = true;
@@ -6255,11 +6281,29 @@ fn checkSameBlockUAF(
     return true;
 }
 
+/// True when the line belongs to a zig-fmt wrapped free statement: the
+/// free's own arguments, never uses of the freed var (EPH-I0351). Tracks
+/// the open paren depth across the continuation lines; a line with a
+/// free pattern starts the span when its parens stay unclosed.
+fn isFreeContinuationLine(t: []const u8, depth: *i32) bool {
+    if (depth.* > 0) {
+        depth.* += parenBalance(t);
+        return true;
+    }
+    if (hasRealFreePattern(t)) {
+        depth.* = parenBalance(t);
+        return true;
+    }
+    return false;
+}
+
 fn detectUseAfterFree(ctx: *const FreeScanCtx) !void {
     // Check direct uses of the freed variable
+    var free_cont: i32 = 0;
     for (ctx.scan.lines, 0..) |line, idx| {
         if (ctx.scan.in_errdefer[idx]) continue;
         const t = mem.trim(u8, line, " \t\r");
+        if (isFreeContinuationLine(t, &free_cont)) continue;
         if (isUAFSkipLine(t, ctx.scan.var_name, ctx.scan.aliases)) continue;
         try checkLineForUAF(ctx, t, ctx.scan.func_line + idx);
     }
@@ -6295,13 +6339,30 @@ fn aliasUAFSeverity(root_rebound: bool, def_freed: bool) Severity {
 /// when a root rebind lies between the free and the use, the alias still
 /// points at the freed target, so the grade stays err and the reach gate
 /// stays off (the root lattice no longer describes the alias there).
+/// Open paren depth of the wrapped free statement that freed on
+/// `freed_line`: the alias use scan primes its continuation tracking
+/// with it (EPH-I0351).
+fn freeContinuationStart(
+    lines: []const []const u8,
+    freed_line: usize,
+    func_line: usize,
+) i32 {
+    const idx = freed_line - func_line;
+    if (idx >= lines.len) return 0;
+    return parenBalance(mem.trim(u8, lines[idx], " \t\r"));
+}
+
 fn reportAliasUAF(ctx: *const FreeScanCtx, alias_name: []const u8, freed_line: usize) !void {
+    // Prime the wrapped-free continuation depth from the free's own line:
+    // the alias use scan starts after it (EPH-I0351).
+    var free_cont: i32 = freeContinuationStart(ctx.scan.lines, freed_line, ctx.scan.func_line);
     for (ctx.scan.lines, 0..) |line, idx| {
         const actual_line = ctx.scan.func_line + idx;
         if (actual_line <= freed_line) continue;
         if (ctx.scan.in_errdefer[idx]) continue;
         if (ctx.scan.in_defer[idx]) continue;
         const t = mem.trim(u8, line, " \t\r");
+        if (isFreeContinuationLine(t, &free_cont)) continue;
         // Alias's own declaration line is skipped by isUAFSkipLine
         if (isUAFSkipLine(t, alias_name, ctx.scan.aliases)) continue;
         const use_col = findVarUseOnLine(t, alias_name) orelse continue;
@@ -6470,6 +6531,9 @@ fn checkSameBlockDoubleFree(
 }
 
 fn detectDoubleFree(ctx: *const FreeScanCtx) !void {
+    // Join buffer for zig-fmt wrapped frees: the argument of a wrapped
+    // free sits on a continuation line (EPH-I0351).
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (ctx.scan.lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
@@ -6478,7 +6542,11 @@ fn detectDoubleFree(ctx: *const FreeScanCtx) !void {
         // EPH-I0780).
         if (ctx.scan.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(t, ctx.scan.var_name, ctx.scan.aliases)) continue;
+        if (!isDirectFreeOfVarOrAlias(
+            joinParenContinuation(ctx.scan.lines, idx, &join_buf),
+            ctx.scan.var_name,
+            ctx.scan.aliases,
+        )) continue;
         try checkLineForDoubleFree(ctx, t, ctx.scan.func_line + idx);
     }
 }
@@ -6522,6 +6590,9 @@ fn collectDeferFrees(
     ctx: *const DeferPairCtx,
 ) !std.ArrayListUnmanaged(DeferFree) {
     var frees: std.ArrayListUnmanaged(DeferFree) = .empty;
+    // Join buffer for zig-fmt wrapped frees: the freed var of a wrapped
+    // defer free sits on a continuation line (EPH-I0351).
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (ctx.lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
@@ -6531,7 +6602,11 @@ fn collectDeferFrees(
         // not the tracked binding (EPH-I0748, EPH-I0780).
         if (ctx.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
+        if (!isDirectFreeOfVarOrAlias(
+            joinParenContinuation(ctx.lines, idx, &join_buf),
+            ctx.var_name,
+            ctx.aliases,
+        )) continue;
         // Conditional defer (`defer if (c) free(x);`): may or may not run, so
         // a pairing is reported at warning severity. An `if` on a line INSIDE
         // a defer block above the free is not seen here (documented limit).
@@ -6655,6 +6730,8 @@ fn detectDeferDoubleFree(
     defer defer_frees.deinit(allocator);
     if (defer_frees.items.len == 0) return;
 
+    // Join buffer for zig-fmt wrapped frees (EPH-I0351).
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (ctx.lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isDoubleFreeSkipLine(t)) continue;
@@ -6663,7 +6740,11 @@ fn detectDeferDoubleFree(
         // must not pair with a defer-registered free (EPH-I0748, EPH-I0780).
         if (ctx.capture_shadowed[idx]) continue;
         if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(t, ctx.var_name, ctx.aliases)) continue;
+        if (!isDirectFreeOfVarOrAlias(
+            joinParenContinuation(ctx.lines, idx, &join_buf),
+            ctx.var_name,
+            ctx.aliases,
+        )) continue;
         try pairDirectFreeWithDefers(allocator, ctx, .{
             .frees = defer_frees.items,
             .free_line = ctx.func_line + idx,
@@ -7205,13 +7286,21 @@ fn countBraceBalance(line: []const u8) i32 {
     return balance;
 }
 
-/// Check nearby lines after allocation for a matching defer
+/// Check nearby lines after allocation for a matching defer. The defer
+/// counts only when it dominates the alloc's exits: a scope-exit source
+/// (return or try) between the alloc and the defer skips the defer
+/// registration and leaks on that path (EPH-I0348). An errdefer counts
+/// only when the success path also references the alloc after it — the
+/// error/success cleanup split — a discard-only tail leaks on success
+/// (EPH-I0349). The name check runs on the joined logical line, so a
+/// zig-fmt wrapped defer free stays visible (EPH-I0351).
 fn hasNearbyDefer(
     lines: []const []const u8,
     alloc_end_idx: usize,
     alloc_indent: usize,
     name: []const u8,
 ) bool {
+    var join_buf: [max_join_bytes]u8 = undefined;
     const search_end = @min(alloc_end_idx + 6, lines.len);
     for (alloc_end_idx + 1..search_end) |check_idx| {
         const raw_line = lines[check_idx];
@@ -7221,8 +7310,13 @@ fn hasNearbyDefer(
         if (check_indent < alloc_indent) break;
         if (!isDeferOrErrdefer(scan_line)) continue;
         if (check_indent != alloc_indent) continue;
-        if (hasRealCleanupPattern(scan_line) and
-            mem.indexOf(u8, scan_line, name) != null) return true;
+        const joined = joinParenContinuation(lines, check_idx, &join_buf);
+        if (!hasRealCleanupPattern(joined) or
+            mem.indexOf(u8, joined, name) == null) continue;
+        if (hasExitBetween(lines, alloc_end_idx, check_idx)) continue;
+        if (mem.startsWith(u8, scan_line, "errdefer ") and
+            !hasHandoffReference(lines, check_idx, name)) continue;
+        return true;
     }
     return false;
 }
@@ -7231,6 +7325,74 @@ fn hasNearbyDefer(
 fn isDeferOrErrdefer(t: []const u8) bool {
     return mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ") or
         mem.startsWith(u8, t, "errdefer{") or mem.startsWith(u8, t, "defer{");
+}
+
+/// True when the line discards the value (`_ = x;`, `_ = x.len;`): a
+/// discard reads and drops the allocation without transferring it, so it
+/// never counts as a handoff reference (EPH-I0349 corpus).
+fn isDiscardLine(t: []const u8, name: []const u8) bool {
+    if (!mem.startsWith(u8, t, "_ = ")) return false;
+    return containsIdentifier(t, name);
+}
+
+/// True when one line references the alloc in a handoff position: the
+/// line mentions the name (masked code) without being a discard
+/// (`_ = x;`), a free of the name, or a defer/errdefer registration
+/// (EPH-I0349 corpus).
+fn isHandoffReferenceLine(
+    t: []const u8,
+    code: []const u8,
+    name: []const u8,
+) bool {
+    if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) return false;
+    if (hasRealFreePattern(t) and isDirectFreeOfVar(t, name)) return false;
+    if (isDiscardLine(t, name)) return false;
+    return containsIdentifier(code, name);
+}
+
+/// True when a line after the errdefer mentions the alloc in a
+/// handoff-like position: the success path keeps or hands the value off,
+/// so the errdefer's error-path free covers a real cleanup split. A
+/// discard (`_ = x;`), a free of the name, and defer/errdefer
+/// registrations never count. A return before the reference rejects it:
+/// that path exits before the handoff and leaks, so the errdefer cannot
+/// mask it. A return line itself still counts when the alloc sits as a
+/// direct call argument on it (`return try f(x)` hands x to the callee),
+/// and the continuation lines of a multi-line return literal or call
+/// (`return T{ .x = x, ... };`, `return try f(\n ..., x,\n );`) transfer
+/// on the return path. Tries after the errdefer stay fine — the errdefer
+/// covers their error paths. Masked code: prose in comments and strings
+/// never references (EPH-I0349 corpus).
+fn hasHandoffReference(
+    lines: []const []const u8,
+    errdefer_idx: usize,
+    name: []const u8,
+) bool {
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var join_buf: [max_join_bytes]u8 = undefined;
+    var blocked = false;
+    var ret_paren: i32 = 0;
+    var ret_brace: usize = 0;
+    for (errdefer_idx + 1..lines.len) |idx| {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code = maskedCodeLine(lines[idx], &blank_buf);
+        if (ret_paren > 0 or ret_brace > 0) {
+            ret_paren += parenBalance(t);
+            ret_brace = countBraceDepth(t, ret_brace);
+            if (ret_paren <= 0 and ret_brace == 0) blocked = true;
+        } else if (hasRealReturnKeyword(code)) {
+            if (handoffOccurrences("", code, name, &join_buf)) return true;
+            ret_paren = parenBalance(t);
+            ret_brace = countBraceDepth(t, 0);
+            if (ret_paren <= 0 and ret_brace == 0) blocked = true;
+            continue;
+        } else if (blocked) {
+            continue;
+        }
+        if (isHandoffReferenceLine(t, code, name)) return true;
+    }
+    return false;
 }
 
 /// True when a comment-stripped line carries a defer/errdefer keyword as a
@@ -7295,15 +7457,34 @@ fn hasGuardToken(seg: []const u8) bool {
         hasRealKeyword(seg, "=>");
 }
 
-/// Scan for a defer/errdefer at an OUTER scope that frees this variable
-fn hasOuterScopeDefer(lines: []const []const u8, alloc_indent: usize, name: []const u8) bool {
+/// Scan for a defer at an OUTER scope that frees this variable. The defer
+/// counts only when it dominates the alloc's exits: a scope-exit source
+/// (return or try) between the alloc and the defer skips the defer
+/// registration and leaks on that path (EPH-I0348). A defer textually
+/// before the alloc always dominates. An errdefer counts only when the
+/// success path also references the alloc after it (EPH-I0349). The name
+/// check runs on the joined logical line, so a zig-fmt wrapped defer free
+/// stays visible (EPH-I0351).
+fn hasOuterScopeDefer(
+    lines: []const []const u8,
+    alloc_end_idx: usize,
+    alloc_indent: usize,
+    name: []const u8,
+) bool {
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (0..lines.len) |check_idx| {
         const raw_line = lines[check_idx];
         const scan_line = mem.trim(u8, raw_line, " \t\r");
         if (!isDeferOrErrdefer(scan_line)) continue;
         if (countIndent(raw_line) >= alloc_indent) continue;
-        if (hasRealCleanupPattern(scan_line) and
-            mem.indexOf(u8, scan_line, name) != null) return true;
+        const joined = joinParenContinuation(lines, check_idx, &join_buf);
+        if (!hasRealCleanupPattern(joined) or
+            mem.indexOf(u8, joined, name) == null) continue;
+        if (check_idx > alloc_end_idx and
+            hasExitBetween(lines, alloc_end_idx, check_idx)) continue;
+        if (mem.startsWith(u8, scan_line, "errdefer ") and
+            !hasHandoffReference(lines, check_idx, name)) continue;
+        return true;
     }
     return false;
 }
@@ -7318,7 +7499,7 @@ fn hasImmediateDefer(
     const alloc_indent = countIndent(lines[alloc_idx]);
     const alloc_end_idx = findAllocStatementEnd(lines, alloc_idx);
     if (hasNearbyDefer(lines, alloc_end_idx, alloc_indent, alloc.name)) return true;
-    return hasOuterScopeDefer(lines, alloc_indent, alloc.name);
+    return hasOuterScopeDefer(lines, alloc_end_idx, alloc_indent, alloc.name);
 }
 
 /// Remove allocations that have immediate defer (marked with line = 0)
@@ -7345,6 +7526,22 @@ fn removeImmediateDeferAllocs(
     }
 }
 
+/// Add a struct-literal bound local to the owner chain when the literal
+/// holds a tracked owner. The literal's fields sit on continuation
+/// lines, so the opener alone cannot prove the binding (EPH-I0349
+/// corpus).
+fn tryAddStructLiteralOwner(
+    allocator: Allocator,
+    lines: []const []const u8,
+    idx: usize,
+    owner_vars: *std.ArrayListUnmanaged(OwnerVar),
+) !void {
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    const name = extractStructOwnerName(t) orelse return;
+    if (structLiteralBindsOwner(lines, idx, t, owner_vars.items))
+        try tryAddOwner(allocator, owner_vars, name);
+}
+
 /// Track owner variables through data flow
 /// Pattern: const x = Type{ .field = alloc_name } -> x is an owner
 const OwnerVar = struct { name: []const u8 };
@@ -7369,12 +7566,49 @@ fn hasOwnerAppearance(owner_vars: []const OwnerVar, t: []const u8) bool {
     return false;
 }
 
-fn extractConstOwnerName(t: []const u8) ?[]const u8 {
-    if (!mem.startsWith(u8, t, "const ") or
-        mem.indexOf(u8, t, "{") == null) return null;
-    var end: usize = 6;
+/// The name bound by a const/var declaration that opens a struct-literal
+/// initializer (`const x = .{`, `var x: T = .{`, `const x = Type{`): the
+/// bound local may hold the tracked alloc, so the name joins the owner
+/// chain. The var form is tracked too: a mutable struct local can still
+/// carry the alloc to a later return (EPH-I0349).
+fn extractStructOwnerName(t: []const u8) ?[]const u8 {
+    const prefix = if (mem.startsWith(u8, t, "const "))
+        "const "
+    else if (mem.startsWith(u8, t, "var "))
+        "var "
+    else
+        return null;
+    if (mem.indexOf(u8, t, "{") == null) return null;
+    var end = prefix.len;
     while (end < t.len and isIdent(t[end])) end += 1;
-    return if (end > 6) t[6..end] else null;
+    return if (end > prefix.len) t[prefix.len..end] else null;
+}
+
+/// True when the struct literal that opens on `idx` holds a tracked
+/// owner: the alloc appears on the opener line itself, or inside the
+/// literal's continuation lines. The bound local joins the owner chain
+/// only then — the literal's fields sit on later lines, so the opener
+/// alone cannot prove the binding (EPH-I0349 corpus).
+fn structLiteralBindsOwner(
+    lines: []const []const u8,
+    idx: usize,
+    opener: []const u8,
+    owners: []const OwnerVar,
+) bool {
+    if (hasOwnerAppearance(owners, opener)) return true;
+    var depth: usize = 0;
+    const limit = @min(idx + max_return_tuple_scan, lines.len);
+    for (idx..limit) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        for (t) |c| {
+            if (c == '{') depth += 1;
+            if (c == '}' and depth > 0) depth -= 1;
+        }
+        if (hasOwnerAppearance(owners, t)) return true;
+        if (depth == 0) break;
+    }
+    return false;
 }
 
 fn extractDerefOwnerName(t: []const u8) ?[]const u8 {
@@ -7399,9 +7633,8 @@ fn trackOwnerVariables(
             const idx = line_num - ctx.body.func_line;
             if (idx >= ctx.body.lines.len) continue;
             const t = mem.trim(u8, ctx.body.lines[idx], " \t\r");
+            try tryAddStructLiteralOwner(ctx.allocator, ctx.body.lines, idx, &owner_vars);
             if (!hasOwnerAppearance(owner_vars.items, t)) continue;
-            if (extractConstOwnerName(t)) |name|
-                try tryAddOwner(ctx.allocator, &owner_vars, name);
             if (extractDerefOwnerName(t)) |name|
                 try tryAddOwner(ctx.allocator, &owner_vars, name);
         }
@@ -7422,6 +7655,19 @@ fn checkOwnershipInLine(
     scan: DeferScanCtx,
     idx: usize,
 ) bool {
+    // Multi-line `return .{ ... };` / `return Type{ ... };` literal: the
+    // alloc as an element transfers to the caller. The opener line
+    // carries no element names, so this check runs before the per-owner
+    // name gate and reads the continuation lines (EPH-I0349 corpus).
+    if (mem.startsWith(u8, t, "return ") and
+        mem.indexOf(u8, t, "{") != null and
+        mem.indexOf(u8, t, "};") == null)
+    {
+        for (scan.owner_vars) |ov| {
+            if (returnTupleTransfersHere(scan.lines, idx, ov.name)) return true;
+        }
+    }
+
     for (scan.owner_vars) |ov| {
         if (!containsIdentifier(t, ov.name)) continue;
 
@@ -7440,6 +7686,46 @@ fn checkOwnershipInLine(
         if (isFieldOrGlobalStore(t, ov.name)) return true;
         // Managed-pointer handoff into a container method (EPH-I0066)
         if (scan.managed_ptr and isContainerArgHandoff(t, scan.lines, idx, ov.name))
+            return true;
+    }
+    return false;
+}
+
+/// True when `name` appears as an element of a multi-line return literal
+/// that opens on this line: `return .{ ... };` or `return Type{ ... };`
+/// both transfer the element values to the caller. The opener line
+/// carries no element names, so the forward scan reads the continuation
+/// lines. Bounded by max_return_tuple_scan lines (EPH-I0349 corpus).
+fn returnTupleTransfersHere(
+    lines: []const []const u8,
+    idx: usize,
+    name: []const u8,
+) bool {
+    var scan: ReturnTupleScan = .{};
+    const limit = @min(idx + max_return_tuple_scan, lines.len);
+    for (idx..limit) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (scan.remaining > 0) {
+            scan.remaining -= 1;
+            if (mem.indexOf(u8, t, "};") != null) scan.remaining = 0;
+            const hit = isReturnTupleElement(t, name, .{
+                .from = 0,
+                .to = t.len,
+                .base_depth = scan.paren_depth,
+            });
+            scan.paren_depth = parenDepthAt(t, 0, t.len, scan.paren_depth);
+            if (hit) return true;
+            continue;
+        }
+        // Opener detection: `return .{` (anon tuple) or `return Type{`
+        // (typed literal). A closed opener is the single-line job of the
+        // `return ` transfer check.
+        const expr = afterReturnKeyword(t) orelse continue;
+        if (mem.indexOf(u8, t, "};") != null) continue;
+        const open = mem.indexOf(u8, expr, "{") orelse continue;
+        scan.remaining = max_return_tuple_scan;
+        scan.paren_depth = parenDepthAt(t, open + 1, t.len, 0);
+        if (isReturnTupleElement(t, name, .{ .from = open + 1, .to = t.len }))
             return true;
     }
     return false;
@@ -7846,6 +8132,17 @@ fn scanBlocksForPatterns(
     return state;
 }
 
+/// Update a multi-line defer/errdefer block depth from one line: the
+/// opener line restarts the depth, every following line contributes its
+/// brace balance.
+fn trackDeferBlockDepthLine(is_block_start: bool, t: []const u8, depth: *usize) void {
+    if (is_block_start) {
+        depth.* = countBraceDepth(t, 0);
+    } else if (depth.* > 0) {
+        depth.* = countBraceDepth(t, depth.*);
+    }
+}
+
 /// Scan a single CFG block for defer/free/return/ownership patterns
 fn scanSingleBlock(
     state: *BlockCoverageState,
@@ -7856,30 +8153,50 @@ fn scanSingleBlock(
     var freed = false;
     var return_after = false;
     var defer_depth: usize = 0;
+    var errdefer_depth: usize = 0;
+    // Join buffer for zig-fmt wrapped frees: the freed var of a wrapped
+    // free sits on a continuation line (EPH-I0351).
+    var join_buf: [max_join_bytes]u8 = undefined;
 
     for (block.start_line..block.end_line + 1) |line_num| {
         if (line_num < scan.func_line) continue;
         const idx = line_num - scan.func_line;
         if (idx >= scan.lines.len) continue;
         const t = mem.trim(u8, scan.lines[idx], " \t\r");
-        const is_defer = isDeferOrErrdefer(t);
-        const has_free = hasRealFreePattern(t) and containsIdentifier(t, scan.alloc_name);
-
-        // Track multi-line defer/errdefer blocks: defer { ... } / errdefer { ... }
-        if (is_defer and (mem.indexOf(u8, t, "{") != null)) {
-            defer_depth = countBraceDepth(t, 0);
-        } else if (defer_depth > 0) {
-            defer_depth = countBraceDepth(t, defer_depth);
-        }
+        const is_errdefer = mem.startsWith(u8, t, "errdefer ") or
+            mem.startsWith(u8, t, "errdefer{");
+        const is_defer = !is_errdefer and
+            (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "defer{"));
+        // Track multi-line defer/errdefer blocks in separate depths: the
+        // two keywords differ in which exit paths their frees cover
+        // (EPH-I0349).
+        trackDeferBlockDepthLine(
+            is_errdefer and mem.indexOf(u8, t, "{") != null,
+            t,
+            &errdefer_depth,
+        );
+        trackDeferBlockDepthLine(
+            is_defer and mem.indexOf(u8, t, "{") != null,
+            t,
+            &defer_depth,
+        );
         const in_defer_block = is_defer or defer_depth > 0;
+        const in_errdefer_block = is_errdefer or errdefer_depth > 0;
+        const ft = joinParenContinuation(scan.lines, idx, &join_buf);
+        const has_free = hasRealFreePattern(ft) and containsIdentifier(ft, scan.alloc_name);
 
         if (in_defer_block and has_free) state.has_defer[bid] = true;
-        // A guarded defer keyword on the comment-stripped line means the
-        // free is a conditional defer: it covers only the branch path, so
-        // the block must not read as directly freed. Comment text is
-        // stripped first — a trailing comment mentioning `defer` must not
-        // flip the verdict (EPH-I0682, F6b; review r1 fix 1).
-        if (!in_defer_block and !hasGuardedDeferKeyword(stripLineComment(t)) and has_free) {
+        // An errdefer free runs only on error exits: it covers neither the
+        // defer lattice nor the direct-free lattice for ZA101/102
+        // (EPH-I0349). A guarded defer keyword on the comment-stripped
+        // line means the free is a conditional defer: it covers only the
+        // branch path, so the block must not read as directly freed.
+        // Comment text is stripped first — a trailing comment mentioning
+        // `defer` must not flip the verdict (EPH-I0682, F6b; review r1
+        // fix 1).
+        if (!in_defer_block and !in_errdefer_block and
+            !hasGuardedDeferKeyword(stripLineComment(t)) and has_free)
+        {
             freed = true;
             state.has_direct_free[bid] = true;
         }
@@ -7935,6 +8252,13 @@ fn tryPropagateCoverage(cfg: *ControlFlowGraph, covered: []bool, bid: usize) boo
     var has_succ = false;
     for (cfg.edges.items) |edge| {
         if (edge.from != bid) continue;
+        // A return block's outgoing edge is phantom: the close-brace
+        // wiring adds a fall-through from a block whose return already
+        // exited the function, so the return path never reaches that
+        // successor. Counting it would read the early-return exit as
+        // covered by a post-return defer — the EPH-I0348 leak shape.
+        // (The UAF lattice skips is_return preds for the same reason.)
+        if (cfg.blocks.items[bid].is_return) continue;
         has_succ = true;
         if (!covered[edge.to]) {
             all_succs_covered = false;
@@ -8009,30 +8333,71 @@ fn checkDeferCoverageForAlloc(
     // boundaries. The scan never matches conditional defers (a line that
     // carries a defer keyword without starting with it), so a same-indent
     // `if (a) defer free(buf);` cannot suppress the partial-coverage
-    // warning (EPH-I0682, design-cfg-soundness F6b).
-    if (hasDeferFreeInFunction(ctx.body.lines, alloc.name))
-        return null;
+    // warning (EPH-I0682, design-cfg-soundness F6b). A defer counts only
+    // when it dominates the alloc's exits: an early return or try before
+    // the defer registration leaks on that path, so the defer cannot mask
+    // the partial-coverage verdict there (EPH-I0348).
+    if (hasDeferFreeInFunction(
+        ctx.body.lines,
+        alloc.name,
+        alloc.line - ctx.body.func_line,
+    )) return null;
 
     return buildPartialCoverageIssue(ctx.body.file_path, alloc);
 }
 
-/// Find the indent level of an allocation line by name
-fn findAllocIndent(lines: []const []const u8, alloc_name: []const u8) usize {
-    var join_buf: [max_join_bytes]u8 = undefined;
-    for (lines, 0..) |line, idx| {
-        const t = joinParenContinuation(lines, idx, &join_buf);
-        // Check for .alloc( or .create( (not in string, not Type factory)
-        if (findAllocCall(t, null) != null and containsIdentifier(t, alloc_name))
-            return countIndent(line);
+/// True when a word-bounded `return` keyword sits in masked code outside
+/// strings and comments. Covers every exit form: bare `return;`,
+/// `return x;`, `return error.E;` (EPH-I0348).
+fn hasRealReturnKeyword(code: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(code);
+    var s: usize = 0;
+    while (mem.indexOf(u8, code[s..], "return")) |rel| {
+        const pos = s + rel;
+        s = pos + "return".len;
+        if (pos > 0 and (isIdent(code[pos - 1]) or code[pos - 1] == '.')) continue;
+        if (s < code.len and isIdent(code[s])) continue;
+        if (cls.isInsideString(pos)) continue;
+        return true;
     }
-    return 0;
+    return false;
+}
+
+/// True when a scope-exit source sits on a line strictly between `from`
+/// (exclusive) and `to` (exclusive): a `return` of any form or a `try`.
+/// A defer registered at `to` cannot cover those exits — the defer
+/// statement never ran on those paths, so the alloc leaks there
+/// (EPH-I0348). Masked code: prose in comments and string literals never
+/// exits.
+fn hasExitBetween(lines: []const []const u8, from: usize, to: usize) bool {
+    if (to <= from + 1) return false;
+    var blank_buf: [16 * 1024]u8 = undefined;
+    for (from + 1..to) |idx| {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code = maskedCodeLine(lines[idx], &blank_buf);
+        if (hasRealReturnKeyword(code) or hasRealKeyword(code, "try ")) return true;
+    }
+    return false;
 }
 
 /// Scan state for the linear defer-free fallback: the allocation being
-/// matched (name + indent) plus the running multi-line defer/skip depths.
+/// matched (name, indent, line), the running multi-line defer/skip
+/// depths, the defer block's start line for the dominance test, and the
+/// source lines plus the join buffer for zig-fmt wrapped frees
+/// (EPH-I0351).
 const DeferFreeScanCtx = struct {
     alloc_name: []const u8,
     alloc_indent: usize,
+    alloc_idx: usize,
+    defer_start: usize,
+    /// True when the open multi-line block belongs to an `errdefer`
+    /// statement: its frees count only with a later handoff reference
+    /// (EPH-I0349).
+    is_errdefer: bool,
+    lines: []const []const u8,
+    join_buf: *[max_join_bytes]u8,
     defer_depth: *usize,
     skip_depth: *usize,
 };
@@ -8041,7 +8406,8 @@ const DeferFreeScanCtx = struct {
 fn checkDeferFreeLine(
     line: []const u8,
     t: []const u8,
-    ctx: *const DeferFreeScanCtx,
+    idx: usize,
+    ctx: *DeferFreeScanCtx,
 ) bool {
     // Skip mode: inside a defer block at deeper scope than alloc
     if (ctx.skip_depth.* > 0) {
@@ -8049,13 +8415,24 @@ fn checkDeferFreeLine(
         return false;
     }
 
-    const is_defer_start = isDeferOrErrdefer(t);
-    if (is_defer_start)
-        return handleDeferStart(line, t, ctx);
+    // errdefer statements count only when the success path also
+    // references the alloc after them — the error/success cleanup split.
+    // A discard-only tail leaks on success (EPH-I0349).
+    if (isDeferOrErrdefer(t))
+        return handleDeferStart(line, t, idx, ctx);
 
     if (ctx.defer_depth.* > 0) {
-        if (hasRealFreePattern(t) and containsIdentifier(t, ctx.alloc_name))
+        const joined = joinParenContinuation(ctx.lines, idx, ctx.join_buf);
+        if (hasRealFreePattern(joined) and containsIdentifier(joined, ctx.alloc_name)) {
+            // The defer block must dominate the alloc's exits: an early
+            // return or try before the defer registration leaks on that
+            // path (EPH-I0348).
+            if (ctx.alloc_idx < ctx.defer_start and
+                hasExitBetween(ctx.lines, ctx.alloc_idx, ctx.defer_start)) return false;
+            if (ctx.is_errdefer and
+                !hasHandoffReference(ctx.lines, ctx.defer_start, ctx.alloc_name)) return false;
             return true;
+        }
         ctx.defer_depth.* = countBraceDepth(t, ctx.defer_depth.*);
     }
     return false;
@@ -8065,7 +8442,8 @@ fn checkDeferFreeLine(
 fn handleDeferStart(
     line: []const u8,
     t: []const u8,
-    ctx: *const DeferFreeScanCtx,
+    idx: usize,
+    ctx: *DeferFreeScanCtx,
 ) bool {
     // Only consider defers at same or outer scope as the allocation
     if (countIndent(line) > ctx.alloc_indent) {
@@ -8073,35 +8451,66 @@ fn handleDeferStart(
             ctx.skip_depth.* = countBraceDepth(t, 0);
         return false;
     }
-    // Single-line defer with free
-    if (hasRealFreePattern(t) and containsIdentifier(t, ctx.alloc_name))
+    const is_errdefer = mem.startsWith(u8, t, "errdefer ");
+    // Single-line defer with free. The defer must dominate the alloc's
+    // exits: an early return or try before it leaks on that path
+    // (EPH-I0348). An errdefer counts only when the success path also
+    // references the alloc after it (EPH-I0349). The free check runs on
+    // the joined logical line so a zig-fmt wrapped free stays visible
+    // (EPH-I0351).
+    const joined = joinParenContinuation(ctx.lines, idx, ctx.join_buf);
+    if (hasRealFreePattern(joined) and containsIdentifier(joined, ctx.alloc_name)) {
+        if (ctx.alloc_idx < idx and hasExitBetween(ctx.lines, ctx.alloc_idx, idx))
+            return false;
+        if (is_errdefer and !hasHandoffReference(ctx.lines, idx, ctx.alloc_name))
+            return false;
         return true;
+    }
     // Multi-line defer block start at same/outer scope
-    if (mem.indexOf(u8, t, "{") != null)
+    if (mem.indexOf(u8, t, "{") != null) {
         ctx.defer_depth.* = countBraceDepth(t, 0);
+        ctx.defer_start = idx;
+        ctx.is_errdefer = is_errdefer;
+    }
     return false;
 }
 
-/// Linear scan for a defer block containing .free(name) or .destroy(name) at the
-/// same or outer scope as the allocation. Handles multi-line defer { ... } blocks.
+/// Linear scan for a defer block containing .free(name) or .destroy(name)
+/// at the same or outer scope as the allocation. Handles multi-line
+/// defer { ... } blocks. A defer counts only when it dominates the
+/// alloc's exits: an early return or try between the alloc and the defer
+/// skips the defer registration and leaks on that path, so the defer
+/// cannot mask the CFG's partial-coverage verdict there (EPH-I0348).
+/// An errdefer counts only when the success path references the alloc
+/// after it. A discard-only tail leaks on the success path and never
+/// counts (EPH-I0349). Runs on joined logical lines, so zig-fmt wrapped
+/// frees stay visible (EPH-I0351).
 fn hasDeferFreeInFunction(
     lines: []const []const u8,
     alloc_name: []const u8,
+    alloc_idx: usize,
 ) bool {
-    const alloc_indent = findAllocIndent(lines, alloc_name);
+    if (alloc_idx >= lines.len) return false;
+    const alloc_indent = countIndent(lines[alloc_idx]);
     var defer_depth: usize = 0;
     var skip_depth: usize = 0;
-    const ctx: DeferFreeScanCtx = .{
+    var join_buf: [max_join_bytes]u8 = undefined;
+    var ctx: DeferFreeScanCtx = .{
         .alloc_name = alloc_name,
         .alloc_indent = alloc_indent,
+        .alloc_idx = alloc_idx,
+        .defer_start = 0,
+        .is_errdefer = false,
+        .lines = lines,
+        .join_buf = &join_buf,
         .defer_depth = &defer_depth,
         .skip_depth = &skip_depth,
     };
 
-    for (lines) |line| {
+    for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (checkDeferFreeLine(line, t, &ctx))
+        if (checkDeferFreeLine(line, t, idx, &ctx))
             return true;
     }
     return false;
@@ -8233,6 +8642,10 @@ fn checkErrdeferOwnershipTransfer(
         const code = maskedCodeLine(line, &blank_buf);
         scan.pos = 0;
         const line_depth = scan.depth;
+        // A same-line try exit precedes any transfer STORE on the line:
+        // the try's error path propagates before the store executes, so
+        // the transfer never covers that path (EPH-I0068).
+        if (tryPrecedesTransferStore(code, mem.trim(u8, line, " \t\r"), alloc.name)) return;
         // A transfer inside a conditional block does not dominate the
         // alloc's fall-through — keep scanning (EPH-I0368).
         if (dominatingTransferAt(&scan, code, alloc.name, alloc_depth)) {
@@ -8368,6 +8781,45 @@ fn dominatingTransferAt(
     const anchor = errdeferTransferAnchor(code, alloc_name) orelse return false;
     const anchor_depth = scanBraceDepth(scan, code, anchor) orelse return false;
     return anchor_depth <= alloc_depth;
+}
+
+/// Byte offset of the first real `try ` keyword in masked code, or null.
+/// Word-bounded and string-aware — `retry f()` and string contents never
+/// count (EPH-I0068).
+fn realTryPos(code: []const u8) ?usize {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(code);
+    var s: usize = 0;
+    while (mem.indexOf(u8, code[s..], "try ")) |rel| {
+        const pos = s + rel;
+        s = pos + "try ".len;
+        if (pos > 0 and isIdent(code[pos - 1])) continue;
+        if (cls.isInsideString(pos)) continue;
+        return pos;
+    }
+    return null;
+}
+
+/// True when a same-line try exit precedes a transfer STORE: the try's
+/// error path propagates before the store executes, so the transfer never
+/// covers that path (EPH-I0068). The store form (`self.field = try
+/// f(buf)`) now reads like the already-correct return form
+/// (`return try f(buf)`). Fires only when the transfer anchor sits
+/// textually BEFORE the try — the try is the RHS of the store. When the
+/// try wraps the transfer itself (`try list.append(x)`), the transfer
+/// still credits: the append-failure leak is the model's accepted bound
+/// (pre-existing). defer/errdefer statement lines stay exempt — a try
+/// there is a compile error (mirrors isUncoveredErrorExit). Masked code:
+/// prose in comments and strings never exits.
+fn tryPrecedesTransferStore(
+    code: []const u8,
+    t: []const u8,
+    alloc_name: []const u8,
+) bool {
+    if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) return false;
+    const try_pos = realTryPos(code) orelse return false;
+    const anchor = errdeferTransferAnchor(code, alloc_name) orelse return false;
+    return anchor < try_pos;
 }
 
 /// Byte offset within the masked code line where an ownership transfer
@@ -19985,18 +20437,22 @@ const max_join_lines = 4;
 const max_join_bytes = 512;
 
 /// Join a logical line whose parenthesized call spans multiple source lines.
-/// zig-fmt wraps long calls as `allocator.alloc(\n    u8,\n    4096,\n);` — the
-/// first line ends right after `(`, hiding the type first-arg from
-/// findAllocCall. Returns the trimmed line unchanged when parens already
-/// balance; otherwise joins up to max_join_lines following lines (bounded by
-/// buf size). No heap allocation: caller provides a fixed stack buffer.
+/// zig-fmt wraps long calls as `allocator.alloc(\n    u8,\n    4096,\n);` —
+/// and frees as `allocator.free(\n    buf,\n);` — the first line ends right
+/// after `(`, hiding the type/argument from the alloc and free matchers.
+/// Returns the trimmed line unchanged when parens already balance or the
+/// line carries no alloc/free pattern; otherwise joins up to
+/// max_join_lines following lines (bounded by buf size). Free and destroy
+/// lines join exactly like alloc lines: the free scanners and the
+/// defer-coverage family read the argument off the joined text
+/// (EPH-I0351). No heap allocation: caller provides a fixed stack buffer.
 fn joinParenContinuation(
     lines: []const []const u8,
     idx: usize,
     buf: []u8,
 ) []const u8 {
     const t = mem.trim(u8, lines[idx], " \t\r");
-    if (!hasAllocCallPattern(t)) return t;
+    if (!hasAllocCallPattern(t) and !hasRealFreePattern(t)) return t;
     var depth = parenBalance(t);
     if (depth <= 0) return t;
     if (t.len > buf.len) return t;
@@ -29423,11 +29879,15 @@ fn markEntryScanned(
     const resolved = Fs.cwd(io).realpath(entry, &buf) catch null;
     const owned = try allocator.dupe(u8, resolved orelse entry);
     errdefer allocator.free(owned);
-    const gop = try seen.getOrPut(allocator, owned);
-    if (gop.found_existing) {
+    // The map keeps the key on a fresh insert, so the success path either
+    // frees (already scanned) or hands the key to the map. The contains
+    // + put form keeps the handoff visible to the ZA101 transfer model
+    // (getOrPut's key retention is not in the container method table).
+    if (seen.contains(owned)) {
         allocator.free(owned);
         return true;
     }
+    try seen.put(allocator, owned, {});
     return false;
 }
 
@@ -32178,6 +32638,205 @@ test "ZA101: owner rebind is not a transfer (EPH-I0346)" {
         "test_rebind.zig",
         RULE_ALLOC_NO_DEFER,
     ) == 1);
+}
+
+test "ZA101: early return before the defer still warns (EPH-I0348)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `if (c) { return; }` path exits before the defer registration:
+    // the defer does not dominate that exit, so the partial-coverage
+    // warning must fire (band-B02 F9). The CFG return-block edge is
+    // phantom, so both the coverage propagation and the linear fallback
+    // must refuse to mask.
+    const content =
+        \\fn leaky(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const x = try allocator.alloc(u8, 10);
+        \\    if (c) {
+        \\        return;
+        \\    }
+        \\    defer allocator.free(x);
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_early_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_early_return.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: far early return still warns, loop with post-loop defer stays silent (EPH-I0348 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The far early-return shape (defer beyond the immediate window)
+    // must fire through the linear fallback's dominance gate. The loop
+    // shape has no exit between alloc and defer, so the fallback still
+    // masks the documented loop-deadlock artifact (EPH-I0682 F6a).
+    const content =
+        \\fn leaky_far(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const x = try allocator.alloc(u8, 10);
+        \\    if (c) {
+        \\        return;
+        \\    }
+        \\    const a = 1;
+        \\    const b = 2;
+        \\    const d = 3;
+        \\    const e = 4;
+        \\    const f = 5;
+        \\    const g = 6;
+        \\    const h = 7;
+        \\    defer allocator.free(x);
+        \\    _ = x;
+        \\}
+        \\fn loop_ok(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const y = try allocator.alloc(u8, 10);
+        \\    var i: usize = 0;
+        \\    while (i < n) : (i += 1) {
+        \\        _ = y;
+        \\    }
+        \\    defer allocator.free(y);
+        \\    _ = y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_early_far.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_early_far.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: defer after the only return stays silent (EPH-I0348 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer registers before the return, so it runs on every exit:
+    // the early-return shape inverts to a covered one.
+    const content =
+        \\fn ok(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const x = try allocator.alloc(u8, 10);
+        \\    defer allocator.free(x);
+        \\    if (c) {
+        \\        return;
+        \\    }
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_first.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_defer_first.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: errdefer-only cleanup warns on the success path (EPH-I0349)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // An errdefer frees only on error exits. The success path keeps the
+    // alloc with nothing freeing it, so ZA101 fires; the errdefer still
+    // covers the error exits, so ZA103 stays silent (band-B02 F10).
+    const content =
+        \\fn errdefer_only(allocator: std.mem.Allocator, s: []const u8) !void {
+        \\    const x = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(x);
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_only.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_only.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_only.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA101: errdefer plus transfer or defer stays silent (EPH-I0349 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The error/success cleanup split: an errdefer plus a visible
+    // success-path handoff (field store) or a plain defer covers both
+    // exit families.
+    const content =
+        \\const Holder = struct { buf: []u8 = &.{} };
+        \\fn split_ok(allocator: std.mem.Allocator, h: *Holder, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(buf);
+        \\    h.buf = buf;
+        \\}
+        \\fn both_ok(allocator: std.mem.Allocator, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(buf);
+        \\    defer allocator.free(buf);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_split.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_split.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: errdefer plus multi-line return literal stays silent (EPH-I0349 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The allocate-assemble-return idiom (tigerbeetle clock shape): the
+    // errdefer covers the error paths and the returned literal holds the
+    // alloc on the success path. The errdefer counts as coverage only
+    // when a later handoff reference exists (corpus-verified bound).
+    const content =
+        \\const Clock = struct { marzullo_tuples: []u8 };
+        \\fn init_clock(allocator: std.mem.Allocator, n: usize) !Clock {
+        \\    const marzullo_tuples = try allocator.alloc(u8, n);
+        \\    errdefer allocator.free(marzullo_tuples);
+        \\    return .{
+        \\        .marzullo_tuples = marzullo_tuples,
+        \\    };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_return.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
 }
 
 test "ZA101: single-line .alloc( detection unchanged by line joining" {
@@ -34957,6 +35616,177 @@ test "ZA106: errdefer free plus defer free stays silent" {
         run.issues.items,
         "test_errdefer_defer.zig",
         RULE_DOUBLE_FREE,
+    ) == 0);
+}
+
+test "ZA105: zig-fmt wrapped free is seen (EPH-I0351)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A free wrapped past 100 columns puts the freed var on a
+    // continuation line (`allocator.free(\n    x,\n);`). The free
+    // scanners must join the logical line or the UAF reads a use of
+    // live memory (band-B02 F12).
+    const content =
+        \\fn use_after_free(allocator: std.mem.Allocator) void {
+        \\    const x = allocator.alloc(u8, 4096) catch return;
+        \\    allocator.free(
+        \\        x,
+        \\    );
+        \\    x[0] = 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_wrapped_free_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_wrapped_free_uaf.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA106: wrapped free double-free and wrapped defer pairing are seen (EPH-I0351)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The wrapped second free double-frees, and a wrapped defer-registered
+    // free pairs with the later direct free.
+    const content =
+        \\fn double_free(allocator: std.mem.Allocator) void {
+        \\    const y = allocator.alloc(u8, 1024) catch return;
+        \\    allocator.free(y);
+        \\    allocator.free(
+        \\        y,
+        \\    );
+        \\}
+        \\fn defer_pair(allocator: std.mem.Allocator) void {
+        \\    const z = allocator.alloc(u8, 100) catch return;
+        \\    defer allocator.free(
+        \\        z,
+        \\    );
+        \\    allocator.free(z);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_wrapped_free_dd.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_wrapped_free_dd.zig",
+        RULE_DOUBLE_FREE,
+    ) == 2);
+}
+
+test "ZA101: wrapped defer free covers the alloc (EPH-I0351 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A wrapped `defer allocator.free(\n x,\n);` must cover the alloc in
+    // the immediate-defer pass, the CFG scan, and the linear fallback —
+    // otherwise the FP warning fires on a properly deferred alloc.
+    const content =
+        \\fn wrapped_defer_ok(allocator: std.mem.Allocator) !void {
+        \\    const x = try allocator.alloc(u8, 10);
+        \\    defer allocator.free(
+        \\        x,
+        \\    );
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_wrapped_defer_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_wrapped_defer_ok.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA103: same-line try-transfer is an uncovered exit (EPH-I0068)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `state.field = try allocator.dupe(u8, buf)` carries both a field
+    // store and a try. The try's error path propagates before the store
+    // executes, so the transfer cannot cover that path — the store form
+    // must warn like the already-correct `return try f(buf)` twin
+    // (band-B03 F1).
+    const content =
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn store_try(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    state.field = try allocator.dupe(u8, buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_store_try.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_store_try.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: errdefer covers the same-line try-store (EPH-I0068 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A real errdefer between the alloc and the try-store covers the
+    // error path, so the same-line try-store stays silent.
+    const content =
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn covered(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(buf);
+        \\    state.field = try allocator.dupe(u8, buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_store_try_covered.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_store_try_covered.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: try wrapping the transfer itself still credits (EPH-I0068 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `try list.append(x)` wraps the transfer in the try: there is no
+    // store after the try point, so the transfer keeps crediting — the
+    // append-failure leak is the model's accepted bound.
+    const content =
+        \\const Sink = struct { items: std.ArrayListUnmanaged([]u8) = .empty };
+        \\fn append_try(allocator: std.mem.Allocator, sink: *Sink, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    try sink.items.append(allocator, buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_append_try.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_append_try.zig",
+        RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
 }
 

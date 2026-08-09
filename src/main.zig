@@ -739,7 +739,9 @@ fn isSwitchArmLine(trimmed: []const u8) bool {
 /// case item of an outer switch hides the outer prong header: the first
 /// code arrow belongs to the inner expression, so the line reads as
 /// expression data and the outer arm loses suppression. Zero occurrences in
-/// the 3000-project corpus.
+/// the 3000-project corpus. zig fmt expands this shape to multi-line, which
+/// scans correctly: the `} =>` line then carries no switch keyword. Only
+/// the unformatted single-line form fires.
 fn isArmHeaderLine(t: []const u8) bool {
     const arrow = findProngArrow(t) orelse return false;
     var lit = types.LiteralState.forLine(t) orelse return false;
@@ -5947,10 +5949,14 @@ fn hasExclusiveBranchBetween(
 /// (F1) and a switch whose join precedes the use (F2) are not exclusive
 /// regions, and an inline switch expression on one line at the statement
 /// indent is no separator either (its arrows are expression data —
-/// isArmHeaderLine). Textual and fail-open toward reporting: a genuine arm
-/// header that merely sits between free and use at a shallow-enough indent
-/// still suppresses (accepted FN — same class as hasSwitchArmBetween's
-/// documented hole; pinned by the EPH-I0062 residual test).
+/// isArmHeaderLine). An inline switch expression in the prong-pattern
+/// position of an outer switch is the exception: the line is a genuine arm
+/// header, but isArmHeaderLine misses the outer arrow and the pair still
+/// fires (EPH-I0834 residual, zero corpus occurrences). Textual and
+/// fail-open toward reporting: a genuine arm header that merely sits between
+/// free and use at a shallow-enough indent still suppresses (accepted FN —
+/// same class as hasSwitchArmBetween's documented hole; pinned by the
+/// EPH-I0062 residual test).
 fn hasExclusiveArmBetween(
     lines: []const []const u8,
     func_line: usize,
@@ -34157,6 +34163,35 @@ test "ZA106: frees in inline sibling arms stay silent (EPH-I0062 probe18)" {
 
     const file = "test_inline_sibling_free.zig";
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+}
+
+test "ZA106: switch-expression case item hides the outer prong header (EPH-I0834)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The outer prong pattern is a single-line switch expression: the
+    // first code arrow on the line belongs to the inner expression, so
+    // isArmHeaderLine reads the line as expression data and the sibling
+    // arms lose exclusivity suppression. Documented EPH-I0834 residual:
+    // zig fmt expands the shape to multi-line (which scans correctly) and
+    // the corpus has zero occurrences. Pins the current FP so a mechanism
+    // change updates this test and the helper doc together.
+    const content =
+        \\fn handle(allocator: std.mem.Allocator, x: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (x) {
+        \\        9 => allocator.free(buf),
+        \\        switch (0) { 0 => 2, else => 3 } => allocator.free(buf),
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_case_item_switch_expr.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_case_item_switch_expr.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
 }
 
 test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {

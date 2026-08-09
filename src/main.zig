@@ -2406,6 +2406,11 @@ const LineRange = struct {
 /// Check if var_name is reassigned on any line between from_line and to_line (exclusive).
 /// Used by cross-block UAF detection to suppress false positives when a freed variable
 /// is reassigned to new memory before the next use.
+/// Arm-blind by design (band-B02 F25 class, EPH-I0836): a reassignment
+/// inside a conditional arm suppresses like an unconditional one, so a use
+/// on the arm-not-taken path stays silent though the variable still dangles
+/// there. Accepted FN, the mirror-consistent FP-to-FN trade EPH-I0347
+/// prescribed for the alias rebind guard.
 fn hasReassignmentBetween(
     lines: []const []const u8,
     func_line: usize,
@@ -6050,6 +6055,76 @@ fn checkSameBlockFree(
     };
 }
 
+/// Same-block free probe for one alias (EPH-I0835): the alias's target is
+/// the tracked allocation, so a root free releases it only while the root
+/// still points at it — before the root's first rebind past the alloc line.
+/// A root rebind hands the name to new memory: it neither frees the alias's
+/// target nor resurrects it (`free(buf); buf = other; use(a);` still reads
+/// freed memory). An alias free releases the target at any time.
+fn checkAliasBlockFree(
+    scan: *const VarFreeCtx,
+    block_start: usize,
+    actual_line: usize,
+) SameBlockFreeResult {
+    var root_rebound = false;
+    var freed = false;
+    var ret = false;
+    var freed_line: usize = 0;
+    for (block_start..actual_line) |cl| {
+        if (cl < scan.func_line) continue;
+        const ci = cl - scan.func_line;
+        if (ci >= scan.lines.len) continue;
+        const ct = mem.trim(u8, scan.lines[ci], " \t\r");
+        if (shouldSkipForFreeAnalysis(ct, ci, scan.in_defer, scan.in_errdefer)) continue;
+        if (scan.capture_shadowed[ci]) continue;
+        if (cl > scan.alloc_info.alloc_line and hasDirectReassignment(ct, scan.var_name)) {
+            root_rebound = true;
+            continue;
+        }
+        if (hasRealFreePattern(ct) and
+            isDirectFreeOfVarOrAlias(ct, scan.var_name, scan.aliases))
+        {
+            if (isDirectFreeOfVar(ct, scan.var_name) and root_rebound) continue;
+            freed = true;
+            freed_line = cl;
+        }
+        if (freed and mem.startsWith(u8, ct, "return")) ret = true;
+    }
+    return .{
+        .freed = freed,
+        .intervening_return = ret,
+        .rebound = false,
+        .freed_line = freed_line,
+    };
+}
+
+/// Same-block verdict for one alias use (EPH-I0835, EPH-I0837): the alias's
+/// target freed in the block is def by construction, so the verdict grades
+/// err and cites the same-block scan's own free line. The direct path's
+/// checkSameBlockUAF names the root and cannot be reused for an alias.
+/// emitted reports the line and the caller stops the scan. suppressed
+/// keeps the scan running: the sibling arm's exclusivity says nothing
+/// about post-join lines, which can still dangle on the free path.
+/// not_in_block falls through to the lattice stage.
+const AliasSameBlockVerdict = enum {
+    emitted,
+    suppressed,
+    not_in_block,
+};
+
+fn emitAliasSameBlockVerdict(
+    ctx: *const FreeScanCtx,
+    sbf: SameBlockFreeResult,
+    site: UAFSite,
+) !AliasSameBlockVerdict {
+    if (!sbf.freed or sbf.intervening_return) return .not_in_block;
+    if (hasExclusiveArmBetween(ctx.scan.lines, ctx.scan.func_line, sbf.freed_line, site.line)) {
+        return .suppressed;
+    }
+    try appendUAFIssue(ctx, site);
+    return .emitted;
+}
+
 /// One use-after-free report: the used variable, its use line and column,
 /// the severity grade (err for a free on every path, warning for the
 /// conditional reach — EPH-I0345), and the free line the verdict cites.
@@ -6206,7 +6281,20 @@ fn detectAliasUseAfterFree(ctx: *const FreeScanCtx) !void {
     }
 }
 
+/// Grade for one alias lattice verdict (EPH-I0835): the root rebind keeps
+/// the alias pointing at freed memory, so the use stays definite. The def
+/// lattice names every path freed; only the may reach stays warning.
+fn aliasUAFSeverity(root_rebound: bool, def_freed: bool) Severity {
+    return if (root_rebound or def_freed) .err else .warning;
+}
+
 /// Report the first use of one alias past the free line, if any.
+/// Verdict order mirrors checkLineForUAF (EPH-I0835): the alias-rebind
+/// guard, then the same-block free (def by construction), then the
+/// lattice reach gate and grade. The lattice tracks the ROOT's value:
+/// when a root rebind lies between the free and the use, the alias still
+/// points at the freed target, so the grade stays err and the reach gate
+/// stays off (the root lattice no longer describes the alias there).
 fn reportAliasUAF(ctx: *const FreeScanCtx, alias_name: []const u8, freed_line: usize) !void {
     for (ctx.scan.lines, 0..) |line, idx| {
         const actual_line = ctx.scan.func_line + idx;
@@ -6222,19 +6310,51 @@ fn reportAliasUAF(ctx: *const FreeScanCtx, alias_name: []const u8, freed_line: u
         // the direct path's hasReassignmentBetween guard (EPH-I0347,
         // band-B02 F8). The rebind line itself is skipped by
         // findVarUseOnLine, so the scan reaches the first post-rebind use.
+        // Arm-blind like the direct path: a rebind inside a conditional
+        // arm suppresses like an unconditional one, an accepted FN on the
+        // arm-not-taken path (EPH-I0836, band-B02 F25 class).
         const range: LineRange = .{ .from_line = freed_line, .to_line = actual_line };
         if (hasReassignmentBetween(ctx.scan.lines, ctx.scan.func_line, range, alias_name))
             continue;
+        const bid = findBlockForLine(ctx.cfg, actual_line) orelse continue;
+        const bs = ctx.cfg.blocks.items[bid].start_line;
+        if (bs == 0 or bs > actual_line) continue;
+        // A free in the same block always precedes the use: the same-block
+        // verdict handles the line (mirror of checkSameBlockUAF). An emitted
+        // verdict reports the line and ends the scan. The suppressed arm use
+        // keeps the scan running: the sibling arm's exclusivity says nothing
+        // about post-join lines (EPH-I0837).
+        const sbf = checkAliasBlockFree(&ctx.scan, bs, actual_line);
+        const verdict = try emitAliasSameBlockVerdict(ctx, sbf, .{
+            .var_name = alias_name,
+            .line = actual_line,
+            .col = use_col,
+            .severity = .err,
+            .freed_line = sbf.freed_line,
+        });
+        if (verdict == .emitted) break;
+        if (verdict != .not_in_block) continue;
+        // The lattice gate and grade hold only while the root still points
+        // at the tracked allocation; a root rebind detaches the lattice
+        // from the alias's target (EPH-I0835).
+        const root_rebound = hasReassignmentBetween(
+            ctx.scan.lines,
+            ctx.scan.func_line,
+            range,
+            ctx.scan.var_name,
+        );
+        if (!root_rebound and !ctx.bstate.may_freed_entry[bid]) continue;
         // Use in an arm mutually exclusive with the free's arm is not
         // reachable after the free — keep scanning for a genuine later use.
         // Indent-aware: a use after the switch join is in no arm (F2).
         if (hasExclusiveArmBetween(ctx.scan.lines, ctx.scan.func_line, freed_line, actual_line))
             continue;
+        const severity = aliasUAFSeverity(root_rebound, ctx.bstate.def_freed_entry[bid]);
         try appendUAFIssue(ctx, .{
             .var_name = alias_name,
             .line = actual_line,
             .col = use_col,
-            .severity = .err,
+            .severity = severity,
             .freed_line = freed_line,
         });
         break; // One UAF per alias is sufficient
@@ -32556,11 +32676,16 @@ test "ZA105: free root then use alias (existing direction)" {
     var run = try runCFGMemoryTest(&diag, allocator, "test_root_alias.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expect(countRuleIssues(
-        run.issues.items,
-        "test_root_alias.zig",
-        RULE_USE_AFTER_FREE,
-    ) == 1);
+    const file = "test_root_alias.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    // The straight-line free is def: the alias verdict grades err, the
+    // lattice's err arm (EPH-I0835).
+    var graded_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        graded_err = issue.severity == .err;
+    }
+    try std.testing.expect(graded_err);
 }
 
 test "ZA105: use inside new declaration after free (subscript)" {
@@ -32959,6 +33084,175 @@ test "ZA105: alias still dangling after the root free fires (EPH-I0347)" {
     ) == 1);
 }
 
+test "ZA105: alias use after a conditional root free grades warning (EPH-I0835)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // reportAliasUAF graded .err unconditionally: the conditional free on 5
+    // reaches the use on 7 on the c-true path only, so the verdict must be
+    // warning, the lattice's may arm, mirroring checkLineForUAF (the direct
+    // path grades this shape warning since EPH-I0345).
+    const content =
+        \\fn alias_cond_free(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_cond_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_alias_cond_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_warning = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        graded_warning = issue.severity == .warning and
+            mem.startsWith(u8, issue.message, "conditional use-after-free:");
+    }
+    try std.testing.expect(graded_warning);
+}
+
+test "ZA105: alias use after a free on an early-return arm stays silent (EPH-I0835)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free on 5 sits on the return path: the use on 7 runs only when
+    // the free never ran. The may lattice carries no flow past the return,
+    // so the mirror's reach gate silences the old .err false positive.
+    const content =
+        \\fn alias_cond_free_return(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\        return;
+        \\    }
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_cond_free_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_alias_cond_free_return.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: root rebind after the free does not resurrect the alias (EPH-I0835)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf = other` hands the ROOT to live memory; the alias `a` still
+    // points at the freed allocation, so the use on 6 stays a definite UAF.
+    // The root lattice would reset on the rebind; the alias verdict must
+    // not follow it (EPH-I0835 root-rebind guard).
+    const content =
+        \\fn alias_after_root_rebind(allocator: std.mem.Allocator, other: []u8) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    allocator.free(buf);
+        \\    buf = other;
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_after_root_rebind.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_alias_after_root_rebind.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        graded_err = issue.severity == .err;
+    }
+    try std.testing.expect(graded_err);
+}
+
+test "ZA105: conditional alias rebind after the free stays silent (EPH-I0836)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // p5c probe shape. hasReassignmentBetween is arm-blind (band-B02 F25
+    // class): the rebind on 6 suppresses like an unconditional one, though
+    // the c-false path still reads the freed allocation. Accepted FN, the
+    // FP-to-FN trade EPH-I0347 prescribed; pinned as current behavior.
+    const content =
+        \\fn alias_cond_rebind(allocator: std.mem.Allocator, other: []u8, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    var a = buf;
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        a = other;
+        \\    }
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_cond_rebind.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_alias_cond_rebind.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: rebind then conditional refree after the join stays silent (EPH-I0836)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // p8 probe shape. The rebind-alloc on 4 is not collected as its own
+    // allocation record (extractVarDeclName needs a var/const prefix), so
+    // the c-true UAF of the second allocation is invisible. The first
+    // alloc's scan suppresses the use on 8 correctly: the rebind detached
+    // it. Pinned as current behavior (EPH-I0836 adjudication).
+    const content =
+        \\fn rebind_refree_postjoin(allocator: std.mem.Allocator, c: bool) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    buf = try allocator.alloc(u8, 128);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_rebind_refree_postjoin.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_rebind_refree_postjoin.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+}
+
 test "ZA105: switch expression between free and use still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -33020,6 +33314,44 @@ test "ZA105: alias use after a switch that frees on one arm still fires" {
         "test_uaf_alias_post.zig",
         RULE_USE_AFTER_FREE,
     ) == 1);
+}
+
+test "ZA105: sibling-arm alias suppression does not end the scan (EPH-I0837)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The use on 6 sits in an arm exclusive with the free's arm: suppressed
+    // (EPH-I0837). The use on 8 runs after the switch join, so it dangles on
+    // the free path and must fire err, mirroring the direct path's post-join
+    // verdict. The suppression says nothing about post-join lines.
+    const content =
+        \\fn alias_post_switch_sibling(allocator: std.mem.Allocator, x: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    switch (x) {
+        \\        0 => allocator.free(buf),
+        \\        else => use(a),
+        \\    }
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_post_switch_sibling.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_alias_post_switch_sibling.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var post_join_fired = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+        post_join_fired = issue.line == 8;
+    }
+    try std.testing.expect(post_join_fired);
 }
 
 test "ZA105: free on both if and else arms then use still fires" {

@@ -21694,7 +21694,10 @@ fn genFallThroughFact(ctx: NullSafetyCtx, bid: usize, var_name: []const u8) !voi
 /// Collect null-check facts from conditionals within a single block: the
 /// checked set the scan consults for every block holding the line, and the
 /// polarity record plus fall-through placement only from the block that
-/// owns the condition's branch edges (EPH-I0678).
+/// owns the condition's branch edges (EPH-I0678). The checked seed is
+/// polarity-gated: a false-edge fact holds only past the exit, so it never
+/// lands in the owner or the then block, where the var is still null
+/// (EPH-I0488).
 fn collectNullChecksInBlock(ctx: NullSafetyCtx, bid: usize) !void {
     const block = ctx.cfg.blocks.items[bid];
     for (block.start_line..block.end_line + 1) |ln| {
@@ -21704,8 +21707,15 @@ fn collectNullChecksInBlock(ctx: NullSafetyCtx, bid: usize) !void {
         const t = mem.trim(u8, ctx.lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (!isNullCheckConditional(t)) continue;
-        const fact = classifyNullCheck(t) orelse continue;
-        try ctx.checked[bid].put(ctx.allocator, fact.var_name, {});
+        const fact = classifyNullCheck(t, ctx.lines, idx) orelse continue;
+        // A true-edge fact holds on the then side, so every block whose
+        // range covers the condition line sees the non-null state. A
+        // false-edge fact holds only after the exit; seeding the owner or
+        // the then block would suppress a deref before the guard or inside
+        // the null arm (EPH-I0488). genFallThroughFact places it at the
+        // branch_false successors instead.
+        if (fact.polarity == .true_edge)
+            try ctx.checked[bid].put(ctx.allocator, fact.var_name, {});
         if (!ownsConditionLine(ctx.cfg, bid, ln)) continue;
         try ctx.polarity[bid].put(ctx.allocator, fact.var_name, fact.polarity);
         if (fact.polarity == .false_edge)
@@ -21840,7 +21850,10 @@ fn checkOptionalUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
 /// Type-based: fires only when the deref target was declared in the fn with
 /// a nullable-pointer annotation. The maybe_/opt_ name gate it replaces
 /// fired on every non-optional maybe_* variable and missed every nullable
-/// pointer without the prefix.
+/// pointer without the prefix. The braced early-return null guard
+/// (`if (p == null) { return; } p.*;`) is covered by the CFG fact channel:
+/// classifyNullCheck accepts the following-block exit and the meet places
+/// the fall-through fact only where the guard dominates (EPH-I0488).
 fn checkOptionalDeref(ctx: NullSafetyCtx, line: NullLineCtx) !void {
     const col = mem.indexOf(u8, line.t, ".*") orelse return;
     if (isInSafeContext(line.t)) return;
@@ -22281,6 +22294,9 @@ fn isStreamWriteCatchMultiline(t: []const u8, preceding_lines: ?[]const []const 
 ///   defer std.fs.cwd()
 ///       .openFile("x", .{})
 ///       .close() catch {};
+/// A terminated one-line `defer a();` never covers a catch on a later
+/// line: the statement boundary is judged first, so a `defer ` line that
+/// ends in `;`/`{`/`}` returns false before the keyword match (EPH-I0490).
 fn isDeferCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bool {
     _ = t;
     const prev = preceding_lines orelse return false;
@@ -22292,7 +22308,6 @@ fn isDeferCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bo
         const pl = mem.trim(u8, prev[idx], " \t\r");
         if (pl.len == 0) continue;
         if (isCommentOrMultilineString(pl)) continue;
-        if (mem.startsWith(u8, pl, "defer ") or mem.startsWith(u8, pl, "errdefer ")) return true;
         // Stop at statement boundaries: the defer cannot be further back.
         // Judge the boundary on the comment-stripped code, or a trailing
         // comment hides the terminator and the walk crosses the statement
@@ -22301,6 +22316,7 @@ fn isDeferCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bo
         const code = mem.trimEnd(u8, pl[0..comment_start], " \t");
         if (mem.endsWith(u8, code, ";") or mem.endsWith(u8, code, "{") or
             mem.endsWith(u8, code, "}")) return false;
+        if (mem.startsWith(u8, pl, "defer ") or mem.startsWith(u8, pl, "errdefer ")) return true;
     }
     return false;
 }
@@ -22496,12 +22512,22 @@ fn extractVarFromNullCheck(after_paren: []const u8, pos: usize) ?[]const u8 {
     return null;
 }
 
+/// Max braced guard-body lines the following-block exit scan accepts
+/// (EPH-I0858). The scan reads at most this many body lines past the
+/// guard line; a body longer than the window loses suppression (known FP
+/// residual, EPH-I0858).
+const max_braced_guard_body_lines = 4;
+
 /// Extract the checked var and the edge the check holds on from a null
 /// check pattern (EPH-I0678). Patterns: "if (x != null)", "if (x) |_|",
 /// "while (x != null)" hold on the true edge. The early-return idiom
 /// "if (x == null) return" (also continue/break) holds on the
-/// fall-through edge, which the CFG models as the false edge.
-fn classifyNullCheck(t: []const u8) ?NullCheckFact {
+/// fall-through edge, which the CFG models as the false edge. The exit
+/// may also sit in the braced body that follows the condition line
+/// (`if (x == null) { return; }`, EPH-I0488); the fact then flows only
+/// where the guard dominates, so a check in one branch never silences a
+/// deref reached through another branch.
+fn classifyNullCheck(t: []const u8, lines: []const []const u8, idx: usize) ?NullCheckFact {
     // Find opening paren
     const open_paren = mem.indexOf(u8, t, "(") orelse return null;
     const after_paren = t[open_paren + 1 ..];
@@ -22517,7 +22543,11 @@ fn classifyNullCheck(t: []const u8) ?NullCheckFact {
         const has_exit = mem.indexOf(u8, t, "return") != null or
             mem.indexOf(u8, t, "continue") != null or
             mem.indexOf(u8, t, "break") != null;
-        if (has_exit)
+        // The window admits max_braced_guard_body_lines body lines past
+        // the guard line; the +1 offsets the exclusive limit (EPH-I0858).
+        const exit_limit = @min(idx + max_braced_guard_body_lines + 1, lines.len);
+        const has_block_exit = hasExitInFollowingBlock(lines, idx + 1, exit_limit);
+        if (has_exit or has_block_exit)
             if (extractVarFromNullCheck(after_paren, eq_pos)) |v|
                 return .{ .var_name = v, .polarity = .false_edge };
     }
@@ -22586,20 +22616,38 @@ fn extractDerefVar(t: []const u8, dot_star_pos: usize) ?[]const u8 {
 
 /// Phase 1: Identify guard patterns in each CFG block
 /// Shared context for the guard-collection pass: the function's lines and
-/// the per-block guard sets the pass fills in.
+/// the per-block local guard sets (var -> line of its earliest guard) the
+/// pass fills in. The line is the temporal anchor the consumers check
+/// against (EPH-I0486).
 const GuardScanCtx = struct {
     allocator: Allocator,
     lines: []const []const u8,
     func_line: usize,
-    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    guarded_per_block: []std.StringHashMapUnmanaged(usize),
 };
 
-/// Scan a range of lines for guard patterns, adding to the given map
+/// True when the line can establish a guard: a conditional/loop header
+/// (if/else-if/while/for, including `} else if` after leading closers) or
+/// an assert statement. A boolean assignment `const b = x > 0;` computes a
+/// value; it guards nothing, so it must not feed the guard set (EPH-I0486).
+/// The assert match is code-position-only: an assert mentioned in a string
+/// or comment is prose, not a guard. A qualified assert
+/// (`std.debug.assert(m > 0);`) seeds through the same leading-`assert(`
+/// gate; hasAssertGeGuard is the separate textual fallback for the
+/// decrement family, not this collection gate.
+fn isGuardEstablishingLine(t: []const u8) bool {
+    if (opensConditionalBody(t)) return true;
+    return findTagInCode(t, "assert(", 0) != null;
+}
+
+/// Scan a range of lines for guard patterns, adding to the given map.
+/// Only guard-establishing lines feed the set (EPH-I0486); each var
+/// records the line of its earliest guard in the range.
 fn scanLinesForGuards(
     ctx: GuardScanCtx,
     start: usize,
     end: usize,
-    guards: *std.StringHashMapUnmanaged(void),
+    guards: *std.StringHashMapUnmanaged(usize),
 ) !void {
     for (start..end + 1) |line_num| {
         if (line_num < ctx.func_line) continue;
@@ -22607,8 +22655,10 @@ fn scanLinesForGuards(
         if (idx >= ctx.lines.len) continue;
         const t = mem.trim(u8, ctx.lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
+        if (!isGuardEstablishingLine(t)) continue;
         const var_name = extractGuardedVar(t) orelse continue;
-        try guards.put(ctx.allocator, var_name, {});
+        const gop = try guards.getOrPut(ctx.allocator, var_name);
+        if (!gop.found_existing) gop.value_ptr.* = idx;
     }
 }
 
@@ -22639,13 +22689,35 @@ fn hasBothBranches(cfg: *ControlFlowGraph, pred: usize) bool {
 
 const PredInfo = struct { block: usize, via_true_branch: bool };
 
+/// The two per-block guard layers the meet and the consumer use: the
+/// entry-guard sets (var -> line from which the guard holds at block
+/// entry) and the local guard sets (var -> line of its earliest guard in
+/// the block) (EPH-I0486).
+const GuardLayers = struct {
+    entry: []std.StringHashMapUnmanaged(usize),
+    local: []std.StringHashMapUnmanaged(usize),
+};
+
 /// Context for the guard-intersection ops: the intersection accumulator
-/// being built and the per-block guard sets it is narrowed against.
+/// being built and the guard layers it is narrowed against (EPH-I0486).
 const GuardIntersectCtx = struct {
     allocator: Allocator,
-    intersection: *std.StringHashMapUnmanaged(void),
-    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    intersection: *std.StringHashMapUnmanaged(usize),
+    layers: GuardLayers,
 };
+
+/// The line from which `pred`'s available guards on `var_name` hold: the
+/// later of its entry guards and its local guards, or null when the pred
+/// has no guard on the var. The max keeps the temporal contract through
+/// back edges: a guard established in a later loop-body line must not
+/// cover an earlier line (EPH-I0486).
+fn predGuardLine(ctx: GuardIntersectCtx, pred: usize, var_name: []const u8) ?usize {
+    const entry_line = ctx.layers.entry[pred].get(var_name);
+    const local_line = ctx.layers.local[pred].get(var_name);
+    if (entry_line == null) return local_line;
+    if (local_line == null) return entry_line;
+    return @max(entry_line.?, local_line.?);
+}
 
 /// Intersect first predecessor's guards into the intersection set
 fn initIntersectionFromPred(
@@ -22653,10 +22725,19 @@ fn initIntersectionFromPred(
     pred_info: PredInfo,
     pred_has_both: bool,
 ) !void {
-    var iter = ctx.guarded_per_block[pred_info.block].iterator();
+    if (pred_has_both and !pred_info.via_true_branch) return;
+    var iter = ctx.layers.entry[pred_info.block].iterator();
     while (iter.next()) |entry| {
-        if (pred_has_both and !pred_info.via_true_branch) continue;
-        try ctx.intersection.put(ctx.allocator, entry.key_ptr.*, {});
+        try ctx.intersection.put(ctx.allocator, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    var local_iter = ctx.layers.local[pred_info.block].iterator();
+    while (local_iter.next()) |entry| {
+        const gop = try ctx.intersection.getOrPut(ctx.allocator, entry.key_ptr.*);
+        if (gop.found_existing) {
+            gop.value_ptr.* = @max(gop.value_ptr.*, entry.value_ptr.*);
+        } else {
+            gop.value_ptr.* = entry.value_ptr.*;
+        }
     }
 }
 
@@ -22670,9 +22751,15 @@ fn narrowIntersection(
     defer to_remove.deinit(ctx.allocator);
     var iter = ctx.intersection.iterator();
     while (iter.next()) |entry| {
-        var has = ctx.guarded_per_block[pred_info.block].contains(entry.key_ptr.*);
-        if (pred_has_both and !pred_info.via_true_branch) has = false;
-        if (!has) try to_remove.append(ctx.allocator, entry.key_ptr.*);
+        var pred_line: ?usize = null;
+        if (!(pred_has_both and !pred_info.via_true_branch)) {
+            pred_line = predGuardLine(ctx, pred_info.block, entry.key_ptr.*);
+        }
+        if (pred_line == null) {
+            try to_remove.append(ctx.allocator, entry.key_ptr.*);
+        } else {
+            entry.value_ptr.* = @max(entry.value_ptr.*, pred_line.?);
+        }
     }
     for (to_remove.items) |key| _ = ctx.intersection.remove(key);
 }
@@ -22703,14 +22790,14 @@ fn collectPredecessors(
 fn computePredIntersection(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
-    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    layers: GuardLayers,
     preds: []const PredInfo,
-) !std.StringHashMapUnmanaged(void) {
-    var intersection: std.StringHashMapUnmanaged(void) = .empty;
+) !std.StringHashMapUnmanaged(usize) {
+    var intersection: std.StringHashMapUnmanaged(usize) = .empty;
     const ix: GuardIntersectCtx = .{
         .allocator = allocator,
         .intersection = &intersection,
-        .guarded_per_block = guarded_per_block,
+        .layers = layers,
     };
     for (preds, 0..) |pi, i| {
         const both = hasBothBranches(cfg, pi.block);
@@ -22723,26 +22810,38 @@ fn computePredIntersection(
     return intersection;
 }
 
-/// Merge intersection into a block's guard set, returning true if changed
+/// Merge intersection into a block's entry-guard set, keeping the later
+/// holds-from line; returns true when the set changed.
 fn mergeIntoBlock(
     allocator: Allocator,
-    intersection: *std.StringHashMapUnmanaged(void),
-    block_guards: *std.StringHashMapUnmanaged(void),
+    intersection: *std.StringHashMapUnmanaged(usize),
+    entry_guards: *std.StringHashMapUnmanaged(usize),
 ) !bool {
     var any_new = false;
     var iter = intersection.iterator();
     while (iter.next()) |entry| {
-        const gop = try block_guards.getOrPut(allocator, entry.key_ptr.*);
-        if (!gop.found_existing) any_new = true;
+        const gop = try entry_guards.getOrPut(allocator, entry.key_ptr.*);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = entry.value_ptr.*;
+            any_new = true;
+        } else if (gop.value_ptr.* < entry.value_ptr.*) {
+            gop.value_ptr.* = entry.value_ptr.*;
+            any_new = true;
+        }
     }
     return any_new;
 }
 
-/// Phase 2: Propagate guard state through CFG (forward dataflow)
+/// Phase 2: Propagate guard state through CFG (forward dataflow).
+/// The meet computes each block's entry-guard set: the intersection of
+/// every predecessor's available guards (its own local guards plus the
+/// entry guards proven for it). Each entry guard keeps the line from
+/// which it holds, so a guard from a back-edge predecessor cannot cover
+/// earlier lines (EPH-I0486).
 fn propagateGuardsThroughCFG(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
-    guarded_per_block: []std.StringHashMapUnmanaged(void),
+    layers: GuardLayers,
 ) !void {
     var changed = true;
     var iterations: usize = 0;
@@ -22757,7 +22856,7 @@ fn propagateGuardsThroughCFG(
             var intersection = try computePredIntersection(
                 allocator,
                 cfg,
-                guarded_per_block,
+                layers,
                 preds.items,
             );
             defer intersection.deinit(allocator);
@@ -22765,24 +22864,40 @@ fn propagateGuardsThroughCFG(
             if (try mergeIntoBlock(
                 allocator,
                 &intersection,
-                &guarded_per_block[bid],
+                &layers.entry[bid],
             )) changed = true;
         }
     }
 }
 
 /// Per-line guard-query context: the trimmed line, the function's lines
-/// for lookback, and the CFG-propagated guard set for its block.
+/// for lookback, the block's entry-guard set (guards that hold at block
+/// entry, proven by the CFG meet, with the line they hold from), and the
+/// block's local guards with their line (EPH-I0486).
 const GuardLineCtx = struct {
     t: []const u8,
     lines: []const []const u8,
     idx: usize,
-    guarded: *const std.StringHashMapUnmanaged(void),
+    entry_guards: *const std.StringHashMapUnmanaged(usize),
+    local_guards: *const std.StringHashMapUnmanaged(usize),
 };
+
+/// True when a guard on `var_name` holds at the candidate line. A guard
+/// proven at block entry holds from its recorded line onward; a guard
+/// collected in this same block holds from its own line onward. Either
+/// way, a guard on a later line must not silence an earlier line
+/// (EPH-I0486 temporal contract).
+fn isGuardedAtLine(ctx: GuardLineCtx, var_name: []const u8) bool {
+    if (ctx.entry_guards.get(var_name)) |guard_idx| {
+        if (guard_idx <= ctx.idx) return true;
+    }
+    if (ctx.local_guards.get(var_name)) |guard_idx| return guard_idx <= ctx.idx;
+    return false;
+}
 
 /// Check if a decrement is guarded by various patterns
 fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8) bool {
-    if (ctx.guarded.contains(var_name)) return true;
+    if (isGuardedAtLine(ctx, var_name)) return true;
     if (hasGuardOnLine(ctx.t, var_name)) return true;
     if (hasBreakGuardOnPriorLines(ctx.lines, ctx.idx, var_name)) return true;
     if (isSignedVarInContext(ctx.lines, ctx.idx, var_name)) return true;
@@ -22795,16 +22910,13 @@ fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8) bool {
 }
 
 /// Check if array base.len is guarded via CFG
-fn isArrayLenCFGGuarded(
-    t: []const u8,
-    guarded: *const std.StringHashMapUnmanaged(void),
-) bool {
-    const base = extractArrayBaseFromIndexArithmetic(t) orelse return false;
+fn isArrayLenCFGGuarded(ctx: GuardLineCtx) bool {
+    const base = extractArrayBaseFromIndexArithmetic(ctx.t) orelse return false;
     var buf: [128]u8 = undefined;
     if (base.len + 4 > buf.len) return false;
     @memcpy(buf[0..base.len], base);
     @memcpy(buf[base.len..][0..4], ".len");
-    return guarded.contains(buf[0 .. base.len + 4]);
+    return isGuardedAtLine(ctx, buf[0 .. base.len + 4]);
 }
 
 /// Check if array index arithmetic is guarded by various patterns
@@ -22812,7 +22924,7 @@ fn isArrayIndexGuarded(ctx: GuardLineCtx) bool {
     if (mem.indexOf(u8, ctx.t, "-|") != null) return true;
     if (hasIndexGuardOnLine(ctx.t)) return true;
     if (hasShortCircuitGuardOnPriorLines(ctx.lines, ctx.idx)) return true;
-    if (isArrayLenCFGGuarded(ctx.t, ctx.guarded)) return true;
+    if (isArrayLenCFGGuarded(ctx)) return true;
     if (hasEndsWithStartsWithGuard(ctx.lines, ctx.idx)) return true;
     if (hasElseBranchGuard(ctx.lines, ctx.idx)) return true;
     if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
@@ -22848,14 +22960,16 @@ fn findDecrementOp(t: []const u8) ?usize {
 
 /// Shared context for the CFG-based panic-pattern checks: the run-wide
 /// plumbing (sink, source lines, path) plus the current block's
-/// propagated guard set and the dedup map of already-reported lines.
+/// entry-guard set (with holds-from lines), its local guards with lines
+/// (EPH-I0486), and the dedup map of already-reported lines.
 const CFGPanicCtx = struct {
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
     lines: []const []const u8,
     func_line: usize,
     file_path: []const u8,
-    guarded: *const std.StringHashMapUnmanaged(void),
+    entry_guards: *const std.StringHashMapUnmanaged(usize),
+    local_guards: *const std.StringHashMapUnmanaged(usize),
     reported: *std.AutoHashMap(usize, void),
 };
 
@@ -22872,7 +22986,8 @@ fn checkDecrementOverflow(
         .t = t,
         .lines = ctx.lines,
         .idx = idx,
-        .guarded = ctx.guarded,
+        .entry_guards = ctx.entry_guards,
+        .local_guards = ctx.local_guards,
     };
     if (isDecrementGuarded(gctx, var_name)) return;
     try ctx.issues.append(ctx.allocator, .{
@@ -22903,7 +23018,8 @@ fn checkArrayIndexOverflow(
         .t = t,
         .lines = ctx.lines,
         .idx = idx,
-        .guarded = ctx.guarded,
+        .entry_guards = ctx.entry_guards,
+        .local_guards = ctx.local_guards,
     };
     if (isArrayIndexGuarded(gctx)) return;
     try ctx.issues.append(ctx.allocator, .{
@@ -22937,6 +23053,41 @@ fn checkPanicPatternsInBlock(
     }
 }
 
+/// Allocate the per-block guard layers, collect the local guards from
+/// guard-establishing lines, and run the CFG meet. The caller owns both
+/// slices and must deinit them (EPH-I0486).
+fn collectGuards(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    run: CFGRunCtx,
+) !GuardLayers {
+    const num_blocks = cfg.blocks.items.len;
+    const local = try allocator.alloc(std.StringHashMapUnmanaged(usize), num_blocks);
+    errdefer {
+        for (local) |*m| m.deinit(allocator);
+        allocator.free(local);
+    }
+    for (local) |*m| m.* = .empty;
+
+    const entry = try allocator.alloc(std.StringHashMapUnmanaged(usize), num_blocks);
+    errdefer {
+        for (entry) |*m| m.deinit(allocator);
+        allocator.free(entry);
+    }
+    for (entry) |*m| m.* = .empty;
+
+    const scan_ctx: GuardScanCtx = .{
+        .allocator = allocator,
+        .lines = run.func.lines,
+        .func_line = run.func.start,
+        .guarded_per_block = local,
+    };
+    try collectBlockGuards(scan_ctx, cfg);
+    const layers: GuardLayers = .{ .entry = entry, .local = local };
+    try propagateGuardsThroughCFG(allocator, cfg, layers);
+    return layers;
+}
+
 /// CFG-based panic/overflow pattern analysis (ZA901/ZA903)
 /// Uses control flow graph to track guards across paths
 fn analyzeCFGPanicPatterns(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
@@ -22947,21 +23098,13 @@ fn analyzeCFGPanicPatterns(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
-    var guarded_per_block = try allocator.alloc(std.StringHashMapUnmanaged(void), num_blocks);
+    const layers = try collectGuards(allocator, cfg, run);
     defer {
-        for (guarded_per_block) |*m| m.deinit(allocator);
-        allocator.free(guarded_per_block);
+        for (layers.local) |*m| m.deinit(allocator);
+        allocator.free(layers.local);
+        for (layers.entry) |*m| m.deinit(allocator);
+        allocator.free(layers.entry);
     }
-    for (guarded_per_block) |*m| m.* = .empty;
-
-    const scan_ctx: GuardScanCtx = .{
-        .allocator = allocator,
-        .lines = run.func.lines,
-        .func_line = run.func.start,
-        .guarded_per_block = guarded_per_block,
-    };
-    try collectBlockGuards(scan_ctx, cfg);
-    try propagateGuardsThroughCFG(allocator, cfg, guarded_per_block);
 
     var reported_lines = std.AutoHashMap(usize, void).init(allocator);
     defer reported_lines.deinit();
@@ -22974,7 +23117,8 @@ fn analyzeCFGPanicPatterns(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
             .lines = run.func.lines,
             .func_line = run.func.start,
             .file_path = run.file.file_path,
-            .guarded = &guarded_per_block[bid],
+            .entry_guards = &layers.entry[bid],
+            .local_guards = &layers.local[bid],
             .reported = &reported_lines,
         };
         try checkPanicPatternsInBlock(pctx, block.start_line, block.end_line);
@@ -22986,6 +23130,8 @@ fn analyzeCFGPanicPatterns(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
 /// Extract variable name from guard pattern
 /// Patterns: "if (x > 0)", "while (x > 0)", "assert(x > 0)", "x >= 1", "x.len > N"
 /// Also: "if (x == 0) return" (early return guard, inverted)
+/// The caller gates the line first: only guard-establishing lines feed
+/// this extractor (isGuardEstablishingLine, EPH-I0486).
 fn extractGuardedVar(t: []const u8) ?[]const u8 {
     // Pattern: x > 0 or x >= 1 or x != 0
     const guard_patterns = [_][]const u8{ "> 0", ">0", ">= 1", ">=1", "!= 0", "!=0" };
@@ -23206,7 +23352,11 @@ fn isLoopBoundary(ctx: []const u8) bool {
     return false;
 }
 
-/// Check if a line has an exit statement (break/continue/return)
+/// Check if a line has an exit statement (break/continue/return) after a
+/// guard condition on the same line. The substring match is deliberate:
+/// the caller's guard context (the condition on this line) rules out an
+/// exit that belongs to a different statement. Lines INSIDE a guard block
+/// are judged by isUnconditionalExitLine, not this function (EPH-I0488).
 fn hasExitStatement(ctx: []const u8) bool {
     if (mem.indexOf(u8, ctx, "break") != null) return true;
     if (mem.indexOf(u8, ctx, "continue") != null) return true;
@@ -23214,13 +23364,86 @@ fn hasExitStatement(ctx: []const u8) bool {
     return false;
 }
 
-/// Check if a multi-line block following a guard has an exit statement
+/// True when the line is an unconditional exit: its trimmed,
+/// comment-stripped code starts with `return`/`break`/`continue` as a
+/// whole keyword and ends with `;`. A conditional exit (a nested
+/// `if (q) return null;`, a partial switch arm) does not dominate the
+/// guard block's fall-through, so it must not qualify (EPH-I0488).
+fn isUnconditionalExitLine(ctx: []const u8) bool {
+    const code = mem.trim(u8, stripLineComment(ctx), " \t\r");
+    if (code.len == 0) return false;
+    const kw = if (mem.startsWith(u8, code, "return"))
+        "return"
+    else if (mem.startsWith(u8, code, "break"))
+        "break"
+    else if (mem.startsWith(u8, code, "continue"))
+        "continue"
+    else
+        return false;
+    if (code.len > kw.len and isIdent(code[kw.len])) return false;
+    const rest = mem.trim(u8, code[kw.len..], " \t\r");
+    return rest.len > 0 and rest[rest.len - 1] == ';';
+}
+
+/// True when the line opens a plain else arm: a `} else {` in any
+/// spacing whose own open brace is the last code brace. A `} else if (x) {`
+/// line opens a new conditional, not the covering else arm of the nested
+/// if, so it must not qualify: the else-if chain can still fall through
+/// (EPH-I0488).
+fn isPlainElseOpener(ctx: []const u8) bool {
+    const code = mem.trim(u8, stripLineComment(ctx), " \t\r");
+    if (code.len == 0 or code[code.len - 1] != '{') return false;
+    const else_pos = mem.lastIndexOf(u8, code, "else") orelse return false;
+    const tail = mem.trim(u8, code[else_pos + 4 .. code.len - 1], " \t\r");
+    return tail.len == 0;
+}
+
+/// Walk state for the depth-aware following-block exit scan: the
+/// then-arm exit and else-arm opener seen inside a nested conditional
+/// (EPH-I0488).
+const GuardWalkState = struct {
+    then_exit: bool = false,
+    else_seen: bool = false,
+};
+
+/// Judge one guard-body line at the current depth: returns true when the
+/// line alone decides the walk's answer. An exit qualifies directly inside
+/// the guard block (depth 1), or in a nested conditional whose then and
+/// else arms both exit (depth 2), which together dominate the
+/// fall-through (EPH-I0488).
+fn judgeGuardWalkLine(inner: []const u8, depth: i32, state: *GuardWalkState) bool {
+    if (depth == 1) return isUnconditionalExitLine(inner);
+    if (depth == 2) {
+        if (isUnconditionalExitLine(inner)) {
+            if (state.then_exit and state.else_seen) return true;
+            state.then_exit = true;
+        } else if (isPlainElseOpener(inner)) {
+            state.else_seen = true;
+        }
+    }
+    return false;
+}
+
+/// Check if a multi-line block following a guard has an exit statement.
+/// Only unconditional exits count: a nested conditional or a partial
+/// switch arm inside the block does not dominate the fall-through
+/// (EPH-I0488). The walk tracks brace depth from the guard block's own
+/// open brace; an exit inside a nested block (depth 2) qualifies only
+/// when the nested conditional's else arm also exits, and the walk stops
+/// when the guard block closes (depth 0).
 fn hasExitInFollowingBlock(lines: []const []const u8, start: usize, limit: usize) bool {
+    var depth: i32 = 1;
+    var state = GuardWalkState{};
     var j = start;
     while (j < limit) : (j += 1) {
         const inner = mem.trim(u8, lines[j], " \t\r");
-        if (hasExitStatement(inner)) return true;
-        if (mem.eql(u8, inner, "}")) break;
+        if (judgeGuardWalkLine(inner, depth, &state)) return true;
+        depth += countCurlyBalance(inner);
+        if (depth <= 0) break;
+        if (depth == 1) {
+            state.then_exit = false;
+            state.else_seen = false;
+        }
     }
     return false;
 }
@@ -23632,7 +23855,10 @@ fn ifConditionImpliesElseIfGuard(if_ctx: []const u8) bool {
     return mem.indexOf(u8, if_ctx, " <= ") != null or mem.indexOf(u8, if_ctx, " < ") != null;
 }
 
-/// Search backward from a line to find the matching if-statement, counting braces
+/// Search backward from a line to find the matching if-statement. The
+/// brace depth counts code-position braces only, so a `{`/`}` inside a
+/// string literal cannot close the walk early or push it past the opener
+/// (EPH-I0487).
 fn findMatchingIfLine(lines: []const []const u8, start_idx: usize) ?[]const u8 {
     var depth: i32 = 1;
     var j = start_idx;
@@ -23640,10 +23866,7 @@ fn findMatchingIfLine(lines: []const []const u8, start_idx: usize) ?[]const u8 {
         j -= 1;
         const ctx = mem.trim(u8, lines[j], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        for (ctx) |c| {
-            if (c == '}') depth += 1;
-            if (c == '{') depth -= 1;
-        }
+        depth -= countCurlyBalance(ctx);
         if (depth == 0) return ctx;
     }
     return null;
@@ -23672,25 +23895,55 @@ fn checkElseGuardForCtx(lines: []const []const u8, ctx: []const u8, i: usize) bo
     return false;
 }
 
+/// Net curly-brace balance of one line, quote/comment-masked: braces
+/// inside string/char literals and trailing comments do not count
+/// (EPH-I0487). A brace in a string must not skew the else-guard walk's
+/// depth.
 fn countCurlyBalance(line: []const u8) i32 {
     var b: i32 = 0;
-    for (line) |c| {
-        if (c == '{') b += 1;
-        if (c == '}') b -= 1;
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line) orelse line.len;
+    for (line[0..comment_start], 0..) |c, i| {
+        if (c != '{' and c != '}') continue;
+        if (cls.isInsideString(i)) continue;
+        if (c == '{') b += 1 else b -= 1;
     }
     return b;
 }
 
+/// True when the line's last code-position brace is an opening brace: the
+/// line opens a block. A plain `if (x) {` opener and a `} else {` /
+/// `} else if (x) {` opener both qualify; the else-openers net zero
+/// braces, so a net-positive test alone would skip them (EPH-I0487).
+fn lineOpensBlock(t: []const u8) bool {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t) orelse t.len;
+    var last_is_open = false;
+    for (t[0..comment_start], 0..) |c, i| {
+        if (c != '{' and c != '}') continue;
+        if (cls.isInsideString(i)) continue;
+        last_is_open = c == '{';
+    }
+    return last_is_open;
+}
+
+/// True when the candidate line sits in an else (or else-if) arm whose
+/// if-condition implies a guard. The walk finds the line that opens the
+/// candidate's own block: the region between it and the candidate must be
+/// brace-balanced (depth 0), and the line itself must open a block. A
+/// depth-0 `} else {` opener qualifies the same as a net-positive
+/// `if (x) {` opener (EPH-I0487).
 fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
-    var brace_depth: i32 = 0;
+    var depth: i32 = 0;
     var i = current_idx;
     while (i > 0) {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        brace_depth += countCurlyBalance(ctx);
-        if (brace_depth <= 0) continue;
-        return checkElseGuardForCtx(lines, ctx, i);
+        if (depth == 0 and lineOpensBlock(ctx)) {
+            return checkElseGuardForCtx(lines, ctx, i);
+        }
+        depth += countCurlyBalance(ctx);
     }
     return false;
 }
@@ -39129,6 +39382,240 @@ test "analyzeCFGMemory ZA802 silent after null-equality guard (EPH-I0219)" {
     ) == 0);
 }
 
+test "analyzeCFGMemory ZA802 silent past the two-line null-guard shape (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { return; }` exits before the deref, so `p.*` on the
+    // following line is safe. The exit sits on its own line, so the
+    // same-line exit gate misses it; classifyNullCheck's braced
+    // following-block exit acceptance covers it (EPH-I0488).
+    const content =
+        \\fn deref_null_guard(p: ?*u8) ?*u8 {
+        \\    if (p == null) {
+        \\        return null;
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_nullguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_nullguard.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 fires past a nested-braced conditional exit in the guard block (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The braced `if (q) { return null; }` inside the guard block is a
+    // conditional exit: when q is false the block falls through and the
+    // deref runs on null. The depth-aware walk accepts exits only directly
+    // inside the guard block or in both arms of a nested conditional, so
+    // this single-arm shape must fire (EPH-I0488).
+    const content =
+        \\fn nested_braced(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) {
+        \\        if (q) {
+        \\            return null;
+        \\        }
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_nestedbraced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_nestedbraced.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 silent past a both-branches exit in the guard block (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Both arms of the nested conditional exit: q true returns, q false
+    // hits the else return. No path through the guard block reaches the
+    // deref with p null, so the both-arms shape stays silent (EPH-I0488).
+    const content =
+        \\fn both_branches(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) {
+        \\        if (q) {
+        \\            return null;
+        \\        } else {
+        \\            return null;
+        \\        }
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_bothbranches.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_bothbranches.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 fires past a nested conditional exit in the guard block (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (q) return null;` inside the guard block is a conditional exit:
+    // when p == null and q is false, the block falls through and the deref
+    // runs on null. Substring exit matching accepted it; the unconditional
+    // line gate rejects it (EPH-I0488).
+    const content =
+        \\fn cond_exit(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) {
+        \\        if (q) return null;
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_condexit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_condexit.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 fires past a switch-arm exit in the guard block (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `true => return null,` is a partial switch arm: when q is false the
+    // switch falls through the empty arm and the deref runs on null. The
+    // arm line neither starts with an exit keyword nor ends with `;`
+    // (EPH-I0488).
+    const content =
+        \\fn switch_exit(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) {
+        \\        switch (q) {
+        \\            true => return null,
+        \\            false => {},
+        \\        }
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_switchexit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_switchexit.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 fires on a deref before the null-arm guard (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The deref runs before the guard line, where p can still be null. The
+    // false-edge fact must not seed the origin block (EPH-I0488).
+    const content =
+        \\fn pre_guard(p: ?*u8) void {
+        \\    const v = p.*;
+        \\    _ = v;
+        \\    if (p == null) {
+        \\        return;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_preguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_preguard.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 fires on a deref inside the null arm (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Inside `if (p == null)`, p IS null: the then block must not inherit
+    // the false-edge fact (EPH-I0488).
+    const content =
+        \\fn null_arm(p: ?*u8) void {
+        \\    if (p == null) {
+        \\        const v = p.*;
+        \\        _ = v;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_nullarm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_nullarm.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 fires on a deref inside a while null-check body (EPH-I0488)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The while body runs only while p == null. The false-edge fact holds
+    // past the loop (branch_false), never in the body (EPH-I0488).
+    const content =
+        \\fn while_body(p: ?*u8) void {
+        \\    while (p == null) {
+        \\        const v = p.*;
+        \\        _ = v;
+        \\        return;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_whilebody.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_whilebody.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
 test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -39766,17 +40253,17 @@ test "analyzeCFGMemory ZA801 silent on unwrap inside a while null check body (EP
     ) == 0);
 }
 
-test "analyzeCFGMemory ZA802 braced early-return null guard stays as-is (EPH-I0678)" {
+test "analyzeCFGMemory ZA802 silent past the braced early-return null guard (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Known pre-existing FP, owned by EPH-I0488: classifyNullCheck only
-    // recognizes `== null` with the exit on the same line, so the braced
-    // guard generates no fact and ZA802 fires here before and after
-    // EPH-I0678. This test pins the boundary: the polarity fix must not
-    // change this verdict, and EPH-I0488 flips it to zero when it lands.
+    // EPH-I0488 landed: classifyNullCheck now accepts the braced
+    // following-block exit, the fall-through fact reaches the merge via
+    // the false edge, and the deref after the guard stays silent. The
+    // polarity fix (EPH-I0678) keeps the meet branch-sensitive: a check
+    // in one branch never silences a deref reached through another.
     const content =
         \\fn braced_return_deref(p: ?*u32) void {
         \\    if (p == null) {
@@ -39792,7 +40279,7 @@ test "analyzeCFGMemory ZA802 braced early-return null guard stays as-is (EPH-I06
         run.issues.items,
         "test_za802_braced.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
-    ) == 1);
+    ) == 0);
 }
 
 test "analyzeCFGMemory ZA801 fires past a true-only check whose then-path returns (EPH-I0678)" {
@@ -58368,6 +58855,49 @@ test "isDeferCatchMultiline: trailing comment must not hide a boundary (EPH-I078
     try std.testing.expect(isDeferCatchMultiline("        .close() catch {};", &cont));
 }
 
+test "isDeferCatchMultiline: terminated one-line defer returns false (EPH-I0490)" {
+    // Pre-fix the keyword match won before the statement-boundary check:
+    // `defer a();` ends in `;`, so a catch on the next line is a new
+    // statement, not the defer's continuation. The boundary check comes
+    // first (EPH-I0490).
+    const prev = [_][]const u8{"    defer a();"};
+    try std.testing.expect(!isDeferCatchMultiline("    b() catch {};", &prev));
+    const er = [_][]const u8{"    errdefer cleanup();"};
+    try std.testing.expect(!isDeferCatchMultiline("    b() catch {};", &er));
+    // A multi-line defer whose keyword line stays open still suppresses.
+    const cont = [_][]const u8{"    defer std.fs.cwd()"};
+    try std.testing.expect(isDeferCatchMultiline("        .openFile(\"x\", .{}) catch {};", &cont));
+}
+
+test "ZA201 fires on a catch after a terminated one-line defer (EPH-I0490)" {
+    // End-to-end: `defer a();` on its own line ends the defer statement,
+    // so `b() catch {};` on the next line is an unguarded silent catch.
+    // Pre-fix isDeferCatchMultiline returned true and the finding was lost.
+    const prev = [_][]const u8{"    defer a();"};
+    const issue = checkSilentCatch(.{
+        .t = "    b() catch {};",
+        .path = "test.zig",
+        .line = 2,
+        .func_name = "processData",
+        .preceding_lines = &prev,
+    });
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_SILENT_CATCH, issue.?.rule);
+    // The multi-line defer continuation keeps its suppression.
+    const cont = [_][]const u8{
+        "    defer std.fs.cwd()",
+        "        .openFile(\"x\", .{})",
+    };
+    const silent = checkSilentCatch(.{
+        .t = "        .close() catch {};",
+        .path = "test.zig",
+        .line = 3,
+        .func_name = "processData",
+        .preceding_lines = &cont,
+    });
+    try std.testing.expect(silent == null);
+}
+
 test "isBufPrintCatchUnreachable detects same-line pattern" {
     try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable", null));
     try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable", null));
@@ -59164,6 +59694,244 @@ test "ZA901: guarded unspaced decrement stays silent" {
         "test_za901_guarded.zig",
         RULE_DECREMENT_WITHOUT_CHECK,
     ) == 0);
+}
+
+test "ZA901: boolean-assignment guard shape does not suppress (EPH-I0486)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const b = m > 0;` computes a value; it guards nothing, so it must
+    // not put m in the guard set. Pre-fix the decrement stayed silent
+    // (collection scope FN).
+    const content =
+        \\fn bool_assign(x: u32) void {
+        \\    var m = x;
+        \\    const b = m > 0;
+        \\    sink(b);
+        \\    m -= 1;
+        \\    sink(m);
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_boolassign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_boolassign.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: guard on a later line does not suppress an earlier decrement (EPH-I0486)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Reversed order in one block: the `if (m > 0)` guard holds only from
+    // its own line onward, so the decrement above it must fire. Pre-fix
+    // the per-block set had no temporal order and stayed silent (FN).
+    const content =
+        \\fn reversed(x: u32) void {
+        \\    var m = x;
+        \\    m -= 1;
+        \\    if (m > 0) sink(m);
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_reversed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_reversed.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: while-header guard still covers the loop body (EPH-I0486 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The temporal contract must not break the loop-body suppression: the
+    // header guard flows into the body through the true edge. The body
+    // decrement stays silent while the pre-loop decrement fires.
+    const content =
+        \\fn while_guard(x: u32) void {
+        \\    var m = x;
+        \\    m -= 1;
+        \\    while (m > 0) {
+        \\        m -= 1;
+        \\    }
+        \\    sink(m);
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_whileguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_whileguard.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA903: else-arm index arithmetic stays silent past a guarded if (EPH-I0487)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else arm of `if (i < n)` implies i >= n, so `arr[i - 1]` in it
+    // is guarded. Pre-fix the backward walk skipped the net-0 `} else {`
+    // opener and the whole else-guard subtree never matched (FP).
+    const content =
+        \\fn else_guard(i: usize, n: usize, arr: []usize) usize {
+        \\    if (i < n) {
+        \\        _ = i;
+        \\    } else {
+        \\        return arr[i - 1];
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_elseguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_elseguard.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA901: else-arm decrement stays silent past a guarded if (EPH-I0487)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The same else-guard mechanism on the decrement family: `if (i < n)`
+    // with `i` decremented in the else arm stays silent.
+    const content =
+        \\fn else_dec(i: usize, n: usize) usize {
+        \\    var m = i;
+        \\    if (m < n) {
+        \\        sink(m);
+        \\    } else {
+        \\        m -= 1;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_elseguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_elseguard.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "ZA903: else-if chain guard covers the final else arm (EPH-I0487)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `} else if (i <= m) {` — the else-if opener matches the walk the
+    // same way `} else {` does, and the chain's if-condition implies the
+    // guard for the final else arm.
+    const content =
+        \\fn else_if_chain(i: usize, n: usize, m: usize, arr: []usize) usize {
+        \\    if (i <= n) {
+        \\        return 0;
+        \\    } else if (i <= m) {
+        \\        return 1;
+        \\    } else {
+        \\        return arr[i - 1];
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_elseifchain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_elseifchain.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: string-literal brace cannot misdirect the else-guard walk (EPH-I0487)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const s = "{";` carries a brace only inside the literal. The
+    // raw-brace walk matched this line (depth 0) before the if opener and
+    // lost the guard, so the else arm fired (FP). The masked walk skips
+    // the literal brace (EPH-I0487).
+    const content =
+        \\fn masked_str(i: usize, n: usize, arr: []usize) usize {
+        \\    if (i < n) {
+        \\        const s = "{";
+        \\        _ = s;
+        \\    } else {
+        \\        return arr[i - 1];
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_maskedstr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_maskedstr.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: candidate outside an else arm still fires (EPH-I0487 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else-guard walk must not widen: the candidate sits in the if
+    // branch, not an else arm, so the guarded-if shape does not silence it.
+    const content =
+        \\fn if_branch(i: usize, n: usize, arr: []usize) usize {
+        \\    if (i < n) {
+        \\        return arr[i - 1];
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_ifbranch.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_ifbranch.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
 }
 
 test "ZA901: literal, increment, comment, and string forms stay silent" {

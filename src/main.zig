@@ -13536,11 +13536,29 @@ const SilentCatchCtx = struct {
     next_lines: []const []const u8 = &.{},
 };
 
+/// Code-position `defer ` / `errdefer ` keyword forms. The trailing space
+/// keeps the patterns from matching identifier prefixes (`deferred` is
+/// not a defer). Shared by the ZA206 has-defer tracker and the ZA201
+/// catch suppression so both use one code-position mechanism
+/// (EPH-I0416, EPH-I0426).
+const defer_keyword_pats = [_][]const u8{ "defer ", "errdefer " };
+
 /// Check for silent catch patterns (ZA201)
 /// Skip the warning in defer/errdefer contexts (best-effort cleanup)
 fn checkSilentCatch(ctx: SilentCatchCtx) ?Issue {
+    // Defer/errdefer context suppresses ZA201 (best-effort cleanup). The
+    // suppression is code-position-wide, matching the ZA206 has-defer
+    // detection: `x: { defer f() catch {}; }` is the same defer as its
+    // multi-line form, which the block tracker suppresses (EPH-I0426,
+    // band B06 F20). The whole-line semantic matches the line-start form
+    // below: a line holding any defer reports no silent catch on that
+    // line. The raw "defer" pre-filter bounds the classifier walk to
+    // defer-bearing lines.
     if (mem.startsWith(u8, ctx.t, "defer ") or
-        mem.startsWith(u8, ctx.t, "errdefer ")) return null;
+        mem.startsWith(u8, ctx.t, "errdefer "))
+        return null;
+    if (mem.indexOf(u8, ctx.t, "defer") != null and
+        containsAnyPatternInCode(ctx.t, &defer_keyword_pats)) return null;
     // Suppress in cleanup/shutdown functions — catch {} is intentional best-effort
     if (isCleanupFunction(ctx.func_name)) return null;
     // Suppress when the called method is a cleanup/best-effort operation
@@ -13715,6 +13733,27 @@ fn isCatchCloseLine(t: []const u8) bool {
 /// evasion forms.
 const catch_probe_max_lines = 4;
 
+/// Bound on the backward lookback window (EPH-I0425, band B06 F19): the
+/// multi-line suppression consumers (findCallSiteLine, isInsideTypeOf,
+/// isDeferCatchMultiline, isStreamWriteCatchMultiline) walk the preceding
+/// lines per catch line, and the full file prefix made the worst case
+/// O(n²) per file. Every consumer walk stops at an expression or
+/// statement boundary (paren balance, `;`, `{`, `}`), so no consumer
+/// needs unbounded history. A walk cut by the window fails fail-safe:
+/// the suppression drops and the rule reports. 64 lines covers any
+/// realistic multi-line expression (zig-fmt wraps call args one per
+/// line), so the corpus output stays byte-identical.
+const max_backward_lookback: usize = 64;
+
+/// Backward lookback window handed to the multi-line suppression
+/// consumers: the last max_backward_lookback lines before `idx`, or the
+/// whole prefix when shorter; null at the first line (EPH-I0425).
+fn backwardLookbackWindow(lines: []const []const u8, idx: usize) ?[]const []const u8 {
+    if (idx == 0) return null;
+    const start = if (idx > max_backward_lookback) idx - max_backward_lookback else 0;
+    return lines[start..idx];
+}
+
 /// Bounded forward probe window after line `idx` (EPH-I0151, EPH-I0152):
 /// up to catch_probe_max_lines following lines, empty at end of input.
 fn forwardProbeWindow(lines: []const []const u8, idx: usize) []const []const u8 {
@@ -13751,6 +13790,25 @@ fn probeEmptyCatchClose(next_lines: []const []const u8) bool {
     return isCatchCloseLine(code);
 }
 
+/// True when the bounded forward window holds a split empty catch body:
+/// the first code line is the opener `{`, and either the close follows on
+/// the same line (`{}`) or the first code line after the opener is the
+/// close. `foo() catch\n{\n}` is the same empty catch as `foo() catch {}`
+/// with the opener on its own line (EPH-I0424, band B06 F18). Anything
+/// else first (`unreachable;`, a fallback expression) is not a silent
+/// catch body.
+fn probeSplitOpenerEmptyCatch(next_lines: []const []const u8) bool {
+    const code = firstCodeLine(next_lines) orelse return false;
+    if (code.len == 0 or code[0] != '{') return false;
+    const tail = mem.trim(u8, code[1..], " \t");
+    // Opener with only trivia (`{` or `{ // comment`): the close must
+    // follow, probed past this line — mirrors the same-line `catch {`.
+    if (tail.len == 0 or mem.startsWith(u8, tail, "//"))
+        return probeEmptyCatchClose(next_lines[1..]);
+    // `{}` (with trailing trivia) closes on the opener line itself.
+    return tail[0] == '}';
+}
+
 fn findSilentCatchCol(
     t: []const u8,
     next_lines: []const []const u8,
@@ -13759,18 +13817,32 @@ fn findSilentCatchCol(
     while (findCatchSite(t, start)) |site| {
         start = site.col + 5;
         if (isInsideWhileCondition(t, site.col)) continue;
-        if (site.rest >= t.len or t[site.rest] != '{') continue;
-        const body = mem.trim(u8, t[site.rest + 1 ..], " \t");
         const msg = silentCatchMsg(t, site);
-        if (body.len > 0 and body[0] == '}')
-            return .{ .col = site.col, .msg = msg };
-        // Empty means no code statements before the matching close
-        // (EPH-I0151): only trivia (nothing, or a trailing comment) may
-        // follow the open brace, and the first code line in the bounded
-        // window must be the close. A comment/blank line between the
-        // opener and the close no longer hides the verdict.
-        if (body.len > 0 and !mem.startsWith(u8, body, "//")) continue;
-        if (probeEmptyCatchClose(next_lines))
+        // Same-line opener: `catch {}` or `catch {` with the close in the
+        // bounded window.
+        if (site.rest < t.len and t[site.rest] == '{') {
+            const body = mem.trim(u8, t[site.rest + 1 ..], " \t");
+            if (body.len > 0 and body[0] == '}')
+                return .{ .col = site.col, .msg = msg };
+            // Empty means no code statements before the matching close
+            // (EPH-I0151): only trivia (nothing, or a trailing comment) may
+            // follow the open brace, and the first code line in the bounded
+            // window must be the close. A comment/blank line between the
+            // opener and the close no longer hides the verdict.
+            if (body.len > 0 and !mem.startsWith(u8, body, "//")) continue;
+            if (probeEmptyCatchClose(next_lines))
+                return .{ .col = site.col, .msg = msg };
+            continue;
+        }
+        // Split opener (EPH-I0424, band B06 F18): `foo() catch\n{` puts
+        // the body brace on a following code line — the same empty catch
+        // as the same-line form, invisible to the opener check above.
+        // Only end-of-line or a trailing comment may follow the catch on
+        // its own line; a split verdict (`unreachable;`, a fallback
+        // expression) belongs to ZA202/ZA207, never ZA201.
+        const rest = mem.trim(u8, t[site.rest..], " \t");
+        if (rest.len > 0 and !mem.startsWith(u8, rest, "//")) continue;
+        if (probeSplitOpenerEmptyCatch(next_lines))
             return .{ .col = site.col, .msg = msg };
     }
     return null;
@@ -13779,16 +13851,26 @@ fn findSilentCatchCol(
 /// Check if `catch {}` at `pos` is inside a while/if/for condition (paren-balanced).
 /// Suppresses ZA201 for patterns like `while (iter.next() catch {}) |val|`
 /// where catch converts error union to optional for the while loop.
+/// Keyword and paren counts are code-position-only: a `while (` or a
+/// paren inside a string literal or comment never arms the condition
+/// check (EPH-I0424, band B06 F18).
 fn isInsideWhileCondition(t: []const u8, pos: usize) bool {
-    // Must have a control-flow keyword before the catch
-    const has_while = mem.indexOf(u8, t, "while (") != null;
-    const has_if = mem.indexOf(u8, t, "if (") != null;
-    const has_for = mem.indexOf(u8, t, "for (") != null;
-    if (!has_while and !has_if and !has_for) return false;
+    // Must have a control-flow keyword at a code position on the line
+    // (the depth gate below keeps the catch inside the condition parens).
+    const control_pats = [_][]const u8{ "while (", "if (", "for (" };
+    if (!containsAnyPatternInCode(t, &control_pats)) return false;
 
-    // Count paren depth at the catch position — if depth > 0, catch is inside condition parens
+    // Count paren depth at the catch position, skipping string and
+    // comment regions: a literal `(` before the catch plus a keyword
+    // anywhere used to suppress a real catch. One classifier walk plus
+    // one comment-start walk per call (EPH-I0153): queries ascend.
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    const limit = if (comment_start) |cs| @min(cs, pos) else pos;
     var depth: isize = 0;
-    for (t[0..pos]) |c| {
+    for (0..limit) |i| {
+        if (cls.isInsideString(i)) continue;
+        const c = t[i];
         if (c == '(') depth += 1;
         if (c == ')') depth -= 1;
     }
@@ -14368,10 +14450,14 @@ fn isModuleLevelDecl(raw_line: []const u8) bool {
     return raw_line[0] != ' ' and raw_line[0] != '\t';
 }
 
-/// Check if `= undefined` is a cleanup pattern (intentional memory clearing)
-/// Patterns like `self.* = undefined;` or `ptr.* = undefined;` are cleanup ops
+/// Check if `= undefined` is a cleanup pattern (intentional whole-object
+/// memory clearing): `self.* = undefined;` / `ptr.* = undefined;` poison
+/// the entire pointed-to object on a deinit path. Indexed writes
+/// (`buf[i] = undefined`) are NOT cleanup — they clear one element of a
+/// live object, a leak-shaped single-element write that ZA204 must report
+/// (EPH-I0418, band B06 F13). isStructFieldPattern already covers
+/// dot-prefixed field writes; no other suppression applies here.
 fn isCleanupUndefinedPattern(t: []const u8, undefined_col: usize) bool {
-    // Look for `.* =` or `.*=` pattern before the `= undefined`
     // The undefined_col points to the `=` in `= undefined`
     if (undefined_col < 2) return false;
 
@@ -14381,15 +14467,8 @@ fn isCleanupUndefinedPattern(t: []const u8, undefined_col: usize) bool {
     while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) {
         i -= 1;
     }
-    // Check for `.*` pattern (pointer dereference)
-    if (i >= 2 and t[i - 2] == '.' and t[i - 1] == '*') {
-        return true;
-    }
-    // Check for `]` pattern (array index assignment)
-    if (i >= 1 and t[i - 1] == ']') {
-        return true;
-    }
-    return false;
+    // `.*` pattern (pointer dereference): whole-object poisoning.
+    return i >= 2 and t[i - 2] == '.' and t[i - 1] == '*';
 }
 
 /// Check for undefined usage (ZA204)
@@ -14535,8 +14614,7 @@ fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
     // string and comment positions never count. The raw "defer" pre-filter
     // bounds the classifier walks to lines that contain the substring.
     if (mem.indexOf(u8, t, "defer") == null) return;
-    const defer_pats = [_][]const u8{ "defer ", "errdefer " };
-    if (containsAnyPatternInCode(t, &defer_pats)) state.has_defer_in_func = true;
+    if (containsAnyPatternInCode(t, &defer_keyword_pats)) state.has_defer_in_func = true;
 }
 
 /// Detect if line starts a catch block (not a silent catch {})
@@ -15234,10 +15312,16 @@ fn checkUselessErrorReturns(
         scanErrRetEvidence(code, &scan);
         // Braces count only real code: trailing comments stripped, string
         // and char literal contents blanked (a `"}"` must not close the fn).
-        const blanked = blankLiteralContents(line[0..code_end], &blank_buf);
-        if (!scan.has_error_path) feedShimLine(&scan, blanked);
-        if (mem.indexOfScalar(u8, blanked, '{') != null) scan.body_started = true;
-        scan.brace_depth = braceDelta(scan.brace_depth, blanked);
+        // Lines longer than the mask buffer blank in chunks with literal
+        // state carried across chunk boundaries (EPH-I0423): the single-shot
+        // blankLiteralContents fails open past 512 bytes, so a literal
+        // brace on a long generated line would corrupt the fn-depth scan.
+        var blank_iter = BlankChunkIter.init(line[0..code_end], &blank_buf);
+        while (blank_iter.next()) |blanked| {
+            if (!scan.has_error_path) feedShimLine(&scan, blanked);
+            if (mem.indexOfScalar(u8, blanked, '{') != null) scan.body_started = true;
+            scan.brace_depth = braceDelta(scan.brace_depth, blanked);
+        }
         if (scan.body_started and scan.brace_depth == 0) {
             try finishErrRetFn(a, issues, path, &scan);
         }
@@ -15474,7 +15558,7 @@ fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: u
         activatePendingFields(ctx.state);
         try checkPendingFields(pf_ctx, ctx.state, ctx.issues, ctx.allocator);
     }
-    const preceding: ?[]const []const u8 = if (line_idx > 0) ctx.all_lines[0..line_idx] else null;
+    const preceding = backwardLookbackWindow(ctx.all_lines, line_idx);
     // Bounded forward window for the empty-catch close probe (EPH-I0151)
     // and the split catch-verdict probe (EPH-I0152).
     const next_lines = forwardProbeWindow(ctx.all_lines, line_idx);
@@ -16003,6 +16087,45 @@ fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
     }
     return buf[0..line.len];
 }
+
+/// Chunked literal-blanker for lines longer than the caller's mask buffer
+/// (EPH-I0423, band B06 F17). blankLiteralContents fails open past the
+/// buffer — a long generated line returns unmasked and a brace inside a
+/// string literal corrupts the caller's brace scan. This iterator masks
+/// in buffer-sized chunks and keeps the LineClassifier state across
+/// chunks, so a literal split by a chunk boundary stays masked. The mask
+/// rule matches blankLiteralContents: string AND char literal contents
+/// plus their quote delimiters, and a `\\` multiline opener plus its
+/// tail. Exactly ONE classifier query per byte: the walk overshoots the
+/// column by one byte on an escape (stepQuoteMode skips the escaped
+/// char), so a second query at the same column fires the ascending
+/// assert (reviewer r2, EPH-I0423). Cost stays O(line).
+const BlankChunkIter = struct {
+    line: []const u8,
+    buf: []u8,
+    cls: LineClassifier,
+    pos: usize = 0,
+
+    fn init(line: []const u8, buf: []u8) BlankChunkIter {
+        return .{ .line = line, .buf = buf, .cls = LineClassifier.init(line) };
+    }
+
+    /// Mask the next chunk of the line into `buf`; null when the line is
+    /// exhausted (covers an empty line). The call site iterates with
+    /// `while (iter.next()) |chunk|`, so the optional is the contract.
+    fn next(self: *BlankChunkIter) ?[]const u8 {
+        if (self.pos >= self.line.len) return null;
+        const end = @min(self.pos + self.buf.len, self.line.len);
+        for (self.pos..end) |i| {
+            self.buf[i - self.pos] = if (self.cls.isInsideLiteral(i) or
+                self.line[i] == '"' or self.line[i] == '\'' or
+                types.isMultilineOpenerAt(self.line, i)) ' ' else self.line[i];
+        }
+        const chunk = self.buf[0 .. end - self.pos];
+        self.pos = end;
+        return chunk;
+    }
+};
 
 /// Counters for a newly entered test block whose `test` keyword is on `line`.
 fn resetTestCounters(line: []const u8, line_num: usize) TestBlockCounters {
@@ -16670,7 +16793,7 @@ fn scanLineCatches(
         .t = sl.t,
         .code = sl.code,
         .next_lines = next_lines,
-        .preceding = if (idx > 0) ctx.lines[0..idx] else null,
+        .preceding = backwardLookbackWindow(ctx.lines, idx),
         .in_defer_block = state.in_defer,
     };
     try checkTestSwallowedCatch(ctx.sink, idx + 1, clc);
@@ -22570,7 +22693,7 @@ fn checkCFGCatchUnreachable(
     line_num: usize,
     idx: usize,
 ) ?Issue {
-    const preceding: ?[]const []const u8 = if (idx > 0) run.func.lines[0..idx] else null;
+    const preceding = backwardLookbackWindow(run.func.lines, idx);
     return checkCatchUnreachable(.{
         .t = t,
         .path = run.file.file_path,
@@ -43839,6 +43962,40 @@ test "checkSilentCatch skips defer context" {
     try std.testing.expect(issue == null);
 }
 
+test "checkSilentCatch skips mid-line defer context (EPH-I0426)" {
+    // Band B06 F20: the defer suppression was line-start-only, so
+    // `x: { defer f() catch {}; }` fired even though the block-form
+    // tracker suppresses the equivalent multi-line defer. The suppression
+    // now uses the same code-position detection as the ZA206 has-defer
+    // tracker (EPH-I0416).
+    const issue = checkSilentCatch(.{
+        .t = "x: { defer f() catch {}; }",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "init",
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "checkSilentCatch mid-line defer suppression is string- and comment-aware (EPH-I0426)" {
+    // A defer in a string or in comment prose never suppresses a real
+    // catch on the same line.
+    const in_string = checkSilentCatch(.{
+        .t = "const s = \"defer \"; foo() catch {};",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "init",
+    });
+    try std.testing.expect(in_string != null);
+    const in_comment = checkSilentCatch(.{
+        .t = "foo() catch {}; // defer cleanup",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "init",
+    });
+    try std.testing.expect(in_comment != null);
+}
+
 test "analyzeErrors detects silent catch (ZA201)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -59549,6 +59706,93 @@ test "ZA201 NOT suppressed for catch {} outside condition" {
 }
 
 // ============================================================================
+// EPH-I0424: split catch opener and classifier-aware while-condition check
+// ============================================================================
+
+test "ZA201 fires on split catch opener (EPH-I0424)" {
+    // Band B06 F18: the valid form `foo() catch\n{\n}` was invisible —
+    // ZA201 required the `{` on the catch line itself.
+    const next = [_][]const u8{ "{", "}" };
+    const issue = checkSilentCatch(.{
+        .t = "    foo() catch",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "process",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_SILENT_CATCH, issue.?.rule);
+}
+
+test "ZA201 fires on split catch opener closed on the opener line (EPH-I0424)" {
+    const next = [_][]const u8{"{}"};
+    const issue = checkSilentCatch(.{
+        .t = "    foo() catch",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "process",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+}
+
+test "ZA201 silent on split catch with a real body (EPH-I0424 pin)" {
+    // The opener line starts a body with code: not a silent catch.
+    const next = [_][]const u8{ "{", "    work();", "}" };
+    const issue = checkSilentCatch(.{
+        .t = "    foo() catch",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "process",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA201 silent on split catch verdict line (EPH-I0424 pin)" {
+    // `catch\nunreachable;` is ZA202's split-verdict form, never ZA201.
+    const next = [_][]const u8{"    unreachable;"};
+    const issue = checkSilentCatch(.{
+        .t = "    foo() catch",
+        .path = "test.zig",
+        .line = 1,
+        .func_name = "process",
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "isInsideWhileCondition ignores string parens and keywords (EPH-I0424)" {
+    // A `(` or a `while (` inside a string literal never arms the
+    // condition check: the raw count used to suppress the real catch on
+    // g() after a string-bearing line (band B06 F18).
+    try std.testing.expect(!isInsideWhileCondition("while (x) f(\"((\"); g() catch {}", 23));
+    try std.testing.expect(!isInsideWhileCondition("const s = \"while (\"; foo() catch {}", 27));
+}
+
+test "isInsideWhileCondition ignores comment keywords (EPH-I0424)" {
+    // Grouping parens around the catch plus an `if (` in comment prose
+    // used to arm the condition check; the keyword must be real code.
+    try std.testing.expect(!isInsideWhileCondition("(foo() catch {}) // if (", 7));
+}
+
+test "backward lookback window bounds the per-line prefix (EPH-I0425)" {
+    const lines = [_][]const u8{"    work();"} ** 130;
+    // The whole prefix passes through before the window engages.
+    const near_start = backwardLookbackWindow(&lines, 10) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 10), near_start.len);
+    // Past the window the slice is capped: only the last
+    // max_backward_lookback lines reach the consumers (band B06 F19).
+    const deep = backwardLookbackWindow(&lines, lines.len) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(max_backward_lookback, deep.len);
+    try std.testing.expect(deep.ptr == lines[lines.len - max_backward_lookback ..].ptr);
+    // First line: nothing precedes.
+    try std.testing.expect(backwardLookbackWindow(&lines, 0) == null);
+}
+
+// ============================================================================
 // Enhancement 4: ZA201 suppressed for multi-line defer catch {}
 // ============================================================================
 
@@ -62622,6 +62866,33 @@ test "ZA204: struct literal field default stays silent" {
         "za204_field.zig",
         RULE_UNDEFINED_USAGE,
     ) == 0);
+}
+
+test "ZA204: indexed undefined write fires, pointer poison stays silent (EPH-I0418)" {
+    // Band B06 F13: `buf[i] = undefined` clears one element of a live
+    // object — a leak-shaped write, not the whole-object poisoning the
+    // `.*` cleanup arm covers. The dropped `]` arm used to suppress it.
+    try std.testing.expect(!isCleanupUndefinedPattern("buf[i] = undefined;", 7));
+    try std.testing.expect(isCleanupUndefinedPattern("self.* = undefined;", 7));
+}
+
+test "ZA204: indexed undefined write reports an issue (EPH-I0418)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var set = PendingUndefinedSet{};
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer issues.deinit(allocator);
+
+    try scanUndefinedOccurrences(
+        .{ .t = "buf[i] = undefined;", .path = "src/lib.zig", .line = 7 },
+        &set,
+        &issues,
+        allocator,
+    );
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_UNDEFINED_USAGE, issues.items[0].rule);
 }
 
 test "lineArmsUndefinedDecl arms only bare-assign var/const decls" {
@@ -68228,6 +68499,143 @@ test "ZA209: single-line interface shim is silent" {
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "za209_shim1.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: literal brace on a >512-byte line cannot close the fn early (EPH-I0423)" {
+    // Band B06 F17: blankLiteralContents returned a >512-byte line
+    // unmasked, so a `"}"` inside a long string closed the fn at the
+    // string line — the real error path after it never counted and the
+    // fn was reported as never failing. Chunked blanking keeps the
+    // literal brace masked.
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const long_line = "    const s = \"" ++ ("x" ** 600) ++ "}\";";
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "fn parse() !void {\n");
+    try content.appendSlice(allocator, long_line);
+    try content.appendSlice(allocator, "\n    try mayFail();\n}\nfn mayFail() !void {\n    return error.Boom;\n}\n");
+
+    var run = try runErrorsCheck(&diag, allocator, "za209_long_line.zig", content.items);
+    defer run.deinit(allocator);
+
+    // The try after the long line is a real error path: no ZA209 fires.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_long_line.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: literal brace on a >512-byte line cannot keep the fn open (EPH-I0423)" {
+    // A `"{"` inside a long string used to add depth: the fn never
+    // closed and its ZA209 note was swallowed.
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const long_line = "    const s = \"" ++ ("x" ** 600) ++ "{\";";
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "fn parse() !void {\n");
+    try content.appendSlice(allocator, long_line);
+    try content.appendSlice(allocator, "\n}\n");
+
+    var run = try runErrorsCheck(&diag, allocator, "za209_long_open.zig", content.items);
+    defer run.deinit(allocator);
+
+    // The fn closes at its real `}` with no error path: exactly one ZA209.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_long_open.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: char-literal brace cannot close the fn early (EPH-I0423 r1)" {
+    // Reviewer r1: the mask blanked string content only — isInsideString
+    // never reports mode `.char`, so a `'}'` comparison line dropped the
+    // fn depth to zero on EVERY line (no >512-byte trigger needed),
+    // closing the fn before its error path and reporting a false ZA209.
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn probe(c: u8) !void {
+        \\    if (c == '}') {}
+        \\    try mayFail();
+        \\}
+        \\fn mayFail() !void {
+        \\    return error.Boom;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_char_close.zig", content);
+    defer run.deinit(allocator);
+
+    // The try after the char-comparison line is a real error path: no
+    // ZA209 fires.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_char_close.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: char-literal brace cannot keep the fn open (EPH-I0423 r1)" {
+    // A `'{'` char literal used to add phantom depth: the fn never closed
+    // and its ZA209 note was swallowed.
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn probe(c: u8) !void {
+        \\    if (c == '{') {}
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_char_open.zig", content);
+    defer run.deinit(allocator);
+
+    // The fn closes at its real `}` with no error path: exactly one ZA209.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_char_open.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: escaped char literal reaches the chunk mask without asserting (EPH-I0423 r2)" {
+    // r2: the mask made TWO classifier queries at one column. The walk
+    // overshoots the column on an escape (stepQuoteMode skips the escaped
+    // byte), so the second query asserted col >= scanned and panicked on
+    // every line with a `'\''` / `'\\'` literal. One query per byte
+    // (isInsideLiteral) keeps the ascending assert.
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn probe(c: u8) !void {
+        \\    if (c == '\'') {}
+        \\    try mayFail();
+        \\}
+        \\fn mayFail() !void {
+        \\    return error.Boom;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_char_escape.zig", content);
+    defer run.deinit(allocator);
+
+    // The try after the escaped-literal line is a real error path: no
+    // ZA209 fires, and no assert panics on the escaped quote byte.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_char_escape.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

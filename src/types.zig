@@ -929,6 +929,22 @@ pub const LineClassifier = struct {
         }
         return self.mode == .str or self.mode == .mline;
     }
+
+    /// True when column `col` sits inside any literal: a string, a char
+    /// literal, or a `\\` multiline tail. The opening quote byte reports
+    /// false — the walk stops at `col` before processing it — so callers
+    /// that mask delimiters must keep their explicit quote-byte checks.
+    /// The walk can overshoot `col` by one byte when an escape precedes
+    /// it (stepQuoteMode skips the escaped char), so callers must never
+    /// query the same column twice: the second query's ascending assert
+    /// fires. `col` must be at or after the previously queried column.
+    pub fn isInsideLiteral(self: *LineClassifier, col: usize) bool {
+        std.debug.assert(col >= self.scanned);
+        while (self.scanned < col and self.scanned < self.line.len) : (self.scanned += 1) {
+            stepQuoteMode(&self.mode, self.line, &self.scanned);
+        }
+        return self.mode == .str or self.mode == .char or self.mode == .mline;
+    }
 };
 
 /// State for masking string/char literals, `\\` multiline tails, and

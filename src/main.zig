@@ -857,17 +857,6 @@ fn findTagInCode(line: []const u8, tag: []const u8, from: usize) ?usize {
     return null;
 }
 
-/// True when `pos` in `line` is string data, not code: the whole line is a
-/// `\\` multiline-string body (LiteralState.forLine), or `pos` sits inside
-/// a string literal (isInsideString). Comment text is NOT masked here.
-/// Callers that must mask comments use findTagInCode. WHY (EPH-I0227):
-/// this issue masks the string reachability-injection only. The comment
-/// variant is EPH-I0299's scope.
-fn isStringDataPosition(line: []const u8, pos: usize) bool {
-    if (types.LiteralState.forLine(line) == null) return true;
-    return isInsideString(line, pos);
-}
-
 /// True when `code[i..]` starts the whole-word keyword `else` (bounded by
 /// non-identifier chars on both sides). Callers handle quote/comment state.
 fn isElseWordAt(code: []const u8, i: usize) bool {
@@ -2161,19 +2150,23 @@ fn hasPatternNotInString(t: []const u8, pattern: []const u8) bool {
     return false;
 }
 
-/// Check if a keyword appears as real code: not inside a string literal and
+/// Check if a keyword appears as real code: not inside a string literal,
 /// not embedded in a longer identifier (`@panic("Retry ...")` contains
-/// "try " on both counts). Iterates ALL occurrences — an early one may be
-/// inside a string while a later one is real.
+/// "try " on both counts), and not inside a trailing `//` comment
+/// (EPH-I0298). Iterates ALL occurrences — an early one may be inside a
+/// string or comment while a later one is real.
 fn hasRealKeyword(t: []const u8, kw: []const u8) bool {
-    // One classifier walk per line (EPH-I0153): candidates ascend.
+    // One classifier walk plus one comment-start walk per call
+    // (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var s: usize = 0;
     while (mem.indexOf(u8, t[s..], kw)) |rel| {
         const pos = s + rel;
         s = pos + kw.len;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
         return true;
     }
     return false;
@@ -6028,8 +6021,10 @@ fn isOrShortCircuitSafe(
     var_name: []const u8,
 ) bool {
     const t = mem.trim(u8, lines[read_idx], " \t\r");
-    // The read must be in an if-condition containing " or "
-    const or_pos = mem.indexOf(u8, t, " or ") orelse return false;
+    // The read must be in an if-condition containing a real `or` keyword:
+    // token-matched, so " or " inside a string literal or trailing comment
+    // never fakes the short-circuit (EPH-I0298).
+    const or_pos = realTokenPos(t, "or") orelse return false;
     // The variable read must be on the RIGHT side of " or "
     const vpos = mem.indexOf(u8, t, var_name) orelse return false;
     if (vpos <= or_pos) return false;
@@ -6157,7 +6152,6 @@ fn isReadExemptOccurrence(
     if (hasLeftDot(t, i)) return true; // field of another var
     if (isBindingNameAt(t, var_name, i)) return true;
     if (cls.isInsideString(i)) return true;
-    if (mem.indexOf(u8, t[0..i], "//")) |_| return true;
     if (end_i + 4 <= t.len and mem.eql(u8, t[end_i .. end_i + 4], ".len")) return true;
     if (i > 0 and t[i - 1] == '&') return true; // fill destination
     if (i > 0 and t[i - 1] == '(' and hasAmpBeforeChain(t, i)) return true;
@@ -6171,11 +6165,17 @@ fn firstVarReadPos(t: []const u8, var_name: []const u8) ?usize {
     // Skip comment and multiline string lines entirely
     if (isCommentOrMultilineString(t)) return null;
 
-    // One classifier walk per line (EPH-I0153): candidates ascend.
+    // One classifier walk plus one comment-start walk per call (EPH-I0153):
+    // the comment start is string-aware, so a `//` inside a string literal
+    // (http:// URLs) never fakes a comment (EPH-I0412 mechanism).
     var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
         if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
+        // Comment text is prose: an occurrence at/after the comment start
+        // is never a read (EPH-I0412 mechanism).
+        if (comment_start != null and i >= comment_start.?) continue;
         if (!isReadExemptOccurrence(t, var_name, i, &cls)) return i;
     }
     return null;
@@ -9612,7 +9612,9 @@ const ErrdeferInfo = struct {
 
 /// Check if line contains a try allocation (not in no-free allocator)
 fn isTryAllocation(t: []const u8) bool {
-    const has_try = mem.indexOf(u8, t, "try ") != null;
+    // Token-matched: "try " in a string literal or trailing comment never
+    // fakes a try allocation (EPH-I0298).
+    const has_try = hasToken(t, "try");
     if (!has_try) return false;
     if (!mem.startsWith(u8, t, "const ") and
         !mem.startsWith(u8, t, "var ")) return false;
@@ -13419,8 +13421,32 @@ fn containsAnyPattern(t: []const u8, patterns: []const []const u8) bool {
     return false;
 }
 
+/// True when the text contains any of the patterns at a code position:
+/// not inside a string literal, not inside a trailing comment (EPH-I0410).
+/// Comment prose and string data never carry method calls or FFI names, so
+/// they never suppress a discard verdict.
+fn containsAnyPatternInCode(t: []const u8, patterns: []const []const u8) bool {
+    // One classifier walk plus one comment-start walk per call (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    for (patterns) |pat| {
+        var from: usize = 0;
+        while (mem.indexOfPos(u8, t, from, pat)) |pos| {
+            from = pos + pat.len;
+            if (cls.isInsideString(pos)) continue;
+            if (comment_start != null and pos >= comment_start.?) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
 /// True for a `_ = ExternalFunction(...)` discard: an uppercase callee after
 /// the `_ = ` prefix is C FFI or an extern symbol, whose result is ignorable.
+/// Comment-safe by construction: t[4] is the first byte after the discard
+/// prefix, a code position — a comment opener would make it '/'. Name-based
+/// heuristic, documented: the type-backed resolveReturnKind arm runs first,
+/// and only unknown returns reach this fallback (EPH-I0410).
 fn isCFFIDiscard(t: []const u8) bool {
     if (t.len <= 4) return false;
     // The guard leaves t[4..] non-empty, so index 0 always exists.
@@ -13430,8 +13456,10 @@ fn isCFFIDiscard(t: []const u8) bool {
 
 /// Check if a discarded result is safe (void/non-error return type)
 fn isSafeToDiscard(t: []const u8, type_ctx: ?*const TypeContext) bool {
-    // Stdlib cleanup patterns (void methods: .free, .destroy, .deinit) — always safe
-    if (containsAnyPattern(t, compat.getCleanupPatterns())) return true;
+    // Stdlib cleanup patterns (void methods: .free, .destroy, .deinit) — always safe.
+    // Code-position match: comment prose and string data never suppress a
+    // discard verdict (EPH-I0410).
+    if (containsAnyPatternInCode(t, compat.getCleanupPatterns())) return true;
     // Return-type resolution (definitive when available)
     if (type_ctx) |ctx| {
         const rk = resolveReturnKind(ctx, t);
@@ -13445,12 +13473,14 @@ fn isSafeToDiscard(t: []const u8, type_ctx: ?*const TypeContext) bool {
     // only match when receiver is a tracked stdlib variable
     const stdlib_vars_ptr = if (type_ctx) |ctx| &ctx.stdlib_vars else null;
     if (isMethodOnStdlibVar(t, stdlib_vars_ptr, compat.getSafeMethodPatterns())) return true;
-    // Non-stdlib patterns (parser internals, C FFI)
+    // Non-stdlib patterns (parser internals, C FFI). Documented name list:
+    // both arms are fallbacks consulted only when type resolution could not
+    // classify the return (the type-backed arm above ran first) (EPH-I0410).
     const non_stdlib_safe = [_][]const u8{
         ".parseEscapeSequence(", // Parser returning parsed value
         "A(", // C FFI / Windows API (uppercase)
     };
-    if (containsAnyPattern(t, &non_stdlib_safe)) return true;
+    if (containsAnyPatternInCode(t, &non_stdlib_safe)) return true;
     return isCFFIDiscard(t);
 }
 
@@ -13546,18 +13576,23 @@ fn isCleanupFunction(name: []const u8) bool {
 
 /// Check if the called method on the line is a cleanup/best-effort operation.
 /// Matches `.leaseRevoke(`, `.close(`, `.cleanup(`, `.shutdown(`, etc.
-/// Case-insensitive substring match (camelCase: `leaseRevoke` matches "revoke").
+/// Case-insensitive camelCase-segment match: `leaseRevoke` matches
+/// "revoke", but "close" never matches `enclose` (EPH-I0409).
 fn isCleanupMethodCall(t: []const u8) bool {
     const cleanup_keywords = [_][]const u8{
         "revoke",  "close",   "cleanup",  "shutdown",   "deinit",
         "release", "destroy", "teardown", "disconnect",
     };
-    // One classifier walk per line (EPH-I0153): candidates ascend.
+    // One classifier walk plus one comment-start walk per line (EPH-I0153):
+    // a comment swallows the rest of the line, so no cleanup call sits
+    // beyond it (EPH-I0409).
     var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     // Find method calls: look for .methodName( patterns
     var pos: usize = 0;
     while (mem.indexOfScalarPos(u8, t, pos, '.')) |dot| {
         pos = dot + 1;
+        if (comment_start != null and dot >= comment_start.?) continue;
         if (pos >= t.len) break;
         // Extract method name after the dot
         var end = pos;
@@ -13573,8 +13608,10 @@ fn isCleanupMethodCall(t: []const u8) bool {
     return false;
 }
 
-/// Case-insensitive substring check: does `name` contain any of the keywords?
-/// Handles camelCase (e.g., "leaseRevoke" contains "revoke" via "Revoke").
+/// Case-insensitive keyword check with camelCase segment boundaries
+/// (EPH-I0409): the keyword must start at the name's start or at an
+/// uppercase letter — `close` matches close/onClose but never
+/// enclose/disclose, so unrelated methods keep the ZA201 verdict.
 fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
     // Convert to lowercase buffer for comparison
     var lower_buf: [128]u8 = undefined;
@@ -13584,7 +13621,14 @@ fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
     }
     const lower = lower_buf[0..name.len];
     for (keywords) |kw| {
-        if (mem.indexOf(u8, lower, kw) != null) return true;
+        var from: usize = 0;
+        while (mem.indexOfPos(u8, lower, from, kw)) |pos| {
+            from = pos + kw.len;
+            // Segment boundary: the match starts the name or a camelCase
+            // segment (uppercase in the ORIGINAL name — case is the
+            // boundary marker).
+            if (pos == 0 or std.ascii.isUpper(name[pos])) return true;
+        }
     }
     return false;
 }
@@ -13770,8 +13814,11 @@ fn hasPointerToVar(t: []const u8, pos: usize, var_name: []const u8) bool {
 /// firstVarReadPos).
 fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
     if (isCommentOrMultilineString(t)) return false;
-    // One classifier walk per line (EPH-I0153): candidates ascend.
+    // One classifier walk plus one comment-start walk per call (EPH-I0153):
+    // the comment start is string-aware, so a `//` inside a string literal
+    // (http:// URLs) never fakes a comment (EPH-I0412).
     var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     // Check all occurrences of var_name (handles Struct.var_name patterns)
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
@@ -13781,7 +13828,7 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         const after_ok = end_i >= t.len or !isIdent(t[end_i]);
         if (!after_ok) continue;
         if (cls.isInsideString(i)) continue;
-        if (mem.indexOf(u8, t[0..i], "//") != null) continue;
+        if (comment_start != null and i >= comment_start.?) continue;
 
         // Pattern 1: &var_name or &Struct.var_name, with any spacing
         // around the dot (`&opts. buf`, EPH-I0796). The chain walk treats
@@ -15130,6 +15177,11 @@ fn checkUselessErrorReturns(
     for (all_lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
+        // Comment text is prose, never evidence (EPH-I0411): the evidence
+        // scans run on the comment-stripped prefix. findCommentStart is
+        // string-aware, so a `//` inside a string literal stays data.
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = mem.trim(u8, line[0..code_end], " \t\r");
         if (!scan.in_fn) {
             startErrRetFn(all_lines[idx..], idx + 1, &scan);
             if (!scan.in_fn) continue;
@@ -15137,11 +15189,10 @@ fn checkUselessErrorReturns(
         // Signature lines (before the body brace) may declare error-typed
         // params on their own continuation lines — record them from the
         // content-backed line, never from the joined stack buffer.
-        if (!scan.body_started) recordErrorTypedParams(t, &scan);
-        scanErrRetEvidence(t, &scan);
+        if (!scan.body_started) recordErrorTypedParams(code, &scan);
+        scanErrRetEvidence(code, &scan);
         // Braces count only real code: trailing comments stripped, string
         // and char literal contents blanked (a `"}"` must not close the fn).
-        const code_end = findCommentStart(line) orelse line.len;
         const blanked = blankLiteralContents(line[0..code_end], &blank_buf);
         if (!scan.has_error_path) feedShimLine(&scan, blanked);
         if (mem.indexOfScalar(u8, blanked, '{') != null) scan.body_started = true;
@@ -18645,12 +18696,14 @@ fn hasSelfParam(t: []const u8, paren_pos: usize) bool {
         mem.startsWith(u8, after, "self)");
 }
 
-/// Check if `needle` occurs as a real code token: identifier-boundary on
-/// BOTH sides (so `orelse` never matches `else`, `modify` never matches
-/// `if`), not inside a string literal, and not inside a trailing `//`
-/// comment. Iterates ALL occurrences — an early one may be inside a string
-/// or comment while a later one is real code.
-fn hasToken(t: []const u8, needle: []const u8) bool {
+/// Position of the first real code-token occurrence of `needle` in `t`, or
+/// null: identifier-boundary on BOTH sides (so `orelse` never matches
+/// `else`, `modify` never matches `if`), not inside a string literal, and
+/// not inside a trailing `//` comment. Iterates ALL occurrences — an early
+/// one may be inside a string or comment while a later one is real code.
+/// Position callers (isOrShortCircuitSafe, EPH-I0298) need the first real
+/// position, not just its existence.
+fn realTokenPos(t: []const u8, needle: []const u8) ?usize {
     // One classifier walk plus one comment-start walk per call
     // (EPH-I0153): the complexity counters call this once per needle per
     // line, and candidates ascend within a call, so per-occurrence
@@ -18665,9 +18718,14 @@ fn hasToken(t: []const u8, needle: []const u8) bool {
         if (pos + needle.len < t.len and isIdent(t[pos + needle.len])) continue;
         if (cls.isInsideString(pos)) continue;
         if (comment_start != null and pos >= comment_start.?) continue;
-        return true;
+        return pos;
     }
-    return false;
+    return null;
+}
+
+/// True when `needle` occurs as a real code token (see realTokenPos).
+fn hasToken(t: []const u8, needle: []const u8) bool {
+    return realTokenPos(t, needle) != null;
 }
 
 /// Check if a loop keyword appears as a runtime loop: `for`/`while` present
@@ -21700,10 +21758,13 @@ fn isAllocatorCreateTypeBased(
 // Ignored Error Analysis Helpers
 // ============================================================================
 
-/// Check if line is a discard pattern with error handling already
+/// Check if line is a discard pattern with error handling already.
+/// Token-matched: `try`/`catch` in a string literal or trailing comment
+/// never counts as handling (EPH-I0298). The `_ = try ` prefix is a code
+/// position by construction: the discard prefix cannot be comment text.
 fn hasErrorHandling(t: []const u8) bool {
-    return mem.indexOf(u8, t, " try ") != null or
-        mem.indexOf(u8, t, " catch ") != null or
+    return hasToken(t, "try") or
+        hasToken(t, "catch") or
         mem.startsWith(u8, t, "_ = try ");
 }
 
@@ -21723,9 +21784,11 @@ fn isSafeBuiltin(t: []const u8, type_ctx: ?*const TypeContext) bool {
     // Stdlib safe methods — type-aware
     const stdlib_vars_ptr = if (type_ctx) |ctx| &ctx.stdlib_vars else null;
     if (isMethodOnStdlibVar(t, stdlib_vars_ptr, compat.getSafeMethodPatterns())) return true;
-    // Non-stdlib safe patterns (struct field access)
-    if (mem.indexOf(u8, t, ".len") != null) return true;
-    if (mem.indexOf(u8, t, ".items") != null) return true;
+    // Non-stdlib safe patterns (struct field access). Code-position match:
+    // ".len"/".items" in comment prose or string data never suppress a
+    // discard verdict (EPH-I0410).
+    const field_patterns = [_][]const u8{ ".len", ".items" };
+    if (containsAnyPatternInCode(t, &field_patterns)) return true;
     return compat.containsOptionalMethod(t);
 }
 
@@ -24620,7 +24683,9 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
 /// Check for index guard patterns on same line
 /// Check for basic short-circuit or loop guard patterns on a line
 fn hasBasicIndexGuard(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "while") != null and mem.indexOf(u8, t, "> 0") != null) return true;
+    // Token-matched: "while" in a string literal or trailing comment never
+    // fakes a loop guard (EPH-I0298).
+    if (hasToken(t, "while") and mem.indexOf(u8, t, "> 0") != null) return true;
     const basic_pats = [_][]const u8{ "== 0 or", "!= 0 and", "!=0 and", "endsWith", "startsWith" };
     for (basic_pats) |pat| {
         if (mem.indexOf(u8, t, pat) != null) return true;
@@ -24630,7 +24695,9 @@ fn hasBasicIndexGuard(t: []const u8) bool {
 
 /// Check for comparison guard combined with `and` keyword
 fn hasAndComparisonGuard(t: []const u8) bool {
-    if (mem.indexOf(u8, t, " and ") == null) return false;
+    // Token-matched: "and" in a string literal or trailing comment never
+    // fakes the conjunction (EPH-I0298).
+    if (!hasToken(t, "and")) return false;
     const cmp_pats = [_][]const u8{ " > ", " >= ", " != " };
     for (cmp_pats) |pat| {
         if (mem.indexOf(u8, t, pat) != null) return true;
@@ -24762,12 +24829,14 @@ fn hasComparisonOp(t: []const u8, op: u8) bool {
 }
 
 /// Exit keyword on the over-limit path: `if (x >= N) return/break/continue`.
+/// Token-matched: exit keywords in a string literal or trailing comment
+/// never prove the path exits (EPH-I0298).
 fn hasExitKeyword(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "return") != null) return true;
-    if (mem.indexOf(u8, t, "break") != null) return true;
-    if (mem.indexOf(u8, t, "continue") != null) return true;
-    if (mem.indexOf(u8, t, "unreachable") != null) return true;
-    if (mem.indexOf(u8, t, "orelse") != null) return true;
+    if (hasToken(t, "return")) return true;
+    if (hasToken(t, "break")) return true;
+    if (hasToken(t, "continue")) return true;
+    if (hasToken(t, "unreachable")) return true;
+    if (hasToken(t, "orelse")) return true;
     return false;
 }
 
@@ -29240,18 +29309,16 @@ fn extractBuildZigEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !v
 }
 
 /// Extract a .zig path from a build.zig line. Matches are masked to code
-/// positions (EPH-I0227): a pattern on a `\\` multiline-string body line or
-/// inside a string literal is text, not a reference, and must not add an
-/// entry.
+/// positions (EPH-I0227): a pattern on a `\\` multiline-string body line,
+/// inside a string literal, or inside a `//` comment is text, not a
+/// reference, and must not add an entry (comments: EPH-I0299).
 fn extractPathFromLine(ctx: EntryScanCtx, line: []const u8) !void {
     if (types.LiteralState.forLine(line) == null) return;
     // Pattern: .path("...") - matches b.path("..."), dep.path("..."), dep.builder.path("...")
-    if (mem.indexOf(u8, line, ".path(\"")) |idx| {
-        if (!isStringDataPosition(line, idx)) {
-            const start = idx + 7; // len of '.path("'
-            if (extractQuotedPath(line, start)) |path|
-                try addEntryIfValid(ctx, path);
-        }
+    if (findTagInCode(line, ".path(\"", 0)) |idx| {
+        const start = idx + 7; // len of '.path("'
+        if (extractQuotedPath(line, start)) |path|
+            try addEntryIfValid(ctx, path);
     }
     // Pattern: .path = "..." or .root_src = "..." or .root_source_file = "..."
     const path_patterns = [_]struct { tag: []const u8, len: usize }{
@@ -29260,22 +29327,19 @@ fn extractPathFromLine(ctx: EntryScanCtx, line: []const u8) !void {
         .{ .tag = ".root_source_file = \"", .len = 20 },
     };
     for (path_patterns) |pat| {
-        const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
-        if (isStringDataPosition(line, idx)) continue;
-        const start = idx + pat.len;
-        if (extractQuotedPath(line, start)) |path|
-            try addEntryIfValid(ctx, path);
-    }
-    // Pattern: @import("...") in build.zig (build module imports, entry points)
-    var search_pos: usize = 0;
-    while (mem.indexOf(u8, line[search_pos..], "@import(\"")) |rel_idx| {
-        const idx = search_pos + rel_idx;
-        const start = idx + 9; // len of '@import("'
-        if (!isStringDataPosition(line, idx)) {
+        if (findTagInCode(line, pat.tag, 0)) |idx| {
+            const start = idx + pat.len;
             if (extractQuotedPath(line, start)) |path|
                 try addEntryIfValid(ctx, path);
         }
+    }
+    // Pattern: @import("...") in build.zig (build module imports, entry points)
+    var search_pos: usize = 0;
+    while (findTagInCode(line, "@import(\"", search_pos)) |idx| {
+        const start = idx + 9; // len of '@import("'
         search_pos = start;
+        if (extractQuotedPath(line, start)) |path|
+            try addEntryIfValid(ctx, path);
     }
 }
 
@@ -29421,7 +29485,7 @@ fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
 }
 
 /// Extract path-tag based entries from a build.zig line. Matches are
-/// masked to code positions (EPH-I0227).
+/// masked to code positions (EPH-I0227 strings, EPH-I0299 comments).
 fn extractPathTagEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const path_tags = [_]struct { tag: []const u8, len: usize }{
         .{ .tag = ".path = \"", .len = 9 },
@@ -29429,24 +29493,22 @@ fn extractPathTagEntries(ctx: EntryScanCtx, line: []const u8) !void {
         .{ .tag = ".root_source_file = \"", .len = 20 },
     };
     for (path_tags) |pat| {
-        const idx = mem.indexOf(u8, line, pat.tag) orelse continue;
-        if (isStringDataPosition(line, idx)) continue;
-        if (extractQuotedPath(line, idx + pat.len)) |path|
-            try addEntryWithPrefix(ctx, path);
+        if (findTagInCode(line, pat.tag, 0)) |idx| {
+            if (extractQuotedPath(line, idx + pat.len)) |path|
+                try addEntryWithPrefix(ctx, path);
+        }
     }
 }
 
 /// Extract pathJoin(&.{ "dir", "file.zig" }) entries from a build.zig line.
-/// Matches are masked to code positions (EPH-I0227).
+/// Matches are masked to code positions (EPH-I0227 strings, EPH-I0299
+/// comments).
 fn extractPathJoinEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const tag = "pathJoin(&.{";
     var pos: usize = 0;
-    while (pos < line.len) {
-        const idx = mem.indexOf(u8, line[pos..], tag) orelse break;
-        const abs_pos = pos + idx + tag.len;
-        pos = abs_pos;
-        if (isStringDataPosition(line, abs_pos - tag.len)) continue;
-        if (extractPathJoin(ctx.allocator, line, abs_pos - 1)) |joined| {
+    while (findTagInCode(line, tag, pos)) |idx| {
+        pos = idx + tag.len;
+        if (extractPathJoin(ctx.allocator, line, idx + tag.len - 1)) |joined| {
             defer ctx.allocator.free(joined);
             try addEntryWithPrefix(ctx, joined);
         }
@@ -29462,13 +29524,13 @@ fn isValidZigImport(imp_path: []const u8) bool {
 }
 
 /// Follow @import entries in a build.zig line and recurse into nested modules.
-/// Matches are masked to code positions (EPH-I0227).
+/// Matches are masked to code positions (EPH-I0227 strings, EPH-I0299
+/// comments).
 fn followImportsInLine(ctx: EntryScanCtx, line: []const u8) !void {
     var imp_pos: usize = 0;
-    while (mem.indexOf(u8, line[imp_pos..], "@import(\"")) |rel| {
-        const istart = imp_pos + rel + 9;
-        defer imp_pos = istart;
-        if (isStringDataPosition(line, imp_pos + rel)) continue;
+    while (findTagInCode(line, "@import(\"", imp_pos)) |idx| {
+        const istart = idx + 9;
+        imp_pos = istart;
         const imp_path = extractQuotedPath(line, istart) orelse continue;
         if (!isValidZigImport(imp_path)) continue;
         try addEntryWithPrefix(ctx, imp_path);
@@ -29499,12 +29561,13 @@ fn recurseNestedBuildModule(ctx: EntryScanCtx, imp_path: []const u8) Allocator.E
 }
 
 /// Extract the first .path("...") entry from a build.zig line. The match is
-/// masked to code positions (EPH-I0227): a match inside a string is text.
+/// masked to code positions (EPH-I0227 strings, EPH-I0299 comments): a
+/// match inside a string or a `//` comment is text.
 fn extractDotPathEntry(ctx: EntryScanCtx, line: []const u8) !void {
-    const idx = mem.indexOf(u8, line, ".path(\"") orelse return;
-    if (isStringDataPosition(line, idx)) return;
-    if (extractQuotedPath(line, idx + 7)) |path|
-        try addEntryWithPrefix(ctx, path);
+    if (findTagInCode(line, ".path(\"", 0)) |idx| {
+        if (extractQuotedPath(line, idx + 7)) |path|
+            try addEntryWithPrefix(ctx, path);
+    }
 }
 
 /// Extract entry points from a build.zig file at a specific path
@@ -33066,6 +33129,67 @@ test "build.zig entry extractors ignore refs on multiline-string lines (EPH-I022
     var band_ctx = ctx;
     band_ctx.build_path = build_path;
     try extractBuildZigEntriesFromPath(band_ctx);
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    const want = try std.fmt.allocPrint(allocator, "{s}/real.zig", .{root});
+    defer allocator.free(want);
+    try std.testing.expectEqualStrings(want, cfg.entries.items[0]);
+}
+
+test "build.zig entry extractors ignore refs in // comments (EPH-I0299)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fake.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fake2.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fake3.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real.zig", .data = "" });
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{root});
+    defer allocator.free(build_path);
+
+    const ctx = EntryScanCtx{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .added = &added,
+        .prefix = root,
+        .build_path = build_path,
+    };
+
+    // Comment text is prose, never a reference: no extractor adds an entry
+    // from a commented pattern. Pre-fix every commented b.path/@import/
+    // pathJoin landed as an entry and silenced ZA501 for the orphan.
+    try extractPathTagEntries(ctx, "    // .path = \"fake.zig\"");
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+    try extractPathJoinEntries(ctx, "    // pathJoin(&.{ \"fake3.zig\" })");
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+    try followImportsInLine(ctx, "    // @import(\"fake2.zig\")");
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+    try extractDotPathEntry(ctx, "    // b.path(\"fake.zig\")");
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+
+    // The whole per-line band: the commented refs add nothing, the real
+    // ref still lands (extractPathFromLine shares the same code-position
+    // gate; it resolves paths against the process cwd, so it is not
+    // directly callable with a tmp-absolute entry).
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void {\n" ++
+            "    // b.path(\"fake.zig\")\n" ++
+            "    // @import(\"fake2.zig\")\n" ++
+            "    // pathJoin(&.{ \"fake3.zig\" })\n" ++
+            "    const exe = b.addExecutable(.{ .root_source_file = b.path(\"real.zig\") });\n" ++
+            "}\n",
+    });
+    try extractBuildZigEntriesFromPath(ctx);
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     const want = try std.fmt.allocPrint(allocator, "{s}/real.zig", .{root});
     defer allocator.free(want);
@@ -50641,6 +50765,91 @@ test "ZA607: or-guard stays silent when the guard's own declaration initializer 
     );
 }
 
+test "ZA607: or-guard ignores a string-position or token (EPH-I0298)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The string "x == null or y" fakes a first " or " at a raw-substring
+    // scan. Pre-fix the fake or stole the or-guard position and the read
+    // was wrongly suppressed; the real `or` after the string must decide.
+    // The real or's LHS (`s == "x == null or y"`) is not a null equality,
+    // so the read fires.
+    const content =
+        \\fn loopStr(items: []const bool, s: []const u8) void {
+        \\    var x: ?u32 = null;
+        \\    var y: u32 = undefined;
+        \\    for (items) |_| {
+        \\        if (s == "x == null or y" or y == 1) {
+        \\            y = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_str_token.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_or_str_token.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard ignores a trailing-comment or token (EPH-I0298)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The comment "z == null or y" holds the only " or " on the line; the
+    // read of y is not short-circuited by anything real, so it fires.
+    // Comment prose cannot fake the short-circuit even at a raw-substring
+    // scan: the first genuine read always precedes a trailing comment, so
+    // the raw check's own vpos gate (read after or) blocks the narrative.
+    // This pin locks that structural inertness — the comment position is
+    // the trailing-comment negative the issue names, and it stays inert
+    // with token matching too.
+    const content =
+        \\fn loopCom(items: []const bool) void {
+        \\    var z: ?u32 = null;
+        \\    var y: u32 = undefined;
+        \\    for (items) |_| {
+        \\        if (y == 1) { // z == null or y
+        \\            y = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_com_token.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_or_com_token.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "realTokenPos skips string and comment positions, keeps word bounds (EPH-I0298)" {
+    // Real token found at its exact position.
+    try std.testing.expectEqual(@as(?usize, 6), realTokenPos("if (a or b)", "or"));
+    try std.testing.expectEqual(@as(?usize, 6), realTokenPos("x = y and z", "and"));
+    try std.testing.expectEqual(@as(?usize, 0), realTokenPos("try f();", "try"));
+    // String literal positions are data, never tokens.
+    try std.testing.expectEqual(@as(?usize, null), realTokenPos("s = \"a or b\";", "or"));
+    try std.testing.expectEqual(@as(?usize, null), realTokenPos("s = \"try f();\";", "try"));
+    // Trailing comment positions are prose, never tokens.
+    try std.testing.expectEqual(@as(?usize, null), realTokenPos("x = 1; // or", "or"));
+    try std.testing.expectEqual(@as(?usize, null), realTokenPos("x = 1; // try", "try"));
+    // Word-boundary: embedded in a longer identifier never matches.
+    try std.testing.expectEqual(@as(?usize, null), realTokenPos("for (x)", "or"));
+    try std.testing.expectEqual(@as(?usize, null), realTokenPos("retry f();", "try"));
+    try std.testing.expectEqual(@as(?usize, null), realTokenPos("x orelse y", "or"));
+    // hasToken is the boolean wrapper over the same matcher.
+    try std.testing.expect(hasToken("x = y or z", "or"));
+    try std.testing.expect(!hasToken("x = 1; // y or z", "or"));
+}
+
 test "ZA607: null-guard correlation fires for sibling-branch assignments (EPH-I0331)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -60377,6 +60586,117 @@ test "isCleanupMethodCall matches cleanup method names" {
     try std.testing.expect(!isCleanupMethodCall("api.fetch() catch {}"));
 }
 
+test "isCleanupMethodCall ignores cleanup prose in a trailing comment (EPH-I0409)" {
+    // The .close( exists only in comment prose — the catch is not a
+    // cleanup call, so ZA201 must fire.
+    try std.testing.expect(!isCleanupMethodCall("foo() catch {}; // .close("));
+    try std.testing.expect(!isCleanupMethodCall("foo() catch {}; // .deinit( conn"));
+    // Real code before the comment still matches.
+    try std.testing.expect(isCleanupMethodCall("conn.close() catch {}; // done"));
+}
+
+test "isCleanupMethodCall applies camelCase boundaries to keywords (EPH-I0409)" {
+    // "close" inside enclose/disclose is a substring, not a cleanup
+    // segment — the silent catch on these methods must fire.
+    try std.testing.expect(!isCleanupMethodCall("x.enclose() catch {}"));
+    try std.testing.expect(!isCleanupMethodCall("x.disclose() catch {}"));
+    // Segment starts still match: prefix and camelCase forms.
+    try std.testing.expect(isCleanupMethodCall("x.close() catch {}"));
+    try std.testing.expect(isCleanupMethodCall("x.onClose() catch {}"));
+    try std.testing.expect(isCleanupMethodCall("x.shutdownLeader() catch {}"));
+    try std.testing.expect(isCleanupMethodCall("x.leaseRevoke() catch {}"));
+}
+
+test "containsAnyPatternInCode skips string and comment positions (EPH-I0410)" {
+    const pats = [_][]const u8{ ".deinit(", "A(" };
+    try std.testing.expect(containsAnyPatternInCode("x.deinit();", &pats));
+    try std.testing.expect(containsAnyPatternInCode("_ = A(b);", &pats));
+    try std.testing.expect(!containsAnyPatternInCode("x = \"a .deinit( b\";", &pats));
+    try std.testing.expect(!containsAnyPatternInCode("x = f(\"A(\");", &pats));
+    try std.testing.expect(!containsAnyPatternInCode("x = 1; // .deinit(", &pats));
+    try std.testing.expect(!containsAnyPatternInCode("x = 1; // A(", &pats));
+}
+
+test "isSafeToDiscard ignores discard-masking prose in comments (EPH-I0410)" {
+    // A trailing comment naming a cleanup call or FFI shape must not
+    // suppress the ZA205 note.
+    try std.testing.expect(!isSafeToDiscard("_ = foo(); // .deinit(", null));
+    try std.testing.expect(!isSafeToDiscard("_ = foo(); // A(", null));
+    try std.testing.expect(!isSafeToDiscard("_ = foo(); // .free(", null));
+    // Real cleanup calls stay silent.
+    try std.testing.expect(isSafeToDiscard("_ = list.deinit();", null));
+}
+
+test "isSafeToDiscard ignores discard-masking prose in strings (EPH-I0410)" {
+    // "A(" and cleanup patterns inside string data are text, not calls.
+    try std.testing.expect(!isSafeToDiscard("_ = f(\"A(\");", null));
+    try std.testing.expect(!isSafeToDiscard("_ = f(\".deinit(\");", null));
+}
+
+test "hasDirectFill finds fills after a URL-bearing string literal (EPH-I0412)" {
+    // The raw `//` check read the "//" of "http://" as a comment start and
+    // skipped the real assignment: x was reported unfilled at scope end
+    // (ZA204 false positive).
+    try std.testing.expect(hasDirectFill("s = \"http://a\"; x = compute();", "x"));
+    try std.testing.expect(hasDirectFill("url = \"https://x/y\"; x = 1;", "x"));
+    // Occurrences inside a real trailing comment stay invisible.
+    try std.testing.expect(!hasDirectFill("y = f(); // x = 5", "x"));
+    try std.testing.expect(!hasDirectFill("y = 1; // x = 5", "x"));
+}
+
+test "firstVarReadPos ignores string-data comment openers and real comments (EPH-I0412)" {
+    // A "//" inside a string literal never fakes a comment: the read of y
+    // stays visible.
+    try std.testing.expect(firstVarReadPos("s = \"http://a\"; y == 1", "y") != null);
+    // Occurrences inside a real trailing comment are prose, not reads.
+    try std.testing.expect(firstVarReadPos("x = 1; // y == 1", "y") == null);
+}
+
+test "isTryAllocation ignores try prose in strings and comments (EPH-I0298)" {
+    // "try " in a trailing comment faked a try allocation on a plain alloc
+    // line, forcing errdefer coverage the code never owed.
+    try std.testing.expect(!isTryAllocation("const buf = allocator.alloc(u8, 10); // a try b"));
+    try std.testing.expect(!isTryAllocation("const s = \"a try b\"; const buf = allocator.alloc(u8, 10);"));
+    // Real try allocations stay detected.
+    try std.testing.expect(isTryAllocation("const buf = try allocator.alloc(u8, 10);"));
+}
+
+test "hasErrorHandling ignores try and catch prose in strings and comments (EPH-I0298)" {
+    // Comment and string positions of try/catch never count as error
+    // handling, so the discard still reports.
+    try std.testing.expect(!hasErrorHandling("_ = f(); // a try b"));
+    try std.testing.expect(!hasErrorHandling("_ = f(); // a catch b"));
+    try std.testing.expect(!hasErrorHandling("_ = f(\"a try b\");"));
+    try std.testing.expect(!hasErrorHandling("_ = f(\"a catch b\");"));
+    // Real handling stays detected.
+    try std.testing.expect(hasErrorHandling("_ = try f();"));
+    try std.testing.expect(hasErrorHandling("_ = f() catch {};"));
+}
+
+test "hasBasicIndexGuard and hasAndComparisonGuard ignore prose (EPH-I0298)" {
+    // "while"/"and" in a comment or string never fakes a guard.
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // while a > 0"));
+    try std.testing.expect(!hasBasicIndexGuard("s = \"a while b > 0\";"));
+    try std.testing.expect(!hasAndComparisonGuard("x = f(); // a and b > c"));
+    try std.testing.expect(!hasAndComparisonGuard("s = \"a and b > c\";"));
+    // Real guards stay detected.
+    try std.testing.expect(hasBasicIndexGuard("while (n > 0) {"));
+    try std.testing.expect(hasAndComparisonGuard("if (a and b > c) {"));
+}
+
+test "hasExitKeyword ignores exit keywords in strings and comments (EPH-I0298)" {
+    // Exit keywords in prose never prove the over-limit path exits.
+    try std.testing.expect(!hasExitKeyword("x = f(); // return"));
+    try std.testing.expect(!hasExitKeyword("x = f(); // break"));
+    try std.testing.expect(!hasExitKeyword("x = f(); // continue"));
+    try std.testing.expect(!hasExitKeyword("x = f(); // unreachable"));
+    try std.testing.expect(!hasExitKeyword("x = f(); // orelse"));
+    try std.testing.expect(!hasExitKeyword("x = \"a return b\";"));
+    // Real exit keywords stay detected.
+    try std.testing.expect(hasExitKeyword("if (x >= N) return;"));
+    try std.testing.expect(hasExitKeyword("if (x >= N) unreachable;"));
+}
+
 test "isStreamWriteCall matches writeSep pattern" {
     try std.testing.expect(isStreamWriteCall("ctr.writeSep(writer) catch {}"));
 }
@@ -67729,6 +68049,32 @@ test "ZA209: discards with a computed return still fires" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countRuleIssues(run.issues.items, "za209_compret.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: // try prose never proves an error path (EPH-I0411)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Trailing comments naming try/return error are prose, not evidence:
+    // a never-failing fn must still fire. Pre-fix the raw evidence scans
+    // read "try " and "return error" inside the comments and silenced the
+    // note.
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    work(); // try this later
+        \\    work(); // return error.X
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_comprose.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_comprose.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

@@ -459,10 +459,20 @@ const ColSpan = struct {
 /// only; the gen side uses the span to move the fill's effect past the
 /// line end so a same-line read after the construct stays uncovered,
 /// while later-line reads keep the entry-block verdict (EPH-I0111).
+/// The span carries the arm block the line's opener dispatch created, so
+/// the fill stays on its arm even when a later blank line normalizes the
+/// block's line range (EPH-I0846/49). A span on a non-opener line (an
+/// Allman `{` claiming a pending entry) has no block of its own: block is
+/// null and callers fall back to whole-line attribution. Later same-line
+/// control openers create no block and no span — only the first control
+/// brace claims the opener — so a fill in a second same-line arm falls
+/// back to whole-line attribution too, a documented false negative
+/// (EPH-I0846/49).
 const ArmSpan = struct {
     line: usize,
     start_col: usize,
     end_col: usize,
+    block: ?usize,
 };
 
 /// Control Flow Graph for a single function
@@ -1808,71 +1818,90 @@ const CFGBuildCtx = struct {
         return items[items.len - 1].block_type == .if_block;
     }
 
-    /// Record the same-line braced arm spans of a line without an else
-    /// (`if (c) { x = 1; }`). A fill inside the arm is conditional, which
-    /// whole-line attribution cannot express (EPH-I0111).
-    fn recordOnelineArms(self: *CFGBuildCtx, events: []const ControlEvent, line: usize) !void {
-        var open_col: ?usize = null;
-        for (events) |event| {
-            if (event.kind == .open_control) {
-                open_col = event.col;
-                continue;
-            }
-            if (event.kind != .close_control) continue;
-            const start = open_col orelse continue;
-            open_col = null;
-            try self.cfg.oneline_arms.append(self.allocator, .{
-                .line = line,
-                .start_col = start,
-                .end_col = event.col + 1,
-            });
-        }
+    /// Record the same-line braced arm span at the arm's close event:
+    /// the dispatched opener's block owns the arm, so a fill inside it
+    /// stays on the guarded path even when a later blank line normalizes
+    /// the block's line range (EPH-I0846/49). Only the first open/close
+    /// pair records: a line's first control brace claims the opener, and
+    /// later same-line control braces are expression braces that emit no
+    /// events. A virtual body (close_virtual) records no span, keeping
+    /// the locked entry-block verdict for braceless one-line bodies
+    /// (EPH-I0111). A non-opener line's pending claim (Allman `{`)
+    /// records no block id: callers fall back to whole-line attribution.
+    fn recordArmSpan(self: *CFGBuildCtx, walk: *EventWalkCtx, event: ControlEvent) !void {
+        if (event.kind != .close_control) return;
+        const start = walk.arm_open_col orelse return;
+        walk.arm_open_col = null;
+        try self.cfg.oneline_arms.append(self.allocator, .{
+            .line = walk.line,
+            .start_col = start,
+            .end_col = event.col + 1,
+            .block = walk.arm_block,
+        });
+    }
+
+    /// Capture the open of a same-line braced arm: the dispatched
+    /// opener's block owns the arm's span; a non-opener line (Allman `{`
+    /// claiming a pending entry) has no arm block of its own
+    /// (EPH-I0846/49).
+    fn captureArmOpen(self: *CFGBuildCtx, walk: *EventWalkCtx, event: ControlEvent) void {
+        if (!walk.record_arms) return;
+        walk.arm_open_col = event.col;
+        walk.arm_block = if (isControlOpener(walk.pattern))
+            self.current_block
+        else
+            null;
     }
 
     /// Outcome of the span prelude for one line: whether the walk records
-    /// column spans for it, and the col_spans length to roll back to when
-    /// the else claims a non-if entry.
+    /// column spans for it, whether it records same-line arm spans, and
+    /// the col_spans length to roll back to when the else claims a
+    /// non-if entry.
     const SpanPrelude = struct {
         record_spans: bool,
+        record_arms: bool,
         span_mark: usize,
     };
 
-    /// Per-line event-walk state: the span prelude's recording flag and
-    /// rollback mark, the advancing span column, and the opener latch.
-    /// Bundled so one event step stays inside the param limit (EPH-I0761).
+    /// Per-line event-walk state: the span prelude's recording flags and
+    /// rollback mark, the advancing span column, the opener latch, and
+    /// the same-line arm span's open column and arm block. Bundled so one
+    /// event step stays inside the param limit (EPH-I0761).
     const EventWalkCtx = struct {
         pattern: CFPattern,
         code: []const u8,
         line: usize,
         record_spans: bool,
+        record_arms: bool,
         span_mark: usize,
         span_col: usize = 0,
         opener_dispatched: bool = false,
+        arm_open_col: ?usize = null,
+        arm_block: ?usize = null,
     };
 
     /// Decide and start span recording for the line. A plain-else line
     /// (`else {`, not an else-if chain, not `else return`) records the
     /// column spans that split the line's ownership across the branch,
     /// the arms, and the merge. A line without an else records same-line
-    /// braced arm spans instead — except a switch, whose prong braces are
-    /// expression braces: exhaustiveness has no unguarded path, so the
-    /// switch's own braces must not become a conditional arm (EPH-I0111).
+    /// braced arm spans during the event walk instead — except a switch,
+    /// whose prong braces are expression braces: exhaustiveness has no
+    /// unguarded path, so the switch's own braces must not become a
+    /// conditional arm (EPH-I0111).
     fn beginLineSpans(
         self: *CFGBuildCtx,
         pattern: CFPattern,
         code: []const u8,
-        line: usize,
-    ) !SpanPrelude {
+    ) SpanPrelude {
         const events = self.event_scratch.items;
         var has_else = false;
         for (events) |event| {
             if (event.kind == .else_keyword) has_else = true;
         }
-        if (!has_else and pattern != .switch_start)
-            try self.recordOnelineArms(events, line);
         return .{
             .record_spans = has_else and !elseChainsIntoIf(code) and
                 !hasInlineElseReturn(code),
+            .record_arms = !has_else and pattern != .switch_start,
             .span_mark = self.cfg.col_spans.items.len,
         };
     }
@@ -1920,12 +1949,13 @@ const CFGBuildCtx = struct {
             else => {},
         }
         const events = self.event_scratch.items;
-        const prelude = try self.beginLineSpans(pattern, code, line);
+        const prelude = self.beginLineSpans(pattern, code);
         var walk: EventWalkCtx = .{
             .pattern = pattern,
             .code = code,
             .line = line,
             .record_spans = prelude.record_spans,
+            .record_arms = prelude.record_arms,
             .span_mark = prelude.span_mark,
         };
         for (events, 0..) |event, idx| {
@@ -1956,6 +1986,7 @@ const CFGBuildCtx = struct {
                 walk.opener_dispatched = true;
                 if (isControlOpener(walk.pattern))
                     try self.dispatchPattern(walk.pattern, walk.code, walk.line);
+                self.captureArmOpen(walk, event);
             },
             .else_keyword => {
                 if (walk.record_spans and !self.elseClaimsIfEntry()) {
@@ -1967,6 +1998,7 @@ const CFGBuildCtx = struct {
             },
             .close_control, .close_virtual => {
                 try self.closeBodyMarkers(event);
+                if (walk.record_arms) try self.recordArmSpan(walk, event);
                 if (next_is_else) return;
                 try self.handleBlockEndOrDefer(walk.line);
             },
@@ -2662,14 +2694,18 @@ fn findBlockForLineCol(cfg: *const ControlFlowGraph, line: usize, col: usize) ?u
     return findBlockForLine(cfg, line);
 }
 
-/// True when the column sits inside a same-line braced arm on a line
-/// without an else (EPH-I0111).
-fn colInOnelineArm(cfg: *const ControlFlowGraph, line: usize, col: usize) bool {
+/// The block owning the same-line braced arm span at (line, col): the
+/// arm block the line's opener dispatch created, carried by the span
+/// itself so a later blank line cannot detach the fill from its arm
+/// (EPH-I0111, EPH-I0846/49). A span without a block (a non-opener
+/// line's pending claim) returns null and the caller keeps the
+/// whole-line attribution.
+fn onelineArmBlockAt(cfg: *const ControlFlowGraph, line: usize, col: usize) ?usize {
     for (cfg.oneline_arms.items) |span| {
         if (span.line == line and col >= span.start_col and col < span.end_col)
-            return true;
+            return span.block;
     }
-    return false;
+    return null;
 }
 
 /// Get predecessors of a block
@@ -3579,15 +3615,22 @@ const GenOccurrence = struct {
 
 /// Attribute one fill occurrence to the block that owns its column and
 /// merge its effect point into that block's first-effect set. A fill
-/// inside a same-line no-else if arm runs on the guarded path only, so it
+/// inside a same-line braced if arm runs on the guarded path only, so it
 /// must not cover a same-line read after the construct; later-line reads
-/// keep the locked same-line-braced-if verdict through the entry block's
-/// gen bit (EPH-I0111).
+/// on the unguarded path stay uncovered — the fill gens the arm's own
+/// block, never the entry block (EPH-I0846/49). The arm span carries the
+/// arm block from the opener dispatch, so a later blank line that
+/// normalizes the block's line range cannot detach the fill from its arm.
+/// A fill inside a second same-line arm (only the first control brace
+/// claims the opener) keeps the whole-line attribution, a documented
+/// false negative (EPH-I0846/49).
 fn recordGenEffect(ctx: *const DefAssignCtx, occ: GenOccurrence, gen_sets: *GenSets) void {
     const actual_line = ctx.func_line + occ.idx;
-    const bid = findBlockForLineCol(ctx.cfg, actual_line, occ.col) orelse return;
+    var bid = findBlockForLineCol(ctx.cfg, actual_line, occ.col) orelse return;
+    const arm_bid = onelineArmBlockAt(ctx.cfg, actual_line, occ.col);
+    if (arm_bid) |arm| bid = arm;
     gen_sets.gen[bid] = true;
-    const effect = if (colInOnelineArm(ctx.cfg, actual_line, occ.col))
+    const effect = if (arm_bid != null)
         AssignEffect{ .line = occ.idx, .col = std.math.maxInt(usize) }
     else
         occ.effect;
@@ -4426,10 +4469,10 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     if (effectCoversRead(sc.first_effect[bid], idx, read_col)) return false;
     // Check if the read is inside a correlated guard: the same if-condition
     // that gates the read also gates an earlier assignment of the variable.
-    if (isCorrelatedGuardRead(sc.da.lines, idx, var_name)) return false;
+    if (isCorrelatedGuardRead(sc.da.lines, idx, read_col, var_name)) return false;
     // Check if the read is inside a null-guard on a variable that is only
     // set non-null in blocks that also assign the flagged variable.
-    if (isNullGuardCorrelatedRead(sc.da.lines, idx, var_name)) return false;
+    if (isNullGuardCorrelatedRead(sc.da.lines, idx, read_col, var_name)) return false;
     // Check if all paths that don't assign the variable have early returns.
     // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
     if (hasEarlyReturnOnUnassignedPaths(sc.da.lines, var_name, idx)) return false;
@@ -4491,12 +4534,16 @@ fn checkVarDefiniteAssignment(
 /// enclose the read (guardDominatesRead — EPH-I0329, band-B01b F-03). The
 /// condition is compared textually; a reassignment of a condition
 /// variable between the guard and the read is an accepted approximation
-/// (the condition is assumed stable). A shared enclosure opener beyond
-/// the lookback window, or a multi-line condition whose brace-bearing
-/// line carries no keyword, is also missed — accepted false negatives.
+/// (the condition is assumed stable). A multi-line condition whose
+/// brace-bearing line carries no keyword is missed, and a guard-if or
+/// read beyond findEnclosingIfCondition's lookback window is not reached
+/// — accepted false negatives. A read on its own guard-if's opener line
+/// (the one-line body form) reaches the guard-if through the read column
+/// (EPH-I0846/49).
 fn isCorrelatedGuardRead(
     lines: []const []const u8,
     read_idx: usize,
+    read_col: usize,
     var_name: []const u8,
 ) bool {
     // Check all enclosing if conditions, not just the nearest one.
@@ -4509,6 +4556,7 @@ fn isCorrelatedGuardRead(
         const guard_cond = findEnclosingIfCondition(
             lines,
             search_from,
+            if (search_from == read_idx) read_col else 0,
         ) orelse break;
 
         for (0..read_idx) |i| {
@@ -4741,7 +4789,9 @@ fn isConditionalOpenerLine(t: []const u8) bool {
 /// Enclosing conditional and loop opener lines of `idx`, nearest first,
 /// within [stop, idx). A plain block (a function body, a bare block) runs
 /// unconditionally and does not gate the line. The walk mirrors
-/// findEnclosingIfCondition's brace accounting (EPH-I0225).
+/// findEnclosingIfCondition's brace accounting (EPH-I0225). The walk
+/// stops collecting at the buffer bound; the caller reads a full count
+/// as "truncated" (EPH-I0847).
 fn enclosingConditionalLines(
     lines: []const []const u8,
     idx: usize,
@@ -4763,6 +4813,7 @@ fn enclosingConditionalLines(
         depth = braces.depth;
         if (!braces.opens_enclosing_block) continue;
         if (isConditionalOpenerLine(code)) {
+            if (count >= out.len) return count;
             out[count] = i;
             count += 1;
         }
@@ -4782,17 +4833,33 @@ fn lineSetContains(set: []const usize, line: usize) bool {
 /// `if_idx` also encloses the read: the guard-if is gated no harder than
 /// the read, so its assignment dominates the read (EPH-I0329, band-B01b
 /// F-03). A guard-if inside a loop or conditional the read does not share
-/// may never run while the read does. The walk stops at the enclosing
-/// block's lookback window (EPH-I0225); a shared opener beyond it is
-/// missed — accepted false negative, documented at isCorrelatedGuardRead.
+/// may never run while the read does.
+///
+/// The cand walk is anchored at the guard-if (its enclosers sit above it),
+/// so a divergent opener beyond the old read-anchored window is still
+/// caught; the window now reaches 40 lines above the guard-if itself
+/// (EPH-I0847). A divergent opener beyond that window is missed — accepted
+/// false negative, the window named here. The read walk covers only the
+/// cand span, so the scan stays proportional to the guard-read distance
+/// rather than the function length. A walk truncated by the 40-entry
+/// buffer presumes dominance — the FN direction, consistent with the
+/// corpus convention (a truncated cand set can only miss divergence).
 fn guardDominatesRead(lines: []const []const u8, if_idx: usize, read_idx: usize) bool {
-    const stop = read_idx -| enclosing_block_lookback;
     var cand: [enclosing_block_lookback]usize =
         [_]usize{0} ** enclosing_block_lookback;
+    const cand_stop = if_idx -| enclosing_block_lookback;
+    const n_cand = enclosingConditionalLines(lines, if_idx, cand_stop, &cand);
+    if (n_cand == 0) return true;
+    if (n_cand == cand.len) return true;
+    // The read walk reaches the cand span: the subset check needs each
+    // cand line's enclosure state, which the closes between the read and
+    // the cand lines determine. The topmost cand line is the last entry
+    // (the walk collects nearest first).
     var read: [enclosing_block_lookback]usize =
         [_]usize{0} ** enclosing_block_lookback;
-    const n_cand = enclosingConditionalLines(lines, if_idx, stop, &cand);
-    const n_read = enclosingConditionalLines(lines, read_idx, stop, &read);
+    const read_stop = cand[n_cand - 1] - 1;
+    const n_read = enclosingConditionalLines(lines, read_idx, read_stop, &read);
+    if (n_read == read.len) return true;
     for (cand[0..n_cand]) |line| {
         if (!lineSetContains(read[0..n_read], line)) return false;
     }
@@ -4839,9 +4906,10 @@ fn findEnclosingLoopLine(lines: []const []const u8, idx: usize) ?usize {
 fn isNullGuardCorrelatedRead(
     lines: []const []const u8,
     read_idx: usize,
+    read_col: usize,
     var_name: []const u8,
 ) bool {
-    const guard_cond = findEnclosingIfCondition(lines, read_idx) orelse return false;
+    const guard_cond = findEnclosingIfCondition(lines, read_idx, read_col) orelse return false;
     if (!isNullInitializedVar(lines, guard_cond)) return false;
     return allGuardAssignsCorrelate(lines, read_idx, guard_cond, var_name);
 }
@@ -5192,13 +5260,21 @@ const or_guard_body_window = 20;
 /// Extract the condition from an enclosing if-statement by walking backwards.
 /// Returns the condition string (e.g., "big" from "if (big) {") or null.
 ///
+/// A read on its own guard-if's opener line (the one-line body form
+/// `if (c) { return x; }`) is enclosed by that if when the read column
+/// sits inside the body braces; a condition read before the `{` is not
+/// enclosed — the condition evaluates before the body runs (EPH-I0846/49).
+///
 /// The walk stops enclosing_block_lookback lines back (EPH-I0225). A block
 /// opener sits above its whole body, so this walk gets the widest window.
 /// An opener beyond the window is missed (accepted false negative).
 fn findEnclosingIfCondition(
     lines: []const []const u8,
     read_idx: usize,
+    read_col: usize,
 ) ?[]const u8 {
+    if (onelineIfBodyCondition(mem.trim(u8, lines[read_idx], " \t\r"), read_col)) |cond|
+        return cond;
     // Walk backwards to find the nearest enclosing if
     const stop = read_idx -| enclosing_block_lookback;
     var depth: usize = 0;
@@ -5217,6 +5293,80 @@ fn findEnclosingIfCondition(
         depth = braces.depth;
         if (!braces.opens_enclosing_block) continue;
         if (extractIfCondition(code)) |cond| return cond;
+    }
+    return null;
+}
+
+/// Condition of an if whose opener shares the read's line, when the read
+/// column sits inside the if's body braces (the one-line body form
+/// `if (c) { return x; }`). The body region runs from the opener's `{`
+/// (after the condition's close paren) to its matching `}`; string and
+/// char content carries no braces. A condition read before the `{` is not
+/// enclosed (EPH-I0846/49).
+fn onelineIfBodyCondition(t: []const u8, col: usize) ?[]const u8 {
+    const cond = extractIfCondition(t) orelse return null;
+    const region = onelineIfBodyRegion(t) orelse return null;
+    if (col < region.open or col >= region.close) return null;
+    return cond;
+}
+
+/// The body brace region of a one-line if: the `{` after the condition's
+/// close paren and the matching `}`. A read inside the region is enclosed
+/// by the if; a read beyond the close sits outside (a later construct on
+/// the same line owns it).
+const OnelineIfBody = struct {
+    open: usize,
+    close: usize,
+};
+
+fn onelineIfBodyRegion(t: []const u8) ?OnelineIfBody {
+    const cp = conditionCloseParen(t) orelse return null;
+    // The body brace is the next `{` after the close paren.
+    const after = t[cp + 1 ..];
+    var open: ?usize = null;
+    for (after, 0..) |c, ci| {
+        if (c == '{') {
+            open = cp + 1 + ci;
+            break;
+        }
+    }
+    const o = open orelse return null;
+    // The body region ends at the `}` matching the body brace.
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var i: usize = o + 1;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (types.isMultilineOpenerAt(t, i)) return null;
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c != '}') continue;
+        depth -= 1;
+        if (depth == 0) return .{ .open = o, .close = i };
+    }
+    return null;
+}
+
+/// Column of the condition's close paren on an if-opener line: the `)`
+/// matching the first `(` after the `if` keyword (mirrors
+/// extractIfCondition's paren scan).
+fn conditionCloseParen(t: []const u8) ?usize {
+    const open = mem.indexOfScalar(u8, t, '(') orelse return null;
+    var depth: usize = 0;
+    for (t[open..], 0..) |c, ci| {
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c != ')') continue;
+        depth -= 1;
+        if (depth == 0) return open + ci;
     }
     return null;
 }
@@ -5337,8 +5487,8 @@ fn isElseIfLine(t: []const u8) bool {
 fn isElseLine(t: []const u8) bool {
     return mem.startsWith(u8, t, "} else {") or
         mem.startsWith(u8, t, "} else{") or
-        mem.eql(u8, t, "else {") or
-        mem.eql(u8, t, "else{");
+        mem.startsWith(u8, t, "else {") or
+        mem.startsWith(u8, t, "else{");
 }
 
 /// Skip past a braced block starting at `start_idx`, returning the index of
@@ -5499,6 +5649,18 @@ const ChainParseState = struct {
         );
         self.depth = nr.depth;
         self.found_open = nr.found_open;
+        // A one-line final-else arm closes on its own line: the pre-track
+        // saw the close, so the branch completes here and the else ends
+        // the chain. The multi-line form adds the branch at the close
+        // line instead (EPH-I0846/49).
+        if (nr.touched_zero and isElseLine(next_t)) {
+            if (!self.branches.add(self.branch_start, next_idx)) {
+                self.overflow = true;
+                self.done = true;
+                return;
+            }
+            self.done = true;
+        }
     }
 };
 
@@ -5620,8 +5782,126 @@ fn branchHasExit(
         if (isCommentOrMultilineString(t)) continue;
         depth = computeBraceDepth(t, depth);
         if (depth <= 1 and isExitStatement(t)) return true;
+        // A one-line else arm carries its exit mid-line: `else { return 0; }`
+        // starts with the arm keyword, so the line-leading check misses it
+        // (EPH-I0846/49). The arm's last statement decides: a trailing
+        // conditional (`else { if (q) return; }`) never exits.
+        if (depth <= 1 and oneLineElseArmTailExits(t)) return true;
     }
     return false;
+}
+
+/// True when a one-line plain-else arm's last statement exits
+/// unconditionally: `else { return 0; }`, `else { x = 1; return 0; }`,
+/// `} else { return 0; }`. The last statement runs whenever the arm runs;
+/// a conditional tail never counts — an `else if` header is a conditional
+/// tail, and a trailing `if (q) return;` in the arm stays conditional
+/// (EPH-I0846/49).
+fn oneLineElseArmTailExits(t: []const u8) bool {
+    // The arm keyword must lead the line, possibly past block-closing
+    // `}` chars: a bare "else" substring inside a string literal or an
+    // identifier is not an arm (EPH-I0846/49). The arm's own `{` is the
+    // first brace after the keyword; an `else if` header carries no arm
+    // of its own and never exits unconditionally.
+    var rest = t;
+    while (rest.len > 0 and rest[0] == '}') {
+        rest = mem.trimStart(u8, rest[1..], " \t");
+    }
+    if (!isElseBodyStart(rest)) return false;
+    if (elseChainsIntoIf(rest)) return false;
+    const else_abs = t.len - rest.len;
+    const open_rel = mem.indexOf(u8, rest["else".len..], "{") orelse return false;
+    const open = else_abs + "else".len + open_rel;
+    const close = onelineArmClose(t, open) orelse return false;
+    return lastStatementExits(t[open + 1 .. close]);
+}
+
+/// Column of the `}` matching the brace at `open` on the same line, or
+/// null when the brace does not close on the line. String and char
+/// content carries no braces; a `\\` opener's tail is string data.
+fn onelineArmClose(t: []const u8, open: usize) ?usize {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var i: usize = open + 1;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (types.isMultilineOpenerAt(t, i)) return null;
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c != '}') continue;
+        depth -= 1;
+        if (depth == 0) return i;
+    }
+    return null;
+}
+
+/// Scan state for the last-statement walk: the current statement's start,
+/// the last completed statement's span, and the running brace depth.
+const LastStmtScan = struct {
+    stmt_start: usize = 0,
+    last_start: usize = 0,
+    last_end: usize = 0,
+    found: bool = false,
+    depth: usize = 0,
+    mode: QuoteMode = .none,
+
+    /// Advance the state over one character. A depth-0 `;` completes the
+    /// current statement; a nested brace pair makes the whole construct
+    /// the current statement (a trailing `if (q) return;` stays a
+    /// conditional statement, never an exit).
+    fn step(self: *LastStmtScan, c: u8, j: usize) void {
+        switch (c) {
+            '{' => {
+                self.depth += 1;
+                if (self.depth == 1) self.stmt_start = j;
+            },
+            '}' => {
+                if (self.depth == 1) {
+                    self.last_start = self.stmt_start;
+                    self.last_end = j + 1;
+                    self.found = true;
+                }
+                if (self.depth > 0) self.depth -= 1;
+                self.stmt_start = j + 1;
+            },
+            ';' => {
+                if (self.depth == 0) {
+                    self.last_start = self.stmt_start;
+                    self.last_end = j + 1;
+                    self.found = true;
+                    self.stmt_start = j + 1;
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+/// True when the last top-level statement of an arm body exits. A nested
+/// brace pair makes the whole construct the statement; a trailing
+/// conditional (`if (q) return;`) is never an exit.
+fn lastStatementExits(body: []const u8) bool {
+    var scan: LastStmtScan = .{};
+    var j: usize = 0;
+    while (j < body.len) : (j += 1) {
+        const c = body[j];
+        if (scanQuoteStep(&scan.mode, c)) |skip| {
+            j += skip;
+            continue;
+        }
+        scan.step(c, j);
+    }
+    if (!scan.found) {
+        scan.last_start = 0;
+        scan.last_end = body.len;
+    }
+    return isExitStatement(mem.trim(u8, body[scan.last_start..scan.last_end], " \t\r"));
 }
 
 fn isExitStatement(t: []const u8) bool {
@@ -46726,9 +47006,10 @@ test "ZA607: same-line guarded assignment keeps the locked verdict" {
 
     // The mid-line `y = 1;` virtual body runs only on the a-true path, but
     // later-line reads keep the locked same-line-if verdict: the entry
-    // block's gen bit covers them, exactly like the braced one-line form
-    // (EPH-I0111). The CFG alone decides — no textual dominance suppressor
-    // (EPH-I0681, F7 shape).
+    // block's gen bit covers them (EPH-I0111). The braceless virtual-body
+    // form is the documented residual of the EPH-I0849 fix, which covers
+    // the braced one-line form; the CFG alone decides — no textual
+    // dominance suppressor (EPH-I0681, F7 shape).
     const content =
         \\fn sameLineGuardedAssign(a: bool) u32 {
         \\    var y: u32 = undefined;
@@ -46951,14 +47232,17 @@ test "ZA607: both braceless arms assigning is silent" {
     );
 }
 
-test "ZA607: same-line braced if keeps current verdict" {
+test "ZA607: same-line braced if does not cover the later read (EPH-I0849)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Pins the current line-granular verdict for a one-line braced if: the
-    // guard-state change must not alter it.
+    // The one-line braced if's fill runs on the guarded path only, so a
+    // later-line read on the unguarded path sees uninitialized x — the
+    // cond == false path reads it in silence before the fix (EPH-I0849).
+    // The pin records the fixed verdict; the earlier locked-verdict pin
+    // (EPH-I0111, I0859 era) recorded the false negative.
     const content =
         \\fn sameLineBraced(cond: bool) u32 {
         \\    var x: u32 = undefined;
@@ -46970,8 +47254,178 @@ test "ZA607: same-line braced if keeps current verdict" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        0,
+        1,
         countRuleIssues(run.issues.items, "da_sameline_braced.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested conditional in a one-line guard block fires (EPH-I0846)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The x assignment sits inside `if (d)` nested in the one-line if (c)
+    // arm. On the c == true, d == false path the guard is non-null and the
+    // read observes uninitialized x. The one-line-arm fill attribution
+    // masked the path through the entry block's gen bit before the fix
+    // (EPH-I0846).
+    const content =
+        \\fn nestedEnclosure(c: bool, d: bool) ?u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (c) { guard = 1; if (d) { x = 2; } }
+        \\    if (guard) |_| { return x; }
+        \\    return null;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0846_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0846_nested.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-block guard correlation in a one-line arm stays silent (EPH-I0846)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Control for the I0846 fix: the guard and x assignments share the
+    // one-line arm's block, so the null-guard correlation (band-B01b F-05)
+    // holds and the read stays silent. The one-line guard body needs the
+    // read column to reach its own guard-if (EPH-I0846).
+    const content =
+        \\fn sameBlockCorr(c: bool) ?u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (c) { guard = 1; x = 2; }
+        \\    if (guard) |_| { return x; }
+        \\    return null;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0846_sameblock.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0846_sameblock.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line-else return arm keeps the later read silent (EPH-I0846/49)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The c == false path returns inside the else arm, so the later read
+    // only runs on the assigned path. The early-return chain must see the
+    // one-line else arm's mid-line exit; the arm fill attribution moved
+    // off the entry block without this (EPH-I0846/49).
+    const content =
+        \\fn elseReturnArm(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) { x = 2; }
+        \\    else { return 0; }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0849_elseret.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0849_elseret.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-condition later one-line if stays silent (EPH-I0849)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The later read shares the guard-if's condition text: the
+    // correlated-guard suppression (band-B01b F-03) covers it even with
+    // the one-line read body — the read column reaches the guard-if on
+    // its own opener line (EPH-I0846/49).
+    const content =
+        \\fn sameCondRead(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) { x = 2; }
+        \\    if (c) { return x; }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0849_samecond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0849_samecond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string-literal else text in an else arm is not an exit (EPH-I0846/49)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else arm holds a string whose content looks like a one-line
+    // else exit (`"else { return 0; }"`). The early-return chain matched
+    // the bare "else" substring inside the literal before the fix and
+    // treated the arm as exiting, hiding the unguarded read. The arm
+    // keyword must lead the line (EPH-I0846/49).
+    const content =
+        \\fn stringElseArm(a: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) {
+        \\        x = 1;
+        \\    } else {
+        \\        const s = "else { return 0; }";
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0849_strelse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0849_strelse.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: blank line after a same-line braced if keeps the read uncovered (EPH-I0846/49)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A blank line between the one-line if and the read normalized the
+    // arm block's line range, so the inverted-range arm lookup missed it
+    // and the fill covered the unguarded path through the entry block.
+    // The arm span carries the arm block id from the opener dispatch, so
+    // the blank line cannot detach the fill from its arm (EPH-I0846/49).
+    const content =
+        \\fn blankLineAfterIf(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) { x = 2; }
+        \\
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0849_blank.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0849_blank.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -49225,6 +49679,108 @@ test "guardDominatesRead requires shared enclosures (EPH-I0329)" {
         "}",
     };
     try std.testing.expect(!guardDominatesRead(&in_else, 3, 8));
+}
+
+test "guardDominatesRead reaches a divergent opener beyond the window (EPH-I0847)" {
+    // The guard-if sits 45 lines above the read, past the 40-line
+    // lookback. The old walk saw no enclosures and presumed dominance
+    // vacuously; the walk to the function top finds if (a), which the
+    // read does not share — the guard-if does not dominate.
+    var far: [57][]const u8 = undefined;
+    far[0] = "fn f(a: bool, c: bool) u32 {";
+    far[1] = "    var x: u32 = undefined;";
+    far[2] = "    if (a) {";
+    far[3] = "        if (c) {";
+    far[4] = "            x = 1;";
+    far[5] = "        }";
+    far[6] = "    }";
+    var fi: usize = 7;
+    while (fi < 51) : (fi += 1) far[fi] = "    _ = 0;";
+    far[51] = "    if (c) {";
+    far[52] = "        return x;";
+    far[53] = "    }";
+    far[54] = "    return 0;";
+    far[55] = "}";
+    try std.testing.expect(!guardDominatesRead(&far, 3, 52));
+
+    // The same distance with a top-level guard-if: no enclosures on
+    // either side, so dominance holds and the read stays silent.
+    var safe: [56][]const u8 = undefined;
+    safe[0] = "fn g(c: bool) u32 {";
+    safe[1] = "    var x: u32 = undefined;";
+    safe[2] = "    if (c) {";
+    safe[3] = "        x = 1;";
+    safe[4] = "    }";
+    var si: usize = 5;
+    while (si < 50) : (si += 1) safe[si] = "    _ = 0;";
+    safe[50] = "    if (c) {";
+    safe[51] = "        return x;";
+    safe[52] = "    }";
+    safe[53] = "    return 0;";
+    safe[54] = "}";
+    try std.testing.expect(guardDominatesRead(&safe, 2, 51));
+
+    // A shared far enclosure still dominates: both the guard-if and the
+    // read sit inside if (a), so the read cannot run without the guard.
+    var shared: [57][]const u8 = undefined;
+    shared[0] = "fn h(a: bool, c: bool) u32 {";
+    shared[1] = "    var x: u32 = undefined;";
+    shared[2] = "    if (a) {";
+    shared[3] = "        if (c) {";
+    shared[4] = "            x = 1;";
+    shared[5] = "        }";
+    var hi: usize = 6;
+    while (hi < 50) : (hi += 1) shared[hi] = "        _ = 0;";
+    shared[50] = "        if (c) {";
+    shared[51] = "            return x;";
+    shared[52] = "        }";
+    shared[53] = "    }";
+    shared[54] = "    return 0;";
+    shared[55] = "}";
+    try std.testing.expect(guardDominatesRead(&shared, 3, 51));
+}
+
+test "ZA607: far divergent guard-if fires past the 40-line window (EPH-I0847)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The guard-if is nested in if (c), the read is not, and 42 padding
+    // lines separate them. The vacuous dominance beyond the 40-line
+    // lookback suppressed the read before the fix (EPH-I0847); the
+    // c == false, cond == true path reads uninitialized x.
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator,
+        \\fn farDivergent(c: bool, cond: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        if (cond) { x = 2; }
+        \\    }
+        \\
+    );
+    var pi: usize = 0;
+    while (pi < 42) : (pi += 1) {
+        const pad = try std.fmt.allocPrint(allocator, "    _ = {d};\n", .{pi});
+        defer allocator.free(pad);
+        try content.appendSlice(allocator, pad);
+    }
+    try content.appendSlice(allocator,
+        \\    if (cond) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+        \\
+    );
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0847_far.zig", content.items);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0847_far.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
 }
 
 test "isMethodCallAt rejects a leading-dot receiver (EPH-I0332)" {
@@ -59940,7 +60496,7 @@ test "hasShortCircuitGuardOnPriorLines misses a guard beyond the window (EPH-I02
 test "findEnclosingIfCondition finds an enclosing if inside the window (EPH-I0225)" {
     var buf: [8][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "if (big) {", 1);
-    const cond = findEnclosingIfCondition(lines, lines.len - 1) orelse
+    const cond = findEnclosingIfCondition(lines, lines.len - 1, 0) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("big", cond);
 }
@@ -59949,7 +60505,7 @@ test "findEnclosingIfCondition misses an enclosing if beyond the window (EPH-I02
     var buf: [50][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "if (big) {", 1);
     // The opener is 48 lines back, past the 40-line window (accepted FN).
-    try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1) == null);
+    try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1, 0) == null);
 }
 
 test "findEnclosingIfLine finds and misses by the same window (EPH-I0225)" {
@@ -59983,7 +60539,7 @@ test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
     try std.testing.expect(!hasNullGuard(lines, lines.len - 1, 0, "x"));
     try std.testing.expect(!hasPairedIncrementInLines(lines, "x"));
     try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1));
-    try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1) == null);
+    try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1, 0) == null);
     try std.testing.expect(findEnclosingIfLine(lines, lines.len - 1) == null);
     try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "x"));
 }

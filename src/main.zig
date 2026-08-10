@@ -5653,13 +5653,38 @@ fn orGuardVariable(lhs: []const u8) ?[]const u8 {
 }
 
 /// True when the line declares the guard `= null`: a `var <guard>`
-/// declaration whose initializer is null (EPH-I0330).
+/// declaration whose own initializer is null (EPH-I0330). The verdict is
+/// the declaration's own initializer, unless a later direct assignment to
+/// the guard on the same line overrides it — another variable's null
+/// initializer on the line never counts (EPH-I0852).
 fn isNullGuardDecl(t: []const u8, guard: []const u8) bool {
     if (!mem.startsWith(u8, t, "var ")) return false;
     const after_var = t[4..];
     if (!mem.startsWith(u8, after_var, guard)) return false;
     if (after_var.len > guard.len and isIdent(after_var[guard.len])) return false;
-    return mem.indexOf(u8, t, "= null") != null;
+    if (guardAssignmentOccurrence(t, guard) != null) return lastGuardWriteIsNull(t, guard);
+    return declInitializerIsNull(t, guard);
+}
+
+/// True when the guard's own `var` declaration initializer on the line is
+/// null: the first plain `=` after the declaration name starts a null
+/// RHS. A comparison op (`==`, `!=`, `<=`, `>=`) is not an initializer,
+/// and other variables' initializers on the same line never count
+/// (EPH-I0852).
+fn declInitializerIsNull(t: []const u8, guard: []const u8) bool {
+    var i = 4 + guard.len;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c != '=') continue;
+        if (i > 0 and (t[i - 1] == '=' or t[i - 1] == '<' or
+            t[i - 1] == '>' or t[i - 1] == '!')) continue;
+        if (i + 1 < t.len and t[i + 1] == '=') continue;
+        const rhs = mem.trimStart(u8, t[i + 1 ..], " \t");
+        if (!mem.startsWith(u8, rhs, "null")) return false;
+        if (rhs.len > "null".len and isIdent(rhs["null".len])) return false;
+        return true;
+    }
+    return false;
 }
 
 /// Null state of the or-guard variable on the walk to the guarded if.
@@ -22486,14 +22511,72 @@ fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
 /// Check if a variable has a null guard earlier in the function
 /// Patterns: "if (name == null) return/continue/break"
 ///           "if (name == null) { return/continue/break"
-/// Check if a line or its successor has an early exit after a null check
+/// Check if a line or its successor has an early exit after a null check.
+/// The same-line exit is judged at the guard's own depth (EPH-I0859): a
+/// nested same-line conditional exit (`{ if (q) return; }`) does not
+/// qualify. The successor check keeps the pre-walk depth-blind
+/// approximation: a `return`/`continue`/`break` opener on the next line
+/// counts whether or not the guard block closed on the guard line
+/// (accepted, EPH-I0861).
+///
+/// Tier split (EPH-I0861 closure): this guard query feeds the CFG-tier
+/// ZA203 emitter (checkOrelseUnreachable). The line-based ZA203 emitter
+/// (checkLineOrelseUnreachable, the errors subcommand) still fires on
+/// the same-line guard shapes — it does not consult the guard at all.
 fn hasNullCheckExit(line: []const u8, lines: []const []const u8, i: usize, limit: usize) bool {
-    if (hasExitStatement(line)) return true;
+    if (guardLineHasSameLineExit(line)) return true;
     if (i + 1 >= limit) return false;
     const next = mem.trim(u8, lines[i + 1], " \t\r");
     return mem.startsWith(u8, next, "return") or
         mem.startsWith(u8, next, "continue") or
         mem.startsWith(u8, next, "break");
+}
+
+/// True when the guard line's own tail exits at the guard's depth: the
+/// line is `if (x == null) return;` or `if (x == null) { return; }`. An
+/// exit inside a same-line nested conditional (`{ if (q) return; }`)
+/// does not qualify — the ZA203-family sibling of the classifyNullCheck
+/// same-line gate (EPH-I0859, EPH-I0861). The condition close is the
+/// first code-position paren group, so a continued condition
+/// (`if (x == null || q) return;`) keeps its exit.
+fn guardLineHasSameLineExit(line: []const u8) bool {
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c != '(') continue;
+        const close = parenCloseAt(line, i) orelse return false;
+        return hasSameLineGuardExit(line[close + 1 ..]);
+    }
+    return false;
+}
+
+/// Position of the `)` that closes the `(` at `open` (quote-aware from
+/// the open position), or null when the group is unterminated.
+fn parenCloseAt(t: []const u8, open: usize) ?usize {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var i = open + 1;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == ')') {
+            depth -= 1;
+            if (depth == 0) return i;
+        }
+    }
+    return null;
 }
 
 fn hasNullGuard(
@@ -22532,6 +22615,239 @@ fn extractVarFromNullCheck(after_paren: []const u8, pos: usize) ?[]const u8 {
 /// residual, EPH-I0858).
 const max_braced_guard_body_lines = 4;
 
+/// True when the guard line's same-line tail exits unconditionally at the
+/// guard's own depth, mirroring the following-block walk's depth-1 rule
+/// (EPH-I0488): the tail is `return...;` / `break...;` / `continue...;`
+/// directly, or a braced block whose own statements hold such an exit.
+/// An exit inside a same-line nested conditional does not dominate the
+/// fall-through on its own: `{ if (q) return null; }` must not qualify
+/// (EPH-I0859). A nested conditional whose then and else arms both hold
+/// a direct exit (`{ if (q) { return null; } else { return null; } }`)
+/// dominates like a direct exit: the judge applies the walk's depth-2
+/// then+else rule to the same-line form (EPH-I0861). The judge and the
+/// walk then agree on every verdict class — direct exits silent, a
+/// nested conditional without an else fires, a nested conditional with
+/// both arms exiting is silent — on both the same-line and the
+/// multi-line forms. The outer-else family (the guard's own else arm,
+/// `{ return null; } else { return null; }`) fires on both forms; for
+/// the nested-then variant (`{ if (q) return null; } else { return
+/// null; }`) the firing is the semantically correct verdict, because
+/// the q-false path still falls through on null. One residual gap: the
+/// walk's multi-line twin of an unbraced then arm (`if (q) return null
+/// else { return null; }`) fires — the walk cannot see an exit line
+/// inside a conditional header — while this judge accepts the
+/// same-line form; the shape is rare and the judge's verdict is the
+/// semantically correct one. The judge accepts the else-terminated
+/// layout (`if (q) return null else { return null; }`) and, through
+/// the else-fragment join, the semicolon spelling (`if (q) return
+/// null; else { return null; }`); the semicolon spelling is a Zig
+/// parse error, so compilable code never carries it, while a broken
+/// file's guard still suppresses the same way (EPH-I0861).
+fn hasSameLineGuardExit(tail: []const u8) bool {
+    var stmt = mem.trim(u8, stripLineComment(tail), " \t\r");
+    if (stmt.len == 0) return false;
+    // A whole-tail braced block: judge its own body as the statement
+    // sequence, mirroring the walk's depth-1 rule for the block's lines.
+    if (stmt[0] == '{') {
+        if (stmt[stmt.len - 1] != '}') return false;
+        stmt = stmt[1 .. stmt.len - 1];
+    }
+    var depth: i32 = 0;
+    var mode: QuoteMode = .none;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < stmt.len) : (i += 1) {
+        const c = stmt[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c == '}') {
+            depth -= 1;
+            continue;
+        }
+        if (c == ';' and depth == 0) {
+            const piece = stmt[start .. i + 1];
+            if (isUnconditionalExitLine(piece)) return true;
+            if (nestedBothArmsExit(piece)) return true;
+            // A semicolon-terminated unbraced then arm splits at its own
+            // `;`, so the piece carries no else and nestedBothArmsExit
+            // rejects it alone. When the next fragment opens with the
+            // word `else`, the split cut a then+else conditional in
+            // half: re-judge the joined statement (EPH-I0861).
+            if (startsWithElseWord(stmt[i + 1 ..]) and nestedBothArmsExit(stmt[start..]))
+                return true;
+            start = i + 1;
+        }
+    }
+    // The nested-both-arms conditional carries no depth-0 semicolon of
+    // its own (its exits sit inside the arm braces), so it survives as
+    // the trailing fragment: judge it under the depth-2 rule only
+    // (EPH-I0861).
+    return nestedBothArmsExit(mem.trim(u8, stmt[start..], " \t\r"));
+}
+
+/// True when the statement is a nested conditional whose then and else
+/// arms both hold a direct exit (EPH-I0861): the same-line form of the
+/// walk's depth-2 then+else rule (judgeGuardWalkLine). The then arm may
+/// be braced or a direct exit statement; the else arm must be a braced
+/// block — the walk's `} else {` parity, so an `else if` chain, which
+/// can still fall through, does not qualify.
+fn nestedBothArmsExit(stmt: []const u8) bool {
+    const code = mem.trim(u8, stmt, " \t\r");
+    if (!mem.startsWith(u8, code, "if ")) return false;
+    const open = mem.indexOf(u8, code, "(") orelse return false;
+    const cond_close = parenCloseAt(code, open) orelse return false;
+    const then_arm = mem.trim(u8, code[cond_close + 1 ..], " \t\r");
+    const then_end: ?usize = if (then_arm.len > 0 and then_arm[0] == '{')
+        bracedArmExitEnd(then_arm)
+    else
+        unbracedArmExitEnd(then_arm);
+    const end = then_end orelse return false;
+    const rest = mem.trim(u8, then_arm[end..], " \t\r");
+    if (!mem.startsWith(u8, rest, "else")) return false;
+    const else_arm = mem.trim(u8, rest["else".len..], " \t\r");
+    if (else_arm.len == 0 or else_arm[0] != '{') return false;
+    return bracedArmExitEnd(else_arm) != null;
+}
+
+/// End offset of a braced arm (one past the matching close) when the
+/// arm's body holds an unconditional exit statement at the body's own
+/// depth; null otherwise (EPH-I0861).
+fn bracedArmExitEnd(arm: []const u8) ?usize {
+    var depth: i32 = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < arm.len) : (i += 1) {
+        const c = arm[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c != '}') continue;
+        depth -= 1;
+        if (depth != 0) continue;
+        if (armBodyHasDirectExit(arm[1..i])) return i + 1;
+        return null;
+    }
+    return null;
+}
+
+/// End offset of an unbraced arm (one past its terminating `;`) when
+/// the arm is a direct exit statement; null otherwise (EPH-I0861). The
+/// else-terminated layout (`if (q) return null else { return null; }`)
+/// carries no `;` at the arm end: the else keyword terminates the arm,
+/// so the direct-exit arm text is accepted without the semicolon
+/// (EPH-I0861).
+fn unbracedArmExitEnd(arm: []const u8) ?usize {
+    var depth: i32 = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < arm.len) : (i += 1) {
+        const c = arm[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c == '}') {
+            depth -= 1;
+            continue;
+        }
+        if (c == ';' and depth == 0) {
+            if (isUnconditionalExitLine(arm[0 .. i + 1])) return i + 1;
+            return null;
+        }
+        // The else-terminated arm: `return null else { ... }` — the `;`
+        // sits inside the else block, past the arm end, so the scan
+        // never finds it at depth 0. The else keyword ends the arm; the
+        // arm text up to it must be a direct exit statement.
+        if (c == 'e' and depth == 0 and wordIsElseAt(arm, i)) {
+            if (isExitStatementStart(arm[0..i])) return i;
+            return null;
+        }
+    }
+    return null;
+}
+
+/// True when `t[i..]` holds the whole word `else`: the keyword plus a
+/// non-identifier successor, so `elsewhere` does not match (EPH-I0861).
+fn wordIsElseAt(t: []const u8, i: usize) bool {
+    if (i + "else".len > t.len) return false;
+    if (!mem.eql(u8, t[i .. i + "else".len], "else")) return false;
+    if (i > 0 and isIdent(t[i - 1])) return false;
+    if (i + "else".len < t.len and isIdent(t[i + "else".len])) return false;
+    return true;
+}
+
+/// True when the trimmed text starts with the whole word `else` — the
+/// fragment join's gate: the fragment after a split then-arm opens the
+/// else arm of the same conditional (EPH-I0861).
+fn startsWithElseWord(t: []const u8) bool {
+    const code = mem.trim(u8, t, " \t\r");
+    if (!mem.startsWith(u8, code, "else")) return false;
+    return code.len == "else".len or !isIdent(code["else".len]);
+}
+
+/// True when the trimmed text is a direct exit statement without the
+/// terminating semicolon: `return null`, `break`, `continue` — the
+/// else-terminated arm form (`if (q) return null else { ... }`). The
+/// exit keyword must stand as a whole word (EPH-I0861).
+fn isExitStatementStart(t: []const u8) bool {
+    const code = mem.trim(u8, stripLineComment(t), " \t\r");
+    if (code.len == 0) return false;
+    const kw = if (mem.startsWith(u8, code, "return"))
+        "return"
+    else if (mem.startsWith(u8, code, "break"))
+        "break"
+    else if (mem.startsWith(u8, code, "continue"))
+        "continue"
+    else
+        return false;
+    if (code.len > kw.len and isIdent(code[kw.len])) return false;
+    return true;
+}
+
+/// True when the arm body holds an unconditional exit statement at the
+/// body's own depth (the depth-1 split, EPH-I0861).
+fn armBodyHasDirectExit(body: []const u8) bool {
+    var depth: i32 = 0;
+    var mode: QuoteMode = .none;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c == '}') {
+            depth -= 1;
+            continue;
+        }
+        if (c == ';' and depth == 0) {
+            if (isUnconditionalExitLine(body[start .. i + 1])) return true;
+            start = i + 1;
+        }
+    }
+    return false;
+}
+
 /// Extract the checked var and the edge the check holds on from a null
 /// check pattern (EPH-I0678). Patterns: "if (x != null)", "if (x) |_|",
 /// "while (x != null)" hold on the true edge. The early-return idiom
@@ -22554,13 +22870,20 @@ fn classifyNullCheck(t: []const u8, lines: []const []const u8, idx: usize) ?Null
     // Pattern: x == null with early return/continue/break - fall-through
     // Zig idiom: if (x == null) return; guarantees x is non-null after
     if (mem.indexOf(u8, after_paren, " == null)")) |eq_pos| {
-        const has_exit = mem.indexOf(u8, t, "return") != null or
-            mem.indexOf(u8, t, "continue") != null or
-            mem.indexOf(u8, t, "break") != null;
         // The window admits max_braced_guard_body_lines body lines past
         // the guard line; the +1 offsets the exclusive limit (EPH-I0858).
         const exit_limit = @min(idx + max_braced_guard_body_lines + 1, lines.len);
-        const has_block_exit = hasExitInFollowingBlock(lines, idx + 1, exit_limit);
+        // A same-line exit must sit at the guard's own depth: `return;`
+        // and `{ return; }` qualify, `{ if (q) return null; }` does not
+        // (EPH-I0859).
+        const tail = after_paren[eq_pos + " == null)".len ..];
+        const has_exit = hasSameLineGuardExit(tail);
+        // A guard whose braced body closes on the guard line itself has
+        // no following block: the walk would read the lines below as
+        // guard-body lines and misjudge a later function exit (EPH-I0859).
+        const block_closed = mem.indexOf(u8, t, "{") != null and countCurlyBalance(t) == 0;
+        const has_block_exit = !block_closed and
+            hasExitInFollowingBlock(lines, idx + 1, exit_limit);
         if (has_exit or has_block_exit)
             if (extractVarFromNullCheck(after_paren, eq_pos)) |v|
                 return .{ .var_name = v, .polarity = .false_edge };
@@ -22595,6 +22918,13 @@ fn hasNullEqualityCheck(ctx: []const u8, var_name: []const u8) bool {
         mem.startsWith(u8, after, " == null )");
 }
 
+/// Max following-block lines the early-return null-guard scan accepts
+/// for the exit below a candidate guard line (EPH-I0860). The walk reads
+/// at most this many body lines past the guard line; an exit farther
+/// down is stale for ZA801 suppression (EPH-I0225). The bound is
+/// exclusive: the walk covers N-1 lines.
+const max_early_return_guard_body_lines = 4;
+
 /// Check for early return null guard on prior lines
 fn hasEarlyReturnNullGuard(
     lines: []const []const u8,
@@ -22610,7 +22940,7 @@ fn hasEarlyReturnNullGuard(
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
         if (!hasNullEqualityCheck(ctx, var_name)) continue;
         if (hasExitStatement(ctx)) return true;
-        const check_end = @min(i + 4, current_idx);
+        const check_end = @min(i + max_early_return_guard_body_lines, current_idx);
         if (hasExitInFollowingBlock(lines, i + 1, check_end)) return true;
     }
     return false;
@@ -23481,11 +23811,20 @@ const ZeroGuardCtx = struct {
     current_idx: usize,
 };
 
+/// Max following-block lines the zero-check guard scan accepts for the
+/// exit below a candidate guard line (EPH-I0860). A zero check whose
+/// exit sits farther down does not dominate the guarded read. The bound
+/// is exclusive: the walk covers N-1 lines.
+const max_zero_check_guard_body_lines = 6;
+
 fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
     if (mem.indexOf(u8, ctx.t, ctx.var_name) == null) return false;
     if (mem.indexOf(u8, ctx.t, "== 0)") == null) return false;
     if (hasExitStatement(ctx.t)) return true;
-    const block_end = if (ctx.line_idx + 6 < ctx.current_idx) ctx.line_idx + 6 else ctx.current_idx;
+    const block_end = if (ctx.line_idx + max_zero_check_guard_body_lines < ctx.current_idx)
+        ctx.line_idx + max_zero_check_guard_body_lines
+    else
+        ctx.current_idx;
     return hasExitInFollowingBlock(ctx.lines, ctx.line_idx + 1, block_end);
 }
 
@@ -39549,6 +39888,181 @@ test "analyzeCFGMemory ZA802 fires past a nested conditional exit in the guard b
     ) == 1);
 }
 
+test "analyzeCFGMemory ZA802 fires past a same-line nested conditional exit in a braced guard (EPH-I0859)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { if (q) return null; }` on one line: the same-line
+    // exit sits inside a nested conditional, so the guard block falls
+    // through when q is false and the deref runs on null. The substring
+    // same-line exit gate accepted it; the depth-aware same-line judgment
+    // rejects it, and the guard block closing on the guard line keeps the
+    // following-block walk from reading the function's own return as a
+    // guard exit (EPH-I0859).
+    const content =
+        \\fn same_line_nested(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) { if (q) return null; }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_sameline_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_sameline_nested.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 silent past a same-line braced guard exit (EPH-I0859)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { return null; }` on one line: the braced body's
+    // exit is direct at the guard's own depth, so the deref below stays
+    // silent — the same-line depth judgment keeps the accepted braced
+    // shape (EPH-I0859).
+    const content =
+        \\fn same_line_braced(p: ?*u8) ?*u8 {
+        \\    if (p == null) { return null; }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_sameline_braced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_sameline_braced.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a plain same-line guard exit (EPH-I0859)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) return null;` — the unbraced same-line exit at the
+    // guard's own depth keeps its suppression under the depth judgment
+    // (EPH-I0859).
+    const content =
+        \\fn same_line_plain(p: ?*u8) ?*u8 {
+        \\    if (p == null) return null;
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_sameline_plain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_sameline_plain.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a same-line nested both-arms guard exit (EPH-I0861)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { if (q) { return null; } else { return null; } }`
+    // on one line: both arms of the nested conditional exit, so the
+    // guard block cannot fall through on null and the deref below stays
+    // silent. The same-line judge applies the walk's depth-2 then+else
+    // rule: the nested exits sit inside the arm braces, past the
+    // depth-0 semicolon split, so the split alone would reject the
+    // shape and the block_closed skip would keep the walk from covering
+    // it (EPH-I0861).
+    const content =
+        \\fn same_line_nested_both(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) { if (q) { return null; } else { return null; } }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_sameline_both.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_sameline_both.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a same-line unbraced-then both-arms guard (EPH-I0861)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The unbraced-then twin of the depth-2 rule: `if (q) return null
+    // else { return null; }` on one line. Both arms exit, so the guard
+    // block cannot fall through on null and the deref below stays
+    // silent. The else keyword terminates the unbraced arm (no
+    // semicolon at the arm end); the semicolon spelling is a Zig parse
+    // error and is judged through the else-fragment join (EPH-I0861).
+    const content =
+        \\fn same_line_unbraced_both(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) { if (q) return null else { return null; } }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_unbraced_both.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_unbraced_both.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 fires past the multi-line twin of an unbraced-then guard (EPH-I0861)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The walk's residual gap: the multi-line twin of the same-line
+    // unbraced-then shape. The walk cannot see an exit line inside a
+    // conditional header (`if (q) return null` opens a conditional, it
+    // is not an exit line), so the guard does not qualify and the deref
+    // fires. The same-line judge accepts the shape; the walk cannot
+    // (EPH-I0861).
+    const content =
+        \\fn multi_line_unbraced_both(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) {
+        \\        if (q) return null
+        \\        else { return null; }
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_unbraced_ml.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_unbraced_ml.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
 test "analyzeCFGMemory ZA802 fires past a switch-arm exit in the guard block (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -48510,6 +49024,38 @@ test "guardNullAtOrIf tracks the null state across assignments (EPH-I0330)" {
         "if (g == null or x == 1) {",
     };
     try std.testing.expect(!guardNullAtOrIf(&other_null, 2, "g"));
+
+    // The guard's declaration line carrying another variable's null
+    // initializer: the guard's own initializer decides, non-null
+    // (EPH-I0852).
+    const decl_other_null = [_][]const u8{
+        "var g: ?u32 = 5; var o: ?u32 = null;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(!guardNullAtOrIf(&decl_other_null, 1, "g"));
+
+    // The mirror: the guard's own initializer is null, the other
+    // variable's is not (EPH-I0852).
+    const decl_own_null = [_][]const u8{
+        "var g: ?u32 = null; var o: ?u32 = 5;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(guardNullAtOrIf(&decl_own_null, 1, "g"));
+}
+
+test "isNullGuardDecl classifies the guard's own initializer (EPH-I0852)" {
+    // The guard's own initializer decides; another variable's null on
+    // the line never counts.
+    try std.testing.expect(!isNullGuardDecl("var g: ?u32 = 5; var o: ?u32 = null;", "g"));
+    try std.testing.expect(isNullGuardDecl("var g: ?u32 = null; var o: ?u32 = 5;", "g"));
+    try std.testing.expect(isNullGuardDecl("var g: ?u32 = null;", "g"));
+    try std.testing.expect(!isNullGuardDecl("var g: ?u32 = 5;", "g"));
+    // A later direct assignment on the same line overrides the
+    // initializer: the last write decides (EPH-I0851 semantics).
+    try std.testing.expect(isNullGuardDecl("var g: ?u32 = 5; g = null;", "g"));
+    try std.testing.expect(!isNullGuardDecl("var g: ?u32 = null; g = 5;", "g"));
+    // A non-declaration line is never a null-guard declaration.
+    try std.testing.expect(!isNullGuardDecl("g = null;", "g"));
 }
 
 test "lastGuardWriteIsNull classifies the final occurrence (EPH-I0851)" {
@@ -48561,6 +49107,13 @@ test "allGuardAssignsCorrelate ignores other-var null writes (EPH-I0851)" {
         "if (guard) |_| {",
     };
     try std.testing.expect(allGuardAssignsCorrelate(&null_line, 3, "guard", "x"));
+
+    // A spaced-dot field write (`foo . x = 1`) is not a direct
+    // assignment occurrence of x: the hasLeftDot correlation path must
+    // reject it (EPH-I0854).
+    const dot_field = "foo . x = 1;";
+    const x_pos = mem.indexOf(u8, dot_field, "x").?;
+    try std.testing.expect(!isDirectAssignOccurrence(dot_field, "x", x_pos));
 }
 
 test "orGuardVariable requires a trailing null equality (EPH-I0330)" {
@@ -49264,6 +49817,65 @@ test "ZA607: or-guard stays silent in the loop with a null guard (EPH-I0330)" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_or_loop_good.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard fires when the guard declaration line carries another var's null (EPH-I0852)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `g` is declared non-null on the first line; the line-level `= null`
+    // substring of `o`'s declaration must not classify g as null. The
+    // first iteration evaluates `x == 1` against uninitialized x, so the
+    // read fires.
+    const content =
+        \\fn loopDeclOtherNull(items: []const bool) void {
+        \\    var g: ?u32 = 5; var o: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    for (items) |_| {
+        \\        if (g == null or x == 1) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_decl_other_null.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_or_decl_other_null.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard stays silent when the guard's own declaration initializer is null (EPH-I0852)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The mirror: `g`'s own initializer is null, so the first iteration
+    // short-circuits and the suppression holds. The other variable's
+    // non-null initializer on the line never counts.
+    const content =
+        \\fn loopDeclOwnNull(items: []const bool) void {
+        \\    var g: ?u32 = null; var o: ?u32 = 5;
+        \\    var x: u32 = undefined;
+        \\    for (items) |_| {
+        \\        if (g == null or x == 1) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_decl_own_null.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_or_decl_own_null.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -59180,6 +59792,116 @@ test "hasNullGuard finds a guard inside the lookback window (EPH-I0225)" {
     var buf: [8][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "if (x == null) return;", 1);
     try std.testing.expect(hasNullGuard(lines, lines.len - 1, 0, "x"));
+}
+
+test "hasNullCheckExit rejects a same-line nested conditional exit (EPH-I0861)" {
+    var buf: [4][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (x == null) { if (q) return; }", 1);
+    // The same-line exit sits inside a nested conditional: the guard
+    // block falls through when q is false, so the exit does not qualify
+    // (EPH-I0859 judgment, ZA203-family site).
+    try std.testing.expect(!hasNullCheckExit(lines[1], lines, 1, lines.len));
+}
+
+test "hasNullCheckExit accepts a same-line direct exit (EPH-I0861)" {
+    var buf: [4][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "if (x == null) return;", 1);
+    try std.testing.expect(hasNullCheckExit(lines[1], lines, 1, lines.len));
+    const braced = guardScanFixture(&buf, "work();", "if (x == null) { return; }", 1);
+    try std.testing.expect(hasNullCheckExit(braced[1], braced, 1, braced.len));
+    // A continued condition keeps its exit: the condition close is the
+    // whole paren group, not the `== null)` position (EPH-I0861).
+    const continued = guardScanFixture(&buf, "work();", "if (x == null || q) return;", 1);
+    try std.testing.expect(hasNullCheckExit(continued[1], continued, 1, continued.len));
+}
+
+test "hasSameLineGuardExit applies the depth-2 then+else rule (EPH-I0861)" {
+    // A nested conditional whose then and else arms both exit dominates
+    // the guard's fall-through like a direct exit: the same-line form of
+    // the walk's depth-2 rule (EPH-I0861).
+    try std.testing.expect(hasSameLineGuardExit("{ if (q) { return null; } else { return null; } }"));
+    // Nested without an else stays rejected: the q-false path falls
+    // through (EPH-I0859).
+    try std.testing.expect(!hasSameLineGuardExit("{ if (q) return null; }"));
+    // The outer-else family (the guard's own else arm) is not the nested
+    // conditional's else: the then-arm's nested exit alone does not
+    // qualify, so the shape fires (EPH-I0861).
+    try std.testing.expect(!hasSameLineGuardExit("{ if (q) return null; } else { return null; }"));
+    // Direct and braced direct exits keep their depth-1 acceptance.
+    try std.testing.expect(hasSameLineGuardExit("return null;"));
+    try std.testing.expect(hasSameLineGuardExit("{ return null; }"));
+    // The else-if chain can still fall through: rejected like the walk's
+    // plain-else-opener rule (EPH-I0861).
+    try std.testing.expect(!hasSameLineGuardExit("{ if (q) { return null; } else if (r) { return null; } }"));
+    // An else arm without an exit does not qualify.
+    try std.testing.expect(!hasSameLineGuardExit("{ if (q) { return null; } else { work(); } }"));
+    // The unbraced-then twin of the both-arms rule: the then arm is a
+    // direct exit without braces. The else-terminated layout carries no
+    // semicolon at the arm end (`if (q) return null else { return null; }`,
+    // the Zig grammar's AssignExpr KEYWORD_else form, EPH-I0861).
+    try std.testing.expect(hasSameLineGuardExit("{ if (q) return null else { return null; } }"));
+    // The semicolon spelling (`if (q) return null; else { return null; }`)
+    // is a Zig parse error; the judge accepts it anyway through the
+    // else-fragment join, so a broken file's guard still suppresses the
+    // same way (EPH-I0861).
+    try std.testing.expect(hasSameLineGuardExit("{ if (q) return null; else { return null; } }"));
+    // The unbraced-then twin stays rejected when the else arm does not
+    // exit: the q-false path falls through (EPH-I0861).
+    try std.testing.expect(!hasSameLineGuardExit("{ if (q) return null else { work(); } }"));
+    // A then arm that is not a direct exit stays rejected: the q-true
+    // path falls through (EPH-I0861).
+    try std.testing.expect(!hasSameLineGuardExit("{ if (q) work() else { return null; } }"));
+}
+
+test "analyzeCFGMemory ZA203 fires past a same-line nested conditional exit in a braced guard (EPH-I0861)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { if (q) return 0; }` on one line: the exit sits
+    // inside a nested conditional, so the block falls through when q is
+    // false and `p orelse unreachable` panics on null. The substring
+    // same-line exit gate suppressed it; the depth judgment lets ZA203
+    // fire (EPH-I0861).
+    const content =
+        \\fn za203_same_line_nested(p: ?*u8, q: bool) u8 {
+        \\    if (p == null) { if (q) return 0; }
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za203_sameline_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "test_za203_sameline_nested.zig", RULE_ORELSE_UNREACHABLE),
+    );
+}
+
+test "analyzeCFGMemory ZA203 silent past a same-line direct guard exit (EPH-I0861)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The direct same-line guard exit keeps its ZA203 suppression under
+    // the depth judgment (EPH-I0861).
+    const content =
+        \\fn za203_same_line_direct(p: ?*u8) u8 {
+        \\    if (p == null) return 0;
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za203_sameline_direct.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "test_za203_sameline_direct.zig", RULE_ORELSE_UNREACHABLE),
+    );
 }
 
 test "hasNullGuard misses a guard beyond the lookback window (EPH-I0225)" {

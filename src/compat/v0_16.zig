@@ -15,6 +15,9 @@
 
 const std = @import("std");
 pub const vocab = @import("vocab.zig");
+// Shared quote machine for the code-position mask (EPH-I0880). types.zig
+// imports only std, so this import edge stays cycle-free.
+const types = @import("../types.zig");
 
 /// Version identifier
 pub const version = "0.16";
@@ -1037,67 +1040,24 @@ pub const managed_container_type_patterns: []const []const u8 = &.{
 // Helper functions
 // ============================================================================
 
-/// Quote-literal state for the code-position mask (EPH-I0876). Mirrors the
-/// types.zig state machine: an odd backslash run keeps a quote as data, a
-/// `'...'` char literal never opens string state, and a `\\` opener makes
-/// the rest of the line string data (EPH-I0671).
-const QuoteMask = enum { none, str, char, mline };
-
-/// Advance the quote scan past one char. A backslash inside a literal also
-/// skips the escaped char, so `i` can move two steps.
-fn stepQuoteMask(mode: *QuoteMask, line: []const u8, i: *usize) void {
-    const c = line[i.*];
-    switch (mode.*) {
-        .char => {
-            if (c == '\\') i.* += 1;
-            if (c == '\'') mode.* = .none;
-        },
-        .str => {
-            if (c == '\\') i.* += 1;
-            if (c == '"') mode.* = .none;
-        },
-        .mline => {},
-        .none => {
-            if (i.* + 1 < line.len and c == '\\' and line[i.* + 1] == '\\') mode.* = .mline;
-            if (c == '\'') mode.* = .char;
-            if (c == '"') mode.* = .str;
-        },
-    }
-}
-
-/// Incremental per-line string/char-literal classifier (EPH-I0876). Mirrors
-/// types.zig LineClassifier: each query continues the scan from the previous
-/// position, so any ascending query sequence on one line costs O(line)
-/// total. Queries MUST NOT move backwards.
-const MaskScanner = struct {
-    line: []const u8,
-    scanned: usize = 0,
-    mode: QuoteMask = .none,
-
-    fn init(line: []const u8) MaskScanner {
-        return .{ .line = line };
-    }
-
-    /// True when column `col` sits inside a string literal or a
-    /// multiline-string body.
-    fn isMasked(self: *MaskScanner, col: usize) bool {
-        std.debug.assert(col >= self.scanned);
-        while (self.scanned < col and self.scanned < self.line.len) : (self.scanned += 1) {
-            stepQuoteMask(&self.mode, self.line, &self.scanned);
-        }
-        return self.mode == .str or self.mode == .mline;
-    }
-};
+// The code-position mask routes through the shared quote machine:
+// types.LineClassifier owns the quote state (EPH-I0876) and its edge battery
+// (EPH-I0104 char-literal spans, EPH-I0671 multiline openers). The compat
+// layer uses that one machine instead of a local copy, so the version
+// modules cannot drift from the analyzer's own classifier (EPH-I0880).
+// findCommentStart and containsPatternInCode stay local: they search THIS
+// module's pattern tables at code positions — version-specific text logic,
+// not quote state.
 
 /// Start of the real `//` comment: not inside a string literal. A line that
 /// is a multiline-string body has no comment (EPH-I0876).
 fn findCommentStart(line: []const u8) ?usize {
     const t = std.mem.trimStart(u8, line, " \t");
     if (std.mem.startsWith(u8, t, "\\\\")) return null;
-    var scanner = MaskScanner.init(line);
+    var scanner = types.LineClassifier.init(line);
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, line, pos, "//")) |idx| {
-        if (!scanner.isMasked(idx)) return idx;
+        if (!scanner.isInsideString(idx)) return idx;
         pos = idx + 2;
     }
     return null;
@@ -1108,11 +1068,11 @@ fn findCommentStart(line: []const u8) ?usize {
 /// that merely names a builtin or method never matches (EPH-I0876).
 fn containsPatternInCode(line: []const u8, pattern: []const u8) bool {
     const comment_start = findCommentStart(line);
-    var scanner = MaskScanner.init(line);
+    var scanner = types.LineClassifier.init(line);
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, line, from, pattern)) |pos| {
         from = pos + pattern.len;
-        if (scanner.isMasked(pos)) continue;
+        if (scanner.isInsideString(pos)) continue;
         if (comment_start != null and pos >= comment_start.?) continue;
         return true;
     }
@@ -1228,6 +1188,28 @@ test "comment or string naming a builtin or method never suppresses (EPH-I0876)"
     try std.testing.expect(!containsOptionalMethod("_ = foo(); const s = \"iter.next()\";"));
     // Real code positions still match.
     try std.testing.expect(containsOptionalMethod("_ = map.get(key);"));
+}
+
+test "code-position mask keeps the shared classifier edges (EPH-I0880)" {
+    // Char-literal span: the `"` inside `'...'` is data (EPH-I0104), so a
+    // `//` after the closed literal is a real comment and its text never
+    // matches a builtin.
+    try std.testing.expect(!containsBuiltin("const q = '\"'; // @sizeOf is data"));
+    try std.testing.expect(findCommentStart("const q = '\"'; // real comment") != null);
+    // Multiline opener: the tail is string data (EPH-I0671), so neither a
+    // comment nor a builtin exists after it.
+    try std.testing.expect(!containsBuiltin("const s = \\\\ @sizeOf data"));
+    try std.testing.expect(findCommentStart("const s = \\\\ tail // data") == null);
+    // Escaped quote: `\"` keeps the string open, so the `//` is string
+    // data, not a comment.
+    try std.testing.expect(!containsBuiltin("const s = \"a \\\" b; // @sizeOf"));
+    // Unterminated string: the `//` and the pattern are string data.
+    try std.testing.expect(!containsBuiltin("const s = \"unterminated // @sizeOf"));
+    // Comment text: a quote inside a comment never opens string state, and
+    // comment prose never matches.
+    try std.testing.expect(!containsBuiltin("// \"quoted\" @sizeOf"));
+    // Code after a closed char literal still matches.
+    try std.testing.expect(containsBuiltin("const q = 'a'; _ = @sizeOf(u32);"));
 }
 
 test "containsErrorMethod detects error-returning methods" {

@@ -13405,12 +13405,12 @@ fn isDirectReturnAlloc(t: []const u8) bool {
 // Error Analysis Helpers
 // ============================================================================
 
-/// Check if code is in a test context (test file path or inside test block)
+/// Check if code is in a test context: inside a test block, or the file
+/// path classifies as a test file. The path half routes through
+/// isTestFilePath, so every test-context suppression shares one boundary
+/// (EPH-I0422, band B06 F16).
 fn isInTestContext(path: []const u8, in_test_block: bool) bool {
-    if (in_test_block) return true;
-    if (mem.indexOf(u8, path, "_test.zig") != null) return true;
-    if (mem.indexOf(u8, path, "/test") != null) return true;
-    return false;
+    return in_test_block or isTestFilePath(path);
 }
 
 /// True when the text contains any of the patterns.
@@ -13889,16 +13889,6 @@ fn extractVarDeclName(t: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Check if &var_name appears at position (pointer passed to function)
-fn hasPointerToVar(t: []const u8, pos: usize, var_name: []const u8) bool {
-    if (t[pos] != '&') return false;
-    const after = pos + 1;
-    if (after + var_name.len > t.len) return false;
-    if (!mem.eql(u8, t[after .. after + var_name.len], var_name)) return false;
-    const end_pos = after + var_name.len;
-    return end_pos >= t.len or !isIdent(t[end_pos]);
-}
-
 /// Check if any occurrence of var_name is directly filled on this line:
 /// &var, &(var) (grouping parens, EPH-I0822), &Struct.var, var[...] =, or
 /// var as an assignment target.
@@ -14104,36 +14094,36 @@ const StructLiteralState = struct {
 fn matchesStructField(
     t: []const u8,
     pos: usize,
-    sn: []const u8,
-    fn_: []const u8,
+    struct_name: []const u8,
+    field_name: []const u8,
 ) bool {
-    if (pos + sn.len >= t.len) return false;
-    if (!mem.eql(u8, t[pos .. pos + sn.len], sn)) return false;
-    const after_s = pos + sn.len;
+    if (pos + struct_name.len >= t.len) return false;
+    if (!mem.eql(u8, t[pos .. pos + struct_name.len], struct_name)) return false;
+    const after_s = pos + struct_name.len;
     if (after_s >= t.len or t[after_s] != '.') return false;
     const fld_start = after_s + 1;
-    if (fld_start + fn_.len > t.len) return false;
-    if (!mem.eql(u8, t[fld_start .. fld_start + fn_.len], fn_)) return false;
-    const af = fld_start + fn_.len;
+    if (fld_start + field_name.len > t.len) return false;
+    if (!mem.eql(u8, t[fld_start .. fld_start + field_name.len], field_name)) return false;
+    const af = fld_start + field_name.len;
     return af >= t.len or !isIdent(t[af]);
 }
 
 /// Check for &struct.field pattern
-fn hasPointerPattern(t: []const u8, sn: []const u8, fn_: []const u8) bool {
+fn hasPointerPattern(t: []const u8, struct_name: []const u8, field_name: []const u8) bool {
     for (t, 0..) |c, i| {
         if (c != '&') continue;
-        if (matchesStructField(t, i + 1, sn, fn_)) return true;
+        if (matchesStructField(t, i + 1, struct_name, field_name)) return true;
     }
     return false;
 }
 
 /// Check for struct.field = pattern
-fn hasAssignPattern(t: []const u8, sn: []const u8, fn_: []const u8) bool {
+fn hasAssignPattern(t: []const u8, struct_name: []const u8, field_name: []const u8) bool {
     var i: usize = 0;
-    while (i + sn.len < t.len) : (i += 1) {
+    while (i + struct_name.len < t.len) : (i += 1) {
         if (i > 0 and isIdent(t[i - 1])) continue;
-        if (!matchesStructField(t, i, sn, fn_)) continue;
-        const af = i + sn.len + 1 + fn_.len;
+        if (!matchesStructField(t, i, struct_name, field_name)) continue;
+        const af = i + struct_name.len + 1 + field_name.len;
         var j = af;
         while (j < t.len and t[j] == ' ') j += 1;
         if (j < t.len and t[j] == '=') return true;
@@ -14142,8 +14132,9 @@ fn hasAssignPattern(t: []const u8, sn: []const u8, fn_: []const u8) bool {
 }
 
 /// Check if struct field is filled
-fn isStructFieldFilled(t: []const u8, sn: []const u8, fn_: []const u8) bool {
-    return hasPointerPattern(t, sn, fn_) or hasAssignPattern(t, sn, fn_);
+fn isStructFieldFilled(t: []const u8, struct_name: []const u8, field_name: []const u8) bool {
+    return hasPointerPattern(t, struct_name, field_name) or
+        hasAssignPattern(t, struct_name, field_name);
 }
 
 /// Check if position starts a struct literal (Type{ or .{)
@@ -14170,17 +14161,11 @@ fn extractStructVarName(t: []const u8) ?[]const u8 {
     if (end <= start) return null;
 
     const name = t[start..end];
-    var i = skipSpaces(t, end);
+    var i = skipBlanks(t, end);
     if (i >= t.len or t[i] != '=') return null;
-    i = skipSpaces(t, i + 1);
+    i = skipBlanks(t, i + 1);
 
     return if (isStructLiteralStart(t, i)) name else null;
-}
-
-fn skipSpaces(t: []const u8, start: usize) usize {
-    var i = start;
-    while (i < t.len and t[i] == ' ') i += 1;
-    return i;
 }
 
 /// Extract field name from ".field_name = undefined"
@@ -14288,21 +14273,27 @@ fn makeUndefinedIssue(path: []const u8, ln: usize, col: usize) ?Issue {
     };
 }
 
-/// Update brace depth tracking
+/// Update brace depth tracking: only braces in code position count.
+/// Braces inside string literals, char literals, and comments are data,
+/// and counting them ends a scope early (EPH-I0421, band B06 N5).
 fn updateBraceDepth(t: []const u8, depth: *usize) void {
-    for (t) |c| {
-        if (c == '{') depth.* += 1;
-        if (c == '}' and depth.* > 0) depth.* -= 1;
+    var lit = types.LiteralState.forLine(t) orelse return;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '{') depth.* += 1;
+        if (t[pos] == '}' and depth.* > 0) depth.* -= 1;
     }
 }
 
-/// Check if scope has ended
-fn hasScopeEnded(t: []const u8, brace_depth: usize) bool {
+/// Check if the enclosing scope ended on this line: the brace depth hit
+/// zero, the line starts a return, or the line opens a new function.
+/// One implementation serves both the pending-undefined scan and the
+/// pending-struct-field scan (EPH-I0421, band B06 F15).
+fn isScopeEnd(t: []const u8, brace_depth: usize) bool {
     if (brace_depth == 0) return true;
-    if (mem.startsWith(u8, t, "return ")) return true;
-    if (mem.startsWith(u8, t, "return;")) return true;
-    const has_fn = mem.indexOf(u8, t, "fn ") != null;
-    return has_fn and mem.indexOf(u8, t, "(") != null;
+    if (mem.startsWith(u8, t, "return ") or mem.startsWith(u8, t, "return;")) return true;
+    return mem.indexOf(u8, t, "fn ") != null and mem.indexOf(u8, t, "(") != null;
 }
 
 /// Line context bundle for ZA204 undefined tracking (keeps helpers ≤4 params)
@@ -14329,7 +14320,7 @@ fn updatePendingUndefinedSet(
         }
         var depth = item.brace_depth;
         updateBraceDepth(ctx.t, &depth);
-        if (!hasScopeEnded(ctx.t, depth)) {
+        if (!isScopeEnd(ctx.t, depth)) {
             set.items[i].brace_depth = depth;
             i += 1;
             continue;
@@ -14537,9 +14528,6 @@ const ErrorAnalysisState = struct {
     // Track current function name for context-sensitive checks
     current_func_name: []const u8 = "",
     func_brace_depth: usize = 0,
-    // Track catch blocks (error recovery context - silent catch is intentional)
-    in_catch_block: bool = false,
-    catch_brace_depth: usize = 0,
     // Track if current function has any defer statements (for ZA206)
     has_defer_in_func: bool = false,
 };
@@ -14567,16 +14555,22 @@ fn trackStaticStructBraces(t: []const u8, state: *ErrorAnalysisState) void {
     }
 }
 
-/// Track brace depth for a block, returning updated in_block and depth.
-/// Used by defer, catch, and function tracking.
+/// Track code-position brace depth for a block, returning updated in_block
+/// and depth. Braces inside string literals, char literals, and comments
+/// are data and never close the block (EPH-I0421, band B06 N5). Used by
+/// defer-block and function-context tracking.
 const BraceTrackResult = struct { in_block: bool, depth: usize };
 
 fn trackBraceBlock(t: []const u8, in_block: bool, depth: usize) BraceTrackResult {
     var d = depth;
     var active = in_block;
-    for (t) |c| {
-        if (c == '{') d += 1;
-        if (c == '}' and d > 0) {
+    var lit = types.LiteralState.forLine(t) orelse
+        return .{ .in_block = active, .depth = d };
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '{') d += 1;
+        if (t[pos] == '}' and d > 0) {
             d -= 1;
             if (d == 0) active = false;
         }
@@ -14617,29 +14611,6 @@ fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
     if (containsAnyPatternInCode(t, &defer_keyword_pats)) state.has_defer_in_func = true;
 }
 
-/// Detect if line starts a catch block (not a silent catch {})
-fn isCatchBlockStart(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "catch |") != null) return true;
-    return mem.indexOf(u8, t, "} catch {") != null and mem.indexOf(u8, t, "catch {}") == null;
-}
-
-/// Track catch blocks for error recovery context detection
-fn trackCatchBlock(t: []const u8, state: *ErrorAnalysisState) void {
-    if (isCatchBlockStart(t)) {
-        if (mem.indexOf(u8, t, "{") != null) {
-            const r = startBraceBlock(t);
-            state.in_catch_block = r.in_block;
-            state.catch_brace_depth = r.depth;
-        }
-        return;
-    }
-    if (state.in_catch_block) {
-        const r = trackBraceBlock(t, true, state.catch_brace_depth);
-        state.in_catch_block = r.in_block;
-        state.catch_brace_depth = r.depth;
-    }
-}
-
 /// Extract function name from function declaration line. Code-position
 /// scan: "fn " in a trailing comment or string literal never resets the
 /// fn context (EPH-I0416, band B06 F10d).
@@ -14668,11 +14639,8 @@ fn extractFuncName(t: []const u8) ?[]const u8 {
 fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState) void {
     if (extractFuncName(t)) |name| {
         state.current_func_name = name;
-        state.func_brace_depth = 0;
+        state.func_brace_depth = startBraceBlock(t).depth;
         state.has_defer_in_func = false;
-        for (t) |c| {
-            if (c == '{') state.func_brace_depth += 1;
-        }
         return;
     }
     if (state.current_func_name.len == 0) return;
@@ -14712,15 +14680,14 @@ fn trackStructBraces(t: []const u8, ss: *StructLiteralState) void {
 /// Collect undefined field if found
 fn collectUndefinedField(t: []const u8, ln: usize, s: *ErrorAnalysisState) void {
     if (!s.struct_state.in_literal) return;
-    if (mem.indexOf(u8, t, "= undefined") == null) return;
+    const undef_pos = mem.indexOf(u8, t, "= undefined") orelse return;
     const field = extractStructFieldName(t) orelse return;
     if (s.pending_field_count >= s.pending_struct_fields.len) return;
-    const col = mem.indexOf(u8, t, "= undefined") orelse 0;
     s.pending_struct_fields[s.pending_field_count] = .{
         .struct_name = s.struct_state.struct_name,
         .field_name = field,
         .line = ln,
-        .col = col + 1,
+        .col = undef_pos + 1,
     };
     s.pending_field_count += 1;
 }
@@ -14732,15 +14699,6 @@ fn activatePendingFields(state: *ErrorAnalysisState) void {
     for (state.pending_struct_fields[0..state.pending_field_count]) |*pf| {
         pf.active = true;
     }
-}
-
-/// Check if line ends the scope (return or new function)
-fn isScopeEnd(t: []const u8) bool {
-    if (mem.startsWith(u8, t, "return ")) return true;
-    if (mem.startsWith(u8, t, "return;")) return true;
-    const has_fn = mem.indexOf(u8, t, "fn ") != null;
-    const has_paren = mem.indexOf(u8, t, "(") != null;
-    return has_fn and has_paren;
 }
 
 /// Line inputs for the pending-struct-field scan (ZA204 undefined fields).
@@ -14768,7 +14726,11 @@ fn checkPendingFields(
             removePendingField(state, i);
             continue;
         }
-        if (isScopeEnd(ctx.t)) {
+        // The pending field's scope is the enclosing fn body. The report
+        // fires when the code-position brace depth nets to zero on the
+        // line, when the line returns, or when the line opens a new fn.
+        // Braces inside strings and comments are data (EPH-I0421).
+        if (isScopeEnd(ctx.t, state.func_brace_depth)) {
             try reportUnfilledField(issues, allocator, ctx.path, pf);
             removePendingField(state, i);
             continue;
@@ -14787,11 +14749,24 @@ fn removePendingField(state: *ErrorAnalysisState, i: usize) void {
     }
 }
 
-/// Check if path is likely a test file
+/// Check if path is a test file: the file name contains `_test.zig`, or
+/// any path segment is exactly `test` or `tests`. Both `/` and `\`
+/// separate segments, so Windows paths classify too. WHY: one classifier
+/// serves every test-context suppression (ZA201/202/203/208, ZA204's
+/// skip, ZT104, ZT105); the old loose `/test` substring matched
+/// `/testbed/` and `/testing/`, and the old strict form missed a
+/// top-level `test/` dir and Windows separators (EPH-I0422, band B06 F16).
 fn isTestFilePath(path: []const u8) bool {
-    return mem.indexOf(u8, path, "_test.zig") != null or
-        mem.indexOf(u8, path, "/test/") != null or
-        mem.indexOf(u8, path, "/tests/") != null;
+    if (mem.indexOf(u8, path, "_test.zig") != null) return true;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= path.len) : (i += 1) {
+        if (i < path.len and path[i] != '/' and path[i] != '\\') continue;
+        const seg = path[start..i];
+        if (mem.eql(u8, seg, "test") or mem.eql(u8, seg, "tests")) return true;
+        start = i + 1;
+    }
+    return false;
 }
 
 /// Report unfilled struct field
@@ -15409,7 +15384,7 @@ fn checkLineErrors(ctx: ErrorLineCtx) !void {
     // ZA205 emits only from analyzeIgnoredErrors (EPH-I0408). A second
     // emitter here double-reported every zero-arg discard.
     // ZA208: @panic() detection — suppress in test blocks and test files
-    if (!ctx.in_test and !isTestFilePath(ctx.path)) {
+    if (!ctx.in_test) {
         if (checkPanic(ctx.t, ctx.path, ctx.line)) |i| {
             try ctx.issues.append(ctx.allocator, i);
         }
@@ -15525,8 +15500,7 @@ fn updateErrorState(
     }
     if (state.in_static_struct) trackStaticStructBraces(t, state);
 
-    const skip = in_test or isTestFilePath(path) or
-        isModuleLevelDecl(line) or state.in_static_struct;
+    const skip = in_test or isModuleLevelDecl(line) or state.in_static_struct;
 
     trackFunctionContext(t, state);
     trackDeferBlock(t, state);
@@ -15620,11 +15594,17 @@ fn analyzeFileErrors(
     try reportEndOfFileIssues(&state, a.path, issues, allocator);
 }
 
+/// Run the error-handling analyzers (ZA201-ZA210) over every file in the
+/// graph and return the merged issue list. WHY: this driver is the only
+/// top-level analyzer the band left undocumented; its list carries
+/// heap-owned messages, so the OOM path frees the partial list with
+/// errdefer (EPH-I0419, band B06 F14).
 fn analyzeErrors(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeFileErrors(allocator, &issues, entry.value_ptr.*);
@@ -19629,12 +19609,17 @@ fn analyzeFileComplexity(
     }
 }
 
+/// Run the complexity analyzers (ZA301-ZA306) over every file in the
+/// graph and return the merged issue list. The list carries heap-owned
+/// messages, so the OOM path frees the partial list with errdefer
+/// (EPH-I0459, band B09 F10).
 fn analyzeComplexity(
     allocator: Allocator,
     graph: *ImportGraph,
     th: Thresholds,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeFileComplexity(allocator, &issues, entry.value_ptr.*, th);
@@ -19651,6 +19636,7 @@ fn analyzeAstTier(
     stats: ?*ast_tier.Stats,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const fa = entry.value_ptr.*;
@@ -19817,12 +19803,17 @@ fn analyzeStyleFile(
     }
 }
 
+/// Run the style analyzers (ZA701/ZA702) over every file in the graph and
+/// return the merged issue list. The list carries heap-owned messages, so
+/// the OOM path frees the partial list with errdefer (EPH-I0459,
+/// band B09 F10).
 fn analyzeStyle(
     allocator: Allocator,
     graph: *ImportGraph,
     th: Thresholds,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeStyleFile(&issues, allocator, entry.value_ptr.*, th);
@@ -62797,6 +62788,260 @@ test "extractVarDeclNameBefore skips type-qualifier const" {
     const multi = "var a = undefined; var b ";
     try std.testing.expectEqualStrings("b", extractVarDeclNameBefore(multi, multi.len).?);
     try std.testing.expect(extractVarDeclNameBefore("y ", 2) == null);
+}
+
+test "isStructFieldFilled keeps fill verdicts after param rename (EPH-I0420)" {
+    // The four struct-field helpers take (struct_name, field_name) since
+    // the sn/fn_ rename; the verdicts are the pins (band B06 F15).
+    try std.testing.expect(isStructFieldFilled("s.x = 1;", "s", "x"));
+    try std.testing.expect(isStructFieldFilled("&s.x", "s", "x"));
+    try std.testing.expect(!isStructFieldFilled("s.x = 1;", "s", "y"));
+    try std.testing.expect(!isStructFieldFilled("s.xy = 1;", "s", "x"));
+}
+
+test "skipBlanks skips spaces and tabs (EPH-I0421)" {
+    // The space-only skipSpaces merged into skipBlanks; tabs advance too.
+    try std.testing.expectEqual(@as(usize, 5), skipBlanks("ab \t c", 2));
+    try std.testing.expectEqual(@as(usize, 2), skipBlanks("  x", 0));
+    try std.testing.expectEqual(@as(usize, 3), skipBlanks("ab c", 2));
+    try std.testing.expectEqual(@as(usize, 1), skipBlanks("abcde", 1));
+}
+
+test "isScopeEnd unifies the depth and return/fn predicates (EPH-I0421)" {
+    // Depth 0 ends the scope on any line; return starts and fn-with-paren
+    // openers end it at depth > 0; ordinary lines do not.
+    try std.testing.expect(isScopeEnd("x = 1;", 0));
+    try std.testing.expect(isScopeEnd("return x;", 3));
+    try std.testing.expect(isScopeEnd("return;", 2));
+    try std.testing.expect(isScopeEnd("fn g() void {", 1));
+    try std.testing.expect(!isScopeEnd("x = 1;", 2));
+    try std.testing.expect(!isScopeEnd("use(s);", 1));
+}
+
+test "collectUndefinedField records one field with 1-based col (EPH-I0421)" {
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "s";
+    collectUndefinedField(".a = undefined;", 3, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_field_count);
+    try std.testing.expectEqualStrings("a", s.pending_struct_fields[0].field_name);
+    try std.testing.expectEqual(@as(usize, 3), s.pending_struct_fields[0].line);
+    try std.testing.expectEqual(@as(usize, 4), s.pending_struct_fields[0].col);
+}
+
+test "ZA204: unfilled struct field reports at the fn closing line (EPH-I0421)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The pending field's scope is the fn body: the report must survive
+    // the lines between the literal close and the fn's closing brace.
+    const content =
+        \\fn build() void {
+        \\    var s = Foo{
+        \\        .a = undefined,
+        \\    };
+        \\    use(s);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_close.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_close.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), countRuleIssues(
+        issues.items,
+        "za204_close.zig",
+        RULE_UNDEFINED_USAGE,
+    ));
+    var found_line: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
+            mem.eql(u8, issue.file, "za204_close.zig"))
+        {
+            found_line = issue.line;
+        }
+    }
+    // The report points at the `= undefined` line, not the closing brace.
+    try std.testing.expectEqual(@as(usize, 3), found_line);
+}
+
+test "ZA204: brace in a string literal does not end the pending field scope (EPH-I0421)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The discriminator: `log("}", .{})` nets the fn brace depth to zero
+    // with a raw scan, so the pre-fix code reports the pending field at
+    // the string line. This test asserts zero findings where the raw scan
+    // reported one, and the fill two lines down suppresses the field.
+    const content =
+        \\fn build() void {
+        \\    var s = Foo{
+        \\        .a = undefined,
+        \\    };
+        \\    log("}", .{});
+        \\    s.a = 1;
+        \\    use(s);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_str_brace.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_str_brace.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        issues.items,
+        "za204_str_brace.zig",
+        RULE_UNDEFINED_USAGE,
+    ));
+}
+
+test "ZA204: brace in a trailing comment does not end the pending field scope (EPH-I0421)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Same discriminator as the string-literal pin: the comment brace is
+    // prose, never a scope close. The fill after the comment suppresses
+    // the pending field, so the file reports zero ZA204 findings.
+    const content =
+        \\fn build() void {
+        \\    var s = Foo{
+        \\        .a = undefined,
+        \\    };
+        \\    use(s); // }
+        \\    s.a = 1;
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_cmt_brace.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_cmt_brace.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        issues.items,
+        "za204_cmt_brace.zig",
+        RULE_UNDEFINED_USAGE,
+    ));
+}
+
+test "isTestFilePath: one classifier for dir segments on either separator (EPH-I0422)" {
+    // Documented test-file semantics: `_test.zig` names and `test`/`tests`
+    // directory segments. The old loose `/test` matched `/testbed/` and
+    // `/testing/`; the segment classifier keeps them out (band B06 F16).
+    // Windows `\` separators classify too.
+    try std.testing.expect(isTestFilePath("src/main_test.zig"));
+    try std.testing.expect(isTestFilePath("test/foo.zig"));
+    try std.testing.expect(isTestFilePath("tests/foo.zig"));
+    try std.testing.expect(isTestFilePath("src/test/foo.zig"));
+    try std.testing.expect(isTestFilePath("src/tests/foo.zig"));
+    try std.testing.expect(isTestFilePath("src\\test\\foo.zig"));
+    try std.testing.expect(!isTestFilePath("src/main.zig"));
+    try std.testing.expect(!isTestFilePath("src/testbed/foo.zig"));
+    try std.testing.expect(!isTestFilePath("src/testing/foo.zig"));
+    try std.testing.expect(!isTestFilePath("src/testdata/foo.zig"));
+    try std.testing.expect(!isTestFilePath("src/contest/foo.zig"));
+}
+
+test "isInTestContext: block flag or the shared path classifier (EPH-I0422)" {
+    try std.testing.expect(isInTestContext("src/main.zig", true));
+    try std.testing.expect(isInTestContext("src/test/foo.zig", false));
+    try std.testing.expect(!isInTestContext("src/testbed/foo.zig", false));
+    try std.testing.expect(!isInTestContext("src/main.zig", false));
+}
+
+test "ZA201 fires inside a catch block body (EPH-I0414)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The removed catch-block tracker promised an error-recovery
+    // suppression that was never wired: a silent catch inside a
+    // `catch |err| { ... }` body still fires (band B06 F8).
+    const content =
+        \\fn foo() void {
+        \\    bar() catch |err| {
+        \\        baz() catch {};
+        \\    };
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "i0414_nested_catch.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "i0414_nested_catch.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "i0414_nested_catch.zig", RULE_SILENT_CATCH),
+    );
+}
+
+test "analyzer drivers free their issue lists on the happy path (EPH-I0459)" {
+    // The four return-by-value drivers carry errdefer deinitIssues on the
+    // OOM path; a wrong defer (or a double fire) trips the testing
+    // allocator when the caller frees the returned lists.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const content =
+        \\fn f() !void {
+        \\    return error.X;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "i0459_drivers.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "i0459_drivers.zig"), {});
+
+    const th = Thresholds{ .max_cyclomatic = 15 };
+    var err_issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&err_issues, allocator);
+    var cx_issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&cx_issues, allocator);
+    var ast_issues = try analyzeAstTier(allocator, &graph, null);
+    defer deinitIssues(&ast_issues, allocator);
+    var style_issues = try analyzeStyle(allocator, &graph, th);
+    defer deinitIssues(&style_issues, allocator);
+
+    // Clean input: no rule fires on any driver.
+    try std.testing.expectEqual(@as(usize, 0), err_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cx_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ast_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), style_issues.items.len);
 }
 
 test "ZA204: filled vars stay silent with multi-var tracking" {

@@ -10171,11 +10171,22 @@ const ImportGraph = struct {
     /// files the walk already joined. The directory iterator reports a
     /// hardlink pair as two .file entries with one inode, so the first
     /// spelling joins and the rest are skipped — one graph entry per
-    /// physical file, no duplicate analysis, no duplicate findings. The
-    /// inode is unique within one filesystem, so only aliases of one
-    /// file collide; a tree spanning devices can in principle reuse an
-    /// inode number (residual risk, cross-device aliases are
-    /// indistinguishable here — std.Io exposes no device identity).
+    /// physical file, no duplicate analysis, no duplicate findings.
+    ///
+    /// Multi-device bound (EPH-I0828): the gate keys on the inode
+    /// alone, because std.Io exposes no device identity as of Zig
+    /// 0.16.0. File.Stat (stdlib std/Io/File.zig:57) and Dir.Entry
+    /// (stdlib std/Io/Dir.zig:72) carry no st_dev equivalent, and
+    /// Dir.Stat is an alias of File.Stat (stdlib std/Io/Dir.zig:874).
+    /// The stdlib inode doc limits uniqueness to one filesystem
+    /// (std/Io/File.zig:68). A scan tree spanning devices can reuse an
+    /// inode number for distinct files, and the gate cannot tell the
+    /// pair apart: the first spelling joins, the second is skipped.
+    /// Hardlinks cannot span devices, so the gate stays exact for its
+    /// target shape. The cross-device collapse is the documented bound
+    /// of the inode-only key. When std.Io gains a device identity, key
+    /// on (device, inode) and drop this bound; the test "inode gate
+    /// bound" fails the build the moment the field lands.
     /// Entries with inode 0 bypass the gate: filesystems that report 0
     /// for every entry would otherwise collapse distinct files.
     walked_file_inodes: std.AutoHashMapUnmanaged(std.Io.File.INode, void),
@@ -10310,7 +10321,10 @@ const ImportGraph = struct {
 
     /// Insert `inode` into the walk gate and return true when a previous
     /// spelling of the same physical file already joined the graph
-    /// (EPH-I0823). See `walked_file_inodes` for the identity contract.
+    /// (EPH-I0823). The key is the inode alone: std.Io exposes no
+    /// device identity, so a cross-device inode reuse looks like a
+    /// hardlink alias (EPH-I0828). See `walked_file_inodes` for the
+    /// identity contract.
     fn walkFileAlreadyScanned(self: *ImportGraph, inode: std.Io.File.INode) !bool {
         if (inode == 0) return false;
         const gop = try self.walked_file_inodes.getOrPut(self.allocator, inode);
@@ -32038,6 +32052,37 @@ test "walk joins one graph entry per physical hardlink (EPH-I0823)" {
     var issues = try graph.getOrphanIssues(allocator, &cfg);
     defer deinitIssues(&issues, allocator);
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+}
+
+test "inode gate bound: inode-only key, inode 0 bypass (EPH-I0828)" {
+    // The multi-device bound at walked_file_inodes holds only while
+    // std.Io has no device identity. Verify that claim against the
+    // stdlib in use. When Zig adds a device field, the compile errors
+    // fire: that is the signal to implement the (device, inode) gate
+    // arm and close the bound.
+    if (@hasField(std.Io.File.Stat, "dev"))
+        @compileError("std.Io.File.Stat has dev: implement (device, inode) gate arm (EPH-I0828)");
+    if (@hasField(std.Io.Dir.Stat, "dev"))
+        @compileError("std.Io.Dir.Stat has dev: implement (device, inode) gate arm (EPH-I0828)");
+    if (@hasField(std.Io.Dir.Entry, "dev"))
+        @compileError("std.Io.Dir.Entry has dev: implement (device, inode) gate arm (EPH-I0828)");
+
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Inode 0 never joins the gate: filesystems that report 0 for
+    // every entry must not collapse distinct files.
+    try std.testing.expect(!(try graph.walkFileAlreadyScanned(0)));
+    try std.testing.expect(!(try graph.walkFileAlreadyScanned(0)));
+
+    // The first spelling of an inode joins the graph.
+    try std.testing.expect(!(try graph.walkFileAlreadyScanned(42)));
+    // The second spelling of the same inode is a duplicate.
+    try std.testing.expect(try graph.walkFileAlreadyScanned(42));
+    // A different inode is a distinct physical file.
+    try std.testing.expect(!(try graph.walkFileAlreadyScanned(43)));
 }
 
 test "corpus warning fires once when resident bytes cross the threshold" {

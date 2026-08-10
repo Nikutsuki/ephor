@@ -2442,6 +2442,26 @@ const LineRange = struct {
     to_line: usize,
 };
 
+/// First line in (from_line, to_line) where var_name is reassigned, or
+/// null. Same predicate and range as hasReassignmentBetween, so the
+/// rebind anchor matches the rebind the reach gate credits.
+fn firstReassignmentLine(
+    lines: []const []const u8,
+    func_line: usize,
+    range: LineRange,
+    var_name: []const u8,
+) ?usize {
+    if (range.from_line == 0 or range.from_line >= range.to_line) return null;
+    for (range.from_line + 1..range.to_line) |ln| {
+        if (ln < func_line) continue;
+        const idx = ln - func_line;
+        if (idx >= lines.len) continue;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (hasDirectReassignment(t, var_name)) return ln;
+    }
+    return null;
+}
+
 /// Check if var_name is reassigned on any line between from_line and to_line (exclusive).
 /// Used by cross-block UAF detection to suppress false positives when a freed variable
 /// is reassigned to new memory before the next use.
@@ -2456,15 +2476,7 @@ fn hasReassignmentBetween(
     range: LineRange,
     var_name: []const u8,
 ) bool {
-    if (range.from_line == 0 or range.from_line >= range.to_line) return false;
-    for (range.from_line + 1..range.to_line) |ln| {
-        if (ln < func_line) continue;
-        const idx = ln - func_line;
-        if (idx >= lines.len) continue;
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (hasDirectReassignment(t, var_name)) return true;
-    }
-    return false;
+    return firstReassignmentLine(lines, func_line, range, var_name) != null;
 }
 
 /// Check if position is an assignment target (not a read) - includes subscript
@@ -7366,11 +7378,22 @@ fn detectAliasUseAfterFree(ctx: *const FreeScanCtx) !void {
     }
 }
 
-/// Grade for one alias lattice verdict (EPH-I0835): the root rebind keeps
-/// the alias pointing at freed memory, so the use stays definite. The def
-/// lattice names every path freed; only the may reach stays warning.
-fn aliasUAFSeverity(root_rebound: bool, def_freed: bool) Severity {
-    return if (root_rebound or def_freed) .err else .warning;
+/// Grade for one alias lattice verdict (EPH-I0835, EPH-I0838). Without a
+/// root rebind the use block's entry state names the free's grade: def
+/// grades err, the may reach grades warning. A root rebind detaches the
+/// root lattice from the alias's target at the use block, so the grade
+/// anchors at the rebind block's entry — the state before the rebind
+/// executes still carries the free's def/may grade on the paths reaching
+/// it. The conditional free + root rebind shape (`if (c) { free(buf); }
+/// buf = other; use(a);`) grades warning; the straight-line free stays
+/// err. A rebind line outside the CFG falls back to err, the
+/// conservative grade.
+fn aliasUAFSeverity(ctx: *const FreeScanCtx, rebind_line: ?usize, use_bid: usize) Severity {
+    if (rebind_line) |rl| {
+        const rebind_bid = findBlockForLine(ctx.cfg, rl) orelse return .err;
+        return if (ctx.bstate.def_freed_entry[rebind_bid]) .err else .warning;
+    }
+    return if (ctx.bstate.def_freed_entry[use_bid]) .err else .warning;
 }
 
 /// Report the first use of one alias past the free line, if any.
@@ -7378,8 +7401,14 @@ fn aliasUAFSeverity(root_rebound: bool, def_freed: bool) Severity {
 /// guard, then the same-block free (def by construction), then the
 /// lattice reach gate and grade. The lattice tracks the ROOT's value:
 /// when a root rebind lies between the free and the use, the alias still
-/// points at the freed target, so the grade stays err and the reach gate
-/// stays off (the root lattice no longer describes the alias there).
+/// points at the freed target, so the reach gate stays off (the root
+/// lattice no longer describes the alias there) and the grade anchors at
+/// the rebind block's entry state — the free's def/may grade on the
+/// paths reaching the rebind (EPH-I0838). The conditional free + root
+/// rebind shape grades warning; the straight-line free stays err. A
+/// rebind nested inside the free's own conditional arm can over-grade
+/// (the anchor reads the rebind's own paths, not the use's), accepted
+/// residual of the rebind-point approximation.
 /// Open paren depth of the wrapped free statement that freed on
 /// `freed_line`: the alias use scan primes its continuation tracking
 /// with it (EPH-I0351).
@@ -7439,19 +7468,20 @@ fn reportAliasUAF(ctx: *const FreeScanCtx, alias_name: []const u8, freed_line: u
         // The lattice gate and grade hold only while the root still points
         // at the tracked allocation; a root rebind detaches the lattice
         // from the alias's target (EPH-I0835).
-        const root_rebound = hasReassignmentBetween(
+        const rebind_line = firstReassignmentLine(
             ctx.scan.lines,
             ctx.scan.func_line,
             range,
             ctx.scan.var_name,
         );
+        const root_rebound = rebind_line != null;
         if (!root_rebound and !ctx.bstate.may_freed_entry[bid]) continue;
         // Use in an arm mutually exclusive with the free's arm is not
         // reachable after the free — keep scanning for a genuine later use.
         // Indent-aware: a use after the switch join is in no arm (F2).
         if (hasExclusiveArmBetween(ctx.scan.lines, ctx.scan.func_line, freed_line, actual_line))
             continue;
-        const severity = aliasUAFSeverity(root_rebound, ctx.bstate.def_freed_entry[bid]);
+        const severity = aliasUAFSeverity(ctx, rebind_line, bid);
         try appendUAFIssue(ctx, .{
             .var_name = alias_name,
             .line = actual_line,
@@ -8599,10 +8629,12 @@ fn tryAddOwner(
     try owner_vars.append(allocator, .{ .name = name });
 }
 
-/// Check if any owner var appears in line
+/// Check if any owner var appears in the line as a token-bounded
+/// identifier: a field like `.buffer_size` must not read as the owner
+/// `buf` (EPH-I0840).
 fn hasOwnerAppearance(owner_vars: []const OwnerVar, t: []const u8) bool {
     for (owner_vars) |ov| {
-        if (mem.indexOf(u8, t, ov.name) != null) return true;
+        if (containsIdentifier(t, ov.name)) return true;
     }
     return false;
 }
@@ -10180,7 +10212,10 @@ fn hasErrdeferGap(
 
 /// True when a direct free of the var appears between the alloc and the
 /// error-return trigger (inclusive) — the catch-free-return idiom cleans up
-/// manually on the error path, so no errdefer is required.
+/// manually on the error path, so no errdefer is required. Reads the
+/// joined logical line like the other free scanners: a zig-fmt wrapped
+/// free puts the var on a continuation line, invisible to the physical
+/// line (EPH-I0351 consistency, EPH-I0839).
 fn hasDirectFreeBetween(
     ctx: *const ErrdeferGapCtx,
     alloc: *const TryAlloc,
@@ -10188,10 +10223,11 @@ fn hasDirectFreeBetween(
 ) bool {
     if (alloc.line < ctx.func_line or trigger_line < ctx.func_line) return false;
     const end = @min(trigger_line, ctx.func_line + ctx.lines.len - 1);
+    var join_buf: [max_join_bytes]u8 = undefined;
     for (alloc.line + 1..end + 1) |ln| {
         const idx = ln - ctx.func_line;
         if (idx >= ctx.lines.len) break;
-        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+        const t = joinParenContinuation(ctx.lines, idx, &join_buf);
         if (hasRealFreePattern(t) and isDirectFreeOfVar(t, alloc.name)) return true;
     }
     return false;
@@ -34521,6 +34557,63 @@ test "ZA101: errdefer plus multi-line return literal stays silent (EPH-I0349 loc
     ) == 0);
 }
 
+test "ZA101: buffer_size struct field does not bind the buf owner (EPH-I0840)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The literal field `buffer_size` contains the owner name `buf` as a
+    // substring, but never carries the alloc. The bound local must not
+    // join the owner chain, so the return on 5 cannot credit a transfer:
+    // the alloc leaks and ZA101 fires. Pre-fix, the substring match
+    // bound `h`, the return credited the transfer, and the leak stayed
+    // silent.
+    const content =
+        \\const H = struct { buffer_size: usize };
+        \\fn sub_credit(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const h = H{ .buffer_size = n };
+        \\    return h;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_owner_sub_credit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_owner_sub_credit.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: buffer_size deref store does not bind the buf owner (EPH-I0840)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The deref gate reads the owner appearance before the deref
+    // extraction: `buffer_size` must not read as the owner `buf`, so the
+    // deref store on 3 must not add the name to the owner chain and the
+    // return on 4 cannot credit a transfer for the leaking alloc on 2.
+    const content =
+        \\fn deref_sub_credit(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    buffer_size.* = S{};
+        \\    return buffer_size;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_owner_deref_sub.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_owner_deref_sub.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
 test "ZA101: single-line .alloc( detection unchanged by line joining" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -35521,6 +35614,84 @@ test "ZA105: root rebind after the free does not resurrect the alias (EPH-I0835)
     defer run.deinit(allocator);
 
     const file = "test_alias_after_root_rebind.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        graded_err = issue.severity == .err;
+    }
+    try std.testing.expect(graded_err);
+}
+
+test "ZA105: conditional root free plus root rebind grades warning (EPH-I0838)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free on 5 reaches the use on 8 on the c-true path only, and the
+    // root rebind on 7 does not resurrect the alias's target. The path
+    // truth is a conditional UAF: the grade must be warning. The lattice
+    // resets at the rebind, so the use block cannot grade it; the grade
+    // anchors at the rebind block's entry state (EPH-I0838).
+    const content =
+        \\fn alias_root_rebind_cond_free(allocator: std.mem.Allocator, c: bool, other: []u8) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    buf = other;
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_root_rebind_cond.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_alias_root_rebind_cond.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_warning = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        graded_warning = issue.severity == .warning and
+            mem.startsWith(u8, issue.message, "conditional use-after-free:");
+    }
+    try std.testing.expect(graded_warning);
+}
+
+test "ZA105: straight-line root free plus root rebind past a block boundary grades err (EPH-I0838)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The def arm of the rebind anchor: the free on 4 fires on every path,
+    // so the rebind block's entry state grades err even though the rebind
+    // resets the lattice before the use. The block boundary (the empty
+    // `if`) forces the verdict through the lattice stage, not the
+    // same-block path.
+    const content =
+        \\fn alias_root_rebind_straight(allocator: std.mem.Allocator, n: usize, other: []u8) !void {
+        \\    var buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    allocator.free(buf);
+        \\    if (n > 0) {
+        \\        _ = n;
+        \\    }
+        \\    buf = other;
+        \\    use(a);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_root_rebind_straight.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_alias_root_rebind_straight.zig";
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
     var graded_err = false;
     for (run.issues.items) |issue| {
@@ -39617,6 +39788,41 @@ test "ZA103: catch-free-return idiom stays silent" {
     try std.testing.expect(countRuleIssues(
         run.issues.items,
         "test_catch_free_ret.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: zig-fmt wrapped catch-free-return credits the gap (EPH-I0839)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The manual free on the error path is wrapped past 100 columns: the
+    // freed var sits on a continuation line. hasDirectFreeBetween must
+    // read the joined logical line like the other free scanners
+    // (EPH-I0351 consistency), or ZA103 fires where the idiom holds.
+    const content =
+        \\fn wrapped_catch_free_return(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    risky() catch {
+        \\        allocator.free(
+        \\            buf,
+        \\        );
+        \\        return error.Failed;
+        \\    };
+        \\    allocator.free(buf);
+        \\}
+        \\fn risky() !void {
+        \\    return error.Oops;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_wrapped_catch_free_ret.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_wrapped_catch_free_ret.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
 }

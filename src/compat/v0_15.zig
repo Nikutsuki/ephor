@@ -1046,10 +1046,92 @@ pub const managed_container_type_patterns: []const []const u8 = &.{
 // Helper functions
 // ============================================================================
 
-/// Check if a line contains an optional-returning method call
+/// Quote-literal state for the code-position mask (EPH-I0876). Mirrors the
+/// types.zig state machine: an odd backslash run keeps a quote as data, a
+/// `'...'` char literal never opens string state, and a `\\` opener makes
+/// the rest of the line string data (EPH-I0671).
+const QuoteMask = enum { none, str, char, mline };
+
+/// Advance the quote scan past one char. A backslash inside a literal also
+/// skips the escaped char, so `i` can move two steps.
+fn stepQuoteMask(mode: *QuoteMask, line: []const u8, i: *usize) void {
+    const c = line[i.*];
+    switch (mode.*) {
+        .char => {
+            if (c == '\\') i.* += 1;
+            if (c == '\'') mode.* = .none;
+        },
+        .str => {
+            if (c == '\\') i.* += 1;
+            if (c == '"') mode.* = .none;
+        },
+        .mline => {},
+        .none => {
+            if (i.* + 1 < line.len and c == '\\' and line[i.* + 1] == '\\') mode.* = .mline;
+            if (c == '\'') mode.* = .char;
+            if (c == '"') mode.* = .str;
+        },
+    }
+}
+
+/// Incremental per-line string/char-literal classifier (EPH-I0876). Mirrors
+/// types.zig LineClassifier: each query continues the scan from the previous
+/// position, so any ascending query sequence on one line costs O(line)
+/// total. Queries MUST NOT move backwards.
+const MaskScanner = struct {
+    line: []const u8,
+    scanned: usize = 0,
+    mode: QuoteMask = .none,
+
+    fn init(line: []const u8) MaskScanner {
+        return .{ .line = line };
+    }
+
+    /// True when column `col` sits inside a string literal or a
+    /// multiline-string body.
+    fn isMasked(self: *MaskScanner, col: usize) bool {
+        std.debug.assert(col >= self.scanned);
+        while (self.scanned < col and self.scanned < self.line.len) : (self.scanned += 1) {
+            stepQuoteMask(&self.mode, self.line, &self.scanned);
+        }
+        return self.mode == .str or self.mode == .mline;
+    }
+};
+
+/// Start of the real `//` comment: not inside a string literal. A line that
+/// is a multiline-string body has no comment (EPH-I0876).
+fn findCommentStart(line: []const u8) ?usize {
+    const t = std.mem.trimStart(u8, line, " \t");
+    if (std.mem.startsWith(u8, t, "\\\\")) return null;
+    var scanner = MaskScanner.init(line);
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, line, pos, "//")) |idx| {
+        if (!scanner.isMasked(idx)) return idx;
+        pos = idx + 2;
+    }
+    return null;
+}
+
+/// True when `pattern` occurs at a code position: not inside a string
+/// literal, not inside a trailing comment. Comment prose or string data
+/// that merely names a builtin or method never matches (EPH-I0876).
+fn containsPatternInCode(line: []const u8, pattern: []const u8) bool {
+    const comment_start = findCommentStart(line);
+    var scanner = MaskScanner.init(line);
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, line, from, pattern)) |pos| {
+        from = pos + pattern.len;
+        if (scanner.isMasked(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Check if a line contains an optional-returning method call at a code position
 pub fn containsOptionalMethod(line: []const u8) bool {
     for (optional_methods) |pattern| {
-        if (std.mem.indexOf(u8, line, pattern) != null) return true;
+        if (containsPatternInCode(line, pattern)) return true;
     }
     return false;
 }
@@ -1073,10 +1155,10 @@ pub fn containsAllocation(line: []const u8) bool {
     return false;
 }
 
-/// Check if a line contains a builtin function
+/// Check if a line contains a builtin function at a code position
 pub fn containsBuiltin(line: []const u8) bool {
     for (builtins) |builtin| {
-        if (std.mem.indexOf(u8, line, builtin) != null) return true;
+        if (containsPatternInCode(line, builtin)) return true;
     }
     return false;
 }
@@ -1133,6 +1215,25 @@ test "containsOptionalMethod detects iterator methods" {
     try std.testing.expect(containsOptionalMethod("if (map.get(key)) |v|"));
     try std.testing.expect(containsOptionalMethod("_ = args.next()"));
     try std.testing.expect(!containsOptionalMethod("try file.read(buf)"));
+}
+
+test "comment or string naming a builtin or method never suppresses (EPH-I0876)" {
+    // Trailing comment names a builtin: no suppression.
+    try std.testing.expect(!containsBuiltin("_ = foo(); // @sizeOf usage"));
+    // String data names a builtin: no suppression.
+    try std.testing.expect(!containsBuiltin("_ = foo(); const s = \"@sizeOf(u32)\";"));
+    // Multiline-string body names a builtin: no suppression.
+    try std.testing.expect(!containsBuiltin("_ = foo(); \\\\ iter.next() @sizeOf data"));
+    // Real code positions still match.
+    try std.testing.expect(containsBuiltin("_ = @sizeOf(u32);"));
+    // A comment mention never masks a real call on the same line.
+    try std.testing.expect(containsBuiltin("_ = @sizeOf(u32); // @sizeOf is a builtin"));
+    // Trailing comment names an optional method: no suppression.
+    try std.testing.expect(!containsOptionalMethod("_ = foo(); // map.get(key) returns an optional"));
+    // String data names an optional method: no suppression.
+    try std.testing.expect(!containsOptionalMethod("_ = foo(); const s = \"iter.next()\";"));
+    // Real code positions still match.
+    try std.testing.expect(containsOptionalMethod("_ = map.get(key);"));
 }
 
 test "containsErrorMethod detects error-returning methods" {

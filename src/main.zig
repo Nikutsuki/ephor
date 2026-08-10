@@ -13425,11 +13425,20 @@ fn containsAnyPattern(t: []const u8, patterns: []const []const u8) bool {
 /// not inside a string literal, not inside a trailing comment (EPH-I0410).
 /// Comment prose and string data never carry method calls or FFI names, so
 /// they never suppress a discard verdict.
+///
+/// One classifier walk per PATTERN, not per call: LineClassifier queries
+/// must be non-decreasing, and pattern matches can arrive out of order
+/// across patterns — `"errdefer "` contains `"defer "` at offset 3, so a
+/// later pattern's first match can precede the earlier pattern's last
+/// query. A fresh classifier per pattern keeps every walk ascending
+/// (EPH-I0416).
 fn containsAnyPatternInCode(t: []const u8, patterns: []const []const u8) bool {
-    // One classifier walk plus one comment-start walk per call (EPH-I0153).
-    var cls = LineClassifier.init(t);
+    // One comment-start walk per call: the comment start is
+    // position-invariant, so it never re-walks per pattern (EPH-I0153).
     const comment_start = findCommentStart(t);
     for (patterns) |pat| {
+        // A fresh classifier per pattern (see the doc above).
+        var cls = LineClassifier.init(t);
         var from: usize = 0;
         while (mem.indexOfPos(u8, t, from, pat)) |pos| {
             from = pos + pat.len;
@@ -13608,10 +13617,11 @@ fn isCleanupMethodCall(t: []const u8) bool {
     return false;
 }
 
-/// Case-insensitive keyword check with camelCase segment boundaries
-/// (EPH-I0409): the keyword must start at the name's start or at an
-/// uppercase letter — `close` matches close/onClose but never
-/// enclose/disclose, so unrelated methods keep the ZA201 verdict.
+/// Case-insensitive keyword check with camelCase/snake_case segment
+/// boundaries (EPH-I0409, EPH-I0875): the keyword must start at the name's
+/// start, at an uppercase letter, or after an underscore — `close` matches
+/// close/onClose but never enclose/disclose, and `teardown` matches
+/// peer_teardown, so unrelated methods keep the ZA201 verdict.
 fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
     // Convert to lowercase buffer for comparison
     var lower_buf: [128]u8 = undefined;
@@ -13624,10 +13634,12 @@ fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
         var from: usize = 0;
         while (mem.indexOfPos(u8, lower, from, kw)) |pos| {
             from = pos + kw.len;
-            // Segment boundary: the match starts the name or a camelCase
+            // Segment boundary: the match starts the name, a camelCase
             // segment (uppercase in the ORIGINAL name — case is the
-            // boundary marker).
-            if (pos == 0 or std.ascii.isUpper(name[pos])) return true;
+            // boundary marker), or a snake_case segment (underscore before
+            // the match) (EPH-I0875).
+            if (pos == 0 or std.ascii.isUpper(name[pos]) or
+                (pos > 0 and name[pos - 1] == '_')) return true;
         }
     }
     return false;
@@ -14498,7 +14510,12 @@ fn startBraceBlock(t: []const u8) BraceTrackResult {
     return trackBraceBlock(t, true, 0);
 }
 
-/// Track defer/errdefer blocks for silent catch exclusion
+/// Track defer/errdefer blocks for silent catch exclusion. The ZA206
+/// has-defer flag is code-position-wide: `if (x) defer f();` and labeled
+/// blocks arm exit-bypasses-defer too (EPH-I0416, band B06 F10). The
+/// block-form brace tracking (ZA201's silent-catch suppression) stays
+/// line-start-only — the mid-line defer shapes are the documented ZA201
+/// limitation, not widened here.
 fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
     if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) {
         state.has_defer_in_func = true;
@@ -14514,6 +14531,12 @@ fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
         state.in_defer_block = r.in_block;
         state.defer_brace_depth = r.depth;
     }
+    // Mid-line defer: `defer` is a keyword, so identifiers cannot fake it;
+    // string and comment positions never count. The raw "defer" pre-filter
+    // bounds the classifier walks to lines that contain the substring.
+    if (mem.indexOf(u8, t, "defer") == null) return;
+    const defer_pats = [_][]const u8{ "defer ", "errdefer " };
+    if (containsAnyPatternInCode(t, &defer_pats)) state.has_defer_in_func = true;
 }
 
 /// Detect if line starts a catch block (not a silent catch {})
@@ -14539,15 +14562,27 @@ fn trackCatchBlock(t: []const u8, state: *ErrorAnalysisState) void {
     }
 }
 
-/// Extract function name from function declaration line
+/// Extract function name from function declaration line. Code-position
+/// scan: "fn " in a trailing comment or string literal never resets the
+/// fn context (EPH-I0416, band B06 F10d).
 fn extractFuncName(t: []const u8) ?[]const u8 {
-    // Pattern: "pub fn name(" or "fn name("
-    const fn_idx = mem.indexOf(u8, t, "fn ") orelse return null;
-    const start = fn_idx + 3;
-    if (start >= t.len) return null;
-    var end = start;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    if (end > start) return t[start..end];
+    // One classifier walk plus one comment-start walk per call
+    // (EPH-I0153): candidates ascend within a call.
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var s: usize = 0;
+    while (mem.indexOfPos(u8, t, s, "fn ")) |fn_idx| {
+        s = fn_idx + 3;
+        if (fn_idx > 0 and isIdent(t[fn_idx - 1])) continue;
+        if (cls.isInsideString(fn_idx)) continue;
+        if (comment_start != null and fn_idx >= comment_start.?) continue;
+        const start = fn_idx + 3;
+        if (start >= t.len) return null;
+        var end = start;
+        while (end < t.len and isIdent(t[end])) end += 1;
+        if (end > start) return t[start..end];
+        return null;
+    }
     return null;
 }
 
@@ -14709,14 +14744,20 @@ fn reportUnfilledField(
 // (`catch |e| { log(e); return e; }`) does real work between catch and
 // return and is deliberately out of scope (v1, documented).
 
-/// Index of the first `catch |` outside a string literal, or null.
+/// Index of the first `catch |` outside a string literal and outside a
+/// trailing comment, or null. Comment prose naming a payload is text, not
+/// code: `x(); // catch |e| return e;` never fires ZA210 (EPH-I0417,
+/// band B06 F11 — mirrors findCatchSite's comment guard).
 fn findCatchPayloadStart(t: []const u8) ?usize {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, t, from, "catch |")) |pos| {
-        if (!cls.isInsideString(pos)) return pos;
         from = pos + 1;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        return pos;
     }
     return null;
 }
@@ -15335,17 +15376,40 @@ const ExitDeferCtx = struct {
     func_name: []const u8,
 };
 
+/// Position of the first real process-exit call on the line, or null.
+/// Comment-aware and string-aware: trailing-comment exit prose never fires
+/// ZA206, and an `exit(` inside a string literal before the real call
+/// never suppresses it — every occurrence is scanned, not just the first
+/// (EPH-I0416, band B06 F10). A bare `exit(` is an arbitrary user
+/// function, not a process exit; only the qualified forms fire.
+fn findExitCallInCode(t: []const u8) ?usize {
+    // One classifier walk plus one comment-start walk per call
+    // (EPH-I0153): candidates ascend within a call.
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "exit(")) |pos| {
+        from = pos + "exit(".len;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        const quals = [_][]const u8{ "std.process.", "process.", "std.posix.", "posix." };
+        for (quals) |q| {
+            if (pos < q.len) continue;
+            const q_start = pos - q.len;
+            if (!mem.endsWith(u8, t[0..pos], q)) continue;
+            // Identifier boundary: `x_process.exit(` is a user method,
+            // not a std process exit.
+            if (q_start > 0 and isIdent(t[q_start - 1])) continue;
+            return pos;
+        }
+    }
+    return null;
+}
+
 /// ZA206: Check for std.process.exit() bypassing defers
 fn checkExitBypassesDefer(ctx: ExitDeferCtx) ?Issue {
     if (!ctx.has_defer or ctx.func_name.len == 0) return null;
-    const has_exit = mem.indexOf(u8, ctx.t, "std.process.exit(") != null or
-        mem.indexOf(u8, ctx.t, "process.exit(") != null or
-        mem.indexOf(u8, ctx.t, "std.posix.exit(") != null or
-        mem.indexOf(u8, ctx.t, "posix.exit(") != null;
-    if (!has_exit) return null;
-
-    const exit_pos = mem.indexOf(u8, ctx.t, "exit(") orelse 0;
-    if (isInsideString(ctx.t, exit_pos)) return null;
+    const exit_pos = findExitCallInCode(ctx.t) orelse return null;
 
     return .{
         .file = ctx.path,
@@ -24680,17 +24744,16 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
     return false;
 }
 
-/// Check for index guard patterns on same line
 /// Check for basic short-circuit or loop guard patterns on a line
 fn hasBasicIndexGuard(t: []const u8) bool {
     // Token-matched: "while" in a string literal or trailing comment never
     // fakes a loop guard (EPH-I0298).
     if (hasToken(t, "while") and mem.indexOf(u8, t, "> 0") != null) return true;
+    // Code-position match: the independent arms ("== 0 or", "!= 0 and",
+    // "endsWith", "startsWith") count only as real code — comment prose
+    // like `// endsWith` never fakes a guard (EPH-I0874).
     const basic_pats = [_][]const u8{ "== 0 or", "!= 0 and", "!=0 and", "endsWith", "startsWith" };
-    for (basic_pats) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) return true;
-    }
-    return false;
+    return containsAnyPatternInCode(t, &basic_pats);
 }
 
 /// Check for comparison guard combined with `and` keyword
@@ -24698,11 +24761,10 @@ fn hasAndComparisonGuard(t: []const u8) bool {
     // Token-matched: "and" in a string literal or trailing comment never
     // fakes the conjunction (EPH-I0298).
     if (!hasToken(t, "and")) return false;
+    // Code-position match: comparison prose in a comment or string never
+    // fakes the guard (EPH-I0874).
     const cmp_pats = [_][]const u8{ " > ", " >= ", " != " };
-    for (cmp_pats) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) return true;
-    }
-    return false;
+    return containsAnyPatternInCode(t, &cmp_pats);
 }
 
 /// Check for if-else expression guard patterns
@@ -50774,8 +50836,10 @@ test "ZA607: or-guard ignores a string-position or token (EPH-I0298)" {
     // The string "x == null or y" fakes a first " or " at a raw-substring
     // scan. Pre-fix the fake or stole the or-guard position and the read
     // was wrongly suppressed; the real `or` after the string must decide.
-    // The real or's LHS (`s == "x == null or y"`) is not a null equality,
-    // so the read fires.
+    // The read fires because the first `y` occurrence (inside the string)
+    // precedes the real `or`: the vpos <= or_pos gate rejects the
+    // narrative before orGuardVariable runs, so no LHS null-equality
+    // check is ever reached (EPH-I0877).
     const content =
         \\fn loopStr(items: []const bool, s: []const u8) void {
         \\    var x: ?u32 = null;
@@ -58504,6 +58568,175 @@ test "ZA206 std.posix.exit fires" {
     try std.testing.expect(found);
 }
 
+test "findExitCallInCode skips prose, strings, and bare exit (EPH-I0416)" {
+    // Trailing-comment exit prose never fires ZA206.
+    try std.testing.expect(findExitCallInCode("work(); // std.process.exit(0)") == null);
+    try std.testing.expect(findExitCallInCode("work(); // std.posix.exit(0)") == null);
+    // An exit( inside a string before the real call never suppresses it.
+    try std.testing.expect(findExitCallInCode("f(\"exit(\"); std.process.exit(1);") != null);
+    // A bare exit( is an arbitrary user function, not a process exit.
+    try std.testing.expect(findExitCallInCode("exit(1);") == null);
+    try std.testing.expect(findExitCallInCode("myexit(1);") == null);
+    // Identifier-embedded process names are user methods, not std exits.
+    try std.testing.expect(findExitCallInCode("x_process.exit(1);") == null);
+    // Real qualified calls stay found.
+    try std.testing.expect(findExitCallInCode("std.process.exit(1);") != null);
+    try std.testing.expect(findExitCallInCode("std.posix.exit(1);") != null);
+    try std.testing.expect(findExitCallInCode("process.exit(1);") != null);
+    try std.testing.expect(findExitCallInCode("posix.exit(1);") != null);
+}
+
+test "extractFuncName ignores fn in comments and strings (EPH-I0416)" {
+    try std.testing.expect(extractFuncName("work(); // fn second(") == null);
+    try std.testing.expect(extractFuncName("const s = \"fn fake(\";") == null);
+    // Real declarations still extract.
+    try std.testing.expectEqualStrings("real", extractFuncName("pub fn real() void {}").?);
+    const string_first = "const doc = \"fn x()\"; fn real() {";
+    try std.testing.expectEqualStrings("real", extractFuncName(string_first).?);
+}
+
+test "ZA206: trailing-comment exit prose never fires (EPH-I0416)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn cleanup() void {
+        \\    defer allocator.free(data);
+        \\    work(); // std.process.exit(0)
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za206_comprose.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za206_comprose.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
+            mem.eql(u8, issue.file, "test_za206_comprose.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(!found);
+}
+
+test "ZA206: string-bearing exit( never suppresses the real call (EPH-I0416)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn cleanup() void {
+        \\    defer allocator.free(data);
+        \\    f("exit(");
+        \\    std.process.exit(1);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za206_strpre.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za206_strpre.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
+            mem.eql(u8, issue.file, "test_za206_strpre.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA206: mid-line defer arms exit-bypasses-defer (EPH-I0416)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn cleanup(ok: bool) void {
+        \\    if (ok) defer allocator.free(data);
+        \\    std.process.exit(1);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za206_middefer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za206_middefer.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
+            mem.eql(u8, issue.file, "test_za206_middefer.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA206: trailing-comment fn name never resets the fn context (EPH-I0416)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const test_content =
+        \\fn cleanup() void {
+        \\    defer allocator.free(data);
+        \\    work(); // fn second(
+        \\    std.process.exit(1);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za206_fncom.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za206_fncom.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
+            mem.eql(u8, issue.file, "test_za206_fncom.zig"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "ZA105: no false positive on variable reassignment after free" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -60607,6 +60840,16 @@ test "isCleanupMethodCall applies camelCase boundaries to keywords (EPH-I0409)" 
     try std.testing.expect(isCleanupMethodCall("x.leaseRevoke() catch {}"));
 }
 
+test "isCleanupMethodCall keeps snake_case segment suppressions (EPH-I0875)" {
+    // An underscore before the match is a segment boundary: the
+    // snake_case compound peer_teardown keeps its legit ZA201 suppression.
+    try std.testing.expect(isCleanupMethodCall("x.peer_teardown() catch {}"));
+    try std.testing.expect(isCleanupMethodCall("x.pre_deinit() catch {}"));
+    // No boundary still rejects: the keyword must start a segment.
+    try std.testing.expect(!isCleanupMethodCall("x.peerteardown() catch {}"));
+    try std.testing.expect(!isCleanupMethodCall("x.enclose() catch {}"));
+}
+
 test "containsAnyPatternInCode skips string and comment positions (EPH-I0410)" {
     const pats = [_][]const u8{ ".deinit(", "A(" };
     try std.testing.expect(containsAnyPatternInCode("x.deinit();", &pats));
@@ -60615,6 +60858,27 @@ test "containsAnyPatternInCode skips string and comment positions (EPH-I0410)" {
     try std.testing.expect(!containsAnyPatternInCode("x = f(\"A(\");", &pats));
     try std.testing.expect(!containsAnyPatternInCode("x = 1; // .deinit(", &pats));
     try std.testing.expect(!containsAnyPatternInCode("x = 1; // A(", &pats));
+}
+
+test "containsAnyPatternInCode keeps one classifier per pattern (EPH-I0416)" {
+    // The defer_pats shape that armed ZA206: "errdefer " contains
+    // "defer " at offset 3, so the second pattern's match can precede
+    // the first pattern's last query. A single classifier would break
+    // its non-decreasing query invariant and panic (gate dogfood).
+    const defer_pats = [_][]const u8{ "defer ", "errdefer " };
+    try std.testing.expect(containsAnyPatternInCode("errdefer gpa.free(buf);", &defer_pats));
+    // Prose-only "defer " before a real "errdefer ": the first pattern's
+    // skipped in-string match must not break the second pattern's walk.
+    const mixed = "s = \"defer \"; errdefer gpa.free(buf);";
+    try std.testing.expect(containsAnyPatternInCode(mixed, &defer_pats));
+    // Prose-only matches still never count as code.
+    try std.testing.expect(!containsAnyPatternInCode("x = 1; // defer cleanup", &defer_pats));
+    try std.testing.expect(!containsAnyPatternInCode("const s = \"errdefer \";", &defer_pats));
+    // General cross-pattern ordering: the second pattern's match ("aaa"
+    // at 0) precedes the first pattern's only query (in-string "aa " at
+    // 5), so the second pattern re-walks from 0.
+    const odd_pats = [_][]const u8{ "aa ", "aaa" };
+    try std.testing.expect(containsAnyPatternInCode("aaa(\"aa x\");", &odd_pats));
 }
 
 test "isSafeToDiscard ignores discard-masking prose in comments (EPH-I0410)" {
@@ -60682,6 +60946,25 @@ test "hasBasicIndexGuard and hasAndComparisonGuard ignore prose (EPH-I0298)" {
     // Real guards stay detected.
     try std.testing.expect(hasBasicIndexGuard("while (n > 0) {"));
     try std.testing.expect(hasAndComparisonGuard("if (a and b > c) {"));
+}
+
+test "guard detectors are code-position scans on the independent arms (EPH-I0874)" {
+    // The keywordless arms ("endsWith", "startsWith", "== 0 or",
+    // "!= 0 and") and the comparison patterns count only at code
+    // positions: comment prose and string data never fake a guard.
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // endsWith"));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // startsWith"));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // i == 0 or j == 0"));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // i != 0 and j != 0"));
+    try std.testing.expect(!hasBasicIndexGuard("const s = \"i == 0 or j\";"));
+    try std.testing.expect(!hasBasicIndexGuard("const s = \"endsWith(\\\"x\\\");\";"));
+    try std.testing.expect(!hasAndComparisonGuard("if (a and b) { // x > y"));
+    try std.testing.expect(!hasAndComparisonGuard("if (a and b) { s = \"x > y\"; }"));
+    // Real guards stay detected.
+    try std.testing.expect(hasBasicIndexGuard("if (s.endsWith(\".zig\")) {"));
+    try std.testing.expect(hasBasicIndexGuard("if (i == 0 or j == 0) {"));
+    try std.testing.expect(hasBasicIndexGuard("if (i != 0 and j != 0) {"));
+    try std.testing.expect(hasAndComparisonGuard("if (i > 0 and j < n) {"));
 }
 
 test "hasExitKeyword ignores exit keywords in strings and comments (EPH-I0298)" {
@@ -68102,6 +68385,15 @@ test "ZA210: multi-line catch block form is silent (v1 scope)" {
 test "ZA210: try form produces no issue" {
     const issue = checkNoCatchReturn("try foo();", "t.zig", 1);
     try std.testing.expect(issue == null);
+}
+
+test "ZA210: catch payload in a trailing comment is prose (EPH-I0417)" {
+    // The payload exists only in comment prose — the verbose-try note
+    // must stay silent (pre-fix the raw scan fired on the comment).
+    try std.testing.expect(checkNoCatchReturn("x(); // catch |e| return e;", "t.zig", 1) == null);
+    // A string payload followed by a real catch still fires.
+    const mixed = "f(\"catch |\"); foo() catch |err| return err;";
+    try std.testing.expect(checkNoCatchReturn(mixed, "t.zig", 1) != null);
 }
 
 test "ZA210: integration through analyzeErrors emits the note" {

@@ -3671,6 +3671,11 @@ fn isAllIdent(s: []const u8) bool {
 
 fn isMethodCallAt(t: []const u8, abs_pos: usize, var_name: []const u8, cls: *LineClassifier) bool {
     if (abs_pos > 0 and isIdent(t[abs_pos - 1])) return false;
+    // The receiver must be the bare local name: `other.x.init()` inits a
+    // field of other, never the local x (EPH-I0332, band-B01b F-06). The
+    // sibling scans carry the same left-dot guard, with any spacing
+    // around the dot (EPH-I0790).
+    if (hasLeftDot(t, abs_pos)) return false;
     const after = abs_pos + var_name.len;
     if (after >= t.len or t[after] != '.') return false;
     const rest = t[after + 1 ..];
@@ -4288,8 +4293,17 @@ fn checkVarDefiniteAssignment(
 /// Check if a variable read at `read_idx` is inside an if-block whose condition
 /// also guards an earlier assignment to the same variable.
 /// Pattern: if (cond) { x = val; } ... if (cond) { use(x); }
-/// Also handles: for (...) { if (cond) { x = val; } } if (guard) |_| { use(x); }
-/// where `guard` is a correlated variable assigned together with `x`.
+///
+/// The suppression is sound only when the earlier guard-if runs on every
+/// path to the read: the assignment must sit at the guard block's top
+/// level (blockContainsAssignment), the guard-if must not be an else-if
+/// arm, and every enclosing conditional or loop of the guard-if must also
+/// enclose the read (guardDominatesRead — EPH-I0329, band-B01b F-03). The
+/// condition is compared textually; a reassignment of a condition
+/// variable between the guard and the read is an accepted approximation
+/// (the condition is assumed stable). A shared enclosure opener beyond
+/// the lookback window, or a multi-line condition whose brace-bearing
+/// line carries no keyword, is also missed — accepted false negatives.
 fn isCorrelatedGuardRead(
     lines: []const []const u8,
     read_idx: usize,
@@ -4311,9 +4325,16 @@ fn isCorrelatedGuardRead(
             const t = mem.trim(u8, lines[i], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
             if (!hasIfCondition(t, guard_cond)) continue;
+            // An else-if arm runs only when the prior arms fail: its
+            // assignment does not dominate a later plain `if (c)` read.
+            if (isElseArmOpener(t)) continue;
+            // A guard-if gated by a conditional or loop the read does not
+            // share may never run while the read does; the assignment then
+            // does not dominate the read either.
+            if (!guardDominatesRead(lines, i, read_idx)) continue;
             if (blockContainsAssignment(
                 lines,
-                i + 1,
+                i,
                 read_idx,
                 var_name,
             )) return true;
@@ -4328,32 +4349,122 @@ fn isCorrelatedGuardRead(
     return false;
 }
 
-/// Check if a brace-delimited block starting at `start` contains an assignment
-/// to `var_name`. Stops at `limit` or when the block closes.
+/// Brace depth at position `pos` of `t` given the depth before the line:
+/// the depth of the innermost block containing the position. Mirrors
+/// computeBraceDepth's quote and multiline handling (EPH-I0107,
+/// EPH-I0751), so the same lines score the same depth here and in the
+/// block walkers.
+fn braceDepthAt(t: []const u8, pos: usize, initial: usize) usize {
+    var depth = initial;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < pos) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (types.isMultilineOpenerAt(t, i)) break;
+        if (c == '{') depth += 1;
+        if (c == '}' and depth > 0) depth -= 1;
+    }
+    return depth;
+}
+
+/// True when the line assigns var_name at the target depth: the top level
+/// of the block being scanned, relative to the line's pre-depth. The
+/// depth-0 phase also counts depth 1 — a brace-less guard body whose
+/// block opens on the same line. Deeper positions sit in nested blocks —
+/// they do not prove the guard (EPH-I0329, band-B01b F-03).
+fn hasTopLevelAssign(
+    t: []const u8,
+    var_name: []const u8,
+    pre_depth: usize,
+    target_depth: usize,
+) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        if (!isDirectAssignOccurrence(t, var_name, pos)) continue;
+        const d = braceDepthAt(t, pos, pre_depth);
+        if (d == target_depth or (target_depth == 0 and d == 1)) return true;
+    }
+    return false;
+}
+
+/// Mutable state of the depth-1 guard scan: the running brace depth and
+/// whether the current depth-2 region is a loop body directly inside the
+/// guard block (EPH-I0329).
+const GuardBlockScan = struct {
+    block_depth: usize = 0,
+    in_loop_body: bool = false,
+};
+
+/// One line of the depth-1 phase: true when the line assigns var_name at
+/// the guard block's top level, or at the top level of a loop body
+/// directly inside it (the loop-carried arm, EPH-I0329).
+fn guardBlockLineAssigns(
+    lines: []const []const u8,
+    j: usize,
+    var_name: []const u8,
+    scan: *GuardBlockScan,
+) bool {
+    const inner = mem.trim(u8, lines[j], " \t\r");
+    if (scan.block_depth == 1) {
+        if (isLoopOpenerLine(inner)) {
+            scan.in_loop_body = true;
+            scan.block_depth = computeBraceDepth(inner, scan.block_depth);
+            return false;
+        }
+        if (hasTopLevelAssign(inner, var_name, scan.block_depth, 1)) return true;
+    } else if (scan.in_loop_body and scan.block_depth == 2 and
+        hasTopLevelAssign(inner, var_name, scan.block_depth, 2)) return true;
+    scan.block_depth = computeBraceDepth(inner, scan.block_depth);
+    if (scan.block_depth < 2) scan.in_loop_body = false;
+    return false;
+}
+
+/// Check if the brace-delimited block opened by the if at `if_idx`
+/// assigns `var_name` at its top level. Stops at `limit` or when the
+/// block closes.
+///
+/// The if line and one following statement line are scanned at the
+/// block's opening depth, so the brace-on-next-line form (`if (c)` /
+/// `{ x = 1; }`) and the brace-less body (`if (c)` / `x = 1;`) count
+/// the same as the canonical form (EPH-I0329, band-B01b F-03). Deeper
+/// nesting never counts: the guard block may run while a nested arm
+/// does not.
+///
+/// One documented exception: an assignment at the top level of a loop
+/// body directly inside the guard block counts as loop-carried (the
+/// `for (0..3) { x = f(); }` class, sig cmd.zig). A possibly-empty loop
+/// makes this an accepted false negative — the loop-carried assignment
+/// is the established corpus pattern (EPH-I0329).
 fn blockContainsAssignment(
     lines: []const []const u8,
-    start: usize,
+    if_idx: usize,
     limit: usize,
     var_name: []const u8,
 ) bool {
-    var block_depth: usize = 1;
-    var j = start;
-    while (j < limit and block_depth > 0) : (j += 1) {
+    var j = if_idx;
+    // Depth-0 phase: the if line, then one candidate body line (the
+    // brace-less statement or the `{` opener). The phase ends when the
+    // block opens or the two lines are spent.
+    var depth0_lines: usize = 0;
+    var block_depth: usize = 0;
+    while (j < limit and depth0_lines < 2 and block_depth == 0) : (j += 1) {
         const inner = mem.trim(u8, lines[j], " \t\r");
+        if (isCommentOrMultilineString(inner)) continue;
+        if (hasTopLevelAssign(inner, var_name, block_depth, 0)) return true;
+        depth0_lines += 1;
         block_depth = computeBraceDepth(inner, block_depth);
-        var s: usize = 0;
-        while (mem.indexOf(u8, inner[s..], var_name)) |rel| {
-            const pos = s + rel;
-            s = pos + var_name.len;
-            // The match must be the variable itself: not mid-identifier
-            // (box =) and not a field of another var (foo.x =, with any
-            // spacing around the dot — EPH-I0790).
-            if (pos > 0 and isIdent(inner[pos - 1])) continue;
-            if (hasLeftDot(inner, pos)) continue;
-            if (pos + var_name.len < inner.len and
-                isIdent(inner[pos + var_name.len])) continue;
-            if (isAssignmentTarget(inner, var_name, pos)) return true;
-        }
+    }
+    // Depth-1 phase: the guard block's top level, plus the loop-carried
+    // arm for a loop body directly inside the block.
+    var scan: GuardBlockScan = .{ .block_depth = block_depth };
+    while (j < limit and scan.block_depth > 0) : (j += 1) {
+        if (guardBlockLineAssigns(lines, j, var_name, &scan)) return true;
     }
     return false;
 }
@@ -4378,6 +4489,153 @@ fn computeBraceDepth(t: []const u8, initial: usize) usize {
     return depth;
 }
 
+/// True when the line opens an else arm (`} else`, `} else if`): the arm
+/// runs only when the prior arms' conditions are false, so an assignment
+/// inside it never dominates a later plain `if (c)` read (EPH-I0329,
+/// band-B01b F-03).
+fn isElseArmOpener(t: []const u8) bool {
+    var rest = t;
+    while (rest.len > 0 and rest[0] == '}') {
+        rest = mem.trimStart(u8, rest[1..], " \t");
+    }
+    return isElseBodyStart(rest);
+}
+
+/// Strip a leading block label (`outer: for ...`) so the opener
+/// classifiers see the keyword. A labeled block runs unconditionally;
+/// only the labeled loop forms gate execution (EPH-I0329).
+fn stripLabel(t: []const u8) []const u8 {
+    if (t.len == 0 or !isIdent(t[0])) return t;
+    const colon = mem.indexOfScalar(u8, t, ':') orelse return t;
+    for (t[0..colon]) |c| {
+        if (!isIdent(c)) return t;
+    }
+    return mem.trimStart(u8, t[colon + 1 ..], " \t");
+}
+
+/// True when the line opens a loop body: a `for`/`while` header, the
+/// inline forms, and labeled variants. A loop may run zero times, so its
+/// body is conditional (EPH-I0110).
+fn isLoopOpenerLine(t: []const u8) bool {
+    const rest = stripLabel(t);
+    return mem.startsWith(u8, rest, "for ") or
+        mem.startsWith(u8, rest, "for(") or
+        mem.startsWith(u8, rest, "inline for ") or
+        mem.startsWith(u8, rest, "inline for(") or
+        mem.startsWith(u8, rest, "while ") or
+        mem.startsWith(u8, rest, "while(") or
+        mem.startsWith(u8, rest, "inline while ") or
+        mem.startsWith(u8, rest, "inline while(");
+}
+
+/// True when the line opens a block whose execution is conditional: an
+/// if/else arm, a loop, a switch, or a comptime block. Used by the
+/// guard-dominance walk (EPH-I0329): a correlated-guard if inside one of
+/// these may never run, so its assignment cannot dominate the later read.
+/// The multi-line-condition form (`if (a and` + `b) {`) classifies only
+/// the brace-bearing line, so the opener is missed — accepted
+/// approximation, documented at isCorrelatedGuardRead.
+fn isConditionalOpenerLine(t: []const u8) bool {
+    var rest = t;
+    while (rest.len > 0 and rest[0] == '}') {
+        rest = mem.trimStart(u8, rest[1..], " \t");
+    }
+    if (isElseBodyStart(rest)) return true;
+    if (isConditionalStart(rest)) return true;
+    if (isLoopOpenerLine(rest)) return true;
+    return mem.startsWith(u8, rest, "switch ") or
+        mem.startsWith(u8, rest, "switch(") or
+        mem.startsWith(u8, rest, "comptime {");
+}
+
+/// Enclosing conditional and loop opener lines of `idx`, nearest first,
+/// within [stop, idx). A plain block (a function body, a bare block) runs
+/// unconditionally and does not gate the line. The walk mirrors
+/// findEnclosingIfCondition's brace accounting (EPH-I0225).
+fn enclosingConditionalLines(
+    lines: []const []const u8,
+    idx: usize,
+    stop: usize,
+    out: []usize,
+) usize {
+    var depth: usize = 0;
+    var count: usize = 0;
+    var i = idx;
+    while (i > stop) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        // Braces inside a trailing comment are not block structure
+        // (EPH-I0095).
+        const code = stripLineComment(t);
+        if (code.len == 0) continue;
+        const braces = trackBackwardBraces(code, depth);
+        depth = braces.depth;
+        if (!braces.opens_enclosing_block) continue;
+        if (isConditionalOpenerLine(code)) {
+            out[count] = i;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// True when the slice holds the line index (enclosure subset helper).
+fn lineSetContains(set: []const usize, line: usize) bool {
+    for (set) |entry| {
+        if (entry == line) return true;
+    }
+    return false;
+}
+
+/// True when every enclosing conditional or loop of the guard-if at
+/// `if_idx` also encloses the read: the guard-if is gated no harder than
+/// the read, so its assignment dominates the read (EPH-I0329, band-B01b
+/// F-03). A guard-if inside a loop or conditional the read does not share
+/// may never run while the read does. The walk stops at the enclosing
+/// block's lookback window (EPH-I0225); a shared opener beyond it is
+/// missed — accepted false negative, documented at isCorrelatedGuardRead.
+fn guardDominatesRead(lines: []const []const u8, if_idx: usize, read_idx: usize) bool {
+    const stop = read_idx -| enclosing_block_lookback;
+    var cand: [enclosing_block_lookback]usize =
+        [_]usize{0} ** enclosing_block_lookback;
+    var read: [enclosing_block_lookback]usize =
+        [_]usize{0} ** enclosing_block_lookback;
+    const n_cand = enclosingConditionalLines(lines, if_idx, stop, &cand);
+    const n_read = enclosingConditionalLines(lines, read_idx, stop, &read);
+    for (cand[0..n_cand]) |line| {
+        if (!lineSetContains(read[0..n_read], line)) return false;
+    }
+    return true;
+}
+
+/// Line index of the outermost loop opener enclosing `idx` (a for/while
+/// header, inline or labeled), or null. The loop-carried or-guard
+/// narrative needs the outermost loop: a non-null assignment in an outer
+/// loop body breaks the entry-null guarantee just as a pre-loop one does
+/// (EPH-I0330, band-B01b F-04).
+///
+/// The walk stops at the enclosing-block lookback window (EPH-I0225). A
+/// loop opener beyond the window is missed — accepted false negative.
+fn findEnclosingLoopLine(lines: []const []const u8, idx: usize) ?usize {
+    const stop = idx -| enclosing_block_lookback;
+    var depth: usize = 0;
+    var outermost: ?usize = null;
+    var i = idx;
+    while (i > stop) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code = stripLineComment(t);
+        if (code.len == 0) continue;
+        const braces = trackBackwardBraces(code, depth);
+        depth = braces.depth;
+        if (!braces.opens_enclosing_block) continue;
+        if (isLoopOpenerLine(code)) outermost = i;
+    }
+    return outermost;
+}
+
 /// Check if a variable read is inside a null-guard block for a correlated variable.
 /// Pattern:
 ///   var guard: ?T = null;
@@ -4386,7 +4644,8 @@ fn computeBraceDepth(t: []const u8, initial: usize) usize {
 ///   if (guard) |_| { use(x); }
 ///
 /// The variable `x` is safe to read because `guard` is only non-null when `x`
-/// was also assigned in the same block.
+/// was also assigned in the same block (EPH-I0331, band-B01b F-05: the
+/// correlation is enforced as same-block — see allGuardAssignsCorrelate).
 fn isNullGuardCorrelatedRead(
     lines: []const []const u8,
     read_idx: usize,
@@ -4411,7 +4670,234 @@ fn isNullInitializedVar(lines: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// Check that every non-null assignment to the guard also assigns the variable.
+/// Position of the last occurrence of the guard variable that assigns it
+/// (word-boundary and left-dot aware), or null. The scan visits every
+/// occurrence: a first non-assignment occurrence (`use(&g); g = 5;`)
+/// must not hide the assignment that follows it (EPH-I0843).
+fn guardAssignmentOccurrence(t: []const u8, guard: []const u8) ?usize {
+    var s: usize = 0;
+    var found: ?usize = null;
+    while (mem.indexOf(u8, t[s..], guard)) |rel| {
+        const pos = s + rel;
+        s = pos + guard.len;
+        if (!isDirectAssignOccurrence(t, guard, pos)) continue;
+        found = pos;
+    }
+    return found;
+}
+
+/// Check if a line assigns to the guard variable (word-boundary aware).
+fn isGuardAssignment(t: []const u8, guard: []const u8) bool {
+    return guardAssignmentOccurrence(t, guard) != null;
+}
+
+/// True when the line's last direct assignment to `guard` writes null.
+/// The last occurrence's own RHS decides the line state: `g = null;
+/// g = 5;` ends non-null, `g = 5; g = null;` ends null. A null
+/// assignment to another variable on the line never counts, and a
+/// `== null` comparison never counts (EPH-I0851).
+fn lastGuardWriteIsNull(t: []const u8, guard: []const u8) bool {
+    const pos = guardAssignmentOccurrence(t, guard) orelse return false;
+    var eq = pos + guard.len;
+    while (eq < t.len and t[eq] != '=') eq += 1;
+    if (eq >= t.len) return false;
+    if (eq > 0 and (t[eq - 1] == '=' or t[eq - 1] == '<' or
+        t[eq - 1] == '>' or t[eq - 1] == '!')) return false;
+    if (eq + 1 < t.len and t[eq + 1] == '=') return false;
+    const rhs = mem.trimStart(u8, t[eq + 1 ..], " \t");
+    if (!mem.startsWith(u8, rhs, "null")) return false;
+    if (rhs.len > "null".len and isIdent(rhs["null".len])) return false;
+    return true;
+}
+
+/// State of a brace scan over a contiguous region: the current depth, the
+/// minimum depth reached, and the quote mode carried across segments.
+const BraceScanState = struct {
+    depth: usize,
+    min_depth: usize,
+    mode: QuoteMode = .none,
+};
+
+/// A position on a function-body line, used by the same-block position
+/// tests (EPH-I0331).
+const LinePos = struct {
+    line: usize,
+    col: usize,
+};
+
+/// True when the occurrence at `pos` is a direct assignment target of the
+/// variable itself: word boundaries on both sides, no field-of-another-var
+/// dot (spacing included, EPH-I0790), and an assignment operator after.
+fn isDirectAssignOccurrence(t: []const u8, var_name: []const u8, pos: usize) bool {
+    if (pos > 0 and isIdent(t[pos - 1])) return false;
+    if (hasLeftDot(t, pos)) return false;
+    if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) return false;
+    return isAssignmentTarget(t, var_name, pos);
+}
+
+/// Advance the brace state over `t[start..end]`. A `{` raises the depth, a
+/// `}` lowers it and tracks the minimum. String and char content carries
+/// no braces (EPH-I0107); a `\\` opener ends the code region (EPH-I0751).
+fn scanBraceRegion(t: []const u8, start: usize, end: usize, state: *BraceScanState) void {
+    var i = start;
+    while (i < end) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&state.mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (types.isMultilineOpenerAt(t, i)) break;
+        if (c == '{') {
+            state.depth += 1;
+            continue;
+        }
+        if (c != '}') continue;
+        if (state.depth > 0) state.depth -= 1;
+        state.min_depth = @min(state.min_depth, state.depth);
+    }
+}
+
+/// True when the positions `a` and `b` (a.line <= b.line) sit inside the
+/// same brace-delimited block. The columns are trimmed-space: callers
+/// compute them on trimmed slices, so the scan runs on the trimmed
+/// slices too. A raw-line scan with trimmed columns skips the last
+/// indent-width characters of the prefix and misses a brace there — the
+/// one-line else arm shape reported silent before the fix (EPH-I0842).
+/// The test is exact in trimmed space: the depth at both positions is
+/// equal, and the depth between them never drops below it — a drop
+/// closes the first position's block, so the second position lives in a
+/// different block even at the same depth (EPH-I0331, band-B01b F-05).
+/// A same-line pair leads with the smaller column: correlationPair
+/// normalizes it, so the between-region scan never reads an empty,
+/// reversed region (EPH-I0850).
+fn positionsInSameBlock(
+    lines: []const []const u8,
+    a: LinePos,
+    b: LinePos,
+    depth_before_a: usize,
+) bool {
+    var state: BraceScanState = .{
+        .depth = depth_before_a,
+        .min_depth = depth_before_a,
+    };
+    const ta = mem.trim(u8, lines[a.line], " \t\r");
+    scanBraceRegion(ta, 0, a.col, &state);
+    const guard_depth = state.depth;
+    state.min_depth = guard_depth;
+    if (b.line == a.line) {
+        // Same line: only the region between the two occurrences counts.
+        scanBraceRegion(ta, a.col + 1, b.col, &state);
+    } else {
+        scanBraceRegion(ta, a.col + 1, ta.len, &state);
+        for (a.line + 1..b.line) |k| {
+            const tk = mem.trim(u8, lines[k], " \t\r");
+            scanBraceRegion(tk, 0, tk.len, &state);
+        }
+        const tb = mem.trim(u8, lines[b.line], " \t\r");
+        scanBraceRegion(tb, 0, b.col, &state);
+    }
+    return state.min_depth >= guard_depth and state.depth == guard_depth;
+}
+
+/// Depth before each line of [start, end), walked once from the function
+/// top. The window is at most twice the correlation radius, so the fixed
+/// buffer bounds the walk (EPH-I0225).
+fn windowDepthsBefore(lines: []const []const u8, start: usize, end: usize, out: []usize) void {
+    var depth: usize = 0;
+    var wi: usize = 0;
+    var k: usize = 0;
+    while (k < end) : (k += 1) {
+        if (k >= start) {
+            out[wi] = depth;
+            wi += 1;
+        }
+        depth = computeBraceDepth(mem.trim(u8, lines[k], " \t\r"), depth);
+    }
+}
+
+/// A correlation candidate's position pair, normalized to forward order,
+/// with the depth-before index of the earlier line.
+const BlockPair = struct {
+    a: LinePos,
+    b: LinePos,
+    depth_idx: usize,
+};
+
+/// Normalize the (guard, var-occurrence) pair to forward order: the
+/// earlier line leads, and a same-line pair leads with the smaller
+/// column. A reversed same-line pair left an empty region in the
+/// same-block scan and read a vacuous same-block verdict (EPH-I0850).
+/// The position walk runs forward (EPH-I0331).
+fn correlationPair(guard_pos: LinePos, j: usize, pos: usize, start: usize) BlockPair {
+    const var_first = j < guard_pos.line or
+        (j == guard_pos.line and pos < guard_pos.col);
+    if (var_first) {
+        return .{
+            .a = .{ .line = j, .col = pos },
+            .b = guard_pos,
+            .depth_idx = j - start,
+        };
+    }
+    return .{
+        .a = guard_pos,
+        .b = .{ .line = j, .col = pos },
+        .depth_idx = guard_pos.line - start,
+    };
+}
+
+/// True when the guard assignment at `guard_pos` correlates with an
+/// assignment of var_name in the same brace-delimited block, within the
+/// correlation radius. The var assignment must sit at the guard's depth:
+/// a sibling branch or a nested arm never correlates (EPH-I0331,
+/// band-B01b F-05). Order inside the block does not matter: both
+/// assignments run whenever the block runs.
+fn hasCorrelatedSameBlockAssign(
+    lines: []const []const u8,
+    guard_pos: LinePos,
+    limit: usize,
+    var_name: []const u8,
+) bool {
+    const start = if (guard_pos.line > guard_correlation_radius)
+        guard_pos.line - guard_correlation_radius
+    else
+        0;
+    const end = @min(guard_pos.line + guard_correlation_radius, limit);
+    var depth_before: [2 * guard_correlation_radius]usize =
+        [_]usize{0} ** (2 * guard_correlation_radius);
+    windowDepthsBefore(lines, start, end, &depth_before);
+    for (start..end) |j| {
+        const t = mem.trim(u8, lines[j], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        var s: usize = 0;
+        while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+            const pos = s + rel;
+            s = pos + var_name.len;
+            if (!isDirectAssignOccurrence(t, var_name, pos)) continue;
+            const pair = correlationPair(guard_pos, j, pos, start);
+            if (positionsInSameBlock(lines, pair.a, pair.b, depth_before[pair.depth_idx]))
+                return true;
+        }
+    }
+    return false;
+}
+
+/// Check that every non-null assignment to the guard also assigns the
+/// variable. A null write needs no correlation: the guarded read never
+/// fires on a null guard. The null verdict is the line's last guard
+/// assignment occurrence, classified by its own RHS — a null assignment
+/// to another variable on the line never counts (EPH-I0851). The
+/// correlation is same-block: the var assignment must sit
+/// in the same brace-delimited block as the guard assignment, at the
+/// guard's depth (EPH-I0331, band-B01b F-05). A sibling branch or a
+/// nested arm does not correlate: on a different-condition sibling the
+/// guard can be non-null while the var stays uninitialized. A sibling if
+/// with the same condition textually runs together with the guard-if, so
+/// that shape is safe and still reports — accepted false positive,
+/// chosen direction (EPH-I0848). A pair farther apart than
+/// guard_correlation_radius lines is missed — accepted false negative,
+/// documented approximation. Every occurrence of the guard on a line is
+/// checked: a first non-assignment occurrence does not hide the
+/// assignment that follows it (EPH-I0843).
 fn allGuardAssignsCorrelate(
     lines: []const []const u8,
     limit: usize,
@@ -4421,50 +4907,24 @@ fn allGuardAssignsCorrelate(
     for (0..limit) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (!isGuardAssignment(t, guard)) continue;
-        if (mem.indexOf(u8, t, "= null") != null) continue;
-        if (!isVarAssignedNearby(lines, i, var_name, 10)) return false;
-    }
-    return true;
-}
-
-/// Check if a line assigns to the guard variable (word-boundary aware).
-fn isGuardAssignment(t: []const u8, guard: []const u8) bool {
-    const gpos = mem.indexOf(u8, t, guard) orelse return false;
-    if (gpos > 0 and isIdent(t[gpos - 1])) return false;
-    if (gpos + guard.len < t.len and isIdent(t[gpos + guard.len])) return false;
-    // Field of another var, with any spacing around the dot (EPH-I0796).
-    if (hasLeftDot(t, gpos)) return false;
-    return isAssignmentTarget(t, guard, gpos);
-}
-
-/// Check if a variable is assigned within `radius` lines of `center_idx`.
-fn isVarAssignedNearby(
-    lines: []const []const u8,
-    center_idx: usize,
-    var_name: []const u8,
-    radius: usize,
-) bool {
-    const start = if (center_idx > radius) center_idx - radius else 0;
-    const end = @min(center_idx + radius, lines.len);
-    for (start..end) |i| {
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
+        // The null verdict applies to the whole line: an assignment
+        // occurrence later in the line supersedes an earlier one.
+        const ends_null = lastGuardWriteIsNull(t, guard);
         var s: usize = 0;
-        while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-            const pos = s + rel;
-            s = pos + var_name.len;
-            // The match must be the variable itself: not mid-identifier
-            // (box =) and not a field of another var (foo.x =, with any
-            // spacing around the dot — EPH-I0795).
-            if (pos > 0 and isIdent(t[pos - 1])) continue;
-            if (hasLeftDot(t, pos)) continue;
-            if (pos + var_name.len < t.len and
-                isIdent(t[pos + var_name.len])) continue;
-            if (isAssignmentTarget(t, var_name, pos)) return true;
+        while (mem.indexOf(u8, t[s..], guard)) |rel| {
+            const gpos = s + rel;
+            s = gpos + guard.len;
+            if (!isDirectAssignOccurrence(t, guard, gpos)) continue;
+            if (ends_null) continue;
+            if (!hasCorrelatedSameBlockAssign(
+                lines,
+                .{ .line = i, .col = gpos },
+                limit,
+                var_name,
+            )) return false;
         }
     }
-    return false;
+    return true;
 }
 
 /// Result of backward brace accounting for one line while walking upward
@@ -4525,6 +4985,19 @@ const enclosing_block_lookback = 40;
 const null_guard_lookback = 20;
 const paired_increment_lookback = 20;
 const short_circuit_lookback = 10;
+
+/// Bounded radius for the null-guard correlation scan (EPH-I0331,
+/// band-B01b F-05): the var assignment must sit within this many lines of
+/// the guard assignment. A correlated pair farther apart is missed — the
+/// read fires — accepted false positive, documented at
+/// allGuardAssignsCorrelate.
+const guard_correlation_radius = 10;
+
+/// Bounded forward window for the or-guard body scan (EPH-I0330,
+/// band-B01b F-04): the body assignment must appear within this many
+/// lines of the if. A longer body is missed — accepted false negative,
+/// documented at isOrShortCircuitSafe.
+const or_guard_body_window = 20;
 
 /// Extract the condition from an enclosing if-statement by walking backwards.
 /// Returns the condition string (e.g., "big" from "if (big) {") or null.
@@ -4971,11 +5444,77 @@ fn isExitStatement(t: []const u8) bool {
         mem.eql(u8, t, "unreachable,");
 }
 
+/// Guard variable of an or-short-circuit LHS: the identifier directly
+/// before a trailing `== null` (`g == null`), or null. A `!= null` or
+/// non-equality LHS never skips the RHS read, so it cannot guard it
+/// (EPH-I0330, band-B01b F-04).
+fn orGuardVariable(lhs: []const u8) ?[]const u8 {
+    const trimmed = mem.trim(u8, lhs, " \t");
+    if (trimmed.len < "== null".len) return null;
+    if (!mem.endsWith(u8, trimmed, "== null")) return null;
+    var end = trimmed.len - "== null".len;
+    while (end > 0 and (trimmed[end - 1] == ' ' or trimmed[end - 1] == '\t')) {
+        end -= 1;
+    }
+    var start = end;
+    while (start > 0 and isIdent(trimmed[start - 1])) start -= 1;
+    if (start == end) return null;
+    return trimmed[start..end];
+}
+
+/// True when the line declares the guard `= null`: a `var <guard>`
+/// declaration whose initializer is null (EPH-I0330).
+fn isNullGuardDecl(t: []const u8, guard: []const u8) bool {
+    if (!mem.startsWith(u8, t, "var ")) return false;
+    const after_var = t[4..];
+    if (!mem.startsWith(u8, after_var, guard)) return false;
+    if (after_var.len > guard.len and isIdent(after_var[guard.len])) return false;
+    return mem.indexOf(u8, t, "= null") != null;
+}
+
+/// Null state of the or-guard variable on the walk to the guarded if.
+const NullState = enum { unknown, null_value, non_null };
+
+/// True when the guard is null at the or-guard if: some `var <guard> =
+/// null` declaration or null assignment precedes the if, and no non-null
+/// assignment to the guard survives between the declaration and the if
+/// (EPH-I0330, band-B01b F-04). The state is tracked over every line, so
+/// a non-null assignment balanced by a later null assignment still ends
+/// null. Every occurrence of the guard on a line is scanned: a first
+/// non-assignment occurrence (`use(&g); g = 5;`) does not hide the
+/// assignment that follows it (EPH-I0843). A line's null verdict is its
+/// last assignment occurrence's own RHS: `g = null; g = 5;` ends
+/// non-null, and another variable's null assignment on the line never
+/// counts (EPH-I0851). A parameter guard never
+/// counts: it may be non-null on the first iteration.
+fn guardNullAtOrIf(lines: []const []const u8, read_idx: usize, guard: []const u8) bool {
+    var state: NullState = .unknown;
+    for (0..read_idx) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (isNullGuardDecl(t, guard)) {
+            state = .null_value;
+        } else if (state != .unknown and isGuardAssignment(t, guard)) {
+            state = if (lastGuardWriteIsNull(t, guard)) .null_value else .non_null;
+        }
+    }
+    return state == .null_value;
+}
+
 /// Check if a variable read is safe due to `or` short-circuit evaluation.
-/// Pattern: `if (guard == null or i > var_name)` where the variable is
-/// assigned inside the if-block body. When `guard == null` is true, the
-/// RHS (`i > var_name`) is never evaluated, so the read is safe. When
-/// `guard != null`, the variable was assigned in a prior iteration.
+/// Pattern: `if (g == null or i > var_name)` inside a loop, where the
+/// variable is assigned at the if-block body's top level. When `g ==
+/// null` holds, the RHS is never evaluated; when `g != null`, the body
+/// ran on an earlier iteration and assigned the variable.
+///
+/// The narrative is enforced, not assumed (EPH-I0330, band-B01b F-04):
+/// the if must sit inside a loop, the LHS must be a null equality on a
+/// guard that is null at the if (guardNullAtOrIf), and the body must
+/// assign the variable at its top level. Accepted approximations: the
+/// body scan stops at or_guard_body_window lines; a guard made non-null
+/// inside the loop after the guarded if stays safe by construction (the
+/// body assigns the variable); an enclosing loop opener beyond the
+/// lookback window is missed.
 fn isOrShortCircuitSafe(
     lines: []const []const u8,
     read_idx: usize,
@@ -4994,12 +5533,19 @@ fn isOrShortCircuitSafe(
     // Must be in an if-condition
     if (!mem.startsWith(u8, t, "if ") and
         !mem.startsWith(u8, t, "if(")) return false;
-    // The variable must be assigned inside the if-block body
+    // The LHS must be a null equality: only then does the guard skip the
+    // RHS read when it holds.
+    const guard = orGuardVariable(t[0..or_pos]) orelse return false;
+    // The loop narrative needs a loop and a guard that is null when the
+    // loop is entered: the first iteration's RHS must never evaluate.
+    if (findEnclosingLoopLine(lines, read_idx) == null) return false;
+    if (!guardNullAtOrIf(lines, read_idx, guard)) return false;
+    // The variable must be assigned at the top level of the if-block body
     if (read_idx + 1 < lines.len) {
         return blockContainsAssignment(
             lines,
-            read_idx + 1,
-            @min(read_idx + 20, lines.len),
+            read_idx,
+            @min(read_idx + or_guard_body_window, lines.len),
             var_name,
         );
     }
@@ -12788,6 +13334,35 @@ fn hasModifyingMethodCall(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
+/// True when the line calls `.init(` on the local: `x.init()`, or a
+/// receiver chain rooted at the local (`x.foo.init()`, `env.pool.init()`
+/// — the field-init idiom: the local's own memory is touched). A leading
+/// dot on the occurrence means a field of ANOTHER var — `other.x.init()`
+/// never fills the local (EPH-I0332, band-B01b F-06). The `&x`
+/// call-argument form stays covered by the hasDirectFill address-of arm.
+fn hasInitCallOnVar(t: []const u8, var_name: []const u8) bool {
+    var s: usize = 0;
+    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
+        const pos = s + rel;
+        s = pos + var_name.len;
+        // The receiver root must be the variable itself: not mid-identifier
+        // (box.init) and not a field of another var (foo.x.init, with any
+        // spacing around the dot — EPH-I0790).
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (hasLeftDot(t, pos)) continue;
+        var i = pos + var_name.len;
+        var last_seg: []const u8 = "";
+        while (i < t.len and t[i] == '.') {
+            i += 1;
+            const seg_start = i;
+            i = skipFieldName(t, i);
+            last_seg = t[seg_start..i];
+        }
+        if (mem.eql(u8, last_seg, "init") and i < t.len and t[i] == '(') return true;
+    }
+    return false;
+}
+
 /// Check if line fills a variable (pointer passed to function or direct assignment)
 fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // &var / &Struct.var / var[...] = / direct assignment, at any occurrence
@@ -12804,10 +13379,10 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // Buffer-filling calls (read/decode/bufPrint/crypto) taking &var_name
     if (hasFillCall(t, var_name)) return true;
 
-    // Common init functions that fill via pointer (bounded word, so
-    // `box.init()` does not count as filling a variable named x)
-    if (mem.indexOf(u8, t, ".init(") != null and containsIdentifier(t, var_name))
-        return true;
+    // Common init functions that fill the self receiver: `x.init()` fills
+    // the local x. The receiver must be the bare local name — `other.x.init()`
+    // inits a field of other, never the local x (EPH-I0332, band-B01b F-06).
+    if (hasInitCallOnVar(t, var_name)) return true;
 
     // Stdlib container mutation methods modify the self receiver
     if (hasModifyingMethodCall(t, var_name)) return true;
@@ -46581,14 +47156,6 @@ test "nextFillCallOccurrence keeps verdict parity on spaced-dot occurrences (EPH
     try std.testing.expect(nextFillCallOccurrence("fill(&buf);", "buf", &s) != null);
 }
 
-test "isVarAssignedNearby skips whitespace-spaced dot field writes (EPH-I0795)" {
-    // `foo . x = 1` writes foo's field through a spaced dot, never local x.
-    const spaced = [_][]const u8{"foo . x = 1;"};
-    try std.testing.expect(!isVarAssignedNearby(&spaced, 0, "x", 10));
-    const plain = [_][]const u8{"x = 1;"};
-    try std.testing.expect(isVarAssignedNearby(&plain, 0, "x", 10));
-}
-
 test "findVarUseOnLine skips whitespace-spaced dot field reads (EPH-I0795)" {
     // `foo . item == 1` reads foo's field through a spaced dot, never the
     // local item.
@@ -46908,14 +47475,17 @@ test "ZA607: or-guard read not suppressed by other-var assignment in body" {
     );
 }
 
-test "ZA607: or-guard read stays silent when body genuinely assigns" {
+test "ZA607: or-guard read fires outside a loop and without a null guard" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // The boundary guard must keep the established or-short-circuit
-    // suppression when the body really assigns x (loop-carried class).
+    // EPH-I0330 (band-B01b F-04): the loop narrative needs a loop and a
+    // guard that is null at the if. This shape has neither: on the
+    // c == false path the RHS `x == 1` reads uninitialized x. It was
+    // pinned silent before the fix — that pin recorded the false
+    // negative.
     const content =
         \\fn negOr(c: bool) void {
         \\    var x: u32 = undefined;
@@ -46928,7 +47498,7 @@ test "ZA607: or-guard read stays silent when body genuinely assigns" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        0,
+        1,
         countRuleIssues(run.issues.items, "da_orguard_neg.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
@@ -46991,20 +47561,490 @@ test "ZA607: correlated guard with genuine assignment stays silent" {
     );
 }
 
-test "isVarAssignedNearby scans every occurrence with word boundaries" {
-    // EPH-I0098: the first same-line occurrence may be a call arg (foo(x))
-    // while the genuine assignment follows it; `foo.x =` is a field of
-    // another var and `box =` a longer identifier — neither assigns x.
-    const second = [_][]const u8{"foo(x); x = 1;"};
-    try std.testing.expect(isVarAssignedNearby(&second, 0, "x", 10));
-    const plain = [_][]const u8{"x = 1;"};
-    try std.testing.expect(isVarAssignedNearby(&plain, 0, "x", 10));
-    const field = [_][]const u8{"foo.x = 1;"};
-    try std.testing.expect(!isVarAssignedNearby(&field, 0, "x", 10));
-    const longer = [_][]const u8{"box = 1;"};
-    try std.testing.expect(!isVarAssignedNearby(&longer, 0, "x", 10));
-    const cmp = [_][]const u8{"if (x == 1)"};
-    try std.testing.expect(!isVarAssignedNearby(&cmp, 0, "x", 10));
+test "positionsInSameBlock is exact on same-line and sibling shapes (EPH-I0331)" {
+    // Same-line pair inside one brace pair: the same block.
+    const same_line = [_][]const u8{"if (c1) { guard = 1; x = 2; }"};
+    const gpos = mem.indexOf(u8, same_line[0], "guard").?;
+    const xpos = mem.indexOf(u8, same_line[0], "x = 2").?;
+    try std.testing.expect(positionsInSameBlock(
+        &same_line,
+        .{ .line = 0, .col = gpos },
+        .{ .line = 0, .col = xpos },
+        0,
+    ));
+
+    // Same-line pair after the block closed: different blocks.
+    const after_close = [_][]const u8{"if (c1) { guard = 1; } x = 2;"};
+    const gpos2 = mem.indexOf(u8, after_close[0], "guard").?;
+    const xpos2 = mem.indexOf(u8, after_close[0], "x = 2").?;
+    try std.testing.expect(!positionsInSameBlock(
+        &after_close,
+        .{ .line = 0, .col = gpos2 },
+        .{ .line = 0, .col = xpos2 },
+        0,
+    ));
+
+    // Adjacent lines inside one multi-line block: the same block. The
+    // columns are trimmed-space (the caller contract): the fixture lines
+    // carry their own indent, and the occurrences sit at trimmed col 0.
+    const multi = [_][]const u8{
+        "if (c1) {",
+        "    guard = 1;",
+        "    x = 2;",
+        "}",
+    };
+    try std.testing.expect(positionsInSameBlock(
+        &multi,
+        .{ .line = 1, .col = 0 },
+        .{ .line = 2, .col = 0 },
+        1,
+    ));
+
+    // Sibling one-line branches: the c1 block closes on the guard's line.
+    const siblings = [_][]const u8{
+        "if (c1) { guard = 1; }",
+        "if (c2) { x = 2; }",
+    };
+    const gpos3 = mem.indexOf(u8, siblings[0], "guard").?;
+    const xpos3 = mem.indexOf(u8, siblings[1], "x = 2").?;
+    try std.testing.expect(!positionsInSameBlock(
+        &siblings,
+        .{ .line = 0, .col = gpos3 },
+        .{ .line = 1, .col = xpos3 },
+        0,
+    ));
+
+    // The else-arm dip: the depth recovers on the `} else {` line, but
+    // the dip below the guard depth closes the guard block.
+    const else_dip = [_][]const u8{
+        "if (c1) {",
+        "    guard = 1;",
+        "} else {",
+        "    x = 2;",
+        "}",
+    };
+    try std.testing.expect(!positionsInSameBlock(
+        &else_dip,
+        .{ .line = 1, .col = 0 },
+        .{ .line = 3, .col = 0 },
+        1,
+    ));
+
+    // A nested block that opens and closes inside the guard block does
+    // not split it: the pair stays in the same block.
+    const nested_balanced = [_][]const u8{
+        "if (c1) {",
+        "    guard = 1;",
+        "    { z = 1; }",
+        "    x = 2;",
+        "}",
+    };
+    try std.testing.expect(positionsInSameBlock(
+        &nested_balanced,
+        .{ .line = 1, .col = 0 },
+        .{ .line = 3, .col = 0 },
+        1,
+    ));
+
+    // Indented lines with trimmed-space columns, as the callers pass
+    // them: the scan must run on the trimmed slices (EPH-I0842).
+    const indented_same = [_][]const u8{"    if (c1) { guard = 1; x = 2; }"};
+    const is_t = mem.trim(u8, indented_same[0], " \t\r");
+    const gpos4 = mem.indexOf(u8, is_t, "guard").?;
+    const xpos4 = mem.indexOf(u8, is_t, "x = 2").?;
+    try std.testing.expect(positionsInSameBlock(
+        &indented_same,
+        .{ .line = 0, .col = gpos4 },
+        .{ .line = 0, .col = xpos4 },
+        0,
+    ));
+
+    // The one-line else arm on an indented line: the else `{` sits in
+    // the prefix slice a raw-line scan skips, so the guard depth reads
+    // one too low and the block-closing dip is absorbed (EPH-I0842).
+    const indented_else = [_][]const u8{
+        "    if (c1) { guard = 1; } else { guard = 1; }",
+        "    if (c2) { x = 2; }",
+    };
+    const g5_t = mem.trim(u8, indented_else[0], " \t\r");
+    const x5_t = mem.trim(u8, indented_else[1], " \t\r");
+    const gpos5 = mem.indexOf(u8, g5_t, "guard").?;
+    const xpos5 = mem.indexOf(u8, x5_t, "x = 2").?;
+    try std.testing.expect(!positionsInSameBlock(
+        &indented_else,
+        .{ .line = 0, .col = gpos5 },
+        .{ .line = 1, .col = xpos5 },
+        1,
+    ));
+
+    // Indented multi-line block: the pair stays in the same block.
+    const indented_multi = [_][]const u8{
+        "    if (c1) {",
+        "        guard = 1;",
+        "        x = 2;",
+        "    }",
+    };
+    try std.testing.expect(positionsInSameBlock(
+        &indented_multi,
+        .{ .line = 1, .col = 0 },
+        .{ .line = 2, .col = 0 },
+        1,
+    ));
+}
+
+test "correlationPair normalizes reversed same-line columns (EPH-I0850)" {
+    // The reversed else-arm one-liner: the var occurrence leads the
+    // guard on the line, and the closing brace between them splits the
+    // blocks. The normalized pair scans the real region — the reversed
+    // order scanned an empty region and read the pair as the same
+    // block, silencing the uninitialized read (EPH-I0850).
+    const rev_else = [_][]const u8{"if (c2) { x = 2; } else { guard = 1; }"};
+    const e_t = mem.trim(u8, rev_else[0], " \t\r");
+    const xpos = mem.indexOf(u8, e_t, "x = 2").?;
+    const gpos = mem.indexOf(u8, e_t, "guard").?;
+    const pair = correlationPair(.{ .line = 0, .col = gpos }, 0, xpos, 0);
+    try std.testing.expectEqual(@as(usize, 0), pair.a.line);
+    try std.testing.expectEqual(xpos, pair.a.col);
+    try std.testing.expectEqual(gpos, pair.b.col);
+    try std.testing.expect(!positionsInSameBlock(&rev_else, pair.a, pair.b, 0));
+
+    // The genuinely same-block shape: the var occurrence leads the guard
+    // inside one brace pair. The normalized pair keeps the correlation.
+    const rev_same = [_][]const u8{"if (c1) { x = 2; guard = 1; }"};
+    const s_t = mem.trim(u8, rev_same[0], " \t\r");
+    const xs = mem.indexOf(u8, s_t, "x = 2").?;
+    const gs = mem.indexOf(u8, s_t, "guard").?;
+    const same_pair = correlationPair(.{ .line = 0, .col = gs }, 0, xs, 0);
+    try std.testing.expectEqual(xs, same_pair.a.col);
+    try std.testing.expectEqual(gs, same_pair.b.col);
+    try std.testing.expect(positionsInSameBlock(&rev_same, same_pair.a, same_pair.b, 0));
+}
+
+test "guardNullAtOrIf tracks the null state across assignments (EPH-I0330)" {
+    // Null declaration with no later assignment: null at the if.
+    const clean = [_][]const u8{
+        "var g: ?u32 = null;",
+        "var x: u32 = undefined;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(guardNullAtOrIf(&clean, 2, "g"));
+
+    // A non-null assignment before the if: non-null at the if.
+    const assigned = [_][]const u8{
+        "var g: ?u32 = null;",
+        "g = 5;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(!guardNullAtOrIf(&assigned, 2, "g"));
+
+    // A non-null assignment balanced by a later null assignment: null at
+    // the if again.
+    const reset = [_][]const u8{
+        "var g: ?u32 = null;",
+        "g = 5;",
+        "g = null;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(guardNullAtOrIf(&reset, 3, "g"));
+
+    // A non-null assignment after a non-assignment occurrence on the same
+    // line: every occurrence is scanned, so the first occurrence does not
+    // hide the assignment that follows it (EPH-I0843).
+    const late = [_][]const u8{
+        "var g: ?u32 = null;",
+        "use(&g); g = 5;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(!guardNullAtOrIf(&late, 2, "g"));
+
+    // A parameter guard never gets a null declaration.
+    const param = [_][]const u8{
+        "if (guard == null or x == 1) {",
+    };
+    try std.testing.expect(!guardNullAtOrIf(&param, 0, "guard"));
+
+    // A same-line null-then-non-null pair ends non-null: the last
+    // occurrence's own RHS decides (EPH-I0851).
+    const reordered = [_][]const u8{
+        "var g: ?u32 = null;",
+        "g = null; g = 5;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(!guardNullAtOrIf(&reordered, 2, "g"));
+
+    // The reverse pair ends null: the last occurrence still decides.
+    const ends_null = [_][]const u8{
+        "var g: ?u32 = null;",
+        "g = 5; g = null;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(guardNullAtOrIf(&ends_null, 2, "g"));
+
+    // Another variable's null assignment on the guard's line never
+    // counts: the guard's own assignment stays non-null (EPH-I0851).
+    const other_null = [_][]const u8{
+        "var g: ?u32 = null;",
+        "g = 5; other = null;",
+        "if (g == null or x == 1) {",
+    };
+    try std.testing.expect(!guardNullAtOrIf(&other_null, 2, "g"));
+}
+
+test "lastGuardWriteIsNull classifies the final occurrence (EPH-I0851)" {
+    // A trailing non-null assignment overrides an earlier null one.
+    try std.testing.expect(!lastGuardWriteIsNull("g = null; g = 5;", "g"));
+    // A trailing null assignment ends null.
+    try std.testing.expect(lastGuardWriteIsNull("g = 5; g = null;", "g"));
+    // Another variable's null assignment never counts.
+    try std.testing.expect(!lastGuardWriteIsNull("g = 5; other = null;", "g"));
+    // A `== null` comparison is not an assignment at all.
+    try std.testing.expect(!lastGuardWriteIsNull("if (g == null) {", "g"));
+    // No assignment on the line: not a null write.
+    try std.testing.expect(!lastGuardWriteIsNull("use(&g);", "g"));
+}
+
+test "allGuardAssignsCorrelate ignores other-var null writes (EPH-I0851)" {
+    // The guard's own non-null assignment must correlate even when the
+    // line also nulls another variable: the read must fire (probe
+    // ng_other_null shape).
+    const uncorrelated = [_][]const u8{
+        "var guard: ?u32 = null;",
+        "var x: u32 = undefined;",
+        "var other: ?u32 = null;",
+        "if (c) {",
+        "    guard = 1; other = null;",
+        "}",
+        "if (guard) |_| {",
+    };
+    try std.testing.expect(!allGuardAssignsCorrelate(&uncorrelated, 7, "guard", "x"));
+
+    // The same line with a genuine x assignment in the block correlates.
+    const correlated = [_][]const u8{
+        "var guard: ?u32 = null;",
+        "var x: u32 = undefined;",
+        "var other: ?u32 = null;",
+        "if (c) {",
+        "    guard = 1; other = null;",
+        "    x = 2;",
+        "}",
+        "if (guard) |_| {",
+    };
+    try std.testing.expect(allGuardAssignsCorrelate(&correlated, 7, "guard", "x"));
+
+    // A line whose final guard write is null needs no correlation.
+    const null_line = [_][]const u8{
+        "var guard: ?u32 = null;",
+        "var x: u32 = undefined;",
+        "guard = 5; guard = null;",
+        "if (guard) |_| {",
+    };
+    try std.testing.expect(allGuardAssignsCorrelate(&null_line, 3, "guard", "x"));
+}
+
+test "orGuardVariable requires a trailing null equality (EPH-I0330)" {
+    try std.testing.expectEqualStrings("g", orGuardVariable("if (g == null").?);
+    try std.testing.expectEqualStrings("g", orGuardVariable("if (g  == null").?);
+    try std.testing.expect(orGuardVariable("if (c") == null);
+    try std.testing.expect(orGuardVariable("if (g != null") == null);
+    try std.testing.expect(orGuardVariable("if (g == null and") == null);
+}
+
+test "guardDominatesRead requires shared enclosures (EPH-I0329)" {
+    // Top-level guard and read: no enclosures, dominated.
+    const top = [_][]const u8{
+        "fn f(c: bool) u32 {",
+        "    var x: u32 = undefined;",
+        "    if (c) {",
+        "        x = 1;",
+        "    }",
+        "    if (c) {",
+        "        return x;",
+        "    }",
+        "    return 0;",
+        "}",
+    };
+    try std.testing.expect(guardDominatesRead(&top, 2, 5));
+
+    // Guard-if inside another if, read at top level: not dominated.
+    const in_if = [_][]const u8{
+        "fn f(a: bool, c: bool) u32 {",
+        "    var x: u32 = undefined;",
+        "    if (a) {",
+        "        if (c) {",
+        "            x = 1;",
+        "        }",
+        "    }",
+        "    if (c) {",
+        "        return x;",
+        "    }",
+        "    return 0;",
+        "}",
+    };
+    try std.testing.expect(!guardDominatesRead(&in_if, 3, 7));
+
+    // Guard-if inside a loop, read at top level: not dominated.
+    const in_loop = [_][]const u8{
+        "fn f(items: []const bool, c: bool) u32 {",
+        "    var x: u32 = undefined;",
+        "    for (items) |_| {",
+        "        if (c) {",
+        "            x = 1;",
+        "        }",
+        "    }",
+        "    if (c) {",
+        "        return x;",
+        "    }",
+        "    return 0;",
+        "}",
+    };
+    try std.testing.expect(!guardDominatesRead(&in_loop, 3, 8));
+
+    // Guard and read share the loop enclosure: dominated (the loop gates
+    // both equally, so the read cannot run without the guard-if running).
+    const shared = [_][]const u8{
+        "fn f(items: []const bool, c: bool) u32 {",
+        "    for (items) |_| {",
+        "        if (c) {",
+        "            x = 1;",
+        "        }",
+        "        if (c) {",
+        "            return x;",
+        "        }",
+        "    }",
+        "    return 0;",
+        "}",
+    };
+    try std.testing.expect(guardDominatesRead(&shared, 2, 5));
+
+    // Guard inside a bare block: the block runs unconditionally, so the
+    // guard stays dominated.
+    const in_bare = [_][]const u8{
+        "fn f(c: bool) u32 {",
+        "    var x: u32 = undefined;",
+        "    {",
+        "        if (c) {",
+        "            x = 1;",
+        "        }",
+        "    }",
+        "    if (c) {",
+        "        return x;",
+        "    }",
+        "    return 0;",
+        "}",
+    };
+    try std.testing.expect(guardDominatesRead(&in_bare, 3, 8));
+
+    // Guard inside an else arm, read at top level: not dominated.
+    const in_else = [_][]const u8{
+        "fn f(a: bool, c: bool) u32 {",
+        "    if (a) {",
+        "    } else {",
+        "        if (c) {",
+        "            x = 1;",
+        "        }",
+        "    }",
+        "    if (c) {",
+        "        return x;",
+        "    }",
+        "    return 0;",
+        "}",
+    };
+    try std.testing.expect(!guardDominatesRead(&in_else, 3, 8));
+}
+
+test "isMethodCallAt rejects a leading-dot receiver (EPH-I0332)" {
+    const other = "other.x.init();";
+    var cls = LineClassifier.init(other);
+    const xpos = mem.indexOf(u8, other, "x").?;
+    try std.testing.expect(!isMethodCallAt(other, xpos, "x", &cls));
+
+    const spaced = "other . x.init();";
+    var cls2 = LineClassifier.init(spaced);
+    const xpos2 = mem.indexOf(u8, spaced, "x").?;
+    try std.testing.expect(!isMethodCallAt(spaced, xpos2, "x", &cls2));
+
+    const local = "x.init();";
+    var cls3 = LineClassifier.init(local);
+    try std.testing.expect(isMethodCallAt(local, 0, "x", &cls3));
+}
+
+test "hasInitCallOnVar requires the local as the receiver root (EPH-I0332)" {
+    try std.testing.expect(hasInitCallOnVar("x.init();", "x"));
+    try std.testing.expect(hasInitCallOnVar("env.pool.init(gpa, size);", "env"));
+    try std.testing.expect(hasInitCallOnVar("x.foo.init();", "x"));
+    try std.testing.expect(!hasInitCallOnVar("other.x.init();", "x"));
+    try std.testing.expect(!hasInitCallOnVar("other . x.init();", "x"));
+    try std.testing.expect(!hasInitCallOnVar("box.init();", "x"));
+    // The &x call-argument form keeps the fill verdict via hasDirectFill.
+    try std.testing.expect(isFillPattern("foo.init(&x);", "x"));
+}
+
+test "blockContainsAssignment counts only the guard block's top level (EPH-I0329)" {
+    // Nested assignment inside the guard block: not top level.
+    const nested = [_][]const u8{
+        "if (c) {",
+        "    if (d) {",
+        "        x = 1;",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(!blockContainsAssignment(&nested, 0, 5, "x"));
+
+    // One-line nested form: the same verdict.
+    const nested_oneline = [_][]const u8{"if (c) { if (d) { x = 1; } }"};
+    try std.testing.expect(!blockContainsAssignment(&nested_oneline, 0, 1, "x"));
+
+    // One-line top-level assignment: counts.
+    const oneline = [_][]const u8{"if (c) { x = 1; }"};
+    try std.testing.expect(blockContainsAssignment(&oneline, 0, 1, "x"));
+
+    // Brace-on-next-line opener: the assignment is still top level.
+    const brace_next = [_][]const u8{
+        "if (c)",
+        "{",
+        "    x = 1;",
+        "}",
+    };
+    try std.testing.expect(blockContainsAssignment(&brace_next, 0, 4, "x"));
+
+    // Brace-less guard body: the first statement is the body.
+    const braceless = [_][]const u8{
+        "if (c)",
+        "    x = 1;",
+    };
+    try std.testing.expect(blockContainsAssignment(&braceless, 0, 2, "x"));
+
+    // An assignment after the guard block closes is not inside it.
+    const after = [_][]const u8{
+        "if (c) {",
+        "}",
+        "x = 1;",
+    };
+    try std.testing.expect(!blockContainsAssignment(&after, 0, 3, "x"));
+
+    // Loop-carried assignment at the loop body's top level counts (the
+    // documented exception — sig cmd.zig `for (0..3)` class).
+    const loop_carried = [_][]const u8{
+        "if (c) {",
+        "    for (items) |_| {",
+        "        x = 1;",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(blockContainsAssignment(&loop_carried, 0, 5, "x"));
+
+    // An assignment nested in a conditional inside the loop body never
+    // counts: the loop may run while the conditional arm does not.
+    const loop_nested_if = [_][]const u8{
+        "if (c) {",
+        "    for (items) |_| {",
+        "        if (d) {",
+        "            x = 1;",
+        "        }",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(!blockContainsAssignment(&loop_nested_if, 0, 7, "x"));
 }
 
 test "ZA607: null-guard correlation not suppressed by other-var field assignment" {
@@ -47051,9 +48091,9 @@ test "ZA607: null-guard correlation keeps same-line second-occurrence assignment
     // EPH-I0080: the original first occurrence `use(x)` was itself a genuine
     // read of x BEFORE the same-line assignment — line-order-aware gen now
     // reports that shape (see "same-line read before assignment"), so this
-    // test uses a non-read first occurrence instead. The call-arg
-    // occurrence-loop case stays covered by the isVarAssignedNearby unit
-    // test above.
+    // test uses a non-read first occurrence instead. The occurrence loop
+    // visits every same-line match, so an assignment after a
+    // non-assignment occurrence still counts (EPH-I0331).
     const content =
         \\fn nullGuardSecondOccurrence(cond: bool) u32 {
         \\    var guard: ?u32 = null;
@@ -47074,6 +48114,148 @@ test "ZA607: null-guard correlation keeps same-line second-occurrence assignment
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_nullguard_second.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line else arm guard does not suppress the correlated read (EPH-I0842)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-05 bad shape: the guard's non-null assignments sit in
+    // the if and else arms, the var assignment in a sibling if. On the
+    // c == false path the guard is non-null (else arm) while x stays
+    // uninitialized, so the read must fire. The one-line else arm's `{`
+    // previously sat in the raw-line prefix slice the trimmed-column
+    // scan skipped, and the correlation read the sibling as the same
+    // block (EPH-I0842); the raw-line sibling variant of this shape is
+    // masked by the pre-existing one-line-if effect attribution and
+    // stays silent by design (verified at c127739 and here). The
+    // multi-line sibling keeps the read visible, so the correlation
+    // verdict is what this pin observes.
+    const content =
+        \\fn oneLineElseGuard(c: bool) u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (c) { guard = 2; } else { guard = 1; }
+        \\    if (c) {
+        \\        x = 2;
+        \\    }
+        \\    if (guard) |_| {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_one_line_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_one_line_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: indented same-block correlation stays silent (EPH-I0842)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The guard and var assignments share one brace-delimited block in
+    // indented code: the correlation holds and the read stays silent.
+    // Indentation is the hiding place of the raw-line column bug: the
+    // trimmed-column scan must not shift the brace regions (EPH-I0842).
+    const content =
+        \\fn indentedCorr(c: bool) u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        guard = 1;
+        \\        x = 2;
+        \\    }
+        \\    if (guard) |_| {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_indented_corr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_indented_corr.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard fires with a same-line pre-assigned guard (EPH-I0843)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-04 bad shape: the guard is set non-null on the same
+    // line as a non-assignment occurrence of it (`use(&g); g = 5;`). The
+    // first-occurrence scan missed the assignment, the null state stayed
+    // null, and iteration 1 read uninitialized x in silence. The
+    // occurrence scan visits every occurrence (EPH-I0843).
+    const content =
+        \\fn loopLateAssign(items: []const bool) void {
+        \\    var g: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    use(&g); g = 5;
+        \\    for (items) |_| {
+        \\        if (g == null or x == 1) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_late_assign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_or_late_assign.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-condition sibling ifs report the correlated read (EPH-I0848)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Chosen direction (band-B01b F-05): the same-block correlation does
+    // not connect sibling ifs, even when both share the condition
+    // textually — `if (c) { guard = 1; }` and `if (c) { x = 2; }` run
+    // together, so the read is safe, yet the analyzer reports it. The
+    // approximation is documented at allGuardAssignsCorrelate; this pin
+    // records the chosen direction (EPH-I0848).
+    const content =
+        \\fn sameCondSiblings(c: bool) u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        guard = 1;
+        \\    }
+        \\    if (c) {
+        \\        x = 2;
+        \\    }
+        \\    if (guard) |_| {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_same_cond_sib.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_same_cond_sib.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -47111,6 +48293,446 @@ test "ZA607: comparison operators in or-condition are reads on every path" {
     try std.testing.expectEqual(
         3,
         countRuleIssues(run.issues.items, "da_cmp_ops.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested guard-if does not suppress the correlated read (EPH-I0329)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-03 bad shape: the assignment-if `if (c)` sits inside
+    // `if (a)`, so x is assigned only when a AND c. The top-level `if (c)`
+    // read is uninitialized on the a == false path. The guard-if is
+    // conditionally enclosed — the suppression must not apply.
+    const content =
+        \\fn nestedGuard(a: bool, c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) {
+        \\        if (c) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\    if (c) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nested_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nested_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested assignment inside the guard block does not suppress (EPH-I0329)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-03 bad shape: the assignment sits at depth 2 inside the
+    // guard block, so x is assigned only when c AND d. The guard block's
+    // top level never assigns x.
+    const content =
+        \\fn nestedAssign(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        if (d) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\    if (c) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nested_assign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nested_assign.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: else-if guard does not suppress the correlated read (EPH-I0329)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-03 bad shape: the assignment-if is an else-if arm. When
+    // a AND c hold, the read executes but the else-if arm did not, so x
+    // is uninitialized.
+    const content =
+        \\fn elseIfGuard(a: bool, c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) {
+        \\    } else if (c) {
+        \\        x = 1;
+        \\    }
+        \\    if (c) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_elseif_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_elseif_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop-enclosed guard-if does not suppress the read (EPH-I0329)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The assignment-if inside the for loop may never run (empty
+    // iterable): the top-level `if (c)` read stays uninitialized on that
+    // path. A loop enclosure is conditional, never unconditional.
+    const content =
+        \\fn loopEnclosedGuard(items: []const bool, c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    for (items) |_| {
+        \\        if (c) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\    if (c) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_loop_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_loop_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: correlated guard keeps the documented stability approximation (EPH-I0329)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The condition-variable mutation between the guard and the read is
+    // an accepted approximation: textual equality of the condition is the
+    // model. Both ifs sit at top level with the assignment at the guard
+    // block's top level, so the suppression stays (documented arm of the
+    // done-when — see isCorrelatedGuardRead).
+    const content =
+        \\fn mutatedCond(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    c = false;
+        \\    if (c) {
+        \\        x = 1;
+        \\    }
+        \\    c = true;
+        \\    if (c) {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_mutated_cond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_mutated_cond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard fires on the first iteration with a non-null guard (EPH-I0330)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-04: the guard is a parameter — it may be non-null when
+    // the loop is entered, so iteration 1 evaluates the RHS `x == 1`
+    // against uninitialized x. The read must fire.
+    const content =
+        \\fn firstIter(guard: ?u32, items: []const bool) void {
+        \\    var x: u32 = undefined;
+        \\    for (items) |_| {
+        \\        if (guard == null or x == 1) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_first_iter.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_or_first_iter.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard fires when the guard is set non-null before the loop (EPH-I0330)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The guard is null-initialized, then assigned non-null before the
+    // loop: iteration 1 reads uninitialized x in the RHS.
+    const content =
+        \\fn loopBad(items: []const bool) void {
+        \\    var g: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    g = 5;
+        \\    for (items) |_| {
+        \\        if (g == null or x == 1) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_pre_assign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_or_pre_assign.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: or-guard stays silent in the loop with a null guard (EPH-I0330)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The loop-carried control: the guard is null at the loop entry, so
+    // iteration 1 short-circuits before the RHS, and the body assigns x
+    // for every later RHS evaluation. The suppression must hold.
+    const content =
+        \\fn loopGood(items: []const bool) void {
+        \\    var g: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    for (items) |_| {
+        \\        if (g == null or x == 1) {
+        \\            g = 1;
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_or_loop_good.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_or_loop_good.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: null-guard correlation fires for sibling-branch assignments (EPH-I0331)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-05 bad shape: the guard and the var are assigned in
+    // sibling branches. When c1 holds and c2 does not, the guard is
+    // non-null and the read observes uninitialized x. The old ±10-line
+    // proximity check counted the pair as correlated.
+    const content =
+        \\fn nullGuardSiblings(c1: bool, c2: bool) u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (c1) {
+        \\        guard = 1;
+        \\    }
+        \\    if (c2) {
+        \\        x = 2;
+        \\    }
+        \\    if (guard) |_| {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nullguard_siblings.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nullguard_siblings.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: null-guard correlation fires for a nested var assignment (EPH-I0331)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The var assignment nested inside the guard block runs only when c2
+    // also holds: the guard can be non-null while x stays uninitialized.
+    const content =
+        \\fn nullGuardNested(c1: bool, c2: bool) u32 {
+        \\    var guard: ?u32 = null;
+        \\    var x: u32 = undefined;
+        \\    if (c1) {
+        \\        guard = 1;
+        \\        if (c2) {
+        \\            x = 2;
+        \\        }
+        \\    }
+        \\    if (guard) |_| {
+        \\        return x;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_nullguard_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_nullguard_nested.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: method call on a field of another var does not init the local (EPH-I0332)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B01b F-06: `other.x.init()` initializes a field of other, not
+    // the local x. The missing leading-dot guard removed x from the
+    // candidate set, so the read of the uninitialized local went silent.
+    const content =
+        \\const Foo = struct { x: u32 = 0 };
+        \\fn methodOnOtherField(other: *Foo) u32 {
+        \\    var x: u32 = undefined;
+        \\    other.x.init();
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_field_method.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_field_method.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: method call on the bare local keeps the fill verdict (EPH-I0332)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The control: `x.init()` on the bare local still counts as indirect
+    // initialization, so the read stays silent. The dot guard must not
+    // over-fire on the genuine receiver shape.
+    const content =
+        \\const Foo = struct { x: u32 = 0 };
+        \\fn methodOnLocal(foo: *Foo) u32 {
+        \\    var x: u32 = undefined;
+        \\    x.init();
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_local_method.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_local_method.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop-carried guard under a shared loop stays silent (EPH-I0329)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The sig cmd.zig shape: the guard-if and the read share the while
+    // enclosure, so the read cannot run without the guard block running;
+    // the loop-carried assignment covers it. The shared enclosure and the
+    // loop-carried arm keep the suppression (documented approximations).
+    const content =
+        \\fn sharedLoopGuard(exit: *bool, i: *usize) u32 {
+        \\    while (!exit.*) {
+        \\        if (i.* % 1000 == 0) {
+        \\            var result: anyerror!void = undefined;
+        \\            for (0..3) |_| {
+        \\                result = f();
+        \\            }
+        \\            result catch |e| {
+        \\                return 0;
+        \\            };
+        \\        }
+        \\    }
+        \\    return 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_shared_loop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_shared_loop.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested-in-conditional assignment inside the loop still fires (EPH-I0329)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The control: the assignment nested in a conditional inside the loop
+    // body is not loop-carried — the loop may run while the conditional
+    // arm does not, so the read can observe uninitialized result.
+    const content =
+        \\fn sharedLoopGuardBad(exit: *bool, i: *usize) u32 {
+        \\    while (!exit.*) {
+        \\        if (i.* % 1000 == 0) {
+        \\            var result: anyerror!void = undefined;
+        \\            for (0..3) |_| {
+        \\                if (i.* > 0) {
+        \\                    result = f();
+        \\                }
+        \\            }
+        \\            result catch |e| {
+        \\                return 0;
+        \\            };
+        \\        }
+        \\    }
+        \\    return 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_shared_loop_bad.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_shared_loop_bad.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

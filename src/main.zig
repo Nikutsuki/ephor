@@ -2711,9 +2711,10 @@ fn isElseBodyStart(t: []const u8) bool {
 /// conditional instead of looking like a top-level statement (EPH-I0087,
 /// EPH-I0108). A loop body is conditional the same way: the loop may run
 /// zero times, so a fill inside never counts as unconditional (EPH-I0110).
-/// A switch prong `else =>` never opens a conditional body: with the
-/// switch brace counted as an expression brace, the prong's depth would
-/// leak past the switch's `};` (EPH-I0106).
+/// A switch prong `else =>` never opens a conditional body: the switch
+/// arm-list brace opens the depth (EPH-I0334), and the prong's own `{`
+/// stays an expression brace, so the prong's depth closes at the arm
+/// close, never past the switch's `}` (EPH-I0106).
 fn opensConditionalBody(check_line: []const u8) bool {
     var rest = check_line;
     while (rest.len > 0 and rest[0] == '}') {
@@ -2863,9 +2864,10 @@ fn isElseBraceOpen(code: []const u8, i: usize) bool {
 }
 
 /// True when `name` is a type/container keyword whose parenthesized
-/// header precedes an expression brace: `switch (y) {`, `union(enum) {`,
-/// `enum(u8) {`. The closing brace of such a form never closes a
-/// conditional block (EPH-I0106).
+/// header precedes a brace: `switch (y) {`, `union(enum) {`,
+/// `enum(u8) {`. The caller redirects a switch header brace to a
+/// conditional block (EPH-I0334); the other header braces stay
+/// expression braces (EPH-I0106).
 fn isContainerKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{ "switch", "union", "enum", "struct", "error", "opaque" };
     for (keywords) |kw| {
@@ -2884,13 +2886,12 @@ fn identBefore(code: []const u8, pos: usize) []const u8 {
     return code[start..end];
 }
 
-/// True when the `)` at `close_idx` closes the parenthesized header of a
-/// type/container expression on this line: a depth-counted backward scan
-/// finds the matching `(`, and the identifier before it is a container
-/// keyword (EPH-I0106). A multi-line header has no `(` on this line and
-/// falls back to false. Control keywords (`if`, `while`, `for`) and
-/// non-keyword identifiers also fall back to false.
-fn isContainerParenHeader(code: []const u8, close_idx: usize) bool {
+/// Identifier of the keyword whose parenthesized header closes at
+/// `close_idx` on this line, or null: a depth-counted backward scan
+/// finds the matching `(`, and the identifier before it names the
+/// header. A multi-line header has no `(` on this line and returns
+/// null. Callers compare against the keywords they recognize.
+fn parenHeaderKeyword(code: []const u8, close_idx: usize) ?[]const u8 {
     var depth: usize = 0;
     var k = close_idx;
     while (k > 0) {
@@ -2898,13 +2899,33 @@ fn isContainerParenHeader(code: []const u8, close_idx: usize) bool {
         switch (code[k]) {
             ')' => depth += 1,
             '(' => {
-                if (depth == 0) return isContainerKeyword(identBefore(code, k));
+                if (depth == 0) return identBefore(code, k);
                 depth -= 1;
             },
             else => {},
         }
     }
-    return false;
+    return null;
+}
+
+/// True when the `)` at `close_idx` closes the parenthesized header of a
+/// type/container expression on this line: the identifier before the
+/// matching `(` is a container keyword (EPH-I0106). Control keywords
+/// (`if`, `while`, `for`) and non-keyword identifiers fall back to
+/// false.
+fn isContainerParenHeader(code: []const u8, close_idx: usize) bool {
+    const kw = parenHeaderKeyword(code, close_idx) orelse return false;
+    return isContainerKeyword(kw);
+}
+
+/// True when the `)` at `close_idx` closes the parenthesized header of
+/// a `switch` on this line: the identifier before the matching `(` is
+/// the switch keyword (EPH-I0334). A multi-line header has no `(` on
+/// this line and falls back to the caller's paren_container_switch
+/// flag.
+fn isSwitchParenHeader(code: []const u8, close_idx: usize) bool {
+    const kw = parenHeaderKeyword(code, close_idx) orelse return false;
+    return mem.eql(u8, kw, "switch");
 }
 
 /// The line's first `}` that pays conditional depth down, with the depth
@@ -2922,7 +2943,12 @@ const CloseMark = struct {
 /// never move the depth (EPH-I0083, EPH-I0085). An `else` after the
 /// closing `}` of the previous arm re-opens the depth for the next arm
 /// (EPH-I0087). A loop opener opens the depth like an `if` does: the body
-/// may run zero times, so fills inside stay conditional (EPH-I0110).
+/// may run zero times, so fills inside stay conditional (EPH-I0110). In
+/// this scan, a switch arm-list brace opens the depth the same way: arms
+/// may not run, so a fill inside an arm never counts as unconditional
+/// (EPH-I0334). The one-line list keeps the property: a fill before the
+/// line's first depth-paying close is judged at the close's depth_before
+/// (EPH-I0111).
 const CondNesting = struct {
     depth: usize = 0, // open if/else blocks
     pending_expr: usize = 0, // unmatched expression-position `{`
@@ -2932,6 +2958,9 @@ const CondNesting = struct {
     // parens never clobber it (EPH-I0106). The next span's transition
     // overwrites it, so it needs no clearing when the span closes.
     paren_container: bool = false,
+    // Whether that header keyword was `switch` (EPH-I0334): the same
+    // transition discipline as paren_container.
+    paren_container_switch: bool = false,
     // The line-start opener was counted on this line, so a control `{`
     // later on the line must not count twice. Only a mid-line else brace
     // after a statement (`_ = c; } else {`) still re-opens the depth
@@ -2970,18 +2999,14 @@ const CondNesting = struct {
         switch (code[i]) {
             '(', '[' => {
                 if (self.paren_depth == 0) {
-                    self.paren_container = isContainerKeyword(identBefore(code, i));
+                    const kw = identBefore(code, i);
+                    self.paren_container = isContainerKeyword(kw);
+                    self.paren_container_switch = mem.eql(u8, kw, "switch");
                 }
                 self.paren_depth += 1;
             },
             ')', ']' => self.paren_depth -|= 1,
-            '{' => {
-                if (self.isExprBraceOpen(code, i)) {
-                    self.pending_expr += 1;
-                } else if (!self.opener_counted and isElseBraceOpen(code, i)) {
-                    self.depth += 1;
-                }
-            },
+            '{' => self.openBrace(code, i),
             '}' => {
                 if (self.first_close == null and self.pending_expr == 0 and
                     self.depth > 0)
@@ -2989,6 +3014,21 @@ const CondNesting = struct {
                 self.closeBrace();
             },
             else => {},
+        }
+    }
+
+    /// Fold one `{` into the nesting state: an expression brace, an else
+    /// arm brace, or a switch arm-list brace that opens conditional
+    /// depth (EPH-I0334).
+    fn openBrace(self: *CondNesting, code: []const u8, i: usize) void {
+        if (self.isExprBraceOpen(code, i)) {
+            if (self.isSwitchHeaderBrace(code, i)) {
+                self.depth += 1;
+            } else {
+                self.pending_expr += 1;
+            }
+        } else if (!self.opener_counted and isElseBraceOpen(code, i)) {
+            self.depth += 1;
         }
     }
 
@@ -3010,11 +3050,13 @@ const CondNesting = struct {
     /// opens an expression unless it is the `else` keyword. A `)` ends a
     /// control keyword's condition, except when the matching `(` belongs
     /// to a type/container header such as `switch (y)` or `union(enum)` —
-    /// that brace opens an expression (EPH-I0106). When the header spans
-    /// lines, the same-line scan finds no `(` and the paren_container
-    /// flag recorded at the span's opening paren decides instead. The
-    /// flag is always fresh here: in balanced code the `)` that returned
-    /// paren_depth to 0 closed the span whose opening set the flag.
+    /// that brace opens an expression (EPH-I0106). The caller redirects
+    /// a switch header brace to a conditional block (EPH-I0334). When
+    /// the header spans lines, the same-line scan finds no `(` and the
+    /// paren_container flag recorded at the span's opening paren decides
+    /// instead. The flag is always fresh here: in balanced code the `)`
+    /// that returned paren_depth to 0 closed the span whose opening set
+    /// the flag.
     fn isExprBraceOpen(self: *const CondNesting, code: []const u8, i: usize) bool {
         if (self.paren_depth > 0) return true;
         if (self.pending_expr > 0) return true;
@@ -3032,6 +3074,29 @@ const CondNesting = struct {
         var start = j - 1;
         while (start > 0 and isIdent(code[start - 1])) start -= 1;
         return !mem.eql(u8, code[start..j], "else");
+    }
+
+    /// True when the `{` at i opens a switch arm list: the switch header
+    /// closes on this line (`switch (...)`) or the recorded header flag
+    /// names switch (multi-line header). Such a brace behaves like a
+    /// conditional body: arms may not run, so a fill inside an arm stays
+    /// conditional (EPH-I0334). A switch inside an open paren or pending
+    /// expression (a condition, a struct literal) is an expression, not
+    /// a statement, and keeps its expression brace.
+    /// Residual (EPH-I0334): a switch whose first arm shares the header
+    /// line never splits arm blocks at the CFG level, because arm blocks
+    /// open only on lines that classify as switch arms. The one-line
+    /// list `switch (c) { 1 => x = 1, else => {} }` (and its two-line
+    /// braced variant) has no such line, so the fill counts as
+    /// unconditional and ZA607 misses the warning the multi-line shape
+    /// gives (accepted, fail-unsafe). Zero corpus occurrences; zig fmt
+    /// expands the shape to a multi-line list, which splits correctly.
+    fn isSwitchHeaderBrace(self: *const CondNesting, code: []const u8, i: usize) bool {
+        if (self.paren_depth > 0 or self.pending_expr > 0) return false;
+        var j = i;
+        while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+        if (j == 0 or code[j - 1] != ')') return false;
+        return isSwitchParenHeader(code, j - 1) or self.paren_container_switch;
     }
 };
 
@@ -3303,6 +3368,14 @@ fn nextFillCallOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize
         if (hasLeftDot(t, pos)) continue;
         if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) continue;
         // Slice-index occurrences are Pattern-2 — whole-line coverage.
+        // The `[` bar denies whole-var credit to element-address
+        // call-fills (EPH-I0827 ruling): one element store does not
+        // prove whole-var initialization, and whole-var credit would
+        // turn partial-init reads into silent false negatives — the
+        // unsound direction. The bar costs an over-warn on
+        // fill-loop-then-whole-read shapes, the fail-safe direction.
+        // EPH-I0822 gave `&buf[i]` and `&(buf[i])` spelling parity, so
+        // the bar is uniform.
         if (pos + var_name.len < t.len and t[pos + var_name.len] == '[') continue;
         // `&var` call argument: the call-fill heuristic writes through the
         // pointer. The grouping-paren form `&(x)` is the same address-of
@@ -3735,68 +3808,184 @@ fn hasAsmOutputVar(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
-/// Detect comptime field assignment: @field(var_name, ...) = ...
-/// This pattern is used in inline for/while loops over struct fields to populate a variable.
-/// Handles both single-line: @field(result, field.name) = value
-/// And multi-line: @field(result, switch (i) { ... }) = value
-fn hasComptimeFieldAssignment(t: []const u8, var_name: []const u8) bool {
-    const prefix = "@field(";
-    // One classifier walk per line (EPH-I0153): candidates ascend.
-    var cls = LineClassifier.init(t);
-    var search_start: usize = 0;
-    while (search_start + prefix.len + var_name.len + 1 <= t.len) {
-        const pos = mem.indexOf(u8, t[search_start..], prefix) orelse return false;
-        const abs_pos = search_start + pos;
-        search_start = abs_pos + 1;
-
-        // Check if inside string or comment
-        if (cls.isInsideString(abs_pos)) continue;
-        if (mem.indexOf(u8, t[0..abs_pos], "//")) |_| continue;
-
-        // After @field(, expect var_name followed by comma or )
-        const after_paren = abs_pos + prefix.len;
-        if (after_paren + var_name.len > t.len) continue;
-        if (!mem.eql(u8, t[after_paren .. after_paren + var_name.len], var_name)) continue;
-
-        // After var_name, expect comma or whitespace (not another identifier char)
-        const after_name = after_paren + var_name.len;
-        if (after_name >= t.len) continue;
-        const next_ch = t[after_name];
-        if (next_ch != ',' and next_ch != ')' and next_ch != ' ' and next_ch != '\t') continue;
-
-        // @field(var_name, ...) found - this indicates comptime field population.
-        // The closing ) and = may be on a later line (multi-line switch expression).
-        return true;
-    }
-    return false;
+/// True when the next code char after the close paren at `close_pos` is
+/// a plain `=`: the assignment operator that initializes the field. The
+/// `==` comparison and the `=>` switch prong pattern read the field, and
+/// compound assignment (`+=`) reads the old value — none initialize
+/// (EPH-I0333). An end-of-line `=` still assigns: the RHS continues on
+/// the next line.
+fn isAssignAfterClose(t: []const u8, close_pos: usize) bool {
+    var j = close_pos + 1;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j >= t.len or t[j] != '=') return false;
+    if (j + 1 >= t.len) return true;
+    return t[j + 1] != '=' and t[j + 1] != '>';
 }
 
-/// Track comptime block depth by counting braces
-const ComptimeState = struct {
-    depth: usize = 0,
-    brace_depth: usize = 0,
+/// True when `t[i..]` holds the lvalue `@field(var_name,` in code
+/// position: the builtin opener, the tracked name, then `,`, `)`, or
+/// whitespace. The name boundary excludes `@field(var_name_other, ...)`
+/// and `@field(other, ...)` (EPH-I0333).
+fn isFieldLValueAt(t: []const u8, i: usize, var_name: []const u8) bool {
+    const opener = "@field(";
+    if (i + opener.len + var_name.len >= t.len) return false;
+    if (!mem.eql(u8, t[i .. i + opener.len], opener)) return false;
+    const name_pos = i + opener.len;
+    if (!mem.eql(u8, t[name_pos .. name_pos + var_name.len], var_name)) return false;
+    const after = name_pos + var_name.len;
+    if (isIdent(t[after])) return false;
+    const next_ch = t[after];
+    return next_ch == ',' or next_ch == ')' or next_ch == ' ' or next_ch == '\t';
+}
 
-    fn update(self: *ComptimeState, t: []const u8) void {
-        if (mem.indexOf(u8, t, "comptime ") != null or mem.indexOf(u8, t, "comptime{") != null) {
-            self.depth += 1;
-            self.brace_depth = 0;
-            for (t) |c| {
-                if (c == '{') self.brace_depth += 1;
+/// Track a pending `@field(var_name, ...)` call across lines so the
+/// assignment check sees the `=` after the call's close paren
+/// (EPH-I0333). The second argument can span lines (`@field(result,
+/// switch (i) { ... }) = value`), so paren depth carries between lines.
+/// Code-position filtering (LiteralState) keeps strings, chars, and
+/// comments from opening or closing the call. A `\\` multiline-string
+/// body line passes the pending depth through unchanged.
+const FieldAssignScan = struct {
+    paren_depth: usize = 0,
+
+    /// Handle one trimmed line for `var_name`: true when the line
+    /// completes an `@field(var_name, ...) = value` assignment. The `=`
+    /// must follow the close paren on the same line (a line break
+    /// between them is not detected).
+    fn step(self: *FieldAssignScan, t: []const u8, var_name: []const u8) bool {
+        var lit = types.LiteralState.forLine(t) orelse return false;
+        var i: usize = 0;
+        while (i < t.len) : (i += 1) {
+            if (lit.updateForChar(t, i) == null) continue;
+            if (self.paren_depth > 0) {
+                if (self.foldParen(t, i)) return true;
+                continue;
             }
+            if (!isFieldLValueAt(t, i, var_name)) continue;
+            self.paren_depth = 1;
+            i += "@field(".len + var_name.len - 1;
         }
-        if (self.depth > 0) self.updateBraces(t);
+        return false;
     }
 
-    fn updateBraces(self: *ComptimeState, t: []const u8) void {
-        for (t) |c| {
-            if (c == '{') self.brace_depth += 1;
-            if (c == '}' and self.brace_depth > 0) {
-                self.brace_depth -= 1;
-                if (self.brace_depth == 0 and self.depth > 0) self.depth -= 1;
+    /// Fold one char of a pending @field call: track paren depth, and
+    /// when the call closes report whether an assignment follows the
+    /// close paren.
+    fn foldParen(self: *FieldAssignScan, t: []const u8, i: usize) bool {
+        if (t[i] == '(') {
+            self.paren_depth += 1;
+        } else if (t[i] == ')') {
+            self.paren_depth -= 1;
+            if (self.paren_depth == 0 and isAssignAfterClose(t, i)) return true;
+        }
+        return false;
+    }
+};
+
+/// Maximum nesting of open `comptime` block scopes the tracker holds.
+/// Deeper nesting (pathological) scopes the extra block like a
+/// brace-less statement: its line only.
+const max_comptime_block_nesting = 8;
+
+/// Track comptime scopes for collectUndefinedVars (EPH-I0328). A
+/// comptime block (`comptime {`, `comptime blk: {`) keeps its body
+/// lines inside the scope until the block's closing `}`. A block whose
+/// `{` opens on the next line scans as normal code (accepted,
+/// fail-safe). A brace-less comptime statement (`comptime var x = 1;`,
+/// `comptime f();`) scopes only its own line. A `comptime` inside a
+/// string, char, or comment is
+/// text, never a scope opener. Interior braces of statements inside a
+/// block count into the innermost block scope, so a multi-line statement
+/// keeps the block open — balanced braces cancel. The per-line verdict
+/// applies to the whole line, so a decl inside a block that opens and
+/// closes on one line scans as normal code. A braced body of a
+/// brace-less form (`comptime if (c) { ... }`) is not a comptime block:
+/// its lines scan as normal code (accepted, fail-safe).
+const ComptimeState = struct {
+    depth: usize = 0,
+    // Open-brace counts per open block scope, innermost last. A
+    // statement scope holds no entry: it closes at its line end.
+    block_braces: [max_comptime_block_nesting]usize =
+        [_]usize{0} ** max_comptime_block_nesting,
+    block_count: usize = 0,
+
+    fn update(self: *ComptimeState, t: []const u8) void {
+        // A `\\` multiline-string body carries no code: the scopes pass
+        // through unchanged.
+        var lit = types.LiteralState.forLine(t) orelse return;
+        var statement_scopes: usize = 0;
+        var i: usize = 0;
+        while (i < t.len) : (i += 1) {
+            if (lit.updateForChar(t, i) == null) continue;
+            if (isComptimeKeywordAt(t, i)) {
+                if (self.openScope(t, i)) statement_scopes += 1;
+                i += "comptime".len - 1;
+                continue;
+            }
+            self.foldBrace(t[i]);
+        }
+        self.depth -|= statement_scopes;
+    }
+
+    /// Open a comptime scope at the keyword: true when the construct is
+    /// brace-less and closes at the line end (a statement, or a block
+    /// beyond the nesting cap).
+    fn openScope(self: *ComptimeState, t: []const u8, i: usize) bool {
+        self.depth += 1;
+        if (comptimeBlockFollows(t, i) and
+            self.block_count < self.block_braces.len)
+        {
+            self.block_count += 1;
+            return false;
+        }
+        return true;
+    }
+
+    /// Fold one code-position brace into the innermost open block scope:
+    /// a `{` opens a brace, a `}` closes one and pops the scope at zero.
+    fn foldBrace(self: *ComptimeState, c: u8) void {
+        if (self.block_count == 0) return;
+        const innermost = self.block_count - 1;
+        if (c == '{') {
+            self.block_braces[innermost] += 1;
+            return;
+        }
+        if (c == '}' and self.block_braces[innermost] > 0) {
+            self.block_braces[innermost] -= 1;
+            if (self.block_braces[innermost] == 0) {
+                self.block_count -= 1;
+                self.depth -= 1;
             }
         }
     }
 };
+
+/// True when `t[i..]` starts the whole-word keyword `comptime` (bounded
+/// by non-identifier chars on both sides). Callers have established
+/// code position (LiteralState).
+fn isComptimeKeywordAt(t: []const u8, i: usize) bool {
+    const kw = "comptime";
+    if (i + kw.len > t.len) return false;
+    if (!mem.eql(u8, t[i .. i + kw.len], kw)) return false;
+    if (i > 0 and isIdent(t[i - 1])) return false;
+    return i + kw.len == t.len or !isIdent(t[i + kw.len]);
+}
+
+/// True when the comptime construct at `i` opens a brace block: the
+/// keyword is followed by `{` (any spacing), or by a labeled block
+/// `label: {`. A brace-less comptime statement scopes only its own
+/// line (EPH-I0328).
+fn comptimeBlockFollows(t: []const u8, i: usize) bool {
+    var j = i + "comptime".len;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j < t.len and t[j] == '{') return true;
+    while (j < t.len and isIdent(t[j])) j += 1;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j >= t.len or t[j] != ':') return false;
+    j += 1;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    return j < t.len and t[j] == '{';
+}
 
 /// Check if `= undefined` token is a complete token (not part of a longer identifier)
 fn isCompleteUndefinedToken(t: []const u8, col: usize) bool {
@@ -4002,12 +4191,13 @@ fn isIndirectlyInitialized(
 ) bool {
     var in_inline_for = false;
     var in_for_loop: usize = 0;
+    var field_scan: FieldAssignScan = .{};
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (hasMethodCallOnVar(t, vn)) return true;
         if (hasAsmOutputVar(t, vn)) return true;
-        if (hasComptimeFieldAssignment(t, vn)) return true;
+        if (field_scan.step(t, vn)) return true;
         if (hasSlicePassToFunction(t, vn)) return true;
         if (isInlineForAssignment(t, vn, &in_inline_for))
             return true;
@@ -50959,6 +51149,336 @@ test "ZA607: fill assigning a multiline string still counts" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_mlstr_real_fill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: brace-less comptime var statement does not wedge the tracker (EPH-I0328)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The comptime statement scopes only its own line: the later
+    // `= undefined` decl must still be seen and the read flagged.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn braceLessComptimeVar() void {
+        \\    comptime var n: usize = 2;
+        \\    _ = n;
+        \\    var y: u32 = undefined;
+        \\    use(y);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ct_bracess_var.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ct_bracess_var.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: brace-less comptime expression statement does not wedge the tracker (EPH-I0328)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn braceLessComptimeExpr(x: u32) void {
+        \\    comptime x + 1;
+        \\    var y: u32 = undefined;
+        \\    use(y);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ct_bracess_expr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ct_bracess_expr.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string containing comptime does not wedge the tracker (EPH-I0328)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn comptimeInString() void {
+        \\    const s = "comptime { var z: u32 = undefined; }";
+        \\    _ = s;
+        \\    var y: u32 = undefined;
+        \\    use(y);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ct_string.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ct_string.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: comment containing comptime does not wedge the tracker (EPH-I0328)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn comptimeInComment() void {
+        \\    // comptime { var z: u32 = undefined; }
+        \\    var y: u32 = undefined;
+        \\    use(y);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ct_comment.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ct_comment.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: comptime block skips its body and closes at its own brace (EPH-I0328)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The decl inside the block is comptime code (skipped); the decl
+    // after the block's close is normal code and must be flagged.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn comptimeBlockCloses() void {
+        \\    comptime {
+        \\        var inside: u32 = undefined;
+        \\        _ = inside;
+        \\    }
+        \\    var y: u32 = undefined;
+        \\    use(y);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_ct_block.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_ct_block.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: @field read in rvalue position does not clear the var (EPH-I0333)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `total += @field(x, f.name)` reads x; the read of x on the return
+    // line must stay flagged.
+    const content =
+        \\const S = struct { a: u32, b: u32 };
+        \\fn f(s: S) u32 {
+        \\    var x: u32 = undefined;
+        \\    var total: u32 = 0;
+        \\    inline for (@typeInfo(S).Struct.fields) |field| {
+        \\        total += @field(x, field.name);
+        \\    }
+        \\    _ = total;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_field_read.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_field_read.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: @field comparison read does not clear the var (EPH-I0333)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `==` after the close paren compares the field value: a read.
+    const content =
+        \\fn f() bool {
+        \\    var x: u32 = undefined;
+        \\    return @field(x, "a") == 5;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_field_eq.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_field_eq.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: genuine @field assignment clears the var (EPH-I0333)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\const S = struct { a: u32, b: u32 };
+        \\fn f() u32 {
+        \\    var s: S = undefined;
+        \\    @field(s, "a") = 5;
+        \\    return s.a;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_field_assign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_field_assign.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line @field assignment with switch argument clears (EPH-I0333)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The second argument spans lines; the close paren and `=` sit on a
+    // later line. The pending scan must still see the assignment.
+    const content =
+        \\const S = struct { a: u32, b: u32 };
+        \\fn f(i: u32) u32 {
+        \\    var s: S = undefined;
+        \\    @field(s, switch (i) {
+        \\        0 => "a",
+        \\        else => "b",
+        \\    }) = 5;
+        \\    return s.a;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_field_ml.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_field_ml.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill inside a switch arm stays conditional (EPH-I0334)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `else` arm never assigns x, so the read after the switch is a
+    // potential undefined read and must be flagged.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn switchArmFill(c: u32) void {
+        \\    var x: u32 = undefined;
+        \\    switch (c) {
+        \\        1 => {
+        \\            x = 1;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_switch_arm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_switch_arm.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: all-arms switch assignment stays silent (EPH-I0334)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every arm assigns x: the CFG merge is definitely assigned, so the
+    // switch-arm conditional depth must not over-warn.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn switchAllArms(c: u32) void {
+        \\    var x: u32 = undefined;
+        \\    switch (c) {
+        \\        1 => x = 1,
+        \\        2 => x = 2,
+        \\        else => x = 3,
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_switch_all.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_switch_all.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line arm-list fill is a documented FN (EPH-I0334)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented FN (accepted, fail-unsafe): a switch whose first arm
+    // shares the header line never splits arm blocks at the CFG level,
+    // so the fill counts as unconditional and the potential undefined
+    // read stays silent. The multi-line shape above warns; zig fmt
+    // expands this shape to multi-line, which warns. The pin names the
+    // shape (EPH-I0334) and asserts the accepted no-warning verdict.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn switchOneLine(c: u32) void {
+        \\    var x: u32 = undefined;
+        \\    switch (c) { 1 => x = 1, else => {} }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_switch_oneline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_switch_oneline.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

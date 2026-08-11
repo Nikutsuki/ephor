@@ -18824,7 +18824,6 @@ const PendingFnStart = struct {
     start_line: usize,
     col: usize,
     abs_start: usize,
-    is_type_factory: bool,
     is_data_dispatch: bool,
     sig_parens: usize,
     // EPH-I0788: count of processed signature lines before the body opens.
@@ -18840,12 +18839,20 @@ const PendingFnStart = struct {
 fn countFnParams(t: []const u8) usize {
     const p = mem.indexOf(u8, t, "(") orelse return 0;
     var params: usize = 0;
+    // EPH-I0458: the paren walk is literal-masked — a `(` inside an
+    // inter-param comment inflated the depth and undercounted the params
+    // after it (distinct from the sentinel-colon EPH-I0270). The window is
+    // multi-line, so a `//` comment ends at the newline (LiteralState is
+    // per-line).
+    var lit = types.LiteralState.forLine(t) orelse return 0;
     var i = p + 1;
     var d: usize = 1;
     while (i < t.len and d > 0) : (i += 1) {
-        if (t[i] == '(') d += 1;
-        if (t[i] == ')') d -= 1;
-        if (t[i] == ':' and d == 1) params += 1;
+        if (t[i] == '\n') lit.in_comment = false;
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '(') d += 1;
+        if (t[pos] == ')') d -= 1;
+        if (t[pos] == ':' and d == 1) params += 1;
     }
     // Subtract self parameter if present — `fn foo(self: *T, ...)` counts self as 1
     if (hasSelfParam(t, p)) {
@@ -18918,10 +18925,26 @@ fn hasElseArrow(t: []const u8) bool {
         if (cls.isInsideString(pos)) continue;
         if (comment_start != null and pos >= comment_start.?) continue;
         var j = pos + 4;
-        while (j < t.len and t[j] == ' ') j += 1;
+        // EPH-I0461: the whitespace class includes tab, so `else\t=>` is a
+        // prong like `else =>` and is not double-counted as a standalone
+        // else on top of the arm.
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
         if (j + 1 < t.len and t[j] == '=' and t[j + 1] == '>') return true;
     }
     return false;
+}
+
+/// True when the line's first real `else` token is immediately followed by
+/// an `if` keyword: token-based, so `else\tif` and `else  if` collapse
+/// like `else if` and never score if+else twice (EPH-I0461).
+fn hasElseIf(t: []const u8) bool {
+    const pos = realTokenPos(t, "else") orelse return false;
+    var j = pos + 4;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j + 2 > t.len) return false;
+    if (t[j] != 'i' or t[j + 1] != 'f') return false;
+    if (j + 2 < t.len and isIdent(t[j + 2])) return false;
+    return true;
 }
 
 /// Check if a standalone `else` branch appears (not `else if`, not `else =>`).
@@ -18961,17 +18984,13 @@ fn countLineBranches(t: []const u8) usize {
 /// CCN = sum of all decision points in a function + 1 (entry point).
 /// The try/orelse/and/or counts use hasToken (EPH-I0226). Raw substring
 /// matching counted these keywords inside strings and trailing comments.
+/// else adds no decision point: the README decision list (McCabe) names
+/// if/while/for/switch/catch/try/orelse/and/or, and an else is the
+/// alternative of an already-counted predicate (EPH-I0455).
 fn countLineCyclomatic(t: []const u8) usize {
     var c: usize = 0;
-    // else if counts as 1 (not if+else separately)
-    if (hasToken(t, "else if")) {
-        c += 1;
-    } else {
-        if (hasToken(t, "if")) c += 1;
-        // standalone else (not else if, not else =>; `orelse` cannot match
-        // the token-bounded `else`)
-        if (hasElseBranch(t)) c += 1;
-    }
+    // else if counts as 1 (not if+else separately): the if below covers it.
+    if (hasToken(t, "if")) c += 1;
     if (hasRuntimeLoop(t, "while")) c += 1;
     if (hasRuntimeLoop(t, "for")) c += 1;
     if (hasToken(t, "switch")) c += 1;
@@ -18987,21 +19006,25 @@ fn countLineCyclomatic(t: []const u8) usize {
 /// Count cognitive complexity cost for a line based on current nesting level.
 /// The try/orelse/and/or counts use hasToken (EPH-I0226). Raw substring
 /// matching counted these keywords inside strings and trailing comments.
-fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
+/// The else-family (`else`, `else if`, `catch`) evaluates at `else_nest`:
+/// the closes before the construct are processed first, so `} else {`
+/// costs at the if's level, not inside it (EPH-I0453).
+fn countLineCognitive(t: []const u8, cog_nest: usize, else_nest: usize) usize {
     var cost: usize = 0;
     // else if counts as 1, not as both if and else if
-    if (hasToken(t, "else if")) {
-        cost += 1 + cog_nest;
+    if (hasElseIf(t)) {
+        cost += 1 + else_nest;
     } else {
         if (hasToken(t, "if")) cost += 1 + cog_nest;
-        if (hasElseBranch(t)) cost += 1 + cog_nest;
+        if (hasElseBranch(t)) cost += 1 + else_nest;
     }
     if (hasRuntimeLoop(t, "while")) cost += 1 + cog_nest;
     if (hasRuntimeLoop(t, "for")) cost += 1 + cog_nest;
     if (hasToken(t, "switch")) cost += 1 + cog_nest;
     cost += countSwitchArms(t) * (1 + cog_nest);
-    if (hasToken(t, "catch")) cost += 1 + cog_nest;
-    if (hasToken(t, "try")) cost += 1 + cog_nest;
+    if (hasToken(t, "catch")) cost += 1 + else_nest;
+    // try has no structural increment: Sonar assigns it none and the
+    // README/AGENTS cognitive rule lists no try (EPH-I0458).
     // Secondary — no nesting impact
     if (hasToken(t, "orelse")) cost += 1;
     if (hasToken(t, "and")) cost += 1;
@@ -19009,17 +19032,35 @@ fn countLineCognitive(t: []const u8, cog_nest: usize) usize {
     return cost;
 }
 
-/// Check if line opens a cognitive-nesting-increasing scope (has control keyword + {).
-/// The try check uses hasToken (EPH-I0226): a raw substring match opened a
-/// scope for `try` inside a string literal or a trailing comment.
+/// True when `{` appears at a code position (outside string/char literals
+/// and comments). A raw substring check is literal-blind: `if (c == '{')`
+/// or a trailing `// {` opens no block (EPH-I0452).
+fn hasCodePositionBrace(t: []const u8) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '{') return true;
+    }
+    return false;
+}
+
+/// True when the line opens a cognitive-nesting-increasing scope: a control
+/// keyword (if/else/switch/while/for/catch) plus a `{` at a code position.
+/// The keyword checks use hasToken (EPH-I0226): a raw substring match
+/// opened a scope for a keyword inside a string literal or a trailing
+/// comment.
+/// `else` opens the else block's scope, so its body measures at the same
+/// cog_nest as the matching if body (EPH-I0453). `try` opens no scope: it
+/// carries no structural increment (EPH-I0458).
 fn opensCognitiveScope(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "{") == null) return false;
+    if (!hasCodePositionBrace(t)) return false;
     return hasToken(t, "if") or
+        hasToken(t, "else") or
         hasToken(t, "switch") or
         hasToken(t, "while") or
         hasToken(t, "for") or
-        hasToken(t, "catch") or
-        hasToken(t, "try");
+        hasToken(t, "catch");
 }
 
 /// Calculate limit with type factory multiplier
@@ -19031,13 +19072,14 @@ fn calcLimit(base: usize, is_factory: bool, mult: usize) usize {
 /// Flat chain: functions where cognitive ≈ cyclomatic (ratio ≤ 1.5) indicate flat branch
 /// patterns (routers, dispatchers) rather than deeply nested control flow.
 fn isFlatChain(state: *const ComplexityState) bool {
-    return state.cyclomatic > 0 and
-        state.cognitive <= (state.cyclomatic * 3) / 2 and
+    // cyclomatic inits at 1 and only grows, so a `> 0` guard would be dead
+    // (EPH-I0458).
+    return state.cognitive <= (state.cyclomatic * 3) / 2 and
         state.max_nest <= 2;
 }
 
-fn cognitiveLimit(base: usize, is_data_dispatch: bool, state: *const ComplexityState) usize {
-    if (is_data_dispatch) return base * 8;
+fn cognitiveLimit(base: usize, state: *const ComplexityState) usize {
+    if (state.is_data_dispatch) return base * 8;
     if (isFlatChain(state)) return base * 2;
     return base;
 }
@@ -19182,7 +19224,7 @@ fn buildComplexityChecks(
         .{
             .rule = RULE_COGNITIVE,
             .actual = state.cognitive,
-            .limit = cognitiveLimit(th.max_cognitive, state.is_data_dispatch, state),
+            .limit = cognitiveLimit(th.max_cognitive, state),
             .metric = "cognitive complexity",
             .help = "flatten or extract nested logic",
         },
@@ -19239,6 +19281,9 @@ const LineView = struct {
     t: []const u8,
     content: []const u8,
     line_offset: usize,
+    /// Leading-whitespace width of the source line: maps a trimmed-line
+    /// position back to its 1-based column (EPH-I0458).
+    lead: usize = 0,
 };
 
 /// True when this line starts a new top-level fn while another fn is still
@@ -19287,6 +19332,42 @@ fn scanSignatureLine(line: []const u8, start: usize, sig_parens: *usize) bool {
     return false;
 }
 
+/// True when the fn signature in `sig` returns `type`: the `) type` marker
+/// appears before the first body `{` (paren depth 0). Walks the bounded
+/// signature window so wrapped factories count (EPH-I0457):
+/// `pub fn Handler(\n comptime T: type,\n) type {` opens its marker on a
+/// later line than the keyword line. The body open terminates the scan, so
+/// a `) type` inside the body cannot grant the [tf] multiplier. Matches
+/// the one-line convention: `) type` with one space, identifier-bounded.
+fn isTypeFactory(sig: []const u8) bool {
+    var lit = types.LiteralState.forLine(sig) orelse return false;
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < sig.len) : (i += 1) {
+        if (sig[i] == '\n') lit.in_comment = false;
+        const pos = lit.updateForChar(sig, i) orelse continue;
+        const c = sig[pos];
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c == '{' and depth == 0) return false;
+        if (c != ')' or depth == 0) continue;
+        depth -= 1;
+        // Only the outermost close may offer the return type. An inner
+        // group close (a fn-pointer param) stays at depth > 0; its
+        // `) type` is the fn-pointer's own return type (EPH-I0457).
+        if (depth != 0) continue;
+        var j = pos + 1;
+        while (j < sig.len and (sig[j] == ' ' or sig[j] == '\t')) j += 1;
+        if (j + 4 > sig.len) continue;
+        if (!mem.eql(u8, sig[j .. j + 4], "type")) continue;
+        if (j + 4 < sig.len and isIdent(sig[j + 4])) continue;
+        return true;
+    }
+    return false;
+}
+
 /// Open fn complexity state for a def whose body brace arrived. The def's
 /// identity comes from `pending`, built on the fn keyword line. `fn_lines`
 /// backfills the processed signature lines from `pending`: full-line
@@ -19298,13 +19379,17 @@ fn openFnState(
     pending: PendingFnStart,
 ) void {
     const sig_end = @min(pending.abs_start + max_signature_lookahead, view.content.len);
+    const sig = view.content[pending.abs_start..sig_end];
     state.* = .{
         .in_fn = true,
         .fn_start = pending.start_line,
         .fn_col = pending.col,
-        .is_type_factory = pending.is_type_factory,
+        // EPH-I0457: the type-factory check scans the same bounded
+        // signature window as countFnParams — a wrapped factory's `) type {`
+        // marker sits on a later line than the keyword line.
+        .is_type_factory = isTypeFactory(sig),
         .is_data_dispatch = pending.is_data_dispatch,
-        .params = countFnParams(view.content[pending.abs_start..sig_end]),
+        .params = countFnParams(sig),
         .fn_name = pending.name,
         .fn_lines = pending.sig_lines,
         .cyclomatic = 1,
@@ -19354,9 +19439,11 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     var pending: PendingFnStart = .{
         .name = name,
         .start_line = line_num,
-        .col = pos + 1,
+        // EPH-I0458: line-absolute column — pos indexes the trimmed line,
+        // so the leading-whitespace width (view.lead) is added. Indented
+        // container methods report their real column.
+        .col = view.lead + pos + 1,
         .abs_start = view.line_offset + pos,
-        .is_type_factory = isTypeFactory(t),
         .is_data_dispatch = isDataDispatchFunction(name),
         .sig_parens = 0,
         .sig_lines = 1,
@@ -19414,10 +19501,12 @@ const BraceScan = struct {
     /// end of line survives the per-line reset. Only code chars land here
     /// — the literal state machine masks string/char/comment data.
     prev_c: u8 = 0,
-    /// A real (non-masked) `{` open landed on this line. Gates the
-    /// cognitive-scope marker: a keyword line whose opens are all masked
-    /// literals opens no scope (EPH-I0818).
-    real_open: bool = false,
+    /// The line opens a cognitive scope (opensCognitiveScope): the first
+    /// real `{` open carries the scope marker (EPH-I0453).
+    scope_open: bool = false,
+    /// One scope marker per line, at the first real open (EPH-I0453). A
+    /// keyword line whose opens are all masked literals sets no marker.
+    scope_marked: bool = false,
 };
 
 /// Track brace nesting, returns true if function ended.
@@ -19428,19 +19517,10 @@ fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     // EPH-I0819: the scan starts from the previous line's last
     // non-whitespace code char — a `.` at end of line still masks the
     // literal `{` on the next line.
-    var scan = BraceScan{ .prev_c = state.prev_code_char };
-    // EPH-I0818: the line's scope marker is valid only while a real open
-    // lands on it. A keyword line whose only `{` is a masked literal
-    // (`try take(.{...});`) opens no scope — a marker and cog_nest bump
-    // left in place would leak into every later line's cognitive cost
-    // (EPH-I0452's marker sub-class). The undo below fires only when no
-    // real open landed, so a real block's marker survives untouched.
-    const scope_open = opensCognitiveScope(t);
-    const scope_depth = state.nest + 1;
-    if (scope_open) {
-        state.cog_nest += 1;
-        if (scope_depth < 32) state.cog_markers |= @as(u32, 1) << @intCast(scope_depth);
-    }
+    var scan = BraceScan{
+        .prev_c = state.prev_code_char,
+        .scope_open = opensCognitiveScope(t),
+    };
     var fn_ended = false;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
@@ -19455,12 +19535,50 @@ fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
         // from the literal mask. The caller already trimmed '\r'.
         if (c != ' ' and c != '\t') scan.prev_c = c;
     }
-    if (scope_open and !scan.real_open) {
-        if (state.cog_nest > 0) state.cog_nest -= 1;
-        if (scope_depth < 32) state.cog_markers &= ~(@as(u32, 1) << @intCast(scope_depth));
-    }
     state.prev_code_char = scan.prev_c;
     return fn_ended;
+}
+
+/// Cognitive nesting at which the line's else-family constructs (`else`,
+/// `else if`, `catch`) evaluate: the closes before the first such token
+/// are processed first, so `} else {` costs at the if's level, not inside
+/// it (EPH-I0453). Mirrors the real brace scan on a state copy up to the
+/// token, so mid-line closes and one-line chains stay exact.
+fn elseFamilyNest(t: []const u8, state: *const ComplexityState) usize {
+    // Raw pre-filter (EPH-I0153): the masked token walks and the state
+    // copy run only on lines that can carry the constructs.
+    if (mem.indexOf(u8, t, "else") == null and mem.indexOf(u8, t, "catch") == null)
+        return state.cog_nest;
+    const pos = realTokenPos(t, "else") orelse
+        realTokenPos(t, "catch") orelse return state.cog_nest;
+    var copy = state.*;
+    const is_switch = hasCodeArrow(t);
+    var scan = BraceScan{
+        .prev_c = state.prev_code_char,
+        .scope_open = opensCognitiveScope(t),
+    };
+    var lit = types.LiteralState.forLine(t) orelse return state.cog_nest;
+    var i: usize = 0;
+    while (i < pos) : (i += 1) {
+        const cp = lit.updateForChar(t, i) orelse continue;
+        const c = t[cp];
+        if (updateBraceState(c, is_switch, &scan, &copy)) break;
+        if (c != ' ' and c != '\t') scan.prev_c = c;
+    }
+    return copy.cog_nest;
+}
+
+/// EPH-I0453: set the cognitive-scope marker for the line's first real
+/// open, at the block's actual open depth. A leading close (`} else {`)
+/// is already processed, so the else block opens one level shallower than
+/// the pre-line nest+1 guess — the old marker leaked +1 cog_nest for the
+/// rest of the fn. One marker per line; a keyword line whose only `{` is a
+/// masked literal sets none (EPH-I0818).
+fn markCognitiveScope(scan: *BraceScan, state: *ComplexityState) void {
+    if (!scan.scope_open or scan.scope_marked) return;
+    scan.scope_marked = true;
+    state.cog_nest += 1;
+    if (state.nest < 32) state.cog_markers |= @as(u32, 1) << @intCast(state.nest);
 }
 
 fn updateBraceState(
@@ -19495,7 +19613,7 @@ fn updateBraceState(
         } else {
             state.nest += 1;
             if (state.nest > state.max_nest) state.max_nest = state.nest;
-            scan.real_open = true;
+            markCognitiveScope(scan, state);
         }
         scan.first = false;
     }
@@ -19559,7 +19677,9 @@ fn processComplexityLine(
     state.fn_lines += 1;
     state.branches += countLineBranches(t);
     state.cyclomatic += countLineCyclomatic(t);
-    state.cognitive += countLineCognitive(t, state.cog_nest);
+    // EPH-I0453: the else-family cost evaluates at the post-close nesting
+    // (`} else {` costs at the if's level, not inside it).
+    state.cognitive += countLineCognitive(t, state.cog_nest, elseFamilyNest(t, state));
     if (!trackBraceNesting(t, state)) return;
 
     // Function ended — unwind cognitive nesting, then report
@@ -19599,11 +19719,15 @@ fn analyzeFileComplexity(
         const line = content[line_start..newline];
         const lead = skipLeadingWhitespace(line);
         const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
+        // fn_lines counts the fn's code lines: blank, comment-only, and
+        // multiline-string lines are non-code padding and stay out — the
+        // signature rule (EPH-I0788) extended to the body (EPH-I0458).
+        if (t.len == 0 or isCommentOrMultilineString(t)) continue;
         const view: LineView = .{
             .t = t,
             .content = content,
             .line_offset = line_start + lead,
+            .lead = lead,
         };
         try processComplexityLine(&reporter, view, &state, line_num);
     }
@@ -26111,20 +26235,6 @@ fn relativePath(path: []const u8, base: []const u8) []const u8 {
 }
 
 // countOccurrences, countLines, isIdent imported from types.zig
-
-/// Check if a function declaration is a comptime type factory (returns `type`)
-/// These functions are used for metaprogramming and legitimately need higher complexity.
-/// Examples:
-///   fn Bind(Instance: type) type { ... }
-///   pub fn Handler(comptime T: type) type { ... }
-fn isTypeFactory(line: []const u8) bool {
-    // Look for pattern: ") type {" or ") type{" or ") type"
-    // This indicates the return type is `type`
-    if (mem.indexOf(u8, line, ") type")) |_| return true;
-    // Also check for multi-line: function signature ends with ) type
-    if (mem.endsWith(u8, mem.trim(u8, line, " \t\r"), ") type")) return true;
-    return false;
-}
 
 // isInsideString imported from types.zig
 
@@ -61229,7 +61339,9 @@ test "countLineCyclomatic counts all decision points" {
     // Control flow keywords
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("if (x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("} else if (y) {"));
-    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("} else {"));
+    // else adds no decision point (McCabe; the README decision list names
+    // no else) — EPH-I0455.
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("} else {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("for (items) |item| {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("switch (x) {"));
     // Error handling
@@ -61253,26 +61365,30 @@ test "countLineCyclomatic counts all decision points" {
 
 test "countLineCognitive weights by nesting and counts else/orelse" {
     // Top level (nest=0): 1 cost each
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("if (x) {", 0));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("while (true) {", 0));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("for (items) |item| {", 0));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("switch (x) {", 0));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("try foo();", 0));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x catch |e| {", 0));
-    // else costs 1 at current nest but doesn't increase nesting
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("} else {", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("if (x) {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("while (true) {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("for (items) |item| {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("switch (x) {", 0, 0));
+    // try has no structural increment (Sonar; the README rule lists no try)
+    // — EPH-I0458.
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("try foo();", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x catch |e| {", 0, 0));
+    // else costs 1 at the closed scope's level (else_nest) but doesn't
+    // increase nesting
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("} else {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 2), countLineCognitive("} else {", 2, 1));
     // Nest level 3: 1 + 3 = 4
-    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("if (x) {", 3));
-    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("while (true) {", 3));
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("if (x) {", 3, 3));
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("while (true) {", 3, 3));
     // orelse always costs 1 regardless of nesting
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 0));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 3));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 3, 3));
     // and/or always cost 1 regardless of nesting
-    try std.testing.expectEqual(@as(usize, 2), countLineCognitive("if (a and b) {", 0));
-    try std.testing.expectEqual(@as(usize, 7), countLineCognitive("if (a and b) {", 5));
+    try std.testing.expectEqual(@as(usize, 2), countLineCognitive("if (a and b) {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 7), countLineCognitive("if (a and b) {", 5, 5));
     // Non-branching lines cost 0
-    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("var x: u32 = 0;", 0));
-    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("x += 1;", 3));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("var x: u32 = 0;", 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("x += 1;", 3, 3));
 }
 
 test "opensCognitiveScope detects control keyword + brace" {
@@ -61283,7 +61399,9 @@ test "opensCognitiveScope detects control keyword + brace" {
     try std.testing.expect(opensCognitiveScope("try foo() catch |e| {"));
     try std.testing.expect(!opensCognitiveScope("var x: u32 = 0;"));
     try std.testing.expect(!opensCognitiveScope("if (x) return;"));
-    try std.testing.expect(!opensCognitiveScope("} else {"));
+    // EPH-I0453: else opens the else block's scope, so its body measures
+    // at the same cog_nest as the matching if body.
+    try std.testing.expect(opensCognitiveScope("} else {"));
 }
 
 test "countLineCyclomatic ignores keywords in strings and comments (EPH-I0226)" {
@@ -61308,17 +61426,18 @@ test "countLineCyclomatic ignores keywords in strings and comments (EPH-I0226)" 
 test "countLineCognitive ignores keywords in strings and comments (EPH-I0226)" {
     try std.testing.expectEqual(
         @as(usize, 0),
-        countLineCognitive("foo(); // try and or orelse", 0),
+        countLineCognitive("foo(); // try and or orelse", 0, 0),
     );
     try std.testing.expectEqual(
         @as(usize, 0),
-        countLineCognitive("const s = \"try and or orelse\";", 3),
+        countLineCognitive("const s = \"try and or orelse\";", 3, 3),
     );
     // Real tokens keep their counts at any nesting level.
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("try foo();", 0));
-    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("try foo();", 3));
-    try std.testing.expectEqual(@as(usize, 2), countLineCognitive("if (a and b) {", 0));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 3));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("try foo();", 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("try foo();", 3, 3));
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("foo() catch |e| {}", 3, 3));
+    try std.testing.expectEqual(@as(usize, 2), countLineCognitive("if (a and b) {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x orelse return;", 3, 3));
 }
 
 test "opensCognitiveScope ignores a try in a string or comment (EPH-I0226)" {
@@ -62548,7 +62667,8 @@ test "countLineCyclomatic counts unspaced control flow" {
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("if(x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("while(x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("for(xs) |x| {"));
-    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}else{"));
+    // else adds no decision point (McCabe; EPH-I0455)
+    try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("}else{"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}else if(x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}catch{"));
     // comptime-unrolled loops are not runtime decision points
@@ -62574,13 +62694,13 @@ test "countLineBranches counts unspaced control flow" {
 }
 
 test "countLineCognitive counts unspaced control flow" {
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("if(x) {", 0));
-    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("if(x) {", 3));
-    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("}else{", 0));
-    try std.testing.expectEqual(@as(usize, 3), countLineCognitive("}else if(x) {", 2));
-    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("inline for(xs) |x| {", 0));
-    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("const s = \"if(x)\";", 0));
-    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("foo(); // if(x)", 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("if(x) {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 4), countLineCognitive("if(x) {", 3, 3));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("}else{", 0, 0));
+    try std.testing.expectEqual(@as(usize, 3), countLineCognitive("}else if(x) {", 2, 2));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("inline for(xs) |x| {", 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("const s = \"if(x)\";", 0, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLineCognitive("foo(); // if(x)", 0, 0));
 }
 
 test "opensCognitiveScope ignores keywords inside strings" {
@@ -63850,19 +63970,22 @@ test "ZA306: keyword+literal lines do not leak cognitive nesting (EPH-I0818)" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // Reviewer shape (EPH-I0818): two `try take(.{ ... })` lines plus four
-    // nested ifs. The try's only `{` is a masked literal, so it opens no
-    // persistent scope. True cognitive: try(1) + try(1) + if(1) + if(2) +
-    // if(3) + if(4) = 12. Pre-fix the leaked nesting made the try lines
-    // cost 1+2 and the ifs 3+4+5+6 = 21 (EPH-I0452 marker sub-class).
+    // Reviewer shape (EPH-I0818): two `if (x) take(.{ ... })` lines plus
+    // four nested ifs. The literal-only lines' only `{` is a masked
+    // literal, so they open no persistent scope. True cognitive:
+    // if(1) + if(1) + if(1) + if(2) + if(3) + if(4) = 12. Pre-fix the
+    // leaked nesting made the literal lines cost 1+2 and the ifs
+    // 3+4+5+6 = 21 (EPH-I0452 marker sub-class). The keyword is `if`, not
+    // `try`: try carries no structural increment (EPH-I0458), so a try
+    // line contributes nothing for the leak to corrupt.
     const code =
         \\fn take(s: anytype) !void {
         \\    _ = s;
         \\}
         \\fn sink() void {}
         \\fn probeCogLeak(x: bool, y: bool, z: bool, w: bool) !void {
-        \\    try take(.{ .a = 1 });
-        \\    try take(.{ .a = 2 });
+        \\    if (x) take(.{ .a = 1 });
+        \\    if (x) take(.{ .a = 2 });
         \\    if (x) {
         \\        if (y) {
         \\            if (z) {
@@ -63916,6 +64039,343 @@ test "ZA306: keyword+literal lines do not leak cognitive nesting (EPH-I0818)" {
         }
     }
     try std.testing.expectEqual(@as(usize, 1), cog_findings);
+}
+
+// ============================================================================
+// Set O — B09 complexity-counter cluster (EPH-I0452/53/55/56/57/58, I0461/62)
+// ============================================================================
+
+test "ZA306: else-family chains measure at the if's level with no residue (EPH-I0453)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // True cognitive: if(c)(1) + if(a)(2) + else-if(2) + else(2) +
+    // trailing if(b)(2) = 9. Pre-fix the else-if and else cost 1+2
+    // (pre-close cog_nest) and the orphaned marker leaked +1 into the
+    // trailing if: 12. Nested under if(c), so the flat-chain 2x
+    // multiplier does not apply (max_nest 3).
+    const code =
+        \\fn chain(a: bool, b: bool, c: bool) void {
+        \\    if (c) {
+        \\        if (a) {
+        \\            sink();
+        \\        } else if (b) {
+        \\            sink();
+        \\        } else {
+        \\            sink();
+        \\        }
+        \\        if (b) {
+        \\            sink();
+        \\        }
+        \\    }
+        \\}
+        \\fn sink() void {}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "chain.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "chain.zig"), {});
+
+    const th = Thresholds{ .max_cognitive = 4 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var cog_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "chain.zig")) {
+            cog_findings += 1;
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 9 cognitive complexity (max 4)") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cog_findings);
+}
+
+test "opensCognitiveScope ignores braces inside char literals and comments (EPH-I0452)" {
+    // A real `if` whose only `{` sits inside a char literal opens no
+    // scope. Pre-fix the raw `{` check opened one and the orphaned marker
+    // leaked +1 cog_nest for the rest of the fn (the :680-shape specimen
+    // family `if (c == '{') open += 1;`).
+    try std.testing.expect(!opensCognitiveScope("if (c == '{') open += 1;"));
+    try std.testing.expect(!opensCognitiveScope("if (c == '}') open += 1;"));
+    // A trailing-comment `{` after a real `if` opens no scope either.
+    try std.testing.expect(!opensCognitiveScope("if (x) y(); // {"));
+    // A real block brace on the same shapes keeps opening.
+    try std.testing.expect(opensCognitiveScope("if (c == '{') {"));
+    try std.testing.expect(opensCognitiveScope("if (x) {"));
+}
+
+test "countFnParams ignores parens inside inter-param comments (EPH-I0458)" {
+    // The trailing-comment `(` in the wrapped signature used to inflate
+    // the paren depth, so the params after it undercounted (2 of 3).
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countFnParams("fn foo(\n    a: u8, // ( note\n    b: u8,\n    c: u8,\n) void"),
+    );
+    // Same class, smaller shape.
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countFnParams("fn bar(\n    a: u8, // ( note\n    b: u8,\n) void"),
+    );
+}
+
+test "hasElseArrow accepts tab after else; hasElseIf accepts extra spaces (EPH-I0461)" {
+    // `else\t=>` is a prong, not a standalone else on top of the arm.
+    try std.testing.expect(hasElseArrow("0 => 1, else\t=> 2,"));
+    try std.testing.expect(!hasElseBranch("0 => 1, else\t=> 2,"));
+    // Token-based else-if: two spaces still dedup to one decision point.
+    try std.testing.expect(hasElseIf("} else  if (x) {"));
+    try std.testing.expect(!hasElseIf("} else {"));
+    try std.testing.expect(!hasElseIf("} else iface {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("} else  if (x) {"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("} else  if (x) {", 0, 0));
+}
+
+test "detectFnStart reports the line-absolute column for indented methods (EPH-I0458)" {
+    var state = ComplexityState{};
+    const content = "    fn method() void {";
+    const view: LineView = .{
+        .t = "fn method() void {",
+        .content = content,
+        .line_offset = 4,
+        .lead = 4,
+    };
+    detectFnStart(view, &state, 1);
+    try std.testing.expect(state.in_fn);
+    // Pre-fix the col was pos+1 = 1 (trim-relative); the indent now counts.
+    try std.testing.expectEqual(@as(usize, 5), state.fn_col);
+}
+
+test "ZA306: catch after a labeled block closes costs 1+0 and leaks nothing (EPH-I0453)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // True cognitive: if(c)(1) + catch(2) + trailing if(v)(2) = 5; the
+    // `try` on the break line costs nothing (EPH-I0458). Pre-fix the
+    // catch's marker landed one level deeper than the block that opened
+    // (the unmarked `blk` close), so the trailing if cost 3 and the
+    // try charged 2, giving a pre-fix total of 8.
+    // Nested under if(c), so the flat-chain 2x multiplier does not apply.
+    const code =
+        \\fn risky() !bool {
+        \\    return true;
+        \\}
+        \\fn guarded(c: bool) !void {
+        \\    if (c) {
+        \\        const v = blk: {
+        \\            break :blk try risky();
+        \\        } catch |e| {
+        \\            return e;
+        \\        };
+        \\        if (v) {
+        \\            sink();
+        \\        }
+        \\    }
+        \\}
+        \\fn sink() void {}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "guarded.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "guarded.zig"), {});
+
+    const th = Thresholds{ .max_cognitive = 4 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var cog_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "guarded.zig")) {
+            cog_findings += 1;
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 5 cognitive complexity (max 4)") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cog_findings);
+}
+
+test "ZA306: trailing-comment brace line leaks no cognitive nesting (EPH-I0452)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // True cognitive: if(1) + if(1) + if(2) = 4. The `// {` line's only
+    // brace is comment data, so it opens no scope and the nested ifs stay
+    // at their real levels.
+    const code =
+        \\fn comment_brace_probe(x: bool) u8 {
+        \\    if (x) sink(); // {
+        \\    if (x) {
+        \\        if (x) {
+        \\            return 1;
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn sink() void {}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "cbrace.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "cbrace.zig"), {});
+
+    const th = Thresholds{ .max_cognitive = 3 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var cog_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cbrace.zig")) {
+            cog_findings += 1;
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 4 cognitive complexity (max 3)") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cog_findings);
+}
+
+test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // 60 raw lines. Pre-fix the factory check saw only the keyword line,
+    // so the wrapped `) type {` factory measured at the 50 limit and
+    // fired; the [tf] 3x limit (150) keeps it silent.
+    const factory =
+        \\fn WrappedFactory(
+        \\    comptime T: type,
+        \\) type {
+        \\    const S = struct { x: T };
+    ++ "\n" ++ "    _ = T;\n" ** 54 ++
+        \\    return S;
+        \\}
+    ;
+    const factory_analysis = try createTestFileAnalysis(allocator, "factory.zig", factory);
+    try graph.files.put(factory_analysis.path, factory_analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "factory.zig"), {});
+
+    // The void twin of the same shape has no multiplier and fires at 50.
+    const plain =
+        \\fn WrappedPlain(
+        \\    comptime T: type,
+        \\) void {
+        \\    const S = struct { x: T };
+    ++ "\n" ++ "    _ = T;\n" ** 54 ++
+        \\    _ = S;
+        \\}
+    ;
+    const plain_analysis = try createTestFileAnalysis(allocator, "plain.zig", plain);
+    try graph.files.put(plain_analysis.path, plain_analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "plain.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 50 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var factory_findings: usize = 0;
+    var plain_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        if (mem.eql(u8, issue.file, "factory.zig")) {
+            factory_findings += 1;
+        } else if (mem.eql(u8, issue.file, "plain.zig")) {
+            plain_findings += 1;
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 60 lines (max 50)") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), factory_findings);
+    try std.testing.expectEqual(@as(usize, 1), plain_findings);
+}
+
+test "isTypeFactory: inner fn-pointer close cannot grant [tf] (EPH-I0457)" {
+    // `fn (x: u8) type` closes to depth 1; the guard rejects the grant.
+    try std.testing.expect(!isTypeFactory("fn foo(a: fn (x: u8) type) void {"));
+    // Wrapped form: the walk crosses the newline, same verdict.
+    try std.testing.expect(!isTypeFactory(
+        \\fn foo(
+        \\    a: fn (x: u8) type,
+        \\) void {
+    ));
+}
+
+test "isTypeFactory: real factory with fn-pointer param still detected (EPH-I0457)" {
+    // The inner close is skipped; the outer `) type` still grants.
+    try std.testing.expect(isTypeFactory("fn foo(a: fn (x: u8) type) type {"));
+}
+
+test "ZA301: blank lines inside a fn stay out of fn_lines (EPH-I0458)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // 9 raw lines, 7 processed: the two blank lines are non-code padding.
+    // Pre-fix they counted, so the fn fired at cap 8.
+    const padded =
+        \\fn with_blanks(a: bool) void {
+        \\    if (a) {
+        \\        sink();
+        \\    }
+        \\
+        \\    sink();
+        \\
+        \\    sink();
+        \\}
+        \\fn sink() void {}
+    ;
+    const padded_analysis = try createTestFileAnalysis(allocator, "padded.zig", padded);
+    try graph.files.put(padded_analysis.path, padded_analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "padded.zig"), {});
+
+    // The comment-free, blank-free twin processes all 9 lines and fires.
+    const tight =
+        \\fn tight(a: bool) void {
+        \\    if (a) {
+        \\        sink();
+        \\    }
+        \\    sink();
+        \\    sink();
+        \\    sink();
+        \\    sink();
+        \\}
+    ;
+    const tight_analysis = try createTestFileAnalysis(allocator, "tight.zig", tight);
+    try graph.files.put(tight_analysis.path, tight_analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "tight.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 8 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var padded_findings: usize = 0;
+    var tight_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        if (mem.eql(u8, issue.file, "padded.zig")) {
+            padded_findings += 1;
+        } else if (mem.eql(u8, issue.file, "tight.zig")) {
+            tight_findings += 1;
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 9 lines (max 8)") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), padded_findings);
+    try std.testing.expectEqual(@as(usize, 1), tight_findings);
 }
 
 // ============================================================================

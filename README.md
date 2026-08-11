@@ -335,7 +335,7 @@ An override that is not absolute or does not resolve prints a warning and falls 
 
 ### Cyclomatic Complexity (ZA305)
 
-McCabe's cyclomatic complexity counts independent execution paths. Every `if`, `while`, `for`, `switch`, `catch`, `try`, `orelse`, `and`, and `or` adds 1 to the count. A function with no branching has a CCN of 1. Default threshold: 15.
+McCabe's cyclomatic complexity counts independent execution paths. Every `if`, `while`, `for`, `switch`, `catch`, `try`, `orelse`, `and`, and `or` adds 1 to the count. Each `=>` switch arm also adds 1 to the count. A function with no branching has a CCN of 1. Default threshold: 15.
 
 ### Cognitive Complexity (ZA306)
 

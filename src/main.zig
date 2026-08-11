@@ -67833,6 +67833,96 @@ test "ZT101: lowercase prose words are not candidates" {
     );
 }
 
+test "ZT101: comptime-reflection invocation is invisible to the call graph (EPH-I0029)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zlint Error.zig: the test name references Severity.jsonParse, but
+    // std.json.parseFromSlice(T, ...) invokes the method through comptime
+    // reflection — no textual call or value reference exists, so ZT101
+    // cannot see the edge and fires on a test that genuinely covers the
+    // fn. Documented limitation (EPH-I0029): the verdict is locked as-is.
+    const content =
+        \\pub const Severity = enum {
+        \\    err,
+        \\    warning,
+        \\
+        \\    pub fn jsonParse(
+        \\        _: std.mem.Allocator,
+        \\        source: *std.json.Scanner,
+        \\        options: std.json.ParseOptions,
+        \\    ) !Severity {
+        \\        _ = options;
+        \\        _ = source;
+        \\        return .err;
+        \\    }
+        \\};
+        \\
+        \\fn expectParse(input: []const u8, expected: Severity) !void {
+        \\    const actual = try std.json.parseFromSlice(Severity, std.testing.allocator, input, .{});
+        \\    defer actual.deinit();
+        \\    try std.testing.expectEqual(expected, actual.value);
+        \\}
+        \\
+        \\test "Severity.jsonParse" {
+        \\    try expectParse("\"error\"", Severity.err);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_reflection.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
+    );
+}
+
+test "ZT101: value reference silences the reflection shape (EPH-I0029)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The documented workaround: `_ = Severity.jsonParse;` is a textual
+    // value reference, which counts as evidence for both ZT101 and ZT105.
+    const content =
+        \\pub const Severity = enum {
+        \\    err,
+        \\    warning,
+        \\
+        \\    pub fn jsonParse(
+        \\        _: std.mem.Allocator,
+        \\        source: *std.json.Scanner,
+        \\        options: std.json.ParseOptions,
+        \\    ) !Severity {
+        \\        _ = options;
+        \\        _ = source;
+        \\        return .err;
+        \\    }
+        \\};
+        \\
+        \\fn expectParse(input: []const u8, expected: Severity) !void {
+        \\    const actual = try std.json.parseFromSlice(Severity, std.testing.allocator, input, .{});
+        \\    defer actual.deinit();
+        \\    try std.testing.expectEqual(expected, actual.value);
+        \\}
+        \\
+        \\test "Severity.jsonParse" {
+        \\    _ = Severity.jsonParse;
+        \\    try expectParse("\"error\"", Severity.err);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_refwork.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_refwork.zig", RULE_TEST_LIE),
+    );
+}
+
 test "ZT104: empty catch in a test is a note" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -69396,6 +69486,127 @@ test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
     try std.testing.expect(cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
 }
 
+test "ZC101: tiny wrapper with a conditional acquire is silent (EPH-I0033, documented FN)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The tiny-wrapper suppression counts body statements, so the
+    // conditional acquire fits the one-statement shape — the branch that
+    // skips the lock is invisible to the heuristic (EPH-I0033 item 7).
+    const content =
+        \\fn doWork(c: bool) void {}
+        \\fn acquire(m: *Mutex, c: bool) void {
+        \\    if (c) { m.lock(); }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_tinycond.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: close() is not a release — lock with only a close warns (EPH-I0033)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // close() is outside the release family, so a resource whose lock is
+    // released by closing it shows no release at all (EPH-I0033 item 2:
+    // messenger's stored file handle).
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    file.lock();
+        \\    doWork();
+        \\    file.close();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_close.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: cross-fn release spelled differently is invisible (EPH-I0033)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The cross-fn suppression needs the receiver field-chain text to
+    // match exactly: w.mutex is acquired, i.mutex is released, so the
+    // release is invisible and the acquire warns (EPH-I0033 item 1,
+    // ghostty blocking_queue class).
+    const content =
+        \\fn lockForRead(w: *Wrapper) []const u8 {
+        \\    w.mutex.lock();
+        \\    return w.slice;
+        \\}
+        \\fn release(i: *Inner) void {
+        \\    i.mutex.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_spelling.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: mis-paired release beside a correct pair is masked (EPH-I0033)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Strict pairing only governs coverage; a mis-paired release is never
+    // reported itself. Beside a correctly-paired same-receiver release it
+    // is fully masked — no ZC101 warning, and ZC103 stays silent because
+    // the receiver HAS acquire evidence (EPH-I0033 item 4).
+    const content =
+        \\fn doWork() void {}
+        \\fn f(m: *Mu) void {
+        \\    m.lock();
+        \\    defer m.unlock();
+        \\    defer m.unlockShared();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_mispair.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: fn-scope defer over a conditional tryLock is covered (EPH-I0033, ZC103 inverse)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The fn-scope defer at depth 0 satisfies the depth rule for the
+    // depth-1 conditional tryLock, so ZC101 sees coverage and stays
+    // silent. The unlock-of-unheld on the tryLock==false path is the
+    // reserved ZC103 warning shape (EPH-I0033 item 8), pinned in the
+    // ZC103 section.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(m: *Mu) void {
+        \\    if (m.tryLock()) {
+        \\        doWork();
+        \\    }
+        \\    defer m.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_trydefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+    try expectZC103Counts(run.issues.items, 1, 0);
+}
+
 // ============================================================================
 // Concurrency Analysis Tests (ZC102 double lock)
 // ============================================================================
@@ -69905,6 +70116,62 @@ test "ZC102: double lock inside one nested method still warns" {
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc102_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: bare-block release reads as branch-scoped — the FP-unsafe class (EPH-I0036)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A bare {} block always executes, so the release really clears the
+    // hold — but the walk reads it as branch-scoped (depth 2 vs the
+    // acquire's depth 1), downgrades the hold to path-conditional, and
+    // the second acquire warns. The one FP-unsafe accepted class
+    // (EPH-I0036 item 4); the ZC101 notes document the downgrade.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(m: *Mu) void {
+        \\    m.lock();
+        \\    {
+        \\        m.unlock();
+        \\    }
+        \\    m.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_bareblock.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 2);
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: multiline else ends the arm chain — arms read as sequential (EPH-I0036)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The arm chain needs `} else {` on one line (the zig fmt form); an
+    // unformatted multiline else closes at a plain close, so the else-arm
+    // acquire re-locks on the if-arm's path and warns (EPH-I0036 item 5).
+    // The same-line control ("acquires in sibling if/else arms are
+    // disjoint paths") stays silent.
+    const content =
+        \\fn doWork() void {}
+        \\fn f(m: *Mu, c: bool) void {
+        \\    if (c) {
+        \\        m.lock();
+        \\    }
+        \\    else {
+        \\        m.lock();
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_multiline_else.zig", content);
     defer run.deinit(allocator);
 
     try expectZC102Counts(run.issues.items, 1, 0);
@@ -70424,6 +70691,54 @@ test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc104_litfield.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: spawn aliased before the call is invisible (EPH-I0036, documented FN)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const spawn = std.Thread.spawn;` then spawn(...) — the call-target
+    // match is textual, so the alias call is not a thread spawn and the
+    // unjoined handle is invisible (EPH-I0036 item 8).
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    const spawn = std.Thread.spawn;
+        \\    const t = try spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_alias.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: last-segment fallback over-suppresses same-named locals (EPH-I0036)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The field-bound handle ctx.thread is searched by its last segment
+    // `thread`, and any `thread.join(` in the file satisfies the search —
+    // including an unrelated local that shares the name. FN-safe
+    // (EPH-I0036 item 9).
+    const content =
+        \\fn work() void {}
+        \\fn start(ctx: *Ctx) !void {
+        \\    ctx.thread = try std.Thread.spawn(.{}, work, .{});
+        \\}
+        \\fn unrelated(thread: *std.Thread) void {
+        \\    thread.join();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_lastseg.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
@@ -71368,6 +71683,34 @@ test "ZA209: // try prose never proves an error path (EPH-I0411)" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countRuleIssues(run.issues.items, "za209_comprose.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: labeled-block error path is not scanned — the note fires (EPH-I0040)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // break :blk error.Fail is a real error path, but the scan does not
+    // follow labeled-block returns, so the fn still fires the never-fails
+    // note — the documented rule-level false positive (EPH-I0040 item 2).
+    // The verdict is locked as-is; a future scan of block-carried errors
+    // would flip this pin.
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    blk: {
+        \\        break :blk error.Fail;
+        \\    }
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_labeled.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_labeled.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

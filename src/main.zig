@@ -12530,9 +12530,10 @@ fn explicitAnnotTypeName(after_name: []const u8) ?[]const u8 {
 }
 
 /// Skip one compound-type prefix item at `ts`: `*`/`?` markers, `const`/
-/// `volatile` qualifiers, slice/array heads, `align(N)` specs, error-union
-/// heads. Returns true when the cursor advanced; each advance is at least
-/// one byte, so the caller's prefix loop is bounded by the slice length.
+/// `volatile`/`allowzero` qualifiers, slice/array heads, `align(N)` specs,
+/// error-union heads. Returns true when the cursor advanced; each advance
+/// is at least one byte, so the caller's prefix loop is bounded by the
+/// slice length.
 fn skipTypePrefix(type_start: []const u8, ts: *usize) bool {
     if (ts.* >= type_start.len) return false;
     const rest = type_start[ts.*..];
@@ -12549,6 +12550,7 @@ fn skipTypePrefix(type_start: []const u8, ts: *usize) bool {
     }
     if (skipQualifier(rest, "const ", ts)) return true;
     if (skipQualifier(rest, "volatile ", ts)) return true;
+    if (skipQualifier(rest, "allowzero ", ts)) return true;
     if (skipAlignSpec(rest, ts)) return true;
     return skipErrorHead(rest, ts);
 }
@@ -19075,13 +19077,20 @@ fn hasSelfParam(t: []const u8, paren_pos: usize) bool {
 /// Position callers (isOrShortCircuitSafe, EPH-I0298) need the first real
 /// position, not just its existence.
 fn realTokenPos(t: []const u8, needle: []const u8) ?usize {
+    return realTokenPosFrom(t, needle, 0);
+}
+
+/// Same filter as realTokenPos, but scans at or after `from`. The ZA703
+/// per-declaration scans advance `from` past each hit to reach later
+/// same-keyword declarations on the line (EPH-I0888).
+fn realTokenPosFrom(t: []const u8, needle: []const u8, from: usize) ?usize {
     // One classifier walk plus one comment-start walk per call
     // (EPH-I0153): the complexity counters call this once per needle per
     // line, and candidates ascend within a call, so per-occurrence
     // rescans are the dominant cost. Both walks are O(line) once each.
     var cls = LineClassifier.init(t);
     const comment_start = findCommentStart(t);
-    var s: usize = 0;
+    var s: usize = from;
     while (mem.indexOf(u8, t[s..], needle)) |rel| {
         const pos = s + rel;
         s = pos + needle.len;
@@ -20385,13 +20394,27 @@ const zig_keywords = [_][]const u8{
 /// const T`). Those bytes are not ident bytes, so the token boundary
 /// check admits them. A declaration never follows `*`/`]`/`)` — it
 /// follows line start, a prefix keyword (`pub`, `threadlocal`), `{`,
-/// `;`, or `}` (EPH-I0886).
+/// `;`, or `}` (EPH-I0886). The word walk skips exactly the three
+/// type-qualifier words that can sit between the marker and `const`:
+/// `volatile`, `allowzero`, and a repeated `const` (`*volatile const T`,
+/// `*allowzero const T`, `*const volatile const T`), so `pub const` and
+/// `threadlocal const` stay declarations (EPH-I0889).
 fn isConstTypeModifier(t: []const u8, pos: usize) bool {
     var i = pos;
-    while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) i -= 1;
-    if (i == 0) return false;
-    const prev = t[i - 1];
-    return prev == '*' or prev == ']' or prev == ')';
+    while (i > 0) {
+        while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) i -= 1;
+        if (i == 0) return false;
+        const prev = t[i - 1];
+        if (prev == '*' or prev == ']' or prev == ')') return true;
+        if (!isIdent(prev)) return false;
+        var word_start = i - 1;
+        while (word_start > 0 and isIdent(t[word_start - 1])) word_start -= 1;
+        const word = t[word_start..i];
+        if (!mem.eql(u8, word, "volatile") and !mem.eql(u8, word, "allowzero") and
+            !mem.eql(u8, word, "const")) return false;
+        i = word_start;
+    }
+    return false;
 }
 
 fn checkConstNaming(
@@ -20403,38 +20426,70 @@ fn checkConstNaming(
     // Extern constant names are ABI-fixed and can never conform (same rule
     // as the extern-fn exemption in checkFnNaming).
     if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
-    const kw_pos = realTokenPos(t, "const") orelse return;
-    // The whole-line gate also matches the `const` type modifier in
-    // bindgen signatures; reject modifier position before reading the
-    // name as a declaration (EPH-I0886).
-    if (isConstTypeModifier(t, kw_pos)) return;
+    // Every real `const` declaration on the line is checked, not just the
+    // first: `const a = 1; const badName = 2;` fires on the second decl
+    // too (EPH-I0888). Type-modifier `const`s are skipped per occurrence,
+    // so a declaration after a modifier still gets checked (EPH-I0890).
+    var from: usize = 0;
+    while (realTokenPosFrom(t, "const", from)) |kw_pos| {
+        from = kw_pos + "const".len;
+        if (isConstTypeModifier(t, kw_pos)) continue;
+        try checkConstDeclName(ctx, content, t_start, kw_pos);
+    }
+}
+
+/// Check one `const` declaration at `kw_pos` against the naming convention.
+fn checkConstDeclName(
+    ctx: NamingLineCtx,
+    content: []const u8,
+    t_start: usize,
+    kw_pos: usize,
+) !void {
+    const t = ctx.t;
     var name_end: usize = undefined;
     var name_col: usize = undefined;
     const name = declNameAt(t, kw_pos + "const".len, &name_end, &name_col) orelse return;
     if (name[0] == '_') return;
 
+    // The classification sees only THIS declaration: its own `=` (the
+    // first at or after the name) and its own RHS (up to the next
+    // top-level `;` or end of line). A line can carry several
+    // declarations, and whole-line classification let a neighbor's RHS
+    // classify the checked decl — `const x = struct {}; const good = 2;`
+    // fired on good, and `const a = 1; const X = struct {};` fired on a
+    // (EPH-I0896). A declaration without its own `=` has no RHS to
+    // classify: the empty segment reads as a plain value.
+    const eq_rel = mem.indexOf(u8, t[name_end..], "=");
+    const decl_seg = if (eq_rel) |eq|
+        t[name_end..findDeclEnd(t, name_end + eq)]
+    else
+        t[name_end..];
+
     // Cheap line-only classification first. The multi-line closure check is
-    // expensive (byte-scans the full type body), so only run it on lines that
-    // look like type defs AND would actually be reported for naming.
-    if (isTypeDefinitionLine(t)) {
+    // expensive (byte-scans the full type body), so only run it on
+    // declarations that look like type defs AND would actually be reported
+    // for naming.
+    if (isTypeDefinitionLine(decl_seg)) {
         if (isTitleCase(name)) return;
         // Non-TitleCase name on a type-looking line — check if it's actually a
         // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
-        if (isClosureFunctionAlias(t, content, t_start) and isCamelCase(name)) return;
-        if (isClosureFunctionAlias(t, content, t_start)) try reportNaming(ctx, .{
+        if (!isClosureFunctionAlias(decl_seg, content, t_start + name_end)) {
+            try reportNamingIssue(ctx.issues, ctx.allocator, .{
+                .path = ctx.path,
+                .line = ctx.line_num,
+                .col = name_col,
+                .kind = "type",
+                .name = name,
+                .expected = "TitleCase",
+            });
+            return;
+        }
+        if (isCamelCase(name)) return;
+        try reportNaming(ctx, .{
             .col = name_col,
             .kind = "function",
             .name = name,
             .expected = "camelCase",
-        });
-        if (isClosureFunctionAlias(t, content, t_start)) return;
-        try reportNamingIssue(ctx.issues, ctx.allocator, .{
-            .path = ctx.path,
-            .line = ctx.line_num,
-            .col = name_col,
-            .kind = "type",
-            .name = name,
-            .expected = "TitleCase",
         });
         return;
     }
@@ -20449,25 +20504,55 @@ fn checkConstNaming(
         });
 }
 
+/// End of the declaration whose initializer starts at `eq_pos`: the next
+/// `;` at brace depth 0, or end of line when the declaration continues on
+/// a later line. `;`/`{`/`(`/`[` inside strings, char literals, and
+/// comments are data and never close or deepen the declaration (EPH-I0896).
+fn findDeclEnd(t: []const u8, eq_pos: usize) usize {
+    var lit = types.LiteralState.forLine(t) orelse return t.len;
+    var depth: usize = 0;
+    var i = eq_pos + 1;
+    while (i < t.len) : (i += 1) {
+        if (lit.updateForChar(t, i) == null) continue;
+        const c = t[i];
+        if (c == '{' or c == '(' or c == '[') {
+            depth += 1;
+            continue;
+        }
+        if (c == '}' or c == ')' or c == ']') {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+        if (c == ';' and depth == 0) return i;
+    }
+    return t.len;
+}
+
 fn checkVarNaming(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Extern variable names are ABI-fixed and can never conform (same rule
     // as the extern-fn exemption in checkFnNaming).
     if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
-    const kw_pos = realTokenPos(t, "var") orelse return;
-    var name_end: usize = undefined;
-    var name_col: usize = undefined;
-    const name = declNameAt(t, kw_pos + "var".len, &name_end, &name_col) orelse return;
-    if (name[0] == '_') return;
-    if (!isSnakeCase(name)) {
-        try reportNamingIssue(ctx.issues, ctx.allocator, .{
-            .path = ctx.path,
-            .line = ctx.line_num,
-            .col = name_col,
-            .kind = "variable",
-            .name = name,
-            .expected = "snake_case",
-        });
+    // Every real `var` declaration on the line is checked, not just the
+    // first: `var a = 1; var badVar = 2;` fires on the second decl too
+    // (EPH-I0888).
+    var from: usize = 0;
+    while (realTokenPosFrom(t, "var", from)) |kw_pos| {
+        from = kw_pos + "var".len;
+        var name_end: usize = undefined;
+        var name_col: usize = undefined;
+        const name = declNameAt(t, kw_pos + "var".len, &name_end, &name_col) orelse continue;
+        if (name[0] == '_') continue;
+        if (!isSnakeCase(name)) {
+            try reportNamingIssue(ctx.issues, ctx.allocator, .{
+                .path = ctx.path,
+                .line = ctx.line_num,
+                .col = name_col,
+                .kind = "variable",
+                .name = name,
+                .expected = "snake_case",
+            });
+        }
     }
 }
 
@@ -20510,45 +20595,48 @@ fn fnReturnsType(t: []const u8, after_name: usize) bool {
     return false;
 }
 
-/// Check function names against the naming convention (ZA703). The search
-/// for `fn ` stops at the start of a line comment. EPH-I0228: comment text
-/// is prose, not a declaration, so `const x = 1; // fn bad_name()` must not
-/// report an issue.
+/// Check function names against the naming convention (ZA703). Every real
+/// `fn` declaration on the line is checked, not just the first: `fn a()
+/// void {} fn BadName() void {}` fires on the second decl too (EPH-I0888).
+/// A `fn` inside a string literal or a comment is data, not a declaration,
+/// so it cannot suppress a later real declaration (EPH-I0228). A `fn` in a
+/// function-pointer TYPE (`*const fn(...)`) fails declNameAt on its `(`
+/// and is skipped the same way the const gate skips type modifiers.
 fn checkFnNaming(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Extern declaration names are ABI-fixed and can never conform.
     // `export fn` is NOT exempt — those names are project-chosen identifiers.
     if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
-    // Comment text is prose, not a declaration. Bound the search to the code
-    // before it (the same data-not-syntax rule as the string check below).
-    const limit = findCommentStart(t) orelse t.len;
-    const fn_pos = mem.indexOf(u8, t[0..limit], "fn ") orelse return;
-    // `fn ` inside a string literal is data (fixture text), not a declaration.
-    if (isInsideString(t, fn_pos)) return;
-    const start = fn_pos + 3;
-    var name_end = start;
-    var name_col: usize = start + 1;
-    const name = declNameAt(t, start, &name_end, &name_col) orelse return;
-    if (name.len > 0 and name[0] == '_') return;
-    const returns_type = fnReturnsType(t, name_end);
-    if (returns_type and !isTitleCase(name)) {
-        try reportNamingIssue(ctx.issues, ctx.allocator, .{
-            .path = ctx.path,
-            .line = ctx.line_num,
-            .col = name_col,
-            .kind = "type-returning fn",
-            .name = name,
-            .expected = "TitleCase",
-        });
-    } else if (!returns_type and !isCamelCase(name)) {
-        try reportNamingIssue(ctx.issues, ctx.allocator, .{
-            .path = ctx.path,
-            .line = ctx.line_num,
-            .col = name_col,
-            .kind = "function",
-            .name = name,
-            .expected = "camelCase",
-        });
+    // realTokenPosFrom filters string/comment occurrences and enforces
+    // ident boundaries, so each hit is a real code token.
+    var from: usize = 0;
+    while (realTokenPosFrom(t, "fn", from)) |fn_pos| {
+        from = fn_pos + "fn".len;
+        const start = fn_pos + "fn".len;
+        var name_end: usize = undefined;
+        var name_col: usize = start + 1;
+        const name = declNameAt(t, start, &name_end, &name_col) orelse continue;
+        if (name.len > 0 and name[0] == '_') continue;
+        const returns_type = fnReturnsType(t, name_end);
+        if (returns_type and !isTitleCase(name)) {
+            try reportNamingIssue(ctx.issues, ctx.allocator, .{
+                .path = ctx.path,
+                .line = ctx.line_num,
+                .col = name_col,
+                .kind = "type-returning fn",
+                .name = name,
+                .expected = "TitleCase",
+            });
+        } else if (!returns_type and !isCamelCase(name)) {
+            try reportNamingIssue(ctx.issues, ctx.allocator, .{
+                .path = ctx.path,
+                .line = ctx.line_num,
+                .col = name_col,
+                .kind = "function",
+                .name = name,
+                .expected = "camelCase",
+            });
+        }
     }
 }
 
@@ -20824,7 +20912,7 @@ fn analyzeNamingFile(
                 try checkConstNaming(naming_ctx, content, t_start);
             if (realTokenPos(t, "var") != null)
                 try checkVarNaming(naming_ctx);
-            if (mem.indexOf(u8, t, "fn ") != null)
+            if (realTokenPos(t, "fn") != null)
                 try checkFnNaming(naming_ctx);
             try checkErrorNaming(naming_ctx, in_error_block);
             trackErrorBlockDepth(t, &error_block_depth);
@@ -21365,6 +21453,10 @@ fn codeKeywordPos(t: []const u8, kw: []const u8) ?usize {
 /// Cheap line-only check: does the declaration RHS look like a type definition?
 /// Does NOT distinguish a real type def from a closure-wrapper function alias —
 /// use `isClosureFunctionAlias` to disambiguate when naming would be reported.
+/// The caller passes the checked declaration's own segment: its `=` (the first
+/// on the segment) and its RHS, cut at the next top-level `;` or end of line
+/// (EPH-I0896). A whole line with several declarations would classify every
+/// declaration by the first one's RHS.
 fn isTypeDefinitionLine(line: []const u8) bool {
     const eq_pos = mem.indexOf(u8, line, "=") orelse return false;
     const after_eq = line[eq_pos + 1 ..];
@@ -21389,7 +21481,9 @@ fn isTypeDefinitionLine(line: []const u8) bool {
 /// the keyword scan in `isTypeDefinitionLine` (same code-position semantics,
 /// EPH-I0474 — the two scanners must agree on which keywords are visible),
 /// but returns true ONLY for the closure case (struct/enum/union/opaque body
-/// whose matching `}` is followed by `.ident`).
+/// whose matching `}` is followed by `.ident`). `line` is the checked
+/// declaration's own segment (see isTypeDefinitionLine, EPH-I0896), so
+/// `line_offset` must be that segment's global offset in `content`.
 fn isClosureFunctionAlias(line: []const u8, content: []const u8, line_offset: usize) bool {
     const eq_pos = mem.indexOf(u8, line, "=") orelse return false;
     const after_eq = line[eq_pos + 1 ..];
@@ -56925,6 +57019,87 @@ test "isConstTypeModifier: pointer and slice const forms are modifiers (EPH-I088
     }
 }
 
+test "isConstTypeModifier: qualifier-before-const forms are modifiers (EPH-I0889)" {
+    // `*volatile const T` and `*allowzero const T` place the qualifier
+    // between the pointer marker and `const`; the word walk must still
+    // recognize the const as a modifier. The pre-existing forms
+    // (`*const volatile`, plain `*const`) keep working.
+    const modifier_lines = [_][]const u8{
+        "fn_ptr: *volatile const Some_Type,",
+        "z_ptr: *allowzero const Some_Type,",
+        "ptr: *const volatile Some_Type,",
+        "plain: *const Some_Type,",
+    };
+    for (modifier_lines) |line| {
+        const pos = mem.indexOf(u8, line, "const").?;
+        try std.testing.expect(isConstTypeModifier(line, pos));
+    }
+    // A `*volatile` or `*allowzero` TYPE on a real declaration must not
+    // turn the declaration's own `const` into a modifier: plain `*volatile`
+    // is not a const modifier.
+    const declaration_lines = [_][]const u8{
+        "pub const v_ptr: *volatile Some_Type = null;",
+        "threadlocal const t_ptr: *allowzero Some_Type = null;",
+    };
+    for (declaration_lines) |line| {
+        const pos = mem.indexOf(u8, line, "const").?;
+        try std.testing.expect(!isConstTypeModifier(line, pos));
+    }
+}
+
+test "isConstTypeModifier: const-to-const qualifier adjacency is a modifier (EPH-I0889)" {
+    // `*const volatile const T` duplicates the const qualifier
+    // (compile-invalid in 0.16, but ephor still scans such lines): the
+    // walk must cross the repeated `const` word to reach the `*` marker,
+    // or the trailing const is misread as a declaration. The trailing
+    // `const` is the discriminating position.
+    const modifier_lines = [_][]const u8{
+        "fn_ptr: *const volatile const Some_Type,",
+        "z_ptr: *allowzero const volatile const Other_Type,",
+    };
+    for (modifier_lines) |line| {
+        const pos = mem.lastIndexOf(u8, line, "const").?;
+        try std.testing.expect(isConstTypeModifier(line, pos));
+    }
+}
+
+test "findDeclEnd: stops at the top-level semicolon (EPH-I0896)" {
+    // The first `;` outside braces closes the declaration; the later
+    // declaration's `=` and RHS stay out of the segment.
+    const line = "= struct {}; const y = 2;";
+    try std.testing.expectEqual(
+        @as(usize, mem.indexOf(u8, line, ";").?),
+        findDeclEnd(line, 0),
+    );
+}
+
+test "findDeclEnd: semicolon inside braces does not close the declaration (EPH-I0896)" {
+    // The struct body's inner `;` sits at brace depth 1; only the closing
+    // `;` at depth 0 terminates the declaration.
+    const line = "= struct { const z = 1; }; const y = 2;";
+    try std.testing.expectEqual(
+        @as(usize, mem.indexOf(u8, line, "};").? + 1),
+        findDeclEnd(line, 0),
+    );
+}
+
+test "findDeclEnd: semicolon inside a string does not close the declaration (EPH-I0896)" {
+    // The `;` inside the string literal is data; the real `;` after the
+    // closing quote terminates the declaration.
+    const line = "= \"a;b\"; const y = 2;";
+    try std.testing.expectEqual(
+        @as(usize, mem.indexOf(u8, line, "\";").? + 1),
+        findDeclEnd(line, 0),
+    );
+}
+
+test "findDeclEnd: unterminated declaration ends at end of line (EPH-I0896)" {
+    // A multi-line declaration (an open struct body) has no top-level `;`
+    // on the line; the segment then ends at end of line.
+    const line = "= struct {";
+    try std.testing.expectEqual(line.len, findDeclEnd(line, 0));
+}
+
 test "analyzeNaming: bindgen const type modifiers stay silent (EPH-I0886)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -56959,6 +57134,437 @@ test "analyzeNaming: bindgen const type modifiers stay silent (EPH-I0886)" {
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: second same-line const decl is checked (EPH-I0888)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Only the first `const` used to be checked; the second declaration's
+    // name must be reported too, at its own column.
+    const code =
+        \\const a = 1; const badName = 2;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_multi_const.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multi_const.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqual(@as(usize, 20), issues.items[0].col);
+}
+
+test "analyzeNaming: second same-line var decl is checked (EPH-I0888)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const code =
+        \\var a = 1; var badVar = 2;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_multi_var.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multi_var.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "variable 'badVar' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqual(@as(usize, 16), issues.items[0].col);
+}
+
+test "analyzeNaming: const decl after a type-modifier const is checked (EPH-I0890)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The line's first `const` is a `*const` type modifier; the later
+    // declaration must still be checked instead of aborting the line scan.
+    const code =
+        \\pub fn bindgenFn(a: *const Some_Type) void { const badName = 2; }
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_modifier_first.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_modifier_first.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqual(@as(usize, 52), issues.items[0].col);
+}
+
+test "analyzeNaming: qualifier-before-const bindgen types stay silent (EPH-I0889)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Bindgen emits `*volatile const` / `*allowzero const` modifier orders;
+    // only the real declaration may fire (it must, so the test is not a
+    // lie: the modifier lines alone would produce zero issues).
+    const code =
+        \\pub fn bindgenVol(a: *volatile const Some_Type, b: *allowzero const Other_Type) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\const badName = 1;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_bindgen_qual.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_bindgen_qual.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: const-to-const bindgen adjacency stays silent (EPH-I0889)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The trailing `const` of `*const volatile const fooBar` must read as
+    // a modifier, not a declaration: the type name fooBar would otherwise
+    // fire a false 'constant' naming issue.
+    const code =
+        \\pub fn bindgenVol(a: *const volatile const fooBar) void {}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_const_adjacent.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_const_adjacent.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: conforming same-line decls stay silent (EPH-I0888)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The iteration must not over-flag: every later declaration here is
+    // well-named, so the line stays silent.
+    const code =
+        \\var a = 1; var good_name = 2; const b = 3; const good_const = 4;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_multi_ok.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multi_ok.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: type-def const before a snake const stays silent (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The type-def classification must anchor on the CHECKED decl's own
+    // `=` and RHS: decl #2's RHS is a plain value, so good_name is a
+    // conforming constant. Whole-line classification used to fire a false
+    // "type 'good_name' should be TitleCase" from decl #1's `struct {}`.
+    // decl #1 (`x`) is itself a lowercase type-def const, so its own
+    // true positive stays; the pin asserts the FP is gone, not that the
+    // line is silent.
+    const code =
+        \\const x = struct {}; const good_name = 2;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_type_def_first.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_type_def_first.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "type 'x' should be TitleCase",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqual(
+        @as(usize, mem.indexOf(u8, code, "x").? + 1),
+        issues.items[0].col,
+    );
+}
+
+test "analyzeNaming: conforming type-def const before a snake const is silent (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The zero-issue shape of the finding: when the type-def const
+    // conforms (X), only the good_name false positive can fire, so the
+    // line must stay silent.
+    const code =
+        \\const X = struct {}; const good_name = 2;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_conforming_first.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_conforming_first.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: closure alias before a snake const stays silent (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Same anchoring for the closure-alias path: decl #2 must not inherit
+    // decl #1's `struct { ... }.f` RHS. Whole-line classification used to
+    // fire a false "function 'good_name' should be camelCase".
+    const code =
+        \\const x = struct { fn f() void {} }.f; const good_name = 2;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_closure_first.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_closure_first.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: plain const before a type-def const stays silent (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The reverse bleed pre-existed at HEAD: decl #1 was classified by
+    // decl #2's RHS and fired a false "type 'a' should be TitleCase".
+    // Each decl now classifies only its own RHS.
+    const code =
+        \\const a = 1; const X = struct {};
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_plain_first.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_plain_first.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: lone lowercase type-def const still fires (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // True-positive guard: per-decl anchoring must not silence the real
+    // type-def check on a lone declaration.
+    const code =
+        \\const foo = struct {};
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_lone_type.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_lone_type.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "type 'foo' should be TitleCase",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: second decl after a type-def const is still checked (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The EPH-I0888 iteration purpose survives the anchoring fix: decl #2
+    // IS checked, with its OWN classification — badName is a
+    // non-conforming constant, not a mis-named type. (The first decl
+    // conforms so exactly one issue can fire.)
+    const code =
+        \\const X = struct {}; const badName = 2;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_second_bad.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_second_bad.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqual(
+        @as(usize, mem.indexOf(u8, code, "badName").? + 1),
+        issues.items[0].col,
+    );
+}
+
+test "analyzeNaming: multi-line closure alias stays silent (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The declaration segment ends at end of line (the body stays open),
+    // and the closure scan resolves the `.f` tail through the global
+    // content offset (t_start + name_end): callWrapper is a conforming
+    // camelCase function alias, so the file stays silent.
+    const code =
+        \\const callWrapper = struct {
+        \\    fn f() void {}
+        \\}.f;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_mline_alias.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_mline_alias.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: multi-line closure alias fires the function kind (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The multi-line body must still resolve to a closure alias (the
+    // `.f` tail lives beyond the line the declaration starts on), so the
+    // snake_case name fires the function convention, not the type one.
+    const code =
+        \\const call_wrapper = struct {
+        \\    fn f() void {}
+        \\}.f;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_mline_alias_bad.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_mline_alias_bad.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "function 'call_wrapper' should be camelCase",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: multi-line lowercase type-def const still fires (EPH-I0896)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The type keyword must survive the end-of-line truncation of the
+    // declaration segment: a multi-line `struct {` body still classifies
+    // as a type def, so the lowercase name fires.
+    const code =
+        \\const lower_struct = struct {
+        \\    field: u8,
+        \\};
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_mline_type.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_mline_type.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "type 'lower_struct' should be TitleCase",
         issues.items[0].message,
     );
 }
@@ -57325,6 +57931,13 @@ test "extractVarTypeName skips pointer qualifiers in annotations" {
     try std.testing.expectEqualStrings("Q", extractVarTypeName("var z: *const Q = undefined;").?);
     try std.testing.expectEqualStrings("T", extractVarTypeName("var t: *volatile T = undefined;").?);
     try std.testing.expectEqualStrings("Q", extractVarTypeName("var q: ?*const Q = undefined;").?);
+}
+
+test "extractVarTypeName skips allowzero qualifier (EPH-I0071)" {
+    // `*allowzero u8` used to yield the garbage key "allowzero"; the
+    // qualifier must be skipped like `volatile ` (I0057 precedent).
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var z: *allowzero u8 = undefined;").?);
+    try std.testing.expectEqualStrings("u8", extractVarTypeName("var z: *allowzero const u8 = undefined;").?);
 }
 
 test "extractVarTypeName skips slice and array prefixes" {
@@ -57891,6 +58504,80 @@ test "checkFnNaming: full-comment line is ignored (pin)" {
         .allocator = a,
         .path = "test.zig",
         .t = "// fn bad_name()",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkFnNaming: every same-line fn decl is checked (EPH-I0888)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // Only the first `fn` used to be checked; the second declaration's
+    // name must be reported too, at its own column.
+    const line = "fn a() void {} fn BadName() void {}";
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = line,
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "function 'BadName' should be camelCase",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqual(
+        @as(usize, mem.indexOf(u8, line, "BadName").? + 1),
+        issues.items[0].col,
+    );
+}
+
+test "checkFnNaming: string-first fn cannot suppress a real decl (EPH-I0888)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // The first `fn ` occurrence sits inside a string literal (data); the
+    // real declaration after it must still be checked.
+    const line = "const s = \"fn x\"; fn bad_name() void {}";
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = line,
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "function 'bad_name' should be camelCase",
+        issues.items[0].message,
+    );
+}
+
+test "checkFnNaming: fn-pointer type is not a declaration (EPH-I0888)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // The `fn` token in a function-pointer TYPE must not be read as a
+    // declaration: declNameAt fails on the param-list `(`.
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "var cb: *const fn(ctx: *Context) void = null;",
         .line_num = 1,
     });
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);

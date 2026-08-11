@@ -921,15 +921,33 @@ fn classifyLineStart(code: []const u8) BodyStart {
 /// Classify an else body starting at index i (just past the keyword): `{`
 /// (braced — else_open_pending claims it), `if` (else-if — its own `{`
 /// claim handles it), labeled block (brace-claimed), a plain statement
-/// (virtual else body), or nothing (Allman else).
+/// (virtual else body), or nothing (Allman else). A `|payload|` capture
+/// after the keyword belongs to the else header, not the body — the
+/// payload-aware skip mirrors peekBodyStart (EPH-I0119). A switch-prong
+/// `=>` after the keyword is never a virtual else body (EPH-I0096).
 fn peekElseBody(code: []const u8, i: usize) BodyStart {
     var j = i;
     while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
     if (j >= code.len) return .none;
+    var payload_skipped = false;
+    if (code[j] == '|') {
+        const close = mem.indexOfScalarPos(u8, code, j + 1, '|') orelse
+            return .statement;
+        j = close + 1;
+        while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+        if (j >= code.len) return .none;
+        payload_skipped = true;
+    }
     if (code[j] == '{') return .brace;
+    if (isLabelBlockAhead(code, j)) return .label_block;
+    // A payload-else body is a statement: a post-payload `if` is a
+    // statement body, not an else-if chain header, and `=>` cannot
+    // follow a payload. The chain and `=>` rejections apply to the
+    // bare keyword only (EPH-I0119, EPH-I0096).
+    if (payload_skipped) return .statement;
     if (j + 2 <= code.len and mem.eql(u8, code[j .. j + 2], "if") and
         (j + 2 == code.len or !isIdent(code[j + 2]))) return .none;
-    if (isLabelBlockAhead(code, j)) return .label_block;
+    if (j + 1 < code.len and code[j] == '=' and code[j + 1] == '>') return .none;
     return .statement;
 }
 
@@ -1072,6 +1090,11 @@ const BraceScanOut = struct {
     // The same-line body statement (virtual or `{ break; }`) is a loop
     // break/continue; the walk wires it at the matching close (EPH-I0094).
     body_jump: JumpKind = .none,
+    // An else keyword whose body is pending on a later line (Allman else,
+    // or a payload-else with nothing after the payload): the walk marks
+    // the else entry pending so the next line's `{` or statement claims
+    // it (EPH-I0119, EPH-I0089).
+    saw_else_pending: bool = false,
     // Ordered events for the line; slices CFGBuildCtx.event_scratch, so it
     // is valid only until the next scanLineBraces call.
     events: []const ControlEvent = &.{},
@@ -1089,6 +1112,10 @@ const LineScanCtx = struct {
     virtual_open: bool = false, // a virtual same-line body is open
     else_virtual: bool = false, // a same-line virtual else body is open
     suppress_pending: bool = false, // line is a pending opener's virtual body
+    // Column of the line's latest else-keyword event: a body brace or
+    // virtual open claimed after it means the else body is on this line,
+    // so the pending mark must not survive (EPH-I0089).
+    last_else_col: ?usize = null,
     // Index of the latest control `{` on this line; a same-line `}` pop
     // extracts the braced body text between them (EPH-I0094).
     last_control_open: ?usize = null,
@@ -1195,6 +1222,12 @@ const CFGBuildCtx = struct {
         const pending_claim = !line_scan.opener and !line_scan.suppress_pending and
             self.clearTopPending();
         if (own_claim or else_claim or pending_claim) {
+            // A body brace claimed after the line's else keyword means the
+            // else body is on this line: the pending mark must not survive
+            // (EPH-I0089). An if's own `{` before the else keyword keeps it.
+            if (line_scan.last_else_col) |else_col| {
+                if (i > else_col) line_scan.out.saw_else_pending = false;
+            }
             line_scan.claimed = true;
             line_scan.else_open_pending = false;
             line_scan.out.saw_control_open = true;
@@ -1270,6 +1303,12 @@ const CFGBuildCtx = struct {
         line_scan.virtual_seen = true;
         if (!line_scan.virtual_ok or line_scan.claimed) return;
         if (peekBodyStart(line_scan.code, i) != .statement) return;
+        // A virtual body opened after the line's else keyword (`else if (d)
+        // x = 1;`) is the else body itself: the pending mark must not
+        // survive (EPH-I0089).
+        if (line_scan.last_else_col) |else_col| {
+            if (i > else_col) line_scan.out.saw_else_pending = false;
+        }
         line_scan.claimed = true;
         line_scan.virtual_open = true;
         line_scan.out.saw_control_open = true;
@@ -1326,10 +1365,15 @@ const CFGBuildCtx = struct {
                 .kind = .else_keyword,
                 .col = i,
             });
-            if (peekElseBody(line_scan.code, i + 4) == .statement) {
+            line_scan.last_else_col = i;
+            const else_body = peekElseBody(line_scan.code, i + 4);
+            if (else_body == .statement) {
                 line_scan.else_virtual = true;
             } else {
                 line_scan.else_open_pending = true;
+                // An Allman else (no body on this line) marks the entry
+                // pending for the next line's claim (EPH-I0119, EPH-I0089).
+                if (else_body == .none) line_scan.out.saw_else_pending = true;
             }
             return 3;
         }
@@ -1665,6 +1709,14 @@ const CFGBuildCtx = struct {
             if (bt == .if_block or bt == .else_block or bt == .else_if_block or
                 isLoopBlock(bt))
             {
+                // A second close on the same line (two-closes-one-line,
+                // `} }`) must not overwrite the first deferral: wire the
+                // earlier entry now or its merge wiring is dropped
+                // (EPH-I0091). The next-line else that claims the first
+                // entry is unaffected — a same-line close directly before
+                // an else keyword never reaches this path (walkOneEvent
+                // skips it).
+                if (self.pending_else != null) try self.finishPendingElse(line);
                 self.pending_else = self.block_stack.pop();
                 return;
             }
@@ -1743,6 +1795,18 @@ const CFGBuildCtx = struct {
         // condition); an inline-return else has no brace coming at all.
         if (isControlOpener(pattern) and !scan.saw_control_open and
             !hasInlineElseReturn(code)) self.markTopPending();
+        // An else whose body is pending on a later line (Allman `else`,
+        // payload-else with nothing after the payload): mark the else
+        // entry pending so the next line's `{` claims it as a control
+        // open or its statement becomes the virtual body (EPH-I0119,
+        // EPH-I0089). A body claim after the else keyword already cleared
+        // the flag; an inline-return else has no body line at all.
+        if (scan.saw_else_pending and !hasInlineElseReturn(code)) {
+            const items = self.block_stack.items;
+            if (items.len > 0 and (items[items.len - 1].block_type == .else_block or
+                items[items.len - 1].block_type == .else_if_block))
+                self.markTopPending();
+        }
         // The virtual body lived in the true block; close the opener at
         // this line's end. A body line that opened its own construct
         // (nested if, braced loop) leaves the opener lingering as pre-B2 —
@@ -2030,8 +2094,12 @@ fn isWhileLiteralTrue(t: []const u8) bool {
     return false;
 }
 
+/// True when the line's real else token has an inline `return` body
+/// (`} else return;`). The token scan is whole-word and string/comment
+/// masked: an identifier containing `else` (elsewhere) or a string literal
+/// carrying `else` before the keyword must not anchor the check (EPH-I0097).
 fn hasInlineElseReturn(t: []const u8) bool {
-    const else_pos = mem.indexOf(u8, t, "else") orelse return false;
+    const else_pos = realTokenPos(t, "else") orelse return false;
     const after_else = mem.trimStart(u8, t[else_pos + 4 ..], " \t");
     return mem.startsWith(u8, after_else, "return ") or
         mem.startsWith(u8, after_else, "return;");
@@ -3439,7 +3507,11 @@ fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
 /// plain slice occurrences (`x[0..n]`) are hasDirectFill Pattern-2
 /// territory and deliberately do NOT match — they keep whole-line coverage
 /// (EPH-I0102). A non-call `&x` (`const p = &x;`) is untrackable aliasing,
-/// not a fill.
+/// not a fill; the `&(x)` spelling keeps that verdict (its paren sits at
+/// the name, and the lookback starts before the amp). A non-call
+/// `(&x)` — a parenthesized address-of outside any call — DOES match: the
+/// lookback finds the grouping paren and cannot tell it from a call paren,
+/// a documented approximation (EPH-I0123).
 fn nextFillCallOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize {
     while (mem.indexOf(u8, t[s.*..], var_name)) |rel| {
         const pos = s.* + rel;
@@ -19178,8 +19250,12 @@ fn hasCodePositionBrace(t: []const u8) bool {
 /// carries no structural increment (EPH-I0458).
 fn opensCognitiveScope(t: []const u8) bool {
     if (!hasCodePositionBrace(t)) return false;
+    // A switch-prong `else =>` opens no scope of its own: the arm is
+    // counted by countSwitchArms and the prong branch is skipped, so the
+    // else token must not mark a second same-line brace (EPH-I0884).
+    // `} else {` and `else if` keep the else-scope behavior (EPH-I0453).
     return hasToken(t, "if") or
-        hasToken(t, "else") or
+        (hasToken(t, "else") and !hasElseArrow(t)) or
         hasToken(t, "switch") or
         hasToken(t, "while") or
         hasToken(t, "for") or
@@ -46239,6 +46315,78 @@ test "buildCFG: multi-line else-if chain pairs each close with its else" {
     try std.testing.expect(cfgHasEdge(&cfg, j_block, i_block, .sequential));
 }
 
+test "buildCFG: two closes on one line preserve the inner merge wiring (EPH-I0091)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a) {", // 2
+        "        if (b) {", // 3
+        "            g();", // 4
+        "        } }", // 5: both closes on one line
+        "    h();", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // The second close must not overwrite the first deferral: the inner
+    // merge wiring (inner body -> inner merge, inner merge -> post-outer
+    // block) must survive (pre-fix: pending_else holds only one entry, so
+    // the second close drops the inner entry and the inner body wires
+    // straight to the outer merge — EPH-I0091).
+    const entry = cfg.entry_block;
+    const outer_true = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const inner_body = cfgSucc(&cfg, outer_true, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const inner_merge = cfgSucc(&cfg, outer_true, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, inner_body, inner_merge, .sequential));
+    const h_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, inner_merge, h_block, .sequential));
+}
+
+test "buildCFG: Allman else brace after same-line if is a control open (EPH-I0089)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {", // 1
+        "    if (a) { f(); } else", // 2: same-line if, bare else
+        "    {", // 3: Allman else brace on the NEXT line
+        "        g();", // 4
+        "    }", // 5
+        "    h();", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // The Allman else `{` must claim the else entry as a control open, so
+    // its close pops the else block and the fn's trailing `}` finds a
+    // balanced stack (pre-fix: the else brace classifies .expr, the
+    // else_open_pending dies at the line boundary, and the trailing close
+    // leaves the else entry lingering — EPH-I0089).
+    const entry = cfg.entry_block;
+    const else_arm = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const body_block = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(else_arm, body_block);
+    const merge = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, else_arm, merge, .sequential));
+    // The else close pops its entry and wires to the merge: the trailing
+    // `h();` line is the merge, never a block left open by a lingering
+    // entry (pre-fix the entry lingered — EPH-I0089).
+    const h_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(merge, h_block);
+}
+
 test "buildCFG: blank line between close and else keeps the pairing" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -48414,6 +48562,131 @@ test "ZA607: braceless else-if statement body is detected" {
         1,
         countRuleIssues(run.issues.items, "da_braceless_elseif.zig", RULE_DEFINITE_ASSIGNMENT),
     );
+}
+
+test "ZA607: payload-else next-line body keeps the else arm conditional (EPH-I0119)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // EPH-I0119 repro variant: the true arm never assigns x, the
+    // payload-else arm does on its next-line body. The else-arm fill must
+    // stay conditional — the cond-true path reaches the read undefined.
+    // Pre-fix peekElseBody returns .statement for `else |e|`, the
+    // else-virtual opens and closes on the header line, and the body
+    // attributes post-merge as an unconditional fill (FN).
+    const content =
+        \\fn elsePayloadGap(fallible: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (fallible) |v| {
+        \\        _ = v;
+        \\    } else |e|
+        \\        x = @intFromError(e);
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_else_payload.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_else_payload.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: payload-else with both arms filling stays silent (EPH-I0119)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The issue's exact repro: both arms fill x, so the trailing read is
+    // covered on every path. The payload-else fix must not over-fire into
+    // a false positive on this shape (EPH-I0119).
+    const content =
+        \\fn elsePayloadBoth(fallible: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (fallible) |v| {
+        \\        x = v;
+        \\    } else |e|
+        \\        x = @intFromError(e);
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_else_payload_both.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_else_payload_both.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "buildCFG: payload-else next-line body lands in the else arm (EPH-I0119)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(fallible: bool) u32 {", // 1
+        "    var x: u32 = undefined;", // 2
+        "    if (fallible) |v| {", // 3
+        "        x = v;", // 4
+        "    } else |e|", // 5
+        "        x = @intFromError(e);", // 6
+        "    return x;", // 7
+        "}", // 8
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // The else body line belongs to the else arm, not the post-merge block
+    // (pre-fix: the else-virtual opens and closes on the header line and
+    // the body attributes post-merge — EPH-I0119).
+    const entry = cfg.entry_block;
+    const else_arm = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const body_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(else_arm, body_block);
+    const merge = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(merge != else_arm);
+    try std.testing.expect(cfgHasEdge(&cfg, else_arm, merge, .sequential));
+}
+
+test "buildCFG: payload-else if-statement body closes same-line (EPH-I0119)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A payload-else whose body is an if-statement is a statement body,
+    // not an else-if chain header: the else closes on the header line
+    // and the next line attributes post-merge. Treating the post-payload
+    // `if` as a chain header marks the else pending and steals the next
+    // line as the else's virtual body (EPH-I0119).
+    const lines = [_][]const u8{
+        "fn f(c: bool, d: bool) u32 {", // 1
+        "    var x: u32 = undefined;", // 2
+        "    if (c) {", // 3
+        "        x = 1;", // 4
+        "    } else |e| if (d) x = @intFromError(e);", // 5
+        "    x = 2;", // 6
+        "    return x;", // 7
+        "}", // 8
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const entry = cfg.entry_block;
+    const else_arm = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const after = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    // The else closes same-line: the next line is post-merge code, never
+    // the else's virtual body.
+    try std.testing.expect(after != else_arm);
+    try std.testing.expect(cfgHasEdge(&cfg, else_arm, after, .sequential));
 }
 
 test "ZA607: unconditional assignment before read is silent" {
@@ -54094,6 +54367,48 @@ test "findFillCallOccurrence matches call-arg dests only" {
     try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("@memset(x[0..4], 0);", "x"));
     try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("const d = x[0..4];", "x"));
     try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("use(x);", "x"));
+}
+
+test "isVirtualElseLine rejects the switch-prong else arrow (EPH-I0096)" {
+    // A switch prong `else => { ... }` is an arm, not a brace-less else
+    // body: treating it as a virtual else would claim a deferred if entry
+    // that the prong close already consumed. The `=>` rejection is cheap
+    // latent hardening (EPH-I0096).
+    try std.testing.expect(!isVirtualElseLine("else => {"));
+    try std.testing.expect(!isVirtualElseLine("else =>"));
+    try std.testing.expect(!isVirtualElseLine("else => x,"));
+    // The non-prong virtual else shapes keep their verdict.
+    try std.testing.expect(isVirtualElseLine("else x = 1;"));
+    try std.testing.expect(isVirtualElseLine("else return;"));
+}
+
+test "hasInlineElseReturn anchors on the real else token (EPH-I0097)" {
+    // Substring anchoring: an identifier containing `else` (elsewhere) or
+    // a string literal carrying `else` before the real keyword mis-anchors
+    // the inline-return check, so a genuine `else return;` is missed
+    // (EPH-I0097).
+    try std.testing.expect(hasInlineElseReturn("x = elsewhere(); } else return;"));
+    try std.testing.expect(hasInlineElseReturn("const s = \"else\"; } else return;"));
+    // No real else token: never an inline-else return.
+    try std.testing.expect(!hasInlineElseReturn("const s = \"else return\";"));
+    try std.testing.expect(!hasInlineElseReturn("x = elsewhere;"));
+    // The plain shapes keep their verdicts.
+    try std.testing.expect(hasInlineElseReturn("} else return;"));
+    try std.testing.expect(hasInlineElseReturn("} else return x;"));
+    try std.testing.expect(!hasInlineElseReturn("} else {"));
+}
+
+test "findFillCallOccurrence grouping-paren non-call matches (EPH-I0123 doc)" {
+    // The doc arm of EPH-I0123: unmatchedOpenParenBefore cannot tell a
+    // grouping paren from a call paren, so a parenthesized `(&x)` outside
+    // any call is matched as a call-fill (`const p = (&x);`). The behavior
+    // is pinned as the documented approximation — a non-call address that
+    // the fill analysis treats as a call-fill (FN direction). The
+    // EPH-I0822 bridge form `&(x)` keeps the no-match verdict: its paren
+    // sits at the name and the scan looks before the amp.
+    try std.testing.expect(findFillCallOccurrence("const p = (&x);", "x") != null);
+    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("const p = &(x);", "x"));
+    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("const p = &x;", "x"));
 }
 
 test "ZA607: payload capture of a filled same-name var is silent" {
@@ -65844,6 +66159,59 @@ test "ZA302: char-literal braces do not inflate nesting depth" {
             try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
         }
     }
+}
+
+test "ZA306: else-prong second same-line brace adds no cognitive nest (EPH-I0884)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The else-prong line `else => { {` opens an anonymous block as a
+    // SECOND code brace. opensCognitiveScope lists the else token without
+    // a hasElseArrow exclusion, so that second brace marks +1 cog_nest for
+    // its interior lines; the identical shape under a numeric prong
+    // (`0 => { {`) measures at the base level. Sonar assigns plain blocks
+    // no nesting, so the else-arm interior overcounts (EPH-I0884).
+    // True cognitive: switch(1) + arm(1+1) + inner if(1+1) + arm(1+1) +
+    // inner if(1+1) = 9. The leaked marker adds +1 to the else-arm's
+    // inner-if cost (10). The limit sits one below the true weight so
+    // only the leak crosses it.
+    const code =
+        \\fn sink() void {}
+        \\fn probe(x: u32) u32 {
+        \\    switch (x) {
+        \\        else => { {
+        \\            if (true) return 1;
+        \\        } },
+        \\        0 => { {
+        \\            if (true) return 2;
+        \\        } },
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "cog_prong.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "cog_prong.zig"), {});
+
+    const th = Thresholds{ .max_cognitive = 8 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var cog_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cog_prong.zig")) {
+            cog_findings += 1;
+            // Pin the measured value: 9 is the true cognitive weight, 10
+            // the leaked one (EPH-I0884).
+            try std.testing.expect(mem.indexOf(u8, issue.message, "has 9 cognitive complexity (max 8)") != null);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cog_findings);
 }
 
 test "ZA302: same-line struct literals do not inflate nesting depth (EPH-I0811)" {

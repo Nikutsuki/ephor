@@ -6489,6 +6489,7 @@ fn analyzeCFGMemorySafety(
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var allocs = try collectMemSafetyAllocs(
         allocator,
         body.lines,
@@ -9257,6 +9258,7 @@ fn analyzeCFGDeferCoverage(
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     const allocator = ctx.allocator;
+    errdefer deinitIssues(&issues, allocator);
 
     // Skip functions that take a no-free allocator by TYPE (e.g., *ArenaAllocator parameter)
     if (hasNoFreeAllocatorParameter(ctx.body.lines)) return issues;
@@ -10598,6 +10600,7 @@ fn analyzeCFGErrdeferCoverage(
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     if (!fn_returns_error) return issues;
 
     // No-free suppression is per call site (collectTryAllocFromLine /
@@ -10927,6 +10930,7 @@ const ImportGraph = struct {
             .{max_source_file_bytes / (1024 * 1024)},
         );
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        errdefer deinitIssues(&issues, allocator);
         for (self.skipped_files.items) |path| {
             try issues.append(allocator, .{
                 .file = path,
@@ -11706,6 +11710,7 @@ const ImportGraph = struct {
         cfg: *const Config,
     ) !std.ArrayListUnmanaged(Issue) {
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        errdefer deinitIssues(&issues, allocator);
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
@@ -17440,6 +17445,7 @@ fn analyzeTests(
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var project = try collectProjectTestFacts(allocator, graph);
     defer project.deinit(allocator);
     var iter = graph.files.iterator();
@@ -18676,6 +18682,7 @@ fn analyzeConcurrency(
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const sink: ConcurrencyIssueSink = .{
@@ -18928,6 +18935,7 @@ fn analyzeUnused(
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const a = entry.value_ptr.*;
@@ -20762,6 +20770,7 @@ fn analyzeNaming(
     error_naming: ErrorNaming,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
@@ -22250,6 +22259,7 @@ fn analyzeCFGMemory(
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         try analyzeCFGFile(allocator, &issues, entry.value_ptr.content, entry.key_ptr.*);
@@ -22555,6 +22565,7 @@ fn analyzeIgnoredErrors(
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const content = entry.value_ptr.content;
@@ -23184,6 +23195,7 @@ fn allocNullBlockState(allocator: Allocator, num_blocks: usize) !NullBlockState 
 fn analyzeCFGNullSafety(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const allocator = run.file.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     const num_blocks = run.cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
@@ -23249,6 +23261,7 @@ fn checkCFGCatchUnreachable(
 fn analyzeCFGErrors(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const allocator = run.file.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     const is_test_ctx = mem.startsWith(u8, run.func.name, "test ") or
         run.func.in_test;
 
@@ -24621,6 +24634,7 @@ fn analyzeCFGPanicPatterns(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
     const allocator = run.file.allocator;
     const cfg = run.cfg;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
 
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
@@ -25798,6 +25812,7 @@ fn analyzeIntCastGuards(
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const a = entry.value_ptr.*;
@@ -32730,6 +32745,11 @@ fn collectAllIssues(
     filtered: *const FilteredMemIssues,
 ) !std.ArrayListUnmanaged(Issue) {
     var all = std.ArrayListUnmanaged(Issue).empty;
+    // Array-only unwind: the gather appends shallow copies, and every
+    // item's payload stays owned by its source list until CheckFindings
+    // teardown. deinitIssues here would free the payloads twice, so the
+    // errdefer frees only the array (EPH-I0882). The export caller
+    // mirrors the array-only deinit on the success path.
     errdefer all.deinit(alloc);
     const groups = .{
         findings.orphan_issues.items, filtered.mem_only.items,
@@ -65391,6 +65411,119 @@ test "analyzer drivers free their issue lists on the happy path (EPH-I0459)" {
     try std.testing.expectEqual(@as(usize, 0), cx_issues.items.len);
     try std.testing.expectEqual(@as(usize, 0), ast_issues.items.len);
     try std.testing.expectEqual(@as(usize, 0), style_issues.items.len);
+}
+
+test "analyzer drivers free their issue lists on the happy path (EPH-I0882)" {
+    // Phase-4 errdefer sweep drivers (EPH-I0882): each carries an
+    // errdefer deinitIssues on the OOM path. This pin drives the
+    // producers and pins clean-input behavior. All nine returned lists
+    // are empty, so the caller's deinit frees nothing: a plain defer
+    // cannot trip the allocator here. Leak detection needs a non-empty
+    // list, which only the EPH-I0882 sweep pin produces (its success
+    // iteration returns the two findings, and the caller then
+    // double-frees under a plain defer). analyzeCFGMemory drives every
+    // per-fn CFG producer through processFunction, so one call pins
+    // the whole CFG family.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const content =
+        \\const used = 42;
+        \\fn f() void { use(used); }
+        \\fn use(v: u32) void { _ = v; }
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "i0882_drivers.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "i0882_drivers.zig"), {});
+
+    var cfg_mem_issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&cfg_mem_issues, allocator);
+    var test_issues = try analyzeTests(allocator, &graph);
+    defer deinitIssues(&test_issues, allocator);
+    var conc_issues = try analyzeConcurrency(allocator, &graph);
+    defer deinitIssues(&conc_issues, allocator);
+    var unused_issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&unused_issues, allocator);
+    var naming_issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&naming_issues, allocator);
+    var ignored_issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&ignored_issues, allocator);
+    var cast_issues = try analyzeIntCastGuards(allocator, &graph);
+    defer deinitIssues(&cast_issues, allocator);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var orphan_issues = try graph.getOrphanIssues(allocator, &cfg);
+    defer deinitIssues(&orphan_issues, allocator);
+    var skipped_issues = try graph.getSkippedFileIssues(allocator);
+    defer deinitIssues(&skipped_issues, allocator);
+
+    // Clean input: no rule fires on any driver.
+    try std.testing.expectEqual(@as(usize, 0), cfg_mem_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), test_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conc_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), unused_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), naming_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ignored_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cast_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), orphan_issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), skipped_issues.items.len);
+}
+
+test "analyzeUnused errdefer frees the partial list on every failure point (EPH-I0882)" {
+    // OOM sweep: fail every allocation inside analyzeUnused in turn and
+    // prove byte balance at each failure point. Pre-fix, the driver
+    // returned error without freeing the partial list — the owned
+    // message and the array backing leaked (EPH-I0882, the representative
+    // driver). Two findings keep the list non-empty before later failure
+    // points: a single-finding input fails only before the first append,
+    // when the array is still empty and nothing leaks either way. The
+    // sweep counts only driver allocations: the graph and its dupes come
+    // from the outer allocator, so the balance is the driver's own proof.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const content =
+        \\const unused_a = 1;
+        \\const unused_b = 2;
+        \\fn f() void { _ = 0; }
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "i0882_unused.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "i0882_unused.zig"), {});
+
+    // Measure the driver's allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run), the EPH-I0767
+    // sweep pattern.
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var issues = try analyzeUnused(probe.allocator(), &graph);
+        deinitIssues(&issues, probe.allocator());
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        if (analyzeUnused(failing.allocator(), &graph)) |issues| {
+            // Success iteration (fail_index == total_allocs): the two
+            // findings keep the list non-empty, so the caller's deinit
+            // double-frees under a plain defer. A regression to a
+            // single-finding input fails this assert instead of
+            // silently disabling the leak pin.
+            try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+            var list = issues;
+            deinitIssues(&list, failing.allocator());
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Byte balance at every failure point is the leak proof.
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "ZA204: filled vars stay silent with multi-var tracking" {

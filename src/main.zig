@@ -14527,6 +14527,9 @@ const ErrorAnalysisState = struct {
     defer_brace_depth: usize = 0,
     // Track current function name for context-sensitive checks
     current_func_name: []const u8 = "",
+    // Start line of the current function (0 outside a function): the
+    // null-guard lookback floor for the line-based ZA203 tier (EPH-I0864)
+    current_func_start: usize = 0,
     func_brace_depth: usize = 0,
     // Track if current function has any defer statements (for ZA206)
     has_defer_in_func: bool = false,
@@ -14636,9 +14639,10 @@ fn extractFuncName(t: []const u8) ?[]const u8 {
 }
 
 /// Track current function context for context-sensitive checks
-fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState) void {
+fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState, line_num: usize) void {
     if (extractFuncName(t)) |name| {
         state.current_func_name = name;
+        state.current_func_start = line_num;
         state.func_brace_depth = startBraceBlock(t).depth;
         state.has_defer_in_func = false;
         return;
@@ -14646,7 +14650,10 @@ fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState) void {
     if (state.current_func_name.len == 0) return;
     const r = trackBraceBlock(t, true, state.func_brace_depth);
     state.func_brace_depth = r.depth;
-    if (!r.in_block) state.current_func_name = "";
+    if (!r.in_block) {
+        state.current_func_name = "";
+        state.current_func_start = 0;
+    }
 }
 
 /// Track struct literal and collect pending undefined fields
@@ -15319,6 +15326,11 @@ const ErrorLineCtx = struct {
     func_name: []const u8,
     preceding_lines: ?[]const []const u8,
     next_lines: []const []const u8,
+    // Full file lines and the current function's start: the ZA203
+    // null-guard lookback inputs for the line-based tier (EPH-I0864).
+    lines: []const []const u8,
+    line_idx: usize,
+    func_start: usize,
 
     /// Bundle the fields checkSilentCatch needs for the ZA201 sub-check.
     fn silentCatchCtx(self: ErrorLineCtx) SilentCatchCtx {
@@ -15362,7 +15374,15 @@ fn checkLineErrors(ctx: ErrorLineCtx) !void {
     }
     // ZA203: orelse unreachable — suppress in test blocks (intentional assertions)
     if (!ctx.in_test) {
-        if (checkLineOrelseUnreachable(ctx.t, ctx.path, ctx.line)) |i| {
+        const orelse_ctx: LineOrelseCtx = .{
+            .t = ctx.t,
+            .file_path = ctx.path,
+            .line_num = ctx.line,
+            .lines = ctx.lines,
+            .line_idx = ctx.line_idx,
+            .func_start = ctx.func_start,
+        };
+        if (checkLineOrelseUnreachable(orelse_ctx)) |i| {
             try ctx.issues.append(ctx.allocator, i);
         }
     }
@@ -15482,28 +15502,35 @@ fn checkExitBypassesDefer(ctx: ExitDeferCtx) ?Issue {
     };
 }
 
-/// Update error analysis state for a single line (tracking only)
-fn updateErrorState(
+/// Per-line state-tracking inputs for the error scan: the trimmed and
+/// raw line, the mutable analysis state, and the position context the
+/// tracking helpers need.
+const ErrorTrackCtx = struct {
     t: []const u8,
     line: []const u8,
     state: *ErrorAnalysisState,
     path: []const u8,
-) struct { skip_undefined: bool } {
-    const ts = trackTestBlock(t, state.in_test_block, state.test_brace_depth);
+    line_num: usize,
+};
+
+/// Update error analysis state for a single line (tracking only)
+fn updateErrorState(ctx: ErrorTrackCtx) struct { skip_undefined: bool } {
+    const state = ctx.state;
+    const ts = trackTestBlock(ctx.t, state.in_test_block, state.test_brace_depth);
     state.in_test_block = ts.in_test;
     state.test_brace_depth = ts.depth;
-    const in_test = isInTestContext(path, state.in_test_block);
+    const in_test = isInTestContext(ctx.path, state.in_test_block);
 
-    if (isStaticStorageStruct(t)) {
+    if (isStaticStorageStruct(ctx.t)) {
         state.in_static_struct = true;
         state.static_struct_depth = 0;
     }
-    if (state.in_static_struct) trackStaticStructBraces(t, state);
+    if (state.in_static_struct) trackStaticStructBraces(ctx.t, state);
 
-    const skip = in_test or isModuleLevelDecl(line) or state.in_static_struct;
+    const skip = in_test or isModuleLevelDecl(ctx.line) or state.in_static_struct;
 
-    trackFunctionContext(t, state);
-    trackDeferBlock(t, state);
+    trackFunctionContext(ctx.t, state, ctx.line_num);
+    trackDeferBlock(ctx.t, state);
     return .{ .skip_undefined = skip };
 }
 
@@ -15524,7 +15551,13 @@ fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: u
     const t = mem.trim(u8, line, " \t\r");
     if (isCommentOrMultilineString(t)) return;
 
-    const s = updateErrorState(t, line, ctx.state, ctx.path);
+    const s = updateErrorState(.{
+        .t = t,
+        .line = line,
+        .state = ctx.state,
+        .path = ctx.path,
+        .line_num = line_num,
+    });
 
     const pf_ctx: PendingFieldsCtx = .{ .t = t, .path = ctx.path };
     if (!s.skip_undefined) {
@@ -15550,6 +15583,9 @@ fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: u
         .func_name = ctx.state.current_func_name,
         .preceding_lines = preceding,
         .next_lines = next_lines,
+        .lines = ctx.all_lines,
+        .line_idx = line_idx,
+        .func_start = ctx.state.current_func_start,
     });
 
     if (checkExitBypassesDefer(.{
@@ -22701,6 +22737,43 @@ fn narrowFilteredIntersection(
     for (rm.items) |key| _ = intersection.remove(key);
 }
 
+/// True when a pred may vote in the null-check meet: a block with a
+/// closed line range always votes. A same-line inline arm (start > end,
+/// or never started) votes only when it carries a fact — the else arm the
+/// guard placed its fall-through fact on. An empty inline arm cannot
+/// carry a fact, and its path either exits (the guard's own then arm,
+/// whose exit the same-line judge guaranteed when it created the fact) or
+/// runs past the guard (a later construct's arm), so its vote would only
+/// wipe the fact at the merge (EPH-I0863).
+fn predCarriesFact(ctx: NullMeetCtx, pred: NullPredInfo) bool {
+    const block = ctx.cfg.blocks.items[pred.block];
+    if (block.start_line > 0 and block.start_line <= block.end_line) return true;
+    return ctx.checked[pred.block].count() > 0;
+}
+
+/// Remove the vars an empty inline-arm pred violates: a var whose fact is
+/// true_edge at a block the arm is reached from via branch_false. The
+/// arm's path is that guard's null side, where the fact does not hold;
+/// every other fact stays valid on the arm's path (EPH-I0863).
+fn removeInlineArmViolations(
+    ctx: NullMeetCtx,
+    intersection: *std.StringHashMapUnmanaged(void),
+    pred: NullPredInfo,
+) !void {
+    var rm = std.ArrayListUnmanaged([]const u8).empty;
+    defer rm.deinit(ctx.allocator);
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.to != pred.block or edge.kind != .branch_false) continue;
+        if (edge.from >= ctx.cfg.blocks.items.len) continue;
+        const pol = &ctx.polarity[edge.from];
+        var it = intersection.keyIterator();
+        while (it.next()) |key| {
+            if (pol.get(key.*) == .true_edge) try rm.append(ctx.allocator, key.*);
+        }
+    }
+    for (rm.items) |key| _ = intersection.remove(key);
+}
+
 /// Intersect predecessor null-check sets into a block, filtering each
 /// pred's contribution to the facts that hold on the connecting edge
 /// (EPH-I0678).
@@ -22720,12 +22793,21 @@ fn intersectPredChecks(ctx: NullMeetCtx, bid: usize) !bool {
 
     var intersection: std.StringHashMapUnmanaged(void) = .empty;
     defer intersection.deinit(ctx.allocator);
-    for (preds.items, 0..) |pred, pi| {
-        if (pi == 0) {
+    var init_done = false;
+    for (preds.items) |pred| {
+        if (!predCarriesFact(ctx, pred)) continue;
+        if (!init_done) {
+            init_done = true;
             try initFilteredIntersection(ctx, &intersection, pred);
         } else {
             try narrowFilteredIntersection(ctx, &intersection, pred);
         }
+    }
+    // An empty inline-arm pred wipes nothing it does not violate: only the
+    // vars its own branch_false in-edges prove absent (EPH-I0863).
+    for (preds.items) |pred| {
+        if (predCarriesFact(ctx, pred)) continue;
+        try removeInlineArmViolations(ctx, &intersection, pred);
     }
     var any_changed = false;
     var it = intersection.iterator();
@@ -23264,7 +23346,10 @@ fn checkOrelseUnreachable(
     if (isInsideString(t, col)) return null;
 
     if (extractOrelseVar(t, col)) |name| {
-        if (hasNullGuard(run.func.lines, idx, run.func.start, name)) return null;
+        // The fn's lines are already fn-bounded, so the floor is a no-op
+        // here; the line-based tier passes the real function start
+        // (EPH-I0864).
+        if (hasNullGuard(run.func.lines, idx, 0, name)) return null;
     }
     return .{
         .file = run.file.file_path,
@@ -23279,23 +23364,34 @@ fn checkOrelseUnreachable(
 
 /// ZA203 (line-based): orelse unreachable without null guard analysis
 /// Used by checkLineErrors for the `errors` subcommand path.
-fn checkLineOrelseUnreachable(
+/// The emitter consults the null-guard lookback (hasNullGuard, the same
+/// verdict the CFG tier uses) so a guarded `orelse unreachable` stays
+/// silent in the line-based tier too (EPH-I0864).
+const LineOrelseCtx = struct {
     t: []const u8,
     file_path: []const u8,
     line_num: usize,
-) ?Issue {
+    lines: []const []const u8,
+    line_idx: usize,
+    func_start: usize,
+};
+
+fn checkLineOrelseUnreachable(ctx: LineOrelseCtx) ?Issue {
     // One classifier walk plus one comment-start walk (EPH-I0153).
-    var cls = LineClassifier.init(t);
-    const comment_start = findCommentStart(t);
+    var cls = LineClassifier.init(ctx.t);
+    const comment_start = findCommentStart(ctx.t);
     var s: usize = 0;
-    while (mem.indexOfPos(u8, t, s, "orelse unreachable")) |col| {
+    while (mem.indexOfPos(u8, ctx.t, s, "orelse unreachable")) |col| {
         s = col + 1;
         if (cls.isInsideString(col)) continue;
         // A mention inside a trailing comment is prose, not code.
         if (comment_start != null and col >= comment_start.?) return null;
+        if (extractOrelseVar(ctx.t, col)) |name| {
+            if (hasNullGuard(ctx.lines, ctx.line_idx, ctx.func_start, name)) return null;
+        }
         return .{
-            .file = file_path,
-            .line = line_num,
+            .file = ctx.file_path,
+            .line = ctx.line_num,
             .col = col + 1,
             .severity = .warning,
             .rule = RULE_ORELSE_UNREACHABLE,
@@ -23389,10 +23485,11 @@ fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
 /// counts whether or not the guard block closed on the guard line
 /// (accepted, EPH-I0861).
 ///
-/// Tier split (EPH-I0861 closure): this guard query feeds the CFG-tier
-/// ZA203 emitter (checkOrelseUnreachable). The line-based ZA203 emitter
-/// (checkLineOrelseUnreachable, the errors subcommand) still fires on
-/// the same-line guard shapes — it does not consult the guard at all.
+/// Tier split (EPH-I0861 closure, EPH-I0864): this guard query feeds the
+/// CFG-tier ZA203 emitter (checkOrelseUnreachable). The line-based ZA203
+/// emitter (checkLineOrelseUnreachable, the errors subcommand) routes
+/// through the same guard verdict since EPH-I0864; its lookback is
+/// fn-bounded through the error scan's function-start tracking.
 fn hasNullCheckExit(line: []const u8, lines: []const []const u8, i: usize, limit: usize) bool {
     if (guardLineHasSameLineExit(line)) return true;
     if (i + 1 >= limit) return false;
@@ -23455,11 +23552,13 @@ fn hasNullGuard(
     func_line: usize,
     name: []const u8,
 ) bool {
-    _ = func_line;
     // Window 20 matches hasEarlyReturnNullGuard, the sibling null-guard
     // query for ZA801 (EPH-I0225). A null check with an exit farther back
-    // is stale for ZA203 suppression and is missed on purpose.
-    const stop = current_idx -| null_guard_lookback;
+    // is stale for ZA203 suppression and is missed on purpose. The
+    // func_line floor bounds the scan to the current function: the
+    // line-based ZA203 emitter scans the whole file and must not match a
+    // guard in the previous function (EPH-I0864).
+    const stop = @max(current_idx -| null_guard_lookback, func_line);
     var i = current_idx;
     while (i > stop) {
         i -= 1;
@@ -23512,10 +23611,23 @@ const max_braced_guard_body_lines = 4;
 /// the else-fragment join, the semicolon spelling (`if (q) return
 /// null; else { return null; }`); the semicolon spelling is a Zig
 /// parse error, so compilable code never carries it, while a broken
-/// file's guard still suppresses the same way (EPH-I0861).
+/// file's guard still suppresses the same way (EPH-I0861). The walk
+/// covers the braced both-arms twin inside a multi-line guard body
+/// (`if (p == null) {` / `if (q) { return null; } else { return
+/// null; }` / `}`) since EPH-I0868; the unbraced-then multi-line gap
+/// below remains.
 fn hasSameLineGuardExit(tail: []const u8) bool {
     var stmt = mem.trim(u8, stripLineComment(tail), " \t\r");
     if (stmt.len == 0) return false;
+    // A trailing statement after the guard's braced body (`} extra();`) is
+    // not part of the body: it cannot rescue a non-exiting body, and it is
+    // not the body's exit, so the verdict comes from the leading block
+    // alone. Cut the statement sequence at the leading block's close and
+    // judge the block as the whole-tail form (EPH-I0867).
+    if (stmt[0] == '{' and stmt[stmt.len - 1] != '}') {
+        const block_end = leadingBracedEnd(stmt) orelse return false;
+        stmt = stmt[0..block_end];
+    }
     // A whole-tail braced block: judge its own body as the statement
     // sequence, mirroring the walk's depth-1 rule for the block's lines.
     if (stmt[0] == '{') {
@@ -23559,6 +23671,30 @@ fn hasSameLineGuardExit(tail: []const u8) bool {
     // the trailing fragment: judge it under the depth-2 rule only
     // (EPH-I0861).
     return nestedBothArmsExit(mem.trim(u8, stmt[start..], " \t\r"));
+}
+
+/// End offset of a leading braced block (one past its matching close), or
+/// null when the block is unterminated. Quote-aware: braces inside string
+/// and char literals are data, not structure (EPH-I0867).
+fn leadingBracedEnd(stmt: []const u8) ?usize {
+    var depth: i32 = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < stmt.len) : (i += 1) {
+        const c = stmt[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c != '}') continue;
+        depth -= 1;
+        if (depth == 0) return i + 1;
+    }
+    return null;
 }
 
 /// True when the statement is a nested conditional whose then and else
@@ -23718,6 +23854,23 @@ fn armBodyHasDirectExit(body: []const u8) bool {
     return false;
 }
 
+/// True when a code-position `{` appears on the line. The raw indexOf
+/// let a `{` inside a trailing comment or a string literal claim the
+/// guard-line walk-skip: the brace-less guard
+/// (`if (p == null) // { note`) wrongly set block_closed and the
+/// following-block walk never ran. Mirrors countCurlyBalance's masking
+/// (LineClassifier + findCommentStart, EPH-I0866).
+fn hasCodeBrace(line: []const u8) bool {
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line) orelse line.len;
+    for (line[0..comment_start], 0..) |c, i| {
+        if (c != '{') continue;
+        if (cls.isInsideString(i)) continue;
+        return true;
+    }
+    return false;
+}
+
 /// Extract the checked var and the edge the check holds on from a null
 /// check pattern (EPH-I0678). Patterns: "if (x != null)", "if (x) |_|",
 /// "while (x != null)" hold on the true edge. The early-return idiom
@@ -23751,7 +23904,7 @@ fn classifyNullCheck(t: []const u8, lines: []const []const u8, idx: usize) ?Null
         // A guard whose braced body closes on the guard line itself has
         // no following block: the walk would read the lines below as
         // guard-body lines and misjudge a later function exit (EPH-I0859).
-        const block_closed = mem.indexOf(u8, t, "{") != null and countCurlyBalance(t) == 0;
+        const block_closed = hasCodeBrace(t) and countCurlyBalance(t) == 0;
         const has_block_exit = !block_closed and
             hasExitInFollowingBlock(lines, idx + 1, exit_limit);
         if (has_exit or has_block_exit)
@@ -23809,7 +23962,10 @@ fn hasEarlyReturnNullGuard(
         if (isCommentOrMultilineString(ctx)) continue;
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
         if (!hasNullEqualityCheck(ctx, var_name)) continue;
-        if (hasExitStatement(ctx)) return true;
+        // The same-line exit is judged at the guard's own depth (EPH-I0859
+        // mechanism, EPH-I0865): a nested same-line conditional exit
+        // (`{ if (q) return; }`) does not dominate the fall-through.
+        if (guardLineHasSameLineExit(ctx)) return true;
         const check_end = @min(i + max_early_return_guard_body_lines, current_idx);
         if (hasExitInFollowingBlock(lines, i + 1, check_end)) return true;
     }
@@ -24624,9 +24780,14 @@ const GuardWalkState = struct {
 /// line alone decides the walk's answer. An exit qualifies directly inside
 /// the guard block (depth 1), or in a nested conditional whose then and
 /// else arms both exit (depth 2), which together dominate the
-/// fall-through (EPH-I0488).
+/// fall-through (EPH-I0488). A one-line nested both-arms conditional at
+/// depth 1 dominates the same way: its arms both exit, so the body cannot
+/// fall through past it (EPH-I0868).
 fn judgeGuardWalkLine(inner: []const u8, depth: i32, state: *GuardWalkState) bool {
-    if (depth == 1) return isUnconditionalExitLine(inner);
+    if (depth == 1) {
+        if (isUnconditionalExitLine(inner)) return true;
+        return nestedBothArmsExit(inner);
+    }
     if (depth == 2) {
         if (isUnconditionalExitLine(inner)) {
             if (state.then_exit and state.else_seen) return true;
@@ -24690,7 +24851,10 @@ const max_zero_check_guard_body_lines = 6;
 fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
     if (mem.indexOf(u8, ctx.t, ctx.var_name) == null) return false;
     if (mem.indexOf(u8, ctx.t, "== 0)") == null) return false;
-    if (hasExitStatement(ctx.t)) return true;
+    // The same-line exit is judged at the guard's own depth (EPH-I0859
+    // mechanism, EPH-I0865): a nested same-line conditional exit
+    // (`{ if (q) break; }`) does not dominate the fall-through.
+    if (guardLineHasSameLineExit(ctx.t)) return true;
     const block_end = if (ctx.line_idx + max_zero_check_guard_body_lines < ctx.current_idx)
         ctx.line_idx + max_zero_check_guard_body_lines
     else
@@ -41087,6 +41251,348 @@ test "analyzeCFGMemory ZA802 silent past a same-line nested both-arms guard exit
     ) == 0);
 }
 
+test "analyzeCFGMemory ZA802 silent past a same-line braced-with-else guard (EPH-I0863)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { return null; } else { sink(); }` + deref: the
+    // then arm exits and the else arm runs on the non-null path, so the
+    // deref after the chain is safe. The fall-through fact lands on the
+    // else body; the empty inline then-arm must not wipe it at the merge
+    // (EPH-I0863).
+    const content =
+        \\fn v2(p: ?*u8) ?*u8 {
+        \\    if (p == null) { return null; } else { sink(); }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn sink() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_else_v2.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_else_v2.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a same-line both-arms guard with else (EPH-I0863)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { return null; } else { return null; }` + deref:
+    // both arms return, so the deref is unreachable. The else body
+    // carries the fall-through fact and votes it through the merge
+    // (EPH-I0863).
+    const content =
+        \\fn v1(p: ?*u8) ?*u8 {
+        \\    if (p == null) { return null; } else { return null; }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_else_v1.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_else_v1.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past split and full one-line else guards (EPH-I0863)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The split-else layout (`{ return null; } else {` newline body) and
+    // the full one-line else (`else { work(); }`): the else arm runs on
+    // the non-null path, so the deref after the chain is safe. The
+    // multi-line else body votes its fact through the merge like any
+    // full-range block (EPH-I0863).
+    const content =
+        \\fn split_else(p: ?*u8) ?*u8 {
+        \\    if (p == null) { return null; } else {
+        \\        sink();
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn full_one_line_else(p: ?*u8) ?*u8 {
+        \\    if (p == null) { return null; } else { work(); }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn sink() void {}
+        \\fn work() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_else_split.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_else_split.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a guarded deref with a later inline construct (EPH-I0863)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The guard's fall-through fact must survive a later same-line
+    // construct whose empty inline arm votes at its own merge: the
+    // inline arm's path runs past the guard, so it cannot violate the
+    // fact (EPH-I0863).
+    const content =
+        \\fn f(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) { return null; } else { sink(); }
+        \\    if (q) { work(); }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn sink() void {}
+        \\fn work() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_else_later.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_else_later.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent on the deref-in-else contrast shapes (EPH-I0863)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The contrast probes: a deref inside the else arm (v5/v6) runs on
+    // the non-null path and stays silent; the multi-line twin of the
+    // one-line with-else guard (v7) stays silent through the same
+    // else-merge fact flow (EPH-I0863).
+    const content =
+        \\fn v5(p: ?*u8) ?*u8 {
+        \\    if (p == null) { return null; } else { const v = p.*; return v; }
+        \\}
+        \\fn v6(p: ?*u8) ?*u8 {
+        \\    if (p == null) {
+        \\        return null;
+        \\    } else {
+        \\        const v = p.*;
+        \\        return v;
+        \\    }
+        \\}
+        \\fn v7(p: ?*u8) ?*u8 {
+        \\    if (p == null) {
+        \\        return null;
+        \\    } else {
+        \\        sink();
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn sink() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_else_contrast.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_else_contrast.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 still fires past a true-edge guard with a falling-through else (EPH-I0863)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p != null) { return null; } else { sink(); }` + deref: the
+    // else arm falls through with p == null, so the deref can panic.
+    // The empty else arm still wipes the true-edge fact at the merge
+    // (EPH-I0863).
+    const content =
+        \\fn f(p: ?*u8) ?*u8 {
+        \\    if (p != null) { return null; } else { sink(); }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn sink() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_else_trueedge.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_else_trueedge.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 still fires on a deref after a non-exit inline arm (EPH-I0863)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (r != null) { sink(); }` + deref: the inline then arm does
+    // not exit and the false path has r == null, so the deref fires.
+    // The true-edge fact is filtered on the branch_false edge before
+    // the inline arm's vote could matter (EPH-I0863).
+    const content =
+        \\fn f(r: ?*u8) ?*u8 {
+        \\    if (r != null) { sink(); }
+        \\    const v = r.*;
+        \\    return v;
+        \\}
+        \\fn sink() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_else_rine.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_else_rine.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 guard walk survives a comment brace on the guard line (EPH-I0866)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The brace-less guard line carries a `{` inside its trailing
+    // comment. The raw brace indexOf set block_closed and skipped the
+    // following-block walk, so the direct exit below never established
+    // the fall-through fact and the deref fired. The comment-masked
+    // brace check keeps the walk: the plain brace-less twin is silent
+    // (EPH-I0866).
+    const content =
+        \\fn comment_brace_direct(p: ?*u8) ?*u8 {
+        \\    if (p == null) // { comment
+        \\    return null;
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_comment_brace.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_comment_brace.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a both-arms guard with a same-line trailing statement (EPH-I0867)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) { if (q) { return null; } else { return null; } }
+    // extra();` — the trailing statement after the guard's braced body
+    // is not part of the body. The judge cuts the tail at the leading
+    // block's close and applies the both-arms verdict to the guard
+    // portion, so the deref below stays silent (EPH-I0867).
+    const content =
+        \\fn both_arms_trailing(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) { if (q) { return null; } else { return null; } } extra();
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn extra() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_trailing.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_trailing.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a both-arms guard with a trailing statement below (EPH-I0867)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The multi-line twin: the guard body holds a one-line nested
+    // both-arms conditional, and `extra();` runs below the guard. The
+    // walk's depth-1 judgment accepts the nested both-arms line, so the
+    // deref below stays silent (EPH-I0867).
+    const content =
+        \\fn both_arms_trailing_multi(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) {
+        \\        if (q) { return null; } else { return null; }
+        \\    }
+        \\    extra();
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+        \\fn extra() void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_trailing_ml.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_trailing_ml.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 silent past a one-line nested both-arms inside a multi-line guard (EPH-I0868)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (p == null) {` + `if (q) { return null; } else { return
+    // null; }` + `}` + deref: the walk's depth-1 judgment accepts the
+    // one-line nested both-arms line (both arms exit, so the guard body
+    // cannot fall through on null) and the deref below stays silent —
+    // the walk extension the gap comment now names (EPH-I0868).
+    const content =
+        \\fn nested_both_arms(p: ?*u8, q: bool) ?*u8 {
+        \\    if (p == null) {
+        \\        if (q) { return null; } else { return null; }
+        \\    }
+        \\    const v = p.*;
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_nested_both_ml.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_nested_both_ml.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
 test "analyzeCFGMemory ZA802 silent past a same-line unbraced-then both-arms guard (EPH-I0861)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -41481,6 +41987,44 @@ test "analyzeCFGMemory ZA801 silent after early-return null guard (EPH-I0220)" {
         "test_za801_early_return.zig",
         RULE_OPTIONAL_UNWRAP_UNSAFE,
     ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 same-line exits judged at the guard's depth (EPH-I0865)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The hasEarlyReturnNullGuard same-line exit is judged at the
+    // guard's own depth: a nested same-line conditional exit
+    // (`{ if (q) return 0; }`) does not dominate the fall-through, so
+    // the unwrap after it fires; the direct and braced exits keep their
+    // suppression (EPH-I0865).
+    const content =
+        \\fn unwrap_nested(p: ?u32, q: bool) u32 {
+        \\    if (p == null) { if (q) return 0; }
+        \\    return p.? + 1;
+        \\}
+        \\fn unwrap_direct(p: ?u32) u32 {
+        \\    if (p == null) return 0;
+        \\    return p.? + 1;
+        \\}
+        \\fn unwrap_braced(p: ?u32) u32 {
+        \\    if (p == null) { return 0; }
+        \\    return p.? + 1;
+        \\}
+        \\fn unwrap_both(p: ?u32, q: bool) u32 {
+        \\    if (p == null) { if (q) { return 0; } else { return 0; } }
+        \\    return p.? + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_depth_judge.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_za801_depth_judge.zig", RULE_OPTIONAL_UNWRAP_UNSAFE),
+    );
 }
 
 test "analyzeCFGMemory ZA801 silent inside payload-capture guard (EPH-I0220)" {
@@ -59229,6 +59773,85 @@ test "ZA203 orelse unreachable fires via analyzeErrors" {
     try std.testing.expect(found);
 }
 
+test "analyzeErrors ZA203 silent on the guarded same-line idioms (EPH-I0864)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The line-based ZA203 emitter routes through the same null-guard
+    // verdict the CFG tier uses: the direct, braced, and same-line
+    // nested both-arms guard shapes keep `orelse unreachable` silent
+    // (EPH-I0864).
+    const test_content =
+        \\fn tier_direct(p: ?*u8) u8 {
+        \\    if (p == null) return 0;
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+        \\fn tier_braced(p: ?*u8) u8 {
+        \\    if (p == null) { return 0; }
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+        \\fn za203_both_same(p: ?*u8, q: bool) u8 {
+        \\    if (p == null) { if (q) { return 0; } else { return 0; } }
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+    ;
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "test_za203_guarded.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za203_guarded.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(issues.items, "test_za203_guarded.zig", RULE_ORELSE_UNREACHABLE),
+    );
+}
+
+test "analyzeErrors ZA203 still fires on the unguarded and nested-exit shapes (EPH-I0864)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // An unguarded `orelse unreachable` and a guard whose same-line exit
+    // sits inside a nested conditional (q-false falls through on null)
+    // keep firing in the line-based tier (EPH-I0864).
+    const test_content =
+        \\fn tier_nested(p: ?*u8, q: bool) u8 {
+        \\    if (p == null) { if (q) return 0; }
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+        \\fn unguarded(p: ?*u8) u8 {
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+    ;
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "test_za203_unguarded.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za203_unguarded.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(issues.items, "test_za203_unguarded.zig", RULE_ORELSE_UNREACHABLE),
+    );
+}
+
 // ============================================================================
 // ZA207 Tests — catch undefined
 // ============================================================================
@@ -62863,6 +63486,87 @@ test "ZA901: guarded unspaced decrement stays silent" {
         "test_za901_guarded.zig",
         RULE_DECREMENT_WITHOUT_CHECK,
     ) == 0);
+}
+
+test "ZA901: zero-check same-line exits judged at the guard's depth (EPH-I0865)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The isZeroCheckGuard same-line exit is judged at the guard's own
+    // depth: a nested same-line conditional exit (`{ if (q) return 0; }`)
+    // does not dominate the fall-through, so the decrement below fires
+    // (the sink padding pushes the function's own return past the walk
+    // window, so no later line rescues the guard); the direct zero-check
+    // exit keeps its suppression (EPH-I0865).
+    const content =
+        \\fn dec_nested(n: usize, q: bool) usize {
+        \\    var m = n;
+        \\    if (m == 0) { if (q) return 0; }
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn dec_direct(n: usize) usize {
+        \\    var m = n;
+        \\    if (m == 0) return 0;
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    sink(m);
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_zero_judge.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_zero_judge.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "isZeroCheckGuard same-line exits judged at the guard's depth (EPH-I0865)" {
+    const lines = [_][]const u8{
+        "fn f(n: usize, q: bool) usize {",
+        "    var m = n;",
+        "    if (m == 0) { if (q) return 0; }",
+        "    m -= 1;",
+        "    return m;",
+        "}",
+    };
+    // A nested same-line conditional exit does not dominate the
+    // fall-through: rejected (EPH-I0865).
+    try std.testing.expect(!isZeroCheckGuard(.{
+        .t = "    if (m == 0) { if (q) return 0; }",
+        .var_name = "m",
+        .lines = &lines,
+        .line_idx = 2,
+        .current_idx = 4,
+    }));
+    // The direct same-line exit dominates: accepted (EPH-I0865).
+    try std.testing.expect(isZeroCheckGuard(.{
+        .t = "    if (m == 0) return 0;",
+        .var_name = "m",
+        .lines = &lines,
+        .line_idx = 2,
+        .current_idx = 4,
+    }));
 }
 
 test "ZA901: boolean-assignment guard shape does not suppress (EPH-I0486)" {

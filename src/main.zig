@@ -20053,18 +20053,94 @@ fn isValidConstName(t: []const u8, name: []const u8) bool {
     return isSnakeCase(name) or isTitleCase(name) or isScreamingCase(name);
 }
 
+/// Decode the declaration name at `after_kw` (skipping whitespace): a plain
+/// identifier, or the inner name of a `@"..."` quoted identifier. The
+/// quoted form is a legal spelling of the same identifier, so the
+/// convention checks the inner text (EPH-I0467). Returns the name, the
+/// index just past it (via `name_end`), and its 1-based column (via
+/// `col`). Null when no name follows the keyword, or when the quoted
+/// inner text is not itself spellable as an identifier — a quoted name
+/// with no unquoted spelling (`@"*i32"`, `@"active-surface"`, `@"error"`)
+/// has no spelling convention to enforce (documented exemption,
+/// EPH-I0467).
+fn declNameAt(
+    t: []const u8,
+    after_kw: usize,
+    name_end: *usize,
+    col: *usize,
+) ?[]const u8 {
+    var name_start = after_kw;
+    while (name_start < t.len and (t[name_start] == ' ' or t[name_start] == '\t')) name_start += 1;
+    if (name_start >= t.len) return null;
+    col.* = name_start + 1;
+    if (t[name_start] != '@') {
+        var end = name_start;
+        while (end < t.len and isIdent(t[end])) end += 1;
+        if (end <= name_start) return null;
+        name_end.* = end;
+        return t[name_start..end];
+    }
+    const open_quote = name_start + 1;
+    if (open_quote >= t.len or t[open_quote] != '"') return null;
+    const after_quote = skipQuotedIdent(t, open_quote + 1);
+    if (after_quote <= open_quote + 1 or t[after_quote - 1] != '"') return null;
+    const name = t[open_quote + 1 .. after_quote - 1];
+    if (name.len == 0) return null;
+    for (name) |c| {
+        if (!isIdent(c)) return null;
+    }
+    for (zig_keywords) |kw| {
+        if (mem.eql(u8, name, kw)) return null;
+    }
+    name_end.* = after_quote;
+    return name;
+}
+
+/// Zig keywords: none can be spelled as an unquoted identifier, so a
+/// quoted name whose inner text is a keyword has no unquoted spelling.
+const zig_keywords = [_][]const u8{
+    "addrspace", "align",       "allowzero",   "and",            "anyframe", "anytype",  "asm",
+    "async",     "await",       "break",       "callconv",       "catch",    "comptime", "const",
+    "continue",  "defer",       "else",        "enum",           "errdefer", "error",    "export",
+    "extern",    "fn",          "for",         "if",             "inline",   "noalias",  "noinline",
+    "nosuspend", "opaque",      "or",          "orelse",         "packed",   "pub",      "resume",
+    "return",    "linksection", "struct",      "suspend",        "switch",   "test",     "threadlocal",
+    "try",       "union",       "unreachable", "usingnamespace", "var",      "volatile", "while",
+};
+
+/// True when the `const` at `pos` is a pointer/slice type modifier, not a
+/// declaration: the preceding non-whitespace byte is `*`, `]`, or `)`
+/// (`*const T`, `[*c]const T`, `[]const T`, `[*]const T`, `*align(4)
+/// const T`). Those bytes are not ident bytes, so the token boundary
+/// check admits them. A declaration never follows `*`/`]`/`)` — it
+/// follows line start, a prefix keyword (`pub`, `threadlocal`), `{`,
+/// `;`, or `}` (EPH-I0886).
+fn isConstTypeModifier(t: []const u8, pos: usize) bool {
+    var i = pos;
+    while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) i -= 1;
+    if (i == 0) return false;
+    const prev = t[i - 1];
+    return prev == '*' or prev == ']' or prev == ')';
+}
+
 fn checkConstNaming(
     ctx: NamingLineCtx,
     content: []const u8,
     t_start: usize,
 ) !void {
     const t = ctx.t;
-    const plen: usize = if (mem.startsWith(u8, t, "pub const ")) 10 else 6;
-    var end = plen;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    if (end <= plen) return;
-    const name = t[plen..end];
-    if (name.len > 0 and name[0] == '_') return;
+    // Extern constant names are ABI-fixed and can never conform (same rule
+    // as the extern-fn exemption in checkFnNaming).
+    if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
+    const kw_pos = realTokenPos(t, "const") orelse return;
+    // The whole-line gate also matches the `const` type modifier in
+    // bindgen signatures; reject modifier position before reading the
+    // name as a declaration (EPH-I0886).
+    if (isConstTypeModifier(t, kw_pos)) return;
+    var name_end: usize = undefined;
+    var name_col: usize = undefined;
+    const name = declNameAt(t, kw_pos + "const".len, &name_end, &name_col) orelse return;
+    if (name[0] == '_') return;
 
     // Cheap line-only classification first. The multi-line closure check is
     // expensive (byte-scans the full type body), so only run it on lines that
@@ -20075,7 +20151,7 @@ fn checkConstNaming(
         // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
         if (isClosureFunctionAlias(t, content, t_start) and isCamelCase(name)) return;
         if (isClosureFunctionAlias(t, content, t_start)) try reportNaming(ctx, .{
-            .col = plen + 1,
+            .col = name_col,
             .kind = "function",
             .name = name,
             .expected = "camelCase",
@@ -20084,7 +20160,7 @@ fn checkConstNaming(
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
             .line = ctx.line_num,
-            .col = plen + 1,
+            .col = name_col,
             .kind = "type",
             .name = name,
             .expected = "TitleCase",
@@ -20095,7 +20171,7 @@ fn checkConstNaming(
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
             .line = ctx.line_num,
-            .col = plen + 1,
+            .col = name_col,
             .kind = "constant",
             .name = name,
             .expected = "snake_case",
@@ -20104,17 +20180,19 @@ fn checkConstNaming(
 
 fn checkVarNaming(ctx: NamingLineCtx) !void {
     const t = ctx.t;
-    const prefix: usize = if (mem.startsWith(u8, t, "pub var ")) 8 else 4;
-    var end = prefix;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    if (end <= prefix) return;
-    const name = t[prefix..end];
-    if (name.len > 0 and name[0] == '_') return;
+    // Extern variable names are ABI-fixed and can never conform (same rule
+    // as the extern-fn exemption in checkFnNaming).
+    if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
+    const kw_pos = realTokenPos(t, "var") orelse return;
+    var name_end: usize = undefined;
+    var name_col: usize = undefined;
+    const name = declNameAt(t, kw_pos + "var".len, &name_end, &name_col) orelse return;
+    if (name[0] == '_') return;
     if (!isSnakeCase(name)) {
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
             .line = ctx.line_num,
-            .col = prefix + 1,
+            .col = name_col,
             .kind = "variable",
             .name = name,
             .expected = "snake_case",
@@ -20124,9 +20202,14 @@ fn checkVarNaming(ctx: NamingLineCtx) !void {
 
 /// Check if a function's return type is literally `type` (or `!type`).
 /// Uses paren balancing to find the closing `)` of the param list,
-/// then checks the return type token that follows.
+/// then checks the return type token that follows. The paren walk is
+/// literal-masked: parens inside string-literal default values, char
+/// literals, and comments are data, not syntax, so they cannot desync
+/// the balance (EPH-I0465).
 fn fnReturnsType(t: []const u8, after_name: usize) bool {
-    // Find opening paren of param list
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    // Find opening paren of param list. Grammar: no literal can sit between
+    // the name and the param list, so the first `(` after it is the open.
     var i = after_name;
     while (i < t.len and t[i] != '(') : (i += 1) {}
     if (i >= t.len) return false;
@@ -20135,6 +20218,7 @@ fn fnReturnsType(t: []const u8, after_name: usize) bool {
     var depth: usize = 1;
     i += 1;
     while (i < t.len and depth > 0) : (i += 1) {
+        if (lit.updateForChar(t, i) == null) continue;
         if (t[i] == '(') depth += 1;
         if (t[i] == ')') depth -= 1;
     }
@@ -20171,17 +20255,16 @@ fn checkFnNaming(ctx: NamingLineCtx) !void {
     // `fn ` inside a string literal is data (fixture text), not a declaration.
     if (isInsideString(t, fn_pos)) return;
     const start = fn_pos + 3;
-    var end = start;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    if (end <= start) return;
-    const name = t[start..end];
+    var name_end = start;
+    var name_col: usize = start + 1;
+    const name = declNameAt(t, start, &name_end, &name_col) orelse return;
     if (name.len > 0 and name[0] == '_') return;
-    const returns_type = fnReturnsType(t, end);
+    const returns_type = fnReturnsType(t, name_end);
     if (returns_type and !isTitleCase(name)) {
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
             .line = ctx.line_num,
-            .col = start + 1,
+            .col = name_col,
             .kind = "type-returning fn",
             .name = name,
             .expected = "TitleCase",
@@ -20190,7 +20273,7 @@ fn checkFnNaming(ctx: NamingLineCtx) !void {
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
             .line = ctx.line_num,
-            .col = start + 1,
+            .col = name_col,
             .kind = "function",
             .name = name,
             .expected = "camelCase",
@@ -20451,9 +20534,13 @@ fn analyzeNamingFile(
         const in_error_block = error_block_depth > 0 or has_error_open;
 
         if (!is_trivia) {
-            if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "pub const "))
+            // Whole-line search with ident boundaries (realTokenPos): a
+            // declaration after a prefix (`pub`, `threadlocal`), in a
+            // one-line block, or behind non-canonical spacing is still a
+            // declaration (EPH-I0466/68/69).
+            if (realTokenPos(t, "const") != null)
                 try checkConstNaming(naming_ctx, content, t_start);
-            if (mem.startsWith(u8, t, "var ") or mem.startsWith(u8, t, "pub var "))
+            if (realTokenPos(t, "var") != null)
                 try checkVarNaming(naming_ctx);
             if (mem.indexOf(u8, t, "fn ") != null)
                 try checkFnNaming(naming_ctx);
@@ -21248,17 +21335,16 @@ fn lineHasNoreturnMarker(t: []const u8) bool {
 /// Detect function start and initialize state
 /// Returns true if a nested function was detected (caller should process current func first)
 fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
-    if (mem.indexOf(u8, t, "fn ") == null) return false;
+    const fn_pos = mem.indexOf(u8, t, "fn ") orelse return false;
 
-    // Check if fn is inside a string or comment (basic check)
-    const fn_pos = mem.indexOf(u8, t, "fn ").?;
     if (fn_pos > 0) {
-        // Check for common non-function patterns
-        const before = t[0..fn_pos];
-        if (mem.indexOf(u8, before, "\"") != null) return false; // In string
-        if (mem.lastIndexOf(u8, before, "//")) |cp| {
-            if (cp < fn_pos) return false; // After comment start
-        }
+        // An OPEN string literal at fn_pos makes `fn ` data (fixture text);
+        // a CLOSED string before it must not hide the declaration (EPH-I0471).
+        if (isInsideString(t, fn_pos)) return false;
+        // Comment text is prose, not a declaration. findCommentStart is
+        // string-aware, so a `//` inside a closed string cannot hide the fn.
+        const comment_start = findCommentStart(t) orelse t.len;
+        if (fn_pos >= comment_start) return false;
     }
 
     const name_start = fn_pos + 3;
@@ -21355,13 +21441,22 @@ fn scanCFGSignatureLine(t: []const u8, state: *CFGState) usize {
     return t.len;
 }
 
-/// True when the `{` at index i opens an error set (`error{...}`) rather
-/// than a function body. Same-line lookback only: an `error` keyword split
-/// from its `{` across lines (Allman error set) is not recognized.
+/// True when the `{` at index i opens an error set (`error {...}`) rather
+/// than a function body. Whitespace between `error` and `{` is tolerated;
+/// that is the parity with the naming-side twin matchesErrorSetOpen
+/// (EPH-I0470). A left boundary guard mirrors the twin: an identifier
+/// byte before `error` rejects the match, so `myerror {` is a return
+/// type, not the keyword. Same-line lookback only: an `error` keyword
+/// split from its `{` across lines (Allman error set) is not recognized.
 fn isErrorSetOpen(t: []const u8, i: usize) bool {
     const error_keyword_len = "error".len;
-    return i >= error_keyword_len and
-        mem.eql(u8, t[i - error_keyword_len .. i], "error");
+    var j = i;
+    while (j > 0 and (t[j - 1] == ' ' or t[j - 1] == '\t')) j -= 1;
+    if (j < error_keyword_len) return false;
+    // Reject a left identifier byte: `myerror {` is a return type, not an
+    // error-set keyword (EPH-I0885). Mirrors matchesErrorSetOpen.
+    if (j > error_keyword_len and isIdent(t[j - error_keyword_len - 1])) return false;
+    return mem.eql(u8, t[j - error_keyword_len .. j], "error");
 }
 
 /// Convert definite assignment issues to ZA607 warnings
@@ -43707,6 +43802,15 @@ test "lineCommentStart ignores comment text in a multiline opener tail (EPH-I067
     try std.testing.expectEqual(@as(usize, 16), lineCommentStart("const c = '\\\\'; // r"));
 }
 
+test "lineCommentStart finds a real comment after a char literal with a quote (EPH-I0464)" {
+    // The `"` inside `'"'` is character data, not a string opener: the
+    // trailing `//` is a real comment, not string content.
+    try std.testing.expectEqual(
+        @as(usize, 15),
+        lineCommentStart("const q = '\"'; // error.badName"),
+    );
+}
+
 test "blankLiteralContents blanks a mid-line multiline opener tail (EPH-I0671)" {
     var buf: [64]u8 = undefined;
     // Target text: const s = \\ if (x) { }
@@ -44794,6 +44898,20 @@ test "trackErrorBlockDepth ignores a backslash pair inside a char literal (EPH-I
     try std.testing.expectEqual(@as(usize, 0), depth);
 }
 
+test "lineOpensErrorBlock sees an error set after a char literal with a quote (EPH-I0464)" {
+    // The `"` inside `'"'` is character data, not a string opener: the
+    // `error{` that follows it is real syntax, not string content.
+    try std.testing.expect(lineOpensErrorBlock("const q = '\"'; const E = error{Real};"));
+}
+
+test "trackErrorBlockDepth counts an error set after a char literal with a quote (EPH-I0464)" {
+    // Same shape as above for the depth tracker: the set stays open at the
+    // end of the line.
+    var depth: usize = 0;
+    trackErrorBlockDepth("const q = '\"'; const E = error{ Real,", &depth);
+    try std.testing.expectEqual(@as(usize, 1), depth);
+}
+
 test "nextCallSite ignores call-shaped text in a multiline opener tail (EPH-I0751)" {
     // Target text: const s = \\ foo() — the tail call is string data.
     try std.testing.expect(nextCallSite("const s = \\\\ foo()", 0) == null);
@@ -44826,6 +44944,62 @@ test "buildCFG: Allman if brace on next line pops correctly" {
     try std.testing.expect(if_block != null);
     try std.testing.expect(after != null);
     try std.testing.expect(if_block.? != after.?);
+}
+
+test "isErrorSetOpen accepts whitespace before the brace (EPH-I0470)" {
+    // `error { A }` is valid Zig: the brace at index 6 opens the set, not
+    // the function body.
+    try std.testing.expect(isErrorSetOpen("error { A }", 6));
+    // The adjacent form keeps working.
+    try std.testing.expect(isErrorSetOpen("error{A}", 5));
+    // A plain body brace is not an error-set open.
+    try std.testing.expect(!isErrorSetOpen("fn f() {", 7));
+    // `!error{...}` keeps working: `!` is not an identifier byte.
+    try std.testing.expect(isErrorSetOpen("!error{", 6));
+    // A spaced error set in a signature keeps working; the body brace
+    // opens later (EPH-I0470).
+    try std.testing.expect(isErrorSetOpen("fn f() error {", 13));
+    // `myerror {` is a return type: the brace opens the body, not an
+    // error set (EPH-I0885). The spaced form is the regression shape.
+    try std.testing.expect(!isErrorSetOpen("fn f() myerror {", 15));
+    // The adjacent `myerror{` shape is rejected the same way (EPH-I0885).
+    try std.testing.expect(!isErrorSetOpen("myerror{", 7));
+}
+
+test "scanCFGSignatureLine: spaced error set is not the body brace (EPH-I0470)" {
+    // The `{` of `error { OutOfMemory }` must count as a signature
+    // container; the body opens only at the real `{` after the return type.
+    var state = CFGState{};
+    const pos = scanCFGSignatureLine("fn f() error { OutOfMemory } void {", &state);
+    try std.testing.expect(state.body_started);
+    try std.testing.expectEqual(@as(usize, 1), state.brace_depth);
+    try std.testing.expectEqual(@as(usize, 0), state.sig_container_depth);
+    try std.testing.expectEqual(@as(usize, 35), pos);
+}
+
+test "detectCFGFuncStart: a closed string before fn does not hide it (EPH-I0471)" {
+    var state = CFGState{};
+    // The return value reports a NESTED fn; the detection itself shows in
+    // the state.
+    const was_in_func = detectCFGFuncStart("const s = \"x\"; fn real() void {", &state, 1);
+    try std.testing.expect(!was_in_func);
+    try std.testing.expect(state.in_func);
+    try std.testing.expectEqualStrings("real", state.func_name);
+}
+
+test "detectCFGFuncStart: an open string at fn_pos still rejects (EPH-I0471)" {
+    var state = CFGState{};
+    try std.testing.expect(!detectCFGFuncStart("const s = \"fn fake() void {", &state, 1));
+    try std.testing.expect(!state.in_func);
+}
+
+test "detectCFGFuncStart: a string containing // does not hide fn (EPH-I0471)" {
+    // The `//` is string data, not a comment start: the fn after the closed
+    // string is a real declaration.
+    var state = CFGState{};
+    _ = detectCFGFuncStart("const s = \"//\"; fn real() void {", &state, 1);
+    try std.testing.expect(state.in_func);
+    try std.testing.expectEqualStrings("real", state.func_name);
 }
 
 test "buildCFG: multi-line condition brace claims pending opener" {
@@ -55253,6 +55427,20 @@ test "fnReturnsType rejects type-prefixed identifiers" {
     try std.testing.expect(!fnReturnsType("fn foo() typedef {", 6));
 }
 
+test "fnReturnsType ignores parens inside string-literal defaults (EPH-I0465)" {
+    // The `)` and `(` inside the default value are string data: the balance
+    // must close on the real param-list `)`, so the `type` return is seen
+    // and the factory is not misreported as a plain fn.
+    try std.testing.expect(fnReturnsType("fn Make(a: []const u8 = \")\") type {", 7));
+    try std.testing.expect(fnReturnsType("fn Make2(a: []const u8 = \"(\") type {", 8));
+}
+
+test "fnReturnsType ignores parens inside a comment (EPH-I0465)" {
+    // The `)` and `type` in the comment are prose: without masking they
+    // close the balance early and fake a `type` return.
+    try std.testing.expect(!fnReturnsType("fn Make(a: u32, // ) type", 7));
+}
+
 test "checkVarNaming: fn-valued vars are still snake_case (declaration kind rules)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -55299,6 +55487,214 @@ test "checkVarNaming: non-snake_case var is flagged" {
     try std.testing.expectEqualStrings(
         "variable 'myBadVar' should be snake_case",
         issues.items[0].message,
+    );
+}
+
+test "isConstTypeModifier: pointer and slice const forms are modifiers (EPH-I0886)" {
+    // Every real `const` type-modifier form has `*`, `]`, or `)` (modulo
+    // whitespace) directly before it; declaration-position consts never do.
+    const modifier_lines = [_][]const u8{
+        "arg_p: [*c]const Some_Type,",
+        "fn_ptr: *const Some_Type,",
+        "slice: []const Some_Type,",
+        "many: [*][*c]const Some_Type,",
+        "aligned: *align(4) const Some_Type,",
+        "spaced: [*c] const Some_Type,",
+    };
+    for (modifier_lines) |line| {
+        const pos = mem.indexOf(u8, line, "const").?;
+        try std.testing.expect(isConstTypeModifier(line, pos));
+    }
+    const declaration_lines = [_][]const u8{
+        "pub const badName = 1;",
+        "const good_name = 1;",
+        "{ const midBad = 1; }",
+        "threadlocal const tName = 1;",
+    };
+    for (declaration_lines) |line| {
+        const pos = mem.indexOf(u8, line, "const").?;
+        try std.testing.expect(!isConstTypeModifier(line, pos));
+    }
+}
+
+test "analyzeNaming: bindgen const type modifiers stay silent (EPH-I0886)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Bindgen output shape: `[*c]const` / `*const` modifiers inside fn
+    // params and struct fields. The widened whole-line gate (EPH-I0466/
+    // 68/69) matched the modifier and read the machine-cased TYPE NAME as
+    // a declaration name; only the real `const badName` declaration fires.
+    const code =
+        \\pub fn bindgenPtrAdd(arg_p: [*c]const Some_Type, x: u8) void {
+        \\    _ = arg_p;
+        \\    _ = x;
+        \\}
+        \\const Foo = struct {
+        \\    ptr: [*c]const Some_Type,
+        \\    fn_ptr: *const Some_Type,
+        \\};
+        \\const badName = 1;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_bindgen.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_bindgen.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: threadlocal var forms are checked (EPH-I0466)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const code =
+        \\threadlocal var badName: u32 = 0;
+        \\pub threadlocal var good_name: u32 = 0;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_threadlocal.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_threadlocal.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    // The threadlocal keyword must not hide the var from the gate: only the
+    // non-snake name fires, the conforming one stays silent.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "variable 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: one-line-block decls are checked (EPH-I0468)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const code =
+        \\fn oneLine() void {
+        \\    { var midBad: u32 = 0; }
+        \\    { const midBadConst = 1; }
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_oneline.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_oneline.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "variable 'midBad' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "constant 'midBadConst' should be snake_case",
+        issues.items[1].message,
+    );
+}
+
+test "analyzeNaming: non-canonical pub spacing is checked (EPH-I0469)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // `pub  const` / `pub  var` (double space) is pre-fmt input: the name
+    // after the keyword is still a declaration.
+    const code =
+        \\pub  const badName = 1;
+        \\pub  var badVar: u32 = 0;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_spaced.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_spaced.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "variable 'badVar' should be snake_case",
+        issues.items[1].message,
+    );
+}
+
+test "analyzeNaming: quoted identifiers are checked as their inner name (EPH-I0467)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    const code =
+        \\fn @"quoted_bad"() void {}
+        \\const @"quotedBadConst" = 1;
+        \\var @"quotedBadVar": u32 = 0;
+        \\fn @"goodName"() void {}
+        \\const @"good_const" = 1;
+        \\var @"good_var": u32 = 0;
+        \\const @"*i32" = 4;
+        \\const @"active-surface" = 1;
+        \\pub const @"error" = struct {};
+        \\extern const kTISPropertyLocalizedName: *CFString;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_quoted.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_quoted.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    // The quoted form is a legal spelling of the same identifier, so the
+    // convention checks the inner text; conforming inner names stay silent.
+    // Quoted names with no unquoted spelling (`@"*i32"`, `@"active-surface"`,
+    // `@"error"`) have no convention to enforce, and extern consts are
+    // ABI-fixed — the documented exemptions (EPH-I0467).
+    try std.testing.expectEqual(@as(usize, 3), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "function 'quoted_bad' should be camelCase",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "constant 'quotedBadConst' should be snake_case",
+        issues.items[1].message,
+    );
+    try std.testing.expectEqualStrings(
+        "variable 'quotedBadVar' should be snake_case",
+        issues.items[2].message,
     );
 }
 
@@ -56111,6 +56507,27 @@ test "checkErrorNaming: does not flag error. in a trailing line comment" {
         "error value 'real_bad' should be TitleCase",
         issues.items[0].message,
     );
+}
+
+test "checkErrorNaming: comment after a char-literal quote is prose (EPH-I0464)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // The `"` inside `'"'` is character data: the scanner must not treat the
+    // trailing comment as string content (it flagged the prose error name).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "const q = '\"'; // error.badName",
+        .line_num = 1,
+        .error_naming = .title_case,
+    }, false);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 test "resolveReturnKind resolves struct method returns" {

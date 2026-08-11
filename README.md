@@ -376,7 +376,7 @@ with existing inline-ignores, and is reported under the Memory category in
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA701** | warning | ON | Line exceeds max length (default: 100 columns; lines over-length solely due to unbreakable string-literal content are exempt) |
+| **ZA701** | warning | ON | Line exceeds max length (default: 100 characters; lines over-length solely due to unbreakable string-literal content are exempt) |
 | **ZA702** | warning | OFF | File exceeds max size (requires `--enable=ZA702` or config `enable`; threshold via `max_file_bytes`, default 50000) |
 | **ZA703** | warning | ON | Naming convention violation (see naming rules below) |
 
@@ -614,7 +614,7 @@ Options:
   --max-nesting=N      Max nesting depth (default: 3)
   --max-params=N       Max parameters (default: 4)
   --max-branches=N     Max branches per function (default: 12)
-  --max-line-length=N  Max columns per line (default: 100)
+  --max-line-length=N  Max characters per line (default: 100)
   --max-file-bytes=N   Max file size in bytes (requires --enable=ZA702)
   -y, --yes            Skip interactive confirmation (e.g., runtime approval)
   --version=<X.Y.Z>   For install/upgrade: pin a specific version

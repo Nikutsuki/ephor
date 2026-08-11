@@ -18953,14 +18953,20 @@ fn hasElseBranch(t: []const u8) bool {
     return hasToken(t, "else");
 }
 
-/// Count switch arms (`=>`) on a line, skipping matches inside string literals.
+/// Count switch arms (`=>`) on a line, skipping matches inside string
+/// literals and trailing comments (EPH-I0017: hasToken is comment-masked,
+/// countSwitchArms was the leftover — `foo(); // a => b` counted a phantom
+/// arm in ZA304/305/306).
 fn countSwitchArms(t: []const u8) usize {
     var count: usize = 0;
-    // One classifier walk per line (EPH-I0153): candidates ascend.
+    // One classifier walk plus one comment-start walk per line (EPH-I0153):
+    // candidates ascend, so the comment clamp is a break, not a continue.
     var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
     var i: usize = 0;
     while (i + 1 < t.len) {
         const arrow_pos = mem.indexOfPos(u8, t, i, "=>") orelse break;
+        if (comment_start != null and arrow_pos >= comment_start.?) break;
         if (!cls.isInsideString(arrow_pos)) count += 1;
         i = arrow_pos + 2;
     }
@@ -19776,15 +19782,68 @@ fn analyzeAstTier(
 // Style Analysis Helpers
 // ============================================================================
 
-/// Calculate visible line length (tabs expand to 4-space boundaries)
+/// Byte length of the unicode sequence starting at `bytes[i]`, or 1 for an
+/// ASCII char and for a malformed/continuation byte. Valid sequences
+/// collapse to one codepoint; malformed bytes stay byte-counted so garbage
+/// never under-reports (EPH-I0248). A cluster counts only when the line
+/// carries every continuation byte (each in 0x80-0xBF) and the first one
+/// respects the overlong/surrogate sub-ranges (firstContinuationValid).
+fn utf8SeqLen(bytes: []const u8, i: usize) usize {
+    const c = bytes[i];
+    if (c < 0x80) return 1;
+    const seq_len: usize = switch (c) {
+        0xC2...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF4 => 4,
+        else => return 1,
+    };
+    if (i + seq_len > bytes.len) return 1;
+    if (!firstContinuationValid(c, bytes[i + 1])) return 1;
+    var j: usize = i + 1;
+    while (j < i + seq_len) : (j += 1) {
+        if (!isContinuationByte(bytes[j])) return 1;
+    }
+    return seq_len;
+}
+
+/// The first continuation byte of `c` must exclude overlong encodings and
+/// surrogate code points: 0xE0 needs >= 0xA0, 0xED <= 0x9F, 0xF0 >= 0x90,
+/// 0xF4 <= 0x8F (EPH-I0248).
+fn firstContinuationValid(c: u8, first: u8) bool {
+    return switch (c) {
+        0xE0 => first >= 0xA0 and first <= 0xBF,
+        0xED => first >= 0x80 and first <= 0x9F,
+        0xF0 => first >= 0x90 and first <= 0xBF,
+        0xF4 => first >= 0x80 and first <= 0x8F,
+        else => isContinuationByte(first),
+    };
+}
+
+/// True when `b` is a continuation byte (0x80-0xBF).
+fn isContinuationByte(b: u8) bool {
+    return b >= 0x80 and b <= 0xBF;
+}
+
+/// Calculate visible line length (tabs expand to 4-space boundaries). Each
+/// codepoint counts one column: a 40-char CJK comment is 40 columns,
+/// not 123 bytes (EPH-I0248). No East-Asian width table — every codepoint
+/// costs 1 regardless of glyph width.
 fn calculateVisibleLength(line: []const u8) usize {
     var visible_len: usize = 0;
-    for (line) |c| {
+    var i: usize = 0;
+    while (i < line.len) {
+        const c = line[i];
         if (c == '\t') {
             visible_len = ((visible_len / 4) + 1) * 4;
-        } else if (c != '\r') {
-            visible_len += 1;
+            i += 1;
+            continue;
         }
+        if (c == '\r') {
+            i += 1;
+            continue;
+        }
+        visible_len += 1;
+        i += utf8SeqLen(line, i);
     }
     return visible_len;
 }
@@ -19822,31 +19881,42 @@ fn stringLiteralEnd(line: []const u8, i: usize) usize {
 /// Visible length when string-literal CONTENT is excluded (only the two quote
 /// characters count). Unbreakable opaque tokens (ENRs, hashes, enodes) have no
 /// meaningful break point, so a line over-length solely due to one is exempt.
+/// Codepoint counting matches calculateVisibleLength (EPH-I0248): one
+/// unicode sequence per column.
 fn visibleLengthExcludingStrings(line: []const u8) usize {
     var visible_len: usize = 0;
     var i: usize = 0;
-    while (i < line.len) : (i += 1) {
+    while (i < line.len) {
         const c = line[i];
         if (c == '\t') {
             visible_len = ((visible_len / 4) + 1) * 4;
+            i += 1;
             continue;
         }
-        if (c == '\r') continue;
+        if (c == '\r') {
+            i += 1;
+            continue;
+        }
         // Char literals are code, not string data — skip their span so a
         // '"' inside one ('"') is not mistaken for a string opener.
         if (c == '\'') {
             const n = charLiteralSpan(line, i) orelse 1;
+            // Matched spans are ASCII by the matcher's shape ('\u{...}'
+            // escapes, single chars), so the byte length IS the codepoint
+            // count here.
             visible_len += n;
-            i += n - 1;
+            i += n;
             continue;
         }
         if (c != '"' or (i > 0 and line[i - 1] == '\\')) {
             visible_len += 1;
+            i += utf8SeqLen(line, i);
             continue;
         }
         visible_len += 1;
         i = stringLiteralEnd(line, i);
         if (i < line.len) visible_len += 1;
+        i += 1;
     }
     return visible_len;
 }
@@ -19880,7 +19950,7 @@ fn reportLineTooLong(
 ) !void {
     const msg = try std.fmt.allocPrint(
         ctx.allocator,
-        "line has {d} columns (max {d})",
+        "line has {d} characters (max {d})",
         .{ visible_len, max_len },
     );
     errdefer ctx.allocator.free(msg);
@@ -20292,7 +20362,9 @@ fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
 
 /// Scan one line's `error.Name` value references, reporting names that
 /// violate the configured convention. Std-lib and `_`-prefixed names are
-/// exempt by convention.
+/// exempt by convention: a reference to `error.FileNotFound` names the
+/// std error, which project code cannot rename (EPH-I0473 — declared
+/// members carry no such exemption; see checkErrorSetMemberNames).
 fn checkErrorValueNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Trailing-comment text is prose, not a reference (same rule as strings).
@@ -20383,8 +20455,13 @@ fn skipErrorSetTrivia(t: []const u8, start: usize, depth: *usize) ?usize {
 }
 
 /// Check error set members on this line against the configured convention
-/// (caller guarantees the line is inside an error block). Std-lib and
-/// `_`-prefixed names are exempt.
+/// (caller guarantees the line is inside an error block). `_`-prefixed
+/// names are exempt; std-lib names are NOT — a project DECLARES its own
+/// members, so it can rename a member that collides with a std name
+/// (EPH-I0473). The std exemption is for references only (checkErrorValueNames):
+/// `error.FileNotFound` names the std error, which project code cannot
+/// rename. In title_case mode std names conform anyway, so this only
+/// changes snake_case-mode reporting.
 fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     var i: usize = errorSetBodyStart(t);
@@ -20402,7 +20479,10 @@ fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
             continue;
         }
         const name = t[member_start..end];
-        if (name[0] == '_' or isStdErrorName(name)) {
+        // Declared members carry no std-name exemption (EPH-I0473): the
+        // project owns the name and can rename it. `_`-prefixed names stay
+        // exempt by convention.
+        if (name[0] == '_') {
             i = skipOptionalComma(t, end);
             continue;
         }
@@ -21057,13 +21137,35 @@ fn isValidTypeBoundary(txt: []const u8, pos: usize, expect_brace: bool) bool {
     return c == '{' or c == '(' or c == ' ' or c == '\t';
 }
 
+/// Position of the first occurrence of `kw` at a code position in `t`
+/// (outside string/char literals and comments), or null. The old scan
+/// compared only the FIRST quote position, so any string before a real type
+/// keyword masked it (`const x = "doc" ++ struct {...};` read as a value
+/// const, EPH-I0474). LiteralState masks all three non-code contexts. The
+/// walk is per-char: updateForChar processes exactly one position, so a
+/// jump between indexOf hits would skip the quote openers between them.
+/// No keyword carries a quote byte, so a code-position first char makes
+/// the whole keyword code.
+fn codeKeywordPos(t: []const u8, kw: []const u8) ?usize {
+    var lit = types.LiteralState.forLine(t) orelse return null;
+    var i: usize = 0;
+    while (i + kw.len <= t.len) {
+        if (lit.updateForChar(t, i) == null) {
+            i += 1;
+            continue;
+        }
+        if (mem.startsWith(u8, t[i..], kw)) return i;
+        i += 1;
+    }
+    return null;
+}
+
 /// Cheap line-only check: does the declaration RHS look like a type definition?
 /// Does NOT distinguish a real type def from a closure-wrapper function alias —
 /// use `isClosureFunctionAlias` to disambiguate when naming would be reported.
 fn isTypeDefinitionLine(line: []const u8) bool {
     const eq_pos = mem.indexOf(u8, line, "=") orelse return false;
     const after_eq = line[eq_pos + 1 ..];
-    const quote_pos = mem.indexOf(u8, after_eq, "\"");
 
     const type_kws = [_]struct { kw: []const u8, chk: bool }{
         .{ .kw = " struct", .chk = true },       .{ .kw = " enum", .chk = true },
@@ -21074,28 +21176,21 @@ fn isTypeDefinitionLine(line: []const u8) bool {
     };
 
     for (type_kws) |pat| {
-        const pos = mem.indexOf(u8, after_eq, pat.kw) orelse continue;
-        if (quote_pos != null and quote_pos.? < pos) continue;
+        const pos = codeKeywordPos(after_eq, pat.kw) orelse continue;
         if (!isValidTypeBoundary(after_eq, pos + pat.kw.len, pat.chk)) continue;
         return true;
     }
     return false;
 }
 
-/// Full check including multi-line closure-wrapper disambiguation.
-/// Returns true only for real type definitions, not function aliases.
-fn isTypeDefinition(line: []const u8, content: []const u8, line_offset: usize) bool {
-    if (!isTypeDefinitionLine(line)) return false;
-    return !isClosureFunctionAlias(line, content, line_offset);
-}
-
 /// True when `const x = struct { fn ... }.call;` (function alias). Mirrors
-/// the keyword scan in `isTypeDefinition`, but returns true ONLY for the closure
-/// case (struct/enum/union/opaque body whose matching `}` is followed by `.ident`).
+/// the keyword scan in `isTypeDefinitionLine` (same code-position semantics,
+/// EPH-I0474 — the two scanners must agree on which keywords are visible),
+/// but returns true ONLY for the closure case (struct/enum/union/opaque body
+/// whose matching `}` is followed by `.ident`).
 fn isClosureFunctionAlias(line: []const u8, content: []const u8, line_offset: usize) bool {
     const eq_pos = mem.indexOf(u8, line, "=") orelse return false;
     const after_eq = line[eq_pos + 1 ..];
-    const quote_pos = mem.indexOf(u8, after_eq, "\"");
 
     const type_kws = [_]struct { kw: []const u8, chk: bool }{
         .{ .kw = " struct", .chk = true },        .{ .kw = " enum", .chk = true },
@@ -21105,8 +21200,7 @@ fn isClosureFunctionAlias(line: []const u8, content: []const u8, line_offset: us
     };
 
     for (type_kws) |pat| {
-        const pos = mem.indexOf(u8, after_eq, pat.kw) orelse continue;
-        if (quote_pos != null and quote_pos.? < pos) continue;
+        const pos = codeKeywordPos(after_eq, pat.kw) orelse continue;
         if (!isValidTypeBoundary(after_eq, pos + pat.kw.len, pat.chk)) continue;
         const kw_end_global = line_offset + eq_pos + 1 + pos + pat.kw.len;
         if (isClosureWrappingType(content, kw_end_global)) return true;
@@ -30464,7 +30558,7 @@ fn printHelp() void {
         \\  --max-nesting=N      Max nesting depth (default: 3)
         \\  --max-params=N       Max parameters (default: 4)
         \\  --max-branches=N     Max branches per function (default: 12)
-        \\  --max-line-length=N  Max columns per line (default: 100)
+        \\  --max-line-length=N  Max characters per line (default: 100)
         \\  --max-file-bytes=N   Max file size in bytes (requires --enable=ZA702)
         \\  -V, --verbose        Verbose output
         \\  -s, --summary        Show summary at end
@@ -55702,33 +55796,42 @@ test "analyzeNaming: quoted identifiers are checked as their inner name (EPH-I04
 // ZA703 Closure-Wrapper / Type-Definition Classification Tests
 // ============================================================================
 
-test "isTypeDefinition: real type defs detected" {
+test "isTypeDefinitionLine: real type defs detected (EPH-I0472)" {
+    // The isTypeDefinition wrapper is deleted (EPH-I0472): each assertion
+    // now pins the two primitives it composed — the line gate and the
+    // closure-alias disambiguation — with the same inputs.
     const c1 = "const Foo = struct {};";
-    try std.testing.expect(isTypeDefinition(c1, c1, 0));
+    try std.testing.expect(isTypeDefinitionLine(c1));
+    try std.testing.expect(!isClosureFunctionAlias(c1, c1, 0));
     const c2 = "const Color = enum { red, green };";
-    try std.testing.expect(isTypeDefinition(c2, c2, 0));
+    try std.testing.expect(isTypeDefinitionLine(c2));
+    try std.testing.expect(!isClosureFunctionAlias(c2, c2, 0));
     const c3 = "const Tag = union { a: u32, b: u64 };";
-    try std.testing.expect(isTypeDefinition(c3, c3, 0));
+    try std.testing.expect(isTypeDefinitionLine(c3));
+    try std.testing.expect(!isClosureFunctionAlias(c3, c3, 0));
     const c4 = "const Bits = packed struct(u32) { a: u16, b: u16 };";
-    try std.testing.expect(isTypeDefinition(c4, c4, 0));
+    try std.testing.expect(isTypeDefinitionLine(c4));
+    try std.testing.expect(!isClosureFunctionAlias(c4, c4, 0));
 }
 
-test "isTypeDefinition: single-line closure NOT a type def" {
+test "isTypeDefinitionLine: single-line closure NOT a type def (EPH-I0472)" {
     const c = "const readBytes = struct { fn call() void {} }.call;";
-    try std.testing.expect(!isTypeDefinition(c, c, 0));
+    try std.testing.expect(isTypeDefinitionLine(c));
+    try std.testing.expect(isClosureFunctionAlias(c, c, 0));
 }
 
-test "isTypeDefinition: multi-line closure NOT a type def" {
+test "isTypeDefinitionLine: multi-line closure NOT a type def (EPH-I0472)" {
     const content =
         "const readBytes = struct {\n" ++
         "    fn call() void {}\n" ++
         "}.call;\n";
     // First line is what the analyzer trims and passes as `t`.
     const line = "const readBytes = struct {";
-    try std.testing.expect(!isTypeDefinition(line, content, 0));
+    try std.testing.expect(isTypeDefinitionLine(line));
+    try std.testing.expect(isClosureFunctionAlias(line, content, 0));
 }
 
-test "isTypeDefinition: nested braces inside closure body still resolved correctly" {
+test "isTypeDefinitionLine: nested braces inside closure body still resolved correctly (EPH-I0472)" {
     const content =
         "const wrap = struct {\n" ++
         "    fn call(a: u32) u32 {\n" ++
@@ -55736,23 +55839,26 @@ test "isTypeDefinition: nested braces inside closure body still resolved correct
         "    }\n" ++
         "}.call;\n";
     const line = "const wrap = struct {";
-    try std.testing.expect(!isTypeDefinition(line, content, 0));
+    try std.testing.expect(isTypeDefinitionLine(line));
+    try std.testing.expect(isClosureFunctionAlias(line, content, 0));
 }
 
-test "isTypeDefinition: multi-line REAL type def still detected" {
+test "isTypeDefinitionLine: multi-line REAL type def still detected (EPH-I0472)" {
     const content =
         "const Foo = struct {\n" ++
         "    field: u32,\n" ++
         "};\n";
     const line = "const Foo = struct {";
-    try std.testing.expect(isTypeDefinition(line, content, 0));
+    try std.testing.expect(isTypeDefinitionLine(line));
+    try std.testing.expect(!isClosureFunctionAlias(line, content, 0));
 }
 
-test "isTypeDefinition: array literal of anonymous struct not a type def" {
+test "isTypeDefinitionLine: array literal of anonymous struct not a type def (EPH-I0472)" {
     // `[_]struct { ... }{ ... }` has no space before `struct`, so the keyword
     // pattern ` struct` must NOT match.
     const c = "const keys = [_]struct { name: []const u8 }{ .{ .name = \"a\" } };";
-    try std.testing.expect(!isTypeDefinition(c, c, 0));
+    try std.testing.expect(!isTypeDefinitionLine(c));
+    try std.testing.expect(!isClosureFunctionAlias(c, c, 0));
 }
 
 test "isClosureFunctionAlias: detects multi-line closure" {
@@ -55767,6 +55873,27 @@ test "isClosureFunctionAlias: detects multi-line closure" {
 test "isClosureFunctionAlias: rejects real type def" {
     const c = "const Foo = struct { x: u32 };";
     try std.testing.expect(!isClosureFunctionAlias(c, c, 0));
+}
+
+test "isTypeDefinitionLine: a closed string before the keyword does not mask it (EPH-I0474)" {
+    // The old first-quote comparison masked any keyword behind a `"` opener,
+    // even when the literal closed before the keyword: `"doc" ++ struct`
+    // read as a value const, not a type def.
+    const c = "const x = \"doc\" ++ struct { a: u32 };";
+    try std.testing.expect(isTypeDefinitionLine(c));
+}
+
+test "isTypeDefinitionLine: a keyword inside a string stays masked (EPH-I0474)" {
+    const c = "const x = \"doc struct\";";
+    try std.testing.expect(!isTypeDefinitionLine(c));
+}
+
+test "isClosureFunctionAlias: a closed string before the keyword keeps alias detection (EPH-I0474)" {
+    // Both scanners share the code-position keyword scan, so the closure
+    // alias behind a string still reads as a function, not a type.
+    const c = "const readBytes = \"doc\" ++ struct { fn call() void {} }.call;";
+    try std.testing.expect(isTypeDefinitionLine(c));
+    try std.testing.expect(isClosureFunctionAlias(c, c, 0));
 }
 
 // ============================================================================
@@ -56011,7 +56138,7 @@ test "checkErrorNaming: error set members must be snake_case" {
     );
 }
 
-test "checkErrorNaming: std-lib error names are exempt" {
+test "checkErrorNaming: std-lib error names are exempt in REFERENCES only (EPH-I0473)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
@@ -56040,16 +56167,8 @@ test "checkErrorNaming: std-lib error names are exempt" {
         .issues = &issues,
         .allocator = a,
         .path = "test.zig",
-        .t = "    OutOfMemory,",
-        .line_num = 3,
-        .error_naming = .snake_case,
-    }, true);
-    try checkErrorNaming(.{
-        .issues = &issues,
-        .allocator = a,
-        .path = "test.zig",
         .t = "return error.FileNotFound;",
-        .line_num = 4,
+        .line_num = 3,
         .error_naming = .snake_case,
     }, false);
     try checkErrorNaming(.{
@@ -56057,9 +56176,59 @@ test "checkErrorNaming: std-lib error names are exempt" {
         .allocator = a,
         .path = "test.zig",
         .t = "return error.my_project_error;",
-        .line_num = 5,
+        .line_num = 4,
         .error_naming = .snake_case,
     }, false);
+    // References to std names stay exempt: project code cannot rename them.
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+
+    // A DECLARED member colliding with a std name is the project's own
+    // name — it can rename it, so snake_case mode reports it (EPH-I0473).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "    OutOfMemory,",
+        .line_num = 5,
+        .error_naming = .snake_case,
+    }, true);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "    FileNotFound,",
+        .line_num = 6,
+        .error_naming = .snake_case,
+    }, true);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "error set member 'OutOfMemory' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "error set member 'FileNotFound' should be snake_case",
+        issues.items[1].message,
+    );
+}
+
+test "checkErrorNaming: title_case mode stays silent on std-name members (EPH-I0473)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // Std names conform to title_case, so the declared-member check (no
+    // std exemption) still passes them (EPH-I0473).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error{ OutOfMemory, FileNotFound }",
+        .line_num = 1,
+        .error_naming = .title_case,
+    }, true);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -61306,6 +61475,68 @@ test "ZA701 exempts lines over-length solely due to string literals" {
     try std.testing.expectEqual(@as(usize, 3), flagged_lines);
 }
 
+test "ZA701: multi-byte lines count codepoints, not bytes (EPH-I0248)" {
+    // 60 CJK chars = 180 bytes; the byte model reported 182 columns.
+    // The codepoint model counts 63 (the "// " prefix included).
+    const cjk = "// " ++ "界" ** 60;
+    try std.testing.expectEqual(@as(usize, 63), calculateVisibleLength(cjk));
+    try std.testing.expectEqual(@as(usize, 63), visibleLengthExcludingStrings(cjk));
+    // Emoji: 25 four-byte sequences = 100 bytes, 28 codepoints.
+    const emoji = "// " ++ "🚀" ** 25;
+    try std.testing.expectEqual(@as(usize, 28), calculateVisibleLength(emoji));
+    // Tabs keep the 4-stop model with codepoint counts.
+    const tabbed = "\t" ++ "界" ** 40;
+    try std.testing.expectEqual(@as(usize, 44), calculateVisibleLength(tabbed));
+}
+
+test "ZA701: malformed clusters stay byte-counted, valid ones collapse (EPH-I0248)" {
+    // \xE2ab is 3 bytes: 0xE2 plus two ASCII bytes that are not valid
+    // continuations, so the cluster falls back to 3 single-byte counts.
+    // 3 + 98 ASCII bytes = 101 columns, over the 100 limit (fires).
+    const malformed = "\xE2ab" ++ "x" ** 98;
+    try std.testing.expectEqual(@as(usize, 101), calculateVisibleLength(malformed));
+    // Overlong \xE0\x80\x80: the first continuation (0x80) is below the
+    // 0xA0 floor for 0xE0, so all three bytes count separately.
+    const overlong = "\xE0\x80\x80" ++ "x" ** 98;
+    try std.testing.expectEqual(@as(usize, 101), calculateVisibleLength(overlong));
+    // A valid 3-byte cluster still collapses to one column.
+    const valid = "†" ++ "x" ** 99;
+    try std.testing.expectEqual(@as(usize, 100), calculateVisibleLength(valid));
+}
+
+test "ZA701: a long CJK comment line is silent, a long ASCII+CJK line fires (EPH-I0248)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // 60 CJK chars: 180 bytes but 63 codepoints — silent under the
+    // codepoint model, flagged under the byte model.
+    const cjk_line = "// " ++ "界" ** 60;
+    // 60 CJK chars plus 50 ASCII chars: 113 codepoints — still too long.
+    const over_line = "// " ++ "界" ** 60 ++ " " ++ "x" ** 49;
+    const code = cjk_line ++ "\n" ++ over_line ++ "\n";
+
+    const analysis = try createTestFileAnalysis(allocator, "test_cjk_lines.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_cjk_lines.zig"), {});
+
+    var issues = try analyzeStyle(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var flagged_lines: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_LINE_TOO_LONG)) {
+            try std.testing.expectEqual(@as(usize, 2), issue.line);
+            flagged_lines += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), flagged_lines);
+}
+
 test "isInsideTypeOf detects @TypeOf context" {
     try std.testing.expect(isInsideTypeOf("const T = @TypeOf(foo() catch unreachable);", 30, null));
     try std.testing.expect(!isInsideTypeOf("const x = foo() catch unreachable;", 22, null));
@@ -61838,6 +62069,41 @@ test "countLineCyclomatic ignores keywords in strings and comments (EPH-I0226)" 
     try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a and b) {"));
     try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a or b) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("const v = x orelse return;"));
+}
+
+test "countSwitchArms ignores arrows in trailing comments (EPH-I0017)" {
+    // hasToken is comment-masked since B2; countSwitchArms was the
+    // leftover: `foo(); // a => b` counted a phantom arm in ZA304/305/306.
+    try std.testing.expectEqual(@as(usize, 0), countSwitchArms("foo(); // a => b"));
+    try std.testing.expectEqual(@as(usize, 0), countSwitchArms("// =>"));
+    try std.testing.expectEqual(@as(usize, 1), countSwitchArms("0 => 1, // a => b"));
+    try std.testing.expectEqual(@as(usize, 2), countSwitchArms("0 => 1, 2 => 3, // x => y"));
+    // String arrows stay masked too (pre-existing EPH-I0153 behavior).
+    try std.testing.expectEqual(@as(usize, 0), countSwitchArms("const s = \"=>\";"));
+}
+
+test "complexity counters ignore a comment arrow on a real branch line (EPH-I0017)" {
+    // The ZA304/305/306 paths: one real arm plus a commented `=>` counts
+    // the arm only.
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("0 => 1, // a => b"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("0 => 1, // a => b"));
+    try std.testing.expectEqual(@as(usize, 1), countLineCognitive("0 => 1, // a => b", 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("if (x) foo(); // a => b"));
+}
+
+test "trackBraceNesting ignores braces inside trailing comments (EPH-I0017)" {
+    // LiteralState masks comment text (types.zig updateForChar), so the
+    // `}` in the trailing comment never closes the block: the line nets
+    // one open at nest 2 and the fn is not ended. Pin documents the
+    // accepted state — the P2-4 addendum's premise (LiteralState does not
+    // model `//`) is stale at HEAD.
+    var state = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(!trackBraceNesting("if (x) { // }", &state));
+    try std.testing.expectEqual(@as(usize, 2), state.nest);
+    // The close-in-comment twin: `}` in the comment must not end the fn.
+    var state2 = ComplexityState{ .in_fn = true, .nest = 1 };
+    try std.testing.expect(!trackBraceNesting("if (x) { // } }", &state2));
+    try std.testing.expectEqual(@as(usize, 2), state2.nest);
 }
 
 test "countLineCognitive ignores keywords in strings and comments (EPH-I0226)" {

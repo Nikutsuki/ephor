@@ -1067,7 +1067,6 @@ const ControlEvent = struct {
 
 /// Per-line output of the CFG brace scan.
 const BraceScanOut = struct {
-    saw_control_close: bool = false, // `}` closed a control block, not an expression
     saw_control_open: bool = false, // `{` was claimed as a control brace
     body_return: bool = false, // the virtual body statement is a `return`
     // The same-line body statement (virtual or `{ break; }`) is a loop
@@ -1222,7 +1221,6 @@ const CFGBuildCtx = struct {
         // An entry still waiting for its `{` (brace-less body) is closed by
         // the next close event, matching pre-guard pop-on-`}` semantics.
         if (line_scan.dispatch_pop and self.topIsPending()) {
-            line_scan.out.saw_control_close = true;
             try self.event_scratch.append(self.allocator, .{
                 .kind = .close_control,
                 .col = i,
@@ -1231,7 +1229,6 @@ const CFGBuildCtx = struct {
         }
         const items = self.brace_stack.items;
         if (items.len == 0) {
-            line_scan.out.saw_control_close = true;
             try self.event_scratch.append(self.allocator, .{
                 .kind = .close_control,
                 .col = i,
@@ -1248,7 +1245,6 @@ const CFGBuildCtx = struct {
             // on the same line must not clobber an earlier one.
             if (jump != .none) line_scan.out.body_jump = jump;
         }
-        line_scan.out.saw_control_close = true;
         try self.event_scratch.append(self.allocator, .{
             .kind = .close_control,
             .col = i,
@@ -2584,6 +2580,29 @@ fn hasLeftDot(t: []const u8, pos: usize) bool {
     return false;
 }
 
+/// Iterate the positions where `name` occurs as the variable itself in
+/// `t`: not mid-identifier (`box`) and not a field of another var
+/// (`foo.x`, `foo . x` — EPH-I0786/90). The fill/read scans share this
+/// left-boundary core and differ only in their right-side checks
+/// (EPH-I0100). Each call to next() yields the next position; callers
+/// apply their right-side checks at the yielded position.
+const VarOccurrenceIter = struct {
+    t: []const u8,
+    name: []const u8,
+    from: usize = 0,
+
+    fn next(self: *VarOccurrenceIter) ?usize {
+        while (mem.indexOfPos(u8, self.t, self.from, self.name)) |pos| {
+            self.from = pos + self.name.len;
+            if (pos > 0 and
+                (isIdent(self.t[pos - 1]) or hasLeftDot(self.t, pos)))
+                continue;
+            return pos;
+        }
+        return null;
+    }
+};
+
 /// Fill/read verdict for one `var_name[...]` occurrence (EPH-I0752).
 const BracketUse = enum { fill, read };
 
@@ -3401,15 +3420,8 @@ fn unmatchedOpenParenBefore(t: []const u8, pos: usize) ?usize {
 /// coverage. Bare element reads fill no longer (EPH-I0752). They reach
 /// this net only through the coarser same-line for-loop heuristic.
 fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
-    var s: usize = 0;
-    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-        const pos = s + rel;
-        s = pos + var_name.len;
-        // The match must be the variable itself: not mid-identifier
-        // (box[...]) and not a field of another var (foo.x[...], with any
-        // spacing around the dot — EPH-I0795).
-        if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (hasLeftDot(t, pos)) continue;
+    var iter = VarOccurrenceIter{ .t = t, .name = var_name };
+    while (iter.next()) |pos| {
         const end = pos + var_name.len;
         if (end < t.len and isIdent(t[end])) continue;
         if (end < t.len and t[end] == '[' and !isAssignmentTarget(t, var_name, pos))
@@ -3585,15 +3597,8 @@ const ForLoopTracker = struct {
         first_effect: []AssignEffect,
     ) void {
         if (!self.in_loop) return;
-        var s: usize = 0;
-        while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-            const pos = s + rel;
-            s = pos + var_name.len;
-            // The match must be the variable itself: not mid-identifier
-            // (box[i] =) and not a field of another var (foo.x[i] =, with
-            // any spacing around the dot — EPH-I0786).
-            if (pos > 0 and isIdent(t[pos - 1])) continue;
-            if (hasLeftDot(t, pos)) continue;
+        var iter = VarOccurrenceIter{ .t = t, .name = var_name };
+        while (iter.next()) |pos| {
             const end_pos = pos + var_name.len;
             if (end_pos >= t.len) return;
             // Pattern: var_name[...] — fills only in write contexts
@@ -3780,7 +3785,7 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
 
         // Make sure it's not inside a string or comment
         if (cls.isInsideString(pos)) continue;
-        if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
+        if (findCommentStart(t[0..pos]) != null) continue;
 
         return true;
     }
@@ -3811,7 +3816,7 @@ fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
 
         // Make sure it's not inside a string or comment
         if (cls.isInsideString(pos)) continue;
-        if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
+        if (findCommentStart(t[0..pos]) != null) continue;
 
         if (!isInsideCallArg(t, pos)) return true;
     }
@@ -3841,7 +3846,7 @@ fn isMethodCallAt(t: []const u8, abs_pos: usize, var_name: []const u8, cls: *Lin
     const method_name = rest[0..paren];
     if (method_name.len == 0 or !isAllIdent(method_name)) return false;
     if (cls.isInsideString(abs_pos)) return false;
-    if (mem.indexOf(u8, t[0..abs_pos], "//") != null) return false;
+    if (findCommentStart(t[0..abs_pos]) != null) return false;
     return true;
 }
 
@@ -4238,7 +4243,7 @@ fn hasPayloadBinding(t: []const u8, var_name: []const u8) bool {
         if (end >= t.len) continue;
         if (t[end] != '|' and t[end] != ',') continue;
         if (cls.isInsideString(pos)) continue;
-        if (mem.indexOf(u8, t[0..pos], "//")) |_| continue;
+        if (findCommentStart(t[0..pos]) != null) continue;
         return true;
     }
     return false;
@@ -4295,12 +4300,12 @@ fn isIndirectlyInitialized(
             // depth into later lines: without the guard, a post-loop fill
             // reads as loop-carried and masks a genuine read inside the
             // loop (EPH-I0785).
-            if (!hasOnelineLoopClose(t)) in_for_loop += countChar(t, '{');
+            if (!hasOnelineLoopClose(t)) in_for_loop += countCodeChar(t, '{');
             continue;
         }
         if (in_for_loop == 0) continue;
-        in_for_loop += countChar(t, '{');
-        in_for_loop -|= countChar(t, '}');
+        in_for_loop += countCodeChar(t, '{');
+        in_for_loop -|= countCodeChar(t, '}');
         if (in_for_loop > 0 and isArrayIndexAssignment(t, vn))
             return true;
     }
@@ -4311,6 +4316,18 @@ fn isIndirectlyInitialized(
 fn countChar(t: []const u8, ch: u8) usize {
     var n: usize = 0;
     for (t) |c| {
+        if (c == ch) n += 1;
+    }
+    return n;
+}
+
+/// Count occurrences of `ch` in code position: string/char literal
+/// content, `\\` tails, and comment text carry no braces (EPH-I0081).
+fn countCodeChar(t: []const u8, ch: u8) usize {
+    var lit = types.LiteralState.forLine(t) orelse return 0;
+    var n: usize = 0;
+    for (t, 0..) |c, i| {
+        if (lit.updateForChar(t, i) == null) continue;
         if (c == ch) n += 1;
     }
     return n;
@@ -4332,35 +4349,15 @@ fn countChar(t: []const u8, ch: u8) usize {
 /// classifyBracketUse (EPH-I0752), which also keeps the slice-form
 /// crudeness this predicate does not need (EPH-I0102).
 fn isArrayIndexAssignment(t: []const u8, vn: []const u8) bool {
-    var pos: usize = 0;
-    while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
-        // Word boundary check
-        if (vpos > 0 and isIdent(t[vpos - 1])) {
-            pos = vpos + vn.len;
-            continue;
-        }
-        // The left-dot guard skips a field of another var: `foo.buf[i] =`
-        // writes foo's field, not the local buf (EPH-I0753). The scan
-        // skips whitespace, so a spaced dot (`foo . buf[i] =`) keeps the
-        // same verdict (EPH-I0786).
-        if (hasLeftDot(t, vpos)) {
-            pos = vpos + vn.len;
-            continue;
-        }
+    var iter = VarOccurrenceIter{ .t = t, .name = vn };
+    while (iter.next()) |vpos| {
         const end = vpos + vn.len;
-        if (end >= t.len) {
-            pos = end;
-            continue;
-        }
-        if (isIdent(t[end])) {
-            pos = end;
-            continue;
-        }
+        if (end >= t.len) continue;
+        if (isIdent(t[end])) continue;
         // `var_name[` must be an assignment target: a bare subscript read
         // does not initialize the array (EPH-I0327).
         if (t[end] == '[' and
             (hasAssignmentAfterBracket(t[end..]) orelse false)) return true;
-        pos = end;
     }
     return false;
 }
@@ -4418,7 +4415,7 @@ fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
             pos = end;
             continue;
         }
-        if (mem.indexOf(u8, t[0..vpos], "//") != null) return false;
+        if (findCommentStart(t[0..vpos]) != null) return false;
         // Check for var_name[ pattern (slice creation)
         if (t[end] != '[') {
             pos = end;
@@ -4635,9 +4632,9 @@ fn isCorrelatedGuardRead(
 
 /// Brace depth at position `pos` of `t` given the depth before the line:
 /// the depth of the innermost block containing the position. Mirrors
-/// computeBraceDepth's quote and multiline handling (EPH-I0107,
-/// EPH-I0751), so the same lines score the same depth here and in the
-/// block walkers.
+/// computeBraceDepth's quote, multiline, and comment handling (EPH-I0107,
+/// EPH-I0751, EPH-I0081), so the same lines score the same depth here and
+/// in the block walkers.
 fn braceDepthAt(t: []const u8, pos: usize, initial: usize) usize {
     var depth = initial;
     var mode: QuoteMode = .none;
@@ -4649,6 +4646,7 @@ fn braceDepthAt(t: []const u8, pos: usize, initial: usize) usize {
             continue;
         }
         if (types.isMultilineOpenerAt(t, i)) break;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
         if (c == '{') depth += 1;
         if (c == '}' and depth > 0) depth -= 1;
     }
@@ -4755,7 +4753,9 @@ fn blockContainsAssignment(
 
 /// Compute brace depth for a line given initial depth, returning new depth.
 /// String and char content carries no braces (EPH-I0107). A `\\` opener's
-/// tail is string data for the same reason (EPH-I0751).
+/// tail is string data for the same reason (EPH-I0751). A `//` comment's
+/// braces are data too — a trailing comment never opens or closes a block
+/// (EPH-I0081).
 fn computeBraceDepth(t: []const u8, initial: usize) usize {
     var depth = initial;
     var mode: QuoteMode = .none;
@@ -4767,6 +4767,7 @@ fn computeBraceDepth(t: []const u8, initial: usize) usize {
             continue;
         }
         if (types.isMultilineOpenerAt(t, i)) break;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
         if (c == '{') depth += 1;
         if (c == '}' and depth > 0) depth -= 1;
     }
@@ -5600,6 +5601,9 @@ fn trackBracesWithZeroDetect(
             continue;
         }
         if (types.isMultilineOpenerAt(t, i)) break;
+        // A trailing comment's braces are data: they never open, close, or
+        // touch zero (EPH-I0081).
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
         if (c == '{') {
             depth += 1;
             if (!found_open) found_open = true;
@@ -9280,12 +9284,14 @@ fn scanBlocksForPatterns(
 
 /// Update a multi-line defer/errdefer block depth from one line: the
 /// opener line restarts the depth, every following line contributes its
-/// brace balance.
+/// brace balance. The arm and the counter use the same code-position
+/// brace notion (EPH-I0883): countBraceDepth stays raw for its own
+/// callers, so the depth walk here routes through computeBraceDepth.
 fn trackDeferBlockDepthLine(is_block_start: bool, t: []const u8, depth: *usize) void {
     if (is_block_start) {
-        depth.* = countBraceDepth(t, 0);
+        depth.* = computeBraceDepth(t, 0);
     } else if (depth.* > 0) {
-        depth.* = countBraceDepth(t, depth.*);
+        depth.* = computeBraceDepth(t, depth.*);
     }
 }
 
@@ -9317,12 +9323,12 @@ fn scanSingleBlock(
         // two keywords differ in which exit paths their frees cover
         // (EPH-I0349).
         trackDeferBlockDepthLine(
-            is_errdefer and mem.indexOf(u8, t, "{") != null,
+            is_errdefer and hasCodeChar(t, '{'),
             t,
             &errdefer_depth,
         );
         trackDeferBlockDepthLine(
-            is_defer and mem.indexOf(u8, t, "{") != null,
+            is_defer and hasCodeChar(t, '{'),
             t,
             &defer_depth,
         );
@@ -13571,7 +13577,9 @@ const TestBlockState = struct {
     depth: usize,
 };
 
-/// Track test block boundaries
+/// Track test block boundaries. Braces in string/char literals and
+/// comments are data: they neither open a test block nor close one
+/// (EPH-I0883).
 fn trackTestBlock(
     t: []const u8,
     in_test: bool,
@@ -13580,15 +13588,20 @@ fn trackTestBlock(
     var in_block = in_test;
     var brace_depth = depth;
     const starts_test = mem.startsWith(u8, t, "test ");
-    const has_brace = mem.indexOf(u8, t, "{") != null;
-    if (starts_test and has_brace) {
+    // The line opens a test block only when a code-position `{` sits on
+    // it: `test "{"` carries no block brace, `test "name" {` does.
+    if (starts_test and hasCodeChar(t, '{')) {
         in_block = true;
         brace_depth = 0;
     }
     if (!in_block) return .{ .in_test = false, .depth = brace_depth };
-    for (t) |c| {
-        if (c == '{') brace_depth += 1;
-        if (c == '}') {
+    var lit = types.LiteralState.forLine(t) orelse
+        return .{ .in_test = in_block, .depth = brace_depth };
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (lit.updateForChar(t, i) == null) continue;
+        if (t[i] == '{') brace_depth += 1;
+        if (t[i] == '}') {
             if (brace_depth > 0) brace_depth -= 1;
             if (brace_depth == 0) in_block = false;
         }
@@ -14017,32 +14030,6 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
-/// Check if a same-line for loop assigns to var_name[...] (indexed fill).
-fn hasForLoopIndexedFill(t: []const u8, var_name: []const u8) bool {
-    // Heuristic only: full analysis needs the loop scope, so a same-line
-    // loop header plus a var_name[...] fill counts as a fill. Each
-    // occurrence takes the classifyBracketUse verdict (EPH-I0772): a bare
-    // element read does not fill, so the scan continues past it. Slice
-    // forms and write contexts keep the fill verdict, the same boundary
-    // as the multi-line sites (checkIndexedAssign, hasDirectFill
-    // Pattern 2, EPH-I0752).
-    if (mem.indexOf(u8, t, "for ") == null and mem.indexOf(u8, t, "for(") == null)
-        return false;
-    var s: usize = 0;
-    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-        const pos = s + rel;
-        s = pos + var_name.len;
-        // The match must be the variable itself: not mid-identifier (box[i])
-        // and not a field of another var (foo.x[i], foo . x[i] —
-        // EPH-I0786). The identifier boundary stays on the immediate byte.
-        if (pos > 0 and (isIdent(t[pos - 1]) or hasLeftDot(t, pos))) continue;
-        const end = pos + var_name.len;
-        if (end < t.len and t[end] == '[' and
-            classifyBracketUse(t, end) == .fill) return true;
-    }
-    return false;
-}
-
 /// Check if &var_name is passed to a call that fills its output buffer.
 fn hasFillCall(t: []const u8, var_name: []const u8) bool {
     // read/recv/decode/bufPrint take the output buffer as first arg or via
@@ -14065,16 +14052,8 @@ fn hasFillCall(t: []const u8, var_name: []const u8) bool {
 fn hasModifyingMethodCall(t: []const u8, var_name: []const u8) bool {
     const modifying_methods = compat.getModifyingMethodPatterns();
     for (modifying_methods) |method| {
-        var s: usize = 0;
-        while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-            const var_pos = s + rel;
-            s = var_pos + var_name.len;
-            // The receiver must be the variable itself: not mid-identifier
-            // (box.append) and not a field of another var (foo.x.append,
-            // with any spacing around the dot — EPH-I0790). The identifier
-            // boundary stays on the immediate byte.
-            if (var_pos > 0 and
-                (isIdent(t[var_pos - 1]) or hasLeftDot(t, var_pos))) continue;
+        var iter = VarOccurrenceIter{ .t = t, .name = var_name };
+        while (iter.next()) |var_pos| {
             const after_var = var_pos + var_name.len;
             if (after_var + method.len > t.len) continue;
             if (mem.startsWith(u8, t[after_var..], method)) return true;
@@ -14090,15 +14069,8 @@ fn hasModifyingMethodCall(t: []const u8, var_name: []const u8) bool {
 /// never fills the local (EPH-I0332, band-B01b F-06). The `&x`
 /// call-argument form stays covered by the hasDirectFill address-of arm.
 fn hasInitCallOnVar(t: []const u8, var_name: []const u8) bool {
-    var s: usize = 0;
-    while (mem.indexOf(u8, t[s..], var_name)) |rel| {
-        const pos = s + rel;
-        s = pos + var_name.len;
-        // The receiver root must be the variable itself: not mid-identifier
-        // (box.init) and not a field of another var (foo.x.init, with any
-        // spacing around the dot — EPH-I0790).
-        if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (hasLeftDot(t, pos)) continue;
+    var iter = VarOccurrenceIter{ .t = t, .name = var_name };
+    while (iter.next()) |pos| {
         var i = pos + var_name.len;
         var last_seg: []const u8 = "";
         while (i < t.len and t[i] == '.') {
@@ -14121,9 +14093,6 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // dest — only the first-arg destination counts
     if (isBuiltinDest(t, var_name, "@memcpy(")) return true;
     if (isBuiltinDest(t, var_name, "@memset(")) return true;
-
-    // Same-line loop with indexed assignment to var_name
-    if (hasForLoopIndexedFill(t, var_name)) return true;
 
     // Buffer-filling calls (read/decode/bufPrint/crypto) taking &var_name
     if (hasFillCall(t, var_name)) return true;
@@ -14620,11 +14589,16 @@ fn isStaticStorageStruct(t: []const u8) bool {
     return false;
 }
 
-/// Track static storage struct braces
+/// Track static storage struct braces. Braces in string/char literals
+/// and comments are data: they never open or close the struct scope
+/// (EPH-I0883).
 fn trackStaticStructBraces(t: []const u8, state: *ErrorAnalysisState) void {
-    for (t) |c| {
-        if (c == '{') state.static_struct_depth += 1;
-        if (c == '}' and state.static_struct_depth > 0) {
+    var lit = types.LiteralState.forLine(t) orelse return;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '{') state.static_struct_depth += 1;
+        if (t[pos] == '}' and state.static_struct_depth > 0) {
             state.static_struct_depth -= 1;
             if (state.static_struct_depth == 0) state.in_static_struct = false;
         }
@@ -14636,6 +14610,18 @@ fn trackStaticStructBraces(t: []const u8, state: *ErrorAnalysisState) void {
 /// are data and never close the block (EPH-I0421, band B06 N5). Used by
 /// defer-block and function-context tracking.
 const BraceTrackResult = struct { in_block: bool, depth: usize };
+
+/// True when `ch` occurs in code position on the line: string/char
+/// literal content, `\\` tails, and comment text are data (EPH-I0883).
+fn hasCodeChar(t: []const u8, ch: u8) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == ch) return true;
+    }
+    return false;
+}
 
 fn trackBraceBlock(t: []const u8, in_block: bool, depth: usize) BraceTrackResult {
     var d = depth;
@@ -14668,7 +14654,11 @@ fn startBraceBlock(t: []const u8) BraceTrackResult {
 fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
     if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) {
         state.has_defer_in_func = true;
-        if (mem.indexOf(u8, t, "{") != null) {
+        // The arm uses the same code-position brace notion as the masked
+        // counter: a `{` inside a comment or string never arms the block
+        // (EPH-I0883). The raw indexOf armed at depth 0 and a bare close
+        // brace never cleared it (the d>0 guard).
+        if (hasCodeChar(t, '{')) {
             const r = startBraceBlock(t);
             state.in_defer_block = r.in_block;
             state.defer_brace_depth = r.depth;
@@ -14749,7 +14739,7 @@ fn trackStructLiteral(
         // literal: collectUndefinedField bails when in_literal is false
         // (EPH-I0413).
         collectUndefinedField(t, ln, state);
-        trackStructBracesMasked(t, &state.struct_state);
+        trackStructBraces(t, &state.struct_state);
         return;
     }
     if (!state.struct_state.in_literal) return;
@@ -14757,22 +14747,12 @@ fn trackStructLiteral(
     collectUndefinedField(t, ln, state);
 }
 
-/// Track braces within struct literal (raw; the continuation-line scan,
-/// pre-existing limitation — string braces miscount).
+/// Track braces within a struct literal. String and char content and
+/// comment text carry no braces (EPH-I0413, EPH-I0883): a `"}"` value
+/// must not close the literal early, and a comment brace must not either.
+/// The literal's own `{` opens the depth from zero, so a same-line `}`
+/// closes it.
 fn trackStructBraces(t: []const u8, ss: *StructLiteralState) void {
-    for (t) |c| {
-        if (c == '{') ss.brace_depth += 1;
-        if (c == '}' and ss.brace_depth > 0) {
-            ss.brace_depth -= 1;
-            if (ss.brace_depth == 0) ss.in_literal = false;
-        }
-    }
-}
-
-/// Track the decl line's braces quote-aware: string and char content and
-/// comment text carry no braces (EPH-I0413). The literal's own `{` opens
-/// the depth from zero, so a same-line `}` closes it.
-fn trackStructBracesMasked(t: []const u8, ss: *StructLiteralState) void {
     var lit = types.LiteralState.forLine(t) orelse return;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
@@ -45591,6 +45571,54 @@ test "trackBracesWithZeroDetect ignores braces in a multiline opener tail (EPH-I
     try std.testing.expect(real.touched_zero);
 }
 
+test "computeBraceDepth ignores braces in comments and strings (EPH-I0081)" {
+    // A trailing-comment brace is data: it neither opens nor closes a
+    // block. A real opener before the comment still counts, and a string
+    // brace never counts.
+    try std.testing.expectEqual(@as(usize, 0), computeBraceDepth("x = 1; // { }", 0));
+    try std.testing.expectEqual(@as(usize, 1), computeBraceDepth("if (c) { // }", 0));
+    try std.testing.expectEqual(@as(usize, 0), computeBraceDepth("const s = \"{\" // }", 0));
+    try std.testing.expectEqual(@as(usize, 1), computeBraceDepth("if (c) { const s = \"}\"; // {", 0));
+}
+
+test "trackBracesWithZeroDetect ignores braces in comments (EPH-I0081)" {
+    // A comment `}` must not close the chain branch and touch zero.
+    const r = trackBracesWithZeroDetect("if (c) { // }", 0, false);
+    try std.testing.expectEqual(@as(usize, 1), r.depth);
+    try std.testing.expect(r.found_open);
+    try std.testing.expect(!r.touched_zero);
+}
+
+test "braceDepthAt ignores braces in comments (EPH-I0081)" {
+    // A comment `{` must not score the assignment position as depth 1:
+    // the assign on `x = 1; // {` sits at depth 0.
+    try std.testing.expectEqual(@as(usize, 0), braceDepthAt("x = 1; // {", 11, 0));
+    try std.testing.expectEqual(@as(usize, 1), braceDepthAt("if (c) { // }", 9, 0));
+}
+
+test "isIndirectlyInitialized ignores string braces in for-loop depth (EPH-I0081)" {
+    // A `"}"` value inside the loop body must not close the loop depth
+    // early: the later indexed fill stays inside the loop.
+    const lines = [_][]const u8{
+        "for (items) |i| {",
+        "    const msg = \"}\";",
+        "    buf[i] = 1;",
+        "}",
+    };
+    try std.testing.expect(isIndirectlyInitialized(&lines, "buf"));
+}
+
+test "ComptimeState.update ignores braces in string literals (EPH-I0081)" {
+    // A `"}"` value inside a comptime block is data: it must not close
+    // the block scope early, and the real closing brace still pays.
+    var st = ComptimeState{};
+    st.update("comptime {");
+    st.update("const s = \"}\";");
+    try std.testing.expectEqual(@as(usize, 1), st.depth);
+    st.update("}");
+    try std.testing.expectEqual(@as(usize, 0), st.depth);
+}
+
 test "braceDepthFrom ignores braces in a multiline opener tail (EPH-I0751)" {
     // Target text: const s = \\ } — the tail `}` is string data and must
     // not pay the caller's carried depth.
@@ -50658,14 +50686,6 @@ test "hasModifyingMethodCall skips whitespace-spaced dot receivers (EPH-I0790)" 
     try std.testing.expect(!hasModifyingMethodCall("foo . list.append(1);", "list"));
     try std.testing.expect(!hasModifyingMethodCall("foo .\tlist.append(1);", "list"));
     try std.testing.expect(hasModifyingMethodCall("list.append(1);", "list"));
-}
-
-test "hasForLoopIndexedFill scans every occurrence" {
-    // EPH-I0082: same first-occurrence blindness as hasModifyingMethodCall.
-    try std.testing.expect(hasForLoopIndexedFill("for (box) |b| x[b] = 1;", "x"));
-    try std.testing.expect(!hasForLoopIndexedFill("for (items) |i| box[i] = 1;", "x"));
-    try std.testing.expect(!hasForLoopIndexedFill("for (items) |i| foo.x[i] = 1;", "x"));
-    try std.testing.expect(!hasForLoopIndexedFill("x[i] = 1;", "x"));
 }
 
 test "blockContainsAssignment scans every occurrence with word boundaries" {
@@ -62939,6 +62959,35 @@ test "hasDirectFill finds fills after a URL-bearing string literal (EPH-I0412)" 
     try std.testing.expect(!hasDirectFill("y = 1; // x = 5", "x"));
 }
 
+test "quote-aware comment guards across the occurrence scans (EPH-I0003)" {
+    // The r2_f_url probe shape (`const url = "http://a.b"; x = 1;` + a
+    // later read): a `//` inside a string literal before the occurrence
+    // is data, not a comment start. The five mid-line `//` guards route
+    // through findCommentStart, which is quote-aware.
+    try std.testing.expect(hasAddressOfVar("const u = \"http://a\"; f(&x)", "x"));
+    try std.testing.expect(hasUntrackableAddressOf("const u = \"http://a\"; const p = &x;", "x"));
+    try std.testing.expect(hasMethodCallOnVar("const u = \"http://a\"; x.clear();", "x"));
+    try std.testing.expect(hasPayloadBinding("const u = \"http://a\"; for (xs) |x|", "x"));
+    try std.testing.expect(hasSlicePassToFunction("const u = \"http://a\"; send(buf[0..])", "buf"));
+    // An occurrence after a real trailing comment stays invisible.
+    try std.testing.expect(!hasAddressOfVar("f(&y); // &x", "x"));
+    try std.testing.expect(!hasPayloadBinding("for (xs) |y| // |x|", "x"));
+}
+
+test "a mid-line multiline opener tail never fills (EPH-I0003)" {
+    // The q5 probe shape: `const s = \\x = 1` — the tail is string data,
+    // so the fill scan must not read the assignment as real code.
+    try std.testing.expect(!hasDirectFill("const s = \\\\x = 1;", "x"));
+}
+
+test "isFillPattern: a fill-shaped debug string on a for line does not fill (EPH-I0099)" {
+    // The deleted hasForLoopIndexedFill matched the `x[i] = ` shape
+    // inside the string literal (it had no literal masking): the debug
+    // print read as filling x. hasDirectFill pattern 2 masks literals,
+    // so the line no longer counts as a fill.
+    try std.testing.expect(!isFillPattern("for (items) |i| log(\"x[i] = 1\", .{x[i]});", "x"));
+}
+
 test "firstVarReadPos ignores string-data comment openers and real comments (EPH-I0412)" {
     // A "//" inside a string literal never fakes a comment: the read of y
     // stays visible.
@@ -64719,6 +64768,69 @@ test "isStructFieldFilled keeps fill verdicts after param rename (EPH-I0420)" {
     try std.testing.expect(isStructFieldFilled("&s.x", "s", "x"));
     try std.testing.expect(!isStructFieldFilled("s.x = 1;", "s", "y"));
     try std.testing.expect(!isStructFieldFilled("s.xy = 1;", "s", "x"));
+}
+
+test "trackTestBlock ignores braces inside strings and comments (EPH-I0883)" {
+    // `test "{"` carries no code-position block brace: the test block
+    // must not arm on string data.
+    const no_brace = trackTestBlock("test \"{\"", false, 0);
+    try std.testing.expect(!no_brace.in_test);
+    // `test "name" {` arms on the real brace, counted from the fresh open.
+    const opened = trackTestBlock("test \"name\" {", false, 0);
+    try std.testing.expect(opened.in_test);
+    try std.testing.expectEqual(@as(usize, 1), opened.depth);
+    // A string `"}"` inside the block is data: the block stays open at
+    // its carried depth.
+    const inside = trackTestBlock("const s = \"}\";", true, 3);
+    try std.testing.expect(inside.in_test);
+    try std.testing.expectEqual(@as(usize, 3), inside.depth);
+}
+
+test "trackStructBraces ignores braces inside strings (EPH-I0883)" {
+    // A `"}"` value on a continuation line is data: it must not close
+    // the literal early.
+    var ss = StructLiteralState{
+        .struct_name = "S",
+        .in_literal = true,
+        .brace_depth = 1,
+    };
+    trackStructBraces("const v = \"}\";", &ss);
+    try std.testing.expect(ss.in_literal);
+    try std.testing.expectEqual(@as(usize, 1), ss.brace_depth);
+}
+
+test "trackStaticStructBraces ignores braces inside strings (EPH-I0883)" {
+    // A `"}"` value must not close the static-struct scope early.
+    var state = ErrorAnalysisState{};
+    state.static_struct_depth = 1;
+    state.in_static_struct = true;
+    trackStaticStructBraces("const v = \"}\";", &state);
+    try std.testing.expect(state.in_static_struct);
+    try std.testing.expectEqual(@as(usize, 1), state.static_struct_depth);
+}
+
+test "trackDeferBlock arms only on a code-position brace (EPH-I0883)" {
+    // A defer line whose only brace sits in a comment must not arm the
+    // block: the raw arm armed at depth 0 and a bare close brace never
+    // cleared it (the d>0 guard).
+    var state = ErrorAnalysisState{};
+    trackDeferBlock("defer f(); // {", &state);
+    try std.testing.expect(state.has_defer_in_func);
+    try std.testing.expect(!state.in_defer_block);
+    // A real block brace arms and counts from the fresh open.
+    trackDeferBlock("defer {", &state);
+    try std.testing.expect(state.in_defer_block);
+    try std.testing.expectEqual(@as(usize, 1), state.defer_brace_depth);
+}
+
+test "trackDeferBlockDepthLine uses one code-position brace notion (EPH-I0883)" {
+    // The arm and the counter agree: a comment-only brace line does not
+    // start a block, and a string `"}"` never closes one early.
+    try std.testing.expect(!hasCodeChar("defer f(); // {", '{'));
+    try std.testing.expect(hasCodeChar("defer {", '{'));
+    var depth: usize = 0;
+    trackDeferBlockDepthLine(true, "defer { const s = \"}\";", &depth);
+    try std.testing.expectEqual(@as(usize, 1), depth);
 }
 
 test "skipBlanks skips spaces and tabs (EPH-I0421)" {

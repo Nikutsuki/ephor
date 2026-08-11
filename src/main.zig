@@ -456,9 +456,10 @@ const ColSpan = struct {
 
 /// Column span of a same-line braced arm on a line without an else
 /// (`if (c) { x = 1; }`). A fill inside the arm runs on the guarded path
-/// only; the gen side uses the span to move the fill's effect past the
-/// line end so a same-line read after the construct stays uncovered,
-/// while later-line reads keep the entry-block verdict (EPH-I0111).
+/// only; the gen side uses the span to move the fill onto the arm block,
+/// and the read side attributes a same-arm read the same way, so a read
+/// inside the arm after the fill is covered while a read after the
+/// construct stays uncovered (EPH-I0111, EPH-I0873).
 /// The span carries the arm block the line's opener dispatch created, so
 /// the fill stays on its arm even when a later blank line normalizes the
 /// block's line range (EPH-I0846/49). A span on a non-opener line (an
@@ -467,7 +468,9 @@ const ColSpan = struct {
 /// control openers create no block and no span — only the first control
 /// brace claims the opener — so a fill in a second same-line arm falls
 /// back to whole-line attribution too, a documented false negative
-/// (EPH-I0846/49).
+/// (EPH-I0846/49, EPH-I0871). The `if (a) { x = 1; } if (b) { x = 2; }
+/// return x;` shape stays silent on the A=false,B=false path for the
+/// same reason: the second arm's fill covers the trailing read.
 const ArmSpan = struct {
     line: usize,
     start_col: usize,
@@ -2824,6 +2827,9 @@ const FillVerdict = enum { not_fill, fill, self_read_use };
 
 fn classifyFillLine(check_line: []const u8, name: []const u8) FillVerdict {
     if (!isFillPattern(check_line, name)) return .not_fill;
+    // The assignment detector excludes string content, but isFillPattern's
+    // hasDirectFill gate is quote-aware too, so a string-only assignment
+    // shape never reaches here (EPH-I0124).
     const is_self_read = findAssignmentOccurrence(check_line, name) != null and
         firstVarReadPos(check_line, name) != null;
     if (is_self_read) return .self_read_use;
@@ -3309,14 +3315,29 @@ fn fillCallEffectPos(
     return no_assign_effect;
 }
 
+/// Quote-aware assignment-occurrence scan inputs for one line: the
+/// per-line classifier plus the comment start, built once per line
+/// (EPH-I0153, EPH-I0124).
+const AssignmentScanCtx = struct {
+    cls: LineClassifier,
+    comment_start: ?usize,
+};
+
 /// Next occurrence of var_name at or after s.* that is a direct assignment
 /// target (`x = ...`, `x.field = ...`, `x[i] = ...`), advancing s.* past
 /// the matched name. Word boundaries and a leading-dot guard keep `box =`
 /// and `foo.x =` from matching, with any spacing around the dot
-/// (`foo . x =`, EPH-I0790). Fill-style writes (x.init(), @memset(&x,
+/// (`foo . x =`, EPH-I0790). String and comment content never matches:
+/// `const s = "x = 1";` must not fake an assignment that hides the real
+/// same-line fill (EPH-I0124). Fill-style writes (x.init(), @memset(&x,
 /// ...), fill(&x)) are not targets — callers fall back to the statement
 /// start for those.
-fn nextAssignmentOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize {
+fn nextAssignmentOccurrence(
+    t: []const u8,
+    var_name: []const u8,
+    s: *usize,
+    scan: *AssignmentScanCtx,
+) ?usize {
     while (mem.indexOf(u8, t[s.*..], var_name)) |rel| {
         const pos = s.* + rel;
         s.* = pos + var_name.len;
@@ -3327,15 +3348,26 @@ fn nextAssignmentOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usi
         if (hasLeftDot(t, pos)) continue;
         if (pos + var_name.len < t.len and
             isIdent(t[pos + var_name.len])) continue;
+        // String literal content is data, not an assignment (EPH-I0124);
+        // a comment's text is prose. Both would fake a fill occurrence
+        // that hides the real same-line fill from the effect scan.
+        if (scan.cls.isInsideString(pos)) continue;
+        if (scan.comment_start != null and pos >= scan.comment_start.?) continue;
         if (isAssignmentTarget(t, var_name, pos)) return pos;
     }
     return null;
 }
 
 /// Column of the first direct-assignment occurrence of var_name, or null.
+/// String and comment content is excluded (EPH-I0124) — one classifier
+/// walk plus one comment-start walk per call (EPH-I0153).
 fn findAssignmentOccurrence(t: []const u8, var_name: []const u8) ?usize {
+    var scan = AssignmentScanCtx{
+        .cls = LineClassifier.init(t),
+        .comment_start = findCommentStart(t),
+    };
     var s: usize = 0;
-    return nextAssignmentOccurrence(t, var_name, &s);
+    return nextAssignmentOccurrence(t, var_name, &s, &scan);
 }
 
 /// True when the occurrence at `pos` is the bare destination argument of
@@ -3626,20 +3658,21 @@ const GenOccurrence = struct {
 /// block, never the entry block (EPH-I0846/49). The arm span carries the
 /// arm block from the opener dispatch, so a later blank line that
 /// normalizes the block's line range cannot detach the fill from its arm.
-/// A fill inside a second same-line arm (only the first control brace
-/// claims the opener) keeps the whole-line attribution, a documented
-/// false negative (EPH-I0846/49).
+/// The fill takes effect at its real statement end, so a read INSIDE the
+/// same arm after the fill is covered — the guarded path always observes
+/// the assigned value there (EPH-I0873). A fill inside a second same-line
+/// arm (only the first control brace claims the opener) keeps the
+/// whole-line attribution, a documented false negative (EPH-I0846/49):
+/// `if (a) { x = 1; } if (b) { x = 2; }` gives the second arm's fill the
+/// entry-block credit, so the trailing `return x;` reads as covered on
+/// the A=false,B=false path (EPH-I0871, pinned by test).
 fn recordGenEffect(ctx: *const DefAssignCtx, occ: GenOccurrence, gen_sets: *GenSets) void {
     const actual_line = ctx.func_line + occ.idx;
     var bid = findBlockForLineCol(ctx.cfg, actual_line, occ.col) orelse return;
     const arm_bid = onelineArmBlockAt(ctx.cfg, actual_line, occ.col);
     if (arm_bid) |arm| bid = arm;
     gen_sets.gen[bid] = true;
-    const effect = if (arm_bid != null)
-        AssignEffect{ .line = occ.idx, .col = std.math.maxInt(usize) }
-    else
-        occ.effect;
-    gen_sets.first_effect[bid] = minAssignEffect(gen_sets.first_effect[bid], effect);
+    gen_sets.first_effect[bid] = minAssignEffect(gen_sets.first_effect[bid], occ.effect);
 }
 
 /// Record every fill occurrence of var_name on one body line. Each
@@ -3657,8 +3690,12 @@ fn recordLineFills(
 ) void {
     const t = mem.trim(u8, ctx.lines[idx], " \t\r");
     var any = false;
+    var scan = AssignmentScanCtx{
+        .cls = LineClassifier.init(t),
+        .comment_start = findCommentStart(t),
+    };
     var occ_s: usize = 0;
-    while (nextAssignmentOccurrence(t, var_name, &occ_s)) |occ_col| {
+    while (nextAssignmentOccurrence(t, var_name, &occ_s, &scan)) |occ_col| {
         any = true;
         recordGenEffect(ctx, .{
             .idx = idx,
@@ -4461,12 +4498,16 @@ const ReadScanCtx = struct {
 /// suppressor applies. The CFG is the only path model: the textual
 /// dominance suppressor (hasDominatingScopeAssignment) was retired when
 /// the virtual-body machinery made the CFG model brace-less guard ifs
-/// correctly (EPH-I0681, mega-audit design-cfg-soundness F7).
+/// correctly (EPH-I0681, mega-audit design-cfg-soundness F7). A read
+/// inside a same-line braced arm attributes to the arm's own block, so
+/// an arm fill's real effect covers a same-arm read after the fill
+/// (EPH-I0873).
 fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) bool {
     const al = sc.da.func_line + idx;
     const t = mem.trim(u8, sc.da.lines[idx], " \t\r");
     const read_col = firstVarReadPos(t, var_name) orelse return false;
-    const bid = findBlockForLineCol(sc.da.cfg, al, read_col) orelse return false;
+    const bid = onelineArmBlockAt(sc.da.cfg, al, read_col) orelse
+        findBlockForLineCol(sc.da.cfg, al, read_col) orelse return false;
     if (sc.def_entry[bid]) return false;
     // A same-block assignment covers this read only when it takes effect
     // at or before the read position — block-granular gen hid reads that
@@ -5737,7 +5778,14 @@ fn skipCommentLines(lines: []const []const u8, start: usize, limit: usize) usize
     return idx;
 }
 
-/// Validate that every branch assigns the variable or exits.
+/// Validate that every branch assigns the variable or exits. The textual
+/// chain model is flow-blind: an else-if ARM's own fill and exit are
+/// branch-level facts, and the one-line else-if chain's arms are not
+/// modeled at all — `if (a) { x = 1; } else if (b) { return 1; } return
+/// x;` stays silent on the A=false,B=false uninit path because the CFG
+/// gives the if-arm's fill the entry-block credit (EPH-I0872, pinned by
+/// test; the chain parsers collect branches only past a depth-zero
+/// close, so a same-line else-if arm never joins the list).
 fn validateBranchCoverage(
     lines: []const []const u8,
     branches: *const BranchList,
@@ -5753,7 +5801,10 @@ fn validateBranchCoverage(
     return has_assignment;
 }
 
-/// Check if a branch (lines[start..end]) assigns the variable.
+/// Check if a branch (lines[start..end]) assigns the variable. String and
+/// comment content never counts: `const s = "{ x = 5; }";` inside a branch
+/// must not fake an assignment that arms the early-return suppressor and
+/// hides a genuine uninit read (EPH-I0870).
 fn branchAssignsVar(
     lines: []const []const u8,
     start: usize,
@@ -5764,10 +5815,18 @@ fn branchAssignsVar(
     for (start..actual_end + 1) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        // Check for assignment at any position in the line
-        if (mem.indexOf(u8, t, var_name)) |vpos| {
+        // Check for assignment at any code position in the line
+        // (EPH-I0870): one classifier walk plus one comment-start walk
+        // per line (EPH-I0153), candidates ascend.
+        var cls = LineClassifier.init(t);
+        const comment_start = findCommentStart(t);
+        var s: usize = 0;
+        while (mem.indexOfPos(u8, t, s, var_name)) |vpos| {
+            s = vpos + var_name.len;
             if (vpos > 0 and isIdent(t[vpos - 1])) continue;
             if (vpos + var_name.len < t.len and isIdent(t[vpos + var_name.len])) continue;
+            if (cls.isInsideString(vpos)) continue;
+            if (comment_start != null and vpos >= comment_start.?) break;
             if (isAssignmentTarget(t, var_name, vpos)) return true;
         }
     }
@@ -6095,8 +6154,19 @@ fn runDefiniteAssignmentWorklist(
     }
 }
 
+/// True when the block has outgoing edges: a return-marked block with
+/// successors models a merge that also continues (a same-line nested if
+/// whose body return landed on the inner merge — EPH-I0121). Its def
+/// state flows to the continuation, so it is not a terminal return.
+fn blockHasSuccessors(cfg: *const ControlFlowGraph, bid: usize) bool {
+    for (cfg.edges.items) |edge| {
+        if (edge.from == bid) return true;
+    }
+    return false;
+}
+
 fn computeBlockEntry(
-    cfg: *ControlFlowGraph,
+    cfg: *const ControlFlowGraph,
     def_exit: []const bool,
     bid: usize,
 ) bool {
@@ -6105,11 +6175,14 @@ fn computeBlockEntry(
     for (cfg.edges.items) |edge| {
         if (edge.to != bid) continue;
         if (edge.kind == .loop_back) continue;
-        // Skip return blocks - they never flow to the merge point,
+        // Skip TERMINAL return blocks — they never flow to the merge point,
         // so they shouldn't affect definite assignment analysis.
         // e.g., if (A) { x = 1; } else { return; } // x is definitely assigned here
+        // A return-marked block WITH successors is a merge that continues:
+        // its def state flows on (EPH-I0121).
         if (edge.from < cfg.blocks.items.len and
-            cfg.blocks.items[edge.from].is_return) continue;
+            cfg.blocks.items[edge.from].is_return and
+            !blockHasSuccessors(cfg, edge.from)) continue;
         has_pred = true;
         if (!def_exit[edge.from]) result = false;
     }
@@ -14656,7 +14729,13 @@ fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState, line_num: usi
     }
 }
 
-/// Track struct literal and collect pending undefined fields
+/// Track struct literal and collect pending undefined fields. The decl
+/// line is part of the literal: its fields are collected and its braces
+/// counted, so a single-line literal closes on its own line (EPH-I0413).
+/// Without the decl-line close, a stale open literal misattributes a
+/// later `.b = undefined` (an anonymous literal argument) to the wrong
+/// struct. Braces inside strings and comments are data on the decl line
+/// (a `"}"` value must not close the literal early).
 fn trackStructLiteral(
     t: []const u8,
     ln: usize,
@@ -14665,7 +14744,12 @@ fn trackStructLiteral(
     if (extractStructVarName(t)) |name| {
         state.struct_state.struct_name = name;
         state.struct_state.in_literal = true;
-        state.struct_state.brace_depth = 1;
+        state.struct_state.brace_depth = 0;
+        // Collect the same-line field BEFORE the brace count closes the
+        // literal: collectUndefinedField bails when in_literal is false
+        // (EPH-I0413).
+        collectUndefinedField(t, ln, state);
+        trackStructBracesMasked(t, &state.struct_state);
         return;
     }
     if (!state.struct_state.in_literal) return;
@@ -14673,11 +14757,28 @@ fn trackStructLiteral(
     collectUndefinedField(t, ln, state);
 }
 
-/// Track braces within struct literal
+/// Track braces within struct literal (raw; the continuation-line scan,
+/// pre-existing limitation — string braces miscount).
 fn trackStructBraces(t: []const u8, ss: *StructLiteralState) void {
     for (t) |c| {
         if (c == '{') ss.brace_depth += 1;
         if (c == '}' and ss.brace_depth > 0) {
+            ss.brace_depth -= 1;
+            if (ss.brace_depth == 0) ss.in_literal = false;
+        }
+    }
+}
+
+/// Track the decl line's braces quote-aware: string and char content and
+/// comment text carry no braces (EPH-I0413). The literal's own `{` opens
+/// the depth from zero, so a same-line `}` closes it.
+fn trackStructBracesMasked(t: []const u8, ss: *StructLiteralState) void {
+    var lit = types.LiteralState.forLine(t) orelse return;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '{') ss.brace_depth += 1;
+        if (t[pos] == '}' and ss.brace_depth > 0) {
             ss.brace_depth -= 1;
             if (ss.brace_depth == 0) ss.in_literal = false;
         }
@@ -48891,6 +48992,317 @@ test "ZA607: blank line after a same-line braced if keeps the read uncovered (EP
     );
 }
 
+test "ZA607: read after fill inside a same-line braced arm is covered (EPH-I0873)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The read `_ = x` runs only on the c=true path, after `x = 1`: it is
+    // genuinely covered. The one-line arm attribution must give the fill
+    // its real statement-end effect so the same-arm read after the fill
+    // is covered; the maxInt effect of the pre-fix code never covered any
+    // same-line read (EPH-I0873). The multi-line form (u2.zig) was
+    // already silent; the read after the construct on the same line stays
+    // uncovered (EPH-I0849 pins that direction).
+    const content =
+        \\fn armReadAfterFill(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) { x = 1; _ = x; }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0873_armread.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0873_armread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line nested if body return no longer severs coverage (EPH-I0121)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The editor.zig:5653 shape: `if (cond) if (c) { ...; return; };`
+    // then a guarded read of cmd/args. The nested if-as-body closes the
+    // outer virtual body at the line end, the body return lands on the
+    // inner merge, and the trailing construct branches from that
+    // return-marked merge. The merge's def state must still flow to the
+    // continuation: a return block WITH successors is not terminal, so
+    // computeBlockEntry cannot skip its def_exit (EPH-I0121). The
+    // no-nest control (p14_editor_no_nest.zig) stays silent.
+    const content =
+        \\fn extract(p: *[]const u8) void {
+        \\    p.* = "x";
+        \\}
+        \\fn extractOpt(p: *u8) void {
+        \\    p.* = 1;
+        \\}
+        \\fn matchArgs(args: anytype) bool {
+        \\    _ = args;
+        \\    return true;
+        \\}
+        \\fn executeName(cmd: []const u8, args: []const u8) void {
+        \\    _ = cmd;
+        \\    _ = args;
+        \\}
+        \\fn editorShape(c: bool, fmt: bool) void {
+        \\    var option: u8 = 0;
+        \\    var then = false;
+        \\    var cmd: []const u8 = undefined;
+        \\    var args: []const u8 = undefined;
+        \\    if (matchArgs(.{ extractOpt(&option), "then", .{ extract(&cmd), extract(&args) } })) {
+        \\        then = true;
+        \\    } else if (matchArgs(.{ "then", .{ extract(&cmd), extract(&args) } })) {
+        \\        then = true;
+        \\    } else {
+        \\        _ = matchArgs(.{extractOpt(&option)});
+        \\    }
+        \\    if (option == 0 and fmt) if (c) {
+        \\        if (then) executeName(cmd, args);
+        \\        return;
+        \\    };
+        \\    if (then)
+        \\        return executeName(cmd, args);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0121_nest.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0121_nest.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: no-nest editor shape control stays silent (EPH-I0121)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The p14_editor_no_nest.zig control: the guarded read at the fn
+    // tail without the outer same-line nested-if wrapper. Already silent
+    // before the fix; the pin locks the semantic.
+    const content =
+        \\fn extract(p: *[]const u8) void {
+        \\    p.* = "x";
+        \\}
+        \\fn extractOpt(p: *u8) void {
+        \\    p.* = 1;
+        \\}
+        \\fn matchArgs(args: anytype) bool {
+        \\    _ = args;
+        \\    return true;
+        \\}
+        \\fn executeName(cmd: []const u8, args: []const u8) void {
+        \\    _ = cmd;
+        \\    _ = args;
+        \\}
+        \\fn editorNoNest(c: bool) void {
+        \\    var option: u8 = 0;
+        \\    var then = false;
+        \\    var cmd: []const u8 = undefined;
+        \\    var args: []const u8 = undefined;
+        \\    if (matchArgs(.{ extractOpt(&option), "then", .{ extract(&cmd), extract(&args) } })) {
+        \\        then = true;
+        \\    } else if (matchArgs(.{ "then", .{ extract(&cmd), extract(&args) } })) {
+        \\        then = true;
+        \\    } else {
+        \\        _ = matchArgs(.{extractOpt(&option)});
+        \\    }
+        \\    _ = c;
+        \\    if (then)
+        \\        return executeName(cmd, args);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0121_nonest.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0121_nonest.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string content no longer fakes a same-line fill (EPH-I0124)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // probe_mixed.zig: the string `"x = 1"` faked an assignment
+    // occurrence whose phantom effect could hide the real `x = 2` fill
+    // from the read coverage scan. The quote-aware assignment scan skips
+    // the string, the real fill covers `use(x)`, and the line stays
+    // silent (EPH-I0124). The string-free isolation (r2_h_nostr) and the
+    // other-name string (r2_i_otherstr) stay silent too.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn mixedLineStringThenFill() void {
+        \\    var x: u32 = undefined;
+        \\    const s = "x = 1"; x = 2; use(x);
+        \\    _ = s;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0124_mixed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0124_mixed.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+
+    const control =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn stringOnlyRead() void {
+        \\    var x: u32 = undefined;
+        \\    const s = "x = 1"; use(x);
+        \\    _ = s;
+        \\}
+    ;
+    var control_run = try runCFGMemoryTest(&diag, allocator, "da_i0124_strread.zig", control);
+    defer control_run.deinit(allocator);
+
+    // The string-only read is a genuine uninit read: the string never
+    // fills x, so the report fires (the isolation direction).
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(control_run.issues.items, "da_i0124_strread.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: string content in a branch arm no longer arms the suppressor (EPH-I0870)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // p_s2.zig: the else arm's string `"{ x = 5; }"` faked an assignment
+    // in branchAssignsVar, arming the early-return suppressor and hiding
+    // the genuine uninit read on the a=false path. The quote-aware
+    // branch scan ignores the string, so the read fires (EPH-I0870).
+    const content =
+        \\fn f(a: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) {
+        \\        x = 1;
+        \\    } else {
+        \\        const s = "{ x = 5; }";
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0870_strarm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0870_strarm.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: second same-line control arm stays silent (EPH-I0871, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // q1.zig: `if (a) { x = 1; } if (b) { x = 2; } return x;` stays
+    // silent though the A=false,B=false path reads uninitialized x. Only
+    // the first same-line control brace claims the opener; the second
+    // arm's braces are expression braces, its fill gets whole-line
+    // (entry-block) attribution, and the trailing read is covered. The
+    // residual is documented at the ArmSpan and recordGenEffect docs;
+    // this pin locks the current verdict (EPH-I0871, adjudicated
+    // documentation-arm per the plan).
+    const content =
+        \\fn f(a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) { x = 1; } if (b) { x = 2; }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0871_secondarm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0871_secondarm.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line else-if chain unassigned path stays silent (EPH-I0872, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // r2_d.zig: `if (a) { x = 1; } else if (b) { return 1; } return x;`
+    // stays silent though the A=false,B=false path reads uninitialized
+    // x. The chain line records no column spans (else-if lines are
+    // excluded from span recording), so the if-arm's fill gens the entry
+    // block and covers every downstream path. The chain parsers collect
+    // branches only past a depth-zero close, so the same-line else-if
+    // arm never joins the list; the residual is documented at
+    // validateBranchCoverage and pinned here (EPH-I0872, adjudicated
+    // documentation-arm per the plan).
+    const content =
+        \\fn f(a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) { x = 1; } else if (b) { return 1; }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0872_chain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0872_chain.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line else-if chain unassigned path stays silent (EPH-I0872, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // t4.zig: the multi-line form of the same class stays silent on the
+    // A=false,B=true path (sink() assigns nothing). The else-if arm's
+    // blocks are not modeled: the deferred if entry is finished before
+    // the line-start else-if can claim it, and the final else line has
+    // no pattern (its brace is an expression brace), so `x = 2` lands in
+    // the merge block and covers the trailing read. Same documented
+    // residual class as the one-line pin (EPH-I0872).
+    const content =
+        \\fn sink() void {}
+        \\fn f(a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (a) { x = 1; }
+        \\    else if (b) { sink(); }
+        \\    else { x = 2; }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0872_mlchain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0872_mlchain.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: braceless while body keeps pre-B2 verdict" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -50280,11 +50692,14 @@ test "nextAssignmentOccurrence skips whitespace-spaced dot field writes (EPH-I07
     // `foo . buf = 1` writes foo's field through a spaced dot, so the
     // occurrence is no assignment target of the local buf.
     var s: usize = 0;
-    try std.testing.expect(nextAssignmentOccurrence("foo . buf = 1;", "buf", &s) == null);
+    var scan = AssignmentScanCtx{ .cls = LineClassifier.init("foo . buf = 1;"), .comment_start = null };
+    try std.testing.expect(nextAssignmentOccurrence("foo . buf = 1;", "buf", &s, &scan) == null);
     s = 0;
-    try std.testing.expect(nextAssignmentOccurrence("foo .\tbuf = 1;", "buf", &s) == null);
+    scan = AssignmentScanCtx{ .cls = LineClassifier.init("foo .\tbuf = 1;"), .comment_start = null };
+    try std.testing.expect(nextAssignmentOccurrence("foo .\tbuf = 1;", "buf", &s, &scan) == null);
     s = 0;
-    try std.testing.expect(nextAssignmentOccurrence("buf = 1;", "buf", &s) != null);
+    scan = AssignmentScanCtx{ .cls = LineClassifier.init("buf = 1;"), .comment_start = null };
+    try std.testing.expect(nextAssignmentOccurrence("buf = 1;", "buf", &s, &scan) != null);
 }
 
 test "hasSliceOccurrence skips whitespace-spaced dot field slices (EPH-I0795)" {
@@ -64585,6 +65000,101 @@ test "ZA204: filled vars stay silent with multi-var tracking" {
         "za204_filled.zig",
         RULE_UNDEFINED_USAGE,
     ) == 0);
+}
+
+test "ZA204: single-line struct literal undefined field is reported (EPH-I0413)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // F7 (band-B06): the decl line's fields were never collected, so the
+    // single-line literal's undefined field never reported. The decl
+    // line now collects its fields and closes the literal (EPH-I0413);
+    // the unfilled field reports at the fn close like the multi-line
+    // form (EPH-I0421).
+    const content =
+        \\fn build() void {
+        \\    var s = Foo{ .a = undefined };
+        \\    use(s);
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_single.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_single.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "za204_single.zig", RULE_UNDEFINED_USAGE),
+    );
+    var found_line: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
+            mem.eql(u8, issue.file, "za204_single.zig"))
+        {
+            found_line = issue.line;
+        }
+    }
+    // The report points at the decl line's `= undefined`, not the scope
+    // end (the same line/col contract as the multi-line form).
+    try std.testing.expectEqual(@as(usize, 2), found_line);
+}
+
+test "ZA204: later anonymous literal field is not misattributed (EPH-I0413)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // F7 (band-B06): the stale open literal (the decl line's braces were
+    // never counted) misattributed the anonymous literal argument's
+    // `.b = undefined` to the outer struct `s`, adding a spurious
+    // unfilled-field report. The single-line literal now closes on its
+    // decl line, so only the genuine `s.a` pending field survives
+    // (EPH-I0413).
+    const content =
+        \\fn build() void {
+        \\    var s = Foo{ .a = undefined };
+        \\    use(.{ .b = undefined });
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "za204_anon.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "za204_anon.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "za204_anon.zig", RULE_UNDEFINED_USAGE),
+    );
+    var found_line: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
+            mem.eql(u8, issue.file, "za204_anon.zig"))
+        {
+            found_line = issue.line;
+        }
+    }
+    // Only the decl line's `.a = undefined` reports; the `.b` on line 3
+    // never joins the pending set.
+    try std.testing.expectEqual(@as(usize, 2), found_line);
 }
 
 test "ZA204: struct literal field default stays silent" {

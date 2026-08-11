@@ -14289,11 +14289,11 @@ fn extractStructVarName(t: []const u8) ?[]const u8 {
     return if (isStructLiteralStart(t, i)) name else null;
 }
 
-/// Extract field name from ".field_name = undefined"
-fn extractStructFieldName(t: []const u8) ?[]const u8 {
-    // Find .field_name = undefined pattern
-    const undef_pos = mem.indexOf(u8, t, "= undefined") orelse return null;
-
+/// Extract the field name from the ".field_name = undefined" pattern at
+/// `undef_pos` (the `=` position). The walk is anchored on the given
+/// occurrence, so a multi-field line yields every field, not just the
+/// first (EPH-I0893).
+fn extractStructFieldName(t: []const u8, undef_pos: usize) ?[]const u8 {
     // Work backwards from = to find field name
     var i: usize = undef_pos;
     // Skip space before =
@@ -14648,8 +14648,10 @@ const ErrorAnalysisState = struct {
     defer_brace_depth: usize = 0,
     // Track current function name for context-sensitive checks
     current_func_name: []const u8 = "",
-    // Start line of the current function (0 outside a function): the
-    // null-guard lookback floor for the line-based ZA203 tier (EPH-I0864)
+    // Start line index of the current function (0 outside a function):
+    // the null-guard lookback floor for the line-based ZA203 tier. The
+    // index is 0-based so the scan floor includes the signature line
+    // itself (EPH-I0864, EPH-I0891).
     current_func_start: usize = 0,
     func_brace_depth: usize = 0,
     // Track if current function has any defer statements (for ZA206)
@@ -14781,10 +14783,10 @@ fn extractFuncName(t: []const u8) ?[]const u8 {
 }
 
 /// Track current function context for context-sensitive checks
-fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState, line_num: usize) void {
+fn trackFunctionContext(t: []const u8, state: *ErrorAnalysisState, line_idx: usize) void {
     if (extractFuncName(t)) |name| {
         state.current_func_name = name;
-        state.current_func_start = line_num;
+        state.current_func_start = line_idx;
         state.func_brace_depth = startBraceBlock(t).depth;
         state.has_defer_in_func = false;
         return;
@@ -14822,8 +14824,12 @@ fn trackStructLiteral(
         return;
     }
     if (!state.struct_state.in_literal) return;
-    trackStructBraces(t, &state.struct_state);
+    // Collect BEFORE the brace count mutates the depth: the walk base
+    // must be the carried start-of-line depth, so a net non-zero line
+    // computes every position at its true depth, and a field on the
+    // literal's closing line is still collected (EPH-I0893).
     collectUndefinedField(t, ln, state);
+    trackStructBraces(t, &state.struct_state);
 }
 
 /// Track braces within a struct literal. String and char content and
@@ -14844,19 +14850,66 @@ fn trackStructBraces(t: []const u8, ss: *StructLiteralState) void {
     }
 }
 
-/// Collect undefined field if found
+/// Direct fields of the tracked struct literal sit at relative brace
+/// depth 1: the literal's own opening `{` is the first code-position
+/// brace on the declaration line (extractStructVarName's shape), and a
+/// nested anonymous literal pushes its fields to depth >= 2
+/// (EPH-I0893).
+const struct_literal_field_depth = 1;
+
+/// Collect every `= undefined` field at the tracked literal's own depth.
+/// The walk is literal-masked and brace-counted from the line start
+/// (struct_state.brace_depth carries across lines): a nested
+/// anonymous-literal field is not attributed to the outer struct, and a
+/// multi-field single-line literal collects all its fields, not just the
+/// first (EPH-I0893). An occurrence is accepted only when the walk's
+/// literal state at its position is code: `= undefined` inside strings,
+/// char literals, comments, and `\\` multiline tails is data and never
+/// collects (EPH-I0883). The walk stops when the tracked literal closes
+/// (the depth returns to zero, the level the declaration line started
+/// at): a same-line second declaration would re-raise the depth and its
+/// fields would be misattributed (EPH-I0893).
 fn collectUndefinedField(t: []const u8, ln: usize, s: *ErrorAnalysisState) void {
     if (!s.struct_state.in_literal) return;
-    const undef_pos = mem.indexOf(u8, t, "= undefined") orelse return;
-    const field = extractStructFieldName(t) orelse return;
-    if (s.pending_field_count >= s.pending_struct_fields.len) return;
-    s.pending_struct_fields[s.pending_field_count] = .{
-        .struct_name = s.struct_state.struct_name,
-        .field_name = field,
-        .line = ln,
-        .col = undef_pos + 1,
-    };
-    s.pending_field_count += 1;
+    var lit = types.LiteralState.forLine(t) orelse return;
+    var depth = s.struct_state.brace_depth;
+    var i: usize = 0;
+    var search_from: usize = 0;
+    while (mem.indexOfPos(u8, t, search_from, "= undefined")) |undef_pos| {
+        search_from = undef_pos + 1;
+        while (i < undef_pos) : (i += 1) {
+            const pos = lit.updateForChar(t, i) orelse continue;
+            if (t[pos] == '{') depth += 1;
+            if (t[pos] != '}' or depth == 0) continue;
+            depth -= 1;
+            // The tracked literal's close returns the depth to zero,
+            // the level the declaration line started at. Stop the
+            // walk: a same-line second declaration would re-raise the
+            // depth and its fields would be misattributed
+            // (EPH-I0893). On continuation lines the walk base is the
+            // carried start-of-line depth (collectUndefinedField runs
+            // before trackStructBraces), so the depth reaches zero
+            // only here, at the tracked literal's own close: the
+            // literal is still open on every earlier position of the
+            // line, and a later line's collect bails on in_literal.
+            if (depth == 0) return;
+        }
+        // The occurrence must sit in code position: inside a string,
+        // char literal, comment, or `\\` multiline tail, the text is
+        // data (EPH-I0883). `=` is not a quote, so the probe does not
+        // mutate the walk state (EPH-I0893).
+        if (lit.updateForChar(t, undef_pos) == null) continue;
+        if (depth != struct_literal_field_depth) continue;
+        const field = extractStructFieldName(t, undef_pos) orelse continue;
+        if (s.pending_field_count >= s.pending_struct_fields.len) return;
+        s.pending_struct_fields[s.pending_field_count] = .{
+            .struct_name = s.struct_state.struct_name,
+            .field_name = field,
+            .line = ln,
+            .col = undef_pos + 1,
+        };
+        s.pending_field_count += 1;
+    }
 }
 
 /// Activate pending fields when struct literal closes
@@ -15670,7 +15723,10 @@ const ErrorTrackCtx = struct {
     line: []const u8,
     state: *ErrorAnalysisState,
     path: []const u8,
-    line_num: usize,
+    // 0-based index of the current line: the function-start floor is
+    // stored 0-based so the signature line stays inside the null-guard
+    // scan (EPH-I0891).
+    line_idx: usize,
 };
 
 /// Update error analysis state for a single line (tracking only)
@@ -15689,7 +15745,7 @@ fn updateErrorState(ctx: ErrorTrackCtx) struct { skip_undefined: bool } {
 
     const skip = in_test or isModuleLevelDecl(ctx.line) or state.in_static_struct;
 
-    trackFunctionContext(ctx.t, state, ctx.line_num);
+    trackFunctionContext(ctx.t, state, ctx.line_idx);
     trackDeferBlock(ctx.t, state);
     return .{ .skip_undefined = skip };
 }
@@ -15716,7 +15772,7 @@ fn scanFileErrorLine(ctx: *const FileErrorScanCtx, line: []const u8, line_idx: u
         .line = line,
         .state = ctx.state,
         .path = ctx.path,
-        .line_num = line_num,
+        .line_idx = line_idx,
     });
 
     const pf_ctx: PendingFieldsCtx = .{ .t = t, .path = ctx.path };
@@ -21655,6 +21711,12 @@ const CFGState = struct {
     paren_depth: isize = 0,
     sig_container_depth: usize = 0,
     body_started: bool = false,
+    // Literal state carried across signature lines (EPH-I0887): a
+    // string-literal default continued with `\`+newline stays open on
+    // the next line, so its `)` and `{` are data and cannot close the
+    // paren count early or open the body. Comments, char literals, and
+    // `\\` multiline tails end at the line end and never carry.
+    sig_in_str: bool = false,
     // Test block context tracking
     in_test_block: bool = false,
     test_brace_depth: usize = 0,
@@ -21752,6 +21814,7 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     state.paren_depth = 0;
     state.sig_container_depth = 0;
     state.body_started = false;
+    state.sig_in_str = false;
     // Detect if function returns errors: ) ! or !void, !bool, etc.
     // (shared marker set — continuation signature lines are OR-ed in by
     // trackCFGBraces while the body has not started, EPH-I0072)
@@ -21809,26 +21872,59 @@ fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
 /// not immediately follow the word `error` (`error{...}` sets are signature
 /// containers, not bodies): sets body_started + brace_depth = 1 and returns
 /// the index just past the body brace. Returns t.len while still in the
-/// signature.
+/// signature. The walk is literal-masked: parens and braces inside
+/// string-literal defaults, char literals, and comments are data, not
+/// syntax, so a `)` inside a default value cannot close the paren count
+/// early and desync body detection (EPH-I0887, the EPH-I0465 sibling
+/// masking). The string state carries across signature lines: a default
+/// continued with `\`+newline stays open on the next line, so its `)`
+/// and `{` are data too (EPH-I0887).
 fn scanCFGSignatureLine(t: []const u8, state: *CFGState) usize {
+    // Seed the literal state from the carried string flag: a
+    // `\`+newline continuation keeps the string-literal default open
+    // across signature lines (EPH-I0887). Comments and `\\` multiline
+    // tails end at the line end and never carry.
+    var lit = types.LiteralState.forLine(t) orelse {
+        state.sig_in_str = false;
+        return t.len;
+    };
+    lit.in_str = state.sig_in_str;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
-        const c = t[i];
+        const pos = lit.updateForChar(t, i) orelse continue;
+        const c = t[pos];
         if (c == '(') state.paren_depth += 1;
         if (c == ')') state.paren_depth -= 1;
         if (c == '}' and state.sig_container_depth > 0) {
             state.sig_container_depth -= 1;
         }
         if (c != '{') continue;
-        if (state.paren_depth != 0 or isErrorSetOpen(t, i)) {
+        if (state.paren_depth != 0 or isErrorSetOpen(t, pos)) {
             state.sig_container_depth += 1;
             continue;
         }
         state.body_started = true;
         state.brace_depth = 1;
-        return i + 1;
+        return pos + 1;
     }
+    // Carry the string state only across a real continuation: a string
+    // still open at the line end continues only when the line ends with
+    // a `\`+newline escape (odd trailing backslash run). Anything else
+    // is broken code and must not mask the next line (EPH-I0887).
+    state.sig_in_str = lit.in_str and lineEndsInStringContinuation(t);
     return t.len;
+}
+
+/// True when the line ends with a `\`+newline continuation: the trailing
+/// backslash run is odd, so the last `\` escapes the newline and a
+/// string opened on this line stays open on the next (EPH-I0887). A
+/// trailing carriage return (CRLF files) does not break the run.
+fn lineEndsInStringContinuation(t: []const u8) bool {
+    var i = t.len;
+    if (i > 0 and t[i - 1] == '\r') i -= 1;
+    var run: usize = 0;
+    while (i > 0 and t[i - 1] == '\\') : (i -= 1) run += 1;
+    return run % 2 == 1;
 }
 
 /// True when the `{` at index i opens an error set (`error {...}`) rather
@@ -23755,7 +23851,12 @@ fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
 /// through the same guard verdict since EPH-I0864; its lookback is
 /// fn-bounded through the error scan's function-start tracking.
 fn hasNullCheckExit(line: []const u8, lines: []const []const u8, i: usize, limit: usize) bool {
-    if (guardLineHasSameLineExit(line)) return true;
+    // The matched predicate anchors the judge on the guard's own
+    // condition group: the line reached this query with "== null"
+    // present, and a leading call's group must not own the verdict
+    // (EPH-I0892).
+    const eq_pos = mem.indexOf(u8, line, "== null") orelse return false;
+    if (guardLineHasSameLineExit(line, eq_pos)) return true;
     if (i + 1 >= limit) return false;
     const next = mem.trim(u8, lines[i + 1], " \t\r");
     return mem.startsWith(u8, next, "return") or
@@ -23767,10 +23868,12 @@ fn hasNullCheckExit(line: []const u8, lines: []const []const u8, i: usize, limit
 /// line is `if (x == null) return;` or `if (x == null) { return; }`. An
 /// exit inside a same-line nested conditional (`{ if (q) return; }`)
 /// does not qualify — the ZA203-family sibling of the classifyNullCheck
-/// same-line gate (EPH-I0859, EPH-I0861). The condition close is the
-/// first code-position paren group, so a continued condition
-/// (`if (x == null || q) return;`) keeps its exit.
-fn guardLineHasSameLineExit(line: []const u8) bool {
+/// same-line gate (EPH-I0859, EPH-I0861). The judge anchors on the
+/// paren group that contains the guard predicate at `pred_col`: a
+/// leading call on the same line (`sink(x); if (p == null) return;`)
+/// owns an earlier group and its tail is not the guard's (EPH-I0892).
+/// A continued condition (`if (x == null || q) return;`) keeps its exit.
+fn guardLineHasSameLineExit(line: []const u8, pred_col: usize) bool {
     var mode: QuoteMode = .none;
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
@@ -23781,7 +23884,10 @@ fn guardLineHasSameLineExit(line: []const u8) bool {
         }
         if (c != '(') continue;
         const close = parenCloseAt(line, i) orelse return false;
-        return hasSameLineGuardExit(line[close + 1 ..]);
+        if (i <= pred_col and pred_col < close) {
+            return hasSameLineGuardExit(line[close + 1 ..]);
+        }
+        i = close;
     }
     return false;
 }
@@ -23821,7 +23927,12 @@ fn hasNullGuard(
     // is stale for ZA203 suppression and is missed on purpose. The
     // func_line floor bounds the scan to the current function: the
     // line-based ZA203 emitter scans the whole file and must not match a
-    // guard in the previous function (EPH-I0864).
+    // guard in the previous function (EPH-I0864). func_line is the
+    // signature line's 0-based index and the scan includes it, so a guard
+    // on the signature line itself suppresses later lines (EPH-I0891). A
+    // zero floor (no function context) degenerates to the bare window:
+    // adjudicated module-level consult, the orelse there is comptime
+    // (EPH-I0891).
     const stop = @max(current_idx -| null_guard_lookback, func_line);
     var i = current_idx;
     while (i > stop) {
@@ -24197,12 +24308,24 @@ fn extractUnwrappedVar(t: []const u8, dot_q_pos: usize) ?[]const u8 {
     return null;
 }
 
-/// Check if a line has `var_name == null)` pattern
-fn hasNullEqualityCheck(ctx: []const u8, var_name: []const u8) bool {
-    const var_pos = mem.indexOf(u8, ctx, var_name) orelse return false;
-    const after = ctx[var_pos + var_name.len ..];
-    return mem.startsWith(u8, after, " == null)") or
-        mem.startsWith(u8, after, " == null )");
+/// Position of the `==` in a `var_name == null)` guard predicate on the
+/// line, or null when the line is not that guard shape. Spaces and tabs
+/// between the variable name and `==`, and between `null` and `)`, are
+/// tolerated. The position anchors guardLineHasSameLineExit on the
+/// guard's own condition group (EPH-I0892).
+fn hasNullEqualityCheck(ctx: []const u8, var_name: []const u8) ?usize {
+    const var_pos = mem.indexOf(u8, ctx, var_name) orelse return null;
+    var after = var_pos + var_name.len;
+    while (after < ctx.len and (ctx[after] == ' ' or ctx[after] == '\t')) after += 1;
+    if (after + "== null".len > ctx.len) return null;
+    if (!mem.startsWith(u8, ctx[after..], "== null")) return null;
+    const tail = after + "== null".len;
+    if (tail >= ctx.len) return null;
+    if (ctx[tail] == ')') return after;
+    if ((ctx[tail] == ' ' or ctx[tail] == '\t') and tail + 1 < ctx.len and ctx[tail + 1] == ')') {
+        return after;
+    }
+    return null;
 }
 
 /// Max following-block lines the early-return null-guard scan accepts
@@ -24225,11 +24348,12 @@ fn hasEarlyReturnNullGuard(
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
-        if (!hasNullEqualityCheck(ctx, var_name)) continue;
+        const eq_pos = hasNullEqualityCheck(ctx, var_name) orelse continue;
         // The same-line exit is judged at the guard's own depth (EPH-I0859
         // mechanism, EPH-I0865): a nested same-line conditional exit
-        // (`{ if (q) return; }`) does not dominate the fall-through.
-        if (guardLineHasSameLineExit(ctx)) return true;
+        // (`{ if (q) return; }`) does not dominate the fall-through. The
+        // judge anchors on the guard's own condition group (EPH-I0892).
+        if (guardLineHasSameLineExit(ctx, eq_pos)) return true;
         const check_end = @min(i + max_early_return_guard_body_lines, current_idx);
         if (hasExitInFollowingBlock(lines, i + 1, check_end)) return true;
     }
@@ -25115,11 +25239,14 @@ const max_zero_check_guard_body_lines = 6;
 
 fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
     if (mem.indexOf(u8, ctx.t, ctx.var_name) == null) return false;
-    if (mem.indexOf(u8, ctx.t, "== 0)") == null) return false;
+    // The matched predicate anchors the judge on the guard's own
+    // condition group: a leading call's group must not own the verdict
+    // (EPH-I0892).
+    const eq_pos = mem.indexOf(u8, ctx.t, "== 0)") orelse return false;
     // The same-line exit is judged at the guard's own depth (EPH-I0859
     // mechanism, EPH-I0865): a nested same-line conditional exit
     // (`{ if (q) break; }`) does not dominate the fall-through.
-    if (guardLineHasSameLineExit(ctx.t)) return true;
+    if (guardLineHasSameLineExit(ctx.t, eq_pos)) return true;
     const block_end = if (ctx.line_idx + max_zero_check_guard_body_lines < ctx.current_idx)
         ctx.line_idx + max_zero_check_guard_body_lines
     else
@@ -45934,6 +46061,43 @@ test "scanCFGSignatureLine: spaced error set is not the body brace (EPH-I0470)" 
     try std.testing.expectEqual(@as(usize, 35), pos);
 }
 
+test "scanCFGSignatureLine masks string-literal parens (EPH-I0887)" {
+    // A `)` inside a string-literal default is data, not syntax: the
+    // paren count must stay balanced so the body `{` still opens at its
+    // real position (EPH-I0887, the EPH-I0465 sibling masking).
+    var state = CFGState{};
+    const pos = scanCFGSignatureLine("fn f(a: []const u8 = \")\") void {", &state);
+    try std.testing.expect(state.body_started);
+    try std.testing.expectEqual(@as(usize, 1), state.brace_depth);
+    try std.testing.expectEqual(@as(usize, 32), pos);
+}
+
+test "scanCFGSignatureLine ignores comment parens (EPH-I0887)" {
+    // A comment `)` on a pre-body line is data: it must not close the
+    // carried paren count early, or the body `{` reads as a signature
+    // container and the CFG extraction never starts the body.
+    var state = CFGState{};
+    _ = scanCFGSignatureLine("fn f(a: usize) void // )", &state);
+    const pos = scanCFGSignatureLine("{", &state);
+    try std.testing.expect(state.body_started);
+    try std.testing.expectEqual(@as(usize, 1), pos);
+    try std.testing.expectEqual(@as(isize, 0), state.paren_depth);
+}
+
+test "scanCFGSignatureLine carries a continued string default (EPH-I0887)" {
+    // A `\`+newline continuation keeps the string-literal default open
+    // on the next signature line: the `)` and the body `{` after the
+    // closing quote are syntax, not string data (EPH-I0887).
+    var state = CFGState{};
+    _ = scanCFGSignatureLine("fn f(a: []const u8 = \"foo \\", &state);
+    try std.testing.expect(!state.body_started);
+    const pos = scanCFGSignatureLine("    bar\") void {", &state);
+    try std.testing.expect(state.body_started);
+    try std.testing.expectEqual(@as(isize, 0), state.paren_depth);
+    try std.testing.expectEqual(@as(usize, 1), state.brace_depth);
+    try std.testing.expectEqual(@as(usize, 16), pos);
+}
+
 test "detectCFGFuncStart: a closed string before fn does not hide it (EPH-I0471)" {
     var state = CFGState{};
     // The return value reports a NESTED fn; the detection itself shows in
@@ -64305,6 +64469,100 @@ test "hasNullGuard finds a guard inside the lookback window (EPH-I0225)" {
     try std.testing.expect(hasNullGuard(lines, lines.len - 1, 0, "x"));
 }
 
+test "line-tier orelse after a signature-line null guard stays silent (EPH-I0891)" {
+    // The guard sits on the fn signature line. The lookback floor is the
+    // signature line's 0-based index: a 1-based floor excludes the line
+    // and the line tier fires a ZA203 FP on the orelse below while the
+    // CFG tier suppresses (EPH-I0891).
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer issues.deinit(std.testing.allocator);
+    var state = ErrorAnalysisState{};
+    const lines = [_][]const u8{
+        "fn f() u8 { if (p == null) return 0; }",
+        "    const x = p orelse unreachable;",
+    };
+    var ctx = FileErrorScanCtx{
+        .allocator = std.testing.allocator,
+        .issues = &issues,
+        .path = "src/app.zig",
+        .all_lines = &lines,
+        .state = &state,
+    };
+    try scanFileErrorLine(&ctx, lines[0], 0);
+    try scanFileErrorLine(&ctx, lines[1], 1);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "func_start zero floor may match a guard in a previous fn (EPH-I0891)" {
+    // Outside a function (func_start == 0) the floor is the file start:
+    // the 20-line window can reach a guard in an earlier function. The
+    // consult is adjudicated as accepted module-level behavior (the
+    // module-level orelse is comptime), pinned as a probe (EPH-I0891).
+    const lines = [_][]const u8{
+        "fn earlier(p: ?*u8) u8 {",
+        "    if (p == null) return 0;",
+        "}",
+        "    const x = p orelse unreachable;",
+    };
+    try std.testing.expect(hasNullGuard(&lines, 3, 0, "p"));
+}
+
+test "hasNullCheckExit accepts a compound-line guard exit (EPH-I0892)" {
+    // A leading call's paren group precedes the guard's own `if (...)`
+    // group: the same-line exit is judged from the guard's group close,
+    // not the call's (EPH-I0892).
+    var buf: [4][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "sink(x); if (p == null) return 0;", 1);
+    try std.testing.expect(hasNullCheckExit(lines[1], lines, 1, lines.len));
+}
+
+test "hasNullCheckExit judges the guard's own nested conditional (EPH-I0892)" {
+    // The nested-exit rejection applies to the guard's own group even
+    // when a leading call precedes it: the guard block falls through on
+    // q false, so the exit does not qualify (EPH-I0859 judgment,
+    // EPH-I0892 anchoring).
+    var buf: [4][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "work();", "sink(x); if (p == null) { if (q) return 0; }", 1);
+    try std.testing.expect(!hasNullCheckExit(lines[1], lines, 1, lines.len));
+}
+
+test "hasEarlyReturnNullGuard accepts a compound-line guard (EPH-I0892)" {
+    // The ZA801 routing inherits the anchored judge: a leading call on
+    // the guard line must not move the exit verdict to the call's tail
+    // (EPH-I0892).
+    const lines = [_][]const u8{
+        "fn f(p: ?*u8) u8 {",
+        "    sink(x); if (p == null) return 0;",
+        "    const v = p.*;",
+    };
+    try std.testing.expect(hasEarlyReturnNullGuard(&lines, 2, "p"));
+}
+
+test "guardLineHasSameLineExit anchors the predicate's group (EPH-I0892)" {
+    // The judge anchors on the paren group that contains the predicate:
+    // a leading call's group owns an earlier span and its tail is not
+    // the guard's (EPH-I0892).
+    const line = "sink(x); if (p == null) return 0;";
+    const eq_pos = mem.indexOf(u8, line, "== null") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(guardLineHasSameLineExit(line, eq_pos));
+    // The nested-exit rejection applies to the guard's own group even on
+    // a compound line (EPH-I0859 judgment, EPH-I0892 anchoring).
+    const nested = "sink(x); if (p == null) { if (q) return 0; }";
+    const nested_eq = mem.indexOf(u8, nested, "== null") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!guardLineHasSameLineExit(nested, nested_eq));
+}
+
+test "hasNullEqualityCheck returns the predicate position (EPH-I0892)" {
+    // The position points at the `==` of the var's own null check, the
+    // anchor for the guard's condition group (EPH-I0892).
+    const line = "sink(x); if (p == null) return 0;";
+    const eq_pos = hasNullEqualityCheck(line, "p") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("== null)", line[eq_pos .. eq_pos + "== null)".len]);
+    try std.testing.expect(hasNullEqualityCheck(line, "q") == null);
+    try std.testing.expect(hasNullEqualityCheck("if (p == null) return 0;", "p") != null);
+    try std.testing.expect(hasNullEqualityCheck("if (p == 0) return 0;", "p") == null);
+}
+
 test "hasNullCheckExit rejects a same-line nested conditional exit (EPH-I0861)" {
     var buf: [4][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "if (x == null) { if (q) return; }", 1);
@@ -65052,6 +65310,26 @@ test "isZeroCheckGuard same-line exits judged at the guard's depth (EPH-I0865)" 
         .lines = &lines,
         .line_idx = 2,
         .current_idx = 4,
+    }));
+}
+
+test "isZeroCheckGuard accepts a compound-line zero guard (EPH-I0892)" {
+    // The ZA901 routing inherits the anchored judge: a leading call on
+    // the guard line must not move the exit verdict to the call's tail
+    // (EPH-I0892).
+    const lines = [_][]const u8{
+        "fn f(m: usize, x: u32) usize {",
+        "    sink(x); if (m == 0) return 0;",
+        "    m -= 1;",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(isZeroCheckGuard(.{
+        .t = "    sink(x); if (m == 0) return 0;",
+        .var_name = "m",
+        .lines = &lines,
+        .line_idx = 1,
+        .current_idx = 3,
     }));
 }
 
@@ -65878,11 +66156,154 @@ test "collectUndefinedField records one field with 1-based col (EPH-I0421)" {
     var s = ErrorAnalysisState{};
     s.struct_state.in_literal = true;
     s.struct_state.struct_name = "s";
+    // The literal is open at its own depth 1 (its opening `{` sat on the
+    // declaration line): the continuation-line field is a direct field.
+    s.struct_state.brace_depth = 1;
     collectUndefinedField(".a = undefined;", 3, &s);
     try std.testing.expectEqual(@as(usize, 1), s.pending_field_count);
     try std.testing.expectEqualStrings("a", s.pending_struct_fields[0].field_name);
     try std.testing.expectEqual(@as(usize, 3), s.pending_struct_fields[0].line);
     try std.testing.expectEqual(@as(usize, 4), s.pending_struct_fields[0].col);
+}
+
+test "collectUndefinedField collects every same-depth field (EPH-I0893)" {
+    // A multi-field single-line literal collects all its fields, not
+    // just the first: the one-shot scan silently dropped `.b` (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "s";
+    collectUndefinedField("var s = Foo{ .a = undefined, .b = undefined };", 3, &s);
+    try std.testing.expectEqual(@as(usize, 2), s.pending_field_count);
+    try std.testing.expectEqualStrings("a", s.pending_struct_fields[0].field_name);
+    try std.testing.expectEqualStrings("b", s.pending_struct_fields[1].field_name);
+}
+
+test "collectUndefinedField skips nested anonymous-literal fields (EPH-I0893)" {
+    // `.b = undefined` belongs to the nested anonymous literal: it must
+    // not be attributed to the tracked outer struct (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "s";
+    collectUndefinedField("var s = Foo{ .a = .{ .b = undefined } };", 3, &s);
+    try std.testing.expectEqual(@as(usize, 0), s.pending_field_count);
+}
+
+test "collectUndefinedField collects outer fields around a nested literal (EPH-I0893)" {
+    // The depth walk re-enters the literal's own level after the nested
+    // literal closes: the outer `.c` is a direct field of `s` (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "s";
+    collectUndefinedField("var s = Foo{ .a = .{ .b = undefined }, .c = undefined };", 3, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_field_count);
+    try std.testing.expectEqualStrings("c", s.pending_struct_fields[0].field_name);
+}
+
+test "collectUndefinedField honors the carried literal depth (EPH-I0893)" {
+    // A continuation line inside a nested anonymous literal carries
+    // brace_depth 2: the field belongs to the nested literal, not the
+    // tracked outer one (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "s";
+    s.struct_state.brace_depth = 2;
+    collectUndefinedField(".b = undefined,", 4, &s);
+    try std.testing.expectEqual(@as(usize, 0), s.pending_field_count);
+}
+
+test "collectUndefinedField ignores a comment occurrence at depth 1 (EPH-I0893)" {
+    // A `// .b = undefined` comment at the literal's own depth is data:
+    // the raw occurrence search finds the text, but the masked probe
+    // rejects it, so no bogus field `b` is collected (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "s";
+    collectUndefinedField("var s = Foo{ .a = undefined, // .b = undefined };", 3, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_field_count);
+    try std.testing.expectEqualStrings("a", s.pending_struct_fields[0].field_name);
+}
+
+test "collectUndefinedField stops at the tracked literal's close (EPH-I0893)" {
+    // A same-line second declaration re-raises the walk depth to 1 after
+    // the tracked literal's `}`: its `.y` must not be attributed to the
+    // tracked struct `a` (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "a";
+    collectUndefinedField("var a = Foo{ .x = undefined }; var b = Bar{ .y = undefined };", 3, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_field_count);
+    try std.testing.expectEqualStrings("x", s.pending_struct_fields[0].field_name);
+}
+
+test "collectUndefinedField ignores a string-value occurrence (EPH-I0893)" {
+    // `= undefined` inside a string value at the literal's own depth is
+    // data: the masked probe rejects the occurrence, so no bogus field
+    // is collected (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    s.struct_state.in_literal = true;
+    s.struct_state.struct_name = "s";
+    collectUndefinedField("var s = Foo{ .a = \" .b = undefined\" };", 3, &s);
+    try std.testing.expectEqual(@as(usize, 0), s.pending_field_count);
+}
+
+test "trackStructLiteral collects a continuation field before a nested literal (EPH-I0893)" {
+    // The continuation branch collects BEFORE the brace count runs: the
+    // `.a` sits at the carried depth 1, and the line's `.{` nets the
+    // depth to 2 before the occurrence is examined under the reverse
+    // order, so the genuine direct field is rejected (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    trackStructLiteral("const s = Foo{", 1, &s);
+    trackStructLiteral(".a = undefined, .b = .{", 2, &s);
+    trackStructLiteral(".x = 1,", 3, &s);
+    trackStructLiteral("},", 4, &s);
+    trackStructLiteral("};", 5, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_field_count);
+    try std.testing.expectEqualStrings("a", s.pending_struct_fields[0].field_name);
+}
+
+test "trackStructLiteral collects the field after a same-line nested close (EPH-I0893)" {
+    // The line `}, .c = undefined,` closes the nested literal and opens
+    // a field of the outer one: `.c` sits at depth 1 after the close.
+    // Under the reverse order the close pre-nets the depth to 1 and the
+    // walk's zero-return fires before the occurrence (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    trackStructLiteral("const s = Foo{", 1, &s);
+    trackStructLiteral(".a = .{", 2, &s);
+    trackStructLiteral(".x = 1,", 3, &s);
+    trackStructLiteral("}, .c = undefined,", 4, &s);
+    trackStructLiteral("};", 5, &s);
+    try std.testing.expectEqual(@as(usize, 1), s.pending_field_count);
+    try std.testing.expectEqualStrings("c", s.pending_struct_fields[0].field_name);
+}
+
+test "trackStructLiteral collects the field on the literal's closing line (EPH-I0893)" {
+    // The literal closes on the same line as its last field: `.c` sits
+    // at depth 1 before the `}`. Under the reverse order the close runs
+    // first, in_literal turns false, and collect bails before the
+    // occurrence (EPH-I0893).
+    var s = ErrorAnalysisState{};
+    trackStructLiteral("const s = Foo{", 1, &s);
+    trackStructLiteral(".a = undefined,", 2, &s);
+    trackStructLiteral(".c = undefined };", 3, &s);
+    try std.testing.expectEqual(@as(usize, 2), s.pending_field_count);
+    try std.testing.expectEqualStrings("a", s.pending_struct_fields[0].field_name);
+    try std.testing.expectEqualStrings("c", s.pending_struct_fields[1].field_name);
+}
+
+test "extractStructFieldName walks from the given occurrence (EPH-I0893)" {
+    // The walk is anchored on the given `= undefined` position: a
+    // multi-field line yields every field, not just the first.
+    const t = "var s = Foo{ .a = undefined, .b = undefined };";
+    const first = mem.indexOf(u8, t, "= undefined") orelse return error.TestUnexpectedResult;
+    const second = mem.indexOfPos(u8, t, first + 1, "= undefined") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(
+        "a",
+        extractStructFieldName(t, first) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqualStrings(
+        "b",
+        extractStructFieldName(t, second) orelse return error.TestUnexpectedResult,
+    );
 }
 
 test "ZA204: unfilled struct field reports at the fn closing line (EPH-I0421)" {

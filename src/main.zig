@@ -16462,7 +16462,10 @@ fn reportTestBlock(ctx: *const TestScanCtx, state: *const TestFileScanState) !vo
 /// `test "catch {}"` and fixtures like `"} || rlp.Error"` would otherwise
 /// corrupt the block depth and misplace the block boundary. A `\\` multiline
 /// opener's tail blanks to end of line for the same reason (EPH-I0671).
-/// Lines longer than `buf` fall back to the raw line.
+/// Lines longer than `buf` fall back to the raw line — a literal brace on
+/// an over-cap line still reaches brace tracking (documented bound,
+/// EPH-I0444: generated/giant lines only; the ZT band masks those
+/// chunk-wise via BlankChunkIter, EPH-I0423).
 fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
     if (line.len > buf.len) return line;
     var i: usize = 0;
@@ -18049,6 +18052,10 @@ const ConcurrencyScanState = struct {
     in_defer: bool = false,
     defer_depth: usize = 0,
     defer_stmt_depth: usize = 0,
+    /// Literal-blanking buffer for one file pass (16 KB): an over-cap
+    /// line returns unblanked, so a literal brace on it still counts
+    /// toward brace depth (documented bound, EPH-I0444 — rare,
+    /// generated/giant lines only; see blankLiteralContents).
     blank_buf: [16 * 1024]u8 = undefined,
 
     fn deinit(self: *ConcurrencyScanState) void {
@@ -18618,6 +18625,11 @@ fn hasPlainReleaseAtDepth(
 /// cross-function acquire/release idiom (zls: `pool.mutex.lock()` in
 /// `stringToSliceLock`, unlocked in `LockedString.release`; InternPool's
 /// `ip.lock` pairs). The receiver field-chain text must match exactly.
+/// File-local bound (EPH-I0443): the scan holds one file's fn records,
+/// so a release living in ANOTHER file never pairs here — a cross-file
+/// lock API draws the warning below, not a note. Over-warn only (a
+/// resolved handle flagged), the same bound ZC104's join search
+/// discloses; a project-wide receiver index would close the gap.
 fn hasCrossFnRelease(
     records: []const FnLockRecord,
     self_idx: usize,
@@ -19052,7 +19064,9 @@ const BoundSpawn = struct {
     name: []const u8,
 };
 
-/// Bundled scan context for ZC104 line passes (param counts).
+/// Bundled scan context for ZC104 line passes (param counts). `blank_buf`
+/// is the file pass's 16 KB literal-blanking buffer: an over-cap line
+/// returns unblanked (documented bound, EPH-I0444).
 const SpawnScanCtx = struct {
     lines: []const []const u8,
     blank_buf: []u8,
@@ -19166,6 +19180,11 @@ fn hasReturnOf(code: []const u8, name: []const u8) bool {
 /// (the last-segment fallback's `receiver.field.join(` admission,
 /// EPH-I0904); the exact-name search keeps the strict boundary so
 /// `event.t.join(` never satisfies a local `t`.
+/// File-local bound (EPH-I0443): the search covers the spawn's own file
+/// only, so a handle stored here and joined in ANOTHER file draws the
+/// warning below. Over-warn, the safe direction (the last-segment
+/// fallback only ever suppresses); a project-wide join search would
+/// close the gap.
 fn findSpawnResolution(
     ctx: SpawnScanCtx,
     name: []const u8,
@@ -19325,10 +19344,27 @@ fn analyzeConcurrency(
 // Unused Analysis Helpers
 // ============================================================================
 
+/// True when the identifier run starting at `i` is a member access
+/// (`x.h`): a single dot immediately before the run. A `..` range end
+/// (`for (a..b)`) is not — the dot's left neighbor is the range's first
+/// dot, and the range end is a real reference (EPH-I0445 r1).
+fn isMemberAccessAt(code: []const u8, i: usize) bool {
+    return i > 0 and code[i - 1] == '.' and (i < 2 or code[i - 2] != '.');
+}
+
+/// Which dot-adjacent identifier runs `countIdentInCodeMode` counts.
+/// `.all` includes member-access runs (`x.h`) — a struct field's uses
+/// ARE its member accesses, so they must count toward the field's own
+/// verdict. `.plain` counts runs without a preceding dot only — the
+/// declaring-line side, where the initializer's member access is part
+/// of the declaration, not a use (`const h = @import("x").h;`, EPH-I0445).
+const MemberKind = enum { all, plain };
+
 /// Count word-boundary occurrences of name in one code slice, skipping
 /// occurrences inside string literals — an import's own "name.zig" string
-/// must not count as a use of the alias.
-fn countIdentInCode(code: []const u8, name: []const u8) usize {
+/// must not count as a use of the alias. `member_kind` picks the
+/// dot-adjacent run set (see MemberKind).
+fn countIdentInCodeMode(code: []const u8, name: []const u8, member_kind: MemberKind) usize {
     var count: usize = 0;
     // One classifier walk per slice (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(code);
@@ -19339,21 +19375,33 @@ fn countIdentInCode(code: []const u8, name: []const u8) usize {
         const end_idx = i + name.len;
         const after_ok = end_idx >= code.len or !isIdent(code[end_idx]);
         if (!before_ok or !after_ok) continue;
+        if (member_kind == .plain and isMemberAccessAt(code, i)) continue;
         if (cls.isInsideString(i)) continue;
         count += 1;
     }
     return count;
 }
 
-/// Count real uses of name across content: skips `//` comment lines and
-/// `\\` multiline-string lines, drops everything after a trailing `//`
-/// comment, and ignores string-literal occurrences. The declaring line
-/// contributes one less than its raw count — the declaration itself
-/// (and, for imports, the filename string) is not a use. analyzeUnused
-/// queries go through IdentUseIndex (EPH-I0762). This direct scan remains
-/// as the fallback for non-identifier names and as the test oracle.
+/// Count word-boundary occurrences of name in one code slice (member
+/// accesses included — a struct field's uses are its member accesses).
+fn countIdentInCode(code: []const u8, name: []const u8) usize {
+    return countIdentInCodeMode(code, name, .all);
+}
+
+/// Count real uses of name across content, saturating at 1: skips `//`
+/// comment lines and `\\` multiline-string lines, drops everything after
+/// a trailing `//` comment, and ignores string-literal occurrences. The
+/// declaration's own line contributes its plain occurrences minus the
+/// declaration itself: the alias is not a use, and member accesses in
+/// the initializer are part of the declaration (`const h =
+/// @import("x").h;` — EPH-I0445), while a second plain occurrence there
+/// (`const dbl = dbl;`) is a use. Every caller answers "used or not"
+/// (> 0), so the scan returns 1 at the first confirmed use: the fallback
+/// cost is the content prefix up to the first use, not the whole file
+/// (EPH-I0438). Exact counting lives in IdentUseIndex (EPH-I0762); this
+/// scan stays as the fallback for non-identifier names and as the
+/// verdict oracle.
 fn countRealIdentUses(content: []const u8, name: []const u8, decl_line: usize) usize {
-    var count: usize = 0;
     var line_num: usize = 1;
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -19361,10 +19409,22 @@ fn countRealIdentUses(content: []const u8, name: []const u8, decl_line: usize) u
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         const code_end = findCommentStart(line) orelse line.len;
-        const n = countIdentInCode(line[0..code_end], name);
-        count += if (line_num == decl_line) n -| 1 else n;
+        const code = line[0..code_end];
+        if (line_num == decl_line) {
+            // The alias is the one plain occurrence the declaration
+            // itself contributes; a second plain occurrence on the line
+            // confirms a use. Member accesses on the line are initializer
+            // parts, never uses (EPH-I0445).
+            if (countIdentInCodeMode(code, name, .plain) > 1) return 1;
+        } else if (countIdentInCode(code, name) > 0) {
+            // Member-access occurrences on other lines still count: a
+            // struct field's uses are its member accesses (`Class.parent`
+            // reads the field), so pre-fix verdicts for those shapes stay
+            // put (EPH-I0445 r1).
+            return 1;
+        }
     }
-    return count;
+    return 0;
 }
 
 /// True when name is a non-empty run of identifier bytes — the only shape
@@ -19397,6 +19457,13 @@ const IdentUseIndex = struct {
     /// One entry per occurrence, so the entry count equals the raw
     /// countIdentInCode total summed over lines.
     map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
+    /// Member-access occurrence lines (dot-preceded runs), kept apart
+    /// from `map`: a struct field's uses are its member accesses (they
+    /// count toward the field's verdict), but a declaration's own
+    /// initializer member access is part of the declaration, not a use
+    /// (`const h = @import("x").h;` — EPH-I0445). The declaring-line
+    /// adjustment drops this list's same-line entries only.
+    member_map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
     arena: std.heap.ArenaAllocator,
     /// Kept for the direct-scan fallback in countUses.
     content: []const u8,
@@ -19454,26 +19521,44 @@ const IdentUseIndex = struct {
             const start = i;
             while (i < code.len and isIdent(code[i])) i += 1;
             if (cls.isInsideString(start)) continue;
+            // Member-access runs go to member_map (see its field doc):
+            // they count toward a field's verdict but never toward a
+            // declaration's own-line use. The direct scan applies the
+            // same rule, so index and oracle agree.
+            const map = if (isMemberAccessAt(code, start)) &self.member_map else &self.map;
             // Dupe before getOrPut: a committed slot always holds an owned
             // key. A redundant dupe for an existing key stays unreachable
             // arena memory, reclaimed at deinit.
             const owned = try alloc.dupe(u8, code[start..i]);
-            const gop = try self.map.getOrPut(alloc, owned);
+            const gop = try map.getOrPut(alloc, owned);
             if (!gop.found_existing) gop.value_ptr.* = .empty;
             try gop.value_ptr.append(alloc, line_num);
         }
     }
 
     /// Count real uses of name with countRealIdentUses's declaring-line
-    /// adjustment: the raw occurrence total, minus one when the declaring
-    /// line holds at least one occurrence (the declaration itself is not a
-    /// use). Non-identifier names fall back to the direct scan.
+    /// semantics: every occurrence counts — plain runs and member-access
+    /// runs (a struct field's uses are its member accesses) — minus the
+    /// declaration itself (the alias: one plain run on the declaring
+    /// line) and minus the member-access runs on that same line (the
+    /// initializer's `.h` in `const h = @import("x").h;` is part of the
+    /// declaration, EPH-I0445). Non-identifier names fall back to the
+    /// direct scan (saturating: 1 when any use exists, else 0 — EPH-I0438).
     fn countUses(self: *const IdentUseIndex, name: []const u8, decl_line: usize) usize {
         if (!isIndexableName(name)) return countRealIdentUses(self.content, name, decl_line);
-        const occs = self.map.get(name) orelse return 0;
-        var total = occs.items.len;
-        if (std.sort.binarySearch(usize, occs.items, decl_line, orderLine) != null)
-            total -= 1;
+        const plain = self.map.get(name);
+        const member = self.member_map.get(name);
+        var total: usize = 0;
+        if (plain) |p| total += p.items.len;
+        if (member) |m| total += m.items.len;
+        if (plain) |p| {
+            if (std.sort.binarySearch(usize, p.items, decl_line, orderLine) != null) total -= 1;
+        }
+        if (member) |m| {
+            for (m.items) |ln| {
+                if (ln == decl_line) total -= 1;
+            }
+        }
         return total;
     }
 };
@@ -33844,9 +33929,14 @@ test "IdentUseIndex matches countRealIdentUses across masked shapes" {
     var decl_line: usize = 1;
     while (decl_line <= 20) : (decl_line += 1) {
         for (ident_use_test_names) |name| {
+            // The direct scan saturates at 1 (EPH-I0438), so parity here
+            // is the > 0 verdict: masking drift still breaks parity in
+            // both directions — an index count that should be 0 (masked
+            // occurrence recorded) or a real use the index misses. The
+            // exact counts are pinned by the exact-count test below.
             try std.testing.expectEqual(
                 countRealIdentUses(ident_use_test_content, name, decl_line),
-                index.countUses(name, decl_line),
+                @min(index.countUses(name, decl_line), 1),
             );
         }
     }
@@ -33887,11 +33977,66 @@ test "IdentUseIndex falls back to the direct scan for non-identifier names" {
     defer index.deinit();
     try index.build();
     // "a-b" is not an identifier run, so the index cannot answer for it.
-    // The fallback keeps the direct scan's count.
+    // The fallback keeps the direct scan's verdict.
     try std.testing.expectEqual(countRealIdentUses(content, "a-b", 1), index.countUses("a-b", 1));
     try std.testing.expectEqual(@as(usize, 1), index.countUses("a-b", 1));
     // The empty name takes the same fallback.
     try std.testing.expectEqual(countRealIdentUses(content, "", 2), index.countUses("", 2));
+}
+
+test "countRealIdentUses saturates at the first confirmed use (EPH-I0438)" {
+    // The > 0 verdict is the contract: a used decl answers 1 no matter
+    // how many uses, an unused decl answers 0. Pre-fix the first case
+    // returned the exact count 2, so the pin fails on the old code.
+    const used = "const x = 1;\nuse(x);\nuse(x);\n";
+    try std.testing.expectEqual(@as(usize, 1), countRealIdentUses(used, "x", 1));
+    const unused = "const x = 1;\n";
+    try std.testing.expectEqual(@as(usize, 0), countRealIdentUses(unused, "x", 1));
+    // A self-reference on the declaring line is a use (the dbl pin's
+    // semantics): n > 1 on the decl line confirms it immediately.
+    const self_ref = "const dbl = dbl;\n";
+    try std.testing.expectEqual(@as(usize, 1), countRealIdentUses(self_ref, "dbl", 1));
+}
+
+test "member-access runs are not decl-line self-uses (EPH-I0445)" {
+    // `const h = @import("x").h;` holds two `h` runs on the declaring
+    // line — the alias and the member access. The initializer's member
+    // access is part of the declaration, not a use: pre-fix it left one
+    // phantom use and the unused alias was never flagged.
+    const lone = "const h = @import(\"x\").h;\n";
+    var idx = IdentUseIndex.init(std.testing.allocator, lone);
+    defer idx.deinit();
+    try idx.build();
+    try std.testing.expectEqual(@as(usize, 0), idx.countUses("h", 1));
+    try std.testing.expectEqual(@as(usize, 0), countRealIdentUses(lone, "h", 1));
+    // A real later use still counts: 2 occurrences, minus the decl line.
+    const used = "const h = @import(\"x\").h;\nuse(h);\n";
+    var idx2 = IdentUseIndex.init(std.testing.allocator, used);
+    defer idx2.deinit();
+    try idx2.build();
+    try std.testing.expectEqual(@as(usize, 1), idx2.countUses("h", 1));
+    try std.testing.expectEqual(@as(usize, 1), countRealIdentUses(used, "h", 1));
+    // A `..` range end is a use, not a member access: the range's second
+    // dot must not exclude the name (EPH-I0445 r1 — the first exclusion
+    // cut read `for (0..n)` as a `0.n` member access and dropped real
+    // uses, surfacing as 7 ZA402 FPs on ephor's own src/).
+    const ranged = "const n = 4;\nfor (0..n) {}\n";
+    var idx3 = IdentUseIndex.init(std.testing.allocator, ranged);
+    defer idx3.deinit();
+    try idx3.build();
+    try std.testing.expectEqual(@as(usize, 1), idx3.countUses("n", 1));
+    try std.testing.expectEqual(@as(usize, 1), countRealIdentUses(ranged, "n", 1));
+    // Member-access uses on OTHER lines still count: a struct field's
+    // uses are its member accesses (`Class.parent` reads the field).
+    // Pre-fix verdicts for those shapes must not move (EPH-I0445 r1 —
+    // the first global exclusion cut produced ghostty ZA402/403 FPs on
+    // fields and mixin consts).
+    const field_used = "var parent: *Parent.Class = undefined;\nuse(Class.parent);\n";
+    var idx4 = IdentUseIndex.init(std.testing.allocator, field_used);
+    defer idx4.deinit();
+    try idx4.build();
+    try std.testing.expectEqual(@as(usize, 1), idx4.countUses("parent", 1));
+    try std.testing.expectEqual(@as(usize, 1), countRealIdentUses(field_used, "parent", 1));
 }
 
 test "countOccurrences" {
@@ -64612,6 +64757,77 @@ test "ZA401 alias differing from filename stem still flagged" {
     try std.testing.expectEqual(@as(usize, 1), n);
 }
 
+test "ZA401 member-access import alias is flagged when unused (EPH-I0445)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // `const h = @import("x").h;` holds two `h` runs on the declaring
+    // line — the alias and the member-access `.h`. Pre-fix the member
+    // access self-counted as a use: 2 occurrences minus the 1-decl
+    // adjustment left one phantom use, and the unused alias was never
+    // flagged (the F9 FN).
+    const test_content =
+        \\const h = @import("x").h;
+        \\
+        \\pub fn f() void {}
+    ;
+
+    const analysis = try createImportTestAnalysis(
+        allocator,
+        "test_za401_member.zig",
+        test_content,
+        .{ .path = "x.zig", .resolved = null, .name = "h", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za401_member.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za401_member.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
+test "ZA401 member-access import alias is silent when used (EPH-I0445)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The control: a real use of the alias still counts as a use — only
+    // the member-access self-count is gone.
+    const test_content =
+        \\const h = @import("x").h;
+        \\
+        \\pub fn f() void {
+        \\    h.thing();
+        \\}
+    ;
+
+    const analysis = try createImportTestAnalysis(
+        allocator,
+        "test_za401_member_used.zig",
+        test_content,
+        .{ .path = "x.zig", .resolved = null, .name = "h", .line = 1, .col = 1 },
+    );
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za401_member_used.zig"), {});
+
+    var issues = try analyzeUnused(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    const n = countRuleIssues(issues.items, "test_za401_member_used.zig", RULE_UNUSED_IMPORT);
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
 test "ZA402 unused const flagged despite string and comment mentions" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -73474,6 +73690,47 @@ test "ZC101: cross-fn release on a DIFFERENT receiver does not suppress" {
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
+test "ZC101: a release in ANOTHER file does not satisfy the acquire (EPH-I0443 doc arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The documented file-local bound: hasCrossFnRelease sees only this
+    // file's fn records, so file A's acquire still warns although file B
+    // releases the same receiver. A project-wide receiver index would be
+    // the fix arm; the disclosure names this bound (over-warn direction).
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const content_a =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    doWork();
+        \\}
+    ;
+    const content_b =
+        \\fn g() void {
+        \\    mu.unlock();
+        \\}
+    ;
+    const analysis_a = try createTestFileAnalysis(allocator, "zc101_cross_a.zig", content_a);
+    try graph.files.put(analysis_a.path, analysis_a);
+    try graph.reachable.put(try allocator.dupe(u8, "zc101_cross_a.zig"), {});
+    const analysis_b = try createTestFileAnalysis(allocator, "zc101_cross_b.zig", content_b);
+    try graph.files.put(analysis_b.path, analysis_b);
+    try graph.reachable.put(try allocator.dupe(u8, "zc101_cross_b.zig"), {});
+
+    var issues = try analyzeConcurrency(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // A's acquire draws the warning; B holds no acquire to judge.
+    const na = countRuleIssues(issues.items, "zc101_cross_a.zig", RULE_LOCK_NO_DEFER_UNLOCK);
+    try std.testing.expectEqual(@as(usize, 1), na);
+    const nb = countRuleIssues(issues.items, "zc101_cross_b.zig", RULE_LOCK_NO_DEFER_UNLOCK);
+    try std.testing.expectEqual(@as(usize, 0), nb);
+}
+
 test "ZC101: free-function fileUnlock satisfies the cross-fn release (EPH-I0903)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -73670,6 +73927,34 @@ test "ZC101: strings and comments are neither acquires nor releases" {
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc101_strings.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: release text after a mid-line multiline opener is string data (EPH-I0444 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const s = \\ mu.unlock();` — the tail is string data, so no
+    // release is recorded and the unpaired acquire draws the warning
+    // (1, 0). The pin discriminates: with the mid-line opener masking
+    // regressed, the tail reads as a depth-1 plain release (EPH-I0671)
+    // and hasPlainReleaseAtDepth downgrades the acquire to a note
+    // (0, 1), failing the assertion. Mid-line opener handling is
+    // blankLiteralContents + nextCallSite, EPH-I0671/EPH-I0751.
+    // Guard: pins the ZC band's exposure (EPH-I0444).
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    const s = \\\\ mu.unlock();
+        \\    mu.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_mline.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
@@ -75345,6 +75630,72 @@ test "ZC104: join text in strings and comments is not evidence" {
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc104_strings.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: a join in ANOTHER file does not resolve the spawn (EPH-I0443 doc arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The documented file-local bound: findSpawnResolution searches the
+    // spawn's own file only, so file A's handle still warns although
+    // file B joins the same name. Over-warn, the safe direction; the
+    // disclosure names this bound.
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const content_a =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+    ;
+    const content_b =
+        \\fn g() void {
+        \\    t.join();
+        \\}
+    ;
+    const analysis_a = try createTestFileAnalysis(allocator, "zc104_cross_a.zig", content_a);
+    try graph.files.put(analysis_a.path, analysis_a);
+    try graph.reachable.put(try allocator.dupe(u8, "zc104_cross_a.zig"), {});
+    const analysis_b = try createTestFileAnalysis(allocator, "zc104_cross_b.zig", content_b);
+    try graph.files.put(analysis_b.path, analysis_b);
+    try graph.reachable.put(try allocator.dupe(u8, "zc104_cross_b.zig"), {});
+
+    var issues = try analyzeConcurrency(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    // A's spawn draws the warning; B holds no spawn to judge.
+    const na = countRuleIssues(issues.items, "zc104_cross_a.zig", RULE_THREAD_NO_JOIN);
+    try std.testing.expectEqual(@as(usize, 1), na);
+    const nb = countRuleIssues(issues.items, "zc104_cross_b.zig", RULE_THREAD_NO_JOIN);
+    try std.testing.expectEqual(@as(usize, 0), nb);
+}
+
+test "ZC104: join text after a mid-line multiline opener is not evidence (EPH-I0444 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const s = \\ t.join();` — the tail is string data, so the phantom
+    // join must not resolve the handle; the warning must fire.
+    // Pre-EPH-I0671 the tail was evidence and this run was silent; the
+    // blankLiteralContents mid-line opener masking is the fix. Guard:
+    // pins the ZC104 band's exposure.
+    const content =
+        \\fn work() void {}
+        \\const s = \\\\ t.join();
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_mline.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 1, 0);

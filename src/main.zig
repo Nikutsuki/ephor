@@ -2124,6 +2124,9 @@ fn buildCFG(
     lines: []const []const u8,
 ) !ControlFlowGraph {
     var cfg = ControlFlowGraph.init(allocator, func_name, func_line);
+    // A mid-build failure must release the partial graph: the caller's
+    // defer only runs after a successful return (EPH-I0895 sweep).
+    errdefer cfg.deinit();
     const current_block = try cfg.addBlock();
     cfg.entry_block = current_block;
     cfg.blocks.items[current_block].start_line = func_line;
@@ -4384,15 +4387,6 @@ fn isIndirectlyInitialized(
     return false;
 }
 
-/// Count occurrences of a byte in a slice.
-fn countChar(t: []const u8, ch: u8) usize {
-    var n: usize = 0;
-    for (t) |c| {
-        if (c == ch) n += 1;
-    }
-    return n;
-}
-
 /// Count occurrences of `ch` in code position: string/char literal
 /// content, `\\` tails, and comment text carry no braces (EPH-I0081).
 fn countCodeChar(t: []const u8, ch: u8) usize {
@@ -6348,15 +6342,6 @@ const DeferBlockMarkers = struct {
 /// Mark which lines are inside defer and errdefer blocks
 /// Track a single defer/errdefer keyword depth for one line.
 /// Returns updated depth after processing braces on the line.
-fn trackBlockDepth(t: []const u8, depth: usize) usize {
-    var d = depth;
-    for (t) |c| {
-        if (c == '{') d += 1;
-        if (c == '}' and d > 0) d -= 1;
-    }
-    return d;
-}
-
 /// Per-keyword defer-block marking state: the per-line inside-block markers,
 /// the current open-brace depth, and the two keyword prefixes that start a
 /// defer/errdefer line.
@@ -6376,13 +6361,13 @@ fn markDeferLine(
     const starts_defer_line = mem.startsWith(u8, t, ctx.start_prefix1) or
         mem.startsWith(u8, t, ctx.start_prefix2);
     if (starts_defer_line) {
-        ctx.depth.* = trackBlockDepth(t, ctx.depth.*);
+        ctx.depth.* = computeBraceDepth(t, ctx.depth.*);
         ctx.markers[idx] = true;
         return;
     }
     if (ctx.depth.* > 0) {
         ctx.markers[idx] = true;
-        ctx.depth.* = trackBlockDepth(t, ctx.depth.*);
+        ctx.depth.* = computeBraceDepth(t, ctx.depth.*);
     }
 }
 
@@ -6630,7 +6615,20 @@ fn initBlockFreeState(
     a: Allocator,
     n: usize,
 ) !BlockFreeState {
-    var s: BlockFreeState = undefined;
+    // Every array starts empty so the errdefer's deinit stays safe on a
+    // mid-build failure (a partial alloc set must not leak, EPH-I0895
+    // sweep). Freeing an empty slice is a no-op.
+    var s: BlockFreeState = .{
+        .freed_in_block = &.{},
+        .block_returns_after_free = &.{},
+        .freed_line_in_block = &.{},
+        .free_op = &.{},
+        .def_freed_entry = &.{},
+        .def_freed_exit = &.{},
+        .may_freed_entry = &.{},
+        .may_freed_exit = &.{},
+    };
+    errdefer s.deinit(a);
     s.freed_in_block = try a.alloc(bool, n);
     s.block_returns_after_free = try a.alloc(bool, n);
     s.freed_line_in_block = try a.alloc(usize, n);
@@ -8583,7 +8581,9 @@ fn isHandoffReferenceLine(
 /// (`return T{ .x = x, ... };`, `return try f(\n ..., x,\n );`) transfer
 /// on the return path. Tries after the errdefer stay fine — the errdefer
 /// covers their error paths. Masked code: prose in comments and strings
-/// never references (EPH-I0349 corpus).
+/// never references (EPH-I0349 corpus). The return-construct brace walk
+/// uses the masked depth too — a string or comment brace never closes a
+/// return construct early (EPH-I0894).
 fn hasHandoffReference(
     lines: []const []const u8,
     errdefer_idx: usize,
@@ -8600,12 +8600,12 @@ fn hasHandoffReference(
         const code = maskedCodeLine(lines[idx], &blank_buf);
         if (ret_paren > 0 or ret_brace > 0) {
             ret_paren += parenBalance(t);
-            ret_brace = countBraceDepth(t, ret_brace);
+            ret_brace = computeBraceDepth(t, ret_brace);
             if (ret_paren <= 0 and ret_brace == 0) blocked = true;
         } else if (hasRealReturnKeyword(code)) {
             if (handoffOccurrences("", code, name, &join_buf)) return true;
             ret_paren = parenBalance(t);
-            ret_brace = countBraceDepth(t, 0);
+            ret_brace = computeBraceDepth(t, 0);
             if (ret_paren <= 0 and ret_brace == 0) blocked = true;
             continue;
         } else if (blocked) {
@@ -9339,11 +9339,18 @@ fn scanBlocksForPatterns(
     num_blocks: usize,
 ) !BlockCoverageState {
     var state = BlockCoverageState{
-        .has_defer = try allocator.alloc(bool, num_blocks),
-        .ownership_transferred = try allocator.alloc(bool, num_blocks),
-        .free_and_return = try allocator.alloc(bool, num_blocks),
-        .has_direct_free = try allocator.alloc(bool, num_blocks),
+        .has_defer = &.{},
+        .ownership_transferred = &.{},
+        .free_and_return = &.{},
+        .has_direct_free = &.{},
     };
+    // A partial alloc set must not leak: the errdefer deinit frees the
+    // empty slices as no-ops (EPH-I0895 sweep).
+    errdefer state.deinit(allocator);
+    state.has_defer = try allocator.alloc(bool, num_blocks);
+    state.ownership_transferred = try allocator.alloc(bool, num_blocks);
+    state.free_and_return = try allocator.alloc(bool, num_blocks);
+    state.has_direct_free = try allocator.alloc(bool, num_blocks);
     @memset(state.has_defer, false);
     @memset(state.ownership_transferred, false);
     @memset(state.free_and_return, false);
@@ -9359,8 +9366,8 @@ fn scanBlocksForPatterns(
 /// Update a multi-line defer/errdefer block depth from one line: the
 /// opener line restarts the depth, every following line contributes its
 /// brace balance. The arm and the counter use the same code-position
-/// brace notion (EPH-I0883): countBraceDepth stays raw for its own
-/// callers, so the depth walk here routes through computeBraceDepth.
+/// brace notion (EPH-I0883): the depth walk routes through
+/// computeBraceDepth (EPH-I0894).
 fn trackDeferBlockDepthLine(is_block_start: bool, t: []const u8, depth: *usize) void {
     if (is_block_start) {
         depth.* = computeBraceDepth(t, 0);
@@ -9637,7 +9644,7 @@ fn checkDeferFreeLine(
 ) bool {
     // Skip mode: inside a defer block at deeper scope than alloc
     if (ctx.skip_depth.* > 0) {
-        ctx.skip_depth.* = countBraceDepth(t, ctx.skip_depth.*);
+        ctx.skip_depth.* = computeBraceDepth(t, ctx.skip_depth.*);
         return false;
     }
 
@@ -9659,7 +9666,7 @@ fn checkDeferFreeLine(
                 !hasHandoffReference(ctx.lines, ctx.defer_start, ctx.alloc_name)) return false;
             return true;
         }
-        ctx.defer_depth.* = countBraceDepth(t, ctx.defer_depth.*);
+        ctx.defer_depth.* = computeBraceDepth(t, ctx.defer_depth.*);
     }
     return false;
 }
@@ -9673,8 +9680,8 @@ fn handleDeferStart(
 ) bool {
     // Only consider defers at same or outer scope as the allocation
     if (countIndent(line) > ctx.alloc_indent) {
-        if (mem.indexOf(u8, t, "{") != null)
-            ctx.skip_depth.* = countBraceDepth(t, 0);
+        const open_depth = computeBraceDepth(t, 0);
+        if (open_depth > 0) ctx.skip_depth.* = open_depth;
         return false;
     }
     const is_errdefer = mem.startsWith(u8, t, "errdefer ");
@@ -9692,9 +9699,12 @@ fn handleDeferStart(
             return false;
         return true;
     }
-    // Multi-line defer block start at same/outer scope
-    if (mem.indexOf(u8, t, "{") != null) {
-        ctx.defer_depth.* = countBraceDepth(t, 0);
+    // Multi-line defer block start at same/outer scope. The arm and the
+    // counter share the masked brace notion: a brace in a string or
+    // comment never opens a phantom block (EPH-I0894).
+    const open_depth = computeBraceDepth(t, 0);
+    if (open_depth > 0) {
+        ctx.defer_depth.* = open_depth;
         ctx.defer_start = idx;
         ctx.is_errdefer = is_errdefer;
     }
@@ -10548,6 +10558,10 @@ fn scanErrdeferLines(
         .error_returns = .empty,
         .bs = .{},
     };
+    // A mid-scan failure must release the partial collections: the
+    // caller's defer only runs after a successful return (EPH-I0895
+    // sweep).
+    errdefer state.deinit(allocator);
 
     // Pre-scan: build set of no-free allocator names by tracking type-based
     // initialization and .allocator() aliases
@@ -12722,7 +12736,9 @@ fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
         .allocator_inits = compat.getAllInitPatterns(),
     };
 
-    // Track type scope (struct/enum/union) via brace depth
+    // Track type scope (struct/enum/union) via brace depth. The depth
+    // uses the masked walk: a brace in a string or comment never opens
+    // or closes a type scope (EPH-I0894).
     var current_type: ?[]const u8 = null;
     var type_brace_depth: usize = 0;
     var brace_depth: usize = 0;
@@ -12732,8 +12748,7 @@ fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
 
-        brace_depth += countChar(t, '{');
-        brace_depth -|= countChar(t, '}');
+        brace_depth = computeBraceDepth(t, brace_depth);
 
         detectTypeScope(t, brace_depth, &current_type, &type_brace_depth);
 
@@ -21975,6 +21990,12 @@ fn emitDefiniteAssignmentIssues(
     }
 }
 
+/// Free the owned payloads of an issue list without freeing the backing
+/// array — the caller's defer deinits the array itself (EPH-I0895).
+fn deinitIssuePayloads(items: []Issue, a: Allocator) void {
+    for (items) |*issue| issue.deinit(a);
+}
+
 /// Run memory-related CFG analyses
 fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     const a = run.file.allocator;
@@ -21991,7 +22012,15 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
         false;
     var r1 = try analyzeCFGMemorySafety(a, run.cfg, body, run.func.no_free_fields);
     defer r1.deinit(a);
+    // The out.appendSlice transfer is the EPH-I0882 consumer side: on an
+    // OOM the array defer frees only the backing array, so r1's
+    // message_owned payloads would leak. The errdefer frees the payloads
+    // without the array; after a successful transfer the payloads belong
+    // to out and a later failure must not free them again (EPH-I0895).
+    var r1_owns_payloads = true;
+    errdefer if (r1_owns_payloads) deinitIssuePayloads(r1.items, a);
     try out.appendSlice(a, r1.items);
+    r1_owns_payloads = false;
     var r2 = if (is_no_free_recipient)
         std.ArrayListUnmanaged(Issue).empty
     else
@@ -22461,6 +22490,12 @@ fn analyzeCFGMemory(
 // Memory Analysis Helpers
 // ============================================================================
 
+/// Raw brace depth of one line: every `{` and `}` byte counts, string,
+/// char, comment, and multiline-string content included. The rawness is
+/// deliberate and documented (EPH-I0894 raw-form pin): analyzer routing
+/// uses the masked computeBraceDepth, and this counter keeps its naive
+/// byte-level contract for callers that need it. The pin test
+/// "countBraceDepth raw contract stays pinned" holds the contract.
 fn countBraceDepth(t: []const u8, depth: usize) usize {
     var d = depth;
     for (t) |c| {
@@ -22475,8 +22510,9 @@ fn countBraceDepth(t: []const u8, depth: usize) usize {
 /// count (EPH-I0794). The naive count let a paren in a trailing comment or
 /// string literal skew the depth walks in isInsideTypeOf, findCallSiteLine,
 /// and joinParenContinuation — past the comment-stripped boundary arm
-/// (EPH-I0783) on the ZA202 paths. countBraceDepth stays naive for its own
-/// callers.
+/// (EPH-I0783) on the ZA202 paths. countBraceDepth keeps its documented
+/// raw contract (EPH-I0894 raw-form pin); every analyzer brace walk routes
+/// through computeBraceDepth.
 fn parenBalance(t: []const u8) i32 {
     return parenBalanceOutsideQuotes(stripLineComment(t));
 }
@@ -22767,30 +22803,6 @@ fn analyzeIgnoredErrors(
     return issues;
 }
 
-/// Count braces on a defer-starting line (skip the first opening brace)
-fn countDeferStartBraces(t: []const u8) usize {
-    var depth: usize = 1;
-    var saw_first = false;
-    for (t) |c| {
-        if (c == '{' and !saw_first)
-            saw_first = true
-        else if (c == '{')
-            depth += 1;
-        if (c == '}' and depth > 0) depth -= 1;
-    }
-    return depth;
-}
-
-/// Update defer depth by counting braces on a line inside a defer block
-fn updateDeferBraceDepth(t: []const u8, depth: usize) usize {
-    var d = depth;
-    for (t) |c| {
-        if (c == '{') d += 1;
-        if (c == '}' and d > 0) d -= 1;
-    }
-    return d;
-}
-
 /// Analyze a single file for ignored errors (ZA205)
 fn analyzeIgnoredErrorsInFile(
     allocator: Allocator,
@@ -22817,12 +22829,14 @@ fn analyzeIgnoredErrorsInFile(
         if (t.len == 0 or isCommentOrMultilineString(t)) continue;
 
         if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) {
-            if (mem.indexOf(u8, t, "{") == null) continue;
-            defer_depth = countDeferStartBraces(t);
+            // The masked depth decides the arm too: a string or comment
+            // brace never opens a phantom defer block (EPH-I0894).
+            const open_depth = computeBraceDepth(t, 0);
+            if (open_depth > 0) defer_depth = open_depth;
             continue;
         }
         if (defer_depth > 0) {
-            defer_depth = updateDeferBraceDepth(t, defer_depth);
+            defer_depth = computeBraceDepth(t, defer_depth);
             continue;
         }
         try checkIgnoredError(ctx, t, line_num);
@@ -35231,6 +35245,10 @@ fn createTestFileAnalysis(
     content: []const u8,
 ) !FileAnalysis {
     const path_copy = try allocator.dupe(u8, path);
+    // The content dupe can fail: free the path on that path so the
+    // FailingAllocator sweeps over this seam stay byte-balanced
+    // (EPH-I0895).
+    errdefer allocator.free(path_copy);
     return .{
         .path = path_copy,
         .resolved_path = path_copy,
@@ -35268,6 +35286,63 @@ fn runCFGMemoryTest(
     var issues = try analyzeCFGMemory(allocator, &graph);
     errdefer deinitIssues(&issues, allocator);
     return .{ .graph = graph, .issues = issues };
+}
+
+/// One failing-allocator sweep iteration over the CFG memory pipeline:
+/// build the one-file graph and run analyzeCFGMemory. An induced
+/// OutOfMemory surfaces as an error; the caller asserts byte balance
+/// after the run. The graph deinit happens inside, so the caller only
+/// checks the allocator ledger (EPH-I0895).
+fn sweepCFGMemoryOnce(
+    failing: *std.testing.FailingAllocator,
+    path: []const u8,
+    content: []const u8,
+) !void {
+    const a = failing.allocator();
+    var diag = testDiagCtx();
+    var graph = ImportGraph.init(a, &diag);
+    defer graph.deinit();
+    var analysis = try createTestFileAnalysis(a, path, content);
+    var analysis_owned = true;
+    defer if (analysis_owned) analysis.deinit(a);
+    try graph.files.put(analysis.path, analysis);
+    analysis_owned = false;
+    var issues = try analyzeCFGMemory(a, &graph);
+    deinitIssues(&issues, a);
+}
+
+test "ZA105: runCFGMemoryAnalyses frees r1 payloads when appendSlice OOMs (EPH-I0895)" {
+    const allocator = std.testing.allocator;
+    const path = "sweep_uaf.zig";
+    const content =
+        \\fn sweep_uaf(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    _ = buf.len;
+        \\}
+    ;
+
+    // Measure the cold-run allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run).
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    try sweepCFGMemoryOnce(&probe, path, content);
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        if (sweepCFGMemoryOnce(&failing, path, content)) |_| {
+            // Success iteration: the pipeline ran clean under the budget.
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Byte balance at every failure point is the leak proof. Pre-fix
+        // the r1 transfer index leaks the message_owned payloads when
+        // out.appendSlice OOMs (EPH-I0895).
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 /// Count issues for a rule within one file (test assertion helper).
@@ -43293,6 +43368,87 @@ test "analyzeIgnoredErrors detects discarded error union (ZA205)" {
     try std.testing.expect(found_za205);
 }
 
+test "analyzeIgnoredErrors: string brace in a defer line does not arm a phantom defer block (EPH-I0894)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The defer line carries only a string `{`: it must not open a
+    // phantom defer block. Pre-fix the raw arm + countDeferStartBraces
+    // swallowed the discard line, so ZA205 never fired on it (FN).
+    const test_content =
+        \\fn bad_discard() void {
+        \\    defer log("{", .{});
+        \\    _ = might_fail();
+        \\}
+        \\fn might_fail() !void {
+        \\    return;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_discard_phantom.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_discard_phantom.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za205 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            found_za205 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za205);
+}
+
+test "analyzeIgnoredErrors: string close brace in a defer block does not drop the mask early (EPH-I0894)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The discard sits inside a real defer block: the string `}` on
+    // the log line must not close the block early. Pre-fix the raw
+    // updateDeferBraceDepth dropped the depth, the discard line read
+    // as ordinary code, and ZA205 fired on it (FP).
+    const test_content =
+        \\fn bad_discard() void {
+        \\    defer {
+        \\        log("}", .{});
+        \\        _ = might_fail();
+        \\    }
+        \\}
+        \\fn might_fail() !void {
+        \\    return;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_discard_in_defer.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_discard_in_defer.zig"), {});
+
+    var issues = try analyzeIgnoredErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za205 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_IGNORED_ERROR)) {
+            found_za205 = true;
+            break;
+        }
+    }
+    try std.testing.expect(!found_za205);
+}
+
 test "analyzeIgnoredErrors no false positive for try" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -47758,6 +47914,149 @@ test "ZA101: return inside loop with post-loop direct free still warns (F6 diver
         1,
         countRuleIssues(run.issues.items, "leak_loop_return.zig", RULE_ALLOC_NO_DEFER),
     );
+}
+
+test "ZA101: string-only brace defer does not arm a phantom defer block (EPH-I0894)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer line carries only a string brace: it must not arm a
+    // defer block. Pre-fix the raw arm counted the string `{`, so the
+    // post-loop direct free read as defer-covered and the return-path
+    // leak stayed silent (the F6 divergence shape above warns).
+    const content =
+        \\fn phantom_defer(allocator: std.mem.Allocator, c: bool, x: bool) !void {
+        \\    const buf = allocator.alloc(u8, 10) catch return;
+        \\    defer log("{", .{});
+        \\    while (c) {
+        \\        if (x) return;
+        \\        _ = buf[0];
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_phantom_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "leak_phantom_defer.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: string close brace in a real defer block does not drop the depth early (EPH-I0894)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The F6a loop shape reaches the linear fallback; the string `}`
+    // on the log line must not close the defer block before the free.
+    // Pre-fix the raw counter dropped the depth, so the defer block
+    // lost its free and the warning fired (FP).
+    const content =
+        \\fn loop_defer(allocator: std.mem.Allocator, xs: []const u32) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    for (xs) |x| {
+        \\        _ = x;
+        \\    }
+        \\    defer {
+        \\        log("}", .{});
+        \\        allocator.free(buf);
+        \\    }
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "leak_loop_strbrace.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "leak_loop_strbrace.zig", RULE_ALLOC_NO_DEFER),
+    );
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "leak_loop_strbrace.zig", RULE_USE_AFTER_FREE),
+    );
+}
+
+test "ZA105: string close brace in a defer block keeps the UAF defer marker (EPH-I0894)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The UAF marker walk (markDeferAndErrdeferBlocks) must keep the
+    // defer block open past the string `}`. Pre-fix the raw trackBlockDepth
+    // dropped the marker, the free read as direct, and the tail use read
+    // as a use-after-free (FP).
+    const content =
+        \\fn real_defer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    defer {
+        \\        log("}", .{});
+        \\        allocator.free(buf);
+        \\    }
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "uaf_defer_strbrace.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "uaf_defer_strbrace.zig", RULE_USE_AFTER_FREE),
+    );
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "uaf_defer_strbrace.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA101: errdefer handoff survives a string brace in a return literal (EPH-I0894)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The errdefer covers the error paths; the return literal mentions
+    // buf on the success path (the handoff). Pre-fix the raw ret_brace
+    // walk closed the return construct at the string `}` line, blocked
+    // the blk body, and the handoff never counted — the errdefer then
+    // read as discard-only and ZA101 fired (FP).
+    const content =
+        \\const T = struct { tag: []const u8, inner: u32 };
+        \\fn handoff(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    if (c) return;
+        \\    return T{
+        \\        .tag = "}",
+        \\        .inner = blk: {
+        \\            std.debug.print("{s}", .{buf});
+        \\            break :blk 1;
+        \\        },
+        \\    };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "handoff_strbrace.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "handoff_strbrace.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "countBraceDepth raw contract stays pinned (EPH-I0894)" {
+    // The documented raw-form pin: countBraceDepth counts every brace
+    // byte, string content included. Analyzer routing uses the masked
+    // computeBraceDepth (EPH-I0894 done-means site 4); this counter
+    // keeps its naive contract for byte-level callers.
+    try std.testing.expectEqual(@as(usize, 1), countBraceDepth("defer log(\"{\", .{});", 0));
+    try std.testing.expectEqual(@as(usize, 0), countBraceDepth("log(\"}\");", 1));
 }
 
 test "ZA101: same-indent conditional defer still warns (F6 probe)" {
@@ -58939,6 +59238,31 @@ test "parseFileTypeContext builds struct methods" {
     try std.testing.expectEqual(ReturnKind.void_type, methods.?.get("clear").?);
     try std.testing.expectEqual(ReturnKind.error_union, methods.?.get("process").?);
     try std.testing.expectEqual(ReturnKind.value, methods.?.get("count").?);
+}
+
+test "parseFileTypeContext: string brace does not corrupt type scope (EPH-I0894)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    // The struct body line `const label = "}";` holds a string close
+    // brace. Pre-fix the raw brace walk closed the struct scope at
+    // that line, so the method below registered as a top-level function
+    // and the struct_methods table lost it.
+    const content =
+        \\const S = struct {
+        \\    const label = "}";
+        \\    pub fn method(self: *S) void {
+        \\    }
+        \\};
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    const methods = ctx.struct_methods.get("S");
+    try std.testing.expect(methods != null);
+    try std.testing.expectEqual(ReturnKind.void_type, methods.?.get("method").?);
 }
 
 test "parseFileTypeContext builds var types" {

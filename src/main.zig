@@ -17474,12 +17474,17 @@ const UntestedFnEvidence = struct {
 };
 
 /// Scan context for one file's ZT105 pass (bundled for param counts).
+/// `scan_root` and `resolved_path` feed the EPH-I0912 build.zig-root
+/// check: the scan root (realpath of the scan path, null in test
+/// harnesses) and this file's realpath.
 const UntestedFnScanCtx = struct {
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
     evidence: *UntestedFnEvidence,
     is_test_file: bool,
+    scan_root: ?[]const u8,
+    resolved_path: []const u8,
 };
 
 /// Mutable per-file state for the ZT105 pass (bundled for param counts).
@@ -17494,6 +17499,10 @@ const UntestedFnFileState = struct {
     /// Brace-less `test "name"` opener carried to the next line (the
     /// Allman form, EPH-I0435); blank and comment lines keep it alive.
     pending: PendingTest = .{},
+    /// The previous significant line's ending token (EPH-I0913): blank
+    /// and comment-only lines keep it, so a continuation `.field` line
+    /// still sees the value chain's base line.
+    prev_tail: LineTail = .{},
 };
 
 /// Prefixes that open a public fn declaration line (ZT105). `pub export`
@@ -17579,17 +17588,115 @@ fn collectQuotedIdentEvidence(
     return after_quote;
 }
 
-/// True when the dot at `dot` opens a field-access chain (the base before
-/// it ends a value expression: `)`, `]`, `}`, a quoted literal, or a
-/// digit) rather than a struct-literal / enum-tag dot. A field-access
-/// field name may hold a fn value (`@import("row.zig").neverExtendBg`),
-/// so it keeps the conservative aliasing; a literal/tag dot never does
-/// (EPH-I0909).
-fn isFieldAccessDot(code: []const u8, dot: usize) bool {
-    if (dot == 0) return false;
-    const c = code[dot - 1];
+/// The token a code slice ends with (EPH-I0913): the ending word when the
+/// last byte is an identifier byte, else the ending character. `char` is
+/// 0 when the slice carries no token. A slice that ends with an
+/// identifier borrows the line content, which outlives the scan.
+/// `is_break_label` is true when the ending word is the label of a
+/// labeled break (`break :blk`): the next `.tag` is the break value, an
+/// enum tag, not a field access.
+const LineTail = struct {
+    word: []const u8 = "",
+    char: u8 = 0,
+    is_break_label: bool = false,
+};
+
+/// The byte directly before an unspaced field-access dot: `)`, `]`, `}`,
+/// a quoted literal, a digit, a pointer deref `*`, or an optional unwrap
+/// `?` (EPH-I0911). Each ends a value expression whose `.field` access
+/// may hold a fn value.
+fn isFieldAccessCloser(c: u8) bool {
     return c == ')' or c == ']' or c == '}' or c == '"' or c == '\'' or
-        std.ascii.isDigit(c);
+        c == '*' or c == '?' or std.ascii.isDigit(c);
+}
+
+/// A dot separated from its base by whitespace (indentation, or the
+/// start of a continuation line): the base is the walked-back word or
+/// char in `tail`. `)` is not a value-ender here: a `)` can close an
+/// if/while/for/switch condition whose next `.name` is an enum-tag
+/// branch, not a field access — the tokenizer cannot see the keyword
+/// before the paren (EPH-I0913 boundary, named in isFieldAccessDot).
+fn isWhitespaceSeparatedFieldAccess(tail: LineTail) bool {
+    if (tail.word.len > 0) return !isBareDotKeyword(tail.word) and !tail.is_break_label;
+    return tail.char != 0 and (tail.char == ']' or tail.char == '}' or
+        tail.char == '"' or tail.char == '\'' or tail.char == '*' or
+        tail.char == '?' or std.ascii.isDigit(tail.char));
+}
+
+/// The identifier run ending at `end` (code[..end+1] walk-back).
+fn wordEndingAt(code: []const u8, end: usize) []const u8 {
+    var i = end;
+    while (i > 0 and isIdent(code[i - 1])) i -= 1;
+    return code[i .. end + 1];
+}
+
+/// Keywords that take a value operand directly: a `.name` after one of
+/// them is an enum tag, not a field access (`return .foo`, `break .foo`,
+/// `else .foo`, `catch .foo`, `orelse .foo`). A labeled break
+/// (`break :blk .foo`) is handled by the label check in lineTailOf.
+fn isBareDotKeyword(word: []const u8) bool {
+    return mem.eql(u8, word, "return") or mem.eql(u8, word, "break") or
+        mem.eql(u8, word, "else") or mem.eql(u8, word, "catch") or
+        mem.eql(u8, word, "orelse");
+}
+
+/// True when `word` is the label of a labeled break (`break :blk`): the
+/// byte before the label is `:`, and the keyword before the colon is
+/// `break` — the next `.tag` is the break value, an enum tag (EPH-I0913).
+fn isLabeledBreakWord(word: []const u8, code: []const u8) bool {
+    if (code.len <= word.len) return false;
+    const pre = code[0 .. code.len - word.len];
+    if (pre[pre.len - 1] != ':') return false;
+    const kw = mem.trimEnd(u8, pre[0 .. pre.len - 1], " \t\r");
+    var s = kw.len;
+    while (s > 0 and isIdent(kw[s - 1])) s -= 1;
+    return mem.eql(u8, kw[s..], "break");
+}
+
+/// The tail token of a comment-stripped line (EPH-I0913): the ending
+/// word when the line ends with an identifier, else the ending char.
+/// `char` 0 means the line carries no token (blank or whitespace-only).
+fn lineTailOf(code: []const u8) LineTail {
+    var i = code.len;
+    while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t' or
+        code[i - 1] == '\r')) i -= 1;
+    if (i == 0) return .{};
+    if (isIdent(code[i - 1])) {
+        const word = wordEndingAt(code, i - 1);
+        return .{
+            .word = word,
+            .char = code[i - 1],
+            .is_break_label = isLabeledBreakWord(word, code),
+        };
+    }
+    return .{ .char = code[i - 1] };
+}
+
+/// True when the dot at `dot` opens a field-access chain (the base before
+/// it ends a value expression: `)`, `]`, `}`, a quoted literal, a digit,
+/// a pointer deref `*`, or an optional unwrap `?`) rather than a
+/// struct-literal / enum-tag dot (EPH-I0911). A field-access field name
+/// may hold a fn value (`@import("row.zig").neverExtendBg`), so it keeps
+/// the conservative aliasing; a literal/tag dot never does (EPH-I0909).
+/// The lookback skips indentation: a dot at the start of a line
+/// continues the previous line's value expression, whose ending token
+/// decides (`prev`, EPH-I0913). Boundary: a `)` base separated from the
+/// dot by whitespace or a line break stays bare — the tokenizer cannot
+/// tell a call result from an if/while/for/switch condition close, and
+/// the condition's next-line `.name` is an enum-tag branch (the
+/// tigerbeetle `.transfers_pending` class is identifier-ending and
+/// covered).
+fn isFieldAccessDot(code: []const u8, dot: usize, prev: LineTail) bool {
+    if (dot == 0) return isWhitespaceSeparatedFieldAccess(prev);
+    if (code[dot - 1] == ' ' or code[dot - 1] == '\t' or code[dot - 1] == '\r') {
+        var i = dot;
+        while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t' or
+            code[i - 1] == '\r')) i -= 1;
+        return isWhitespaceSeparatedFieldAccess(
+            if (i == 0) prev else lineTailOf(code[0..i]),
+        );
+    }
+    return isFieldAccessCloser(code[dot - 1]);
 }
 
 /// Tokenize one comment-stripped code slice into the ZT105 evidence sets:
@@ -17602,11 +17709,14 @@ fn isFieldAccessDot(code: []const u8, dot: usize) bool {
 /// `.field` run in non-test value position (struct-literal LHS/shorthand,
 /// enum tag) is a field name, not a fn reference, and never aliases
 /// (EPH-I0909); a dotted chain (`x.field`) stays conservative — the field
-/// may hold a fn value.
+/// may hold a fn value. `prev_tail` is the previous significant line's
+/// ending token, consulted when the dot sits at the start of a
+/// continuation line (EPH-I0913).
 fn collectUntestedFnIdents(
     ctx: *const UntestedFnScanCtx,
     code: []const u8,
     in_test_context: bool,
+    prev_tail: LineTail,
 ) !void {
     var i: usize = 0;
     while (i < code.len) {
@@ -17636,10 +17746,11 @@ fn collectUntestedFnIdents(
         // tag — a field name, never a fn value reference (EPH-I0909): it
         // must not alias a same-named pub fn (`Fs.cwd` suppressed by
         // `.cwd = .{...}` literals). Field-ACCESS dots (after `)`, `]`,
-        // `}`, a literal, or a digit) stay conservative — the field may
-        // hold a fn value (`@import("row.zig").neverExtendBg`).
+        // `}`, a literal, a digit, `*`, `?`, or a continuation-line base —
+        // EPH-I0911, EPH-I0913) stay conservative — the field may hold a
+        // fn value (`@import("row.zig").neverExtendBg`).
         const is_bare_field = i > 0 and code[i - 1] == '.' and
-            !isFieldAccessDot(code, i - 1);
+            !isFieldAccessDot(code, i - 1, prev_tail);
         if (in_test_context) {
             try ctx.evidence.addTestedRun(ctx.allocator, code[i..end]);
         } else if (!is_bare_field) {
@@ -17698,10 +17809,14 @@ fn collectPubFnCandidate(
     const window = signatureWindow(ctx.content, content_off + t_off, &state.sig_buf);
     const name = extractPubFnCandidate(t, window) orelse return false;
     if (ul.in_test_context) return true;
-    // `pub fn build` in a build.zig is the build entry point, exercised by
-    // `zig build` exactly as main is by the binary (EPH-I0910). Path-scoped:
-    // a same-named fn in ordinary modules is a normal candidate.
-    if (mem.eql(u8, name, "build") and mem.endsWith(u8, ctx.path, "build.zig")) return true;
+    // `pub fn build` in the scan root's own build.zig is the build entry
+    // point, exercised by `zig build` exactly as main is by the binary
+    // (EPH-I0910). Root-scoped (EPH-I0912): a nested build.zig
+    // (sub/build.zig) and a name that merely ends with "build.zig"
+    // (my-build.zig) are ordinary candidates — only the root runs its
+    // build fn.
+    if (mem.eql(u8, name, "build") and
+        isBuildEntryPoint(ctx.resolved_path, ctx.scan_root)) return true;
     try ctx.evidence.decls.append(ctx.allocator, .{
         .path = ctx.path,
         .line = ul.number,
@@ -17709,6 +17824,31 @@ fn collectPubFnCandidate(
         .name = name,
     });
     return true;
+}
+
+/// True when this file is the scan root's own build.zig, whose `build` fn
+/// `zig build` exercises (EPH-I0910, EPH-I0912). The root build.zig sits
+/// at the scan root itself (`ephor check .`), or above it when the config
+/// pulls it in as an entry ("build.zig" entry with path_dir "src"). A
+/// bare path ("build.zig", no directory component — a single-file scan
+/// or the test harness) is the root of its own scan. Any other shape —
+/// a build.zig strictly inside the scan root (sig's
+/// src/rpc/webzockets/build.zig), or a name that merely ends with
+/// "build.zig" — is an ordinary candidate.
+fn isBuildEntryPoint(resolved: []const u8, scan_root: ?[]const u8) bool {
+    if (!mem.eql(u8, std.fs.path.basename(resolved), "build.zig")) return false;
+    const dir = std.fs.path.dirname(resolved) orelse return true;
+    const root = scan_root orelse return false;
+    return !pathIsStrictlyInside(dir, root);
+}
+
+/// True when `dir` is a strict descendant of `root`, boundary-checked:
+/// "/a/bc" is not inside "/a/b".
+fn pathIsStrictlyInside(dir: []const u8, root: []const u8) bool {
+    if (dir.len <= root.len) return false;
+    if (!mem.startsWith(u8, dir, root)) return false;
+    if (root.len > 0 and root[root.len - 1] == '/') return true;
+    return dir[root.len] == '/';
 }
 
 /// Process one source line for the ZT105 pass: track test-block membership
@@ -17725,6 +17865,12 @@ fn scanUntestedFnLine(
     if (isCommentOrMultilineString(t)) return;
     const code_end = findCommentStart(line) orelse line.len;
     const code = line[0..code_end];
+    // The previous significant line's tail, captured before this line's
+    // own tail replaces it: the line's tokenization classifies its
+    // leading dots against the PREVIOUS line's ending token (EPH-I0913).
+    const prev_tail = state.prev_tail;
+    const tail = lineTailOf(code);
+    if (tail.char != 0) state.prev_tail = tail;
 
     const was_in_test = state.in_test;
     const opener = resolveTestOpener(&state.pending, t, was_in_test, line_num);
@@ -17741,10 +17887,10 @@ fn scanUntestedFnLine(
     };
     if (try collectPubFnCandidate(ctx, state, ul)) return;
     if (!in_test_context and !ctx.is_test_file) {
-        try collectUntestedFnIdents(ctx, code, false);
+        try collectUntestedFnIdents(ctx, code, false, prev_tail);
         return;
     }
-    try collectUntestedFnIdents(ctx, code, true);
+    try collectUntestedFnIdents(ctx, code, true, prev_tail);
     // Every test context seeds the reachability pass — inline test blocks
     // and whole test files alike: a helper called from either is a live
     // edge into the project call graph (EPH-I0429). Test files contribute
@@ -17899,6 +18045,8 @@ fn analyzeUntestedPubFns(
             .content = entry.value_ptr.content,
             .evidence = &evidence,
             .is_test_file = isTestFilePath(entry.value_ptr.path),
+            .scan_root = graph.scan_root,
+            .resolved_path = entry.value_ptr.resolved_path,
         };
         try scanFileForUntestedFns(&ctx);
     }
@@ -73409,6 +73557,188 @@ test "ZT105 EPH-I0910: pub fn build in build.zig is not a candidate" {
         @as(usize, 1),
         countUntestedFnNotes(run.issues.items, "build_stray"),
     );
+}
+
+test "ZT105 EPH-I0911: ptr-deref and optional-unwrap field access aliases" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `ptr.*.field` dereferences to a value and `x.?.field` unwraps to a
+    // value: each `.field` is a field access whose name may hold a fn
+    // value, so it aliases. Pre-fix the star and question mark were
+    // absent from the closer set, the runs classified bare, and the
+    // same-named pub fns kept spurious notes (FN, EPH-I0911).
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_i0911_decl.zig",
+            .content =
+            \\pub fn field() void {}
+            \\pub fn unwrap_field() void {}
+            ,
+        },
+        .{
+            .path = "zt105_i0911_uses.zig",
+            .content =
+            \\fn uses() void {
+            \\    const p: *const S = undefined;
+            \\    const f = p.*.field;
+            \\    const u = p.?.unwrap_field;
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "field"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "unwrap_field"),
+    );
+}
+
+test "ZT105 EPH-I0913: continuation-line value chain aliases (newline-dot)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle src/state_machine.zig shape: a struct-literal RHS value
+    // chain `tree_values_count_limit` NEWLINE `.transfers_pending.timestamp`.
+    // The continuation line's leading-dot run is a field-access chain on
+    // the previous line's value, so its segments alias. Pre-fix the
+    // one-char lookback could not see the previous line, the run
+    // classified bare, and same-named pub fns kept spurious notes (FN,
+    // EPH-I0913).
+    const content =
+        \\pub fn transfers_pending() void {}
+        \\pub fn timestamp() void {}
+        \\const opts = .{
+        \\    .tree_options_object = .{
+        \\        .batch_value_count_limit = tree_values_count_limit
+        \\            .transfers_pending.timestamp,
+        \\    },
+        \\};
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_i0913.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "transfers_pending"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "timestamp"),
+    );
+}
+
+test "ZT105 EPH-I0913 guard: enum tags after keywords and if-branches stay bare" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The whitespace walk must not alias enum tags: `return .tag`,
+    // `break .tag`, `catch .tag`, `orelse .tag` (the walked-back word is
+    // a keyword), and the if-branch `if (cond) .tag` (the walked-back
+    // char is a `)` — excluded from the continuation set, EPH-I0913
+    // boundary). A struct literal field `.cwd = .{...}` stays bare
+    // (EPH-I0909). Guards: pre-fix they pass, post-fix they pin the FP
+    // direction.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_i0913g_decl.zig",
+            .content =
+            \\pub fn ret_tag() void {}
+            \\pub fn brk_tag() void {}
+            \\pub fn cch_tag() void {}
+            \\pub fn if_tag() void {}
+            \\pub fn cwd() void {}
+            ,
+        },
+        .{
+            .path = "zt105_i0913g_uses.zig",
+            .content =
+            \\fn f() !void {
+            \\    const v = blk: {
+            \\        break :blk .brk_tag;
+            \\    };
+            \\    const a = if (cond) .if_tag else .if_tag;
+            \\    const b = ret_fn() catch .cch_tag;
+            \\    const c = err_fn() orelse .cch_tag;
+            \\    const opts = .{ .cwd = .{ .path = "/" } };
+            \\    return .ret_tag;
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "if_tag"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "ret_tag"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "brk_tag"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "cch_tag"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "cwd"),
+    );
+}
+
+test "ZT105 EPH-I0912: nested and build.zig-suffixed files are candidates" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The root "build.zig" (bare path, the root of its own scan) keeps
+    // the EPH-I0910 exemption; "sub/build.zig" and "my-build.zig" are
+    // ordinary candidates. Pre-fix the endsWith exemption hid all three
+    // (note count 0); post-fix exactly the two non-root decls are
+    // flagged.
+    const files = [_]TestQualityFile{
+        .{ .path = "build.zig", .content = "pub fn build(b: *std.Build) void {}\n" },
+        .{ .path = "sub/build.zig", .content = "pub fn build(b: *std.Build) void {}\n" },
+        .{ .path = "my-build.zig", .content = "pub fn build(b: *std.Build) void {}\n" },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countUntestedFnNotes(run.issues.items, "build"),
+    );
+}
+
+test "ZT105 EPH-I0912: root build.zig classification across scan forms" {
+    // Production path shapes for isBuildEntryPoint: the scan root's own
+    // build.zig is exempt in every scan form; a strict descendant or a
+    // build.zig-suffixed name is a candidate.
+    try std.testing.expect(isBuildEntryPoint("/proj/build.zig", "/proj"));
+    try std.testing.expect(isBuildEntryPoint("build.zig", null));
+    try std.testing.expect(isBuildEntryPoint("build.zig", "/proj/build.zig"));
+    try std.testing.expect(isBuildEntryPoint("/proj/build.zig", "/proj/src"));
+    try std.testing.expect(!isBuildEntryPoint("/proj/src/rpc/build.zig", "/proj/src"));
+    try std.testing.expect(!isBuildEntryPoint("/proj/src/rpc/build.zig", null));
+    try std.testing.expect(!isBuildEntryPoint("/proj/my-build.zig", "/proj"));
 }
 
 test "ZT105: spaced call in non-test code is a call, not an alias (EPH-I0433)" {

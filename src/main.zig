@@ -17962,10 +17962,13 @@ fn analyzeTests(
 /// A located lock-family acquire call: where it is, on what receiver.
 /// `receiver` and `method` borrow the file content, which outlives the
 /// scan. `depth` is the brace depth at the call relative to the fn body.
-/// `cond_position` is true when the acquire's line opens a block after
-/// the call (`if (mu.tryLock()) {`) — the opened block is the acquire's
-/// guard, so a defer one level deeper still registers on every acquired
-/// path.
+/// `cond_position` is true when the acquire sits in an `if (`/`while (`
+/// guard condition whose block opens on the same line after the
+/// condition's close paren (`if (mu.tryLock()) {`) — the opened block
+/// is the acquire's guard, so a defer one level deeper still registers
+/// on every acquired path. Struct-literal arguments (`mu.lock(.{})`)
+/// never count: the conditionality is the call's position, not the
+/// argument's shape (EPH-I0440).
 const LockAcquire = struct {
     line: usize,
     col: usize,
@@ -18068,9 +18071,11 @@ const ConcurrencyIssueSink = struct {
 
 /// One line's call-scan context for ZC101 (bundled for param counts).
 /// `defer_attr_depth` is the depth attributed to releases in defer
-/// context: the defer STATEMENT's depth — this line's start depth for a
-/// single-line defer or block opener, the depth captured at the opener
-/// for lines inside a `defer { }` block.
+/// context: the defer STATEMENT's depth — the brace depth at the
+/// keyword (the line's start depth for a plain line-start defer, the
+/// post-close depth for a `} defer ...` continuation, EPH-I0439) — or
+/// the depth captured at the opener for lines inside a `defer { }`
+/// block.
 const ConcLineCtx = struct {
     code: []const u8,
     blanked: []const u8,
@@ -18158,12 +18163,18 @@ fn callReceiver(target: []const u8) ?[]const u8 {
     return target[0..dot];
 }
 
-/// True when the statement discards the call result (`_ = file.tryLock(...)`).
-/// A discarded acquire is not scoped ownership — it is the hold-till-close
-/// file-lock idiom — so ZC101 does not treat it as an acquire.
+/// True when the statement discards the call result (`_ = file.tryLock(...)`,
+/// `_=file.tryLock(...)`, `_ =file.tryLock(...)`). A discarded acquire is
+/// not scoped ownership — it is the hold-till-close file-lock idiom — so
+/// ZC101 does not treat it as an acquire. Missing spaces around the `=`
+/// are accepted: the compiler accepts them, only zig fmt normalizes
+/// (EPH-I0446).
 fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
     const prefix = mem.trim(u8, code[0..call_start], " \t");
-    return mem.endsWith(u8, prefix, "_ =");
+    if (prefix.len < 2 or prefix[prefix.len - 1] != '=') return false;
+    var i = prefix.len;
+    while (i > 1 and (prefix[i - 2] == ' ' or prefix[i - 2] == '\t')) i -= 1;
+    return prefix[i - 2] == '_';
 }
 
 /// Update defer/errdefer block tracking for one literal-blanked line
@@ -18173,17 +18184,20 @@ fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
 /// leaks on the success path, but flagging the dominant correct
 /// `lock(); errdefer unlock(); work(); unlock();` form would be worse).
 /// A block opener also captures the defer STATEMENT's depth (the opener
-/// line's start depth): releases inside the block are attributed that
-/// depth, not their own — the defer registers at the opener's scope.
+/// line's brace depth at the keyword): releases inside the block are
+/// attributed that depth, not their own — the defer registers at the
+/// opener's scope. The caller computes the keyword depth, so a
+/// `} defer {` continuation registers at the post-close depth (EPH-I0439).
 fn trackConcurrencyDefer(
     blanked: []const u8,
     defer_line: bool,
+    defer_stmt_depth: usize,
     state: *ConcurrencyScanState,
 ) void {
     if (defer_line and mem.indexOfScalar(u8, blanked, '{') != null) {
         state.in_defer = true;
         state.defer_depth = 0;
-        state.defer_stmt_depth = state.fn_depth;
+        state.defer_stmt_depth = defer_stmt_depth;
     }
     if (!state.in_defer) return;
     for (blanked) |c| {
@@ -18276,7 +18290,7 @@ fn recordLockCall(
                 .receiver = call.receiver,
                 .method = call.seg,
                 .depth = call.depth,
-                .cond_position = mem.indexOfScalar(u8, lc.blanked[call.start..], '{') != null,
+                .cond_position = isCondPosition(lc.blanked, call.start),
             };
             if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) return;
             try rec.acquires.append(state.allocator, acq);
@@ -18312,6 +18326,60 @@ fn firstCallArg(blanked: []const u8, open_paren: usize) ?[]const u8 {
     if (i == start or i >= blanked.len or
         (blanked[i] != ')' and blanked[i] != ',')) return null;
     return blanked[start..i];
+}
+
+/// True when the call at `call_start` sits in the guard condition of an
+/// `if (` or `while (` whose block opens on this line after the
+/// condition's close paren — `if (mu.tryLock()) {` (EPH-I0440). The
+/// block must follow the ENCLOSING condition's close: a `{` inside the
+/// call's own arguments (`mu.lock(.{})`, `foo(mu.tryLock(), .{...})`)
+/// is an argument shape, not a guard block, and never counts. The
+/// directly-enclosing paren group must be the guard's: a call nested in
+/// helper parens (`if (foo(mu.tryLock())) {`) or an inner wrapping
+/// group is not in condition position. The single-line approximation
+/// (the block opens on the same line) matches the LockAcquire doc.
+fn isCondPosition(blanked: []const u8, call_start: usize) bool {
+    // The call's own paren group: find its open and the matching close.
+    const open_rel = mem.indexOfScalar(u8, blanked[call_start..], '(') orelse return false;
+    var i = call_start + open_rel + 1;
+    var depth: usize = 1;
+    while (i < blanked.len and depth > 0) : (i += 1) {
+        if (blanked[i] == '(') depth += 1;
+        if (blanked[i] == ')') depth -= 1;
+    }
+    if (depth != 0) return false;
+    // A block must open after the condition's close parens. Enclosing
+    // groups may close in between (`if (a and (mu.tryLock())) {`), and
+    // for the direct shape the call's own close IS the guard's close.
+    var guard_depth: i32 = 0;
+    while (i < blanked.len) : (i += 1) {
+        const c = blanked[i];
+        if (c == ' ' or c == '\t') continue;
+        if (c == ')') {
+            guard_depth -= 1;
+            continue;
+        }
+        if (c == '(') {
+            guard_depth += 1;
+            continue;
+        }
+        if (c == '{' and guard_depth <= 0) return guardIsIfOrWhile(blanked, call_start);
+        return false;
+    }
+    return false;
+}
+
+/// True when the paren group directly enclosing the call at
+/// `call_start` is an `if (` or `while (` guard: the identifier token
+/// immediately before that group's open paren.
+fn guardIsIfOrWhile(blanked: []const u8, call_start: usize) bool {
+    const enc = mem.lastIndexOfScalar(u8, blanked[0..call_start], '(') orelse return false;
+    var j = enc;
+    while (j > 0 and (blanked[j - 1] == ' ' or blanked[j - 1] == '\t')) j -= 1;
+    const end = j;
+    while (j > 0 and isIdent(blanked[j - 1])) j -= 1;
+    const tok = blanked[j..end];
+    return mem.eql(u8, tok, "if") or mem.eql(u8, tok, "while");
 }
 
 /// Record one line's lock-family calls into the open fn record (ZC101).
@@ -18375,6 +18443,70 @@ fn closeOpensArm(rest: []const u8) bool {
         (t.len == 4 or !isIdent(t[4]));
 }
 
+/// Index just past a `/*` block comment starting at `i` (t[i] == '/',
+/// t[i + 1] == '*'); the line end when the comment is unterminated.
+fn skipBlockComment(t: []const u8, i: usize) usize {
+    var j = i + 2;
+    while (j + 1 < t.len and !(t[j] == '*' and t[j + 1] == '/')) j += 1;
+    return j;
+}
+
+/// Position of a defer or errdefer keyword that opens a statement on the
+/// trimmed line `t`, or null: the line start, or a statement boundary
+/// before it — a `;`, a block close `}`, or a block open `{` (EPH-I0439).
+/// Those are the statement-continuation positions valid Zig permits for
+/// a defer: `if (x) defer ...` and `} else defer ...` are compile errors
+/// ("expected block or assignment", verified with zig ast-check 0.16 —
+/// the ZA101 F6b pin cites the same result). String literals, char
+/// literals, comments, and `\\` multiline-string content never match:
+/// prose holding the word `defer` is not a defer statement.
+fn deferKeywordPos(t: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < t.len) {
+        const c = t[i];
+        // Skip literal content so prose holding the word `defer` cannot
+        // match: a string or char literal, a `\\` multiline opener (the
+        // rest of the line is string content), or a comment.
+        if (c == '"' or c == '\'') {
+            i = if (c == '"') skipPastString(t, i) else skipPastChar(t, i);
+            continue;
+        }
+        if (types.isMultilineOpenerAt(t, i)) return null;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return null;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '*') {
+            i = skipBlockComment(t, i);
+            continue;
+        }
+        if (c != 'd' and c != 'e') {
+            i += 1;
+            continue;
+        }
+        const kw = if (c == 'd') "defer" else "errdefer";
+        const kw_end = i + kw.len;
+        if (kw_end <= t.len and mem.startsWith(u8, t[i..], kw) and
+            (kw_end == t.len or t[kw_end] == ' ' or t[kw_end] == '\t' or
+                t[kw_end] == '{') and (i == 0 or !isIdent(t[i - 1])) and
+            deferOpensStatement(t, i))
+        {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
+/// True when the keyword at `pos` opens a statement: the preceding
+/// non-space text is a statement boundary (`;`, a block close `}`, a
+/// block open `{`) or the line start. A keyword glued to an identifier
+/// (`undefer`) is part of that word and rejected by the caller.
+fn deferOpensStatement(t: []const u8, pos: usize) bool {
+    var i = pos;
+    while (i > 0 and (t[i - 1] == ' ' or t[i - 1] == '\t')) i -= 1;
+    if (i == 0) return true;
+    const c = t[i - 1];
+    return c == ';' or c == '}' or c == '{';
+}
+
 /// Scan one line of a file for concurrency facts, updating `state`.
 fn scanConcurrencyLine(
     state: *ConcurrencyScanState,
@@ -18404,14 +18536,20 @@ fn scanConcurrencyLine(
             .opens_arm = false,
         });
     }
-    const defer_line = isDeferOrErrdefer(t);
-    const defer_ctx = defer_line or state.in_defer;
+    const defer_pos = deferKeywordPos(t);
+    const defer_ctx = defer_pos != null or state.in_defer;
     // Depth attributed to defer-context releases: the defer STATEMENT's
-    // depth. Computed BEFORE trackConcurrencyDefer mutates block state —
-    // for an opener line that is this line's start depth, for lines
-    // inside a block the depth captured at the opener.
-    const defer_attr_depth = if (state.in_defer) state.defer_stmt_depth else state.fn_depth;
-    trackConcurrencyDefer(blanked, defer_line, state);
+    // depth — the brace depth at the keyword, so a `} defer ...` or
+    // `{ defer ...` continuation registers at the post-close or
+    // inside-block depth (EPH-I0439). Computed BEFORE
+    // trackConcurrencyDefer mutates block state; for lines inside an
+    // open defer block the depth captured at the opener applies.
+    const defer_stmt_depth = if (defer_pos) |p|
+        braceDelta(state.fn_depth, blanked[0 .. skipLeadingWhitespace(code) + p])
+    else
+        state.fn_depth;
+    const defer_attr_depth = if (state.in_defer) state.defer_stmt_depth else defer_stmt_depth;
+    trackConcurrencyDefer(blanked, defer_pos != null, defer_stmt_depth, state);
     try scanConcurrencyCalls(state, .{
         .code = code,
         .blanked = blanked,
@@ -18681,6 +18819,7 @@ fn emitDoubleLock(
     else
         try std.fmt.allocPrint(sink.allocator, "double lock of " ++
             "'{s}' — already held, deadlock", .{acq.receiver});
+    errdefer sink.allocator.free(msg);
     const help: []const u8 = if (shared)
         "std.Io.RwLock blocks new readers once a writer waits — " ++
             "re-entrant read locking is unsafe"
@@ -73958,6 +74097,151 @@ test "ZC101: fn-scope defer over a conditional tryLock is covered (EPH-I0033, ZC
     try expectZC103Counts(run.issues.items, 1, 0);
 }
 
+test "ZC101: block-close then defer on one line is deferred coverage (EPH-I0439)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `} defer mu.unlock();` continues the line after the block close —
+    // a valid defer statement (zig ast-check 0.16) the line-start
+    // keyword check missed: the release read as a plain statement and
+    // ZC101 flagged the defer as missing. Regression pin (band B08 F3).
+    const content =
+        \\fn doWork() void {}
+        \\fn f(x: bool) void {
+        \\    mu.lock();
+        \\    if (x) { doWork(); } defer mu.unlock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_closedefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: semicolon-continuation defer is deferred coverage (EPH-I0439)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (x) doWork(); defer mu.unlock();` — the defer opens a new
+    // statement after the `;`, still on the same line. Same
+    // statement-position class as the `} defer` form (band B08 F3).
+    const content =
+        \\fn doWork() void {}
+        \\fn f(x: bool) void {
+        \\    mu.lock();
+        \\    if (x) doWork(); defer mu.unlock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_semidefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: one-line guard-block defer is branch-scoped (EPH-I0439)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer opens the guard's block on the same line: it registers
+    // only on the entered path, so an outer-depth acquire is not
+    // covered — matching the multi-line `if (x) {` + `defer` form pinned
+    // above. Pre-fix the release read as a plain branch release and the
+    // verdict was a note; the deferred classification warns (band B08
+    // F3).
+    const content =
+        \\fn doWork() void {}
+        \\fn f(x: bool) void {
+        \\    mu.lock();
+        \\    if (x) { defer mu.unlock(); doWork(); }
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_openbrackdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: defer word in a string or comment is not a defer line (EPH-I0439 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard (passes pre-fix): the statement-position keyword scan skips
+    // string literals and comments, so prose holding `} defer` never
+    // flips a line into defer context. The lock still warns.
+    const content =
+        \\fn f() void {
+        \\    const s = "} defer mu.unlock();";
+        \\    // } defer mu.unlock();
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_prose_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: struct-literal lock argument is not a condition position (EPH-I0440)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `.{}` argument brace sat AFTER the call, so the old brace
+    // probe read the acquire as condition-position and a defer one
+    // level deeper counted as covering. The block after the call is not
+    // the acquire's guard — the outer acquire stays uncovered.
+    // Regression pin (band B08 F4).
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock(.{ .a = 1 });
+        \\    {
+        \\        defer mu.unlock();
+        \\    }
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_lockstruct.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: unspaced discard is not an acquire (EPH-I0446)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `_=file.tryLock();` — the compiler accepts the missing spaces
+    // (zig fmt normalizes them). Pre-fix the `_ =`-with-spaces matcher
+    // missed the discard and the hold-till-close idiom drew a warning.
+    // Regression pin (band B08 F10).
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    _=file.tryLock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_unspaced_discard.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
 // ============================================================================
 // Concurrency Analysis Tests (ZC102 double lock)
 // ============================================================================
@@ -74090,6 +74374,32 @@ test "ZC102: lock;defer unlock;lock warns — the defer runs at scope exit" {
     var run = try runConcurrencyCheck(&diag, allocator, "zc102_defer.zig", content);
     defer run.deinit(allocator);
 
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: block-close defer runs at scope exit — later lock warns (EPH-I0439)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `} defer` release registers after the close and runs at the
+    // FN's exit — the second lock executes while the first is still
+    // held. Pre-fix the release read as a plain statement and cleared
+    // the hold at the statement, missing the double lock. Regression
+    // pin (band B08 F3).
+    const content =
+        \\fn doWork() void {}
+        \\fn f(x: bool) void {
+        \\    mu.lock();
+        \\    if (x) { doWork(); } defer mu.unlock();
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_closedefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
     try expectZC102Counts(run.issues.items, 1, 0);
 }
 
@@ -74692,6 +75002,31 @@ test "ZC103: defer inside the tryLock guard block is silent" {
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc103_tryguard.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: tryLock as a call argument is not in condition position (EPH-I0440)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `.{ ... }` after the tryLock is an ARGUMENT of the enclosing
+    // call, not the guard block of a condition. Pre-fix the arg brace
+    // set cond_position and the false-path defer warning fired on a
+    // non-conditional tryLock — the acquire runs unconditionally, so
+    // the fn-scope defer is correct. Regression pin (band B08 F4).
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    foo(mu.tryLock(), .{ .a = 1 });
+        \\    defer mu.unlock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_arg_trylock.zig", content);
     defer run.deinit(allocator);
 
     try expectZC103Counts(run.issues.items, 0, 0);

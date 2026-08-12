@@ -16641,14 +16641,16 @@ const FnDef = struct {
 
 /// Extract the fn defined on this trimmed line, if any: a real `fn name`
 /// with a word boundary on BOTH sides — `findRealFnDef` alone accepts the
-/// "fn " inside `has_fn and ...`, inventing a fn named `and`.
+/// "fn " inside `has_fn and ...`, inventing a fn named `and`. The name is
+/// a plain identifier or the `@"..."` quoted form; both spellings come
+/// from pubFnNameAt so a quoted decl matches a quoted call site's
+/// callSiteName spelling (EPH-I0442, EPH-I0908).
 fn extractFnDef(t: []const u8) ?FnDef {
     const pos = findRealFnDef(t) orelse return null;
     if (pos > 0 and isIdent(t[pos - 1])) return null;
-    var end = pos + 3;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    const excluded = fnReturnsType(t, end) or hasGenericParams(t, end);
-    return .{ .name = t[pos + 3 .. end], .excluded = excluded };
+    const fn_name = pubFnNameAt(t, pos + 3) orelse return null;
+    const excluded = fnReturnsType(t, fn_name.end) or hasGenericParams(t, fn_name.end);
+    return .{ .name = fn_name.name, .excluded = excluded };
 }
 
 /// One source line in the forms the ZT101 call-graph scan needs: trimmed,
@@ -18036,6 +18038,10 @@ const ConcurrencyScanState = struct {
     records: std.ArrayListUnmanaged(FnLockRecord) = .empty,
     in_fn: bool = false,
     pending_fn: bool = false,
+    /// Paren depth of a pending fn def's signature (EPH-I0447): a `{`
+    /// inside the signature parens (a `.{}` default param) is not the
+    /// body, mirroring the ZT101 FnSpanState contract.
+    sig_parens: usize = 0,
     fn_depth: usize = 0,
     in_defer: bool = false,
     defer_depth: usize = 0,
@@ -18193,6 +18199,9 @@ fn trackConcurrencyDefer(
 /// A pending def ended by `;` first is a bodiless extern decl — drop it.
 /// Fns nested inside another fn are not tracked separately; their calls
 /// roll up into the outer fn's record (widens coverage — FP-safe).
+/// The body brace is the first `{` OUTSIDE the signature's parens: a
+/// `.{}` default param value opens no record of its own, so a wrapped
+/// signature's real body is not lost to a phantom span (EPH-I0447).
 fn updateConcurrencySpan(
     state: *ConcurrencyScanState,
     tc: []const u8,
@@ -18201,8 +18210,21 @@ fn updateConcurrencySpan(
     if (!state.pending_fn) {
         if (extractFnDef(tc) == null) return;
         state.pending_fn = true;
+        state.sig_parens = 0;
     }
-    if (mem.indexOfScalar(u8, blanked, '{') == null) {
+    // Scan the literal-blanked line for the body open: paren depth is
+    // carried across lines, so a `.{}` default on a wrapped param line
+    // stays inside the signature.
+    var body_open = false;
+    for (blanked) |c| {
+        if (c == '(') state.sig_parens += 1;
+        if (c == ')' and state.sig_parens > 0) state.sig_parens -= 1;
+        if (c == '{' and state.sig_parens == 0) {
+            body_open = true;
+            break;
+        }
+    }
+    if (!body_open) {
         if (mem.endsWith(u8, tc, ";")) state.pending_fn = false;
         return;
     }
@@ -19105,17 +19127,24 @@ fn analyzeFileSpawns(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
     for (lines.items) |line| {
         line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
-        const ts = trackTestBlock(t, in_test, test_depth);
+        // Sibling-band contract (EPH-I0437): trackTestBlock receives the
+        // comment-stripped, literal-blanked neutral line, so braces in
+        // test-name strings, fixture strings, and trailing comments are
+        // data — they never open or close the test block (mirrors
+        // scanTestLine :17314 and scanUntestedFnLine :17719).
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = line[0..code_end];
+        const neutral = mem.trim(u8, blankLiteralContents(code, &blank_buf), " \t\r");
+        const ts = trackTestBlock(neutral, in_test, test_depth);
         in_test = ts.in_test;
         test_depth = ts.depth;
         if (in_test or isCommentOrMultilineString(t)) continue;
-        const code_end = findCommentStart(line) orelse line.len;
         const ctx: SpawnScanCtx = .{
             .lines = lines.items,
             .blank_buf = &blank_buf,
             .needle_buf = &needle_buf,
         };
-        try checkLineSpawns(sink, ctx, line[0..code_end], line_num);
+        try checkLineSpawns(sink, ctx, code, line_num);
     }
 }
 
@@ -19936,8 +19965,10 @@ fn findRealFnDef(t: []const u8) ?usize {
     if (findCommentStart(t)) |comment_start| {
         if (pos >= comment_start) return null;
     }
-    // Must be followed by identifier (function name)
-    if (pos + 3 >= t.len or !isIdent(t[pos + 3])) return null;
+    // Must be followed by a function name: a plain identifier or the
+    // `@"..."` quoted form (EPH-I0442). pubFnNameAt validates both and
+    // rejects a malformed quoted name.
+    if (pubFnNameAt(t, pos + 3) == null) return null;
     return pos;
 }
 
@@ -20105,9 +20136,11 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     }
     if (state.in_fn) return;
 
-    var end = pos + 3;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    const name = t[pos + 3 .. end];
+    // Plain identifier or `@"..."` quoted name (EPH-I0442) — pubFnNameAt
+    // yields the inner content for the quoted form, so reports name the
+    // fn the same way call sites do.
+    const fn_name = pubFnNameAt(t, pos + 3) orelse return;
+    const name = fn_name.name;
     var pending: PendingFnStart = .{
         .name = name,
         .start_line = line_num,
@@ -69701,6 +69734,21 @@ test "detectFnStart: extern decl with trailing comment opens no fn state (EPH-I0
     try std.testing.expect(!state.in_fn);
 }
 
+test "findRealFnDef: quoted fn name is a real def (EPH-I0442)" {
+    // The decl-side sibling of the EPH-I0908 call-site fix: `fn @"x"()`
+    // must open the same spans a plain-name def does, so lock calls in
+    // quoted-name bodies reach ZC101-ZC103. The inner content is the
+    // spelling callSiteName records for a quoted call.
+    try std.testing.expect(findRealFnDef("fn @\"weird-name\"() void {}") != null);
+    try std.testing.expect(findRealFnDef("pub fn @\"a-b\"() void {}") != null);
+    // A malformed quote is not a def; a fn-pointer type is not a def.
+    try std.testing.expect(findRealFnDef("fn @\"unterminated() void {}") == null);
+    try std.testing.expect(findRealFnDef("cb: *const fn () void,") == null);
+    const quoted_def = extractFnDef("fn @\"weird-name\"() void {}") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("weird-name", quoted_def.name);
+}
+
 test "ZA301: wrapped extern decl followed by a real fn reports no phantom (EPH-I0756)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -75161,6 +75209,236 @@ test "ZC104: dotted-receiver defer join satisfies the field-bound handle (EPH-I0
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: test-name/fixture/trailing braces keep block bounds (EPH-I0437)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard pins: the EPH-I0883 literal-aware trackTestBlock already
+    // masks the three shapes; the ZC104 site now feeds it the
+    // comment-stripped, literal-blanked neutral line (the sibling-band
+    // contract). A `{` inside the test NAME must not arm a phantom block,
+    // and a `}` in a fixture string or trailing comment must not close
+    // the real block early — either way the after-block spawn would be
+    // mis-attributed.
+    const content =
+        \\fn work() void {}
+        \\test "leaky {" {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\    const s = "}";
+        \\    _ = s;
+        \\    doWork(); // }
+        \\}
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_neutral.zig", content);
+    defer run.deinit(allocator);
+
+    // Only f()'s spawn is attributed: the test block stays closed after
+    // `}`, and the name brace never leaks in_test past the block.
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: brace-carrying test name arms and closes the block exactly once (EPH-I0437)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `test "leaky {" {` arms on the REAL `{` after the name string. The
+    // fixture `"}"` and the trailing `// }` comment are data on the
+    // neutral line: depth 1 opens and the block closes only at the real
+    // `}`. Two sibling tests follow, so the block must close exactly.
+    const content =
+        \\fn work() void {}
+        \\test "leaky {" {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\    const s = "}";
+        \\    _ = s;
+        \\    doWork(); // }
+        \\}
+        \\test "second" {
+        \\    const n: usize = 2;
+        \\    _ = n;
+        \\}
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_neutral2.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: wrapped signature with .{} default opens the record at the real body (EPH-I0447)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Regression pin (fails pre-fix): the `.{}` default on the wrapped
+    // param line used to open a phantom record that closed on the same
+    // line, so the real body never opened and the lock calls vanished
+    // (0 issues instead of the baseline 1). Signature parens now bound
+    // the pending window, mirroring the ZT101 updatePending contract.
+    const content =
+        \\fn work() void {}
+        \\fn setup(
+        \\    items: []const u8 = &.{ .x = 1 },
+        \\) void {
+        \\    mu.lock();
+        \\    _ = mu;
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_wrapped.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 1);
+}
+
+test "ZC101: fn-pointer field never opens a phantom fn span (EPH-I0447)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard pin: findRealFnDef requires an identifier after "fn ", so a
+    // fn-pointer field (`fn (`) never arms pending state; the sig_parens
+    // bound (EPH-I0447) keeps a `.{}` default on the next line from
+    // opening a phantom record either way. The real fn's lock note is
+    // the only issue.
+    const content =
+        \\fn work() void {}
+        \\const Handler = struct {
+        \\    cb: *const fn () void,
+        \\    items: []const u8 = &.{ .x = 1 },
+        \\};
+        \\fn f() void {
+        \\    mu.lock();
+        \\    _ = mu;
+        \\    mu.unlock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_fnptr.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 1);
+}
+
+test "ZC101: quoted-name fn def opens a span, lock calls reach the evaluator (EPH-I0442)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Regression pin (fails pre-fix): `fn @"weird-name"()` never matched
+    // findRealFnDef (the name is not an ident), so the span never opened
+    // and the never-unlocked lock drew nothing. The decl side now accepts
+    // the quoted form, symmetric with the call-side fix (EPH-I0908).
+    const content =
+        \\fn work() void {}
+        \\fn @"weird-name"() void {
+        \\    mu.lock();
+        \\    _ = mu;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_quoted.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZA202: error-scan test tracking survives brace shapes (EPH-I0921, guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard pin for the updateErrorState trackTestBlock site (:15846).
+    // The site passes the raw trimmed line, but (a) scanFileErrorLine
+    // pre-strips whole-line comments and multiline bodies at :15879
+    // before the tracker runs, and (b) trackTestBlock masks in-line
+    // strings and trailing comments itself (EPH-I0883). A `{` in the
+    // test name, a `"}"` fixture, and a trailing `// }` must keep the
+    // block boundary exact: the catch inside the block is test-context
+    // (suppressed), the catch after the block is not (fires).
+    const content =
+        \\fn f() void {
+        \\    const x = bar() catch unreachable;
+        \\    _ = x;
+        \\}
+        \\test "catch {" {
+        \\    const s = "}";
+        \\    _ = s;
+        \\    const y = baz() catch unreachable;
+        \\    _ = y;
+        \\    doWork(); // }
+        \\}
+        \\fn g() void {
+        \\    const z = qux() catch unreachable;
+        \\    _ = z;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za202_shapes.zig", content);
+    defer run.deinit(allocator);
+
+    // Only the two non-test catches fire; the test-block catch is
+    // suppressed. A corrupted boundary would flip one of these counts.
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "za202_shapes.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
+test "ZA103: CFG test tracking survives brace shapes (EPH-I0921, guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard pin for the analyzeCFGFile trackTestBlock site (:22831).
+    // The isCommentOrMultilineString check at :22828 precedes the tracker
+    // call at :22831 (verified order), and trackTestBlock masks in-line
+    // strings itself (EPH-I0883). A test block whose name carries `{`,
+    // whose body carries a `"}"` fixture and a trailing `// }` comment
+    // must still bound exactly: the no-free fn INSIDE the block is test
+    // context (r3 suppressed), the twin OUTSIDE fires ZA103.
+    const content =
+        \\fn outside(allocator: std.mem.Allocator, x: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 100);
+        \\    _ = buf;
+        \\    if (x > 0) return error.bad;
+        \\}
+        \\test "alloc {" {
+        \\    const s = "}";
+        \\    _ = s;
+        \\    fn inside(allocator: std.mem.Allocator, x: u8) !void {
+        \\        const buf = try allocator.alloc(u8, 100);
+        \\        _ = buf;
+        \\        if (x > 0) return error.bad;
+        \\    }
+        \\    doWork(); // }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za103_shapes.zig", content);
+    defer run.deinit(allocator);
+
+    // Only the outside twin fires; the inside fn is test-context.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za103_shapes.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
 }
 
 // ============================================================================

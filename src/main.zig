@@ -9842,9 +9842,14 @@ fn hasBareIdentReturn(t: []const u8) bool {
 /// line and keeps looking for a dominating transfer or an uncovered
 /// exit (EPH-I0063). A conditional return of any OTHER name leaves the
 /// alloc untransferred on its path and stays an uncovered exit — the
-/// gate is name-exact. The `else return` twin (`if (a) return buf;
-/// else return buf;`) matches: every arm transfers there, so the line
-/// never leaks. The guard head must be exactly the word `if`: a leading
+/// gate is name-exact. The `else return` twin matches only when it
+/// shares the if line (`if (a) return buf; else return buf;`): the
+/// predicate sees the if line and its first return, so the one-line
+/// twin transfers. A two-line twin (`else return buf;` on its own
+/// line) fails the guard-head check and the else line stops the scan
+/// as a bare-ident exit (hasBareIdentReturn); it stays silent only
+/// because code after a both-arms return is dead (EPH-I0917). The
+/// guard head must be exactly the word `if`: a leading
 /// statement (`sink(); if (x) return buf;`) is not the shape.
 fn isConditionalReturnTransfer(t: []const u8, name: []const u8) bool {
     if (name.len == 0) return false;
@@ -16398,7 +16403,7 @@ fn referencesTestingAllocator(neutral: []const u8) bool {
 }
 
 /// True when any fn the test body calls — directly or through the
-/// file-local call graph (BFS, depth-capped, cycle-safe) — contains an
+/// file-local call graph (depth-capped, cycle-safe work-stack walk) — contains an
 /// assertion call in its own body (ZT102 helper-mediation): the test
 /// delegates verification to the helper, so it is not smoke. The
 /// project-wide witness set covers cross-file helpers (ghostty's
@@ -16914,11 +16919,11 @@ fn collectLineCalls(
     }
 }
 
-/// Max BFS depth when resolving helper-mediated calls (ZT101). Deeper
+/// Max call-graph depth when resolving helper-mediated calls (ZT101). Deeper
 /// mediation chains are pathological; the cap keeps the walk bounded.
 const max_call_depth = 8;
 
-/// Bounded call-graph work item: a callee plus its BFS depth.
+/// Bounded call-graph work item: a callee plus its hop depth.
 const ReachWork = struct {
     name: []const u8,
     depth: usize,
@@ -16926,8 +16931,8 @@ const ReachWork = struct {
 
 /// Work-stack + visited set for computeReachableCalls, bundled to keep
 /// param counts low. Consumed LIFO (stack pop — a DFS); the traversal
-/// order is irrelevant because the visited set makes the reachability
-/// result order-independent (EPH-I0436).
+/// order is irrelevant without the depth cap, because the visited set
+/// makes the uncapped reachability result order-independent (EPH-I0436).
 const ReachBfs = struct {
     reachable: std.StringHashMapUnmanaged(void) = .empty,
     stack: std.ArrayListUnmanaged(ReachWork) = .empty,
@@ -16959,7 +16964,9 @@ const ReachBfs = struct {
 
 /// All fn names reachable from a test body's direct calls through the
 /// file-local call graph (depth-capped, cycle-safe via the reachable set
-/// itself; traversal order is a DFS but irrelevant to the result). The
+/// itself; traversal order is a DFS, irrelevant to the result without the
+/// depth cap — under the cap a name first pushed at the cap never expands,
+/// so the capped result can depend on order). The
 /// direct calls are included: a body that calls the
 /// candidate needs no graph edge.
 fn computeReachableCalls(
@@ -17642,7 +17649,7 @@ fn collectUntestedFnIdents(
     }
 }
 
-/// Collect the last segments of call targets on one test-block line as BFS
+/// Collect the last segments of call targets on one test-block line as
 /// seeds for the helper-mediation pass (ZT101 machinery, uncapped — a cap
 /// would shrink the corpus and invent false positives).
 fn collectTestRootCalls(
@@ -17770,7 +17777,7 @@ fn mergeCalleesIntoIndex(
 /// project-wide call graph to the tested set (EPH-I0429): a test in
 /// foo_test.zig that calls a helper defined in foo.zig still exercises
 /// every pub fn the helper's body reaches — the 2-hop cross-file chain
-/// the file-local BFS could not see. The index merges every file's
+/// the file-local walk could not see. The index merges every file's
 /// callee facts by name; a name defined in several files expands through
 /// all of them, the same name-based over-approximation the per-file
 /// graph already made (note severity, and the direction is fewer notes).
@@ -17778,15 +17785,20 @@ fn mergeCalleesIntoIndex(
 /// lsm/tree_fuzz.zig `apply` (fuzz-binary-only, callers nested inside
 /// `EnvironmentType(...) type {`) is cleared by replica_test.zig's
 /// `t.run()` seed expanding through forest_fuzz.zig's same-named `run`.
-/// A distinctive-name gate on the BFS edges was considered and rejected
+/// A distinctive-name gate on the call-graph edges was considered and rejected
 /// (EPH-I0907): ghostty's `prepare` removals run through a plain callee
 /// edge — harfbuzz.zig:437 and coretext.zig:837 same-file tests drive
 /// `it.next()` → run.zig:47 `RunIterator.next` → run.zig:76
 /// `self.hooks.prepare()`, the sole prepare call site — so the gate
 /// would re-flag genuinely test-reachable fns. The limitation is
 /// documented in the note's help text.
-/// The BFS is depth-capped and cycle-safe — the reachable set doubles as
-/// the visited set — so a hostile import cycle terminates.
+/// The walk is depth-capped and cycle-safe — the reachable set doubles as
+/// the visited set — so a hostile import cycle terminates. Order-dependence
+/// holds under the cap: the depth guard sits at the pop site, so a name
+/// first pushed at the depth cap is never expanded — its subtree stays
+/// excluded even when the name is reachable within the cap through another
+/// path, because push marks visited at push time and pins the first-reach
+/// depth.
 fn addProjectReachableTested(
     allocator: Allocator,
     evidence: *UntestedFnEvidence,
@@ -19322,6 +19334,8 @@ fn analyzeFileConcurrency(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !v
     try analyzeFileSpawns(sink, a);
 }
 
+/// Drive the concurrency rules (EPH-I0448): ZC101/ZC102 lock pairing per
+/// fn, ZC103 conditional-tryLock fn-scope defers, ZC104 spawn handles.
 fn analyzeConcurrency(
     allocator: Allocator,
     graph: *ImportGraph,
@@ -19641,6 +19655,8 @@ fn checkUnusedDecl(ctx: UnusedFileCtx, t: []const u8, line_num: usize) !void {
     });
 }
 
+/// Drive the unused-declaration rules (EPH-I0448): ZA401 unused imports,
+/// ZA402 unused const declarations, ZA403 unused var declarations.
 fn analyzeUnused(
     allocator: Allocator,
     graph: *ImportGraph,
@@ -24507,7 +24523,10 @@ fn checkPanic(
 /// null-guard model binds (EPH-I0906). Transparent paren groups strip
 /// from the result, so a parenthesized operand matches the same guard
 /// as its bare form. A leading dot from a mid-line chain (`foo().field
-/// orelse`) also strips.
+/// orelse`) also strips. Mixed deref/paren forms do not cross-match:
+/// a `(p).*` guard does not bind a `p.*` orelse operand and the
+/// reverse, because the trailing star stops the paren strip — an FP
+/// residual on contrived shapes, disclosed here (EPH-I0918).
 fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
     if (orelse_col == 0) return null;
     // Walk backward from "orelse" to find the operand form
@@ -71249,7 +71268,7 @@ test "ZT102: call-graph cycle terminates with the correct verdict" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // a <-> b recursion, no assertions on either side: the BFS must not
+    // a <-> b recursion, no assertions on either side: the walk must not
     // hang and the smoke-test note must still fire.
     const content =
         \\fn a() !void {
@@ -72961,7 +72980,7 @@ test "ZT105 EPH-I0429: test file through a cross-file helper reaches the pub fn"
     // zig-pulse processBlock shape: the test in the _test.zig file calls
     // build_block (defined in test_helpers.zig), whose body calls the pub
     // fn in root.zig. Pre-fix the chain was invisible: test files never
-    // seeded the BFS and the graph could not cross files. root_stray is
+    // seeded the call graph and the walk could not cross files. root_stray is
     // the control.
     const files = [_]TestQualityFile{
         .{
@@ -73011,7 +73030,7 @@ test "ZT105 EPH-I0429: pub fn reached through a helper in the same non-test file
 
     // zig-pulse signWith shape: build_attestation and sign_with both live
     // in test_helpers.zig, a non-test file without inline test blocks —
-    // pre-fix its file-local BFS had no seeds, so sign_with was flagged
+    // pre-fix its file-local walk had no seeds, so sign_with was flagged
     // despite the test file exercising it. helper_stray is the control.
     const files = [_]TestQualityFile{
         .{

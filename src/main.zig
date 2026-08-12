@@ -12597,14 +12597,15 @@ fn extractSelfTypeName(t: []const u8) ?[]const u8 {
 }
 
 /// Extract the function name from a fn declaration line.
-/// "pub fn foo(...)" -> "foo", "fn bar(...)" -> "bar"
+/// "pub fn foo(...)" -> "foo", "fn bar(...)" -> "bar", "fn @\"quoted\"()"
+/// -> the quoted inner content. The plain and quoted arms are the same
+/// validator findRealFnDef uses (pubFnNameAt, EPH-I0442): a malformed
+/// quoted name yields null, so a broken decl registers nothing
+/// (EPH-I0922).
 fn extractFnName(t: []const u8) ?[]const u8 {
     const fn_pos = mem.indexOf(u8, t, "fn ") orelse return null;
-    const after_fn = t[fn_pos + 3 ..];
-    var end: usize = 0;
-    while (end < after_fn.len and isIdent(after_fn[end])) end += 1;
-    if (end == 0) return null;
-    return after_fn[0..end];
+    const name = pubFnNameAt(t, fn_pos + 3) orelse return null;
+    return name.name;
 }
 
 /// Strategy A: explicit annotation — extract the type from `var x: TypeName = ...`.
@@ -24480,17 +24481,49 @@ fn findCallSiteLine(t: []const u8, preceding_lines: ?[]const []const u8) ?[]cons
     return null;
 }
 
+/// True when the paren group opened just before `from` still holds `to`
+/// open: the depth starts at 1 and never returns to zero on the slice.
+/// Quote-masked so a paren inside a string or char literal cannot close
+/// the group early (EPH-I0492, EPH-I0794 discipline).
+fn parensStayOpen(t: []const u8, from: usize, to: usize) bool {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var i = from;
+    while (i < to and depth > 0) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '(') depth += 1;
+        if (c == ')') depth -= 1;
+    }
+    return depth > 0;
+}
+
 /// Check if `catch unreachable` is inside a @TypeOf() expression (compile-time only).
 /// Walks backwards through preceding lines accumulating paren depth. If a line
 /// contains `@TypeOf(` while cumulative depth shows we're still inside its parens,
 /// the catch unreachable is compile-time only and safe to suppress.
 fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) bool {
-    // Check current line first (fast path) — scan left of `catch unreachable`
+    // Check current line first (fast path) — scan left of the catch site.
+    // An opener contains the catch only while its parens stay open at the
+    // catch site (EPH-I0492): `const T = @TypeOf(x); y() catch
+    // unreachable;` closes the opener, so the catch is runtime code and
+    // must not suppress. A closed opener is skipped; an earlier opener
+    // may still hold the catch open.
     var i = pos;
     while (i > 0) {
         i -= 1;
-        if (i + 8 <= t.len and mem.eql(u8, t[i .. i + 8], "@TypeOf(")) return true;
-        if (i + 7 <= t.len and mem.eql(u8, t[i .. i + 7], "@typeOf(")) return true;
+        const opener_len: usize = if (i + 8 <= t.len and mem.eql(u8, t[i .. i + 8], "@TypeOf("))
+            8
+        else if (i + 7 <= t.len and mem.eql(u8, t[i .. i + 7], "@typeOf("))
+            7
+        else
+            continue;
+        if (parensStayOpen(t, i + opener_len, pos)) return true;
+        // The opener closed before the catch — keep scanning left for an
+        // earlier opener that may still hold it.
     }
     // Multi-line: accumulate paren depth from current line backwards.
     // If we find @TypeOf( on a line where depth > 0, we're nested inside it.
@@ -24628,6 +24661,11 @@ fn checkOrelseUnreachable(
 ) ?Issue {
     const col = mem.indexOf(u8, t, "orelse unreachable") orelse return null;
     if (isInsideString(t, col)) return null;
+    // A mention inside a trailing comment is prose, not code — the
+    // line-based twin's comment-start discipline (EPH-I0491).
+    if (findCommentStart(t)) |comment_start| {
+        if (col >= comment_start) return null;
+    }
 
     if (extractOrelseVar(t, col)) |name| {
         // The fn's lines are already fn-bounded, so the floor is a no-op
@@ -26195,15 +26233,20 @@ fn isLoopBoundary(ctx: []const u8) bool {
 }
 
 /// Check if a line has an exit statement (break/continue/return) after a
-/// guard condition on the same line. The substring match is deliberate:
-/// the caller's guard context (the condition on this line) rules out an
-/// exit that belongs to a different statement. Lines INSIDE a guard block
-/// are judged by isUnconditionalExitLine, not this function (EPH-I0488).
+/// guard condition on the same line. The keywords are matched on
+/// identifier boundaries over the comment-stripped text, so identifiers
+/// like `returnValue` and trailing-comment mentions (`// return here`)
+/// do not count as exit guards (EPH-I0494). String CONTENTS are not
+/// masked: `if (i == 0) foo("return")` still arms the exit guard — an
+/// accepted FN-direction residual (EPH-I0494 disclosure). The caller's
+/// guard context (the condition on this line) rules out an exit that
+/// belongs to a different statement. Lines INSIDE a guard block are
+/// judged by isUnconditionalExitLine, not this function (EPH-I0488).
 fn hasExitStatement(ctx: []const u8) bool {
-    if (mem.indexOf(u8, ctx, "break") != null) return true;
-    if (mem.indexOf(u8, ctx, "continue") != null) return true;
-    if (mem.indexOf(u8, ctx, "return") != null) return true;
-    return false;
+    const code = stripLineComment(ctx);
+    if (mentionsIdent(code, "break")) return true;
+    if (mentionsIdent(code, "continue")) return true;
+    return mentionsIdent(code, "return");
 }
 
 /// True when the line is an unconditional exit: its trimmed,
@@ -59943,6 +59986,19 @@ test "extractFnName extracts function names" {
     try std.testing.expect(extractFnName("const x = 42;") == null);
 }
 
+test "extractFnName accepts quoted names (EPH-I0922)" {
+    // The quoted-name arm findRealFnDef uses (EPH-I0442, pubFnNameAt):
+    // `fn @"quoted"()` yields the inner content, the spelling a call
+    // site shares. Malformed quotes and fn-pointer shapes stay null.
+    try std.testing.expectEqualStrings(
+        "weird-name",
+        extractFnName("fn @\"weird-name\"() void {").?,
+    );
+    try std.testing.expectEqualStrings("a-b", extractFnName("pub fn @\"a-b\"(x: u32) !void {").?);
+    try std.testing.expect(extractFnName("fn @\"unterminated() void {}") == null);
+    try std.testing.expect(extractFnName("cb: *const fn () void,") == null);
+}
+
 test "extractVarTypeName extracts explicit type annotations" {
     const t1 = extractVarTypeName("var x: MyStruct = .{};");
     try std.testing.expect(t1 != null);
@@ -60877,6 +60933,25 @@ test "parseFileTypeContext builds struct methods" {
     try std.testing.expectEqual(ReturnKind.void_type, methods.?.get("clear").?);
     try std.testing.expectEqual(ReturnKind.error_union, methods.?.get("process").?);
     try std.testing.expectEqual(ReturnKind.value, methods.?.get("count").?);
+}
+
+test "parseFileTypeContext registers quoted fn names (EPH-I0922)" {
+    // FN-direction: extractFnName returned null for `fn @"quoted"()`, so
+    // registerFnSignature consumed the line without a table entry. The
+    // quoted name now registers under its inner content.
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\fn @"never-fails"() !void {}
+        \\fn @"plain"() void {}
+    ;
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    try std.testing.expectEqual(ReturnKind.error_union, ctx.function_returns.get("never-fails").?);
+    try std.testing.expectEqual(ReturnKind.void_type, ctx.function_returns.get("plain").?);
 }
 
 test "parseFileTypeContext: string brace does not corrupt type scope (EPH-I0894)" {
@@ -63469,6 +63544,43 @@ test "analyzeErrors ZA203 still fires on the unguarded and nested-exit shapes (E
     );
 }
 
+test "ZA203 silent on a trailing-comment mention via the CFG tier (EPH-I0491)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // F8: the CFG emitter (checkOrelseUnreachable) checked only
+    // isInsideString, so a trailing `// orelse unreachable` mention filed
+    // ZA203. The comment-start gate — the line-based twin's discipline —
+    // keeps the mention silent; the real code shape still fires (control).
+    const mention_content =
+        \\fn f(p: ?*u8) u8 {
+        \\    const x = p; // orelse unreachable
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za203_mention.zig", mention_content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "test_za203_mention.zig", RULE_ORELSE_UNREACHABLE),
+    );
+
+    const control_content =
+        \\fn g(p: ?*u8) u8 {
+        \\    const x = p orelse unreachable;
+        \\    return x;
+        \\}
+    ;
+    var run2 = try runCFGMemoryTest(&diag, allocator, "test_za203_control.zig", control_content);
+    defer run2.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run2.issues.items, "test_za203_control.zig", RULE_ORELSE_UNREACHABLE),
+    );
+}
+
 // ============================================================================
 // ZA207 Tests — catch undefined
 // ============================================================================
@@ -65972,6 +66084,48 @@ test "isInsideTypeOf: comment paren on the catch line keeps a genuine match (EPH
     try std.testing.expect(isInsideTypeOf(line, col, &prev));
 }
 
+test "isInsideTypeOf: closed @TypeOf parens do not contain the catch (EPH-I0492)" {
+    // F9: the fast path returned true on ANY `@TypeOf(` left of the
+    // catch, even a closed one — `const T = @TypeOf(x); y() catch
+    // unreachable;` was suppressed though the catch is runtime code. The
+    // opener now counts only while its parens stay open at the catch
+    // site. The slow path stays untouched.
+    const line = "const T = @TypeOf(x); y() catch unreachable;";
+    const col = mem.indexOf(u8, line, "catch").?;
+    try std.testing.expect(!isInsideTypeOf(line, col, null));
+    // Guard: a catch inside an open @TypeOf still suppresses.
+    try std.testing.expect(isInsideTypeOf("const T = @TypeOf(foo() catch unreachable);", 30, null));
+}
+
+test "ZA202 fires on the closed @TypeOf shape (EPH-I0492)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // End-to-end: the closed `@TypeOf(u8);` on the same line no longer
+    // suppresses the runtime `catch unreachable` on the sibling
+    // statement.
+    const content =
+        \\fn f() void {
+        \\    const T = @TypeOf(u8); const r = risky() catch unreachable;
+        \\    _ = T;
+        \\    _ = r;
+        \\}
+    ;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_closed_typeof.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_closed_typeof.zig"), {});
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "test_za202_closed_typeof.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
 test "findCallSiteLine: comment parens cannot skip the real opener (EPH-I0794)" {
     // Two skews stack. The `)` in the opener's trailing comment cancels
     // its real `(` in the naive count, so the walk sails past the real
@@ -67986,6 +68140,47 @@ test "ZA903: trailing comment and string forms stay silent" {
         run.issues.items,
         "test_za903_comment.zig",
         RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "hasExitStatement matches exit keywords on word boundaries (EPH-I0494)" {
+    // F11: substring `break`/`continue`/`return` matched identifiers and
+    // trailing comments. Word boundaries over the comment-stripped text
+    // keep `returnValue` and `// return here` out of the exit-guard set.
+    try std.testing.expect(!hasExitStatement("if (x == 0) returnValue;"));
+    try std.testing.expect(!hasExitStatement("if (x == 0) foo(); // return here"));
+    try std.testing.expect(!hasExitStatement("const bp = breakpoint();"));
+    // Guards: real exits still count.
+    try std.testing.expect(hasExitStatement("if (x == 0) return;"));
+    try std.testing.expect(hasExitStatement("if (x == 0) break;"));
+    try std.testing.expect(hasExitStatement("if (x == 0) continue;"));
+}
+
+test "ZA901: trailing-comment return does not arm the == 0 guard (EPH-I0494)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // F11 fan-out: hasGuardOnLine's `== 0` + exit arm matched the
+    // substring `return` inside the trailing comment, so the phantom exit
+    // suppressed the decrement finding. Word-boundary matching over the
+    // comment-stripped text drops the phantom and ZA901 fires.
+    const content =
+        \\fn f(i: usize) void {
+        \\    i -= 1; if (i == 0) sink(i); // return here
+        \\    _ = i;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_phantom_exit.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_phantom_exit.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
     ) == 1);
 }
 
@@ -77356,6 +77551,39 @@ test "ZA209: multi-line signature with error-union return fires" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countRuleIssues(run.issues.items, "za209_multiline.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: quoted-name error-union fn reports the quoted name (EPH-I0922)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn work() void {}
+        \\fn @"never-fails"() !void {
+        \\    work();
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_quoted.zig", content);
+    defer run.deinit(allocator);
+
+    // The note fires and its message names the fn's inner content —
+    // pre-fix the name was empty (extractFnName returned null).
+    var found_name = false;
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_USELESS_ERROR_RETURN) and
+            mem.eql(u8, issue.file, "za209_quoted.zig") and
+            mem.indexOf(u8, issue.message, "never-fails") != null)
+        {
+            found_name = true;
+        }
+    }
+    try std.testing.expect(found_name);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_quoted.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

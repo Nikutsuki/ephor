@@ -20388,7 +20388,11 @@ fn reportNaming(ctx: NamingLineCtx, v: NameViolation) !void {
     });
 }
 
-/// Check if this is a function alias (const fooBar = module.fooBar)
+/// Check if this is a function alias (const fooBar = module.fooBar). `t`
+/// is the checked declaration's own segment (its `=` through the next
+/// top-level `;`, EPH-I0896): the first `= ` in the segment is the
+/// declaration's own equals, so a same-line neighbor's RHS cannot read as
+/// this declaration's alias source (EPH-I0898).
 fn isFunctionAlias(t: []const u8, name: []const u8) bool {
     if (!isCamelCase(name)) return false;
     const eq_pos = mem.indexOf(u8, t, "= ") orelse return false;
@@ -20397,10 +20401,15 @@ fn isFunctionAlias(t: []const u8, name: []const u8) bool {
     return mem.startsWith(u8, rhs[dot_pos + 1 ..], name);
 }
 
-/// Check if constant naming follows conventions
-fn isValidConstName(t: []const u8, name: []const u8) bool {
-    if (mem.indexOf(u8, t, "@import(") != null) return true;
-    if (isFunctionAlias(t, name)) return true;
+/// Check if constant naming follows conventions. `seg` is the checked
+/// declaration's own segment (its `=` through the next top-level `;`,
+/// EPH-I0896). The @import and function-alias exemptions classify against
+/// the segment, never the whole line: a same-line neighbor's RHS cannot
+/// exempt this declaration, and an @import exemption applies only to the
+/// checked declaration's own RHS (EPH-I0897, EPH-I0898).
+fn isValidConstName(seg: []const u8, name: []const u8) bool {
+    if (mem.indexOf(u8, seg, "@import(") != null) return true;
+    if (isFunctionAlias(seg, name)) return true;
     return isSnakeCase(name) or isTitleCase(name) or isScreamingCase(name);
 }
 
@@ -20564,7 +20573,12 @@ fn checkConstDeclName(
         });
         return;
     }
-    if (!isValidConstName(t, name))
+    // The exemption path classifies per-segment too: the @import and
+    // function-alias exemptions must not read a same-line neighbor's RHS
+    // (`const a = @import("x"); const badName = 1;` fires on badName,
+    // `const x = mod.myAlias; const myAlias = 1;` fires on myAlias —
+    // EPH-I0897, EPH-I0898).
+    if (!isValidConstName(decl_seg, name))
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
             .line = ctx.line_num,
@@ -23864,15 +23878,35 @@ fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
 /// emitter (checkLineOrelseUnreachable, the errors subcommand) routes
 /// through the same guard verdict since EPH-I0864; its lookback is
 /// fn-bounded through the error scan's function-start tracking.
-fn hasNullCheckExit(line: []const u8, lines: []const []const u8, i: usize, limit: usize) bool {
+/// Lookback context for hasNullCheckExit: the full line array, the
+/// candidate guard line's index, and the exclusive scan limit (the orelse
+/// site's index, from hasNullGuard).
+const NullGuardLookup = struct {
+    lines: []const []const u8,
+    i: usize,
+    limit: usize,
+};
+
+/// True when the guard line's own tail exits at the guard's depth: the
+/// line is `if (x == null) return;` or `if (x == null) { return; }`. An
+/// exit inside a same-line nested conditional (`{ if (q) return; }`)
+/// does not qualify — the ZA203-family sibling of the classifyNullCheck
+/// same-line gate (EPH-I0859, EPH-I0861). The judge anchors on the
+/// paren group that contains the guard predicate at `eq_pos`: a leading
+/// call on the same line (`sink(x); if (p == null) return;`) owns an
+/// earlier group and its tail is not the guard's (EPH-I0892). A
+/// continued condition (`if (x == null || q) return;`) keeps its exit.
+/// `eq_pos` is the predicate's code position, supplied by the caller
+/// (hasNullGuard matches `== null` through the LiteralState mask): a
+/// string that merely carries `== null` cannot own the verdict
+/// (EPH-I0899).
+fn hasNullCheckExit(line: []const u8, lookup: NullGuardLookup, eq_pos: usize) bool {
     // The matched predicate anchors the judge on the guard's own
-    // condition group: the line reached this query with "== null"
-    // present, and a leading call's group must not own the verdict
-    // (EPH-I0892).
-    const eq_pos = mem.indexOf(u8, line, "== null") orelse return false;
+    // condition group: the caller supplies the code position, and a
+    // leading call's group must not own the verdict (EPH-I0892).
     if (guardLineHasSameLineExit(line, eq_pos)) return true;
-    if (i + 1 >= limit) return false;
-    const next = mem.trim(u8, lines[i + 1], " \t\r");
+    if (lookup.i + 1 >= lookup.limit) return false;
+    const next = mem.trim(u8, lookup.lines[lookup.i + 1], " \t\r");
     return mem.startsWith(u8, next, "return") or
         mem.startsWith(u8, next, "continue") or
         mem.startsWith(u8, next, "break");
@@ -23953,9 +23987,13 @@ fn hasNullGuard(
         i -= 1;
         const line = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(line)) continue;
-        if (mem.indexOf(u8, line, name) == null) continue;
-        if (mem.indexOf(u8, line, "== null") == null) continue;
-        if (hasNullCheckExit(line, lines, i, current_idx)) return true;
+        // Both matches anchor on code positions (LiteralState mask): a
+        // string that carries the name or `== null` is data, not a guard
+        // predicate, and cannot anchor the judge (EPH-I0899).
+        if (findTagInCode(line, name, 0) == null) continue;
+        const eq_pos = findTagInCode(line, "== null", 0) orelse continue;
+        const lookup = NullGuardLookup{ .lines = lines, .i = i, .limit = current_idx };
+        if (hasNullCheckExit(line, lookup, eq_pos)) return true;
     }
     return false;
 }
@@ -57630,6 +57668,124 @@ test "analyzeNaming: second same-line const decl is checked (EPH-I0888)" {
     try std.testing.expectEqual(@as(usize, 20), issues.items[0].col);
 }
 
+test "analyzeNaming: @import exemption does not bleed to a same-line decl (EPH-I0897)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The whole-line @import exemption read decl 1's RHS and wrongly
+    // exempted decl 2: the exemption must classify against the checked
+    // declaration's own segment, which carries no @import (EPH-I0897).
+    const code =
+        \\const a = @import("x.zig"); const badName = 1;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_import_bleed.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_import_bleed.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: @import decls stay exempt in their own segment (EPH-I0897)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The exemption is about the @import itself: a good name on an import
+    // decl stays silent, and a bad name on an import decl stays silent
+    // too — only a plain declaration without an import RHS is judged
+    // (EPH-I0897).
+    const code =
+        \\const a = @import("x.zig");
+        \\const badName = @import("y.zig");
+        \\const good_name = 1;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_import_exempt.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_import_exempt.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: function-alias exemption does not bleed to a same-line decl (EPH-I0898)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The whole-line `= ` search read decl 1's RHS as the alias source
+    // and wrongly exempted decl 2: the alias check must anchor on the
+    // checked declaration's own segment, which has no alias RHS
+    // (EPH-I0898).
+    const code =
+        \\const x = mod.myAlias; const myAlias = 1;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_alias_bleed.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_alias_bleed.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'myAlias' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: real function alias stays silent (EPH-I0898)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // A real alias `const fooBar = mod.fooBar;` is exempt in its own
+    // segment, on a line of its own and on a multi-decl line: the
+    // per-segment anchor keeps the alias source at the declaration's own
+    // RHS (EPH-I0898). The string-RHS probe `const strAlias = "=
+    // mod.strAlias";` keeps its pre-existing verdict: the first `= ` in
+    // the segment is the declaration's own equals, so the anchor never
+    // lands inside the string (probe, EPH-I0898).
+    const code =
+        \\const fooBar = mod.fooBar;
+        \\const a = 1; const barBaz = mod.barBaz;
+        \\const strAlias = "= mod.strAlias";
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_alias_exempt.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_alias_exempt.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
 test "analyzeNaming: second same-line var decl is checked (EPH-I0888)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -64837,7 +64993,51 @@ test "hasNullCheckExit accepts a compound-line guard exit (EPH-I0892)" {
     // not the call's (EPH-I0892).
     var buf: [4][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "sink(x); if (p == null) return 0;", 1);
-    try std.testing.expect(hasNullCheckExit(lines[1], lines, 1, lines.len));
+    const eq_pos = findTagInCode(lines[1], "== null", 0) orelse return error.TestUnexpectedResult;
+    const lookup = NullGuardLookup{ .lines = lines, .i = 1, .limit = lines.len };
+    try std.testing.expect(hasNullCheckExit(lines[1], lookup, eq_pos));
+}
+
+test "hasNullCheckExit anchors the guard's own code-position predicate (EPH-I0899)" {
+    // A leading call whose string carries `== null` before the guard's
+    // real `== null`: the caller passes the code-position anchor, so the
+    // judge examines the guard's condition group, not the string's. The
+    // old whole-line re-find anchored on the string position and the
+    // guard lost its same-line exit (EPH-I0899).
+    var buf: [4][]const u8 = undefined;
+    const lines = guardScanFixture(
+        &buf,
+        "work();",
+        "std.debug.print(\"== null\", .{}); if (p == null) return 0;",
+        1,
+    );
+    const eq_pos = findTagInCode(lines[1], "== null", 0) orelse return error.TestUnexpectedResult;
+    const lookup = NullGuardLookup{ .lines = lines, .i = 1, .limit = lines.len };
+    try std.testing.expect(hasNullCheckExit(lines[1], lookup, eq_pos));
+    // The anchor is the code position: the raw first match sits inside
+    // the string and must not be used.
+    const raw_pos = mem.indexOf(u8, lines[1], "== null") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(raw_pos < eq_pos);
+}
+
+test "hasNullGuard ignores == null inside a string (EPH-I0899)" {
+    // A string carrying `== null` is data, not a guard predicate: the raw
+    // whole-line match admitted the line, and the string position anchored
+    // the judge on the leading call's group, whose tail (`return p;`) read
+    // as an exit and suppressed the report (EPH-I0899).
+    const lines = [_][]const u8{
+        "std.debug.print(\"== null\", .{}); return p;",
+        "const y = p orelse unreachable;",
+    };
+    try std.testing.expect(!hasNullGuard(&lines, 1, 0, "p"));
+    // The next-line-exit variant: the string line plus an unrelated
+    // `return` line must not suppress either (EPH-I0899).
+    const next_exit = [_][]const u8{
+        "std.debug.print(\"== null\", .{}); const x = p;",
+        "return 0;",
+        "const y = p orelse unreachable;",
+    };
+    try std.testing.expect(!hasNullGuard(&next_exit, 2, 0, "p"));
 }
 
 test "hasNullCheckExit judges the guard's own nested conditional (EPH-I0892)" {
@@ -64847,7 +65047,9 @@ test "hasNullCheckExit judges the guard's own nested conditional (EPH-I0892)" {
     // EPH-I0892 anchoring).
     var buf: [4][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "sink(x); if (p == null) { if (q) return 0; }", 1);
-    try std.testing.expect(!hasNullCheckExit(lines[1], lines, 1, lines.len));
+    const eq_pos = findTagInCode(lines[1], "== null", 0) orelse return error.TestUnexpectedResult;
+    const lookup = NullGuardLookup{ .lines = lines, .i = 1, .limit = lines.len };
+    try std.testing.expect(!hasNullCheckExit(lines[1], lookup, eq_pos));
 }
 
 test "hasEarlyReturnNullGuard accepts a compound-line guard (EPH-I0892)" {
@@ -64893,19 +65095,28 @@ test "hasNullCheckExit rejects a same-line nested conditional exit (EPH-I0861)" 
     // The same-line exit sits inside a nested conditional: the guard
     // block falls through when q is false, so the exit does not qualify
     // (EPH-I0859 judgment, ZA203-family site).
-    try std.testing.expect(!hasNullCheckExit(lines[1], lines, 1, lines.len));
+    const eq_pos = findTagInCode(lines[1], "== null", 0) orelse return error.TestUnexpectedResult;
+    const lookup = NullGuardLookup{ .lines = lines, .i = 1, .limit = lines.len };
+    try std.testing.expect(!hasNullCheckExit(lines[1], lookup, eq_pos));
 }
 
 test "hasNullCheckExit accepts a same-line direct exit (EPH-I0861)" {
     var buf: [4][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "if (x == null) return;", 1);
-    try std.testing.expect(hasNullCheckExit(lines[1], lines, 1, lines.len));
+    const eq_pos = findTagInCode(lines[1], "== null", 0) orelse return error.TestUnexpectedResult;
+    const lookup = NullGuardLookup{ .lines = lines, .i = 1, .limit = lines.len };
+    try std.testing.expect(hasNullCheckExit(lines[1], lookup, eq_pos));
     const braced = guardScanFixture(&buf, "work();", "if (x == null) { return; }", 1);
-    try std.testing.expect(hasNullCheckExit(braced[1], braced, 1, braced.len));
+    const braced_eq = findTagInCode(braced[1], "== null", 0) orelse return error.TestUnexpectedResult;
+    const braced_lookup = NullGuardLookup{ .lines = braced, .i = 1, .limit = braced.len };
+    try std.testing.expect(hasNullCheckExit(braced[1], braced_lookup, braced_eq));
     // A continued condition keeps its exit: the condition close is the
     // whole paren group, not the `== null)` position (EPH-I0861).
     const continued = guardScanFixture(&buf, "work();", "if (x == null || q) return;", 1);
-    try std.testing.expect(hasNullCheckExit(continued[1], continued, 1, continued.len));
+    const continued_eq = findTagInCode(continued[1], "== null", 0) orelse
+        return error.TestUnexpectedResult;
+    const continued_lookup = NullGuardLookup{ .lines = continued, .i = 1, .limit = continued.len };
+    try std.testing.expect(hasNullCheckExit(continued[1], continued_lookup, continued_eq));
 }
 
 test "hasSameLineGuardExit applies the depth-2 then+else rule (EPH-I0861)" {

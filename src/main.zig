@@ -8366,8 +8366,11 @@ fn hasNoFreeAllocatorParameter(lines: []const []const u8) bool {
         for (no_free_ptrs) |ptr_pat| {
             if (mem.indexOf(u8, t, ptr_pat) != null) return true;
         }
-        // Stop scanning at function body start
-        if (mem.indexOf(u8, t, ") ") != null and mem.indexOf(u8, t, "{") != null) break;
+        // Stop scanning at function body start. The probe is
+        // code-position-masked: a `) {` inside a comment or string is
+        // data, not the body opener, so a later arena-typed parameter
+        // line is still scanned (EPH-I0900).
+        if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
     }
     return false;
 }
@@ -8793,7 +8796,9 @@ fn hasOwnerAppearance(owner_vars: []const OwnerVar, t: []const u8) bool {
 /// initializer (`const x = .{`, `var x: T = .{`, `const x = Type{`): the
 /// bound local may hold the tracked alloc, so the name joins the owner
 /// chain. The var form is tracked too: a mutable struct local can still
-/// carry the alloc to a later return (EPH-I0349).
+/// carry the alloc to a later return (EPH-I0349). The opener probe is
+/// code-position-masked: a `{` inside a string is data, not a literal
+/// opener, so the call line binds no owner (EPH-I0900).
 fn extractStructOwnerName(t: []const u8) ?[]const u8 {
     const prefix = if (mem.startsWith(u8, t, "const "))
         "const "
@@ -8801,7 +8806,7 @@ fn extractStructOwnerName(t: []const u8) ?[]const u8 {
         "var "
     else
         return null;
-    if (mem.indexOf(u8, t, "{") == null) return null;
+    if (!hasCodeChar(t, '{')) return null;
     var end = prefix.len;
     while (end < t.len and isIdent(t[end])) end += 1;
     return if (end > prefix.len) t[prefix.len..end] else null;
@@ -8811,7 +8816,10 @@ fn extractStructOwnerName(t: []const u8) ?[]const u8 {
 /// owner: the alloc appears on the opener line itself, or inside the
 /// literal's continuation lines. The bound local joins the owner chain
 /// only then — the literal's fields sit on later lines, so the opener
-/// alone cannot prove the binding (EPH-I0349 corpus).
+/// alone cannot prove the binding (EPH-I0349 corpus). The depth walk
+/// masks string, char, comment, and multiline-tail braces: a string
+/// `}` must not close the literal early and a string `{` must not
+/// extend the walk past the real close (EPH-I0900).
 fn structLiteralBindsOwner(
     lines: []const []const u8,
     idx: usize,
@@ -8824,19 +8832,21 @@ fn structLiteralBindsOwner(
     for (idx..limit) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        for (t) |c| {
-            if (c == '{') depth += 1;
-            if (c == '}' and depth > 0) depth -= 1;
-        }
+        depth = computeBraceDepth(t, depth);
         if (hasOwnerAppearance(owners, t)) return true;
         if (depth == 0) break;
     }
     return false;
 }
 
+/// The name of a deref-store into a struct literal (`p.* = .{ ... }`):
+/// the write rebinds the deref target, so `p` joins the owner chain.
+/// The literal probe is code-position-masked: a `{` inside a string is
+/// data, not a literal store, so the call line binds no owner
+/// (EPH-I0900).
 fn extractDerefOwnerName(t: []const u8) ?[]const u8 {
     if (mem.indexOf(u8, t, ".* = ") == null or
-        mem.indexOf(u8, t, "{") == null) return null;
+        !hasCodeChar(t, '{')) return null;
     var end: usize = 0;
     while (end < t.len and isIdent(t[end])) end += 1;
     return if (end > 0) t[0..end] else null;
@@ -8882,9 +8892,12 @@ fn checkOwnershipInLine(
     // alloc as an element transfers to the caller. The opener line
     // carries no element names, so this check runs before the per-owner
     // name gate and reads the continuation lines (EPH-I0349 corpus).
+    // Both probes are code-position-masked: a `{` inside a string must
+    // not arm the scan, and a `};` inside a comment must not hide a
+    // real opener (EPH-I0900).
     if (mem.startsWith(u8, t, "return ") and
-        mem.indexOf(u8, t, "{") != null and
-        mem.indexOf(u8, t, "};") == null)
+        hasCodeChar(t, '{') and
+        findTagInCode(t, "};", 0) == null)
     {
         for (scan.owner_vars) |ov| {
             if (returnTupleTransfersHere(scan.lines, idx, ov.name)) return true;
@@ -8919,6 +8932,10 @@ fn checkOwnershipInLine(
 /// both transfer the element values to the caller. The opener line
 /// carries no element names, so the forward scan reads the continuation
 /// lines. Bounded by max_return_tuple_scan lines (EPH-I0349 corpus).
+/// All three arm/close probes are code-position-masked (LiteralState):
+/// a `{` inside a string must not open the scan, and a `};` inside a
+/// string or comment must not close it early or skip a real opener
+/// (EPH-I0900).
 fn returnTupleTransfersHere(
     lines: []const []const u8,
     idx: usize,
@@ -8930,7 +8947,7 @@ fn returnTupleTransfersHere(
         const t = mem.trim(u8, lines[i], " \t\r");
         if (scan.remaining > 0) {
             scan.remaining -= 1;
-            if (mem.indexOf(u8, t, "};") != null) scan.remaining = 0;
+            if (findTagInCode(t, "};", 0) != null) scan.remaining = 0;
             const hit = isReturnTupleElement(t, name, .{
                 .from = 0,
                 .to = t.len,
@@ -8944,8 +8961,8 @@ fn returnTupleTransfersHere(
         // (typed literal). A closed opener is the single-line job of the
         // `return ` transfer check.
         const expr = afterReturnKeyword(t) orelse continue;
-        if (mem.indexOf(u8, t, "};") != null) continue;
-        const open = mem.indexOf(u8, expr, "{") orelse continue;
+        if (findTagInCode(t, "};", 0) != null) continue;
+        const open = findTagInCode(expr, "{", 0) orelse continue;
         scan.remaining = max_return_tuple_scan;
         scan.paren_depth = parenDepthAt(t, open + 1, t.len, 0);
         if (isReturnTupleElement(t, name, .{ .from = open + 1, .to = t.len }))
@@ -12170,6 +12187,9 @@ fn collectAllAllocatorNames(
 }
 
 /// Scan the first ~10 lines for parameters typed as Allocator and track them.
+/// Both body-start probes are code-position-masked: a `) {` inside a
+/// comment or string is data, not the body opener, so a later
+/// Allocator-typed parameter line is still scanned (EPH-I0900).
 fn trackAllocatorParams(
     a: Allocator,
     lines: []const []const u8,
@@ -12182,7 +12202,7 @@ fn trackAllocatorParams(
             mem.indexOf(u8, t, ": std.mem.Allocator") orelse
             mem.indexOf(u8, t, ": *Allocator") orelse
             mem.indexOf(u8, t, ":Allocator") orelse {
-            if (mem.indexOf(u8, t, ") ") != null and mem.indexOf(u8, t, "{") != null) break;
+            if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
             continue;
         };
         // Extract parameter name (word before the colon)
@@ -12190,7 +12210,7 @@ fn trackAllocatorParams(
         while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '_')) start -= 1;
         if (start < colon_pos) try names.put(a, t[start..colon_pos], {});
         // Stop at function body
-        if (mem.indexOf(u8, t, ") ") != null and mem.indexOf(u8, t, "{") != null) break;
+        if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
     }
 }
 
@@ -12981,9 +13001,11 @@ fn isReturnTransfer(t: []const u8, name: []const u8) bool {
     const expr = afterReturnKeyword(t) orelse return false;
     if (!mem.startsWith(u8, expr, ".{")) return isPlainReturnTransfer(expr, name);
     // Tuple literal: a transfer only when it closes on this line; unclosed
-    // openers are tracked across lines by checkReturnTupleLine.
+    // openers are tracked across lines by checkReturnTupleLine. The
+    // closer probe is code-position-masked: a `};` inside a string is
+    // data and must not cut the element region short (EPH-I0900).
     const open = mem.indexOf(u8, t, ".{") orelse return false;
-    const close = mem.indexOfPos(u8, t, open + 2, "};") orelse return false;
+    const close = findTagInCode(t, "};", open + 2) orelse return false;
     return isReturnTupleElement(t, name, .{ .from = open + 2, .to = close });
 }
 
@@ -13089,11 +13111,13 @@ const ReturnTupleScan = struct {
 /// armed (`scan.remaining > 0`) each line is checked for the alloc name as a
 /// tuple element at the carried paren depth until the `};` closer; otherwise
 /// an unclosed `return .{` opener arms the scan (the opener line itself may
-/// carry the first element).
+/// carry the first element). Both closer probes are code-position-masked: a
+/// `};` inside a string or comment is data and must not disarm the scan
+/// early or hide a real opener (EPH-I0900).
 fn checkReturnTupleLine(t: []const u8, name: []const u8, scan: *ReturnTupleScan) bool {
     if (scan.remaining > 0) {
         scan.remaining -= 1;
-        if (mem.indexOf(u8, t, "};") != null) scan.remaining = 0;
+        if (findTagInCode(t, "};", 0) != null) scan.remaining = 0;
         const hit = isReturnTupleElement(t, name, .{
             .from = 0,
             .to = t.len,
@@ -13105,7 +13129,7 @@ fn checkReturnTupleLine(t: []const u8, name: []const u8, scan: *ReturnTupleScan)
     const expr = afterReturnKeyword(t) orelse return false;
     if (!mem.startsWith(u8, expr, ".{")) return false;
     // Closed on this line — isReturnTransfer's single-line job.
-    if (mem.indexOf(u8, t, "};") != null) return false;
+    if (findTagInCode(t, "};", 0) != null) return false;
     const open = mem.indexOf(u8, t, ".{") orelse return false;
     scan.remaining = max_return_tuple_scan;
     scan.paren_depth = parenDepthAt(t, open + 2, t.len, 0);
@@ -20497,6 +20521,31 @@ fn isConstTypeModifier(t: []const u8, pos: usize) bool {
     return false;
 }
 
+/// True when the declaration whose keyword sits at `kw_pos` is an extern
+/// declaration: its segment — from the previous `;` or `}` (or the line
+/// start) up to the keyword — begins with the extern prefix (`extern ` or
+/// `pub extern `). Extern declaration names are ABI-fixed and can never
+/// conform, so the naming checks skip them; a same-line trailing
+/// declaration starts its own segment and stays checked (EPH-I0901). The
+/// boundary scan is raw: a `;` or `}` inside a string cannot be the last
+/// boundary before a code keyword (the string must close before the code
+/// that follows it, and the real `;`/`}` sits between), and a trailing
+/// comment swallows the rest of the line.
+fn declIsExternOwned(t: []const u8, kw_pos: usize) bool {
+    var seg_start: usize = 0;
+    var i = kw_pos;
+    while (i > 0) {
+        i -= 1;
+        if (t[i] == ';' or t[i] == '}') {
+            seg_start = i + 1;
+            break;
+        }
+    }
+    const seg = mem.trimStart(u8, t[seg_start..kw_pos], " \t");
+    return mem.startsWith(u8, seg, "extern ") or
+        mem.startsWith(u8, seg, "pub extern ");
+}
+
 fn checkConstNaming(
     ctx: NamingLineCtx,
     content: []const u8,
@@ -20504,8 +20553,9 @@ fn checkConstNaming(
 ) !void {
     const t = ctx.t;
     // Extern constant names are ABI-fixed and can never conform (same rule
-    // as the extern-fn exemption in checkFnNaming).
-    if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
+    // as the extern-fn exemption in checkFnNaming). The exemption covers
+    // the extern declaration itself: a same-line trailing decl starts its
+    // own segment and is still checked (EPH-I0901).
     // Every real `const` declaration on the line is checked, not just the
     // first: `const a = 1; const badName = 2;` fires on the second decl
     // too (EPH-I0888). Type-modifier `const`s are skipped per occurrence,
@@ -20514,6 +20564,7 @@ fn checkConstNaming(
     while (realTokenPosFrom(t, "const", from)) |kw_pos| {
         from = kw_pos + "const".len;
         if (isConstTypeModifier(t, kw_pos)) continue;
+        if (declIsExternOwned(t, kw_pos)) continue;
         try checkConstDeclName(ctx, content, t_start, kw_pos);
     }
 }
@@ -20616,14 +20667,16 @@ fn findDeclEnd(t: []const u8, eq_pos: usize) usize {
 fn checkVarNaming(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Extern variable names are ABI-fixed and can never conform (same rule
-    // as the extern-fn exemption in checkFnNaming).
-    if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
+    // as the extern-fn exemption in checkFnNaming). The exemption covers
+    // the extern declaration itself: a same-line trailing decl starts its
+    // own segment and is still checked (EPH-I0901).
     // Every real `var` declaration on the line is checked, not just the
     // first: `var a = 1; var badVar = 2;` fires on the second decl too
     // (EPH-I0888).
     var from: usize = 0;
     while (realTokenPosFrom(t, "var", from)) |kw_pos| {
         from = kw_pos + "var".len;
+        if (declIsExternOwned(t, kw_pos)) continue;
         var name_end: usize = undefined;
         var name_col: usize = undefined;
         const name = declNameAt(t, kw_pos + "var".len, &name_end, &name_col) orelse continue;
@@ -20691,12 +20744,15 @@ fn checkFnNaming(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Extern declaration names are ABI-fixed and can never conform.
     // `export fn` is NOT exempt — those names are project-chosen identifiers.
-    if (mem.startsWith(u8, t, "extern ") or mem.startsWith(u8, t, "pub extern ")) return;
+    // The exemption covers the extern declaration itself: a same-line
+    // trailing decl starts its own segment and is still checked
+    // (EPH-I0901).
     // realTokenPosFrom filters string/comment occurrences and enforces
     // ident boundaries, so each hit is a real code token.
     var from: usize = 0;
     while (realTokenPosFrom(t, "fn", from)) |fn_pos| {
         from = fn_pos + "fn".len;
+        if (declIsExternOwned(t, fn_pos)) continue;
         const start = fn_pos + "fn".len;
         var name_end: usize = undefined;
         var name_col: usize = start + 1;
@@ -22504,29 +22560,14 @@ fn analyzeCFGMemory(
 // Memory Analysis Helpers
 // ============================================================================
 
-/// Raw brace depth of one line: every `{` and `}` byte counts, string,
-/// char, comment, and multiline-string content included. The rawness is
-/// deliberate and documented (EPH-I0894 raw-form pin): analyzer routing
-/// uses the masked computeBraceDepth, and this counter keeps its naive
-/// byte-level contract for callers that need it. The pin test
-/// "countBraceDepth raw contract stays pinned" holds the contract.
-fn countBraceDepth(t: []const u8, depth: usize) usize {
-    var d = depth;
-    for (t) |c| {
-        if (c == '{') d += 1;
-        if (c == '}' and d > 0) d -= 1;
-    }
-    return d;
-}
-
 /// Signed paren balance of one line (`(` minus `)`), masked: parens inside
 /// string/char literals, `\\` multiline tails, and `//` comments do not
 /// count (EPH-I0794). The naive count let a paren in a trailing comment or
 /// string literal skew the depth walks in isInsideTypeOf, findCallSiteLine,
 /// and joinParenContinuation — past the comment-stripped boundary arm
-/// (EPH-I0783) on the ZA202 paths. countBraceDepth keeps its documented
-/// raw contract (EPH-I0894 raw-form pin); every analyzer brace walk routes
-/// through computeBraceDepth.
+/// (EPH-I0783) on the ZA202 paths. Every analyzer brace walk routes
+/// through the masked computeBraceDepth (EPH-I0894); the raw byte-level
+/// brace counter was deleted with its last caller (EPH-I0905).
 fn parenBalance(t: []const u8) i32 {
     return parenBalanceOutsideQuotes(stripLineComment(t));
 }
@@ -23991,11 +24032,49 @@ fn hasNullGuard(
         // string that carries the name or `== null` is data, not a guard
         // predicate, and cannot anchor the judge (EPH-I0899).
         if (findTagInCode(line, name, 0) == null) continue;
-        const eq_pos = findTagInCode(line, "== null", 0) orelse continue;
         const lookup = NullGuardLookup{ .lines = lines, .i = i, .limit = current_idx };
+        if (lineHasBoundNullGuard(line, lookup, name)) return true;
+    }
+    return false;
+}
+
+/// True when the line carries a code-position `== null` predicate that
+/// binds `name` as its operand and whose exit covers the orelse site.
+/// The `== null` predicate must bind the checked name: the name is the
+/// predicate's operand. A line that carries both the name and a null
+/// check of a DIFFERENT variable (`use(p); if (q == null) return 0;`)
+/// is not p's guard and must not suppress p's report (EPH-I0902). Every
+/// code-position predicate on the line is examined, so a combined
+/// condition (`q == null && p == null`) keeps its binding through the
+/// later predicate.
+fn lineHasBoundNullGuard(
+    line: []const u8,
+    lookup: NullGuardLookup,
+    name: []const u8,
+) bool {
+    var from: usize = 0;
+    while (findTagInCode(line, "== null", from)) |eq_pos| {
+        from = eq_pos + "== null".len;
+        if (!nullPredicateBinds(line, eq_pos, name)) continue;
         if (hasNullCheckExit(line, lookup, eq_pos)) return true;
     }
     return false;
+}
+
+/// True when the `== null` predicate whose `==` sits at `eq_pos` on
+/// `line` binds `name` as its operand: the token span immediately before
+/// the `==` (identifier and dot bytes) contains an ident-bounded
+/// occurrence of the name. The bound-predicate model is the ZA801
+/// sibling's check (hasNullEqualityCheck, EPH-I0892) generalized to
+/// field operands: `obj.p == null` guards both `obj` and `p`, while a
+/// line that merely carries the name elsewhere (`use(p); if (q == null)
+/// return 0;`) is not p's guard (EPH-I0902).
+fn nullPredicateBinds(line: []const u8, eq_pos: usize, name: []const u8) bool {
+    var end = eq_pos;
+    while (end > 0 and (line[end - 1] == ' ' or line[end - 1] == '\t')) end -= 1;
+    var start = end;
+    while (start > 0 and (isIdent(line[start - 1]) or line[start - 1] == '.')) start -= 1;
+    return containsIdentifier(line[start..end], name);
 }
 
 /// Extract variable name portion before a null-check keyword position
@@ -48088,13 +48167,133 @@ test "ZA101: errdefer handoff survives a string brace in a return literal (EPH-I
     );
 }
 
-test "countBraceDepth raw contract stays pinned (EPH-I0894)" {
-    // The documented raw-form pin: countBraceDepth counts every brace
-    // byte, string content included. Analyzer routing uses the masked
-    // computeBraceDepth (EPH-I0894 done-means site 4); this counter
-    // keeps its naive contract for byte-level callers.
-    try std.testing.expectEqual(@as(usize, 1), countBraceDepth("defer log(\"{\", .{});", 0));
-    try std.testing.expectEqual(@as(usize, 0), countBraceDepth("log(\"}\");", 1));
+test "structLiteralBindsOwner masks string braces in the depth walk (EPH-I0900)" {
+    const owner = [_]OwnerVar{.{ .name = "buf" }};
+    // A string `}` is data: it must not close the literal early, so the
+    // owner on the continuation line is still inside the literal
+    // (pre-fix the raw walk dropped to depth 0 and missed the binding).
+    const early_close = [_][]const u8{
+        "const x = .{",
+        "    .a = \"}\",",
+        "    .b = buf,",
+        "};",
+    };
+    try std.testing.expect(structLiteralBindsOwner(&early_close, 0, early_close[0], &owner));
+    // A string `{` is data: it must not extend the walk past the real
+    // close, so the owner on the statement after `};` reads as outside
+    // the literal (pre-fix the raw walk never reached depth 0 and the
+    // statement line bound the owner spuriously).
+    const late_extend = [_][]const u8{
+        "const x = .{",
+        "    .a = \"{\",",
+        "    .b = 1,",
+        "};",
+        "buf = 5;",
+    };
+    try std.testing.expect(!structLiteralBindsOwner(&late_extend, 0, late_extend[0], &owner));
+}
+
+test "extractStructOwnerName ignores a brace in string content (EPH-I0900)" {
+    // A `{` inside a string is data, not a struct-literal opener: the
+    // call line binds no owner. Pre-fix the raw byte gate admitted the
+    // line and the name joined the owner chain.
+    try std.testing.expect(extractStructOwnerName("const x = log(\"{\");") == null);
+    // Real openers keep their extraction.
+    try std.testing.expectEqualStrings("x", extractStructOwnerName("const x = .{").?);
+}
+
+test "extractDerefOwnerName ignores a brace in string content (EPH-I0900)" {
+    // A `{` inside a string is data, not a struct-literal store: the
+    // deref write binds no owner. Pre-fix the raw byte gate admitted
+    // the line and the deref name joined the owner chain.
+    try std.testing.expect(extractDerefOwnerName("p.* = log(\"{\");") == null);
+    // A real literal store keeps its extraction.
+    try std.testing.expectEqualStrings("p", extractDerefOwnerName("p.* = .{}").?);
+}
+
+test "checkOwnershipInLine return-literal gate masks strings and comments (EPH-I0900)" {
+    const owner = [_]OwnerVar{.{ .name = "buf" }};
+    // A string `{` must not arm the multi-line scan: `return log("{")`
+    // opens no literal, and the next line is not its continuation
+    // (pre-fix the raw `{` gate armed the scan and `buf,` read as a
+    // tuple element).
+    const spurious = [_][]const u8{
+        "    return log(\"{\");",
+        "    buf,",
+    };
+    try std.testing.expect(!checkOwnershipInLine(mem.trim(u8, spurious[0], " \t"), .{
+        .lines = &spurious,
+        .func_line = 0,
+        .alloc_name = "buf",
+        .owner_vars = &owner,
+        .managed_ptr = false,
+    }, 0));
+    // A `};` in a comment must not hide a real opener: `return Foo{`
+    // still opens the literal whose continuation carries the owner
+    // (pre-fix the raw `};` gate skipped the multi-line scan).
+    const hidden = [_][]const u8{
+        "    return Foo{ // };",
+        "        .x = buf,",
+        "    };",
+    };
+    try std.testing.expect(checkOwnershipInLine(mem.trim(u8, hidden[0], " \t"), .{
+        .lines = &hidden,
+        .func_line = 0,
+        .alloc_name = "buf",
+        .owner_vars = &owner,
+        .managed_ptr = false,
+    }, 0));
+}
+
+test "returnTupleTransfersHere masks strings and comments in the opener scan (EPH-I0900)" {
+    // A string `{` must not open the continuation scan: the element
+    // line below is not inside a literal (pre-fix the raw opener gate
+    // armed the scan and `buf,` read as an element).
+    const spurious = [_][]const u8{
+        "    return log(\"{\");",
+        "    buf,",
+    };
+    try std.testing.expect(!returnTupleTransfersHere(&spurious, 0, "buf"));
+    // A `};` inside a string must not close the scan early: the element
+    // on the following line is still inside the literal (pre-fix the
+    // raw closer gate disarmed the scan at the string line).
+    const early_close = [_][]const u8{
+        "    return Foo{",
+        "        .x = \"};\",",
+        "        .y = buf,",
+        "    };",
+    };
+    try std.testing.expect(returnTupleTransfersHere(&early_close, 0, "buf"));
+    // A `};` in a comment on the opener line must not skip a real
+    // opener (pre-fix the raw closer gate skipped the line entirely).
+    const hidden = [_][]const u8{
+        "    return Foo{ // };",
+        "        .x = buf,",
+        "    };",
+    };
+    try std.testing.expect(returnTupleTransfersHere(&hidden, 0, "buf"));
+}
+
+test "checkReturnTupleLine masks a closer inside string content (EPH-I0900)" {
+    // A `};` inside a string is data: it must not disarm the
+    // continuation scan, so the element on the following line is still
+    // inside the tuple (pre-fix the raw closer gate disarmed the scan
+    // at the string line and the transfer was missed).
+    var scan: ReturnTupleScan = .{};
+    try std.testing.expect(!checkReturnTupleLine("return .{", "buf", &scan));
+    try std.testing.expect(!checkReturnTupleLine("    .x = \"};\",", "buf", &scan));
+    try std.testing.expect(checkReturnTupleLine("    .y = buf,", "buf", &scan));
+    try std.testing.expect(!checkReturnTupleLine("};", "buf", &scan));
+}
+
+test "isReturnTransfer masks a closer inside string content (EPH-I0900)" {
+    // A `};` inside a string is data: the element region must end at
+    // the real closer, so `buf` still reads as an element of the tuple
+    // (pre-fix the raw closer probe cut the region at the string and
+    // the transfer was missed).
+    try std.testing.expect(isReturnTransfer("return .{ .x = \"};\", buf };", "buf"));
+    // A closed tuple without string noise keeps its transfer.
+    try std.testing.expect(isReturnTransfer("return .{ buf, 0 };", "buf"));
 }
 
 test "ZA101: same-indent conditional defer still warns (F6 probe)" {
@@ -57725,6 +57924,64 @@ test "analyzeNaming: @import decls stay exempt in their own segment (EPH-I0897)"
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
+test "analyzeNaming: extern fn line still checks a trailing const decl (EPH-I0901)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The whole-line extern exemption covered the trailing const too:
+    // the ABI-fixed exemption is the extern declaration's own name, so
+    // the project-chosen trailing decl must fire (EPH-I0901).
+    const code =
+        \\extern fn h() void; const badName = 1;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_extern_trailing_const.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_extern_trailing_const.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "analyzeNaming: extern const line still checks a trailing const decl (EPH-I0901)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The extern declaration's own name stays exempt (ABI-fixed); the
+    // trailing const is a project-chosen identifier and must fire
+    // (EPH-I0901).
+    const code =
+        \\extern const x: u32 = 5; const badName = 1;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_extern_trailing2.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_extern_trailing2.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'badName' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
 test "analyzeNaming: function-alias exemption does not bleed to a same-line decl (EPH-I0898)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -59018,6 +59275,56 @@ test "checkFnNaming: extern declarations are exempt" {
         .line_num = 2,
     });
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "checkVarNaming: extern line still checks a trailing var decl (EPH-I0901)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // The whole-line extern exemption covered the trailing var too: the
+    // ABI-fixed exemption is the extern declaration's own name, so the
+    // project-chosen trailing var must fire (EPH-I0901).
+    try checkVarNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "extern fn h() void; var badVar = 1;",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "variable 'badVar' should be snake_case",
+        issues.items[0].message,
+    );
+}
+
+test "checkFnNaming: extern line still checks a trailing fn decl (EPH-I0901)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // The whole-line extern exemption covered the trailing fn too: the
+    // ABI-fixed exemption is the extern declaration's own name, so the
+    // project-chosen trailing fn must fire (EPH-I0901).
+    try checkFnNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "extern fn h() void; fn BadName() void {}",
+        .line_num = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "function 'BadName' should be camelCase",
+        issues.items[0].message,
+    );
 }
 
 test "checkFnNaming: non-camelCase fn is still flagged" {
@@ -60925,6 +61232,39 @@ test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
         }
     }
     try std.testing.expect(found_memory_issue);
+}
+
+test "hasNoFreeAllocatorParameter body-start gate masks comment text (EPH-I0900)" {
+    // A `) {` inside a comment is data, not the body opener: the
+    // signature scan must continue past the comment line and find the
+    // arena-typed parameter. Pre-fix the raw `) {` gate broke the scan
+    // at the comment line and the no-free suppression was lost
+    // (EPH-I0900).
+    const lines = [_][]const u8{
+        "fn f(",
+        "    a: u8, // ) {",
+        "    arena: *std.heap.ArenaAllocator,",
+        ") void {",
+    };
+    try std.testing.expect(hasNoFreeAllocatorParameter(&lines));
+}
+
+test "trackAllocatorParams body-start gate masks comment text (EPH-I0900)" {
+    // A `) {` inside a comment is data, not the body opener: the
+    // parameter scan must continue past the comment line and track the
+    // Allocator-typed parameter. Pre-fix the raw `) {` gate broke the
+    // scan at the comment line and the parameter was not tracked
+    // (EPH-I0900).
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(std.testing.allocator);
+    const lines = [_][]const u8{
+        "fn f(",
+        "    a: u8, // ) {",
+        "    allocator: std.mem.Allocator,",
+        ") void {",
+    };
+    try trackAllocatorParams(std.testing.allocator, &lines, &names);
+    try std.testing.expect(names.contains("allocator"));
 }
 
 test "arena param no FP for ZA103 errdefer (name-based)" {
@@ -65038,6 +65378,58 @@ test "hasNullGuard ignores == null inside a string (EPH-I0899)" {
         "const y = p orelse unreachable;",
     };
     try std.testing.expect(!hasNullGuard(&next_exit, 2, 0, "p"));
+}
+
+test "hasNullGuard requires the == null predicate to bind the checked name (EPH-I0902)" {
+    // The name on the guard line is not the null-check operand:
+    // `use(p);` precedes q's guard, so q's exit does not cover p and
+    // p's ZA203 must fire. Pre-fix the name-plus-`== null` line gate
+    // admitted the line and suppressed the report (EPH-I0902).
+    const cross = [_][]const u8{
+        "use(p); if (q == null) return 0;",
+        "const y = p orelse unreachable;",
+    };
+    try std.testing.expect(!hasNullGuard(&cross, 1, 0, "p"));
+    // The genuine same-line form still suppresses: the predicate's
+    // operand IS the checked name.
+    const genuine = [_][]const u8{
+        "if (p == null) return 0;",
+        "const y = p orelse unreachable;",
+    };
+    try std.testing.expect(hasNullGuard(&genuine, 1, 0, "p"));
+    // A combined condition binds through the second predicate: the
+    // return fires whenever p is null, so p's orelse stays silent.
+    const combined = [_][]const u8{
+        "if (q == null && p == null) return 0;",
+        "const y = p orelse unreachable;",
+    };
+    try std.testing.expect(hasNullGuard(&combined, 1, 0, "p"));
+}
+
+test "line-tier ZA203 fires when the guard line binds another name (EPH-I0902)" {
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer issues.deinit(std.testing.allocator);
+    var state = ErrorAnalysisState{};
+    const lines = [_][]const u8{
+        "fn f(p: ?*u8, q: ?*u8) u8 {",
+        "    use(p); if (q == null) return 0;",
+        "    const x = p orelse unreachable;",
+        "    return x.*;",
+        "}",
+    };
+    var ctx = FileErrorScanCtx{
+        .allocator = std.testing.allocator,
+        .issues = &issues,
+        .path = "src/app.zig",
+        .all_lines = &lines,
+        .state = &state,
+    };
+    try scanFileErrorLine(&ctx, lines[0], 0);
+    try scanFileErrorLine(&ctx, lines[1], 1);
+    try scanFileErrorLine(&ctx, lines[2], 2);
+    try scanFileErrorLine(&ctx, lines[3], 3);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_ORELSE_UNREACHABLE, issues.items[0].rule);
 }
 
 test "hasNullCheckExit judges the guard's own nested conditional (EPH-I0892)" {

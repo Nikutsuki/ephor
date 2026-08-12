@@ -9834,20 +9834,72 @@ fn hasBareIdentReturn(t: []const u8) bool {
     return false;
 }
 
+/// True when the line is a single-line conditional transfer of `name`:
+/// `if (<guard>) return <name>;` with nothing else after the return.
+/// The if-return covers only the guard-true path, so it is not a
+/// dominating transfer; the guard-false path keeps the alloc alive, so
+/// it is not an uncovered exit either. The transfer scan passes the
+/// line and keeps looking for a dominating transfer or an uncovered
+/// exit (EPH-I0063). A conditional return of any OTHER name leaves the
+/// alloc untransferred on its path and stays an uncovered exit — the
+/// gate is name-exact. The `else return` twin (`if (a) return buf;
+/// else return buf;`) matches: every arm transfers there, so the line
+/// never leaks. The guard head must be exactly the word `if`: a leading
+/// statement (`sink(); if (x) return buf;`) is not the shape.
+fn isConditionalReturnTransfer(t: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    const code = mem.trim(u8, t, " \t\r");
+    if (code.len < "if () return ;".len) return false;
+    // The return must be a real keyword: word-bounded, outside strings.
+    var cls = LineClassifier.init(code);
+    var s: usize = 0;
+    while (mem.indexOf(u8, code[s..], "return ")) |rel| {
+        const pos = s + rel;
+        s = pos + "return ".len;
+        if (pos > 0 and isIdent(code[pos - 1])) continue;
+        if (cls.isInsideString(pos)) continue;
+        // The return's remainder must be exactly name + `;`.
+        const expr = code[pos + "return ".len ..];
+        if (!mem.startsWith(u8, expr, name)) return false;
+        var end = name.len;
+        if (end < expr.len and isIdent(expr[end])) return false;
+        while (end < expr.len and (expr[end] == ' ' or expr[end] == '\t')) end += 1;
+        if (end >= expr.len or expr[end] != ';') return false;
+        // The text before the return must be an if-guard group: a `)`
+        // whose matching `(` is preceded by exactly the word `if`.
+        const before = mem.trim(u8, code[0..pos], " \t\r");
+        if (before.len == 0 or before[before.len - 1] != ')') return false;
+        const open = parenOpenBackAt(before, before.len - 1) orelse return false;
+        const guard_head = mem.trim(u8, before[0..open], " \t\r");
+        return mem.eql(u8, guard_head, "if");
+    }
+    return false;
+}
+
 /// True when a post-alloc line is an error-path exit that a LATER ownership
 /// transfer cannot cover: a `try` (the error propagates before ownership
 /// moves), `return error.X;`, or a bare `return ident;`. The alloc's own
 /// `return name;` is a transfer — transfer checks run before this. Comment
-/// and multiline-string lines are excluded, as are defer/errdefer statement
-/// lines (`try` is a compile error inside defer bodies — verified — so a
-/// `try` there can only appear in non-compiling code).
-fn isUncoveredErrorExit(t: []const u8) bool {
+/// and multiline-string lines are excluded, and a mid-line comment is
+/// stripped before the checks: prose mentioning `try` or a bare return is
+/// text, not an exit (EPH-I0070). A single-line conditional return of the
+/// alloc itself (`if (x) return buf;`) is a conditional transfer, not an
+/// exit (EPH-I0063). A bare `return;` (success exit) is intentionally NOT
+/// an exit-stopper: errdefer does not run on success paths, so a success
+/// return never leaks through an errdefer gap — ZA101 owns that leak class
+/// (EPH-I0070 rationale). defer/errdefer statement lines are excluded
+/// (`try` is a compile error inside defer bodies — verified — so a `try`
+/// there can only appear in non-compiling code).
+fn isUncoveredErrorExit(t: []const u8, name: []const u8) bool {
     if (isCommentOrMultilineString(t)) return false;
     if (mem.startsWith(u8, t, "defer ")) return false;
     if (mem.startsWith(u8, t, "errdefer ")) return false;
-    if (hasRealKeyword(t, "try ")) return true;
-    if (hasRealKeyword(t, "return error.")) return true;
-    return hasBareIdentReturn(t);
+    const comment_start = findCommentStart(t) orelse t.len;
+    const code = mem.trim(u8, t[0..comment_start], " \t\r");
+    if (hasRealKeyword(code, "try ")) return true;
+    if (hasRealKeyword(code, "return error.")) return true;
+    if (isConditionalReturnTransfer(code, name)) return false;
+    return hasBareIdentReturn(code);
 }
 
 /// Check ownership transfer for errdefer analysis. A transfer covers the
@@ -9917,7 +9969,7 @@ fn checkErrdeferOwnershipTransfer(
         // Error-path exit BEFORE any transfer: ownership has not moved on
         // this path, so a later transfer cannot cover it. Stop without
         // marking coverage — ZA103 emission decides from real triggers.
-        if (isUncoveredErrorExit(mem.trim(u8, line, " \t\r"))) return;
+        if (isUncoveredErrorExit(mem.trim(u8, line, " \t\r"), alloc.name)) return;
     }
 }
 
@@ -13049,7 +13101,12 @@ const TupleElementRegion = struct {
 ///     single-arg call closers (`foo(buf)`) have other followers
 /// Transparent parens around a bare name (`.{ (buf), 0 }`) are conservatively
 /// NOT a match: distinguishing them from call args costs more than the shape
-/// occurs in practice (disclosed residual).
+/// occurs in practice (disclosed residual, EPH-I0063). Corpus prevalence
+/// re-verified 2026-08-12 (batch 14): zero occurrences of a paren-wrapped
+/// single-operand element in zls/ghostty/sig/tigerbeetle (the sole `.{(`
+/// hit, ghostty font/Metrics.zig:496, wraps an expression `(v - 1) * 100`,
+/// not a bare operand) and zero in RhyOS. The residual stays documented,
+/// not fixed.
 fn isReturnTupleElement(t: []const u8, name: []const u8, region: TupleElementRegion) bool {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
@@ -13113,7 +13170,14 @@ const ReturnTupleScan = struct {
 /// an unclosed `return .{` opener arms the scan (the opener line itself may
 /// carry the first element). Both closer probes are code-position-masked: a
 /// `};` inside a string or comment is data and must not disarm the scan
-/// early or hide a real opener (EPH-I0900).
+/// early or hide a real opener (EPH-I0900). All per-line checks run on the
+/// caller's masked code (comments stripped, literal contents blanked), so
+/// comment text mentioning the alloc name, and unbalanced parens inside
+/// comments or char literals, cannot skew the element match or the carried
+/// paren depth (EPH-I0369 mechanism; residual (3) of EPH-I0063 re-verified
+/// dead at batch 14 — probe `.tmp/probe-b14/i0063_res3.zig` and corpus scan:
+/// 40 comment lines with trailing identifiers inside 1192 multi-line return
+/// regions, 2 with unbalanced parens; none affect the verdict).
 fn checkReturnTupleLine(t: []const u8, name: []const u8, scan: *ReturnTupleScan) bool {
     if (scan.remaining > 0) {
         scan.remaining -= 1;
@@ -24173,24 +24237,26 @@ fn checkPanic(
     return null;
 }
 
-/// Extract variable name before "orelse unreachable"
-/// Pattern: "x orelse unreachable" or "x.field orelse unreachable"
+/// Extract the operand name before "orelse unreachable". Patterns:
+/// "x orelse unreachable", "x.field orelse unreachable", "p.* orelse
+/// unreachable", "(p) orelse unreachable" — the operand forms the
+/// null-guard model binds (EPH-I0906). Transparent paren groups strip
+/// from the result, so a parenthesized operand matches the same guard
+/// as its bare form. A leading dot from a mid-line chain (`foo().field
+/// orelse`) also strips.
 fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
     if (orelse_col == 0) return null;
-    // Walk backward from "orelse" to find the variable name
+    // Walk backward from "orelse" to find the operand form
     var end = orelse_col;
     // Skip whitespace before "orelse"
-    while (end > 0 and t[end - 1] == ' ') end -= 1;
+    while (end > 0 and (t[end - 1] == ' ' or t[end - 1] == '\t')) end -= 1;
     if (end == 0) return null;
-    // Walk backward through identifier chars (and dots for field access)
-    var start = end;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.'))
-        start -= 1;
+    const start = operandFormStart(t, end) orelse return null;
     if (start >= end) return null;
     const name = t[start..end];
-    // Strip leading dot if present
+    // Strip leading dot if present (mid-line chain, EPH-I0906)
     if (name.len > 0 and name[0] == '.') return name[1..];
-    return name;
+    return stripTransparentParens(name);
 }
 
 /// Check if a variable has a null guard earlier in the function
@@ -24351,19 +24417,111 @@ fn lineHasBoundNullGuard(
     return false;
 }
 
+/// Start offset of the operand form ending at `end` (exclusive) on `t`,
+/// or null when the bytes before `end` are not a bindable operand.
+/// Supported forms: an ident/dot chain (`p`, `obj.field`), an optional
+/// deref-star suffix (`p.*`), and transparent paren groups around the
+/// whole form (`(p)`, `((p))`, `(p).*`). A paren group is transparent
+/// only when its content is exactly one operand form: `(p, q)` and
+/// `(foo(p))` are not transparent, so a call operand never binds its
+/// argument (`if (foo(p) == null)` must not guard `p` — EPH-I0906).
+/// The deref star must directly follow the chain's dot: a spaced star
+/// (`p . *`) or a star after a non-dot byte is not the deref token.
+/// The deref suffix peels iteratively, so any suffix length scans in
+/// bounded stack (EPH-I0919).
+fn operandFormStart(t: []const u8, end: usize) ?usize {
+    // Deref suffix: `p.*` — the star directly follows the chain's dot.
+    // The peel is iterative, one pair per loop step: the former
+    // recursion (operandFormStart(t, end - 2)) grew one frame per pair
+    // and overflowed the stack on adversarial multi-suffix lines
+    // (EPH-I0919 — ephor scans untrusted trees).
+    var cur_end = end;
+    while (cur_end >= 2 and t[cur_end - 1] == '*') {
+        if (t[cur_end - 2] != '.') return null;
+        cur_end -= 2;
+    }
+    // Transparent paren group: the content between the parens must be
+    // exactly one operand form, and the open paren must not follow a
+    // call or subscript head — `foo(p)` and `arr[i](p)` are calls, not
+    // transparent groups, so their arguments never bind (EPH-I0906).
+    if (cur_end > 0 and t[cur_end - 1] == ')') {
+        const open = parenOpenBackAt(t, cur_end - 1) orelse return null;
+        if (open > 0 and (isIdent(t[open - 1]) or t[open - 1] == '.' or
+            t[open - 1] == ']' or t[open - 1] == ')')) return null;
+        const content = t[open + 1 .. cur_end - 1];
+        if (operandFormStart(content, content.len) != 0) return null;
+        return open;
+    }
+    var cur = cur_end;
+    while (cur > 0 and (isIdent(t[cur - 1]) or t[cur - 1] == '.')) cur -= 1;
+    if (cur >= cur_end) return null;
+    return cur;
+}
+
+/// Offset of the `(` whose group closes at `close`, or null when the
+/// group is unterminated before the line start. Quote-aware: parens
+/// inside string and char literals are data, not structure (EPH-I0906).
+/// The forward walk keeps a bounded open-paren stack; deeper nesting
+/// overflows to null (fail-safe: the operand is not bindable).
+fn parenOpenBackAt(t: []const u8, close: usize) ?usize {
+    var stack = [_]usize{0} ** 64;
+    var len: usize = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < close) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '(') {
+            if (len >= stack.len) return null;
+            stack[len] = i;
+            len += 1;
+            continue;
+        }
+        if (c == ')') {
+            if (len == 0) return null;
+            len -= 1;
+        }
+    }
+    if (len == 0) return null;
+    return stack[len - 1];
+}
+
+/// Strip transparent paren groups from an operand form: `((p))` -> `p`.
+/// Each stripped group wraps exactly one operand form (validated by
+/// operandFormStart), so the result is the form's operand proper. The
+/// orelse side and the guard side compare through this normalization,
+/// so a parenthesized operand matches the same guard as its bare form
+/// (EPH-I0906).
+fn stripTransparentParens(t: []const u8) []const u8 {
+    var cur = t;
+    while (cur.len >= 2 and cur[0] == '(' and cur[cur.len - 1] == ')') {
+        const start = operandFormStart(cur, cur.len) orelse return cur;
+        if (start != 0) return cur;
+        const open = parenOpenBackAt(cur, cur.len - 1) orelse return cur;
+        cur = cur[open + 1 .. cur.len - 1];
+    }
+    return cur;
+}
+
 /// True when the `== null` predicate whose `==` sits at `eq_pos` on
-/// `line` binds `name` as its operand: the token span immediately before
-/// the `==` (identifier and dot bytes) contains an ident-bounded
-/// occurrence of the name. The bound-predicate model is the ZA801
-/// sibling's check (hasNullEqualityCheck, EPH-I0892) generalized to
-/// field operands: `obj.p == null` guards both `obj` and `p`, while a
-/// line that merely carries the name elsewhere (`use(p); if (q == null)
-/// return 0;`) is not p's guard (EPH-I0902).
+/// `line` binds `name` as its operand: the operand form immediately
+/// before the `==` (ident/dot chain with an optional deref star and
+/// transparent parens) contains an ident-bounded occurrence of the
+/// name. The bound-predicate model is the ZA801 sibling's check
+/// (hasNullEqualityCheck, EPH-I0892) generalized to field operands:
+/// `obj.p == null` guards both `obj` and `p`, while a line that merely
+/// carries the name elsewhere (`use(p); if (q == null) return 0;`) is
+/// not p's guard (EPH-I0902). The deref and paren forms bind since
+/// EPH-I0906: `p.* == null` guards the deref operand, and `(p) == null`
+/// guards the same name as `p == null`.
 fn nullPredicateBinds(line: []const u8, eq_pos: usize, name: []const u8) bool {
     var end = eq_pos;
     while (end > 0 and (line[end - 1] == ' ' or line[end - 1] == '\t')) end -= 1;
-    var start = end;
-    while (start > 0 and (isIdent(line[start - 1]) or line[start - 1] == '.')) start -= 1;
+    const start = operandFormStart(line, end) orelse return false;
+    if (start >= end) return false;
     return containsIdentifier(line[start..end], name);
 }
 
@@ -40141,6 +40299,138 @@ test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)"
         "test_errdefer_covers.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
+}
+
+test "ZA103: conditional alloc-return passes the transfer scan (EPH-I0063)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (cond) return buf;` is a conditional transfer: the field store
+    // on the fall-through covers every path, so the later try is not a
+    // gap. Pre-fix the bare-ident exit-stop fired at the conditional
+    // return and the store never credited (EPH-I0063).
+    const content =
+        \\fn cond_store(allocator: std.mem.Allocator, state: *State, cond: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (cond) return buf;
+        \\    state.field = buf;
+        \\    try validate();
+        \\}
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn validate() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cond_return_pass.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_cond_return_pass.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: conditional return of another name stays a gap (EPH-I0063 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The if-return returns `err`, not buf: buf stays untransferred on
+    // that path, so the exit-stop stays and the later try fires. The
+    // conditional-transfer gate is name-exact (EPH-I0063).
+    const content =
+        \\fn cond_other(allocator: std.mem.Allocator, state: *State, cond: bool, err: anyerror) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (cond) return err;
+        \\    state.field = buf;
+        \\    try validate();
+        \\}
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn validate() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cond_other_gap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_cond_other_gap.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "isUncoveredErrorExit ignores mid-line comment exits (EPH-I0070)" {
+    // A mid-line comment mentioning an exit is prose, not an exit: the
+    // scan must pass the line. The `// return err;` pin failed pre-fix
+    // (hasBareIdentReturn matched the comment text); the `// try this`
+    // pin is a guard (hasRealKeyword was already comment-aware). The
+    // conditional alloc-return pin failed pre-fix (EPH-I0063); the
+    // conditional other-name and real-try pins are locks.
+    try std.testing.expect(!isUncoveredErrorExit("work(); // return err;", "buf"));
+    try std.testing.expect(!isUncoveredErrorExit("work(); // try this", "buf"));
+    try std.testing.expect(isUncoveredErrorExit("try work2();", "buf"));
+    try std.testing.expect(!isUncoveredErrorExit("if (cond) return buf;", "buf"));
+    try std.testing.expect(isUncoveredErrorExit("if (cond) return err;", "buf"));
+}
+
+test "ZA103: comment mentioning return between alloc and transfer stays silent (EPH-I0070)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `// return err;` prose between the alloc and the field-store
+    // transfer: the store must credit and the later try must not fire.
+    // Pre-fix the comment text stopped the ownership scan (EPH-I0070).
+    const content =
+        \\fn comment_gap(allocator: std.mem.Allocator, state: *State) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    work(); // return err;
+        \\    state.field = buf;
+        \\    try validate();
+        \\}
+        \\const State = struct { field: []u8 = &.{} };
+        \\fn work() void {}
+        \\fn validate() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_gap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_comment_gap.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: comment before a real try gap still fires (EPH-I0070 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `// try this` comment must not hide the real try gap: the try
+    // before the return-transfer leaks on its error path (EPH-I0005
+    // semantics), and the comment fix must not over-suppress (EPH-I0070).
+    const content =
+        \\fn comment_try_gap(allocator: std.mem.Allocator) ![]u8 {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    work(); // try this
+        \\    try validate();
+        \\    return buf;
+        \\}
+        \\fn work() void {}
+        \\fn validate() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_try_gap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_comment_try_gap.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
 }
 
 test "ZA103: transfer before later try stays silent (EPH-I0005 lock)" {
@@ -65920,6 +66210,121 @@ test "analyzeCFGMemory ZA203 silent past a same-line direct guard exit (EPH-I086
         0,
         countRuleIssues(run.issues.items, "test_za203_sameline_direct.zig", RULE_ORELSE_UNREACHABLE),
     );
+}
+
+test "analyzeCFGMemory ZA203 silent past deref and transparent-paren guard operands (EPH-I0906)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The qa-gate batch-9 probe shapes (p1/p2): `(p) == null` and
+    // `p.* == null` both dominate the orelse on the same operand. Both
+    // fired before the operand-form walker bound the shapes (EPH-I0906).
+    const content =
+        \\fn paren_guard(p: ?*u8) u8 {
+        \\    if ((p) == null) return 0;
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+        \\fn deref_guard(p: *?u8) u8 {
+        \\    if (p.* == null) return 0;
+        \\    const x = p.* orelse unreachable;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za203_operand_forms.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "test_za203_operand_forms.zig", RULE_ORELSE_UNREACHABLE),
+    );
+}
+
+test "analyzeCFGMemory ZA203 fires when a call operand guards (EPH-I0906)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The qa-gate batch-9 probe p3: `foo(p) == null` tells nothing about
+    // p itself, so the orelse must stay loud. The call-head gate keeps
+    // call parens non-transparent (EPH-I0906).
+    const content =
+        \\fn call_guard(p: ?*u8) u8 {
+        \\    if (foo(p) == null) return 0;
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
+        \\fn foo(p: ?*u8) ?*u8 {
+        \\    return p;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za203_call_operand.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "test_za203_call_operand.zig", RULE_ORELSE_UNREACHABLE),
+    );
+}
+
+test "nullPredicateBinds binds deref and transparent-paren operands (EPH-I0906)" {
+    const paren = "if ((p) == null) return 0;";
+    const eq_paren = findTagInCode(paren, "== null", 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nullPredicateBinds(paren, eq_paren, "p"));
+
+    const deref = "if (p.* == null) return 0;";
+    const eq_deref = findTagInCode(deref, "== null", 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nullPredicateBinds(deref, eq_deref, "p.*"));
+    try std.testing.expect(nullPredicateBinds(deref, eq_deref, "p"));
+
+    const call = "if (foo(p) == null) return 0;";
+    const eq_call = findTagInCode(call, "== null", 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!nullPredicateBinds(call, eq_call, "p"));
+
+    const plain = "if (p == null) return 0;";
+    const eq_plain = findTagInCode(plain, "== null", 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nullPredicateBinds(plain, eq_plain, "p"));
+}
+
+test "extractOrelseVar binds deref and paren operands (EPH-I0906)" {
+    const deref = "const x = p.* orelse unreachable;";
+    const deref_col = mem.indexOf(u8, deref, "orelse unreachable") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("p.*", extractOrelseVar(deref, deref_col).?);
+
+    const paren = "const x = (p) orelse unreachable;";
+    const paren_col = mem.indexOf(u8, paren, "orelse unreachable") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("p", extractOrelseVar(paren, paren_col).?);
+
+    const plain = "const x = p orelse unreachable;";
+    const plain_col = mem.indexOf(u8, plain, "orelse unreachable") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("p", extractOrelseVar(plain, plain_col).?);
+}
+
+test "operandFormStart peels a 1M-suffix deref chain without recursion (EPH-I0919)" {
+    // The pre-fix deref branch recursed one frame per `.*` pair
+    // (operandFormStart(t, end - 2)), so a long suffix line overflowed
+    // the 8 MB stack on both entry paths: nullPredicateBinds (guard
+    // side) and extractOrelseVar (orelse side). The qa-gate probes
+    // (.tmp/probe-qagate-b14/deref_guard.zig, deref_orelse.zig) crashed
+    // with exit 134; the bisect crashed at n=40000. The peel is
+    // iterative now; this pin asserts the verdict on the 1M-suffix
+    // crash shape. The chain is `p` plus N `.*` pairs (the probe shape
+    // `p.*.*.*...`), which peels to the bare `p` at offset 0, so the
+    // form start is 0 — the verdict the recursion also produced on
+    // short suffixes.
+    const allocator = std.testing.allocator;
+    const n = 1_000_000;
+    const chain = try allocator.alloc(u8, n * 2 + 1);
+    defer allocator.free(chain);
+    chain[0] = 'p';
+    for (0..n) |i| {
+        chain[i * 2 + 1] = '.';
+        chain[i * 2 + 2] = '*';
+    }
+    try std.testing.expectEqual(@as(?usize, 0), operandFormStart(chain, chain.len));
 }
 
 test "hasNullGuard misses a guard beyond the lookback window (EPH-I0225)" {

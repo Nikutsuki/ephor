@@ -17158,7 +17158,11 @@ fn analyzeFileTests(
 // `zig build test` can only report on tests that exist; it cannot see the
 // public API surface no test exercises at all. ZT105 collects every pub fn
 // declaration in the project and reports those whose name never appears in
-// test context. Note severity: indirect invocation (@field dispatch,
+// test context. Test evidence spans the whole project corpus: identifiers
+// in test context, plus every fn name reachable from a test call site
+// through the project-wide call graph (EPH-I0429) — a test in foo_test.zig
+// that calls a helper in foo.zig still exercises the pub fns the helper's
+// body reaches. Note severity: indirect invocation (@field dispatch,
 // function-pointer tables built in ways the scan cannot see, integration
 // harnesses in other languages) is statically invisible — the EPH-I0029
 // class — so a hit is a prompt to verify coverage, not a proven gap.
@@ -17176,21 +17180,26 @@ const PubFnDecl = struct {
 /// Project-wide identifier evidence for ZT105. `tested` holds every
 /// identifier occurring in test context — test-block lines, whole test
 /// files (`_test.zig`, `/test/`, `/tests/` — everything there exists to
-/// support tests), plus names reachable from test-block calls through the
-/// file-local call graph (the helper-mediation pattern from ZT101).
-/// `aliased` holds identifiers in non-test VALUE positions: a re-export
-/// like `pub const x = name;` or a function-pointer table means the fn may
-/// be exercised under that alias, so the name is never flagged. Non-test
-/// CALL sites deliberately do not suppress — a pub fn called from other
-/// code but never from a test is exactly the target. Keys borrow content.
+/// support tests), plus names reachable from test call sites through the
+/// project-wide call graph (the helper-mediation pattern from ZT101,
+/// cross-file since EPH-I0429). `aliased` holds identifiers in non-test
+/// VALUE positions: a re-export like `pub const x = name;` or a
+/// function-pointer table means the fn may be exercised under that alias,
+/// so the name is never flagged. Non-test CALL sites deliberately do not
+/// suppress — a pub fn called from other code but never from a test is
+/// exactly the target. `seeds` holds the call-site targets from every
+/// test context (inline test blocks and whole test files): the root set
+/// for the project-wide reachability pass. Keys borrow content.
 const UntestedFnEvidence = struct {
     tested: std.StringHashMapUnmanaged(void) = .empty,
     aliased: std.StringHashMapUnmanaged(void) = .empty,
+    seeds: std.StringHashMapUnmanaged(void) = .empty,
     decls: std.ArrayListUnmanaged(PubFnDecl) = .empty,
 
     fn deinit(self: *UntestedFnEvidence, allocator: Allocator) void {
         self.tested.deinit(allocator);
         self.aliased.deinit(allocator);
+        self.seeds.deinit(allocator);
         self.decls.deinit(allocator);
     }
 
@@ -17229,59 +17238,110 @@ const UntestedFnEvidence = struct {
 };
 
 /// Scan context for one file's ZT105 pass (bundled for param counts).
-/// `facts` is the file's shared call graph, built once per project pass.
 const UntestedFnScanCtx = struct {
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
-    facts: *const FnCallFacts,
     evidence: *UntestedFnEvidence,
     is_test_file: bool,
 };
 
 /// Mutable per-file state for the ZT105 pass (bundled for param counts).
-/// `seeds` collects the test blocks' direct call targets for the
-/// reachability pass; the buffers back literal-blanking and the
-/// signature-normalization window.
+/// The buffers back literal-blanking and the signature-normalization
+/// window; the reachability seeds live on the shared evidence (the
+/// project pass runs once, after every file is scanned).
 const UntestedFnFileState = struct {
     in_test: bool = false,
     depth: usize = 0,
     blank_buf: [16 * 1024]u8 = undefined,
     sig_buf: [max_signature_lookahead]u8 = undefined,
-    seeds: std.StringHashMapUnmanaged(void) = .empty,
 };
 
 /// Prefixes that open a public fn declaration line (ZT105). `pub export`
 /// and `pub extern` fns are deliberately unmatched: their callers live
-/// outside Zig source and are statically invisible.
-const pub_fn_prefixes = [_][]const u8{ "pub fn ", "pub inline fn " };
+/// outside Zig source and are statically invisible. `pub noinline fn`
+/// joins the fn-family prefixes (EPH-I0031): a noinline decl is as
+/// testable as a plain one.
+const pub_fn_prefixes = [_][]const u8{
+    "pub fn ",
+    "pub inline fn ",
+    "pub noinline fn ",
+};
+
+/// The fn name declared after a matched prefix: `.name` borrows the line,
+/// `.end` is the offset just past the name (for a quoted name, past the
+/// closing quote). A plain identifier scans as before; a `@"..."` quoted
+/// name (EPH-I0031) yields its inner content — the spelling a call site
+/// shares. Malformed quotes yield null: a broken decl is not a candidate.
+const PubFnName = struct {
+    name: []const u8,
+    end: usize,
+};
+
+fn pubFnNameAt(t: []const u8, start: usize) ?PubFnName {
+    if (start >= t.len) return null;
+    if (t[start] != '@') {
+        var end = start;
+        while (end < t.len and isIdent(t[end])) end += 1;
+        if (end == start) return null;
+        return .{ .name = t[start..end], .end = end };
+    }
+    const open_quote = start + 1;
+    if (open_quote >= t.len or t[open_quote] != '"') return null;
+    const after_quote = skipQuotedIdent(t, open_quote + 1);
+    if (after_quote <= open_quote + 1 or t[after_quote - 1] != '"') return null;
+    return .{ .name = t[open_quote + 1 .. after_quote - 1], .end = after_quote };
+}
 
 /// Extract the pub fn declared on this trimmed line when it is a ZT105
 /// candidate, else null. `window` is the signature-normalized slice
 /// (newlines replaced by spaces) starting at the same trimmed start, so a
 /// generic param list or type-factory return spanning lines is still
 /// detected. Skips: `main` (exercised by running the binary), generics
-/// (tests name the generic but call instantiations), type factories
-/// (returned type is exercised, not the fn), and exotic `pub fn @"..."`.
+/// (tests name the generic but call instantiations), and type factories
+/// (returned type is exercised, not the fn).
 fn extractPubFnCandidate(t: []const u8, window: []const u8) ?[]const u8 {
     for (pub_fn_prefixes) |prefix| {
         if (!mem.startsWith(u8, t, prefix)) continue;
-        var end = prefix.len;
-        while (end < t.len and isIdent(t[end])) end += 1;
-        if (end == prefix.len) return null;
-        const name = t[prefix.len..end];
-        if (mem.eql(u8, name, "main")) return null;
-        if (fnReturnsType(window, end) or hasGenericParams(window, end)) return null;
-        return name;
+        const fn_name = pubFnNameAt(t, prefix.len) orelse continue;
+        if (mem.eql(u8, fn_name.name, "main")) return null;
+        if (fnReturnsType(window, fn_name.end) or
+            hasGenericParams(window, fn_name.end)) return null;
+        return fn_name.name;
     }
     return null;
+}
+
+/// Record one `@"..."` quoted identifier as ZT105 evidence: inner content
+/// into `tested` (test context) or `aliased` (non-test value position).
+/// Returns the index just past the quoted name, or null when `i` does not
+/// open a well-formed quoted identifier (EPH-I0031).
+fn collectQuotedIdentEvidence(
+    ctx: *const UntestedFnScanCtx,
+    code: []const u8,
+    i: usize,
+    in_test_context: bool,
+) !?usize {
+    if (i + 1 >= code.len or code[i + 1] != '"') return null;
+    const after_quote = skipQuotedIdent(code, i + 2);
+    if (after_quote <= i + 2 or code[after_quote - 1] != '"') return null;
+    const quoted = code[i + 2 .. after_quote - 1];
+    const is_call = after_quote < code.len and code[after_quote] == '(';
+    if (in_test_context) {
+        try ctx.evidence.tested.put(ctx.allocator, quoted, {});
+    } else if (!is_call) {
+        try ctx.evidence.aliased.put(ctx.allocator, quoted, {});
+    }
+    return after_quote;
 }
 
 /// Tokenize one comment-stripped code slice into the ZT105 evidence sets:
 /// identifier runs (dots allowed) contribute their segments — all of them
 /// in test context, value-position segments otherwise. String and char
 /// literal contents are skipped: a name inside a string is prose, not a
-/// reference.
+/// reference. A `@"..."` quoted identifier (EPH-I0031) contributes its
+/// inner content — the spelling the declaration side records — as one
+/// name, never dot-split: quoted content is one byte string.
 fn collectUntestedFnIdents(
     ctx: *const UntestedFnScanCtx,
     code: []const u8,
@@ -17296,6 +17356,12 @@ fn collectUntestedFnIdents(
         }
         if (c == '\'') {
             i = skipPastChar(code, i);
+            continue;
+        }
+        if (c == '@') {
+            const next = try collectQuotedIdentEvidence(ctx, code, i, in_test_context) orelse
+                (i + 1);
+            i = next;
             continue;
         }
         if (!isIdent(c)) {
@@ -17406,37 +17472,77 @@ fn scanUntestedFnLine(
         return;
     }
     try collectUntestedFnIdents(ctx, code, true);
-    // Test files contribute their whole content already; only inline test
-    // blocks need seeds for the helper-mediation pass.
-    if (in_test_context and !ctx.is_test_file) {
-        try collectTestRootCalls(code, &state.seeds, ctx.allocator);
+    // Every test context seeds the reachability pass — inline test blocks
+    // and whole test files alike: a helper called from either is a live
+    // edge into the project call graph (EPH-I0429). Test files contribute
+    // their whole content as evidence already; the seeds add the edges.
+    if (in_test_context) {
+        try collectTestRootCalls(code, &ctx.evidence.seeds, ctx.allocator);
     }
 }
 
-/// Add every name reachable from the test blocks' direct calls through the
-/// file-local call graph to the tested set (ZT101 machinery): a test that
-/// calls a private helper which calls the pub fn still exercises it. The
-/// facts are the shared per-file graph built by collectProjectTestFacts.
-fn addReachableTested(
-    ctx: *const UntestedFnScanCtx,
-    state: *const UntestedFnFileState,
+/// Merge one file's callee facts into the project-wide name index
+/// (EPH-I0429): the union of every file's direct callees per fn name.
+/// Keys and callee names borrow file content, which outlives the pass.
+fn mergeCalleesIntoIndex(
+    allocator: Allocator,
+    index: *std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
+    facts: *const FnCallFacts,
 ) !void {
-    if (state.seeds.count() == 0) return;
-    var seed_list: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer seed_list.deinit(ctx.allocator);
-    var seed_it = state.seeds.keyIterator();
-    while (seed_it.next()) |k| try seed_list.append(ctx.allocator, k.*);
-    var reachable = try computeReachableCalls(ctx.allocator, ctx.facts, seed_list.items);
-    defer reachable.deinit(ctx.allocator);
-    var reach_it = reachable.keyIterator();
-    while (reach_it.next()) |k| try ctx.evidence.tested.put(ctx.allocator, k.*, {});
+    var fn_it = facts.callees.iterator();
+    while (fn_it.next()) |fn_entry| {
+        const gop = try index.getOrPut(allocator, fn_entry.key_ptr.*);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (fn_entry.value_ptr.items) |callee| {
+            if (containsName(gop.value_ptr.items, callee)) continue;
+            try gop.value_ptr.append(allocator, callee);
+        }
+    }
 }
 
-/// Collect ZT105 evidence from one file in a single line pass, then fold in
-/// call-graph reachability for the file's inline test blocks.
+/// Add every fn name reachable from any test call site through the
+/// project-wide call graph to the tested set (EPH-I0429): a test in
+/// foo_test.zig that calls a helper defined in foo.zig still exercises
+/// every pub fn the helper's body reaches — the 2-hop cross-file chain
+/// the file-local BFS could not see. The index merges every file's
+/// callee facts by name; a name defined in several files expands through
+/// all of them, the same name-based over-approximation the per-file
+/// graph already made (note severity, and the direction is fewer notes).
+/// The BFS is depth-capped and cycle-safe — the reachable set doubles as
+/// the visited set — so a hostile import cycle terminates.
+fn addProjectReachableTested(
+    allocator: Allocator,
+    evidence: *UntestedFnEvidence,
+    cache: *const std.StringHashMapUnmanaged(FnCallFacts),
+) !void {
+    if (evidence.seeds.count() == 0) return;
+    var index = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)){};
+    defer {
+        var it = index.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        index.deinit(allocator);
+    }
+    var file_it = cache.iterator();
+    while (file_it.next()) |entry| {
+        try mergeCalleesIntoIndex(allocator, &index, entry.value_ptr);
+    }
+    var bfs = ReachBfs{};
+    defer bfs.deinit(allocator);
+    var seed_it = evidence.seeds.keyIterator();
+    while (seed_it.next()) |k| try bfs.push(allocator, k.*, 0);
+    while (bfs.stack.pop()) |item| {
+        if (item.depth >= max_call_depth) continue;
+        const kids = index.get(item.name) orelse continue;
+        for (kids.items) |kid| try bfs.push(allocator, kid, item.depth + 1);
+    }
+    var reach_it = bfs.reachable.keyIterator();
+    while (reach_it.next()) |k| try evidence.tested.put(allocator, k.*, {});
+}
+
+/// Collect ZT105 evidence from one file in a single line pass. The
+/// project-wide reachability fold runs once in analyzeUntestedPubFns.
 fn scanFileForUntestedFns(ctx: *const UntestedFnScanCtx) !void {
     var state = UntestedFnFileState{};
-    defer state.seeds.deinit(ctx.allocator);
     var line_num: usize = 1;
     var offset: usize = 0;
     while (offset <= ctx.content.len) {
@@ -17446,7 +17552,6 @@ fn scanFileForUntestedFns(ctx: *const UntestedFnScanCtx) !void {
         offset = end + 1;
         line_num += 1;
     }
-    if (!ctx.is_test_file) try addReachableTested(ctx, &state);
 }
 
 /// ZT105: report each collected pub fn absent from both evidence sets.
@@ -17479,8 +17584,10 @@ fn reportUntestedPubFns(
 }
 
 /// Project-level ZT105 pass: gather test-corpus and alias evidence across
-/// every analyzed file, then judge each pub fn declaration against it.
-/// Call facts come from the shared per-project build (never rebuilt).
+/// every analyzed file, fold the project-wide call-graph reachability
+/// (EPH-I0429) into the tested set, then judge each pub fn declaration
+/// against it. Call facts come from the shared per-project build (never
+/// rebuilt).
 fn analyzeUntestedPubFns(
     allocator: Allocator,
     graph: *ImportGraph,
@@ -17495,12 +17602,12 @@ fn analyzeUntestedPubFns(
             .allocator = allocator,
             .path = entry.value_ptr.path,
             .content = entry.value_ptr.content,
-            .facts = facts_cache.getPtr(entry.key_ptr.*).?,
             .evidence = &evidence,
             .is_test_file = isTestFilePath(entry.value_ptr.path),
         };
         try scanFileForUntestedFns(&ctx);
     }
+    try addProjectReachableTested(allocator, &evidence, facts_cache);
     try reportUntestedPubFns(allocator, &evidence, issues);
 }
 
@@ -71486,6 +71593,313 @@ test "ZT105: pub fn used only inside a test file is silent" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countUntestedFnNotes(run.issues.items, "never_api"),
+    );
+}
+
+test "ZT105 EPH-I0429: pub fn defer-called from hosted tests in other files stays silent" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // RhyOS resetForTest shape: the pub fn lives in scheduler.zig; hosted
+    // test blocks in signal.zig and process_ops.zig defer-call it through
+    // the Sched namespace. The dotted defer call is test evidence in both
+    // files. orphan_sched is the control.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_scheduler.zig",
+            .content =
+            \\pub fn resetForTest() void {}
+            \\pub fn orphan_sched() void {}
+            ,
+        },
+        .{
+            .path = "zt105_signal.zig",
+            .content =
+            \\test "hosted wake" {
+            \\    defer Sched.resetForTest();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+        .{
+            .path = "zt105_process_ops.zig",
+            .content =
+            \\test "hosted sleep" {
+            \\    defer Sched.resetForTest();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "resetForTest"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "orphan_sched"),
+    );
+}
+
+test "ZT105 EPH-I0429: test file through a cross-file helper reaches the pub fn" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zig-pulse processBlock shape: the test in the _test.zig file calls
+    // build_block (defined in test_helpers.zig), whose body calls the pub
+    // fn in root.zig. Pre-fix the chain was invisible: test files never
+    // seeded the BFS and the graph could not cross files. root_stray is
+    // the control.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_root.zig",
+            .content =
+            \\pub fn process_block() void {}
+            \\pub fn root_stray() void {}
+            ,
+        },
+        .{
+            .path = "zt105_test_helpers.zig",
+            .content =
+            \\pub fn build_block() void {
+            \\    process_block();
+            \\}
+            ,
+        },
+        .{
+            .path = "zt105_blocks_test.zig",
+            .content =
+            \\test "x" {
+            \\    build_block();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "process_block"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "root_stray"),
+    );
+}
+
+test "ZT105 EPH-I0429: pub fn reached through a helper in the same non-test file" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zig-pulse signWith shape: build_attestation and sign_with both live
+    // in test_helpers.zig, a non-test file without inline test blocks —
+    // pre-fix its file-local BFS had no seeds, so sign_with was flagged
+    // despite the test file exercising it. helper_stray is the control.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_attest_helpers.zig",
+            .content =
+            \\pub fn build_attestation() void {
+            \\    sign_with();
+            \\}
+            \\pub fn sign_with() void {}
+            \\pub fn helper_stray() void {}
+            ,
+        },
+        .{
+            .path = "zt105_attest_test.zig",
+            .content =
+            \\test "x" {
+            \\    build_attestation();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "sign_with"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "helper_stray"),
+    );
+}
+
+test "ZT105 EPH-I0429: two-hop cross-file chain reaches the pub fn in the impl file" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zig-pulse hashTreeRootOfUint64 shape: the test file calls
+    // build_signed_block (test_helpers.zig), which calls the private
+    // sign_with (same file), which calls hash_root in signature.zig —
+    // two cross-file hops before the pub fn. sig_stray is the control.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_signature.zig",
+            .content =
+            \\pub fn hash_root() void {}
+            \\pub fn sig_stray() void {}
+            ,
+        },
+        .{
+            .path = "zt105_signed_helpers.zig",
+            .content =
+            \\pub fn build_signed_block() void {
+            \\    sign_with();
+            \\}
+            \\fn sign_with() void {
+            \\    hash_root();
+            \\}
+            ,
+        },
+        .{
+            .path = "zt105_signed_test.zig",
+            .content =
+            \\test "x" {
+            \\    build_signed_block();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "hash_root"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "sig_stray"),
+    );
+}
+
+test "ZT105 EPH-I0031: pub noinline fn is a candidate" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the pub_fn_prefixes list skipped `pub noinline fn`, so the
+    // decl never became a candidate. The callconv(.C) signature combines
+    // with the noinline prefix on combo_api. plain_api is the control.
+    const content =
+        \\pub noinline fn noinline_api() void {}
+        \\pub noinline fn combo_api() callconv(.C) void {}
+        \\pub fn plain_api() void {}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_noinline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countBySeverity(run.issues.items, RULE_TEST_UNTESTED_PUBLIC_FN, .note),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "noinline_api"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "combo_api"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "plain_api"),
+    );
+}
+
+test "ZT105 EPH-I0031: pub fn with callconv(.C) is a candidate" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `pub fn ` prefix already matched a callconv(.C) signature; the
+    // pin guards the class against future prefix-list drift. plain_api is
+    // the control.
+    const content =
+        \\pub fn cc_api() callconv(.C) void {}
+        \\pub fn plain_api() void {}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_callconv.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countBySeverity(run.issues.items, RULE_TEST_UNTESTED_PUBLIC_FN, .note),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "cc_api"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "plain_api"),
+    );
+}
+
+test "ZT105 EPH-I0031: quoted fn name is a candidate and a test call is evidence" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix a `pub fn @"..."` decl was skipped (the name scan only
+    // accepted identifier starts), so quoted-name fns were never
+    // candidates — tested or not. The test calls the hyphenated one; the
+    // underscore one stays unreferenced. plain_api is the control.
+    const content =
+        \\pub fn @"quoted-name"() void {}
+        \\pub fn @"quoted_unused"() void {}
+        \\pub fn plain_api() void {}
+        \\test "x" {
+        \\    @"quoted-name"();
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_quoted.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countBySeverity(run.issues.items, RULE_TEST_UNTESTED_PUBLIC_FN, .note),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "quoted-name"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "quoted_unused"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "plain_api"),
     );
 }
 

@@ -16800,6 +16800,30 @@ fn braceDelta(depth: usize, blanked: []const u8) usize {
     return d;
 }
 
+/// Brace depth at an offset into one literal-blanked line, with `/* */`
+/// spans skipped (EPH-I0925): only code braces before the offset count.
+/// The input is literal-blanked, so string/char braces are already data;
+/// `/* */` spans are mid-edit text — Zig has no block comments (the
+/// I0916 ruling) — but their braces must not shift the depth. `//` tails
+/// never reach the caller's slice (findCommentStart strips them), so the
+/// walk needs no line-comment handling.
+fn braceDepthAtCodeOffset(depth: usize, blanked: []const u8, end: usize) usize {
+    var d = depth;
+    var i: usize = 0;
+    while (i < end) {
+        if (i + 1 < end and blanked[i] == '/' and blanked[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < end and !(blanked[i] == '*' and blanked[i + 1] == '/')) i += 1;
+            i += 2;
+            continue;
+        }
+        if (blanked[i] == '{') d += 1;
+        if (blanked[i] == '}' and d > 0) d -= 1;
+        i += 1;
+    }
+    return d;
+}
+
 /// Slice membership by string equality (small bounded lists only).
 fn containsName(list: []const []const u8, name: []const u8) bool {
     for (list) |item| {
@@ -18333,15 +18357,16 @@ fn callReceiver(target: []const u8) ?[]const u8 {
 /// True when the statement discards the call result (`_ = file.tryLock(...)`,
 /// `_=file.tryLock(...)`, `_ =file.tryLock(...)`). A discarded acquire is
 /// not scoped ownership — it is the hold-till-close file-lock idiom — so
-/// ZC101 does not treat it as an acquire. Missing spaces around the `=`
-/// are accepted: the compiler accepts them, only zig fmt normalizes
+/// ZC101 does not treat it as an acquire. The discard must be the bare
+/// `_` identifier: `x_ = mu.tryLock(...)` binds the result to a variable
+/// and stays a tracked acquire (EPH-I0927). Missing spaces around the
+/// `=` are accepted: the compiler accepts them, only zig fmt normalizes
 /// (EPH-I0446).
 fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
     const prefix = mem.trim(u8, code[0..call_start], " \t");
     if (prefix.len < 2 or prefix[prefix.len - 1] != '=') return false;
-    var i = prefix.len;
-    while (i > 1 and (prefix[i - 2] == ' ' or prefix[i - 2] == '\t')) i -= 1;
-    return prefix[i - 2] == '_';
+    const target = mem.trim(u8, prefix[0 .. prefix.len - 1], " \t");
+    return mem.eql(u8, target, "_");
 }
 
 /// Update defer/errdefer block tracking for one literal-blanked line
@@ -18355,25 +18380,49 @@ fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
 /// attributed that depth, not their own — the defer registers at the
 /// opener's scope. The caller computes the keyword depth, so a
 /// `} defer {` continuation registers at the post-close depth (EPH-I0439).
+/// The opener line's brace walk starts AT the keyword (`keyword_code_pos`
+/// is the code-relative offset, null on lines without a defer keyword) —
+/// but only for the line's own FRESH arm: the defer block's own `{`
+/// counts from there, and a leading `}` — the close of the block the
+/// defer follows — belongs to the enclosing context and never disarms
+/// the fresh arm (EPH-I0926). A non-armed line inside an open defer
+/// block walks from the line start, so a leading `}` closes the block
+/// and in_defer does not leak past the close to the next line. A
+/// single-statement defer opens no block: when the keyword segment
+/// carries no brace, in_defer never arms for the line.
 fn trackConcurrencyDefer(
     blanked: []const u8,
-    defer_line: bool,
+    keyword_code_pos: ?usize,
     defer_stmt_depth: usize,
     state: *ConcurrencyScanState,
 ) void {
-    if (defer_line and mem.indexOfScalar(u8, blanked, '{') != null) {
+    const armed = keyword_code_pos != null and
+        mem.indexOfScalar(u8, blanked, '{') != null;
+    if (armed) {
         state.in_defer = true;
-        state.defer_depth = 0;
         state.defer_stmt_depth = defer_stmt_depth;
     }
     if (!state.in_defer) return;
-    for (blanked) |c| {
-        if (c == '{') state.defer_depth += 1;
+    // The keyword start applies only to the fresh arm above: a non-armed
+    // line inside an open defer block walks from the line start, so a
+    // leading `}` closes the block and in_defer cannot leak to the next
+    // line (EPH-I0926).
+    const walk_start = if (armed) keyword_code_pos.? else 0;
+    var walk_depth = if (armed) 0 else state.defer_depth;
+    for (blanked[walk_start..]) |c| {
+        if (c == '{') walk_depth += 1;
         if (c == '}') {
-            if (state.defer_depth > 0) state.defer_depth -= 1;
-            if (state.defer_depth == 0) state.in_defer = false;
+            if (walk_depth > 0) walk_depth -= 1;
+            if (walk_depth == 0) state.in_defer = false;
         }
     }
+    // A single-statement defer opens no block: the walk can end at
+    // depth 0 with no block opened (a brace outside the keyword
+    // segment armed the line) or with the block closed (the non-armed
+    // close line of an open defer block). Either way in_defer leaves
+    // this line false — it never leaks to the next line (EPH-I0926).
+    if (walk_depth == 0) state.in_defer = false;
+    state.defer_depth = walk_depth;
 }
 
 /// Open a fn record when a pending fn def gains its body `{` (ZC101).
@@ -18711,12 +18760,23 @@ fn scanConcurrencyLine(
     // inside-block depth (EPH-I0439). Computed BEFORE
     // trackConcurrencyDefer mutates block state; for lines inside an
     // open defer block the depth captured at the opener applies.
+    // Only code braces count: `code` is comment-stripped by
+    // findCommentStart (the `// }` line-comment form never reaches the
+    // prefix, and deferKeywordPos returns null past a `//`), and
+    // braceDepthAtCodeOffset skips `/* */` spans — mid-edit text, since
+    // Zig has no block comments (the I0916 ruling) — whose braces would
+    // otherwise shift the attributed depth (EPH-I0925).
     const defer_stmt_depth = if (defer_pos) |p|
-        braceDelta(state.fn_depth, blanked[0 .. skipLeadingWhitespace(code) + p])
+        braceDepthAtCodeOffset(state.fn_depth, blanked, skipLeadingWhitespace(code) + p)
     else
         state.fn_depth;
     const defer_attr_depth = if (state.in_defer) state.defer_stmt_depth else defer_stmt_depth;
-    trackConcurrencyDefer(blanked, defer_pos != null, defer_stmt_depth, state);
+    trackConcurrencyDefer(
+        blanked,
+        if (defer_pos) |p| skipLeadingWhitespace(code) + p else null,
+        defer_stmt_depth,
+        state,
+    );
     try scanConcurrencyCalls(state, .{
         .code = code,
         .blanked = blanked,
@@ -19439,12 +19499,18 @@ fn analyzeFileSpawns(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
 
     var blank_buf: [16 * 1024]u8 = undefined;
     var needle_buf: [256]u8 = undefined;
+    var pending: PendingTest = .{};
     var in_test = false;
     var test_depth: usize = 0;
     var line_num: usize = 0;
     for (lines.items) |line| {
         line_num += 1;
         const t = mem.trim(u8, line, " \t\r");
+        // Comment and multiline-string lines never reach the pending
+        // machinery (mirrors scanTestLine :17343): a comment between
+        // the Allman opener and its brace keeps the pending alive, so
+        // the block still opens as a test (EPH-I0924).
+        if (isCommentOrMultilineString(t)) continue;
         // Sibling-band contract (EPH-I0437): trackTestBlock receives the
         // comment-stripped, literal-blanked neutral line, so braces in
         // test-name strings, fixture strings, and trailing comments are
@@ -19453,10 +19519,17 @@ fn analyzeFileSpawns(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
         const code_end = findCommentStart(line) orelse line.len;
         const code = line[0..code_end];
         const neutral = mem.trim(u8, blankLiteralContents(code, &blank_buf), " \t\r");
-        const ts = trackTestBlock(neutral, in_test, test_depth);
+        // The resolveTestOpener pending machinery (mirrors scanTestLine's
+        // EPH-I0435 arm): a brace-less `test "name"` opener with `{` on
+        // the next line arms in_test here too, so a spawn inside an
+        // Allman test block is skipped like the same-line form
+        // (EPH-I0924).
+        const was_in_test = in_test;
+        const opener = resolveTestOpener(&pending, t, was_in_test, line_num);
+        const ts = trackTestBlock(neutral, was_in_test or opener.pending_open, test_depth);
         in_test = ts.in_test;
         test_depth = ts.depth;
-        if (in_test or isCommentOrMultilineString(t)) continue;
+        if (in_test) continue;
         const ctx: SpawnScanCtx = .{
             .lines = lines.items,
             .blank_buf = &blank_buf,
@@ -73970,6 +74043,49 @@ test "ZC101: conditional and block-form defers count as coverage" {
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
+test "ZC101: multi-line } defer { body releases at the defer depth (EPH-I0926)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `if (c) { ... } defer { ... }` continuation: the leading `}`
+    // closes the if block, so the defer registers at the post-close
+    // depth and the body release covers the depth-1 acquire (the
+    // trackConcurrencyDefer doc's claimed support). The pre-fix arm
+    // disarmed in_defer on the leading `}` and recorded the body release
+    // as plain (note). The sibling fn on a distinct receiver keeps the
+    // cross-fn release from masking the control.
+    const content =
+        \\fn doWork() void {}
+        \\fn foo() void {}
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    if (c) {
+        \\        foo();
+        \\    } defer {
+        \\        mu.unlock();
+        \\    }
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex.lock();
+        \\    if (c) {
+        \\        foo();
+        \\    }
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_deferclose.zig", content);
+    defer run.deinit(allocator);
+
+    // f is silent (deferred coverage); g still warns. ZC102 has nothing
+    // to flag: f holds no re-acquire, and the deferred release fires at
+    // the fn's close, after the last event.
+    try expectZC101Counts(run.issues.items, 1, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
 test "ZC101: tiny acquire wrapper is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -74255,6 +74371,40 @@ test "ZC101: discarded tryLock result is not an acquire (file-lock idiom)" {
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
+test "ZC101: identifier-underscore binding is a tracked acquire, bare _ discard is not (EPH-I0927)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `x_ = mu.tryLock()` binds the result to a variable — an acquire,
+    // not the hold-till-close discard (which is the bare `_`). Pre-fix
+    // the loose matcher dropped `x_ =` and the unspaced `x_=` from
+    // tracking (both silent); post-fix both warn. The bare `_` forms
+    // (spaced and unspaced — EPH-I0446's widened acceptance) stay
+    // discarded. The `work()` calls keep stmt_count above the tiny
+    // acquire-wrapper exemption.
+    const content =
+        \\fn work() void {}
+        \\fn f() void {
+        \\    x_ = mu.tryLock(.exclusive);
+        \\    work();
+        \\}
+        \\fn g() void {
+        \\    x_=mu.tryLock(.exclusive);
+        \\    work();
+        \\}
+        \\fn h() void {
+        \\    _ = mu.tryLock(.exclusive);
+        \\    _=mu.tryLock(.exclusive);
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_xdiscard.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 2, 0);
+}
+
 test "ZC101: strings and comments are neither acquires nor releases" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -74276,6 +74426,60 @@ test "ZC101: strings and comments are neither acquires nor releases" {
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc101_strings.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: comment braces never count toward the defer depth (EPH-I0925)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Mid-edit invalid text (Zig has no block comments — the I0916
+    // ruling): the `/* } */` span before the keyword must not decrement
+    // the attributed depth. Pre-fix the defer reads as depth 2 and
+    // covers the depth-2 acquire (silent, suppressing a genuine leak
+    // note); the true depth 3 does not cover it, so the warning fires.
+    const content =
+        \\fn work() void {}
+        \\fn f(c: bool) void {
+        \\    if (c) {
+        \\        mu.lock();
+        \\    }
+        \\    { /* } */ { defer mu.unlock(); }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_commentbrace.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: // } tail on a defer line never corrupts the attributed depth (EPH-I0925 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard pin (passes pre-fix): the constructible line-comment form.
+    // The `// }` tail is stripped from `code` by findCommentStart before
+    // blankLiteralContents, and a `//` before the keyword makes
+    // deferKeywordPos return null — so no `// }` position can reach the
+    // keyword-prefix slice. This pins the documented mask contract: the
+    // deferred release attributes the inside-if depth 2, which does not
+    // cover the depth-1 acquire (warning), exactly as the no-comment
+    // sibling behaves.
+    const content =
+        \\fn work() void {}
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    if (c) { defer mu.unlock(); // }
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_commenttail.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
@@ -75031,6 +75235,39 @@ test "ZC102: block-close defer runs at scope exit — later lock warns (EPH-I043
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc102_closedefer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+    try expectZC102Counts(run.issues.items, 1, 0);
+}
+
+test "ZC102: close line of an open defer block with a sibling defer — later lock warns (EPH-I0926)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Regression pin (fails pre-fix): the `} defer mu.unlock();` close
+    // line of the open defer block is NON-armed (the keyword segment
+    // carries no `{`), so the brace walk must start at the line start —
+    // the leading `}` closes the block. Pre-fix the walk started at the
+    // keyword, skipped the `}`, and leaked in_defer to the next line,
+    // where the second acquire was dropped as defer-context (silent —
+    // the exact FN class the EPH-I0926 fix is one level shallower
+    // against). Post-fix the close disarms, the second lock executes
+    // while the first is still held, and ZC102 warns. The first acquire
+    // stays covered by the deferred unlock, so ZC101 stays silent.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    mu.lock();
+        \\    defer {
+        \\        doWork();
+        \\    } defer mu.unlock();
+        \\    mu.lock();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc102_nestedclosedefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
@@ -76310,6 +76547,73 @@ test "ZC104: brace-carrying test name arms and closes the block exactly once (EP
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc104_neutral2.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: spawn inside an Allman test block is not attributed (EPH-I0924)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Regression pin (fails pre-fix): a brace-less `test "name"` opener
+    // with `{` on the next line (the EPH-I0435 Allman form) must arm
+    // in_test via the resolveTestOpener pending machinery, so the skip
+    // fires and the block's spawn stays silent — matching the same-line
+    // form. The spawn inside a NON-test block is the control and must
+    // still fire.
+    const content =
+        \\fn work() void {}
+        \\test "allman"
+        \\{
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+        \\fn f() !void {
+        \\    {
+        \\        const t = try std.Thread.spawn(.{}, work, .{});
+        \\        _ = t;
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: comment between the Allman opener and its brace keeps the block a test (EPH-I0924)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Regression pin (fails pre-fix): a comment line between the
+    // brace-less `test "name"` opener and its `{` must keep the pending
+    // opener alive (mirrors scanTestLine, whose comment skip runs
+    // BEFORE resolveTestOpener). Pre-fix the mirror ran resolveTestOpener
+    // on the comment first: the non-`{` line dropped the pending, the
+    // `{` line never opened a test block, and the spawn fired. Post-fix
+    // the block opens as a test and the spawn stays silent; the spawn
+    // inside the non-test block is the control and still fires.
+    const content =
+        \\fn work() void {}
+        \\test "allman"
+        \\// a comment between the name and the brace
+        \\{
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    _ = t;
+        \\}
+        \\fn f() !void {
+        \\    {
+        \\        const t = try std.Thread.spawn(.{}, work, .{});
+        \\        _ = t;
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_allman_comment.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 1, 0);

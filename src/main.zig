@@ -13705,9 +13705,17 @@ fn trackTestBlock(
 ) TestBlockState {
     var in_block = in_test;
     var brace_depth = depth;
-    const starts_test = mem.startsWith(u8, t, "test ");
+    // One opener predicate with resolveTestOpener (EPH-I0915): the strict
+    // "test " prefix dropped the anonymous no-space form — the literal
+    // blanker manufactures the space for the quoted no-space form
+    // (`test"x" {`), but `test{` has no literal to blank. The blanked
+    // line is a trimmed line, so isTestOpenerLine's contract holds, and
+    // literal contents can never occupy the keyword position.
+    const starts_test = isTestOpenerLine(t);
     // The line opens a test block only when a code-position `{` sits on
-    // it: `test "{"` carries no block brace, `test "name" {` does.
+    // it: `test "{"` carries no block brace, `test "name" {` does. The
+    // same guard keeps a carried Allman opener line (`test` alone, the
+    // brace on the next line) from arming itself.
     if (starts_test and hasCodeChar(t, '{')) {
         in_block = true;
         brace_depth = 0;
@@ -15931,8 +15939,13 @@ const TestBlockCounters = struct {
 };
 
 /// A located call site: the target text range plus the index of its `(`.
+/// `name_end` is the index just past the target's identifier run (or
+/// closing quote for `@"..."`), before any whitespace: `foo ()` is a call
+/// of `foo` (EPH-I0433), so consumers slice `start..name_end`, never
+/// `start..open_paren`.
 const CallSite = struct {
     start: usize,
+    name_end: usize,
     open_paren: usize,
 };
 
@@ -15975,24 +15988,29 @@ fn identRunEnd(code: []const u8, start: usize) usize {
 
 /// The call site when `code[i..]` opens a `@"..."` quoted-identifier call
 /// (EPH-I0908): start at the `@`, open paren just past the closing quote.
+/// Whitespace may separate the closing quote from the `(` (EPH-I0433).
 /// Malformed or non-call quoted idents yield null — the caller falls
 /// through to the string-literal skip, which ends at the same position.
 fn quotedCallSite(code: []const u8, i: usize) ?CallSite {
     if (i + 1 >= code.len or code[i + 1] != '"') return null;
     const after = skipQuotedIdent(code, i + 2);
     if (after <= i + 2 or after > code.len or code[after - 1] != '"') return null;
-    if (after < code.len and code[after] == '(') return .{ .start = i, .open_paren = after };
+    const paren = skipWhitespace(code, after, false);
+    if (paren < code.len and code[paren] == '(') {
+        return .{ .start = i, .name_end = after, .open_paren = paren };
+    }
     return null;
 }
 
 /// Find the next call site at/after `from`, skipping string/char literals.
-/// A call site is an identifier run (dots allowed) immediately followed by
-/// `(` — distinguishes calls from same-named variables. A `@"..."` quoted
-/// identifier (EPH-I0908) is a call site the same way: the `(` follows the
-/// closing quote. Its opener must win over the string-literal skip, or the
-/// call becomes invisible and helper-mediated quoted coverage never seeds.
-/// A `\\` multiline opener ends the search: its tail is string data, so no
-/// call site can follow it on the line (EPH-I0751).
+/// A call site is an identifier run (dots allowed) followed by `(` after
+/// optional whitespace (EPH-I0433) — distinguishes calls from same-named
+/// variables. A `@"..."` quoted identifier (EPH-I0908) is a call site the
+/// same way: the `(` follows the closing quote. Its opener must win over
+/// the string-literal skip, or the call becomes invisible and
+/// helper-mediated quoted coverage never seeds. A `\\` multiline opener
+/// ends the search: its tail is string data, so no call site can follow it
+/// on the line (EPH-I0751).
 fn nextCallSite(code: []const u8, from: usize) ?CallSite {
     var i = from;
     while (i < code.len) {
@@ -16015,7 +16033,10 @@ fn nextCallSite(code: []const u8, from: usize) ?CallSite {
             continue;
         }
         const end = identRunEnd(code, i);
-        if (end < code.len and code[end] == '(') return .{ .start = i, .open_paren = end };
+        const paren = skipWhitespace(code, end, false);
+        if (paren < code.len and code[paren] == '(') {
+            return .{ .start = i, .name_end = end, .open_paren = paren };
+        }
         i = end;
     }
     return null;
@@ -16032,10 +16053,11 @@ fn lastSegment(target: []const u8) []const u8 {
 /// quoted target (EPH-I0908) — the spelling the declaration side records,
 /// so a quoted call edge reaches a quoted decl. A site starting at `@` is
 /// quoted by construction: nextCallSite is the only producer and plain
-/// runs never start with `@`.
+/// runs never start with `@`. Slices stop at `name_end`, so whitespace
+/// before the `(` never pollutes the name (EPH-I0433).
 fn callSiteName(code: []const u8, site: CallSite) []const u8 {
-    if (code[site.start] == '@') return code[site.start + 2 .. site.open_paren - 1];
-    return lastSegment(code[site.start..site.open_paren]);
+    if (code[site.start] == '@') return code[site.start + 2 .. site.name_end - 1];
+    return lastSegment(code[site.start..site.name_end]);
 }
 
 /// True when `seg` contains the snapshot-testing verb `snap` as a whole
@@ -16090,7 +16112,7 @@ fn countAssertions(code: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
     while (nextCallSite(code, pos)) |site| {
-        if (isAssertionTarget(code[site.start..site.open_paren])) count += 1;
+        if (isAssertionTarget(code[site.start..site.name_end])) count += 1;
         pos = site.open_paren + 1;
     }
     return count;
@@ -16098,12 +16120,18 @@ fn countAssertions(code: []const u8) usize {
 
 /// True when a `(` appears before the statement ends — the operand of a
 /// `try` is (or contains) a call rather than a bare error-union value.
+/// String and char literal spans are data: a `;` or `(` inside one does
+/// not end the statement or open a call (EPH-I0432).
 fn hasCallBeforeSemicolon(rest: []const u8) bool {
     var i: usize = 0;
     while (i < rest.len) {
         if (rest[i] == ';') return false;
         if (rest[i] == '"') {
             i = skipPastString(rest, i);
+            continue;
+        }
+        if (rest[i] == '\'') {
+            i = skipPastChar(rest, i);
             continue;
         }
         if (rest[i] == '(') return true;
@@ -16248,7 +16276,7 @@ fn checkTrivialAssertCall(
     code: []const u8,
     site: CallSite,
 ) !void {
-    const seg = lastSegment(code[site.start..site.open_paren]);
+    const seg = lastSegment(code[site.start..site.name_end]);
     if (!mem.eql(u8, seg, "expect") and !mem.eql(u8, seg, "expectEqual")) return;
     const args = callArgs(code, site.open_paren) orelse return;
     const msg = if (mem.eql(u8, seg, "expect"))
@@ -16270,7 +16298,9 @@ fn checkTrivialAssertCall(
 /// `test ... {` opener, pure brace/punctuation, a `_ = ...;` discard,
 /// or a refAllDecls call (the Zig test-reference idioms).
 fn isTestBoilerplateLine(t: []const u8) bool {
-    if (mem.startsWith(u8, t, "test ")) return true;
+    // One opener shape with the tracker (EPH-I0915): `test{` and
+    // `test"x" {` openers are boilerplate exactly like the spaced form.
+    if (isTestOpenerLine(t)) return true;
     if (mem.startsWith(u8, t, "_ = ")) return true;
     if (mem.indexOf(u8, t, "refAllDecls") != null) return true;
     for (t) |c| {
@@ -16284,8 +16314,9 @@ fn isTestBoilerplateLine(t: []const u8) bool {
 fn isTestRefLine(t: []const u8) bool {
     if (mem.startsWith(u8, t, "_ = ")) return true;
     if (mem.indexOf(u8, t, "refAllDecls") != null) return true;
-    // single-line form: `test { _ = @import("x.zig"); }`
-    if (mem.startsWith(u8, t, "test ") and mem.indexOf(u8, t, "@import(") != null) {
+    // single-line form: `test { _ = @import("x.zig"); }` and the
+    // no-space sibling (EPH-I0915 class)
+    if (isTestOpenerLine(t) and mem.indexOf(u8, t, "@import(") != null) {
         return true;
     }
     return false;
@@ -16469,8 +16500,11 @@ const LieTestState = struct {
 };
 
 /// True when `name` occurs in `code` as a whole identifier outside string
-/// literals — a value reference like `Duration.parse_flag_value` handed to
-/// a fuzz/table harness, which exercises the fn without a call expression.
+/// and char literals — a value reference like `Duration.parse_flag_value`
+/// handed to a fuzz/table harness, which exercises the fn without a call
+/// expression. The classifier's literal mode covers char spans too: a
+/// 1-char candidate inside `'f'` is literal data, not a reference
+/// (EPH-I0432).
 fn hasIdentRef(code: []const u8, name: []const u8) bool {
     // One classifier walk per slice (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(code);
@@ -16480,7 +16514,7 @@ fn hasIdentRef(code: []const u8, name: []const u8) bool {
         const before_ok = idx == 0 or !isIdent(code[idx - 1]);
         const after_ok = pos >= code.len or !isIdent(code[pos]);
         if (!before_ok or !after_ok) continue;
-        if (cls.isInsideString(idx)) continue;
+        if (cls.isInsideLiteral(idx)) continue;
         return true;
     }
     return false;
@@ -16600,7 +16634,7 @@ const FnCallFacts = struct {
         var pos: usize = 0;
         while (nextCallSite(code, pos)) |site| {
             pos = site.open_paren + 1;
-            const target = code[site.start..site.open_paren];
+            const target = code[site.start..site.name_end];
             if (isAssertionTarget(target)) try self.asserting.put(allocator, name, {});
             const seg = callSiteName(code, site);
             if (containsName(list.items, seg)) continue;
@@ -17026,6 +17060,8 @@ const TestScanCtx = struct {
 };
 
 /// Mutable state for the per-file test-quality scan (ZT101-ZT104).
+/// `pending` carries a brace-less `test "name"` opener one line forward
+/// (the Allman form, EPH-I0435): the block brace arrives on a later line.
 const TestFileScanState = struct {
     in_test: bool = false,
     depth: usize = 0,
@@ -17035,6 +17071,7 @@ const TestFileScanState = struct {
     blank_buf: [16 * 1024]u8 = undefined,
     in_defer: bool = false,
     defer_depth: usize = 0,
+    pending: PendingTest = .{},
 };
 
 /// Update defer-block tracking for one literal-blanked line (ZT104):
@@ -17101,6 +17138,91 @@ fn scanLineCatches(
     try checkTestSwallowedCatch(ctx.sink, idx + 1, clc);
 }
 
+/// True when the trimmed line opens a Zig test declaration: the `test`
+/// keyword followed by end-of-line, whitespace, the name string, or the
+/// block brace. Zig 0.16 accepts all of `test "x" {`, `test {`,
+/// `test"x" {`, `test{`, and the Allman forms where the brace (or the
+/// name) sits on a later line (probed with zig ast-check, 2026-08-12,
+/// EPH-I0435). `test` is a reserved keyword, so no identifier can start
+/// with it; the boundary still requires a non-identifier byte after the
+/// keyword to reject `testing` and friends.
+fn isTestOpenerLine(t: []const u8) bool {
+    return mem.startsWith(u8, t, "test") and (t.len == 4 or !isIdent(t[4]));
+}
+
+/// A carried brace-less `test "name"` opener (the Allman form, EPH-I0435):
+/// `active` when a previous line opened a test declaration whose block
+/// brace has not arrived; `line` is the opener's line number — the report
+/// anchor and lie-name source when the block opens.
+const PendingTest = struct {
+    active: bool = false,
+    line: usize = 0,
+};
+
+/// Result of one line's test-opener analysis: whether the line opens a
+/// test block (same-line `{` or a carried Allman opener), and, for the
+/// Allman open, the opener's line number.
+const TestOpener = struct {
+    starts_test: bool,
+    pending_open: bool = false,
+    open_line_num: usize = 0,
+};
+
+/// Decide whether this line opens a test block, carrying a brace-less
+/// `test "name"` opener one line forward (the Allman form, EPH-I0435).
+/// The block brace must be the next line's first code token — the block
+/// is the next token after the name — so a later fn def (`test "x"` then
+/// `fn f() void {`) never opens a phantom block. Blank and comment lines
+/// keep a pending opener alive (the grammar allows whitespace and
+/// comments between the name and the block); the first non-blank line
+/// without a leading `{` drops it. Two probed shapes stay unhandled by
+/// design: the name on its own line (`test` then `"name"` then `{`) and
+/// a name that itself contains a `{` (`test "a{b"` with the block brace
+/// on the next line — the name's `{` opens same-line block state, so the
+/// Allman brace is dropped). Both are near-zero prevalence (`zig fmt`
+/// normalizes them) and documented here as residuals.
+fn resolveTestOpener(
+    pending: *PendingTest,
+    t: []const u8,
+    was_in_test: bool,
+    line_num: usize,
+) TestOpener {
+    const was_pending = pending.active;
+    pending.active = false;
+    const opens_test = !was_in_test and isTestOpenerLine(t);
+    const pending_open = was_pending and !opens_test and !was_in_test and
+        t.len > 0 and t[0] == '{';
+    const starts_test = (opens_test and mem.indexOfScalar(u8, t, '{') != null) or
+        pending_open;
+    if (opens_test and !starts_test) {
+        pending.active = true;
+        pending.line = line_num;
+    } else if (was_pending and t.len == 0) {
+        pending.active = true;
+    }
+    if (pending_open) {
+        return .{ .starts_test = true, .pending_open = true, .open_line_num = pending.line };
+    }
+    return .{ .starts_test = starts_test };
+}
+
+/// Start a newly opened test block's counters: the report anchor, the
+/// ZT101 lie candidates from the opener's name, and the body-call list.
+/// For an Allman open, the anchor and the name come from the pending
+/// opener line (EPH-I0435).
+fn resetTestBlockOnOpen(
+    ctx: *const TestScanCtx,
+    state: *TestFileScanState,
+    opener: TestOpener,
+    line_num: usize,
+) void {
+    const anchor_line = if (opener.pending_open) opener.open_line_num else line_num;
+    const anchor = ctx.lines[anchor_line - 1];
+    state.counters = resetTestCounters(anchor, anchor_line);
+    state.lie = extractLieTestState(mem.trim(u8, anchor, " \t\r"), ctx.facts);
+    state.body_calls.clearRetainingCapacity();
+}
+
 /// Scan one line of a file for test-quality issues, updating `state`.
 fn scanTestLine(
     ctx: *const TestScanCtx,
@@ -17116,15 +17238,10 @@ fn scanTestLine(
     const code = line[0..code_end];
 
     const was_in_test = state.in_test;
-    const starts_test = !was_in_test and mem.startsWith(u8, t, "test ") and
-        mem.indexOfScalar(u8, t, '{') != null;
-    if (starts_test) {
-        state.counters = resetTestCounters(line, line_num);
-        state.lie = extractLieTestState(t, ctx.facts);
-        state.body_calls.clearRetainingCapacity();
-    }
+    const opener = resolveTestOpener(&state.pending, t, was_in_test, line_num);
+    if (opener.starts_test) resetTestBlockOnOpen(ctx, state, opener, line_num);
     const neutral = mem.trim(u8, blankLiteralContents(code, &state.blank_buf), " \t\r");
-    const ts = trackTestBlock(neutral, state.in_test, state.depth);
+    const ts = trackTestBlock(neutral, state.in_test or opener.pending_open, state.depth);
     state.in_test = ts.in_test;
     state.depth = ts.depth;
     trackTestDeferBlock(neutral, state);
@@ -17132,7 +17249,7 @@ fn scanTestLine(
     const sl: ScanLineCtx = .{
         .t = t,
         .code = code,
-        .in_block_now = was_in_test or starts_test,
+        .in_block_now = was_in_test or opener.starts_test,
     };
     try scanLineCatches(ctx, idx, sl, state);
     // Lines inside a test block include the start line (which may also be
@@ -17150,7 +17267,7 @@ fn scanTestLine(
     state.counters.try_calls += countTryCalls(code);
     try checkLineTrivialAsserts(sink, line_num, code);
     try collectLineCalls(code, &state.body_calls, sink.allocator);
-    markLineLieReferences(code, starts_test, state);
+    markLineLieReferences(code, opener.starts_test, state);
     if (!state.in_test) {
         try reportTestBlock(ctx, state);
         try reportLieTest(ctx, state);
@@ -17220,7 +17337,12 @@ const PubFnDecl = struct {
 /// suppress — a pub fn called from other code but never from a test is
 /// exactly the target. `seeds` holds the call-site targets from every
 /// test context (inline test blocks and whole test files): the root set
-/// for the project-wide reachability pass. Keys borrow content.
+/// for the project-wide reachability pass. Evidence is segment-granular:
+/// every dotted segment counts as its own name, so a test-local variable
+/// `header` or a non-test `config.mode` value reference suppresses a
+/// same-named pub fn project-wide — the name-based boundary cost of a
+/// flat namespace, deliberately conservative (EPH-I0434). Keys borrow
+/// content.
 const UntestedFnEvidence = struct {
     tested: std.StringHashMapUnmanaged(void) = .empty,
     aliased: std.StringHashMapUnmanaged(void) = .empty,
@@ -17286,6 +17408,9 @@ const UntestedFnFileState = struct {
     depth: usize = 0,
     blank_buf: [16 * 1024]u8 = undefined,
     sig_buf: [max_signature_lookahead]u8 = undefined,
+    /// Brace-less `test "name"` opener carried to the next line (the
+    /// Allman form, EPH-I0435); blank and comment lines keep it alive.
+    pending: PendingTest = .{},
 };
 
 /// Prefixes that open a public fn declaration line (ZT105). `pub export`
@@ -17361,7 +17486,8 @@ fn collectQuotedIdentEvidence(
     const after_quote = skipQuotedIdent(code, i + 2);
     if (after_quote <= i + 2 or code[after_quote - 1] != '"') return null;
     const quoted = code[i + 2 .. after_quote - 1];
-    const is_call = after_quote < code.len and code[after_quote] == '(';
+    const paren = skipWhitespace(code, after_quote, false);
+    const is_call = paren < code.len and code[paren] == '(';
     if (in_test_context) {
         try ctx.evidence.tested.put(ctx.allocator, quoted, {});
     } else if (!is_call) {
@@ -17421,7 +17547,8 @@ fn collectUntestedFnIdents(
             continue;
         }
         const end = identRunEnd(code, i);
-        const is_call = end < code.len and code[end] == '(';
+        const paren = skipWhitespace(code, end, false);
+        const is_call = paren < code.len and code[paren] == '(';
         // A bare `.field` run is a struct-literal LHS/shorthand or an enum
         // tag — a field name, never a fn value reference (EPH-I0909): it
         // must not alias a same-named pub fn (`Fs.cwd` suppressed by
@@ -17517,13 +17644,12 @@ fn scanUntestedFnLine(
     const code = line[0..code_end];
 
     const was_in_test = state.in_test;
-    const starts_test = !was_in_test and mem.startsWith(u8, t, "test ") and
-        mem.indexOfScalar(u8, t, '{') != null;
+    const opener = resolveTestOpener(&state.pending, t, was_in_test, line_num);
     const neutral = mem.trim(u8, blankLiteralContents(code, &state.blank_buf), " \t\r");
-    const ts = trackTestBlock(neutral, was_in_test, state.depth);
+    const ts = trackTestBlock(neutral, was_in_test or opener.pending_open, state.depth);
     state.in_test = ts.in_test;
     state.depth = ts.depth;
-    const in_test_context = was_in_test or starts_test;
+    const in_test_context = was_in_test or opener.starts_test;
 
     const ul: UntestedFnLine = .{
         .text = line,
@@ -17656,7 +17782,10 @@ fn reportUntestedPubFns(
                 "indirect/integration coverage is statically invisible; " ++
                 "cross-file reachability merges same-named fns, so a " ++
                 "test-reachable same-named fn elsewhere can suppress this " ++
-                "note (tree_fuzz apply class, EPH-I0907)",
+                "note (tree_fuzz apply class, EPH-I0907); evidence is " ++
+                "segment-granular: a test-local variable `header` or a " ++
+                "non-test value-position segment (`config.mode`) " ++
+                "suppresses a same-named pub fn (EPH-I0434)",
         });
     }
 }
@@ -18097,7 +18226,7 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
     var pos: usize = 0;
     while (nextCallSite(lc.code, pos)) |site| {
         pos = site.open_paren + 1;
-        const target = lc.code[site.start..site.open_paren];
+        const target = lc.code[site.start..site.name_end];
         const seg = lastSegment(target);
         const kind = classifyCall(seg);
         if (kind == .other) continue;
@@ -18857,7 +18986,7 @@ fn checkLineSpawns(
     var pos: usize = 0;
     while (nextCallSite(code, pos)) |site| {
         pos = site.open_paren + 1;
-        const target = code[site.start..site.open_paren];
+        const target = code[site.start..site.name_end];
         if (!isThreadSpawnTarget(target)) continue;
         const name = classifySpawnBinding(code[0..site.start]) orelse continue;
         if (spawnResolved(ctx, name)) continue;
@@ -46439,6 +46568,38 @@ test "nextCallSite ignores call-shaped text in a multiline opener tail (EPH-I075
     try std.testing.expectEqual(@as(usize, 10), site.?.start);
 }
 
+test "nextCallSite and quotedCallSite accept whitespace before the paren (EPH-I0433)" {
+    // `foo ()` is a call of foo: Zig allows whitespace between the target
+    // and its `(`. The site's name range must exclude the whitespace, or
+    // name indexes carry a trailing space.
+    const plain = nextCallSite("const x = foo ()", 0) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 10), plain.start);
+    try std.testing.expectEqual(@as(usize, 13), plain.name_end);
+    try std.testing.expectEqual(@as(usize, 14), plain.open_paren);
+    try std.testing.expect(mem.eql(u8, callSiteName("const x = foo ()", plain), "foo"));
+
+    const quoted = nextCallSite("const x = @\"my fn\" ()", 0) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 10), quoted.start);
+    try std.testing.expectEqual(@as(usize, 18), quoted.name_end);
+    try std.testing.expectEqual(@as(usize, 19), quoted.open_paren);
+    try std.testing.expect(mem.eql(u8, callSiteName("const x = @\"my fn\" ()", quoted), "my fn"));
+
+    // A run with no paren after the whitespace is still not a call.
+    try std.testing.expect(nextCallSite("const x = foo ", 0) == null);
+}
+
+test "char-literal contents are not references or try-calls (EPH-I0432)" {
+    // A 1-char candidate inside a char literal is literal data, not a
+    // value reference; a `(` inside a char literal is not a call opener.
+    try std.testing.expect(!hasIdentRef("const c = 'f';", "f"));
+    try std.testing.expect(hasIdentRef("const f = 1;", "f"));
+    try std.testing.expect(!hasCallBeforeSemicolon(" x == '(';"));
+    try std.testing.expect(!hasCallBeforeSemicolon(" x == ';';"));
+    try std.testing.expect(hasCallBeforeSemicolon(" foo(x)"));
+}
+
 test "buildCFG: Allman if brace on next line pops correctly" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -69560,6 +69721,155 @@ test "ZT102: try-only smoke test is a note, not a warning" {
     );
 }
 
+test "ZT102: char literal with a paren is not a try-call (EPH-I0432)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `try x == '('` compares against a char — no call, so the block is
+    // vacuous (warning), not a smoke test (note). Pre-fix the char's `(`
+    // counted as a call opener and downgraded the verdict.
+    const content =
+        \\test "x" { try x == '('; }
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_charparen.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: Allman test opener with the brace on the next line is tracked (EPH-I0435)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Grammar-proven shape (zig ast-check, 2026-08-12): the block brace
+    // may sit on the line after `test "name"`. Pre-fix the block never
+    // entered test context, so an assertion-less Allman test was silent
+    // instead of warning (FN for every ZT1xx rule in the block).
+    const content =
+        \\test "allman vacuous"
+        \\{
+        \\    const n: u32 = 0;
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: Allman test with a real assertion stays silent (EPH-I0435 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard: the pending opener must not leak — an Allman test whose body
+    // asserts is fully silent (this also holds pre-fix; it pins the open
+    // not misfiring on the assertion line).
+    const content =
+        \\test "allman asserting"
+        \\{
+        \\    try std.testing.expectEqual(@as(u32, 1), @as(u32, 2));
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_allman_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT102/ZT105: anonymous no-space test{ opener with assertions stays silent (EPH-I0915)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Grammar-accepted no-space anonymous opener (zig ast-check,
+    // 2026-08-12): `test{` opens a block whose body asserts. Pre-fix the
+    // tracker's strict "test " prefix dropped the opener — the literal
+    // blanker manufactures the space for the quoted no-space form, but
+    // `test{` has no literal to blank — so the body never entered test
+    // context: ZT102 warned "test has no assertions" and the called pub
+    // fn drew a ZT105 note.
+    const content =
+        \\pub fn anonNospaceApi() void {}
+        \\test{
+        \\    anonNospaceApi();
+        \\    try std.testing.expect(true);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_anon_nospace.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "anonNospaceApi"),
+    );
+}
+
+test "ZT102: pending Allman opener does not survive a fn def line (EPH-I0435 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The brace must be the next line's first code token: a fn def after
+    // a brace-less opener (invalid Zig, but scannable) must not open a
+    // phantom test block over the fn's body.
+    const content =
+        \\test "x"
+        \\fn real() void {
+        \\    const n: u32 = 0;
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_phantom.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: spaced assertion call counts as an assertion (EPH-I0433)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `expect (n == 0)` with whitespace before the paren: pre-fix it was
+    // not an assertion call, and the try's `(` made the block a smoke
+    // note. Post-fix the assertion counts and the block is silent.
+    const content =
+        \\test "x" { try std.testing.expect (n == 0); }
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_spaced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_spaced.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
 test "ZT102: try expectEqual counts as an assertion" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -69995,6 +70305,27 @@ test "ZT102: test-reference blocks are not vacuous" {
         \\}
     ;
     var run = try runTestQualityCheck(&diag, allocator, "zt102_refs.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZT102: no-space single-line test-reference block is not vacuous (EPH-I0915 class)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The no-space sibling of the pinned ref form: `test{_ = @import(...)}`
+    // is grammar-identical to `test { _ = @import(...); }` (zig ast-check,
+    // 2026-08-12). The strict "test " prefixes in isTestRefLine and
+    // isTestBoilerplateLine dropped it, so the single-line ref block drew
+    // a loud ZT102 warning while the spaced form stays silent — the same
+    // strict-prefix class as the multi-line half-open.
+    const content =
+        \\test{_ = @import("single_line_nospace.zig");}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_ref_nospace.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
@@ -71075,6 +71406,86 @@ test "ZT101: candidates passed as values are exercised" {
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "zt101_valueref.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: char-literal contents do not mark a candidate referenced (EPH-I0432)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the `'f'` char literal read as a value reference to the
+    // candidate `f`, silencing the lie warning.
+    const content =
+        \\fn f() void {}
+        \\test f {
+        \\    const c = 'f';
+        \\    _ = c;
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_charlit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
+    );
+}
+
+test "ZT101: spaced call satisfies the candidate through a helper (EPH-I0433)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `helper ()` is a call of helper — whitespace between target and
+    // paren. A direct `foo ()` in the same test body would also satisfy
+    // pre-fix through the value-reference evidence (the name appears as a
+    // whole identifier), so the discriminating shape routes the spaced
+    // call through a helper: pre-fix the call was invisible, the graph
+    // never reached foo, and the named test reported a lie.
+    const content =
+        \\fn foo() void {}
+        \\fn helper() void { foo(); }
+        \\test foo {
+        \\    helper ();
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_spaced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_spaced.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: Allman test opener keeps its name candidates (EPH-I0435)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The lie candidates come from the opener line's name even when the
+    // block brace sits on the next line: a test named parseHeader that
+    // never calls it must warn. Pre-fix the whole block was invisible.
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\test "parseHeader rejects empty"
+        \\{
+        \\    const n: u32 = 0;
+        \\    try std.testing.expect(n == 0);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
     );
 }
 
@@ -72163,6 +72574,108 @@ test "ZT105 EPH-I0910: pub fn build in build.zig is not a candidate" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countUntestedFnNotes(run.issues.items, "build_stray"),
+    );
+}
+
+test "ZT105: spaced call in non-test code is a call, not an alias (EPH-I0433)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A spaced call `spaced_api ()` from non-test code exercises nothing
+    // test-visible: it must not alias the pub fn. Pre-fix the run
+    // tokenizer read it as a value position, suppressed the note, and the
+    // genuinely untested fn stayed silent (FN).
+    const content =
+        \\pub fn spaced_api() void {}
+        \\fn driver() void {
+        \\    spaced_api ();
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_spaced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "spaced_api"),
+    );
+}
+
+test "ZT105: segment-collision suppression is pinned — test-local variable (EPH-I0434 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard pin for the documented name-based boundary: every identifier
+    // segment in test context marks a same-named pub fn covered, so a
+    // test-local variable `header` in an inline block suppresses pub fn
+    // `header` project-wide.
+    const content =
+        \\pub fn header() void {}
+        \\test "x" {
+        \\    const header = @as(u32, 0);
+        \\    try std.testing.expectEqual(@as(u32, 0), header);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_seg_header.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "header"),
+    );
+}
+
+test "ZT105: segment-collision suppression is pinned — value-position segment (EPH-I0434 guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Guard pin for the documented name-based boundary: a non-test
+    // value-position segment (`config.mode`) aliases a same-named pub fn.
+    const content =
+        \\pub fn mode() void {}
+        \\const config = struct { mode: u32 = 0 };
+        \\fn read_mode() void {
+        \\    _ = config.mode;
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_seg_mode.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "mode"),
+    );
+}
+
+test "ZT105: Allman test opener covers the pub fn it calls (EPH-I0435)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The ZT105 scan tracks test context with the same pending-opener
+    // rule. Single file, inline block: pre-fix the block never entered
+    // test context, the call line tokenized as non-test evidence, and the
+    // pub fn was flagged (FN).
+    const content =
+        \\pub fn allman_api() void {}
+        \\test "allman api"
+        \\{
+        \\    allman_api();
+        \\    try std.testing.expect(true);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "allman_api"),
     );
 }
 

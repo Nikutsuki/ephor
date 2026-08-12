@@ -16548,8 +16548,12 @@ fn checkLineTrivialAsserts(
 // --- ZT101: lie tests (the name promises a fn the body never calls) ---
 
 /// Bounded candidate set: fn names referenced by a test's own name (ZT101).
-/// A test name mentioning more than 8 distinct local fns is pathological;
-/// dropped extras only ever suppress the warning — the safe direction.
+/// A test name mentioning more than 8 distinct local fns is pathological.
+/// The bound is NOT suppression-safe (EPH-I0430): reportLieTest suppresses
+/// when ANY candidate is satisfied, so each dropped extra removes a
+/// suppression opportunity and strictly increases warning probability — an
+/// FP is possible for a test name with >8 candidates where the called fn
+/// is word 9 or later.
 const max_lie_candidates = 8;
 
 /// Per-test-block ZT101 state: the fns the test name claims to exercise.
@@ -16915,8 +16919,10 @@ const ReachWork = struct {
     depth: usize,
 };
 
-/// BFS frontier + visited set for computeReachableCalls, bundled to keep
-/// param counts low.
+/// Work-stack + visited set for computeReachableCalls, bundled to keep
+/// param counts low. Consumed LIFO (stack pop — a DFS); the traversal
+/// order is irrelevant because the visited set makes the reachability
+/// result order-independent (EPH-I0436).
 const ReachBfs = struct {
     reachable: std.StringHashMapUnmanaged(void) = .empty,
     stack: std.ArrayListUnmanaged(ReachWork) = .empty,
@@ -16947,8 +16953,9 @@ const ReachBfs = struct {
 };
 
 /// All fn names reachable from a test body's direct calls through the
-/// file-local call graph (BFS, depth-capped, cycle-safe via the reachable
-/// set itself). The direct calls are included: a body that calls the
+/// file-local call graph (depth-capped, cycle-safe via the reachable set
+/// itself; traversal order is a DFS but irrelevant to the result). The
+/// direct calls are included: a body that calls the
 /// candidate needs no graph edge.
 fn computeReachableCalls(
     allocator: Allocator,

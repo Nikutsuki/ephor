@@ -15973,14 +15973,34 @@ fn identRunEnd(code: []const u8, start: usize) usize {
     return i;
 }
 
+/// The call site when `code[i..]` opens a `@"..."` quoted-identifier call
+/// (EPH-I0908): start at the `@`, open paren just past the closing quote.
+/// Malformed or non-call quoted idents yield null — the caller falls
+/// through to the string-literal skip, which ends at the same position.
+fn quotedCallSite(code: []const u8, i: usize) ?CallSite {
+    if (i + 1 >= code.len or code[i + 1] != '"') return null;
+    const after = skipQuotedIdent(code, i + 2);
+    if (after <= i + 2 or after > code.len or code[after - 1] != '"') return null;
+    if (after < code.len and code[after] == '(') return .{ .start = i, .open_paren = after };
+    return null;
+}
+
 /// Find the next call site at/after `from`, skipping string/char literals.
 /// A call site is an identifier run (dots allowed) immediately followed by
-/// `(` — distinguishes calls from same-named variables. A `\\` multiline
-/// opener ends the search: its tail is string data, so no call site can
-/// follow it on the line (EPH-I0751).
+/// `(` — distinguishes calls from same-named variables. A `@"..."` quoted
+/// identifier (EPH-I0908) is a call site the same way: the `(` follows the
+/// closing quote. Its opener must win over the string-literal skip, or the
+/// call becomes invisible and helper-mediated quoted coverage never seeds.
+/// A `\\` multiline opener ends the search: its tail is string data, so no
+/// call site can follow it on the line (EPH-I0751).
 fn nextCallSite(code: []const u8, from: usize) ?CallSite {
     var i = from;
     while (i < code.len) {
+        if (code[i] == '@') {
+            if (quotedCallSite(code, i)) |site| return site;
+            // Non-call quoted ident: the string handler below skips the
+            // quoted content to the same end position (EPH-I0908).
+        }
         if (code[i] == '"') {
             i = skipPastString(code, i);
             continue;
@@ -16005,6 +16025,17 @@ fn nextCallSite(code: []const u8, from: usize) ?CallSite {
 fn lastSegment(target: []const u8) []const u8 {
     if (mem.lastIndexOfScalar(u8, target, '.')) |dot| return target[dot + 1 ..];
     return target;
+}
+
+/// The name one call site contributes to name-based indexes: the last
+/// dotted segment for a plain target, the inner content for a `@"..."`
+/// quoted target (EPH-I0908) — the spelling the declaration side records,
+/// so a quoted call edge reaches a quoted decl. A site starting at `@` is
+/// quoted by construction: nextCallSite is the only producer and plain
+/// runs never start with `@`.
+fn callSiteName(code: []const u8, site: CallSite) []const u8 {
+    if (code[site.start] == '@') return code[site.start + 2 .. site.open_paren - 1];
+    return lastSegment(code[site.start..site.open_paren]);
 }
 
 /// True when `seg` contains the snapshot-testing verb `snap` as a whole
@@ -16571,7 +16602,7 @@ const FnCallFacts = struct {
             pos = site.open_paren + 1;
             const target = code[site.start..site.open_paren];
             if (isAssertionTarget(target)) try self.asserting.put(allocator, name, {});
-            const seg = lastSegment(target);
+            const seg = callSiteName(code, site);
             if (containsName(list.items, seg)) continue;
             try list.append(allocator, seg);
         }
@@ -16770,7 +16801,7 @@ fn collectLineCalls(
     while (nextCallSite(code, pos)) |site| {
         pos = site.open_paren + 1;
         if (calls.items.len >= max_body_calls) return;
-        const seg = lastSegment(code[site.start..site.open_paren]);
+        const seg = callSiteName(code, site);
         if (containsName(calls.items, seg)) continue;
         try calls.append(allocator, seg);
     }
@@ -17299,7 +17330,8 @@ fn pubFnNameAt(t: []const u8, start: usize) ?PubFnName {
 /// generic param list or type-factory return spanning lines is still
 /// detected. Skips: `main` (exercised by running the binary), generics
 /// (tests name the generic but call instantiations), and type factories
-/// (returned type is exercised, not the fn).
+/// (returned type is exercised, not the fn). The build.zig `build` entry
+/// point is exempted by the caller, which knows the path (EPH-I0910).
 fn extractPubFnCandidate(t: []const u8, window: []const u8) ?[]const u8 {
     for (pub_fn_prefixes) |prefix| {
         if (!mem.startsWith(u8, t, prefix)) continue;
@@ -17315,7 +17347,10 @@ fn extractPubFnCandidate(t: []const u8, window: []const u8) ?[]const u8 {
 /// Record one `@"..."` quoted identifier as ZT105 evidence: inner content
 /// into `tested` (test context) or `aliased` (non-test value position).
 /// Returns the index just past the quoted name, or null when `i` does not
-/// open a well-formed quoted identifier (EPH-I0031).
+/// open a well-formed quoted identifier (EPH-I0031). A quoted field name
+/// in a struct literal (`.{ .@"cwd" = ... }`) still aliases — the plain
+/// `.field` form is excluded by the run tokenizer (EPH-I0909); the quoted
+/// literal shape is rare enough to leave conservative.
 fn collectQuotedIdentEvidence(
     ctx: *const UntestedFnScanCtx,
     code: []const u8,
@@ -17335,13 +17370,30 @@ fn collectQuotedIdentEvidence(
     return after_quote;
 }
 
+/// True when the dot at `dot` opens a field-access chain (the base before
+/// it ends a value expression: `)`, `]`, `}`, a quoted literal, or a
+/// digit) rather than a struct-literal / enum-tag dot. A field-access
+/// field name may hold a fn value (`@import("row.zig").neverExtendBg`),
+/// so it keeps the conservative aliasing; a literal/tag dot never does
+/// (EPH-I0909).
+fn isFieldAccessDot(code: []const u8, dot: usize) bool {
+    if (dot == 0) return false;
+    const c = code[dot - 1];
+    return c == ')' or c == ']' or c == '}' or c == '"' or c == '\'' or
+        std.ascii.isDigit(c);
+}
+
 /// Tokenize one comment-stripped code slice into the ZT105 evidence sets:
 /// identifier runs (dots allowed) contribute their segments — all of them
 /// in test context, value-position segments otherwise. String and char
 /// literal contents are skipped: a name inside a string is prose, not a
 /// reference. A `@"..."` quoted identifier (EPH-I0031) contributes its
 /// inner content — the spelling the declaration side records — as one
-/// name, never dot-split: quoted content is one byte string.
+/// name, never dot-split: quoted content is one byte string. A bare
+/// `.field` run in non-test value position (struct-literal LHS/shorthand,
+/// enum tag) is a field name, not a fn reference, and never aliases
+/// (EPH-I0909); a dotted chain (`x.field`) stays conservative — the field
+/// may hold a fn value.
 fn collectUntestedFnIdents(
     ctx: *const UntestedFnScanCtx,
     code: []const u8,
@@ -17370,9 +17422,17 @@ fn collectUntestedFnIdents(
         }
         const end = identRunEnd(code, i);
         const is_call = end < code.len and code[end] == '(';
+        // A bare `.field` run is a struct-literal LHS/shorthand or an enum
+        // tag — a field name, never a fn value reference (EPH-I0909): it
+        // must not alias a same-named pub fn (`Fs.cwd` suppressed by
+        // `.cwd = .{...}` literals). Field-ACCESS dots (after `)`, `]`,
+        // `}`, a literal, or a digit) stay conservative — the field may
+        // hold a fn value (`@import("row.zig").neverExtendBg`).
+        const is_bare_field = i > 0 and code[i - 1] == '.' and
+            !isFieldAccessDot(code, i - 1);
         if (in_test_context) {
             try ctx.evidence.addTestedRun(ctx.allocator, code[i..end]);
-        } else {
+        } else if (!is_bare_field) {
             try ctx.evidence.addNonTestRun(ctx.allocator, code[i..end], is_call);
         }
         i = end;
@@ -17390,7 +17450,7 @@ fn collectTestRootCalls(
     var pos: usize = 0;
     while (nextCallSite(code, pos)) |site| {
         pos = site.open_paren + 1;
-        try seeds.put(allocator, lastSegment(code[site.start..site.open_paren]), {});
+        try seeds.put(allocator, callSiteName(code, site), {});
     }
 }
 
@@ -17428,6 +17488,10 @@ fn collectPubFnCandidate(
     const window = signatureWindow(ctx.content, content_off + t_off, &state.sig_buf);
     const name = extractPubFnCandidate(t, window) orelse return false;
     if (ul.in_test_context) return true;
+    // `pub fn build` in a build.zig is the build entry point, exercised by
+    // `zig build` exactly as main is by the binary (EPH-I0910). Path-scoped:
+    // a same-named fn in ordinary modules is a normal candidate.
+    if (mem.eql(u8, name, "build") and mem.endsWith(u8, ctx.path, "build.zig")) return true;
     try ctx.evidence.decls.append(ctx.allocator, .{
         .path = ctx.path,
         .line = ul.number,
@@ -17508,6 +17572,17 @@ fn mergeCalleesIntoIndex(
 /// callee facts by name; a name defined in several files expands through
 /// all of them, the same name-based over-approximation the per-file
 /// graph already made (note severity, and the direction is fewer notes).
+/// The collateral is bounded by nothing but the name: tigerbeetle's
+/// lsm/tree_fuzz.zig `apply` (fuzz-binary-only, callers nested inside
+/// `EnvironmentType(...) type {`) is cleared by replica_test.zig's
+/// `t.run()` seed expanding through forest_fuzz.zig's same-named `run`.
+/// A distinctive-name gate on the BFS edges was considered and rejected
+/// (EPH-I0907): ghostty's `prepare` removals run through a plain callee
+/// edge — harfbuzz.zig:437 and coretext.zig:837 same-file tests drive
+/// `it.next()` → run.zig:47 `RunIterator.next` → run.zig:76
+/// `self.hooks.prepare()`, the sole prepare call site — so the gate
+/// would re-flag genuinely test-reachable fns. The limitation is
+/// documented in the note's help text.
 /// The BFS is depth-capped and cycle-safe — the reachable set doubles as
 /// the visited set — so a hostile import cycle terminates.
 fn addProjectReachableTested(
@@ -17578,7 +17653,10 @@ fn reportUntestedPubFns(
             .message = msg,
             .message_owned = true,
             .help = "call or reference it from a test; " ++
-                "indirect/integration coverage is statically invisible",
+                "indirect/integration coverage is statically invisible; " ++
+                "cross-file reachability merges same-named fns, so a " ++
+                "test-reachable same-named fn elsewhere can suppress this " ++
+                "note (tree_fuzz apply class, EPH-I0907)",
         });
     }
 }
@@ -71900,6 +71978,191 @@ test "ZT105 EPH-I0031: quoted fn name is a candidate and a test call is evidence
     try std.testing.expectEqual(
         @as(usize, 1),
         countUntestedFnNotes(run.issues.items, "plain_api"),
+    );
+}
+
+test "ZT105 EPH-I0908: quoted-name call through a helper chain is silent" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // qa-gate gate-b11 probe shape: the test file calls helper in the
+    // impl file, helper calls the quoted pub fn. Pre-fix nextCallSite
+    // treated the @" opener as a string, so no callee edge and no seed —
+    // quoted-leaf fired while its plain-name twin leaf stayed silent.
+    // leaf is the twin (must stay silent), quoted_stray the control.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_quoted_impl.zig",
+            .content =
+            \\fn helper() void {
+            \\    @"quoted-leaf"();
+            \\    leaf();
+            \\}
+            \\pub fn @"quoted-leaf"() void {}
+            \\pub fn leaf() void {}
+            \\pub fn quoted_stray() void {}
+            ,
+        },
+        .{
+            .path = "zt105_quoted_test.zig",
+            .content =
+            \\test "x" {
+            \\    helper();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "quoted-leaf"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "leaf"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "quoted_stray"),
+    );
+}
+
+test "ZT105 EPH-I0907: type-factory-nested pub fns keep the name-union bound pinned" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // tigerbeetle tree_fuzz apply shape: the pub fns sit inside a type
+    // factory, so neither name becomes a call-graph key; the test seeds
+    // `run`, whose merged callees include `apply` — the documented
+    // name-union over-approximation (EPH-I0907). open_then_apply is the
+    // invariant: it must STAY flagged on both binaries. The apply=0
+    // assertion pins the documented limitation — it flips to 1 if the
+    // distinctive-name gate ever lands. fuzz_stray is the control.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_fuzz_tree.zig",
+            .content =
+            \\fn EnvironmentType() type {
+            \\    return struct {
+            \\        pub fn apply() void {}
+            \\        pub fn open_then_apply() void {}
+            \\    };
+            \\}
+            \\pub fn fuzz_stray() void {}
+            ,
+        },
+        .{
+            .path = "zt105_fuzz_forest.zig",
+            .content =
+            \\pub fn run() void {
+            \\    apply();
+            \\}
+            ,
+        },
+        .{
+            .path = "zt105_fuzz_test.zig",
+            .content =
+            \\test "x" {
+            \\    t.run();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "open_then_apply"),
+    );
+    // Documented limitation: cleared by the merged run -> apply edge.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "apply"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "fuzz_stray"),
+    );
+}
+
+test "ZT105 EPH-I0909: struct-literal field names are not value references" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Fs.cwd / CompatDir.iterate class: `.cwd = .{...}` and
+    // `.iterate = true` literal LHS names are field names, never fn value
+    // references. Pre-fix they aliased `cwd` and `iterate`, silently
+    // suppressing the same-named pub fns. fs_ctrl is the control.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt105_fs.zig",
+            .content =
+            \\pub fn cwd() void {}
+            \\pub fn iterate() void {}
+            \\pub fn fs_ctrl() void {}
+            ,
+        },
+        .{
+            .path = "zt105_uses.zig",
+            .content =
+            \\const opts = .{ .cwd = .{ .path = "/" }, .iterate = true };
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "cwd"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "iterate"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "fs_ctrl"),
+    );
+}
+
+test "ZT105 EPH-I0910: pub fn build in build.zig is not a candidate" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `zig build` exercises build.zig's build entry point exactly as the
+    // binary exercises main; flagging it would be noise on every project.
+    // Pre-fix the name-based value suppression happened to hide it — the
+    // exemption makes it deterministic. build_stray is the control.
+    const content =
+        \\pub fn build(b: *std.Build) void {}
+        \\pub fn build_stray() void {}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "build.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "build"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "build_stray"),
     );
 }
 

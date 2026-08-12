@@ -17623,11 +17623,9 @@ const FnLockRecord = struct {
     acquires: std.ArrayListUnmanaged(LockAcquire) = .empty,
     /// Acquires excluded from ZC101/ZC102 evaluation — defer-context
     /// (zls diagnostics cleanup blocks) or discarded-result (hold-till-
-    /// close file locks). They still ACQUIRE the lock at runtime, so
-    /// ZC103 consults them as evidence: an unlock paired with a deferred
-    /// re-lock (ghostty mailbox) or a discarded tryLock (ghostty
-    /// DiskCache) is scoped ownership, not unlock-of-unheld.
-    other_acquires: std.ArrayListUnmanaged(LockAcquire) = .empty,
+    /// close file locks). The exclusion is the whole story: no consumer
+    /// reads them since the ZC103 zero-evidence note was removed
+    /// (EPH-I0903).
     defer_releases: std.ArrayListUnmanaged(LockRelease) = .empty,
     plain_releases: std.ArrayListUnmanaged(LockRelease) = .empty,
     closes: std.ArrayListUnmanaged(BlockClose) = .empty,
@@ -17640,7 +17638,6 @@ const FnLockRecord = struct {
 
     fn deinit(self: *FnLockRecord, allocator: Allocator) void {
         self.acquires.deinit(allocator);
-        self.other_acquires.deinit(allocator);
         self.defer_releases.deinit(allocator);
         self.plain_releases.deinit(allocator);
         self.closes.deinit(allocator);
@@ -17730,12 +17727,30 @@ fn isReleaseMethod(seg: []const u8) bool {
     return false;
 }
 
+/// Free-function file-lock release names (ZC101, EPH-I0903): a helper
+/// like `compat.fileUnlock(file)` releases the lock object passed as its
+/// first argument, not the module receiver — the pairing receiver for
+/// these calls IS the argument (see scanConcurrencyCalls). Only the
+/// exact name is recognized: the std file-lock helper convention.
+fn isFreeFnReleaseMethod(seg: []const u8) bool {
+    return mem.eql(u8, seg, "fileUnlock");
+}
+
 /// Strict acquire/release pairing (ZC101): exclusive locks pair with
 /// `unlock`/`unlockUncancelable`, shared (read) locks with `unlockShared`/
 /// `unlockSharedUncancelable`, semaphore `wait` with `post`. A mis-paired
 /// release does NOT count as coverage — releasing an RwLock with the wrong
-/// mode is itself a defect, not a pairing.
+/// mode is itself a defect, not a pairing. A free-function release
+/// (EPH-I0903) pairs with the exclusive file-lock acquires: `File.lock`
+/// covers both modes through its argument, so the shared-mode names stay
+/// unpaired (strict — a fileUnlock after a shared acquire is not claimed
+/// as coverage).
 fn releaseMatchesAcquire(acquire: []const u8, release: []const u8) bool {
+    if (isFreeFnReleaseMethod(release)) {
+        return mem.eql(u8, acquire, "lock") or
+            mem.eql(u8, acquire, "lockUncancelable") or
+            mem.eql(u8, acquire, "tryLock");
+    }
     if (isSemaphoreAcquire(acquire)) return mem.eql(u8, release, "post");
     const shared_acquire = mem.indexOf(u8, acquire, "Shared") != null;
     const shared_release = mem.indexOf(u8, release, "Shared") != null;
@@ -17818,7 +17833,7 @@ const CallKind = enum { acquire, release, other };
 /// Classify one call target's final segment (ZC101).
 fn classifyCall(seg: []const u8) CallKind {
     if (isAcquireMethod(seg)) return .acquire;
-    if (isReleaseMethod(seg)) return .release;
+    if (isReleaseMethod(seg) or isFreeFnReleaseMethod(seg)) return .release;
     return .other;
 }
 
@@ -17832,11 +17847,12 @@ const ResolvedCall = struct {
 };
 
 /// Record one classified lock-family call into the open fn record (ZC101).
-/// Acquires inside defer context or with discarded results are set aside
-/// into `other_acquires` — they are not scoped ownership for ZC101/ZC102,
-/// but they still take the lock at runtime, so ZC103 uses them as
-/// evidence. Releases are split deferred vs plain for the coverage
-/// cascade. Deferred releases are attributed the defer STATEMENT's depth;
+/// Acquires inside defer context or with discarded results are NOT
+/// scoped ownership for ZC101/ZC102 — they are dropped (a discarded
+/// `_ = file.tryLock(...)` is the hold-till-close file-lock idiom, and a
+/// defer-context acquire cannot be the subject of a coverage verdict).
+/// Releases are split deferred vs plain for the coverage cascade.
+/// Deferred releases are attributed the defer STATEMENT's depth;
 /// plain releases keep their call-site depth.
 fn recordLockCall(
     state: *ConcurrencyScanState,
@@ -17855,10 +17871,7 @@ fn recordLockCall(
                 .depth = call.depth,
                 .cond_position = mem.indexOfScalar(u8, lc.blanked[call.start..], '{') != null,
             };
-            if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) {
-                try rec.other_acquires.append(state.allocator, acq);
-                return;
-            }
+            if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) return;
             try rec.acquires.append(state.allocator, acq);
         },
         .release => {
@@ -17876,6 +17889,24 @@ fn recordLockCall(
     }
 }
 
+/// First argument text of the call at `open_paren` (ZC101, EPH-I0903):
+/// the pairing receiver of a free-function release (`compat.fileUnlock
+/// (file)` releases `file`). Only simple argument shapes are followed —
+/// an identifier or dotted chain, optionally `&`-prefixed (a pointer
+/// pass like `fileUnlock(&file)`). A literal, nested call, or multiline
+/// argument returns null and the release is not paired — the safe
+/// direction (no false suppression).
+fn firstCallArg(blanked: []const u8, open_paren: usize) ?[]const u8 {
+    var i = open_paren + 1;
+    while (i < blanked.len and (blanked[i] == ' ' or blanked[i] == '\t')) i += 1;
+    if (i < blanked.len and blanked[i] == '&') i += 1;
+    const start = i;
+    while (i < blanked.len and (isIdent(blanked[i]) or blanked[i] == '.')) i += 1;
+    if (i == start or i >= blanked.len or
+        (blanked[i] != ')' and blanked[i] != ',')) return null;
+    return blanked[start..i];
+}
+
 /// Record one line's lock-family calls into the open fn record (ZC101).
 fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
     var pos: usize = 0;
@@ -17885,7 +17916,14 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
         const seg = lastSegment(target);
         const kind = classifyCall(seg);
         if (kind == .other) continue;
-        const receiver = callReceiver(target) orelse continue;
+        // A free-function release pairs by its first argument (the lock
+        // object), not by the module receiver (`compat.fileUnlock(file)`
+        // releases `file`; a bare `fileUnlock(file)` has no receiver at
+        // all). An argument-less call of the name is not followed.
+        const receiver = if (isFreeFnReleaseMethod(seg))
+            firstCallArg(lc.blanked, site.open_paren) orelse continue
+        else
+            callReceiver(target) orelse continue;
         try recordLockCall(state, lc, kind, .{
             .start = site.start,
             .seg = seg,
@@ -18374,82 +18412,6 @@ fn evaluateDoubleLock(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecor
     }
 }
 
-/// True when the fn holds ANY acquire of this receiver (ZC103). Source
-/// order is not checked: a release followed by a re-acquire is the
-/// borrow idiom — the caller holds the lock, the fn releases it for a
-/// slow operation, and re-acquires before returning (ghostty mailbox:
-/// `m.unlock(); defer m.lock();`). A fn that releases AND re-acquires is
-/// managing a borrowed lock; a fn that releases without EVER acquiring
-/// is the unlock-of-unheld defect. Pairing is not checked either: a
-/// mis-paired acquire/release is ZC101's report, and counting it here
-/// would double-report. Set-aside acquires (defer-context, discarded
-/// result) count — they take the lock at runtime.
-fn hasSatisfyingAcquire(rec: *const FnLockRecord, rel: LockRelease) bool {
-    for ([_][]const LockAcquire{ rec.acquires.items, rec.other_acquires.items }) |list| {
-        for (list) |acq| {
-            if (mem.eql(u8, acq.receiver, rel.receiver)) return true;
-        }
-    }
-    return false;
-}
-
-/// True when any OTHER fn record in the file acquires this receiver — the
-/// cross-function acquire/release idiom (mirror of ZC101's cross-fn
-/// release suppression: zls string_pool locks in one fn, unlocks in
-/// another). Matching is textual by receiver field-chain, so an acquire
-/// in a different FILE — or spelled differently across the fn boundary
-/// (ghostty blocking_queue: `self.mutex` vs `self.queue.mutex`) — is
-/// invisible; note severity bounds the cost.
-fn hasCrossFnAcquire(
-    records: []const FnLockRecord,
-    self_idx: usize,
-    receiver: []const u8,
-) bool {
-    for (records, 0..) |rec, idx| {
-        if (idx == self_idx) continue;
-        for (rec.acquires.items) |acq| {
-            if (mem.eql(u8, acq.receiver, receiver)) return true;
-        }
-        for (rec.other_acquires.items) |acq| {
-            if (mem.eql(u8, acq.receiver, receiver)) return true;
-        }
-    }
-    return false;
-}
-
-/// ZC103 note for a release whose receiver has no acquire in the fn and
-/// no cross-fn acquire evidence in the file. `post` is exempt: signaling
-/// a semaphore without an in-fn wait is the normal producer shape, never
-/// unlock-of-unheld.
-fn checkOneRelease(
-    sink: *const ConcurrencyIssueSink,
-    records: []const FnLockRecord,
-    rec_idx: usize,
-    rel: LockRelease,
-) !void {
-    if (mem.eql(u8, rel.method, "post")) return;
-    const rec = &records[rec_idx];
-    if (hasSatisfyingAcquire(rec, rel)) return;
-    if (hasCrossFnAcquire(records, rec_idx, rel.receiver)) return;
-    const msg = try std.fmt.allocPrint(
-        sink.allocator,
-        "unlock of '{s}' without acquire in this function",
-        .{rel.receiver},
-    );
-    errdefer sink.allocator.free(msg);
-    try sink.issues.append(sink.allocator, .{
-        .file = sink.path,
-        .line = rel.line,
-        .col = rel.col,
-        .severity = .note,
-        .rule = RULE_UNLOCK_WITHOUT_LOCK,
-        .message = msg,
-        .help = "releasing an unheld lock is UB (debug builds assert); " ++
-            "acquire it earlier in this function",
-        .message_owned = true,
-    });
-}
-
 /// The conditional try-acquire matching this release, if any (ZC103):
 /// tryLock/tryLockShared in condition position (`if (mu.tryLock()) {`).
 fn findCondTryAcquire(rec: *const FnLockRecord, rel: LockRelease) ?LockAcquire {
@@ -18507,27 +18469,22 @@ fn checkTryLockDefer(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord
     }
 }
 
-/// ZC103: releases with no acquire evidence (note), plus the
-/// conditional-tryLock fn-scope-defer false-path shape (warning).
-fn evaluateUnlockWithoutLock(
-    sink: *const ConcurrencyIssueSink,
-    records: []const FnLockRecord,
-    rec_idx: usize,
-) !void {
-    const rec = &records[rec_idx];
-    for (rec.plain_releases.items) |rel| {
-        try checkOneRelease(sink, records, rec_idx, rel);
-    }
-    for (rec.defer_releases.items) |rel| {
-        try checkOneRelease(sink, records, rec_idx, rel);
-    }
+/// ZC103: the conditional-tryLock fn-scope-defer false-path shape
+/// (warning). The zero-evidence unlock note is gone (EPH-I0903): a
+/// release whose receiver never acquires anywhere in the file is an
+/// app-domain method (ClientIdentityGate.unlock) or a RAII guard
+/// (writeWithLock), not a lock release — and no textual discriminator
+/// separates those from a real 0.16 `mu.unlock(io)`, so the note class
+/// was unsound. The warning path needs no change: a conditional try
+/// acquire is in-file evidence by construction.
+fn evaluateUnlockWithoutLock(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord) !void {
     try checkTryLockDefer(sink, rec);
 }
 
 /// Evaluate every fn record once the file scan is complete — cross-fn
 /// evidence needs the whole file first. ZC101 judges each acquire's
 /// coverage; ZC102 walks the ordered lock flow for re-acquires; ZC103
-/// judges each release's acquire evidence.
+/// checks the conditional-tryLock defer warning.
 fn evaluateLockRecords(
     sink: *const ConcurrencyIssueSink,
     records: []const FnLockRecord,
@@ -18537,7 +18494,7 @@ fn evaluateLockRecords(
             try evaluateAcquire(sink, records, rec_idx, acq);
         }
         try evaluateDoubleLock(sink, rec);
-        try evaluateUnlockWithoutLock(sink, records, rec_idx);
+        try evaluateUnlockWithoutLock(sink, rec);
     }
 }
 
@@ -18602,12 +18559,28 @@ fn classifySpawnBinding(prefix_raw: []const u8) ?[]const u8 {
     return name;
 }
 
+/// True when a needle hit at `pos` satisfies the search boundary
+/// (ZC104): a clean word start, or a preceding `.` when `allow_dotted`
+/// (the last-segment fallback's `receiver.field.join(` admission,
+/// EPH-I0904). A mid-identifier hit (`mythread.join(` for segment
+/// `thread`) never satisfies the search.
+fn joinBoundaryOk(code: []const u8, pos: usize, allow_dotted: bool) bool {
+    if (pos == 0) return true;
+    const prev = code[pos - 1];
+    if (prev == '.') return allow_dotted;
+    return !isIdent(prev);
+}
+
 /// True when `<name>.join(` or `<name>.detach(` appears with a clean left
 /// boundary (ZC104), including the optional-unwrap form `<name>.?.join(`
 /// (messenger: `worker.thread.?.join()` on a `?std.Thread` field).
 /// `it.join(` and `event.t.join(` name a DIFFERENT handle and must not
-/// satisfy the search.
-fn hasJoinOrDetach(code: []const u8, name: []const u8, buf: []u8) bool {
+/// satisfy the search — a preceding `.` fails the boundary. The
+/// last-segment fallback (EPH-I0904) sets `allow_dotted`, admitting
+/// `receiver.field.join(`: a field-bound handle (`witness.thread`) may
+/// be joined through ANY receiver that carries the same field name
+/// (`self.thread.join()`), the skytale witness-deinit shape.
+fn hasJoinOrDetach(code: []const u8, name: []const u8, buf: []u8, allow_dotted: bool) bool {
     const suffixes = [_][]const u8{ ".join(", ".detach(", ".?.join(", ".?.detach(" };
     for (suffixes) |suffix| {
         if (name.len + suffix.len > buf.len) continue;
@@ -18617,8 +18590,7 @@ fn hasJoinOrDetach(code: []const u8, name: []const u8, buf: []u8) bool {
         var from: usize = 0;
         while (mem.indexOfPos(u8, code, from, needle)) |pos| {
             from = pos + 1;
-            if (pos == 0) return true;
-            if (!isIdent(code[pos - 1]) and code[pos - 1] != '.') return true;
+            if (joinBoundaryOk(code, pos, allow_dotted)) return true;
         }
     }
     return false;
@@ -18644,19 +18616,21 @@ fn hasReturnOf(code: []const u8, name: []const u8) bool {
 /// a return to the caller, a store into a struct field, or a hand-off as
 /// a call argument (container puts included). String literals and
 /// comments are never evidence — a "t.join()" in a format string joins
-/// nothing.
+/// nothing. `allow_dotted` admits a preceding `.` on the join search
+/// (the last-segment fallback's `receiver.field.join(` admission,
+/// EPH-I0904); the exact-name search keeps the strict boundary so
+/// `event.t.join(` never satisfies a local `t`.
 fn findSpawnResolution(
-    lines: []const []const u8,
+    ctx: SpawnScanCtx,
     name: []const u8,
-    blank_buf: []u8,
-    needle_buf: []u8,
+    allow_dotted: bool,
 ) bool {
-    for (lines) |line| {
+    for (ctx.lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         const code_end = findCommentStart(line) orelse line.len;
-        const blanked = blankLiteralContents(line[0..code_end], blank_buf);
-        if (hasJoinOrDetach(blanked, name, needle_buf)) return true;
+        const blanked = blankLiteralContents(line[0..code_end], ctx.blank_buf);
+        if (hasJoinOrDetach(blanked, name, ctx.needle_buf, allow_dotted)) return true;
         if (hasReturnOf(blanked, name)) return true;
         if (structFieldStorePos(blanked, name) != null) return true;
         if (isFunctionArgTransfer(blanked, name)) return true;
@@ -18714,17 +18688,19 @@ fn checkLineSpawns(
 /// file (ZC104). Field-bound handles (`context.thread`) are also searched
 /// by their LAST segment: the copy idiom (`const thread = self.thread;
 /// defer thread.join();` — tigerbeetle tb_client) joins through an alias
-/// whose receiver spelling the direct search cannot follow. The fallback
-/// only ever suppresses — the safe direction — and skips short segments
+/// whose receiver spelling the direct search cannot follow, and a DOTTED
+/// receiver join (`self.thread.join()` — skytale witness deinit) names
+/// the same field through any receiver (EPH-I0904). The fallback only
+/// ever suppresses — the safe direction — and skips short segments
 /// whose genericity would mask real leaks.
 fn spawnResolved(ctx: SpawnScanCtx, name: []const u8) bool {
-    if (findSpawnResolution(ctx.lines, name, ctx.blank_buf, ctx.needle_buf)) {
+    if (findSpawnResolution(ctx, name, false)) {
         return true;
     }
     const dot = mem.lastIndexOfScalar(u8, name, '.') orelse return false;
     const segment = name[dot + 1 ..];
     if (segment.len < 3) return false;
-    return findSpawnResolution(ctx.lines, segment, ctx.blank_buf, ctx.needle_buf);
+    return findSpawnResolution(ctx, segment, true);
 }
 
 /// Analyze a single file for spawned-thread handle leaks (ZC104). Test
@@ -18759,8 +18735,8 @@ fn analyzeFileSpawns(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
 }
 
 /// Analyze a single file for concurrency defects (ZC1xx): lock/unlock
-/// pairing (ZC101), double lock (ZC102), unlock-of-unheld (ZC103), and
-/// spawned-thread handle leaks (ZC104).
+/// pairing (ZC101), double lock (ZC102), conditional-tryLock defer
+/// unlock (ZC103), and spawned-thread handle leaks (ZC104).
 fn analyzeFileConcurrency(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
     var state = ConcurrencyScanState{ .allocator = sink.allocator };
     defer state.deinit();
@@ -71709,6 +71685,83 @@ test "ZC101: cross-fn release on a DIFFERENT receiver does not suppress" {
     try expectZC101Counts(run.issues.items, 1, 0);
 }
 
+test "ZC101: free-function fileUnlock satisfies the cross-fn release (EPH-I0903)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // skytale advanced_features.zig shape: the file lock is acquired as a
+    // method (`file.lock(...)`, hold-till-close) and released by a free
+    // function whose FIRST ARGUMENT is the lock object
+    // (`compat.fileUnlock(file)` in releaseFileLock). The release pairs
+    // by argument, not by the module receiver text.
+    const content =
+        \\fn doWork() void {}
+        \\fn acquireOsLock(file: File, exclusive: bool) void {
+        \\    file.lock(.exclusive) catch {
+        \\        file.close();
+        \\    };
+        \\    doWork();
+        \\}
+        \\fn releaseFileLock(file: File) void {
+        \\    compat.fileUnlock(file);
+        \\    file.close();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_fileunlock.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: free-function fileUnlock with a MISMATCHED argument does not suppress" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The release unlocks a DIFFERENT file (`other`) than the acquire
+    // (`file`) — the pairing must not suppress.
+    const content =
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    file.lock(.exclusive) catch {};
+        \\    doWork();
+        \\}
+        \\fn release(other: File) void {
+        \\    compat.fileUnlock(other);
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_fileunlock_mismatch.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: deferred free-function fileUnlock covers a same-fn acquire (EPH-I0903)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The deferred free-function release registers as defer coverage at
+    // the defer statement's depth — the standard lock/defer-unlock shape
+    // through the compat wrapper.
+    const content =
+        \\fn doWork() !void {}
+        \\fn f() !void {
+        \\    try file.lock(.exclusive);
+        \\    defer compat.fileUnlock(file);
+        \\    try doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_fileunlock_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
 test "ZC101: 0.16 form lock(io) with defer unlock(io) is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -72846,12 +72899,18 @@ fn expectZC103Counts(
     );
 }
 
-test "ZC103: bare unlock with no acquire anywhere is a note" {
+test "ZC103: unlock with no lock evidence in the file is silent (EPH-I0903)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // A release whose receiver never acquires anywhere in the file is an
+    // app-domain method (ClientIdentityGate.unlock) or a RAII guard, not
+    // a lock release. No textual discriminator separates those from a
+    // real 0.16 `mu.unlock(io)`, so the zero-evidence note class was
+    // unsound and is gone (EPH-I0903). The tryLock-defer WARNING shape
+    // still fires — it carries in-file acquire evidence by construction.
     const content =
         \\fn f() void {
         \\    mu.unlock();
@@ -72860,7 +72919,63 @@ test "ZC103: bare unlock with no acquire anywhere is a note" {
     var run = try runConcurrencyCheck(&diag, allocator, "zc103_note.zig", content);
     defer run.deinit(allocator);
 
-    try expectZC103Counts(run.issues.items, 0, 1);
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: identity-gate unlock is an app-domain call, not a release (EPH-I0903)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // skytale http_server_handlers_identity.zig:110 shape: the receiver
+    // is a *ClientIdentityGate whose unlock(passphrase) decrypts an
+    // identity — never a lock. The ZC103 zero-evidence note no longer
+    // fires (EPH-I0903).
+    const content =
+        \\const Gate = @import("gate").ClientIdentityGate;
+        \\fn runGateOperation(
+        \\    gate: *Gate,
+        \\    op: enum { create, unlock },
+        \\) !void {
+        \\    switch (op) {
+        \\        .create => try gate.create("p"),
+        \\        .unlock => try gate.unlock("p"),
+        \\    }
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_gate.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
+}
+
+test "ZC103: nested-fn identity-gate unlock is silent (EPH-I0903)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // skytale client_identity_gate_tests.zig:605 shape: the unlock runs
+    // inside a nested fn taking the gate as a param. Same app-domain
+    // class as the handler shape — silent (EPH-I0903).
+    const content =
+        \\const Gate = @import("gate").ClientIdentityGate;
+        \\fn spawnUnlockAttempt(gate: *Gate) !void {
+        \\    const t = try std.Thread.spawn(.{}, struct {
+        \\        fn run(g: *Gate, out: *?anyerror) void {
+        \\            g.unlock("wrong") catch |err| {
+        \\                out.* = err;
+        \\            };
+        \\        }
+        \\    }.run, .{ gate, null });
+        \\    t.join();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc103_gatetest.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC103Counts(run.issues.items, 0, 0);
 }
 
 test "ZC103: cross-fn acquire/release idiom is silent" {
@@ -72870,7 +72985,8 @@ test "ZC103: cross-fn acquire/release idiom is silent" {
     const allocator = gpa.allocator();
 
     // zls string_pool shape: the acquire lives in a sibling fn of the
-    // same file (mirror of ZC101's cross-fn release suppression).
+    // same file. No ZC103 channel fires on either fn (the release's
+    // zero-evidence note is gone, EPH-I0903).
     const content =
         \\fn lockIt() void {
         \\    mu.lock();
@@ -72958,8 +73074,8 @@ test "ZC103: defer registered before the acquire is silent (fires at exit)" {
     const allocator = gpa.allocator();
 
     // Weird but legal: the defer fires at scope exit, after the acquire
-    // ran — a fn that releases AND acquires the receiver is managing the
-    // lock, not releasing an unheld one.
+    // ran. The tryLock-defer warning does not fire — `mu.lock()` is not a
+    // conditional try acquire.
     const content =
         \\fn f() void {
         \\    defer mu.unlock();
@@ -72978,8 +73094,8 @@ test "ZC103: semaphore post without in-fn wait is the producer shape" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Producers post semaphores they never wait on — post is exempt from
-    // unlock-of-unheld (signaling is always legal, never UB).
+    // Producers post semaphores they never wait on — `post` is never a
+    // release-defect signal (signaling is always legal, never UB).
     const content =
         \\fn produce() void {
         \\    sem.post();
@@ -72998,9 +73114,9 @@ test "ZC103: unlock with deferred re-lock is the borrow idiom" {
     const allocator = gpa.allocator();
 
     // The fn received the lock held, releases it for a slow operation,
-    // and re-locks at scope exit. The deferred re-lock is set-aside
-    // ZC101 evidence but still acquires at runtime — without it counting,
-    // the unlock reads as unlock-of-unheld.
+    // and re-locks at scope exit. No ZC103 channel fires: the release's
+    // zero-evidence note is gone (EPH-I0903), and the deferred re-lock
+    // is not a conditional try acquire.
     const content =
         \\fn slowPush() void {}
         \\fn f() void {
@@ -73022,8 +73138,9 @@ test "ZC103: discarded tryLock satisfies the deferred unlock" {
     const allocator = gpa.allocator();
 
     // `_ = file.tryLock(...) catch return` is the hold-till-close file
-    // lock: ZC101 ignores the discarded acquire, but it still takes the
-    // lock on success, so the deferred unlock is paired — not unheld.
+    // lock: the discarded acquire is not evaluated, and the deferred
+    // unlock must not trip the tryLock-defer warning (the acquire is not
+    // in condition position, and it is not an in-fn verdict subject).
     const content =
         \\fn f(file: std.fs.File) !void {
         \\    _ = file.tryLock(.exclusive) catch return error.Locked;
@@ -73387,6 +73504,58 @@ test "ZC104: last-segment fallback over-suppresses same-named locals (EPH-I0036)
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc104_lastseg.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: dotted-receiver plain join satisfies the field-bound handle (EPH-I0904)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // skytale dht_link_rpc_tests.zig:311 / dht_replication_tests.zig:783
+    // shape: the handle is bound as `witness.thread` and joined in the
+    // witness deinit through a DIFFERENT receiver spelling
+    // (`self.thread.join()`). The last-segment fallback admits the
+    // dotted receiver (EPH-I0904).
+    const content =
+        \\fn work() void {}
+        \\fn start(witness: *W) !void {
+        \\    witness.thread = try std.Thread.spawn(.{}, work, .{});
+        \\}
+        \\fn stop(self: *W) void {
+        \\    self.running = false;
+        \\    self.thread.join();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_dottedjoin.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 0, 0);
+}
+
+test "ZC104: dotted-receiver defer join satisfies the field-bound handle (EPH-I0904)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // skytale p2p_core_tests.zig:4871/4878 shape: the handle is bound as
+    // `capture.thread` inside a helper and joined at the call site
+    // through the caller's own receiver (`defer cap_ab.thread.join()`).
+    const content =
+        \\fn work() void {}
+        \\fn spawnLegCapture(capture: *LegCapture) !void {
+        \\    capture.thread = try std.Thread.spawn(.{}, work, .{});
+        \\}
+        \\fn testIt(cap_ab: *LegCapture) !void {
+        \\    try spawnLegCapture(cap_ab);
+        \\    defer cap_ab.thread.join();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_dotteddefer.zig", content);
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 0, 0);

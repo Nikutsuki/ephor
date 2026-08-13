@@ -26326,16 +26326,6 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
     return false;
 }
 
-/// Check for break/continue guard on prior lines within same loop body
-/// Pattern: while (true) { if (x == 0) break; x -= 1; }
-/// Based on Zig control flow semantics - break/continue/return exits prevent reaching decrement
-/// Check if a line starts a loop keyword (at same or outer scope level)
-fn isLoopBoundary(ctx: []const u8) bool {
-    if (mem.startsWith(u8, ctx, "while ") or mem.startsWith(u8, ctx, "while(")) return true;
-    if (mem.startsWith(u8, ctx, "for ") or mem.startsWith(u8, ctx, "for(")) return true;
-    return false;
-}
-
 /// Check if a line has an exit statement (break/continue/return) after a
 /// guard condition on the same line. The keywords are matched on
 /// identifier boundaries over the comment-stripped text, so identifiers
@@ -26484,32 +26474,181 @@ fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
     return hasExitInFollowingBlock(ctx.lines, ctx.line_idx + 1, block_end);
 }
 
+/// Context for the prior-line zero-check guard walk: the candidate's
+/// function slice, its line index, and the guarded variable (EPH-I0936).
+const PriorGuardCtx = struct {
+    lines: []const []const u8,
+    current_idx: usize,
+    var_name: []const u8,
+};
+
 /// True when a zero-check break/continue/return guard on a prior line
 /// dominates the candidate. The 10-line window stops at a function
-/// boundary and at any loop opener: a guard above a loop opener never
-/// dominates an access inside its body — the loop's later iterations
-/// reach the access without re-passing the guard (EPH-I0498). The
-/// boundary check runs before the opener's own `{` is folded, so a
+/// boundary and at any enclosing loop opener: a guard above a loop
+/// opener never dominates an access inside its body — the loop's later
+/// iterations reach the access without re-passing the guard (EPH-I0498).
+/// The boundary check runs before the opener's own `{` is folded, so a
 /// canonical `while (...) {` stops the walk like a brace-less header.
+///
+/// A closed loop body does not gate the candidate: a break inside exits
+/// the loop, not the path below it, so the walk skips the body to the
+/// matching opener (EPH-I0936) — the Allman body open (a bare `{` under
+/// the header) skips the same way via the header line (EPH-I0951). The
+/// walk also passes closed SIBLING loops — a loop that closed above the
+/// candidate does not gate it, so a guard above the sibling still
+/// dominates (EPH-I0941, batch-24 review).
 fn hasBreakGuardOnPriorLines(
     lines: []const []const u8,
     current_idx: usize,
     var_name: []const u8,
 ) bool {
-    const check_start = if (current_idx > 10) current_idx - 10 else 0;
+    const pctx: PriorGuardCtx = .{
+        .lines = lines,
+        .current_idx = current_idx,
+        .var_name = var_name,
+    };
+    const check_start = current_idx -| 10;
+    // depth: net closes-minus-opens crossed walking back from the
+    // candidate. A close crossing opens a skip to the matching open; a
+    // loop opener whose body closes below the candidate is an enclosing
+    // loop and stops the walk.
+    var depth: i32 = 0;
     var i = current_idx;
     while (i > check_start) {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
         if (isFuncBoundary(ctx)) return false;
-        if (isLoopBoundary(ctx)) return false;
+        if (isLoopOpenerLine(ctx)) {
+            // The enclosing check uses the loop's own body close: a
+            // closed sibling loop is not on the candidate's control-flow
+            // path as a gate, so the walk passes it (EPH-I0941). A
+            // brace-less next-line body closes at the body's first
+            // line; when that line is the candidate, the loop still
+            // encloses it, so `>=` stops the walk on the candidate's
+            // own line and a guard above the opener never dominates an
+            // access inside its body (EPH-I0936 review F1).
+            if (loopBodyCloseLine(lines, i) >= current_idx) return false;
+            continue;
+        }
+        const balance = countCurlyBalance(ctx);
+        if (balance >= 0) {
+            depth -= balance;
+            const zctx: ZeroGuardCtx = .{
+                .t = ctx,
+                .var_name = var_name,
+                .lines = lines,
+                .line_idx = i,
+                .current_idx = current_idx,
+            };
+            if (isZeroCheckGuard(zctx)) return true;
+            continue;
+        }
+        switch (crossClosedBlock(pctx, i, check_start, &depth)) {
+            .found => return true,
+            .exhausted => return false,
+            .passed => |open| i = open,
+        }
+    }
+    return false;
+}
+
+/// How the prior-line walk continues after crossing a closed block.
+const ClosedBlockOutcome = union(enum) {
+    found,
+    exhausted,
+    passed: usize,
+};
+
+/// Cross a block that closed at `close_idx` (a line whose net brace
+/// balance is negative), walking to its brace-matching open without
+/// judging guards. The block sits entirely above the candidate: a
+/// break/continue inside it exits the block, not the path to the
+/// candidate, so its guards cannot dominate (EPH-I0936). A closed
+/// non-loop block's guards still dominate — every path to the candidate
+/// passes the whole block — so its body is judged instead (EPH-I0941).
+/// An Allman loop's body open is a bare `{` line, so the walk reads the
+/// loop header from the preceding non-comment line and passes the body
+/// like the K&R shape (EPH-I0951).
+/// `depth` (net closes-minus-opens crossed, going up) is in/out: it
+/// returns to the pre-close value exactly at the matching open. Returns
+/// how the walk continues: `found` (a dominating guard), `exhausted`
+/// (the window or a function boundary ended the walk), or `passed` with
+/// the open line index.
+fn crossClosedBlock(
+    pctx: PriorGuardCtx,
+    close_idx: usize,
+    check_start: usize,
+    depth: *i32,
+) ClosedBlockOutcome {
+    const target = depth.*;
+    depth.* -= countCurlyBalance(pctx.lines[close_idx]);
+    var i = close_idx;
+    while (i > check_start) {
+        i -= 1;
+        const ctx = mem.trim(u8, pctx.lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        if (isFuncBoundary(ctx)) return .exhausted;
+        depth.* -= countCurlyBalance(ctx);
+        if (depth.* != target) continue;
+        if (isLoopOpenerLine(ctx)) return .{ .passed = i };
+        // An Allman body open is the bare `{` line under the loop
+        // header, so the depth-returning line is not itself a loop
+        // opener: look up past comment lines for the header and pass
+        // the body like the K&R shape (EPH-I0951). The header must not
+        // carry its own `{` (a K&R or same-line body opens elsewhere)
+        // nor a same-line brace-less body (`while (y) stmt;`), which
+        // would make the `{` line a separate block to judge.
+        var k = i;
+        while (k > check_start) {
+            k -= 1;
+            const above = mem.trim(u8, pctx.lines[k], " \t\r");
+            if (isCommentOrMultilineString(above)) continue;
+            if (isLoopOpenerLine(above) and
+                !lineCarriesOpenBrace(above) and
+                !lineCarriesStatementEnd(above)) return .{ .passed = i };
+            break;
+        }
+        // The open line itself can carry the guard: `if (m == 0) {`
+        // with the exit in the body dominates the candidate like any
+        // prior guard line (EPH-I0941).
         const zctx: ZeroGuardCtx = .{
             .t = ctx,
-            .var_name = var_name,
-            .lines = lines,
+            .var_name = pctx.var_name,
+            .lines = pctx.lines,
             .line_idx = i,
-            .current_idx = current_idx,
+            .current_idx = pctx.current_idx,
+        };
+        if (isZeroCheckGuard(zctx)) return .found;
+        if (judgeClosedBlockSpan(pctx, i + 1, close_idx)) return .found;
+        return .{ .passed = i };
+    }
+    return .exhausted;
+}
+
+/// Judge the body lines of a closed NON-loop block (EPH-I0941): the
+/// block sits entirely above the candidate, so its guards still
+/// dominate — every path to the candidate passes the whole block. Loop
+/// opener lines inside the body are skipped like the main walk does.
+/// Returns true on the first zero-check guard match; a function
+/// boundary inside the body ends the scan.
+fn judgeClosedBlockSpan(
+    ctx: PriorGuardCtx,
+    start: usize,
+    end: usize,
+) bool {
+    var j = start;
+    while (j < end) : (j += 1) {
+        const inner = mem.trim(u8, ctx.lines[j], " \t\r");
+        if (isCommentOrMultilineString(inner)) continue;
+        if (isFuncBoundary(inner)) return false;
+        if (isLoopOpenerLine(inner)) continue;
+        const zctx: ZeroGuardCtx = .{
+            .t = inner,
+            .var_name = ctx.var_name,
+            .lines = ctx.lines,
+            .line_idx = j,
+            .current_idx = ctx.current_idx,
         };
         if (isZeroCheckGuard(zctx)) return true;
     }
@@ -27008,7 +27147,7 @@ fn findEnclosingLoop(lines: []const []const u8, current_idx: usize) ?EnclosingLo
         if (isCommentOrMultilineString(ctx)) continue;
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
         if (isFuncBoundary(ctx)) return null;
-        if (isLoopBoundary(ctx) and brace_depth < 0) {
+        if (isLoopOpenerLine(ctx) and brace_depth < 0) {
             const close = loopBodyCloseLine(lines, i);
             if (close > current_idx) return .{ .header = i, .close = close };
         }
@@ -27032,14 +27171,22 @@ fn loopBodyCloseLine(lines: []const []const u8, header_idx: usize) usize {
     while (i < lines.len) : (i += 1) {
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
+        // A blank line carries no code and cannot close a body: it
+        // returns depth 0, so without this skip a blank line between a
+        // brace-less header and its body closed the loop short of the
+        // candidate and a stale guard above silenced the in-body
+        // decrement (EPH-I0936 review r3 F3).
+        if (ctx.len == 0) continue;
         const balance = countCurlyBalance(ctx);
         // A K&R loop header (`while (n > 0)` with `{` on the next line)
         // opens no block on its own line: the depth-0 return here would
         // close the body at the header and reject a real enclosing loop
-        // (EPH-I0931 review F1). A same-line `{}` body still closes at
-        // the header: it carries an opening brace, and an empty body
-        // holds no candidate line, so the header return stays correct.
-        if (i == header_idx and balance == 0 and !lineCarriesOpenBrace(ctx)) continue;
+        // (EPH-I0931 review F1). A same-line body closes at the header
+        // either way: `{}` carries an opening brace, and a
+        // `;`-terminated statement ends the loop's own statement, so
+        // the line below it is not the body open (EPH-I0936 review F1).
+        if (i == header_idx and balance == 0 and
+            !lineCarriesOpenBrace(ctx) and !lineCarriesStatementEnd(ctx)) continue;
         depth += balance;
         if (depth <= 0) return i;
     }
@@ -27394,13 +27541,34 @@ fn lineOpensBlock(t: []const u8) bool {
 /// last brace need not be the open — `while (n > 0) {}` carries an
 /// open and qualifies. loopBodyCloseLine uses this to tell a K&R loop
 /// header (no brace at all) from a same-line empty body, which must
-/// keep closing at the header (EPH-I0931 review F1).
+/// keep closing at the header (EPH-I0931 review F1). Char-literal
+/// braces do not count: the `{` inside `'{'` in `while (c == '{')` is
+/// data, and a leak here closed an Allman loop at its header and hid
+/// the after-loop decrement (EPH-I0936 review r3 F2).
 fn lineCarriesOpenBrace(t: []const u8) bool {
     var cls = LineClassifier.init(t);
     const comment_start = findCommentStart(t) orelse t.len;
     for (t[0..comment_start], 0..) |c, i| {
         if (c != '{') continue;
-        if (cls.isInsideString(i)) continue;
+        if (cls.isInsideLiteral(i)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// True when `t` carries a code-position statement terminator (`;`): a
+/// brace-less loop body sits on the header line (`while (y) stmt;`),
+/// so the `{` line below it is a separate block, not the Allman body
+/// open (EPH-I0951). Comments and string literals do not count.
+/// Char-literal terminators do not count either: the `;` inside `';'`
+/// in `while (c == ';')` is data, and a leak here closed the loop at
+/// its header and hid the in-body decrement (EPH-I0936 review r3 F1).
+fn lineCarriesStatementEnd(t: []const u8) bool {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t) orelse t.len;
+    for (t[0..comment_start], 0..) |c, i| {
+        if (c != ';') continue;
+        if (cls.isInsideLiteral(i)) continue;
         return true;
     }
     return false;
@@ -69153,6 +69321,228 @@ test "hasBreakGuardOnPriorLines stops at a canonical while opener (EPH-I0498)" {
     try std.testing.expect(hasBreakGuardOnPriorLines(&same_lines, 4, "m"));
 }
 
+test "isLoopOpenerLine matches labeled and inline loop openers (EPH-I0937)" {
+    // The labeled (`label: while`) and inline (`inline for`/`inline
+    // while`) forms must stop the guard walks like plain openers do.
+    // Pre-fix the boundary matcher recognized only plain keyword line
+    // starts and the walks ran past these openers to a stale guard.
+    try std.testing.expect(isLoopOpenerLine("outer: while (y > 0) {"));
+    try std.testing.expect(isLoopOpenerLine("outer: for (items) |it| {"));
+    try std.testing.expect(isLoopOpenerLine("inline while (y > 0) {"));
+    try std.testing.expect(isLoopOpenerLine("inline for (items) |it| {"));
+    try std.testing.expect(!isLoopOpenerLine("if (y > 0) {"));
+    try std.testing.expect(!isLoopOpenerLine("const pat = \"while (\";"));
+}
+
+test "hasBreakGuardOnPriorLines stops at labeled and inline loop openers (EPH-I0937)" {
+    // A guard above a labeled or inline loop opener does not dominate an
+    // access inside its body — the EPH-I0498 dominance rule. Pre-fix the
+    // boundary matcher missed these opener forms and the walk found the
+    // stale guard.
+    const labeled = [_][]const u8{
+        "fn f(x: usize, y: usize) void {",
+        "    var m = x;",
+        "    if (m == 0) return;",
+        "    outer: while (y > 0) {",
+        "        m -= 1;",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&labeled, 4, "m"));
+    const inline_while = [_][]const u8{
+        "fn f(x: usize, y: usize) void {",
+        "    var m = x;",
+        "    if (m == 0) return;",
+        "    inline while (y > 0) {",
+        "        m -= 1;",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&inline_while, 4, "m"));
+    const inline_for = [_][]const u8{
+        "fn f(x: usize, items: []const usize) void {",
+        "    var m = x;",
+        "    if (m == 0) return;",
+        "    inline for (items) |it| {",
+        "        m -= 1;",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&inline_for, 4, "m"));
+}
+
+test "findEnclosingLoop recognizes labeled and inline openers (EPH-I0937)" {
+    // The init-witness scan end (initReassignScanEnd) needs the labeled
+    // and inline forms as enclosing loops. Pre-fix findEnclosingLoop
+    // returned null for both shapes.
+    const labeled = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    _ = n;",
+        "    var i = 5;",
+        "    outer: while (n > 0) {",
+        "        n -= 1;",
+        "        _ = arr[i - 1];",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    const found = findEnclosingLoop(&labeled, 5).?;
+    try std.testing.expectEqual(@as(usize, 3), found.header);
+    try std.testing.expectEqual(@as(usize, 6), found.close);
+    const inline_loop = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    _ = n;",
+        "    var i = 5;",
+        "    inline while (n > 0) {",
+        "        n -= 1;",
+        "        _ = arr[i - 1];",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    const found_inline = findEnclosingLoop(&inline_loop, 5).?;
+    try std.testing.expectEqual(@as(usize, 3), found_inline.header);
+    try std.testing.expectEqual(@as(usize, 6), found_inline.close);
+}
+
+test "hasBreakGuardOnPriorLines skips a closed loop body (EPH-I0936)" {
+    // A break guard inside a loop body exits the loop; it does not
+    // dominate an access after the loop — the loop can exit via its
+    // condition with the var still zero. Pre-fix the walk crossed the
+    // closing `}` and found the depth-1 guard.
+    const lines = [_][]const u8{
+        "fn f(x: usize, y: usize) usize {",
+        "    var m = x;",
+        "    while (y > 0) {",
+        "        if (m == 0) break;",
+        "        y -= 1;",
+        "    }",
+        "    m -= 1;",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&lines, 6, "m"));
+}
+
+test "hasBreakGuardOnPriorLines skips an Allman closed loop body (EPH-I0951)" {
+    // The Allman open is the bare `{` line under the `while` header, so
+    // crossClosedBlock does not see a loop opener at the depth-returning
+    // line. Pre-fix the body was judged and the in-body break guard
+    // suppressed the after-loop decrement; the header check passes the
+    // body like the K&R shape.
+    const lines = [_][]const u8{
+        "fn f(x: usize, y: usize) usize {",
+        "    var m = x;",
+        "    while (y > 0)",
+        "    {",
+        "        if (m == 0) break;",
+        "        y -= 1;",
+        "    }",
+        "    m -= 1;",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&lines, 7, "m"));
+    // A same-line brace-less loop body is not Allman: the `{` block
+    // below the header is a separate block, and its guard still
+    // dominates the candidate.
+    const brace_less = [_][]const u8{
+        "fn g(x: usize, y: usize) usize {",
+        "    var m = x;",
+        "    while (y > 0) y -= 1;",
+        "    {",
+        "        if (m == 0) return 0;",
+        "    }",
+        "    m -= 1;",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(hasBreakGuardOnPriorLines(&brace_less, 6, "m"));
+}
+
+test "hasBreakGuardOnPriorLines stops at a brace-less loop opener whose body is the candidate (EPH-I0936 review F1)" {
+    // The inner loop's brace-less next-line body IS the candidate line:
+    // loopBodyCloseLine returns that line, and the pre-fix `>` check
+    // passed the opener (close == current_idx is not "beyond"), so the
+    // stale break guard above the inner loop silenced the in-body
+    // decrement. The close must stop the walk on the candidate's own
+    // line (`>=`).
+    const lines = [_][]const u8{
+        "fn f(x: usize, y: usize) usize {",
+        "    var m = x;",
+        "    while (y > 0) {",
+        "        if (m == 0) break;",
+        "        while (y > 1)",
+        "            m -= 1;",
+        "        y -= 1;",
+        "    }",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&lines, 5, "m"));
+}
+
+test "hasBreakGuardOnPriorLines stops at a brace-less top-guard loop opener (EPH-I0936 review F1)" {
+    // The top-guard twin: a zero-check-exit guard above the loop does
+    // not dominate the brace-less loop-body decrement — the loop can
+    // iterate with m == 0. Pre-fix the walk passed the opener (the body
+    // close equals the candidate line) and the stale guard suppressed
+    // the decrement.
+    const lines = [_][]const u8{
+        "fn f(x: usize, y: usize) usize {",
+        "    var m = x;",
+        "    if (m == 0) return 0;",
+        "    while (y > 0)",
+        "        m -= 1;",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&lines, 4, "m"));
+}
+
+test "hasBreakGuardOnPriorLines passes a closed sibling loop to the guard above (EPH-I0941)" {
+    // A candidate in a switch prong BELOW a closed sibling loop is still
+    // dominated by a zero-check-exit guard above the loop: guard -> loop
+    // -> prong is sequential control flow. Pre-fix the batch-24
+    // unconditional opener stop masked the guard and the walk missed it.
+    const lines = [_][]const u8{
+        "fn f(x: usize, k: u8) usize {",
+        "    var m = x;",
+        "    if (m == 0) return 0;",
+        "    while (m > 3) {",
+        "        m -= 1;",
+        "    }",
+        "    switch (k) {",
+        "        1 => {",
+        "            m -= 1;",
+        "            return m;",
+        "        },",
+        "        else => {},",
+        "    }",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(hasBreakGuardOnPriorLines(&lines, 8, "m"));
+}
+
+test "hasBreakGuardOnPriorLines judges a closed non-loop block's guard opener (EPH-I0941)" {
+    // A multi-line if-block above the candidate keeps its dominance: the
+    // walk crosses the block, then judges the open line (the `if (m ==
+    // 0) {` guard with the exit in the body) and the body. The closed-
+    // block skip must not swallow the opener's guard.
+    const lines = [_][]const u8{
+        "fn f(x: usize, y: usize) usize {",
+        "    var m = x;",
+        "    if (m == 0) {",
+        "        return 0;",
+        "    }",
+        "    m -= 1;",
+        "    return m;",
+        "}",
+    };
+    try std.testing.expect(hasBreakGuardOnPriorLines(&lines, 5, "m"));
+}
+
 test "ZA901: pre-loop break guard does not suppress the loop-body decrement (EPH-I0498)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -69186,6 +69576,470 @@ test "ZA901: pre-loop break guard does not suppress the loop-body decrement (EPH
         "test_za901_stale.zig",
         RULE_DECREMENT_WITHOUT_CHECK,
     ) == 1);
+}
+
+test "ZA901: in-loop break guard does not suppress the after-loop decrement (EPH-I0936)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The loop can exit via its condition with m == 0, so the after-loop
+    // decrement can underflow; the in-body break guard exits the loop,
+    // not the path to the decrement. Pre-fix the guard silenced it.
+    const content =
+        \\fn dec_after(x: usize, y: usize) usize {
+        \\    var m = x;
+        \\    while (y > 0) {
+        \\        if (m == 0) break;
+        \\        y -= 1;
+        \\    }
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_after_loop.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_after_loop.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: Allman in-loop break guard does not suppress the after-loop decrement (EPH-I0951)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The Allman twin of the EPH-I0936 shape: the loop body opens on
+    // the bare `{` line under the header. Pre-fix crossClosedBlock saw
+    // no loop opener at the depth-returning line, judged the body, and
+    // the in-body break guard silenced the after-loop decrement. The
+    // body holds no decrement of its own: an in-body decrement of the
+    // loop var fires through a separate pre-existing CFG gap (the
+    // Allman loop-condition guard is lost at the bare `{` block open,
+    // EPH-I0952), which would add an unrelated second issue.
+    const content =
+        \\fn dec_allman_iso(x: usize, y: usize) usize {
+        \\    var m = x;
+        \\    while (y > 0)
+        \\    {
+        \\        if (m == 0) break;
+        \\    }
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_after_loop_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_after_loop_allman.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: guard above a closed sibling loop keeps the prong decrement silent (EPH-I0941)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // guard -> sibling loop -> switch prong is sequential control flow:
+    // the guard above the loop dominates the prong decrement, so the
+    // prong stays silent. Pre-fix the batch-24 unconditional opener
+    // stop masked the guard and the prong fired (FP).
+    const content =
+        \\fn dec_prong(x: usize, k: u8) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (m > 3) {
+        \\        m -= 1;
+        \\    }
+        \\    switch (k) {
+        \\        1 => {
+        \\            m -= 1;
+        \\            return m;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_prong.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_prong.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "ZA901: Allman sibling-loop body guard does not suppress the prong decrement (EPH-I0951)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The Allman twin of the closed-sibling-loop dominance rule
+    // (EPH-I0941): the guard inside the closed sibling loop body exits
+    // the loop, not the path to the prong. Pre-fix the bare `{` open
+    // was judged as a non-loop block, the in-body break guard matched,
+    // and the prong decrement stayed silent (FP).
+    const content =
+        \\fn prong_allman(x: usize, k: u8) usize {
+        \\    var m = x;
+        \\    while (m > 3)
+        \\    {
+        \\        if (m == 0) break;
+        \\        m -= 1;
+        \\    }
+        \\    switch (k) {
+        \\        1 => {
+        \\            m -= 1;
+        \\            return m;
+        \\        },
+        \\        else => {},
+        \\    }
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_prong_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_prong_allman.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: brace-less inner-loop body decrement fires (EPH-I0936 review F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The brace-less twin of the EPH-I0498 shape: the inner loop's body
+    // is the next-line `m -= 1;` itself. The break guard above the inner
+    // loop exits the OUTER loop, so it does not dominate the in-body
+    // decrement. Pre-fix the guard-walk passed the opener (the body
+    // close equals the candidate line under `>`) and the decrement
+    // stayed silent.
+    const content =
+        \\fn dec_braceless_inner(x: usize, y: usize) usize {
+        \\    var m = x;
+        \\    while (y > 0) {
+        \\        if (m == 0) break;
+        \\        while (y > 1)
+        \\            m -= 1;
+        \\        y -= 1;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_braceless_inner.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_braceless_inner.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: brace-less top-guard loop-body decrement fires (EPH-I0936 review F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The brace-less twin of the top-guard shape: the guard above the
+    // loop does not dominate the loop-body decrement, because the loop
+    // can iterate with m == 0. Pre-fix the stale guard silenced it.
+    const content =
+        \\fn dec_braceless_topguard(x: usize, y: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (y > 0)
+        \\        m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_braceless_topguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_braceless_topguard.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: brace-less loop with a block-body statement keeps firing (EPH-I0936 review F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `while (y > 1) if (q) { m -= 1; };` — the brace-less loop body is
+    // a multi-line if-statement. The depth scan computes the close at
+    // the `};` line (not the first line after the header), so the
+    // opener still encloses the decrement and the guard above the loop
+    // does not dominate it. This pin guards the `;`-header change: a
+    // hard short-circuit of the next-line scan would return the `if`
+    // line as the close and the decrement would go silent.
+    const content =
+        \\fn dec_block_body(x: usize, y: usize, q: bool) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (y > 1)
+        \\        if (q) {
+        \\            m -= 1;
+        \\        };
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_block_body.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_block_body.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: char-literal terminator in the header keeps the brace-less body firing (EPH-I0936 review r3 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `while (c == ';')` — the `;` sits inside a char literal, so it is
+    // data, not a statement terminator. Pre-fix lineCarriesStatementEnd
+    // used isInsideString (false inside char literals), the header
+    // claimed a same-line `;` body, loopBodyCloseLine closed the loop
+    // at the header, the walk passed the opener, and the stale guard
+    // above silenced the in-body decrement.
+    const content =
+        \\fn dec_char_braceless(x: usize, c: u8) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (c == ';')
+        \\        m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_char_braceless.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_char_braceless.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: char-literal terminator in the header keeps the Allman body firing (EPH-I0936 review r3 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The Allman twin of the brace-less shape: the `;` inside `';'` in
+    // `while (c == ';')` must not close the loop at its header. Pre-fix
+    // the walk passed the opener and the stale guard above silenced the
+    // in-body decrement (regression: r2 fired it).
+    const content =
+        \\fn dec_char_allman(x: usize, c: u8) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (c == ';')
+        \\    {
+        \\        m -= 1;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_char_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_char_allman.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: char-literal terminator in the header keeps the block-body firing (EPH-I0936 review r3 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The block-body twin: `while (c == ';') if (q) { m -= 1; };`.
+    // Pre-fix the header claimed a same-line `;` body and the walk
+    // passed the opener, silencing the in-body decrement (regression:
+    // r2 fired it).
+    const content =
+        \\fn dec_char_block_body(x: usize, c: u8, q: bool) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (c == ';')
+        \\        if (q) {
+        \\            m -= 1;
+        \\        };
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_char_block_body.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_char_block_body.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: char-literal brace in the header keeps the Allman after-loop firing (EPH-I0936 review r3 F2)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `while (c == '{')` with an Allman body: the `{` inside `'{'` is
+    // data. Pre-fix lineCarriesOpenBrace used isInsideString (false
+    // inside char literals), so the closed body's break guard read as
+    // dominating the after-loop decrement and silenced it. The plain
+    // header control (`while (y > 0)`) keeps firing either way.
+    const content =
+        \\fn dec_after_brace_header(x: usize, c: u8) usize {
+        \\    var m = x;
+        \\    while (c == '{')
+        \\    {
+        \\        if (m == 0) break;
+        \\        x = c;
+        \\    }
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_char_open_brace.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_char_open_brace.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: a blank line between header and body keeps the decrement firing (EPH-I0936 review r3 F3)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A blank line between a brace-less header and its body carries no
+    // code and cannot close the body. Pre-fix loopBodyCloseLine
+    // returned the blank line (depth 0), short of the candidate, and
+    // the stale guard above silenced the in-body decrement.
+    const content =
+        \\fn dec_blank_pad(x: usize, y: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (y > 0)
+        \\
+        \\        m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_blank_pad.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_blank_pad.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: real same-line body plus guard-above keeps the bare-block decrement silent (EPH-I0936 review r3 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The regression guard for the char-literal fix: `while (y > 0)
+    // y -= 1;` carries a REAL statement terminator, so the loop body
+    // closes at the header, the `{` block below is a separate block,
+    // and the guard above still dominates its decrement. The literal
+    // swap must not mask real terminators.
+    const content =
+        \\fn dec_same_line_body(x: usize, y: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (y > 0) y -= 1;
+        \\    {
+        \\        m -= 1;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_same_line_body.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_same_line_body.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
 }
 
 test "ZA903: else-arm index arithmetic stays silent past a guarded if (EPH-I0487)" {

@@ -6907,7 +6907,7 @@ fn markCaptureScopes(
 /// an alias inside a root-capture scope) is masked with the line. A
 /// brace-less if with a same-line `else` masks the whole line. A capture
 /// whose payload aliases the tracked alloc reads as freeing the payload, not
-/// the alloc — the EPH-I0748 shadow contract.
+/// the alloc — the EPH-I0748 shadow rule.
 fn computeCaptureShadowedLines(
     allocator: Allocator,
     ctx: *const AllocSafetyCtx,
@@ -10909,7 +10909,7 @@ const ImportGraph = struct {
     /// (EPH-I0823). The key is the inode alone: std.Io exposes no
     /// device identity, so a cross-device inode reuse looks like a
     /// hardlink alias (EPH-I0828). See `walked_file_inodes` for the
-    /// identity contract.
+    /// identity rule.
     fn walkFileAlreadyScanned(self: *ImportGraph, inode: std.Io.File.INode) !bool {
         if (inode == 0) return false;
         const gop = try self.walked_file_inodes.getOrPut(self.allocator, inode);
@@ -13779,7 +13779,7 @@ fn trackTestBlock(
     // "test " prefix dropped the anonymous no-space form — the literal
     // blanker manufactures the space for the quoted no-space form
     // (`test"x" {`), but `test{` has no literal to blank. The blanked
-    // line is a trimmed line, so isTestOpenerLine's contract holds, and
+    // line is a trimmed line, so isTestOpenerLine's rule holds, and
     // literal contents can never occupy the keyword position.
     const starts_test = isTestOpenerLine(t);
     // The line opens a test block only when a code-position `{` sits on
@@ -16518,7 +16518,7 @@ const BlankChunkIter = struct {
 
     /// Mask the next chunk of the line into `buf`; null when the line is
     /// exhausted (covers an empty line). The call site iterates with
-    /// `while (iter.next()) |chunk|`, so the optional is the contract.
+    /// `while (iter.next()) |chunk|`, so the optional is the rule.
     fn next(self: *BlankChunkIter) ?[]const u8 {
         if (self.pos >= self.line.len) return null;
         const end = @min(self.pos + self.buf.len, self.line.len);
@@ -18231,7 +18231,7 @@ const ConcurrencyScanState = struct {
     pending_fn: bool = false,
     /// Paren depth of a pending fn def's signature (EPH-I0447): a `{`
     /// inside the signature parens (a `.{}` default param) is not the
-    /// body, mirroring the ZT101 FnSpanState contract.
+    /// body, mirroring the ZT101 FnSpanState rule.
     sig_parens: usize = 0,
     fn_depth: usize = 0,
     in_defer: bool = false,
@@ -19297,7 +19297,7 @@ const SpawnScanCtx = struct {
 /// True for `std.Thread.spawn` and alias forms (`Thread.spawn` when
 /// std.Thread is imported by name) — but NOT `MyThread.spawn` (the dot
 /// boundary rejects it), `child.spawn`, or `exe.spawn` (process spawning
-/// has no join/detach contract; std.process.Child is reaped by wait()).
+/// has no join/detach requirement; std.process.Child is reaped by wait()).
 fn isThreadSpawnTarget(target: []const u8) bool {
     if (mem.eql(u8, target, "Thread.spawn")) return true;
     return mem.endsWith(u8, target, ".Thread.spawn");
@@ -19425,7 +19425,7 @@ fn findSpawnResolution(
 }
 
 /// ZC104 warning: the spawned thread's handle is never joined or
-/// detached — std.Thread.spawn's contract ("the caller must eventually
+/// detached — std.Thread.spawn's requirement ("the caller must eventually
 /// either call join() ... or call detach()") makes the leak certain.
 fn emitThreadNoJoin(sink: *const ConcurrencyIssueSink, spawn: BoundSpawn) !void {
     const msg = try std.fmt.allocPrint(
@@ -19512,7 +19512,7 @@ fn analyzeFileSpawns(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
         // the Allman opener and its brace keeps the pending alive, so
         // the block still opens as a test (EPH-I0924).
         if (isCommentOrMultilineString(t)) continue;
-        // Sibling-band contract (EPH-I0437): trackTestBlock receives the
+        // Sibling-band rule (EPH-I0437): trackTestBlock receives the
         // comment-stripped, literal-blanked neutral line, so braces in
         // test-name strings, fixture strings, and trailing comments are
         // data — they never open or close the test block (mirrors
@@ -25587,7 +25587,7 @@ const GuardIntersectCtx = struct {
 
 /// The line from which `pred`'s available guards on `var_name` hold: the
 /// later of its entry guards and its local guards, or null when the pred
-/// has no guard on the var. The max keeps the temporal contract through
+/// has no guard on the var. The max keeps the temporal rule through
 /// back edges: a guard established in a later loop-body line must not
 /// cover an earlier line (EPH-I0486).
 fn predGuardLine(ctx: GuardIntersectCtx, pred: usize, var_name: []const u8) ?usize {
@@ -25765,7 +25765,7 @@ const GuardLineCtx = struct {
 /// proven at block entry holds from its recorded line onward; a guard
 /// collected in this same block holds from its own line onward. Either
 /// way, a guard on a later line must not silence an earlier line
-/// (EPH-I0486 temporal contract).
+/// (EPH-I0486 temporal rule).
 fn isGuardedAtLine(ctx: GuardLineCtx, var_name: []const u8) bool {
     if (ctx.entry_guards.get(var_name)) |guard_idx| {
         if (guard_idx <= ctx.idx) return true;
@@ -34268,7 +34268,7 @@ test "IdentUseIndex falls back to the direct scan for non-identifier names" {
 }
 
 test "countRealIdentUses saturates at the first confirmed use (EPH-I0438)" {
-    // The > 0 verdict is the contract: a used decl answers 1 no matter
+    // The > 0 verdict is the rule: a used decl answers 1 no matter
     // how many uses, an unused decl answers 0. Pre-fix the first case
     // returned the exact count 2, so the pin fails on the old code.
     const used = "const x = 1;\nuse(x);\nuse(x);\n";
@@ -34963,7 +34963,7 @@ test "walk joins one graph entry per physical hardlink (EPH-I0823)" {
     });
     try tmp.dir.hardLink("a/x.zig", tmp.dir, "a/link/x.zig", std.testing.io, .{});
     // A symlinked dir adds no joins: the walk skips .sym_link entries.
-    // Pinning the no-duplicate contract for the alternate shape too.
+    // Pinning the no-duplicate rule for the alternate shape too.
     try tmp.dir.symLink(std.testing.io, "a", "linkdir", .{ .is_directory = true });
     try tmp.dir.createDirPath(std.testing.io, "b");
     try tmp.dir.writeFile(std.testing.io, .{
@@ -39454,7 +39454,7 @@ test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {
 
     // The catch capture |item| rebinds the name for the handler block, so a
     // free of the name there cannot pair with the outer free on 3. Ephor is
-    // type-blind on the payload: the contract under test is the scope mask.
+    // type-blind on the payload: the rule under test is the scope mask.
     const content =
         \\fn fetch(allocator: std.mem.Allocator, input: []const u8) !void {
         \\    const item = try allocator.alloc(u8, 32);
@@ -43907,7 +43907,7 @@ test "analyzeCFGMemory ZA801 fires past attestation_ identifier (EPH-I0224)" {
     const allocator = gpa.allocator();
 
     // `attestation_` trips neither old substring, so this fired pre-fix
-    // too. The pin locks the word-boundary contract for test-ish names.
+    // too. The pin locks the word-boundary rule for test-ish names.
     const content =
         \\fn f(p: ?u32) u32 {
         \\    const attestation_total = p.? + 1;
@@ -49525,7 +49525,7 @@ test "ZA101: same-indent conditional defer still warns (F6 probe)" {
     // a-true path. The block scan must not read the line as a direct free
     // of the entry block — the allocation leaks on the a-false path. The
     // shape is a Zig compile error (defer cannot be a guard body,
-    // verified with zig ast-check 0.16), but the audit's probe contract
+    // verified with zig ast-check 0.16), but the audit's probe expectations
     // and the guard-token classifier keep the warning.
     const content =
         \\fn condDefer(a: bool, allocator: std.mem.Allocator) !void {
@@ -53478,7 +53478,7 @@ test "positionsInSameBlock is exact on same-line and sibling shapes (EPH-I0331)"
     ));
 
     // Adjacent lines inside one multi-line block: the same block. The
-    // columns are trimmed-space (the caller contract): the fixture lines
+    // columns are trimmed-space (the caller rule): the fixture lines
     // carry their own indent, and the occurrences sit at trimmed col 0.
     const multi = [_][]const u8{
         "if (c1) {",
@@ -65994,7 +65994,7 @@ test "isInsideTypeOf detects balanced-paren line inside @TypeOf" {
 }
 
 test "isInsideTypeOf: trailing comment on a boundary cannot force a match (EPH-I0783)" {
-    // Verdict pin from the EPH-I0783 investigation. The pinned contract is
+    // Verdict pin from the EPH-I0783 investigation. The pinned rule is
     // narrow. At a depth-0 catch line the comment-stripped boundary check
     // sees the `;` terminator and breaks. This trailing comment cannot
     // force a match. A catch line at deeper paren depth (inside a call
@@ -67842,7 +67842,7 @@ test "ZA901: while-header guard still covers the loop body (EPH-I0486 lock)" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // The temporal contract must not break the loop-body suppression: the
+    // The temporal rule must not break the loop-body suppression: the
     // header guard flows into the body through the true edge. The body
     // decrement stays silent while the pre-loop decrement fires.
     const content =
@@ -69197,7 +69197,7 @@ test "ZA204: single-line struct literal undefined field is reported (EPH-I0413)"
         }
     }
     // The report points at the decl line's `= undefined`, not the scope
-    // end (the same line/col contract as the multi-line form).
+    // end (the same line/col rule as the multi-line form).
     try std.testing.expectEqual(@as(usize, 2), found_line);
 }
 
@@ -74662,7 +74662,7 @@ test "ZC101: // } tail on a defer line never corrupts the attributed depth (EPH-
     // The `// }` tail is stripped from `code` by findCommentStart before
     // blankLiteralContents, and a `//` before the keyword makes
     // deferKeywordPos return null — so no `// }` position can reach the
-    // keyword-prefix slice. This pins the documented mask contract: the
+    // keyword-prefix slice. This pins the documented mask rule: the
     // deferred release attributes the inside-if depth 2, which does not
     // cover the depth-1 acquire (warning), exactly as the no-comment
     // sibling behaves.
@@ -76687,7 +76687,7 @@ test "ZC104: test-name/fixture/trailing braces keep block bounds (EPH-I0437)" {
     // Guard pins: the EPH-I0883 literal-aware trackTestBlock already
     // masks the three shapes; the ZC104 site now feeds it the
     // comment-stripped, literal-blanked neutral line (the sibling-band
-    // contract). A `{` inside the test NAME must not arm a phantom block,
+    // rule). A `{` inside the test NAME must not arm a phantom block,
     // and a `}` in a fixture string or trailing comment must not close
     // the real block early — either way the after-block spawn would be
     // mis-attributed.
@@ -76824,7 +76824,7 @@ test "ZC101: wrapped signature with .{} default opens the record at the real bod
     // param line used to open a phantom record that closed on the same
     // line, so the real body never opened and the lock calls vanished
     // (0 issues instead of the baseline 1). Signature parens now bound
-    // the pending window, mirroring the ZT101 updatePending contract.
+    // the pending window, mirroring the ZT101 updatePending rule.
     const content =
         \\fn work() void {}
         \\fn setup(

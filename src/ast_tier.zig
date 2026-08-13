@@ -9,7 +9,7 @@
 //! that are impossible or unreliable line-based. It is strictly additive:
 //! line-tier rules and their baselines are unaffected.
 //!
-//! Degradation contract: when a file's parse produces errors the tree is
+//! Degradation guarantee: when a file's parse produces errors the tree is
 //! partial and `AstContext.ok` is false — AST rules skip the file and the
 //! line tier still covers it. Files that nest delimiters or prefix
 //! operators past `max_nesting_depth` skip the same way before the parse
@@ -141,7 +141,7 @@ pub const max_nesting_depth: usize = 512;
 /// the cheap first gate, this is the guarantee that needs no grammar
 /// assumptions. 64 KiB sits past ZA702's exceptional-file threshold
 /// (50 KB default), so real code is unaffected. Over-cap files degrade
-/// to line-tier coverage, the same contract as parse errors.
+/// to line-tier coverage, the same guarantee as parse errors.
 pub const max_ast_file_bytes: usize = 64 * 1024;
 
 /// Carried state for the pre-scan: two counters that estimate live
@@ -1329,7 +1329,7 @@ pub fn analyzeFileAstTier(
     }
     // Deep delimiter or operator nesting SIGSEGVs the recursive host
     // parser mid-run (EPH-I0191). Degrade to line-tier coverage, the
-    // same contract as parse errors.
+    // same guarantee as parse errors.
     if (exceedsNestingBudget(content, max_nesting_depth)) {
         if (out.stats) |s| s.skipped += 1;
         return;

@@ -23772,7 +23772,17 @@ fn isInSafeContext(t: []const u8) bool {
     return hasTestingCall(code);
 }
 
-/// Check if .? unwrap is followed by usage (unsafe)
+/// Check if .? unwrap is followed by usage (unsafe).
+///
+/// The terminator family `;`, `,`, `)` after `.?` stays silent: the
+/// unwrapped value is complete at the terminator — bound (`const v =
+/// opt.?;`), returned (`return opt.?;`), or passed (`foo(opt.?)`,
+/// `foo(opt.?, x)`). The rule targets unwraps used in-line in a larger
+/// expression. Return and argument positions deliberately do not count as
+/// usage (band-B12 F25 decision, EPH-I0509, 2026-08-13): they carry the
+/// same terminator-complete shape as the bind, and the audit alternative
+/// (drop `;` and `)`, keep `,`) would split one family on no semantic
+/// difference while firing on the deliberate-bind pin (EPH-I0220).
 fn isUnsafeUnwrapUsage(t: []const u8, col: usize) bool {
     if (col + 2 >= t.len) return false;
     const after = mem.trim(u8, t[col + 2 ..], " \t");
@@ -24063,21 +24073,26 @@ fn intersectPredChecks(ctx: NullMeetCtx, bid: usize) !bool {
 
 /// Check for unsafe .? unwrap on a line
 fn checkOptionalUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
-    const col = mem.indexOf(u8, line.t, ".?") orelse return;
     if (isInSafeContext(line.t)) return;
-    if (!isUnsafeUnwrapUsage(line.t, col)) return;
-    const var_name = extractUnwrappedVar(line.t, col) orelse return;
-    if (line.checked_set.contains(var_name)) return;
-    if (hasEarlyReturnNullGuard(ctx.lines, line.idx, var_name)) return;
-    try ctx.issues.append(ctx.allocator, .{
-        .file = ctx.file_path,
-        .line = line.line_num,
-        .col = col + 1,
-        .severity = .warning,
-        .rule = RULE_OPTIONAL_UNWRAP_UNSAFE,
-        .message = "optional unwrap (.?) may panic if null",
-        .help = "use 'orelse' for safe unwrap, or check for null with 'if'",
-    });
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, line.t, pos, ".?")) |col| {
+        pos = col + 2;
+        // Per-site suppression: a bare `opt.?;` clears only its own site,
+        // so a second real unwrap on the line still fires (band-B12 F24).
+        if (!isUnsafeUnwrapUsage(line.t, col)) continue;
+        const var_name = extractUnwrappedVar(line.t, col) orelse continue;
+        if (line.checked_set.contains(var_name)) continue;
+        if (hasEarlyReturnNullGuard(ctx.lines, line.idx, var_name)) continue;
+        try ctx.issues.append(ctx.allocator, .{
+            .file = ctx.file_path,
+            .line = line.line_num,
+            .col = col + 1,
+            .severity = .warning,
+            .rule = RULE_OPTIONAL_UNWRAP_UNSAFE,
+            .message = "optional unwrap (.?) may panic if null",
+            .help = "use 'orelse' for safe unwrap, or check for null with 'if'",
+        });
+    }
 }
 
 /// Check for unsafe .* deref on a nullable pointer (ZA802, EPH-I0219).
@@ -24089,20 +24104,25 @@ fn checkOptionalUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
 /// classifyNullCheck accepts the following-block exit and the meet places
 /// the fall-through fact only where the guard dominates (EPH-I0488).
 fn checkOptionalDeref(ctx: NullSafetyCtx, line: NullLineCtx) !void {
-    const col = mem.indexOf(u8, line.t, ".*") orelse return;
     if (isInSafeContext(line.t)) return;
-    const var_name = extractDerefVar(line.t, col) orelse return;
-    if (!ctx.nullable_ptrs.contains(var_name)) return;
-    if (line.checked_set.contains(var_name)) return;
-    try ctx.issues.append(ctx.allocator, .{
-        .file = ctx.file_path,
-        .line = line.line_num,
-        .col = col + 1,
-        .severity = .warning,
-        .rule = RULE_ORELSE_QUESTION_UNSAFE,
-        .message = "dereferencing nullable pointer without a null check",
-        .help = "check for null before dereferencing",
-    });
+    var pos: usize = 0;
+    while (mem.indexOfPos(u8, line.t, pos, ".*")) |col| {
+        pos = col + 2;
+        const var_name = extractDerefVar(line.t, col) orelse continue;
+        if (!ctx.nullable_ptrs.contains(var_name)) continue;
+        if (line.checked_set.contains(var_name)) continue;
+        // Per-site scan: a checked first deref clears only its own site,
+        // so a second deref on the line still fires (band-B12 F24).
+        try ctx.issues.append(ctx.allocator, .{
+            .file = ctx.file_path,
+            .line = line.line_num,
+            .col = col + 1,
+            .severity = .warning,
+            .rule = RULE_ORELSE_QUESTION_UNSAFE,
+            .message = "dereferencing nullable pointer without a null check",
+            .help = "check for null before dereferencing",
+        });
+    }
 }
 
 /// Phase 3: Check for unsafe unwraps on a line
@@ -24400,12 +24420,14 @@ fn checkCatchUnreachable(ctx: CatchVerdictCtx) ?Issue {
         const split = rest.len == 0 or mem.startsWith(u8, rest, "//");
         if (split and !probeSplitVerdict(ctx.next_lines, "unreachable")) continue;
         if (!split and !startsWithVerdict(rest, "unreachable")) continue;
-        // Suppress inside @TypeOf() — compile-time only, never executed at runtime
-        if (isInsideTypeOf(ctx.t, site.col, ctx.preceding_lines)) return null;
+        // Suppress inside @TypeOf() — compile-time only, never executed at
+        // runtime. Per-site: a suppression clears only the site it names,
+        // so a later real catch on the line still fires (band-B12 F24).
+        if (isInsideTypeOf(ctx.t, site.col, ctx.preceding_lines)) continue;
         // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe
-        if (isBufPrintCatchUnreachable(ctx.t, ctx.preceding_lines)) return null;
+        if (isBufPrintCatchUnreachable(ctx.t, ctx.preceding_lines)) continue;
         // Suppress stdlib functions called with string literals (parseIp("0.0.0.0", ...))
-        if (isSafeStdlibLiteralCall(ctx.t, ctx.preceding_lines)) return null;
+        if (isSafeStdlibLiteralCall(ctx.t, ctx.preceding_lines)) continue;
         return .{
             .file = ctx.path,
             .line = ctx.line,
@@ -27733,21 +27755,91 @@ fn isForRangeIndex(t: []const u8, ident: []const u8) bool {
 /// Does this line bound the casted value? Any one guard class suffices:
 /// comparison against an upper limit (`x < N`, `x <= N`), an exit guard on
 /// the over-limit path (`if (x >= N) return`), a maxInt/minInt comparison,
-/// @min/@max clamping, a std.math.cast checked conversion, a range-for
-/// index capture (`for (0..N) |i|`), or a const-from-literal declaration
-/// (comptime-known value).
+/// an @min/@max clamp assigned to the casted value, a std.math.cast checked
+/// conversion, or a const-from-literal declaration (comptime-known value).
+/// The range-for index capture is scope-checked by the caller (band-B12
+/// F26d). The threshold magnitude is text-only: any `x > N`/`x <= N` counts
+/// as a bound, no value analysis (band-B12 F26b). String/char literals and
+/// the trailing comment never establish a proof (band-B12 F26c).
 fn lineBoundsCastValue(t: []const u8, ident: []const u8) bool {
-    if (!mentionsIdent(t, ident)) return false;
-    if (mem.indexOf(u8, t, "std.math.cast(") != null) return true;
-    if (mem.indexOf(u8, t, "@min(") != null) return true;
-    if (mem.indexOf(u8, t, "@max(") != null) return true;
-    if (mem.indexOf(u8, t, "maxInt") != null) return true;
-    if (mem.indexOf(u8, t, "minInt") != null) return true;
-    if (hasComparisonOp(t, '<')) return true;
-    if (hasComparisonOp(t, '>') and hasExitKeyword(t)) return true;
-    if (isConstLiteralInit(t, ident)) return true;
-    if (isForRangeIndex(t, ident)) return true;
+    var mask_buf: [256]u8 = undefined;
+    const code = if (t.len > mask_buf.len) t else maskLineLiterals(t, &mask_buf);
+    if (!mentionsIdent(code, ident)) return false;
+    if (mem.indexOf(u8, code, "std.math.cast(") != null) return true;
+    if (isClampAssignment(code, ident)) return true;
+    if (mem.indexOf(u8, code, "maxInt") != null) return true;
+    if (mem.indexOf(u8, code, "minInt") != null) return true;
+    if (hasComparisonOp(code, '<')) return true;
+    if (hasComparisonOp(code, '>') and hasExitKeyword(code)) return true;
+    if (isConstLiteralInit(code, ident)) return true;
     return false;
+}
+
+/// `IDENT = @min(...)` / `IDENT = @max(...)` — the clamp result assigned to
+/// the casted value bounds it. `const y = @min(x, 255);` proves nothing
+/// about x (band-B12 F26a): the clamp argument is not the bounded value.
+/// Comparison operators (`==`, `!=`, `<=`, `>=`) are not assignments.
+fn isClampAssignment(t: []const u8, ident: []const u8) bool {
+    if (mem.indexOf(u8, t, "@min(") == null and mem.indexOf(u8, t, "@max(") == null)
+        return false;
+    const eq = mem.lastIndexOfScalar(u8, t, '=') orelse return false;
+    if (eq > 0 and (t[eq - 1] == '=' or t[eq - 1] == '!' or
+        t[eq - 1] == '<' or t[eq - 1] == '>')) return false;
+    var lhs = mem.trim(u8, t[0..eq], " \t");
+    if (mem.startsWith(u8, lhs, "const ")) lhs = mem.trim(u8, lhs["const ".len..], " \t");
+    if (mem.startsWith(u8, lhs, "var ")) lhs = mem.trim(u8, lhs["var ".len..], " \t");
+    return mem.eql(u8, lhs, ident);
+}
+
+/// Mask string/char literals and the trailing comment with spaces, so the
+/// bounds arms see only code (band-B12 F26c: `const s = "x < 5";` must not
+/// read as a comparison proof). Lines longer than the buffer keep their raw
+/// text — the F26c shape on such lines stays a documented residual.
+fn maskLineLiterals(t: []const u8, buf: []u8) []const u8 {
+    const ls = types.LiteralState.forLine(t) orelse return t;
+    var state = ls;
+    for (t, 0..) |c, i| {
+        if (i >= buf.len) return t;
+        buf[i] = if (state.updateForChar(t, i) != null) c else ' ';
+    }
+    return buf[0..t.len];
+}
+
+/// Net brace balance of a line's code. Call with the literal-masked line:
+/// a `}` inside a string or comment must not close a loop body (band-B12
+/// F26d).
+fn braceBalance(t: []const u8) isize {
+    var balance: isize = 0;
+    for (t) |c| {
+        if (c == '{') balance += 1;
+        if (c == '}') balance -= 1;
+    }
+    return balance;
+}
+
+/// True when a range-for header on the line proves the casted value, for
+/// the two caller shapes: the same-line prefix and the lookback. The
+/// lookback's `depth` (net braces between the cast and the header) must be
+/// >= 0 — a negative depth means the loop body closed before the cast.
+/// A `}` on the header line closes the body on that line, so a cast below
+/// the line is outside the loop (band-B12 F26d).
+///
+/// Residual (batch 27 review F-1, EPH-I0944): a `}` on a non-`\\` line
+/// after a mid-line `\\` opener (invalid Zig) drives the lookback's depth
+/// negative here, so a genuine header below is rejected and the cast fires
+/// a spurious ZA904 note. Documented, not fixed; same status as the
+/// >256-col raw-line residual in maskLineLiterals.
+fn isRangeForProof(t: []const u8, ident: []const u8, depth: isize) bool {
+    if (depth < 0) return false;
+    if (!isForRangeIndex(t, ident)) return false;
+    const for_pos = mem.indexOf(u8, t, "for (") orelse return false;
+    return mem.indexOfScalarPos(u8, t, for_pos + 4, '}') == null;
+}
+
+/// Masked copy of `t` in `buf`, or the raw line when it is too long for
+/// the buffer (band-B12 F26c residual, documented in maskLineLiterals).
+fn maskOrRaw(t: []const u8, buf: []u8) []const u8 {
+    return if (t.len > buf.len) t else maskLineLiterals(t, buf);
 }
 
 /// Bounded lookback (10 lines) over the current line's prefix and the
@@ -27755,6 +27847,22 @@ fn lineBoundsCastValue(t: []const u8, ident: []const u8) bool {
 /// Stops at function boundaries — a guard in another function proves
 /// nothing. Comment/multiline-string lines are skipped with the same
 /// discipline as the detection pass (patterns.md F1).
+///
+/// Residual (batch 27 review F-1, EPH-I0944): a non-`\\` line after a
+/// mid-line `\\` opener (`const msg = \\usage` then `} text`) is code
+/// under the line model — EPH-I0671: the opener swallows only its own
+/// line, and LiteralState.forLine treats only `\\`-starting lines as
+/// whole-line data — so the continuation line's `}` feeds braceBalance
+/// as a real brace. The depth then goes negative and a genuine range-for
+/// header below is rejected, so a provably-bounded cast fires a spurious
+/// ZA904 note. Pre-fix code was silent on the shape. The shape is invalid
+/// Zig (a multiline string is a run of consecutive `\\` lines; ZR104
+/// already flags the file) and shows no corpus delta in the A/B corpus
+/// (zls/ghostty/sig/tigerbeetle byte-identical). Same status as the
+/// >256-col raw-line residual documented in maskLineLiterals: named, not
+/// fixed. A fix needs a cross-line literal-state model that must not
+/// swallow the string's own terminator line in valid Zig (`; }`), or a
+/// parse-validity gate for line rules.
 fn hasCastBoundsProof(
     lines: []const []const u8,
     idx: usize,
@@ -27763,15 +27871,22 @@ fn hasCastBoundsProof(
 ) bool {
     const prefix = mem.trim(u8, lines[idx][0..cast_col], " \t\r");
     if (lineBoundsCastValue(prefix, ident)) return true;
+    var pbuf: [256]u8 = undefined;
+    if (isRangeForProof(maskOrRaw(prefix, &pbuf), ident, 0)) return true;
     const lookback = 10;
     const start = if (idx > lookback) idx - lookback else 0;
     var i = idx;
+    var depth: isize = 0;
     while (i > start) {
         i -= 1;
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (isFuncBoundary(t)) return false;
-        if (lineBoundsCastValue(t, ident)) return true;
+        var mask_buf: [256]u8 = undefined;
+        const code = maskOrRaw(t, &mask_buf);
+        if (isRangeForProof(code, ident, depth)) return true;
+        if (lineBoundsCastValue(code, ident)) return true;
+        depth += braceBalance(code);
     }
     return false;
 }
@@ -28863,8 +28978,15 @@ fn parseTestOutput(
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
-        if (isPanicLine(t))
+        // One classification per line (band-B12 F23): a FAIL line that also
+        // carries `panic:` is a panicking test's summary — the panic is the
+        // failure cause, so it wins and the duplicate ZR104 stays silent.
+        // A real runner emits the panic and the FAIL summary on separate
+        // lines, so both rules still fire on separate lines (EPH-I0489).
+        if (isPanicLine(t)) {
             try handlePanicLine(ctx, t, verbose);
+            continue;
+        }
         if (mem.startsWith(u8, t, "FAIL"))
             try handleFailLine(ctx, t, verbose);
     }
@@ -28880,8 +29002,9 @@ fn extractFileLocation(text: []const u8) FileLocation {
     // Look for pattern: /path/to/file.zig:123 or file.zig:123:45
     var i: usize = 0;
     while (i < text.len) : (i += 1) {
-        // Find .zig extension
-        const is_zig = i + 4 < text.len and mem.eql(u8, text[i .. i + 4], ".zig");
+        // Find .zig extension. The suffix bound reads <= so a .zig name at
+        // end of text still matches (band-B12 F23).
+        const is_zig = i + 4 <= text.len and mem.eql(u8, text[i .. i + 4], ".zig");
         if (!is_zig) continue;
         // Find start of filename (backtrack to last space or start)
         var start = i;
@@ -28906,7 +29029,9 @@ fn parseLocationLine(text: []const u8, file_end: usize) ?usize {
     while (line_end < text.len and text[line_end] >= '0' and text[line_end] <= '9')
         line_end += 1;
     if (line_end == file_end + 1) return null;
-    return std.fmt.parseInt(usize, text[file_end + 1 .. line_end], 10) catch 0;
+    // Overflow reads as no location (null), never a fake line 0 — line 0
+    // is not a valid source line (band-B12 F23).
+    return std.fmt.parseInt(usize, text[file_end + 1 .. line_end], 10) catch null;
 }
 
 // ============================================================================
@@ -36336,10 +36461,11 @@ test "extractFileLocation parses file:line shapes" {
         .{ .input = "src/main.zig:42", .file = "src/main.zig", .line = 42 },
         .{ .input = "no location here", .file = "unknown", .line = 0 },
         .{ .input = "x.zig:notdigits", .file = "x.zig", .line = 0 },
-        // A bare .zig name at end of input is not matched: the scan
-        // requires one byte past the extension (i + 4 < len).
-        .{ .input = "bare.zig", .file = "unknown", .line = 0 },
-        // Line numbers that overflow usize parse to 0 (catch 0).
+        // A bare .zig name at end of input matches: the suffix bound reads
+        // <=, so the file is located with no line number (band-B12 F23).
+        .{ .input = "bare.zig", .file = "bare.zig", .line = 0 },
+        // Line numbers that overflow usize read as no location (null), so
+        // the fallback anchors at the file with line 0 (band-B12 F23).
         .{ .input = "x.zig:99999999999999999999999999999 x", .file = "x.zig", .line = 0 },
         // The first .zig match wins, even when a later one carries the
         // line number.
@@ -36358,8 +36484,9 @@ test "parseLocationLine parses the :NN suffix after a file name" {
     try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig:", 5));
     try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig:abc", 5));
     try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig", 5));
-    // Overflowing line numbers parse to 0, not null (catch 0).
-    try std.testing.expectEqual(@as(?usize, 0), parseLocationLine("f.zig:99999999999999999999999999", 5));
+    // Overflowing line numbers read as no location (null), never a fake
+    // line 0 (band-B12 F23, EPH-I0508).
+    try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig:99999999999999999999999999", 5));
 }
 
 test "classifyGPALine routes every gpa_classifications pattern to its rule" {
@@ -36474,16 +36601,17 @@ test "parseTestOutput stays silent on clean output" {
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "parseTestOutput emits both panic and failure for a FAIL panic line" {
+test "parseTestOutput emits one classification for a FAIL panic line (EPH-I0508 F23)" {
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
-    // The panic check runs first, so the panic finding lands first
-    // (EPH-I0230 pin of the double classification).
+    // One classification per line: the panic is the failure cause, so a
+    // line matching both markers emits the panic finding only. The
+    // duplicate ZR104 stays silent (band-B12 F23; the EPH-I0230 double
+    // classification is superseded).
     try parseTestOutput(allocator, &issues, "FAIL panic: x", false);
-    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
-    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[1].rule);
 }
 
 test "handleMemoryLeak builds an owned message from the next line" {
@@ -44772,6 +44900,56 @@ test "analyzeCFGMemory ZA801 silent on bare unwrap statement (EPH-I0220)" {
         "test_za801_bare_unwrap.zig",
         RULE_OPTIONAL_UNWRAP_UNSAFE,
     ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 fires on a second unwrap site after a bare first (EPH-I0508 F24)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A bare `opt.?;` statement suppresses only its own site; the second
+    // unwrap on the line is a real usage and must still fire (band-B12 F24).
+    const content =
+        \\fn f(opt: ?u32, other: ?u32) void {
+        \\    const a = opt.?; use(other.? + 1);
+        \\    _ = a;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_second_site.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_second_site.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 1);
+}
+
+test "analyzeCFGMemory ZA802 fires on a second deref site after a checked first (EPH-I0508 F24)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The checked set suppresses p's deref; the second deref of q on the
+    // same line must still fire (band-B12 F24).
+    const content =
+        \\fn f(p: ?*u32, q: ?*u32) void {
+        \\    if (p != null) {
+        \\        const a = p.*; q.* = 1;
+        \\        _ = a;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_second_site.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_second_site.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 1);
 }
 
 test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
@@ -64350,6 +64528,37 @@ test "ZA202 catch unreachable fires via analyzeErrors" {
     try std.testing.expect(found);
 }
 
+test "ZA202 second catch site fires after a @TypeOf-suppressed first (EPH-I0508 F24)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The @TypeOf suppression clears only the first catch site; the second
+    // real catch unreachable on the same line must still fire (band-B12 F24).
+    const test_content =
+        \\fn f() void {
+        \\    const T = @TypeOf(bar() catch unreachable); baz() catch unreachable;
+        \\    _ = T;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_second_site.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_second_site.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "test_za202_second_site.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
 test "ZA203 orelse unreachable fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -80406,6 +80615,107 @@ test "ZA904: range-for index casts stay silent, item casts still fire" {
         countRuleIssues(run.issues.items, "app_forloop.zig", RULE_INTCAST_NO_BOUNDS),
     );
     try std.testing.expectEqual(@as(usize, 8), run.issues.items[0].line);
+}
+
+test "ZA904: @min clamp for a different variable does not suppress (EPH-I0510 F26a)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const y = @min(x, 255);` bounds y, not x — the casted x must still
+    // fire (band-B12 F26a: the clamp must target the casted value).
+    const content =
+        \\fn other_clamp(x: u32) u8 {
+        \\    const y = @min(x, 255);
+        \\    _ = y;
+        \\    return @as(u8, @intCast(x));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_other_clamp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_other_clamp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: string-literal comparisons never prove a bound (EPH-I0510 F26c)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const s = "x < 5";` mentions x and carries a `<` — string data,
+    // never a bounds proof (band-B12 F26c).
+    const content =
+        \\fn str_proof(x: u32) u8 {
+        \\    const s = "x < 5";
+        \\    _ = s;
+        \\    return @as(u8, @intCast(x));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_str_proof.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_str_proof.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: range-for index proof does not cross the loop closing brace (EPH-I0510 F26d)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The cast sits after the loop's closing brace: the range-for header
+    // no longer bounds the shadowed i (band-B12 F26d).
+    const content =
+        \\fn after_loop(n: usize) void {
+        \\    for (0..n) |i| {
+        \\        use(i);
+        \\    }
+        \\    use8(@intCast(i));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_after_loop.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_after_loop.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: range-for proof survives a braced multiline string in the loop body (EPH-I0510 F26d)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A multiline string with brace content sits between the header and
+    // the cast: the `\\{`/`\\}` lines are whole-line string data (skipped
+    // by isCommentOrMultilineString), so the depth stays 0 and the header
+    // proves the in-loop cast (band-B12 F26d). The invalid-Zig
+    // continuation shape (`const msg = \\usage` then `} text`) stays a
+    // documented residual (EPH-I0944).
+    const content =
+        \\fn braced_msg(n: usize) void {
+        \\    for (0..n) |i| {
+        \\        const msg = \\{
+        \\        \\}
+        \\        ;
+        \\        use8(@intCast(i));
+        \\        _ = msg;
+        \\    }
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_braced_msg.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_braced_msg.zig", RULE_INTCAST_NO_BOUNDS),
+    );
 }
 
 // ============================================================================

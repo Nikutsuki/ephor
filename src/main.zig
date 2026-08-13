@@ -26295,14 +26295,21 @@ fn hasShortCircuitGuardOnPriorLines(
 /// Check for endsWith/startsWith guard on prior lines
 /// Zig semantics: mem.endsWith(str, suffix) implies str.len >= suffix.len
 /// Pattern: assert(mem.endsWith(var, "X")) on prior line protects var.len - "X".len
+/// The exit probe matches on word boundaries over the comment-stripped
+/// text (hasExitStatement), so a `returnValue` identifier or a
+/// `// return here` trailing comment does not arm a phantom exit guard
+/// (EPH-I0932).
 fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) bool {
     // Look back within the same block (up to function boundary)
     const check_start = if (current_idx > 10) current_idx - 10 else 0;
-    for (lines[check_start..current_idx]) |line| {
+    for (lines[check_start..current_idx], check_start..) |line, i| {
         const ctx = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        // Stop at function boundary
-        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+        // The function's own signature (index 0) is not a guard source;
+        // skip it so a guard line between the signature and the
+        // candidate still engages. A signature deeper in the window is
+        // a scope boundary (EPH-I0931).
+        if (i > 0 and isFuncBoundary(ctx)) return false;
 
         // Check for endsWith or startsWith patterns in assert
         // Pattern: assert(mem.endsWith(...)) or std.debug.assert(std.mem.endsWith(...))
@@ -26312,8 +26319,8 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
             // If there's an assert on this line, it's a guard
             if (mem.indexOf(u8, ctx, "assert(") != null) return true;
             if (mem.indexOf(u8, ctx, "assert (") != null) return true;
-            // Also check for conditional early returns: if (!endsWith) return;
-            if (mem.indexOf(u8, ctx, "return") != null) return true;
+            // Also check for conditional early exits: if (!endsWith) return;
+            if (hasExitStatement(ctx)) return true;
         }
     }
     return false;
@@ -26612,10 +26619,14 @@ fn hasAssertGeGuard(
     decrement_amount: ?usize,
 ) bool {
     const check_start = if (current_idx > 5) current_idx - 5 else 0;
-    for (lines[check_start..current_idx]) |line| {
+    for (lines[check_start..current_idx], check_start..) |line, i| {
         const ctx = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+        // The function's own signature (index 0) is not a guard source;
+        // skip it so an assert between the signature and the candidate
+        // still engages. A signature deeper in the window is a scope
+        // boundary (EPH-I0931).
+        if (i > 0 and isFuncBoundary(ctx)) return false;
         if (assertLineCoversDecrement(ctx, var_name, decrement_amount)) return true;
     }
     return false;
@@ -26652,7 +26663,11 @@ fn hasEarlyReturnLengthGuard(
     while (i < current_idx) : (i += 1) {
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        if (isFuncBoundary(ctx)) return false;
+        // The function's own signature (index 0) is not a guard source;
+        // skip it so a `.len` guard between the signature and the
+        // candidate still engages. A signature deeper in the window is
+        // a scope boundary (EPH-I0931).
+        if (i > 0 and isFuncBoundary(ctx)) return false;
         if (!isLenGuardLine(ctx)) continue;
         if (!lenGuardMatchesBase(ctx, base)) continue;
         if (hasExitStatement(ctx)) return true;
@@ -26784,23 +26799,38 @@ fn initValueExceedsSubtrahend(ctx: []const u8, subtrahend: usize) bool {
 
 /// Check if loop initialization guarantees minimum index value
 /// A `var i = N` init (N >= subtrahend), with no reassignment of i
-/// between the init and the candidate, proves the subtraction cannot
-/// underflow. The candidate must sit inside a loop body (EPH-I0497):
-/// without the loop the init says nothing about the iteration; a
-/// reassignment (`i = 0`) between init and use breaks the proof. The
+/// between the init and the end of the loop body, proves the
+/// subtraction cannot underflow. The candidate must sit inside a loop
+/// body (EPH-I0497): without the loop the init says nothing about the
+/// iteration; a reassignment (`i = 0`) anywhere in the body, before or
+/// after the candidate, breaks the proof — an after-candidate write
+/// still reaches the next iteration's candidate run (EPH-I0934). The
 /// window is 20 lines and stops at the function boundary.
 fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
     const info = extractIndexSubtraction(current_line) orelse return false;
-    if (!hasEnclosingLoopHeader(lines, current_idx)) return false;
-    return hasInitWitness(lines, current_idx, info);
+    const enclosing = findEnclosingLoop(lines, current_idx) orelse return false;
+    return hasInitWitness(lines, current_idx, info, enclosing.close);
 }
 
 /// True when a prior declaration initializes `info.idx_var` to a
 /// literal at least `info.subtrahend` with no reassignment between
-/// (EPH-I0497, EPH-I0499). The 20-line window stops at the function
-/// boundary. Shared by the [i - N] iteration form (hasLoopInitGuard)
-/// and the [0 .. x - N] slice-end form (hasRangeEndInitGuard).
-fn hasInitWitness(lines: []const []const u8, current_idx: usize, info: IdxSub) bool {
+/// (EPH-I0497, EPH-I0499). The reassignment scan covers
+/// [init + 1, reassign_end): the caller extends the end past the
+/// candidate to the INNERMOST enclosing loop body's close, so a
+/// loop-body write after the candidate still breaks the proof
+/// (EPH-I0934). The bound names the innermost loop only: a write in an
+/// outer loop's body after the inner loop's close sits beyond
+/// reassign_end and stays unscanned — the EPH-I0934 residual is the
+/// outer-loop write (EPH-I0931 review F2). The 20-line window stops at
+/// the function boundary. Shared by the [i - N] iteration form
+/// (hasLoopInitGuard) and the [0 .. x - N] slice-end form
+/// (hasRangeEndInitGuard).
+fn hasInitWitness(
+    lines: []const []const u8,
+    current_idx: usize,
+    info: IdxSub,
+    reassign_end: usize,
+) bool {
     const check_start = if (current_idx > 20) current_idx - 20 else 0;
     for (lines[check_start..current_idx], check_start..) |line, init_idx| {
         const ctx = mem.trim(u8, line, " \t\r");
@@ -26812,8 +26842,7 @@ fn hasInitWitness(lines: []const []const u8, current_idx: usize, info: IdxSub) b
         // window (check_start > 0) the first window line is an
         // arbitrary mid-function line: a signature there is a boundary
         // like any other (batch 24 review F-A).
-        if (init_idx > 0 and
-            mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+        if (init_idx > 0 and isFuncBoundary(ctx)) return false;
 
         const has_var = mem.indexOf(u8, ctx, "var ") != null;
         const has_const = mem.indexOf(u8, ctx, "const ") != null;
@@ -26822,7 +26851,7 @@ fn hasInitWitness(lines: []const []const u8, current_idx: usize, info: IdxSub) b
         if (!mentionsIdent(ctx, info.idx_var)) continue;
         if (mem.indexOf(u8, ctx, "= ") == null) continue;
         if (!initValueExceedsSubtrahend(ctx, info.subtrahend)) continue;
-        if (indexVarReassignedAfter(lines, init_idx + 1, current_idx, info.idx_var)) continue;
+        if (indexVarReassignedAfter(lines, init_idx + 1, reassign_end, info.idx_var)) continue;
         return true;
     }
     return false;
@@ -26895,20 +26924,23 @@ fn extractRangeEndSubtraction(t: []const u8) ?IdxSub {
 
 /// ZA903 witness for the `[0 .. x - N]` slice-end form: the end
 /// underflows when x < N, so the form fires unless a prior declaration
-/// initializes x to a literal >= N with no reassignment between
-/// (EPH-I0499). The slice end is evaluated once per expression, so no
-/// enclosing loop is required — unlike the [i - N] iteration form's
-/// hasLoopInitGuard. The witness covers only its own bracket: every
-/// LATER subtraction-bearing bracket must carry its own witness or
-/// scope guard, or the line still fires (batch 24 review F-B).
+/// initializes x to a literal >= N with no reassignment between the
+/// init and the scan end (EPH-I0499; the scan end extends to the loop
+/// body's close inside a loop — EPH-I0934). The slice end is evaluated
+/// once per expression, so no enclosing loop is required — unlike the
+/// [i - N] iteration form's hasLoopInitGuard. The witness covers only
+/// its own bracket: every LATER subtraction-bearing bracket must carry
+/// its own witness or scope guard, or the line still fires (batch 24
+/// review F-B).
 fn hasRangeEndInitGuard(
     lines: []const []const u8,
     current_idx: usize,
     current_line: []const u8,
 ) bool {
     const info = extractRangeEndSubtraction(current_line) orelse return false;
-    if (!hasInitWitness(lines, current_idx, info)) return false;
-    return everyLaterBracketWitnessed(lines, current_idx, current_line);
+    const scan_end = initReassignScanEnd(lines, current_idx);
+    if (!hasInitWitness(lines, current_idx, info, scan_end)) return false;
+    return everyLaterBracketWitnessed(lines, current_idx, current_line, scan_end);
 }
 
 /// True when every subtraction-bearing bracket AFTER the line's first
@@ -26923,6 +26955,7 @@ fn everyLaterBracketWitnessed(
     lines: []const []const u8,
     current_idx: usize,
     t: []const u8,
+    scan_end: usize,
 ) bool {
     var i: usize = 0;
     var past_first = false;
@@ -26940,9 +26973,9 @@ fn everyLaterBracketWitnessed(
             continue;
         }
         if (rangeEndSubOf(inside)) |rinfo| {
-            if (!hasInitWitness(lines, current_idx, rinfo)) return false;
+            if (!hasInitWitness(lines, current_idx, rinfo, scan_end)) return false;
         } else if (indexSubOf(inside)) |iinfo| {
-            if (!hasInitWitness(lines, current_idx, iinfo) and
+            if (!hasInitWitness(lines, current_idx, iinfo, scan_end) and
                 !hasEnclosingGuardForVar(lines, current_idx, iinfo.idx_var)) return false;
         } else return false;
         i = end;
@@ -26950,11 +26983,23 @@ fn everyLaterBracketWitnessed(
     return true;
 }
 
-/// True when `current_idx` sits inside a loop body: a `while`/`for`
-/// header line opens an enclosing block above the candidate before the
-/// function boundary. A loop that closed before the candidate does not
-/// enclose it (EPH-I0497).
-fn hasEnclosingLoopHeader(lines: []const []const u8, current_idx: usize) bool {
+/// The innermost loop whose body contains `current_idx`: the header
+/// index and the body's close line, or null. A loop that closed before
+/// the candidate does not enclose it: the header reads as an unclosed
+/// block only while the walk has not passed the loop's own closing
+/// brace, so the header candidate is verified by walking forward to
+/// the body's close (EPH-I0497, EPH-I0934). The close is part of the
+/// record: the reassignment-scan bound is the verified close, and the
+/// caller never recomputes it (EPH-I0931 review F4). The close is the
+/// brace-derived depth-0 line; a body the slice cuts (a nested
+/// signature splits the slice) bounds the scan at the slice end, the
+/// conservative fallback (EPH-I0931 review r2).
+const EnclosingLoop = struct {
+    header: usize,
+    close: usize,
+};
+
+fn findEnclosingLoop(lines: []const []const u8, current_idx: usize) ?EnclosingLoop {
     var brace_depth: i32 = 0;
     var i = current_idx;
     while (i > 0) {
@@ -26962,15 +27007,61 @@ fn hasEnclosingLoopHeader(lines: []const []const u8, current_idx: usize) bool {
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
-        if (isFuncBoundary(ctx)) return false;
-        if (isLoopBoundary(ctx) and brace_depth < 0) return true;
+        if (isFuncBoundary(ctx)) return null;
+        if (isLoopBoundary(ctx) and brace_depth < 0) {
+            const close = loopBodyCloseLine(lines, i);
+            if (close > current_idx) return .{ .header = i, .close = close };
+        }
     }
-    return false;
+    return null;
+}
+
+/// The line index where the loop body opened at `header_idx` closes:
+/// the first line from the header whose cumulative brace balance
+/// returns to zero. The scan never stops at a line that merely
+/// mentions `fn` — a string literal like `const pat = "fn (";` stays
+/// data, not a boundary — so the close is always the brace-derived
+/// depth-0 line (EPH-I0931 review r2). A body that never closes inside
+/// the function slice (a nested signature splits the slice, so the
+/// loop's own close is not in the slice) scans to the slice end: the
+/// bound is the slice end, and every after-write the slice can see
+/// stays covered (EPH-I0934).
+fn loopBodyCloseLine(lines: []const []const u8, header_idx: usize) usize {
+    var depth: i32 = 0;
+    var i = header_idx;
+    while (i < lines.len) : (i += 1) {
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        const balance = countCurlyBalance(ctx);
+        // A K&R loop header (`while (n > 0)` with `{` on the next line)
+        // opens no block on its own line: the depth-0 return here would
+        // close the body at the header and reject a real enclosing loop
+        // (EPH-I0931 review F1). A same-line `{}` body still closes at
+        // the header: it carries an opening brace, and an empty body
+        // holds no candidate line, so the header return stays correct.
+        if (i == header_idx and balance == 0 and !lineCarriesOpenBrace(ctx)) continue;
+        depth += balance;
+        if (depth <= 0) return i;
+    }
+    return lines.len;
+}
+
+/// The reassignment scan bound for the init witness: the end of the
+/// innermost enclosing loop's body when the candidate sits inside a
+/// loop — a write to the index var after the candidate still reaches
+/// the next iteration, so the init proof needs the whole body
+/// (EPH-I0934). Without a loop, the candidate line itself bounds the
+/// scan: the expression evaluates once (EPH-I0499).
+fn initReassignScanEnd(lines: []const []const u8, current_idx: usize) usize {
+    const enclosing = findEnclosingLoop(lines, current_idx) orelse return current_idx;
+    return enclosing.close;
 }
 
 /// True when any line in [start, end) reassigns `idx_var`: a
-/// reassignment between the init and the candidate breaks the init
-/// guard (EPH-I0497).
+/// reassignment between the init and the scan end breaks the init
+/// guard. The caller extends the end past the candidate to the loop
+/// body's close, so an after-candidate write still breaks the proof
+/// (EPH-I0497, EPH-I0934).
 fn indexVarReassignedAfter(
     lines: []const []const u8,
     start: usize,
@@ -26987,13 +27078,15 @@ fn indexVarReassignedAfter(
 
 /// True when `t` assigns `idx_var`: a plain or compound assignment
 /// (`i = 0`, `i -= 1`, `i += 1`, `i *= 2`) at an identifier-bounded
-/// occurrence. Comparisons (`i == 0`) and reads are not assignments
-/// (EPH-I0497).
+/// occurrence. Comparisons (`i == 0`) and reads are not assignments,
+/// and a switch prong shape (`0...i => 5`) is not an assignment
+/// (EPH-I0497, EPH-I0934).
 fn lineReassignsIndexVar(t: []const u8, idx_var: []const u8) bool {
     var from: usize = 0;
     while (nextBoundaryIdent(t, idx_var, &from)) |pos| {
         const after = mem.trimStart(u8, t[pos + idx_var.len ..], " \t");
         if (mem.startsWith(u8, after, "==")) continue;
+        if (mem.startsWith(u8, after, "=>")) continue;
         if (mem.startsWith(u8, after, "=")) return true;
         if (mem.startsWith(u8, after, "-=") or mem.startsWith(u8, after, "+=") or
             mem.startsWith(u8, after, "*=") or mem.startsWith(u8, after, "/=") or
@@ -27294,6 +27387,23 @@ fn lineOpensBlock(t: []const u8) bool {
         last_is_open = c == '{';
     }
     return last_is_open;
+}
+
+/// True when `t` has a code-position opening brace: a lone `{` opener
+/// or the open of a same-line `{}` pair. Unlike lineOpensBlock, the
+/// last brace need not be the open — `while (n > 0) {}` carries an
+/// open and qualifies. loopBodyCloseLine uses this to tell a K&R loop
+/// header (no brace at all) from a same-line empty body, which must
+/// keep closing at the header (EPH-I0931 review F1).
+fn lineCarriesOpenBrace(t: []const u8) bool {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t) orelse t.len;
+    for (t[0..comment_start], 0..) |c, i| {
+        if (c != '{') continue;
+        if (cls.isInsideString(i)) continue;
+        return true;
+    }
+    return false;
 }
 
 /// True when the candidate line sits in an else (or else-if) arm whose
@@ -69472,6 +69582,279 @@ test "hasInitWitness stops at a nested fn at the window edge (batch 24 review F-
     // boundary check turns the guard off, so the outer shape stays a
     // finding.
     try std.testing.expect(!hasRangeEndInitGuard(&lines, 23, lines[23]));
+}
+
+test "EPH-I0931: endsWith guard 3 lines below the signature engages (dead-zone)" {
+    // The guard sits 3 lines below the function signature, the candidate
+    // 5 lines below the guard. Pre-fix the increasing-order walk aborted
+    // at the signature (index 0) before reaching the guard line, so the
+    // candidate never got the suppression.
+    const lines = [_][]const u8{
+        "fn f(s: []const u8) usize {",
+        "    _ = s.len;",
+        "    _ = s[0];",
+        "    std.debug.assert(mem.endsWith(s, \"x\"));",
+        "    _ = s.len;",
+        "    _ = s[0];",
+        "    _ = s.len;",
+        "    _ = s[0];",
+        "    return s.len - 1;",
+        "}",
+    };
+    try std.testing.expect(hasEndsWithStartsWithGuard(&lines, 8));
+}
+
+test "EPH-I0931: assertGe guard 3 lines below the signature engages (dead-zone)" {
+    // The 5-line window spans the signature for a candidate at index 5:
+    // pre-fix the walk aborted at the signature before the assert line.
+    const lines = [_][]const u8{
+        "fn f(x: usize) usize {",
+        "    _ = x;",
+        "    _ = x;",
+        "    std.debug.assert(x >= 5);",
+        "    _ = x;",
+        "    return x - 1;",
+        "}",
+    };
+    try std.testing.expect(hasAssertGeGuard(&lines, 5, "x", 1));
+}
+
+test "EPH-I0931: early-return length guard 3 lines below the signature engages (dead-zone)" {
+    // The guard sits 3 lines below the function signature, the candidate
+    // 5 lines below the guard. Pre-fix the 30-line window aborted at the
+    // signature before the guard line.
+    const lines = [_][]const u8{
+        "fn f(s: []const u8, i: usize) usize {",
+        "    _ = s.len;",
+        "    _ = s[0];",
+        "    if (s.len == 0) return 0;",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    return s[i - 1];",
+        "}",
+    };
+    try std.testing.expect(hasEarlyReturnLengthGuard(&lines, 8, lines[8]));
+}
+
+test "EPH-I0931: loop-init witness 3 lines below the signature engages (dead-zone)" {
+    // The `var i = 5` init sits 3 lines below the signature, the
+    // candidate 5 lines below it. Batch 24's index-0 exemption already
+    // skips the signature; this pin locks the done-when shape.
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    _ = n;",
+        "    _ = arr.len;",
+        "    var i = 5;",
+        "    _ = i;",
+        "    while (n > 0) {",
+        "        _ = arr[i - 1];",
+        "        n -= 1;",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    try std.testing.expect(hasLoopInitGuard(&lines, 6, lines[6]));
+}
+
+test "EPH-I0932: endsWith guard ignores returnValue ident and trailing-comment return" {
+    // The return probe must match on word boundaries over the
+    // comment-stripped text: `returnValue` and a `// return here`
+    // trailing comment must not arm a phantom exit guard (F11 class,
+    // EPH-I0494 parity). The candidate sits at index 12 so the 10-line
+    // window (check_start 2) excludes the signature and reaches the
+    // guard line: the probe itself is under test, not the dead-zone.
+    const lines = [_][]const u8{
+        "fn f(s: []const u8) usize {",
+        "    _ = s.len;",
+        "    _ = s[0];",
+        "    if (mem.endsWith(s, \"x\")) returnValue = 1; // return here",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    return s.len - 1;",
+        "}",
+    };
+    try std.testing.expect(!hasEndsWithStartsWithGuard(&lines, 12));
+
+    // Positive control: a real return exit still arms the guard.
+    const armed = [_][]const u8{
+        "fn f(s: []const u8) usize {",
+        "    _ = s.len;",
+        "    _ = s[0];",
+        "    if (mem.endsWith(s, \"x\")) return 0;",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    _ = s[0];",
+        "    return s.len - 1;",
+        "}",
+    };
+    try std.testing.expect(hasEndsWithStartsWithGuard(&armed, 12));
+}
+
+test "EPH-I0934: loop-body write after the candidate breaks the init witness" {
+    // `i = 0;` runs after the candidate on each iteration and reaches
+    // the next iteration's candidate run, so the init proof needs the
+    // whole loop body. Pre-fix the reassignment scan stopped at the
+    // candidate line and the underflow stayed suppressed.
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    _ = n;",
+        "    var i = 5;",
+        "    while (n > 0) {",
+        "        n -= 1;",
+        "        _ = arr[i - 1];",
+        "        i = 0;",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    try std.testing.expect(!hasLoopInitGuard(&lines, 5, lines[5]));
+}
+
+test "EPH-I0934: switch range prong 0...i => does not count as a reassignment" {
+    // A range prong ending in the index var reads `i =>` after the
+    // boundary match; the `=` check must exclude the `=>` prong shape.
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    _ = n;",
+        "    var i = 5;",
+        "    while (n > 0) {",
+        "        n -= 1;",
+        "        switch (n) {",
+        "            0...i => return arr[0],",
+        "            else => {},",
+        "        }",
+        "        _ = arr[i - 1];",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    try std.testing.expect(hasLoopInitGuard(&lines, 9, lines[9]));
+}
+
+test "EPH-I0931 review F1: K&R loop header (brace on the next line) keeps the loop-init witness" {
+    // `while (n > 0)` carries no brace, so the body opens on the next
+    // line. Pre-fix loopBodyCloseLine returned the header itself (the
+    // depth-0 return at the brace-less header), findEnclosingLoop
+    // rejected it, and the init witness never engaged for K&R brace
+    // placement — a batch-28 regression that lost a working suppression.
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    _ = n;",
+        "    var i = 5;",
+        "    while (n > 0)",
+        "    {",
+        "        _ = arr[i - 1];",
+        "        n -= 1;",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    try std.testing.expect(hasLoopInitGuard(&lines, 5, lines[5]));
+}
+
+test "EPH-I0931 review F1: an empty same-line loop body never claims a later candidate" {
+    // `while (n > 0) {}` closes at the header: the empty body holds no
+    // candidate, so the close verification rejects it and the walk
+    // keeps looking outward to the real enclosing loop (the outer
+    // while). A naive "opened" loopBodyCloseLine scans past the header
+    // to the next depth-0 line (the nested if-block's close here), the
+    // empty loop falsely claims the candidate, and the scan bound stops
+    // BEFORE the outer-body write at `i = 0;` — a write that reaches
+    // the next outer iteration. The write stays unscanned and the
+    // underflow stays suppressed (the empty-body break the reviewer
+    // flagged, EPH-I0931 review F1).
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize, m: usize, q: bool) usize {",
+        "    _ = n;",
+        "    _ = m;",
+        "    _ = q;",
+        "    var i = 5;",
+        "    while (m > 0) {",
+        "        while (n > 0) {}",
+        "        if (q) {",
+        "            _ = arr[i - 1];",
+        "        }",
+        "        i = 0;",
+        "        m -= 1;",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    try std.testing.expect(!hasLoopInitGuard(&lines, 8, lines[8]));
+}
+
+test "EPH-I0931 review r2: a \"fn (\" string line cannot truncate the loop-body close (hasLoopInitGuard)" {
+    // `const pat = "fn (";` carries "fn " and "(" as substrings. The
+    // mid-scan isFuncBoundary check treated the line as a function
+    // boundary and truncated the body close to the line before it, so
+    // the after-write `i = 0;` below stayed unscanned and the init
+    // witness survived (false negative). The close must be the true
+    // depth-0 line, with the after-write inside the reassignment
+    // bound.
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    var i = 5;",
+        "    while (n > 0) {",
+        "        _ = arr[i - 1];",
+        "        _ = n;",
+        "        const pat = \"fn (\";",
+        "        i = 0;",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    try std.testing.expect(!hasLoopInitGuard(&lines, 3, lines[3]));
+}
+
+test "EPH-I0931 review r2: a \"fn (\" string line cannot truncate the scan bound (hasRangeEndInitGuard)" {
+    // The same mid-scan truncation reaches the range-end witness
+    // through initReassignScanEnd: the close bound shrank to the line
+    // before the string literal, the after-write `n = 0;` below stayed
+    // unscanned, and the witness survived (false negative).
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    var n = 5;",
+        "    while (n > 0) {",
+        "        _ = arr[0 .. n - 1][0];",
+        "        _ = arr[0];",
+        "        const pat = \"fn (\";",
+        "        n = 0;",
+        "    }",
+        "    return arr[0];",
+        "}",
+    };
+    try std.testing.expect(!hasRangeEndInitGuard(&lines, 3, lines[3]));
+}
+
+test "EPH-I0931 review r3: a slice-cut body's final-line write stays inside the scan bound" {
+    // The slice cuts the body: no closing brace follows, so
+    // loopBodyCloseLine takes the fallback close. The fallback was
+    // lines.len - 1, and the reassignment scan [init+1, close) skipped
+    // the slice's final line — the write `i = 0;` above the cut
+    // escaped the witness and the guard suppressed the finding (false
+    // negative). The fallback must be the slice end so the last line
+    // stays inside the scan bound.
+    const lines = [_][]const u8{
+        "fn f(arr: []usize, n: usize) usize {",
+        "    var i = 5;",
+        "    while (n > 0) {",
+        "        _ = arr[i - 1];",
+        "        i = 0;",
+    };
+    try std.testing.expect(!hasLoopInitGuard(&lines, 3, lines[3]));
 }
 
 test "ZA903: a range-end witness does not silence a later unwitnessed index (batch 24 review F-B)" {

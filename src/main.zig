@@ -13849,7 +13849,7 @@ fn checkSilentCatch(ctx: SilentCatchCtx) ?Issue {
     // ignores both value and error
     if (isDiscardedCatch(ctx.t)) return null;
     // Suppress catch {} on continuation lines of multi-line defer expressions
-    if (isDeferCatchMultiline(ctx.t, ctx.preceding_lines)) return null;
+    if (isDeferCatchMultiline(ctx.preceding_lines)) return null;
     // Suppress writer/stream catch {} — uses paren-balanced lookback for multi-line
     if (isStreamWriteCatchMultiline(ctx.t, ctx.preceding_lines)) return null;
     const found = findSilentCatchCol(ctx.t, ctx.next_lines) orelse return null;
@@ -17101,7 +17101,7 @@ fn isCleanupCatchForm(clc: CatchLineCtx) bool {
     if (mem.startsWith(u8, clc.t, "errdefer ")) return true;
     if (isDiscardedCatch(clc.t)) return true;
     if (isCleanupMethodCall(clc.t)) return true;
-    if (isDeferCatchMultiline(clc.t, clc.preceding)) return true;
+    if (isDeferCatchMultiline(clc.preceding)) return true;
     return isStreamWriteCatchMultiline(clc.t, clc.preceding);
 }
 
@@ -23623,46 +23623,6 @@ fn isSafeBuiltin(t: []const u8, type_ctx: ?*const TypeContext) bool {
     return compat.containsOptionalMethod(t);
 }
 
-/// Check if line is a statement pattern (not assignment/control flow)
-fn isStatementPattern(t: []const u8) bool {
-    if (!mem.endsWith(u8, t, ");")) return false;
-    const skip = [_][]const u8{
-        "const ", "var ",   "return ", "try ",   "_ = ",
-        "if ",    "while ", "for ",    "defer ", "errdefer ",
-        "}",
-    };
-    for (skip) |prefix| {
-        if (mem.startsWith(u8, t, prefix)) return false;
-    }
-    return mem.indexOf(u8, t, " catch ") == null;
-}
-
-/// Check if it's a known void function (safe to not capture result)
-fn isKnownVoidFunction(t: []const u8, type_ctx: ?*const TypeContext) bool {
-    // Stdlib cleanup patterns (.free, .destroy, .deinit) — always void
-    for (compat.getCleanupPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat) != null) return true;
-    }
-    // Return-type resolution (definitive when available)
-    if (type_ctx) |ctx| {
-        const rk = resolveReturnKind(ctx, t);
-        switch (rk) {
-            .void_type, .noreturn_type => return true,
-            .error_union, .value, .optional => return false,
-            .unknown => {}, // fall through to vocab
-        }
-    }
-    // Stdlib void methods — type-aware: .clear, .close, .reset only on stdlib vars;
-    // debug.print, assert always apply (universal patterns)
-    const stdlib_vars_ptr = if (type_ctx) |ctx| &ctx.stdlib_vars else null;
-    if (isMethodOnStdlibVar(t, stdlib_vars_ptr, compat.getVoidMethodPatterns())) return true;
-    // log.* with word boundary (std.log.info, std.log.warn, etc.)
-    if (mem.indexOf(u8, t, "log.")) |pos| {
-        if (pos == 0 or !isIdent(t[pos - 1])) return true;
-    }
-    return false;
-}
-
 /// Per-file context for the ignored-error scan (ZA205): output plumbing plus
 /// the file's type context used to recognize safe builtin discards.
 const IgnoredErrorFileCtx = struct {
@@ -24605,8 +24565,7 @@ fn isStreamWriteCatchMultiline(t: []const u8, preceding_lines: ?[]const []const 
 /// A terminated one-line `defer a();` never covers a catch on a later
 /// line: the statement boundary is judged first, so a `defer ` line that
 /// ends in `;`/`{`/`}` returns false before the keyword match (EPH-I0490).
-fn isDeferCatchMultiline(t: []const u8, preceding_lines: ?[]const []const u8) bool {
-    _ = t;
+fn isDeferCatchMultiline(preceding_lines: ?[]const []const u8) bool {
     const prev = preceding_lines orelse return false;
     // Walk backwards through preceding lines looking for `defer ` or `errdefer `
     // within the same expression (stop at semicolons and closing braces)
@@ -28063,6 +28022,11 @@ fn runRuntimeAnalysis(
 
     try parseGPADiagnostics(allocator, &issues, result.stderr, opts.verbose);
     try parseTestOutput(allocator, &issues, result.stdout, opts.verbose);
+    // Panics land on stderr on the pinned 0.16 runner (probe 2026-08-13:
+    // stdout stays empty, the crash block and the "panic:" line both go
+    // to stderr). Classify stderr beside stdout so a panicking fixture
+    // surfaces ZR105 instead of a bare ZR104 (EPH-I0489).
+    try parseTestOutput(allocator, &issues, result.stderr, opts.verbose);
 
     // Term is a tagged union in 0.16: a signal-killed child is .signal,
     // and reading .exited on it is a safety-checked panic (EPH-I0231).
@@ -28468,9 +28432,8 @@ fn handleRunnerBlock(
     for (lines) |line| try classifyGPATable(ctx, verbose, line);
 }
 
-/// Parse test output for failures and panics. The `" panic:"` form is a
-/// substring of `"panic:"`, so one match covers both markers
-/// (EPH-I0503).
+/// The `" panic:"` form is a substring of `"panic:"`, so one match covers
+/// both markers (EPH-I0503).
 fn isPanicLine(t: []const u8) bool {
     return mem.indexOf(u8, t, "panic:") != null;
 }
@@ -28497,13 +28460,18 @@ fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
     try emitLocatedIssue(ctx, fail_issue_spec, t);
 }
 
+/// Parse test output for failures and panics. Runs on the child's stdout
+/// and stderr: the pinned 0.16 runner sends the crash block, the `panic:`
+/// line, and the pass/fail summary all to stderr with stdout empty, while
+/// older runners use stdout. Scanning both streams keeps panics
+/// classifiable as ZR105 instead of a bare ZR104 (EPH-I0489).
 fn parseTestOutput(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
-    stdout_output: []const u8,
+    output: []const u8,
     verbose: bool,
 ) !void {
-    var lines = mem.splitScalar(u8, stdout_output, '\n');
+    var lines = mem.splitScalar(u8, output, '\n');
     const ctx = RuntimeEmitCtx{ .issues = issues, .allocator = allocator };
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
@@ -36851,6 +36819,38 @@ test "runRuntimeAnalysis reports ZR104 for a nonzero exit with no diagnostics" {
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expectEqualStrings("command failed", issues.items[0].message);
+}
+
+test "runRuntimeAnalysis reports ZR105 for a stderr panic (EPH-I0489)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The pinned 0.16 runner sends panics to stderr, not stdout (probe
+    // 2026-08-13). A panicking fixture must surface ZR105, never a bare
+    // ZR104 command failure.
+    const script_body =
+        \\echo 'thread 1 panic: boom at /x/proj/src/main.zig:42 now' >&2
+        \\exit 1
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "panic.sh", .data = script_body });
+    const script = try tmpFilePath(allocator, &tmp, "panic.sh");
+    defer allocator.free(script);
+    const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
+    defer allocator.free(cmd);
+
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = cmd },
+    );
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 42), issues.items[0].line);
 }
 
 test "runRuntimeAnalysis frees the partial findings list on a mid-parse failure" {
@@ -66655,25 +66655,25 @@ test "isDeferCatchMultiline: trailing comment must not hide a boundary (EPH-I078
         "    defer cleanup();",
         "    doWork(); // trailing comment",
     };
-    try std.testing.expect(!isDeferCatchMultiline("    risky() catch {};", &prev));
+    try std.testing.expect(!isDeferCatchMultiline(&prev));
     // The same miss through the block-opener boundary.
     const blk = [_][]const u8{
         "    defer cleanup();",
         "    if (x) { // trailing comment",
     };
-    try std.testing.expect(!isDeferCatchMultiline("        risky() catch {};", &blk));
+    try std.testing.expect(!isDeferCatchMultiline(&blk));
     // The genuine multi-line defer continuation still suppresses.
     const ok = [_][]const u8{
         "    defer std.fs.cwd()",
         "        .openFile(\"x\", .{})",
     };
-    try std.testing.expect(isDeferCatchMultiline("        .close() catch {};", &ok));
+    try std.testing.expect(isDeferCatchMultiline(&ok));
     // A boundary char inside the trailing comment is not a boundary.
     const cont = [_][]const u8{
         "    defer std.fs.cwd()",
         "        .openFile(\"x\", .{}) // note: {",
     };
-    try std.testing.expect(isDeferCatchMultiline("        .close() catch {};", &cont));
+    try std.testing.expect(isDeferCatchMultiline(&cont));
 }
 
 test "isDeferCatchMultiline: terminated one-line defer returns false (EPH-I0490)" {
@@ -66682,12 +66682,12 @@ test "isDeferCatchMultiline: terminated one-line defer returns false (EPH-I0490)
     // statement, not the defer's continuation. The boundary check comes
     // first (EPH-I0490).
     const prev = [_][]const u8{"    defer a();"};
-    try std.testing.expect(!isDeferCatchMultiline("    b() catch {};", &prev));
+    try std.testing.expect(!isDeferCatchMultiline(&prev));
     const er = [_][]const u8{"    errdefer cleanup();"};
-    try std.testing.expect(!isDeferCatchMultiline("    b() catch {};", &er));
+    try std.testing.expect(!isDeferCatchMultiline(&er));
     // A multi-line defer whose keyword line stays open still suppresses.
     const cont = [_][]const u8{"    defer std.fs.cwd()"};
-    try std.testing.expect(isDeferCatchMultiline("        .openFile(\"x\", .{}) catch {};", &cont));
+    try std.testing.expect(isDeferCatchMultiline(&cont));
 }
 
 test "ZA201 fires on a catch after a terminated one-line defer (EPH-I0490)" {

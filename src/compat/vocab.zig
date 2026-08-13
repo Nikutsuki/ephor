@@ -66,7 +66,7 @@ pub const ContainerMethod = struct {
 };
 
 /// Stdlib method whose return value is safe to discard (void, T, or ?T — not !T)
-/// Used by isSafeToDiscard, isSafeBuiltin, isKnownVoidFunction
+/// Used by isSafeToDiscard and isSafeBuiltin
 pub const SafeMethod = struct {
     /// Pattern for line matching: ".clear("
     pattern: []const u8,

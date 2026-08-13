@@ -731,7 +731,7 @@ pub const container_methods = [_]vocab.ContainerMethod{
 };
 
 /// Stdlib methods safe to discard (void or value-returning, not error-returning).
-/// Used by isSafeToDiscard, isSafeBuiltin, isKnownVoidFunction in main.zig.
+/// Used by isSafeToDiscard and isSafeBuiltin in main.zig.
 pub const safe_methods = [_]vocab.SafeMethod{
     // Void methods (container lifecycle)
     .{ .pattern = ".clear(", .is_void = true },

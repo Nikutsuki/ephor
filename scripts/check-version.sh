@@ -1,16 +1,22 @@
 #!/bin/sh
 # Validates all version references match before pushing a tagged release.
-# Usage: ./scripts/check-version.sh [expected_version]
+# Usage: ./scripts/check-version.sh [expected_version] [post-tag]
 #
 # If no version is given, extracts it from build.zig.zon as the source of truth.
+# The optional second argument "post-tag" names the post-tag mode: the
+# release runbook (REL-RELEASE-6) runs the script after pushing the tag, and
+# section 6 treats a remote tag that is not the expected version as MISMATCH.
+# The pre-push hook passes only the version; its tag does not exist on the
+# remote yet, so PENDING stays non-failing for the hook.
 #
 # Checked locations:
 #   1. build.zig.zon        .version field (source of truth)
 #   2. src/main.zig          EPHOR_VERSION constant
-#   3. README.md             manual install URL matches the latest remote tag
-#   4. README.md             example config "version" field
+#   3. README.md             every install URL matches the latest remote tag
+#   4. README.md             every example config "version" matches EXPECTED
 #   5. install.sh            EPHOR_FALLBACK_TAG matches the latest remote tag
 #   5b. install.ps1          EPHOR_FALLBACK_TAG matches install.sh's value
+#   5c. install.ps1          EPHOR_0_15_COMMIT matches install.sh's value
 #   6. Codeberg tags API     latest remote tag matches
 #   7. README.md             changelog header names the in-development version
 
@@ -68,33 +74,55 @@ else
     echo "ok       src/main.zig EPHOR_VERSION: ${MAIN_VERSION}"
 fi
 
-# 3. README.md install URL matches the latest remote tag.
-# The manual install URL must name the newest existing tag, never the
-# untagged version under development. Bump it to the release version in the
-# first post-tag commit so the pre-push hook passes while the tag is in flight.
-README_URL_VERSION=$(grep 'ephor/archive/v' README.md | head -1 | sed 's/.*\/v\([0-9][0-9.]*\)\.tar\.gz.*/\1/')
-if [ -z "$README_URL_VERSION" ]; then
+# 3. Every README.md install URL matches the latest remote tag.
+# The manual install URLs must name the newest existing tag, never the
+# untagged version under development. Bump them to the release version in
+# the first post-tag commit so the pre-push hook passes while the tag is in
+# flight. EPH-I0252: every match is checked, not just the first; a second
+# stale archive URL can no longer hide drift. REL-RELEASE-6.
+README_URL_COUNT=0
+README_URL_BAD=0
+for README_URL_VERSION in $(grep 'ephor/archive/v' README.md | sed 's/.*\/v\([0-9][0-9.]*\)\.tar\.gz.*/\1/'); do
+    README_URL_COUNT=$((README_URL_COUNT + 1))
+    if [ -z "$REMOTE_TAG" ]; then
+        echo "SKIP     README.md install URL: Codeberg tags API unreachable"
+        break
+    fi
+    if [ "$README_URL_VERSION" != "$REMOTE_TAG" ]; then
+        echo "MISMATCH README.md install URL: v${README_URL_VERSION} (latest remote tag v${REMOTE_TAG})"
+        ERRORS=$((ERRORS + 1))
+        README_URL_BAD=$((README_URL_BAD + 1))
+    fi
+done
+if [ "$README_URL_COUNT" -eq 0 ]; then
     echo "MISSING  README.md: no tagged install URL found"
     ERRORS=$((ERRORS + 1))
-elif [ -z "$REMOTE_TAG" ]; then
-    echo "SKIP     README.md install URL: Codeberg tags API unreachable"
-elif [ "$README_URL_VERSION" != "$REMOTE_TAG" ]; then
-    echo "MISMATCH README.md install URL: v${README_URL_VERSION} (latest remote tag v${REMOTE_TAG})"
-    ERRORS=$((ERRORS + 1))
-else
-    echo "ok       README.md install URL: v${README_URL_VERSION}"
+elif [ "$README_URL_BAD" -eq 0 ] && [ -n "$REMOTE_TAG" ]; then
+    echo "ok       README.md install URL: v${REMOTE_TAG}"
 fi
 
-# 4. README.md example config version
-README_CFG_VERSION=$(grep '"version":' README.md | grep -v '2\.0\.0' | head -1 | sed 's/.*"\([0-9][0-9.]*\)".*/\1/')
-if [ -z "$README_CFG_VERSION" ]; then
+# 4. Every README.md example config version matches the expected version.
+# A "version" line belongs to the ephor.json example when it sits directly
+# above the example's "path_dir" line. The VS Code tasks.json example
+# (README.md:797, "version": "2.0.0") has no path_dir line and stays out of
+# the check by context, never by a magic version literal. EPH-I0252: every
+# example is checked, not just the first; the pairing must stay adjacent or
+# the section fails closed with MISSING.
+README_CFG_COUNT=0
+README_CFG_BAD=0
+for README_CFG_VERSION in $(grep -B1 '"path_dir"' README.md | grep '"version":' | sed 's/.*"\([0-9][0-9.]*\)".*/\1/'); do
+    README_CFG_COUNT=$((README_CFG_COUNT + 1))
+    if [ "$README_CFG_VERSION" != "$EXPECTED" ]; then
+        echo "MISMATCH README.md example config: ${README_CFG_VERSION} (expected ${EXPECTED})"
+        ERRORS=$((ERRORS + 1))
+        README_CFG_BAD=$((README_CFG_BAD + 1))
+    fi
+done
+if [ "$README_CFG_COUNT" -eq 0 ]; then
     echo "MISSING  README.md: no example config version found"
     ERRORS=$((ERRORS + 1))
-elif [ "$README_CFG_VERSION" != "$EXPECTED" ]; then
-    echo "MISMATCH README.md example config: ${README_CFG_VERSION} (expected ${EXPECTED})"
-    ERRORS=$((ERRORS + 1))
-else
-    echo "ok       README.md example config: ${README_CFG_VERSION}"
+elif [ "$README_CFG_BAD" -eq 0 ]; then
+    echo "ok       README.md example config: ${EXPECTED}"
 fi
 
 # 5. install.sh EPHOR_FALLBACK_TAG matches the latest remote tag.
@@ -131,11 +159,44 @@ else
     echo "ok       install.ps1 EPHOR_FALLBACK_TAG: v${PS1_FALLBACK}"
 fi
 
+# 5c. install.ps1 EPHOR_0_15_COMMIT matches install.sh's value. Both
+# installers pin the same pre-0.15-era archive commit; they must never
+# diverge (EPH-I0286). A missing install.sh pin is MISSING, not SKIP:
+# section 5b can skip on a missing install.sh fallback only because
+# section 5 already fails on that condition, while nothing else covers
+# install.sh's commit pin. install.sh:144 assembles the pre-0.15 archive
+# URL from it. REL-RELEASE-6.
+SH_COMMIT=$(grep 'EPHOR_0_15_COMMIT=' install.sh | head -1 \
+    | sed 's/.*"\([0-9a-f]\{40\}\)".*/\1/')
+PS1_COMMIT=$(grep 'EPHOR_0_15_COMMIT = ' install.ps1 | head -1 \
+    | sed 's/.*"\([0-9a-f]\{40\}\)".*/\1/')
+if [ -z "$PS1_COMMIT" ]; then
+    echo "MISSING  install.ps1: EPHOR_0_15_COMMIT not found"
+    ERRORS=$((ERRORS + 1))
+elif [ -z "$SH_COMMIT" ]; then
+    echo "MISSING  install.sh: EPHOR_0_15_COMMIT not found"
+    ERRORS=$((ERRORS + 1))
+elif [ "$PS1_COMMIT" != "$SH_COMMIT" ]; then
+    echo "MISMATCH install.ps1 EPHOR_0_15_COMMIT: ${PS1_COMMIT}" \
+        "(install.sh ${SH_COMMIT})"
+    ERRORS=$((ERRORS + 1))
+else
+    echo "ok       install.ps1 EPHOR_0_15_COMMIT: ${PS1_COMMIT}"
+fi
+
 # 6. Codeberg tags API - latest remote tag
+# The post-tag mode (second argument "post-tag") asserts the tag IS the
+# latest remote tag: the release runbook runs the script after pushing the
+# tag, and PENDING becomes MISMATCH so a failed or missing push cannot pass
+# the gate. EPH-I0252. The pre-push hook never passes the post-tag mode;
+# its tag does not exist on the remote yet. REL-RELEASE-6.
 if [ -z "$REMOTE_TAG" ]; then
     echo "SKIP     Codeberg tags API: could not reach (offline?)"
 elif [ "$REMOTE_TAG" = "$EXPECTED" ]; then
     echo "ok       Codeberg latest tag: v${REMOTE_TAG}"
+elif [ "${2:-}" = "post-tag" ]; then
+    echo "MISMATCH Codeberg latest tag: v${REMOTE_TAG} (expected v${EXPECTED}: tag not on the remote)"
+    ERRORS=$((ERRORS + 1))
 else
     echo "PENDING  Codeberg latest tag: v${REMOTE_TAG} (will be v${EXPECTED} after push)"
 fi
@@ -175,6 +236,7 @@ if [ "$ERRORS" -gt 0 ]; then
     echo "FAILED: ${ERRORS} version mismatch(es) found"
     echo "  Sections 1, 2, 4, and 7 must be ${EXPECTED} before tagging v${EXPECTED}."
     echo "  Sections 3 and 5 must match the latest remote tag."
+    echo "  Sections 5b and 5c pins must agree across install.sh and install.ps1."
     exit 1
 else
     echo "All versions match: ${EXPECTED}"

@@ -1,15 +1,16 @@
 #!/bin/sh
 # Pre-push hook for ephor (open-source-bound).
 # 1. Secret pattern scan of pushed commits
-# 2. Quality gate on main pushes (fmt, build, test)
-# 3. Version consistency on tag pushes
+# 2. Quality gate and version consistency on main pushes
+# 3. Version consistency on new tag pushes (re-pushes of existing tags skip)
 # 4. Block personal dev files (.opencode/, opencode.json)
 
 fail=0
+zero_sha="0000000000000000000000000000000000000000"
 
 while read local_ref local_sha remote_ref remote_sha; do
     # Determine the commit range being pushed
-    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    if [ "$remote_sha" = "$zero_sha" ]; then
         range="$local_sha"
     else
         range="${remote_sha}..${local_sha}"
@@ -32,7 +33,11 @@ while read local_ref local_sha remote_ref remote_sha; do
         fail=1
     fi
 
-    # 2. Quality gate on pushes to main (fmt + build + test)
+    # 2. Quality gate on pushes to main (fmt + build + test) plus version
+    # consistency (EPH-I0655, REL-RELEASE-6): the post-tag fallback refresh
+    # lands on a main push, and a fallback that names a tag the remote does
+    # not have must not ship. check-version.sh sections 3/5/6 skip when the
+    # tags API is unreachable, so an offline push still passes.
     case "$local_ref" in
         refs/heads/main)
             echo "Running pre-push quality gate..."
@@ -48,18 +53,40 @@ while read local_ref local_sha remote_ref remote_sha; do
                 echo "PUSH BLOCKED: zig build test failed"
                 fail=1
             fi
+            if [ -f scripts/check-version.sh ]; then
+                if ! ./scripts/check-version.sh; then
+                    echo "PUSH BLOCKED: version mismatch"
+                    fail=1
+                fi
+            fi
             ;;
     esac
 
-    # 3. Version consistency on tag pushes
+    # 3. Version consistency on NEW tag pushes. Re-pushing a tag that already
+    # exists on the remote (a rewritten history, EPH-I0930) can never match
+    # the working-tree version, so the comparison would block the re-push
+    # forever. The secret and personal-file scans above cover the pushed
+    # delta only when the old tag commit resolves locally. After a history
+    # rewrite (git filter-repo) the old commit is pruned, the diff yields
+    # nothing, and the hook prints a manual-review NOTE instead.
     case "$local_ref" in
         refs/tags/v*)
             TAG_VERSION=$(echo "$local_ref" | sed 's|refs/tags/v||')
-            echo "Checking version consistency for tag v${TAG_VERSION}..."
-            if [ -f scripts/check-version.sh ]; then
-                if ! ./scripts/check-version.sh "$TAG_VERSION"; then
-                    echo "PUSH BLOCKED: version mismatch"
-                    fail=1
+            if [ "$remote_sha" = "$zero_sha" ]; then
+                echo "Checking version consistency for tag v${TAG_VERSION}..."
+                if [ -f scripts/check-version.sh ]; then
+                    if ! ./scripts/check-version.sh "$TAG_VERSION"; then
+                        echo "PUSH BLOCKED: version mismatch"
+                        fail=1
+                    fi
+                fi
+            else
+                if git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+                    echo "Re-pushing existing tag v${TAG_VERSION}: version check skipped"
+                else
+                    echo "NOTE: the pushed delta for tag v${TAG_VERSION} cannot be computed."
+                    echo "      The old tag commit ${remote_sha} does not resolve locally."
+                    echo "      Review the pushed commits manually before this push."
                 fi
             fi
             ;;

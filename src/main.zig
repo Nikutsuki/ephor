@@ -24519,8 +24519,14 @@ fn isBufPrintCatchUnreachable(t: []const u8, preceding_lines: ?[]const []const u
     return hasBufPrintCall(call_line);
 }
 
-/// Check if `catch unreachable` comes from a stdlib function that is provably
-/// safe when called with a string literal argument (e.g., parseIp("0.0.0.0", port)).
+/// Heuristic: `catch unreachable` after a stdlib parse call with a string
+/// literal first argument (parseIp("0.0.0.0", port)) is treated as
+/// deliberate. The call can still fail at runtime on a malformed literal
+/// (parseIp4("10.0.0.256", 0) returns an error), so the suppression is a
+/// heuristic for the well-formed-literal shape, not a proof — the
+/// malformed-literal panic stays an accepted false negative. Decision
+/// recorded (band-B12 F12, EPH-I0505): the doc arm, because a textual
+/// analyzer cannot verify comptime validation of the literal.
 fn isSafeStdlibLiteralCall(t: []const u8, preceding_lines: ?[]const []const u8) bool {
     const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
     const safe_fns = [_][]const u8{
@@ -25798,7 +25804,11 @@ fn isArrayLenCFGGuarded(ctx: GuardLineCtx) bool {
 fn isArrayIndexGuarded(ctx: GuardLineCtx) bool {
     if (mem.indexOf(u8, ctx.t, "-|") != null) return true;
     if (hasIndexGuardOnLine(ctx.t)) return true;
-    if (hasShortCircuitGuardOnPriorLines(ctx.lines, ctx.idx)) return true;
+    // The prior-line short-circuit guard binds the index var: a guard on
+    // another var proves nothing (band-B12 F17, EPH-I0506).
+    if (extractIndexExprLoc(ctx.t)) |expr| {
+        if (hasShortCircuitGuardOnPriorLines(ctx.lines, ctx.idx, expr.var_name)) return true;
+    }
     if (isArrayLenCFGGuarded(ctx)) return true;
     if (hasEndsWithStartsWithGuard(ctx.lines, ctx.idx)) return true;
     if (hasElseBranchGuard(ctx.lines, ctx.idx)) return true;
@@ -26111,7 +26121,13 @@ fn extractDecrementVar(t: []const u8, decrement_pos: usize) ?[]const u8 {
     return null;
 }
 
-/// Check if variable is signed type in context
+/// Heuristic: a variable declared with a signed type is treated as safe to
+/// decrement without an overflow guard. The assumption is documented, not
+/// proven: a signed decrement at the type minimum still panics (illegal
+/// behavior in safe builds) — `var x: i32 = minInt(i32); x -= 1;` is an
+/// accepted false negative (band-B12 F16, EPH-I0505). Decision recorded:
+/// the doc arm, no lower-bound guard requirement — the suppression targets
+/// the common small-positive counting shape.
 fn isSignedVarInContext(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
     const check_start = if (current_idx > 10) current_idx - 10 else 0;
     for (lines[check_start .. current_idx + 1]) |line| {
@@ -26161,13 +26177,32 @@ fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bo
     return false;
 }
 
-/// Check for short-circuit guard on prior lines (multi-line expressions)
-/// Pattern: assert(offset == 0 or switch { .x => values[offset - 1] });
-/// Based on Zig short-circuit evaluation - RHS only evaluated when LHS fails
-fn hasShortCircuitPattern(ctx: []const u8) bool {
-    const pats = [_][]const u8{ "== 0 or", "!= 0 and", "> 0 and" };
-    for (pats) |p| {
-        if (mem.indexOf(u8, ctx, p) != null) return true;
+/// True when `t` carries a short-circuit zero-exclusion on `var_name` at
+/// or before `limit`: `i == 0 or`, `i != 0 and`, `i !=0 and`, `i > 0
+/// and`. The short-circuit shape excludes zero from the right side, so
+/// an index subtraction there cannot underflow. The comparison's left
+/// side must be the var — a pattern whose operand is another var, or the
+/// pattern right of the index expression, proves nothing (band-B12 F17,
+/// EPH-I0506). The shape assumes the index sits in the short-circuit
+/// right side; an `if` body after the condition stays an accepted
+/// residual (same as pre-fix).
+fn hasShortCircuitGuardForVar(t: []const u8, var_name: []const u8, limit: usize) bool {
+    // One comment-start walk per call; a fresh classifier per pattern
+    // (EPH-I0416: classifier queries must ascend).
+    const comment_start = findCommentStart(t);
+    const pats = [_][]const u8{ "== 0 or", "!= 0 and", "!=0 and", "> 0 and" };
+    for (pats) |pat| {
+        var cls = LineClassifier.init(t);
+        var from: usize = 0;
+        while (mem.indexOfPos(u8, t, from, pat)) |pos| {
+            from = pos + pat.len;
+            if (pos >= limit) break;
+            if (cls.isInsideString(pos)) continue;
+            if (comment_start != null and pos >= comment_start.?) continue;
+            const lhs_start = identStartBefore(t, pos) orelse continue;
+            const lhs = mem.trim(u8, t[lhs_start..pos], " \t");
+            if (mem.eql(u8, lhs, var_name)) return true;
+        }
     }
     return false;
 }
@@ -26185,13 +26220,18 @@ const DelimScanResult = struct {
 };
 
 /// Scan a line's characters updating delimiter counts, checking for guard at unmatched open-paren
-fn scanLineDelimiters(ctx: []const u8, parens: usize, braces: usize) DelimScanResult {
+fn scanLineDelimiters(
+    ctx: []const u8,
+    parens: usize,
+    braces: usize,
+    index_var: []const u8,
+) DelimScanResult {
     var cp = parens;
     var cb = braces;
     for (ctx) |c| {
         if (c == ')') cp += 1;
         if (c == '(' and cp > 0) cp -= 1;
-        if (c == '(' and cp == 0 and hasShortCircuitPattern(ctx))
+        if (c == '(' and cp == 0 and hasShortCircuitGuardForVar(ctx, index_var, ctx.len))
             return .{ .close_parens = cp, .close_braces = cb, .found_guard = true };
         if (c == '}') cb += 1;
         if (c == '{' and cb > 0) cb -= 1;
@@ -26199,7 +26239,11 @@ fn scanLineDelimiters(ctx: []const u8, parens: usize, braces: usize) DelimScanRe
     return .{ .close_parens = cp, .close_braces = cb, .found_guard = false };
 }
 
-fn hasShortCircuitGuardOnPriorLines(lines: []const []const u8, current_idx: usize) bool {
+fn hasShortCircuitGuardOnPriorLines(
+    lines: []const []const u8,
+    current_idx: usize,
+    index_var: []const u8,
+) bool {
     // The guard lives on a prior line of the same multi-line expression.
     // The `;` break at depth 0 bounds most scans to the statement start.
     // The 10-line window caps a pathological open-delimiter continuation
@@ -26213,12 +26257,12 @@ fn hasShortCircuitGuardOnPriorLines(lines: []const []const u8, current_idx: usiz
         line_idx -= 1;
         const ctx = mem.trim(u8, lines[line_idx], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        const r = scanLineDelimiters(ctx, close_parens, close_braces);
+        const r = scanLineDelimiters(ctx, close_parens, close_braces, index_var);
         if (r.found_guard) return true;
         close_parens = r.close_parens;
         close_braces = r.close_braces;
         if ((close_parens > 0 or close_braces > 0) and
-            hasShortCircuitPattern(ctx)) return true;
+            hasShortCircuitGuardForVar(ctx, index_var, ctx.len)) return true;
         if (close_parens == 0 and close_braces == 0 and
             ctx.len > 0 and ctx[ctx.len - 1] == ';') break;
         if (isFuncBoundary(ctx)) break;
@@ -27121,10 +27165,25 @@ fn extractArrayBaseFromIndexArithmetic(t: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Check for else/else-if branch guards
+/// Position of the `if` keyword on `t` at a left word boundary, or null.
+/// The keyword must sit before a `(` after optional spaces: `if (x)` and
+/// `if(x)` match; `diff (x)` and `serif(x)` do not (band-B12 F17,
+/// EPH-I0506).
+fn ifKeywordPos(t: []const u8) ?usize {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "if")) |pos| {
+        from = pos + 2;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        var j = pos + 2;
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+        if (j < t.len and t[j] == '(') return pos;
+    }
+    return null;
+}
+
 /// Check if a line contains an if statement
 fn lineHasIf(ctx: []const u8) bool {
-    return mem.indexOf(u8, ctx, "if (") != null or mem.indexOf(u8, ctx, "if(") != null;
+    return ifKeywordPos(ctx) != null;
 }
 
 /// Check if an if-condition line has comparison patterns that imply a guard in the else branch
@@ -27236,57 +27295,273 @@ fn hasElseBranchGuard(lines: []const []const u8, current_idx: usize) bool {
     return false;
 }
 
-/// Check for basic short-circuit or loop guard patterns on a line
-fn hasBasicIndexGuard(t: []const u8) bool {
+/// The first `[x - y]` index expression on a line: the open bracket's
+/// position and the index var (a plain ident/dot chain). A bracket whose
+/// index var is not a plain chain — a call-result or compound index — is
+/// descended, never skipped, so a nested `[i - 1]` inside it still binds
+/// a same-line guard (`a[b[i - 1]]` under `if (i > 0)` extracts `i`).
+/// Null when the line has no such bracket (band-B12 F17, EPH-I0506).
+const IndexExprLoc = struct {
+    var_name: []const u8,
+    bracket_pos: usize,
+};
+
+fn extractIndexExprLoc(t: []const u8) ?IndexExprLoc {
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '[') continue;
+        const end = findMatchingBracket(t, i) orelse continue;
+        const inside = t[i + 1 .. end];
+        const sub = findIndexSubtraction(inside) orelse {
+            i = end;
+            continue;
+        };
+        const var_text = mem.trim(u8, inside[0..sub], " \t");
+        if (var_text.len == 0 or !isIdent(var_text[0]) or !isPlainIdentChain(var_text)) {
+            // Descend into the bracket: a nested `[i - 1]` inside a
+            // compound index still binds a same-line guard (EPH-I0506).
+            continue;
+        }
+        return .{ .var_name = var_text, .bracket_pos = i };
+    }
+    return null;
+}
+
+/// True when every byte of `s` is an identifier byte or a dot.
+fn isPlainIdentChain(s: []const u8) bool {
+    for (s) |ch| {
+        if (!isIdent(ch) and ch != '.') return false;
+    }
+    return true;
+}
+
+/// True when `t` has a lower-bound or zero-exclusion comparison on
+/// `var_name` at or before `limit`: `>`, `>=` (not the `->` or `=>`
+/// arrows), and `!=` with a literal-zero right side. The comparison's
+/// left side must be the var; an upper-bound comparison (`<`, `<=`)
+/// proves no lower bound, and a comparison on another var guards
+/// nothing. A `!= 0` arm with an `or`-tail proves nothing: `x != 0 or
+/// y` runs the guarded body when y holds and x == 0, so the subtraction
+/// can underflow. The `>` arm has no tail discipline — `x > 0 or y`
+/// stays an accepted residual, the shape the pre-fix `> 0` substring
+/// matched (band-B12 F17, EPH-I0506).
+fn hasLowerBoundGuardForVar(t: []const u8, var_name: []const u8, limit: usize) bool {
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    const scan_end = @min(limit, t.len);
+    var i: usize = 0;
+    while (i < scan_end) : (i += 1) {
+        const is_gt = t[i] == '>' and isGtComparisonAt(t, i);
+        const zero_end = neqZeroEndAt(t, i);
+        if (!is_gt and zero_end == null) continue;
+        if (cls.isInsideString(i)) continue;
+        if (comment_start != null and i >= comment_start.?) continue;
+        // An `or`-tail re-enters zero on its right side (`x != 0 or y`
+        // runs the guarded body when y holds and x == 0); an `and`-tail
+        // keeps the exclusion. The `>` arm has no tail discipline —
+        // `x > 0 or y` stays an accepted residual (band-B12 F17,
+        // EPH-I0506).
+        if (zero_end != null and mem.startsWith(u8, t[zero_end.?..], " or")) continue;
+        if (comparisonLhsIsVar(t, i, var_name)) return true;
+    }
+    return false;
+}
+
+/// True when the `>` at `pos` starts a lower-bound comparison: `>` or
+/// `>=`, but not the `->` pointer arrow, the `=>` switch arrow, or the
+/// `>>` shift.
+fn isGtComparisonAt(t: []const u8, pos: usize) bool {
+    if (pos > 0 and (t[pos - 1] == '-' or t[pos - 1] == '=')) return false;
+    return pos + 1 >= t.len or t[pos + 1] != '>';
+}
+
+/// Position right after the literal zero when the `!=` at `pos` compares
+/// against it (`i != 0`, `i !=0`), else null. A non-zero right side
+/// proves nothing about underflow.
+fn neqZeroEndAt(t: []const u8, pos: usize) ?usize {
+    if (pos + 1 >= t.len or t[pos] != '!' or t[pos + 1] != '=') return null;
+    var j = pos + 2;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j >= t.len or t[j] != '0') return null;
+    if (j + 1 < t.len and (isIdent(t[j + 1]) or t[j + 1] == '.')) return null;
+    return j + 1;
+}
+
+/// True when the ident/dot chain ending at `op_pos` (skipping spaces) is
+/// `var_name`. A literal or a call-result left side (`0 < x`, `f(i) > 0`)
+/// binds nothing.
+fn comparisonLhsIsVar(t: []const u8, op_pos: usize, var_name: []const u8) bool {
+    const start = identStartBefore(t, op_pos) orelse return false;
+    const lhs = mem.trim(u8, t[start..op_pos], " \t");
+    return mem.eql(u8, lhs, var_name);
+}
+
+/// Check for the basic same-line index guard shapes: a `while` header
+/// with a lower-bound comparison on the index var, the short-circuit
+/// zero-exclusion forms, and the `.len`-derived endsWith/startsWith
+/// guard. Every arm binds the index var and sits left of the index
+/// expression (band-B12 F17, EPH-I0506).
+fn hasBasicIndexGuard(t: []const u8, expr: IndexExprLoc) bool {
     // Token-matched: "while" in a string literal or trailing comment never
     // fakes a loop guard (EPH-I0298).
-    if (hasToken(t, "while") and mem.indexOf(u8, t, "> 0") != null) return true;
-    // Code-position match: the independent arms ("== 0 or", "!= 0 and",
-    // "endsWith", "startsWith") count only as real code — comment prose
-    // like `// endsWith` never fakes a guard (EPH-I0874).
-    const basic_pats = [_][]const u8{ "== 0 or", "!= 0 and", "!=0 and", "endsWith", "startsWith" };
-    return containsAnyPatternInCode(t, &basic_pats);
+    if (hasToken(t, "while") and
+        hasLowerBoundGuardForVar(t, expr.var_name, expr.bracket_pos)) return true;
+    if (hasShortCircuitGuardForVar(t, expr.var_name, expr.bracket_pos)) return true;
+    return hasEndsWithGuardForIndex(t, expr);
 }
 
-/// Check for comparison guard combined with `and` keyword
-fn hasAndComparisonGuard(t: []const u8) bool {
-    // Token-matched: "and" in a string literal or trailing comment never
-    // fakes the conjunction (EPH-I0298).
-    if (!hasToken(t, "and")) return false;
-    // Code-position match: comparison prose in a comment or string never
-    // fakes the guard (EPH-I0874).
-    const cmp_pats = [_][]const u8{ " > ", " >= ", " != " };
-    return containsAnyPatternInCode(t, &cmp_pats);
-}
-
-/// Check for if-else expression guard patterns
-fn hasIfElseExprGuard(t: []const u8) bool {
-    if (mem.indexOf(u8, t, " else ") == null) return false;
-    if (!lineHasIf(t)) return false;
-    if (mem.indexOf(u8, t, ".len < ") != null) return true;
-    if (mem.indexOf(u8, t, ".len <= ") != null) return true;
-    return hasComparisonBeforeElse(t);
-}
-
-/// Check if a comparison operator appears before the else keyword
-fn hasComparisonBeforeElse(t: []const u8) bool {
-    const else_pos = mem.indexOf(u8, t, " else ") orelse return false;
-    const ops = [_][]const u8{ "== 0)", " < ", " <= " };
-    for (ops) |op| {
-        if (mem.indexOf(u8, t, op)) |pos| {
-            if (pos < else_pos) return true;
+/// The `.len`-derived same-line guard: `mem.endsWith(s, ".zig") and
+/// s[s.len - 1]`. A non-empty needle proves the base's length is at
+/// least 1, so `s.len - 1` cannot underflow. The call must sit left of
+/// the index, its first argument must be the index var's base, and the
+/// needle must be a non-empty string literal — a call on another var,
+/// a call right of the index, or an empty needle proves nothing
+/// (band-B12 F17, EPH-I0506).
+fn hasEndsWithGuardForIndex(t: []const u8, expr: IndexExprLoc) bool {
+    if (!mem.endsWith(u8, expr.var_name, ".len")) return false;
+    const base = expr.var_name[0 .. expr.var_name.len - ".len".len];
+    if (base.len == 0) return false;
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    const calls = [_][]const u8{ "endsWith(", "startsWith(" };
+    for (calls) |call| {
+        var from: usize = 0;
+        while (mem.indexOfPos(u8, t, from, call)) |pos| {
+            from = pos + call.len;
+            if (pos >= expr.bracket_pos) break;
+            if (cls.isInsideString(pos)) continue;
+            if (comment_start != null and pos >= comment_start.?) continue;
+            if (endsWithCallGuardsBase(t, pos, call, base)) return true;
         }
     }
     return false;
 }
 
-fn hasIndexGuardOnLine(t: []const u8) bool {
-    if (hasBasicIndexGuard(t)) return true;
-    if (hasAndComparisonGuard(t)) return true;
-    if (mem.indexOf(u8, t, "if (") != null) {
-        if (mem.indexOf(u8, t, "> ") != null or mem.indexOf(u8, t, ">= ") != null) return true;
+/// True when the endsWith/startsWith call at `pos` guards `base`: the
+/// base chain sits before the call (`s.endsWith(...)`) or as the first
+/// argument (`mem.endsWith(s, ...)`), and the needle argument is a
+/// non-empty string literal. A call on another var or an empty needle
+/// proves nothing.
+fn endsWithCallGuardsBase(t: []const u8, pos: usize, call: []const u8, base: []const u8) bool {
+    // Method form: the chain before the call ends with the method name;
+    // the base sits before the final dot.
+    const method = call[0 .. call.len - 1];
+    if (identStartBefore(t, pos + method.len)) |start| {
+        const chain = mem.trim(u8, t[start .. pos + method.len], " \t");
+        if (methodChainGuardsBase(chain, method, base) and
+            needleLiteralGuardsBase(t, pos + call.len)) return true;
     }
-    return hasIfElseExprGuard(t);
+    // Free-function form: the first argument is the base chain.
+    var j = pos + call.len;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    const first_start = j;
+    while (j < t.len and (isIdent(t[j]) or t[j] == '.')) j += 1;
+    if (j == first_start or j >= t.len or t[j] != ',') return false;
+    if (!mem.eql(u8, mem.trim(u8, t[first_start..j], " \t"), base)) return false;
+    return needleLiteralGuardsBase(t, j + 1);
+}
+
+/// True when `chain` is `base.method`: the chain ends with the method
+/// name, the byte before it is a dot, and the base matches.
+fn methodChainGuardsBase(chain: []const u8, method: []const u8, base: []const u8) bool {
+    if (chain.len <= method.len) return false;
+    const base_end = chain.len - method.len - 1;
+    return chain[base_end] == '.' and
+        mem.eql(u8, chain[chain.len - method.len ..], method) and
+        mem.eql(u8, chain[0..base_end], base);
+}
+
+/// True when a non-empty double-quoted string literal follows `pos`
+/// (after optional spaces): the endsWith needle. An empty, non-literal,
+/// or unterminated needle proves no length lower bound.
+fn needleLiteralGuardsBase(t: []const u8, pos: usize) bool {
+    var j = pos;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j >= t.len or t[j] != '"') return false;
+    const needle_open = j + 1;
+    j = needle_open;
+    while (j < t.len and t[j] != '"') {
+        if (t[j] == '\\') j += 1;
+        j += 1;
+    }
+    return j < t.len and j > needle_open;
+}
+
+/// The `and`-conjunction shape: `if (i > 0 and i < n) a[i - 1];`. The
+/// conjunction requires a lower-bound comparison on the index var left
+/// of the index expression; a comparison right of the index (`a[i - 1]
+/// > 0 and ...`) or on another var counts for nothing (band-B12 F17,
+/// EPH-I0506).
+fn hasAndComparisonGuard(t: []const u8, expr: IndexExprLoc) bool {
+    // Token-matched: "and" in a string literal or trailing comment never
+    // fakes the conjunction (EPH-I0298).
+    if (!hasToken(t, "and")) return false;
+    return hasLowerBoundGuardForVar(t, expr.var_name, expr.bracket_pos);
+}
+
+/// The same-line `if` shape: `if (i > 0) return a[i - 1];`. The `if`
+/// must be a whole keyword and the lower-bound comparison must sit left
+/// of the index expression (band-B12 F17, EPH-I0506).
+fn hasIfExprGuard(t: []const u8, expr: IndexExprLoc) bool {
+    if (ifKeywordPos(t) == null) return false;
+    return hasLowerBoundGuardForVar(t, expr.var_name, expr.bracket_pos);
+}
+
+/// True when the if-condition region before `else_pos` excludes zero
+/// from the else arm: the condition `i == 0`, `i <= 0`, or `i < 1` (the
+/// else arm then runs only for i != 0, i > 0, or i >= 1). An `and`-tail
+/// is excluded — its negation no longer dominates. An `or`-tail keeps
+/// the exclusion on the `<= 0` and `< 1` arms: the negated disjunction
+/// forces the var side. The `== 0` arm never matches an or-tail — its
+/// pattern demands the `)` right after the zero. An `i < n`-with-larger-
+/// literal form stays an accepted false positive (band-B12 F17,
+/// EPH-I0506).
+fn hasElseArmZeroExclusion(t: []const u8, var_name: []const u8, else_pos: usize) bool {
+    const pats = [_][]const u8{ "== 0)", "<= 0", "< 1" };
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    for (pats) |pat| {
+        var from: usize = 0;
+        while (mem.indexOfPos(u8, t[0..else_pos], from, pat)) |pos| {
+            from = pos + pat.len;
+            const after = pos + pat.len;
+            if (after < t.len and isIdent(t[after])) continue;
+            if (mem.startsWith(u8, t[after..], " and")) continue;
+            if (cls.isInsideString(pos)) continue;
+            if (comment_start != null and pos >= comment_start.?) continue;
+            if (comparisonLhsIsVar(t, pos, var_name)) return true;
+        }
+    }
+    return false;
+}
+
+/// The if-expression shape: `if (i > 0) a[i - 1] else 0` (then-arm
+/// index under a lower-bound condition) or `if (i == 0) 0 else
+/// a[i - 1]` (else-arm index under a zero-exclusion condition). The
+/// arm side matters: an upper-bound condition protects only the else
+/// arm, never the then arm — `if (i < n) a[i - 1] else 0` still
+/// underflows at i == 0 (band-B12 F17, EPH-I0506).
+fn hasIfElseExprGuard(t: []const u8, expr: IndexExprLoc) bool {
+    if (ifKeywordPos(t) == null) return false;
+    const else_pos = mem.indexOf(u8, t, " else ") orelse return false;
+    if (expr.bracket_pos < else_pos)
+        return hasLowerBoundGuardForVar(t, expr.var_name, expr.bracket_pos);
+    return hasElseArmZeroExclusion(t, expr.var_name, else_pos);
+}
+
+/// Check if the same line carries a guard for its index arithmetic. A
+/// guard counts only when its lower-bound comparison relates to the
+/// index var and sits left of the index expression (band-B12 F17,
+/// EPH-I0506).
+fn hasIndexGuardOnLine(t: []const u8) bool {
+    const expr = extractIndexExprLoc(t) orelse return false;
+    if (hasBasicIndexGuard(t, expr)) return true;
+    if (hasAndComparisonGuard(t, expr)) return true;
+    if (hasIfExprGuard(t, expr)) return true;
+    return hasIfElseExprGuard(t, expr);
 }
 
 // ============================================================================
@@ -27306,16 +27581,35 @@ fn hasComparisonGuardPattern(line: []const u8) bool {
     return false;
 }
 
-/// Check if a line contains a guard for a variable
+/// Check if a line contains a guard for a variable. Every arm relates
+/// the comparison to the var: a lower-bound comparison (`>`, `>=`,
+/// `!= 0`) or a zero-exclusion exit (`if (x == 0) return;`). A
+/// comparison on another var — `if (j > 0) x -= 1;` — guards nothing
+/// (band-B12 F17, EPH-I0506).
 fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
     if (!mentionsIdent(line, var_name)) return false;
-    if (hasComparisonGuardPattern(line)) return true;
-    if (mem.indexOf(u8, line, "while") != null and mem.indexOf(u8, line, ">") != null) return true;
-    if (mem.indexOf(u8, line, "== 0") != null and hasExitStatement(line)) return true;
-    if (mem.indexOf(u8, line, "== 0 or") != null) return true;
-    if (mem.indexOf(u8, line, "assert") != null and hasComparisonGuardPattern(line)) return true;
-    if (mem.indexOf(u8, line, "debug.assert") != null) {
-        if (mem.indexOf(u8, line, ">") != null or mem.indexOf(u8, line, "!=") != null) return true;
+    if (hasLowerBoundGuardForVar(line, var_name, line.len)) return true;
+    if (hasExitStatement(line) and hasEqualsZeroGuardForVar(line, var_name)) return true;
+    return false;
+}
+
+/// True when `t` carries an `== 0` comparison on `var_name` (`if (x == 0)
+/// return;`). An `and`-tail is excluded: `x == 0 and y` exits only for
+/// the conjunction, so the decrement path is not zero-excluded. An
+/// `or`-tail keeps the exclusion — the exit covers every x == 0 path.
+fn hasEqualsZeroGuardForVar(t: []const u8, var_name: []const u8) bool {
+    const pat = "== 0";
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, pat)) |pos| {
+        from = pos + pat.len;
+        const after = pos + pat.len;
+        if (after < t.len and isIdent(t[after])) continue;
+        if (mem.startsWith(u8, t[after..], " and")) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        if (comparisonLhsIsVar(t, pos, var_name)) return true;
     }
     return false;
 }
@@ -27824,47 +28118,134 @@ const ParsedArgv = struct {
     truncated: bool,
 };
 
-/// Split a `--command` string on unquoted spaces into `argv_buf`.
-/// Writes stop at the buffer bound and set `truncated` (RED5-1).
-fn parseCommandIntoArgv(cmd: []const u8, argv_buf: *[64][]const u8) ParsedArgv {
-    var in_quote = false;
-    var start: usize = 0;
+/// Split a `--command` string into `argv_buf`, stripping quote characters
+/// and honoring backslash escapes. `"a b"` becomes one token `a b`, and
+/// `\"`/`\'`/`\\` produce the escaped byte literally in any quote state
+/// (simpler than POSIX single-quote semantics, documented deviation,
+/// band-B12 F20, EPH-I0507). Unquoted tokens copy into `scratch`; writes
+/// stop at either buffer bound and set `truncated` (RED5-1). An
+/// unterminated quote consumes the rest of the command as one token.
+fn parseCommandIntoArgv(
+    cmd: []const u8,
+    argv_buf: *[64][]const u8,
+    scratch: []u8,
+) ParsedArgv {
     var argc: usize = 0;
-    for (cmd, 0..) |c, i| {
-        if (c == '"' or c == '\'') in_quote = !in_quote;
-        if (c != ' ' or in_quote) continue;
-        if (i == start) {
-            start = i + 1;
+    var token: ArgvTokenState = .{};
+    var i: usize = 0;
+    while (i < cmd.len) {
+        const c = cmd[i];
+        if (c == '\\' and i + 1 < cmd.len) {
+            if (!appendArgvByte(scratch, &token, cmd[i + 1]))
+                return .{ .argc = argc, .truncated = true };
+            i += 2;
             continue;
         }
-        // Bound every write: token 65 would write past the stack buffer
-        // (RED5-1). Stop and report truncation instead.
-        if (argc >= argv_buf.len) return .{ .argc = argc, .truncated = true };
-        argv_buf[argc] = cmd[start..i];
-        argc += 1;
-        start = i + 1;
+        if (c == '"' or c == '\'') {
+            if (!applyArgvQuote(c, &token, scratch))
+                return .{ .argc = argc, .truncated = true };
+            i += 1;
+            continue;
+        }
+        if ((c == ' ' or c == '\t') and token.quote == 0) {
+            if (!closeArgvToken(argv_buf, scratch, &token, &argc))
+                return .{ .argc = argc, .truncated = true };
+            i += 1;
+            continue;
+        }
+        if (!appendArgvByte(scratch, &token, c))
+            return .{ .argc = argc, .truncated = true };
+        i += 1;
     }
-    if (start < cmd.len) {
-        if (argc >= argv_buf.len) return .{ .argc = argc, .truncated = true };
-        argv_buf[argc] = cmd[start..];
-        argc += 1;
+    if (token.end > token.start or token.quoted) {
+        if (!commitArgvToken(argv_buf, scratch, &token, &argc))
+            return .{ .argc = argc, .truncated = true };
     }
     return .{ .argc = argc, .truncated = false };
+}
+
+/// Mutable token state of the argv tokenizer: the token span in the
+/// scratch (absolute offsets) and the quote state.
+const ArgvTokenState = struct {
+    start: usize = 0,
+    end: usize = 0,
+    quoted: bool = false,
+    quote: u8 = 0,
+};
+
+/// Copy `b` into the current token. Returns false when the scratch is
+/// full.
+fn appendArgvByte(scratch: []u8, token: *ArgvTokenState, b: u8) bool {
+    if (token.end >= scratch.len) return false;
+    scratch[token.end] = b;
+    token.end += 1;
+    return true;
+}
+
+/// Apply one quote char to the token state: open, close, or copy the
+/// other-kind quote as a literal byte. Returns false when the scratch is
+/// full.
+fn applyArgvQuote(c: u8, token: *ArgvTokenState, scratch: []u8) bool {
+    if (token.quote == 0) {
+        token.quote = c;
+        token.quoted = true;
+        return true;
+    }
+    if (token.quote == c) {
+        token.quote = 0;
+        return true;
+    }
+    return appendArgvByte(scratch, token, c);
+}
+
+/// Close the token at a whitespace boundary: commit it when it holds
+/// content (or a quote pair), then reset the span. Returns false when
+/// the token buffer is full.
+fn closeArgvToken(
+    argv_buf: *[64][]const u8,
+    scratch: []const u8,
+    token: *ArgvTokenState,
+    argc: *usize,
+) bool {
+    if (token.end > token.start or token.quoted) {
+        return commitArgvToken(argv_buf, scratch, token, argc);
+    }
+    token.start = token.end;
+    return true;
+}
+
+/// Commit the current token (scratch[token.start..token.end]) into
+/// `argv_buf`, advancing `argc`. Returns false when the token buffer is
+/// full.
+fn commitArgvToken(
+    argv_buf: *[64][]const u8,
+    scratch: []const u8,
+    token: *ArgvTokenState,
+    argc: *usize,
+) bool {
+    if (argc.* >= argv_buf.len) return false;
+    argv_buf[argc.*] = scratch[token.start..token.end];
+    argc.* += 1;
+    token.start = token.end;
+    token.quoted = false;
+    token.quote = 0;
+    return true;
 }
 
 fn buildRuntimeArgv(
     custom_command: ?[]const u8,
     argv_buf: *[64][]const u8,
     verbose: bool,
+    scratch: []u8,
 ) usize {
     if (custom_command) |cmd| {
         if (verbose)
             std.debug.print("Running: {s} (with GPA diagnostics)\n", .{cmd});
-        const parsed = parseCommandIntoArgv(cmd, argv_buf);
+        const parsed = parseCommandIntoArgv(cmd, argv_buf, scratch);
         if (parsed.truncated)
             std.debug.print(
-                "warning: --command truncated to {d} arguments\n",
-                .{argv_buf.len},
+                "warning: --command truncated (limit {d} tokens, {d} bytes)\n",
+                .{ argv_buf.len, runtime_argv_scratch_bytes },
             );
         return parsed.argc;
     }
@@ -27968,6 +28349,11 @@ fn reportRunFailure(
 /// outputs fail with StreamTooLong instead of growing unbounded.
 const runtime_capture_limit_bytes = 10 * 1024 * 1024;
 
+/// Byte cap on the unquoted `--command` argv scratch in the runtime
+/// band. A custom command longer than this fails with the truncated
+/// marker instead of growing unbounded (band-B12 F20, EPH-I0507).
+const runtime_argv_scratch_bytes = 4096;
+
 /// Spawn a child with the capture caps on both streams. The runtime
 /// band and the fmt band share this spawn so no capture path can grow
 /// unbounded (EPH-I0501): `zig fmt --check` on a hostile tree is a
@@ -28004,7 +28390,8 @@ fn runRuntimeAnalysis(
     // must free the partial list, not drop it (EPH-I0767).
     errdefer deinitIssues(&issues, allocator);
     var argv_buf: [64][]const u8 = undefined;
-    const argv_len = buildRuntimeArgv(opts.custom_command, &argv_buf, opts.verbose);
+    var argv_scratch: [runtime_argv_scratch_bytes]u8 = undefined;
+    const argv_len = buildRuntimeArgv(opts.custom_command, &argv_buf, opts.verbose, &argv_scratch);
 
     const result = runChildCapped(
         allocator,
@@ -35857,12 +36244,34 @@ test "build.zig entry extractors ignore refs in // comments (EPH-I0299)" {
 
 test "parseCommandIntoArgv parses tokens within the buffer" {
     var buf: [64][]const u8 = undefined;
-    const parsed = parseCommandIntoArgv("zig build test", &buf);
+    var scratch: [1024]u8 = undefined;
+    const parsed = parseCommandIntoArgv("zig build test", &buf, &scratch);
     try std.testing.expectEqual(@as(usize, 3), parsed.argc);
     try std.testing.expect(!parsed.truncated);
     try std.testing.expectEqualStrings("zig", buf[0]);
     try std.testing.expectEqualStrings("build", buf[1]);
     try std.testing.expectEqualStrings("test", buf[2]);
+}
+
+test "parseCommandIntoArgv strips quotes and honors escapes (EPH-I0507)" {
+    var buf: [64][]const u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    // The band-B12 F20 shape: `--command 'run "a b"'` must pass `a b` to
+    // the child without the quote bytes, and `\'`/`\"` escapes stay
+    // literal bytes in any quote state.
+    const parsed = parseCommandIntoArgv("zig run \"a b\" 'c\\'d'", &buf, &scratch);
+    try std.testing.expectEqual(@as(usize, 4), parsed.argc);
+    try std.testing.expect(!parsed.truncated);
+    try std.testing.expectEqualStrings("zig", buf[0]);
+    try std.testing.expectEqualStrings("run", buf[1]);
+    try std.testing.expectEqualStrings("a b", buf[2]);
+    try std.testing.expectEqualStrings("c'd", buf[3]);
+    // The `"it's"` shape: the inner single quote is a literal byte
+    // inside double quotes, so quoting does not end early.
+    const parsed2 = parseCommandIntoArgv("echo \"it's\"", &buf, &scratch);
+    try std.testing.expectEqual(@as(usize, 2), parsed2.argc);
+    try std.testing.expect(!parsed2.truncated);
+    try std.testing.expectEqualStrings("it's", buf[1]);
 }
 
 test "parseCommandIntoArgv fits exactly 64 tokens without truncation" {
@@ -35874,7 +36283,8 @@ test "parseCommandIntoArgv fits exactly 64 tokens without truncation" {
         try cmd.append(allocator, 'x');
     }
     var buf: [64][]const u8 = undefined;
-    const parsed = parseCommandIntoArgv(cmd.items, &buf);
+    var scratch: [1024]u8 = undefined;
+    const parsed = parseCommandIntoArgv(cmd.items, &buf, &scratch);
     try std.testing.expectEqual(@as(usize, 64), parsed.argc);
     try std.testing.expect(!parsed.truncated);
 }
@@ -35889,10 +36299,18 @@ test "parseCommandIntoArgv truncates token 65 instead of overflowing" {
         try cmd.appendSlice(allocator, "tok");
     }
     var buf: [64][]const u8 = undefined;
-    const parsed = parseCommandIntoArgv(cmd.items, &buf);
+    var scratch: [1024]u8 = undefined;
+    const parsed = parseCommandIntoArgv(cmd.items, &buf, &scratch);
     try std.testing.expectEqual(@as(usize, 64), parsed.argc);
     try std.testing.expect(parsed.truncated);
     try std.testing.expectEqualStrings("tok", buf[63]);
+}
+
+test "parseCommandIntoArgv truncates on a scratch byte cap (EPH-I0507)" {
+    var buf: [64][]const u8 = undefined;
+    var scratch: [4]u8 = undefined;
+    const parsed = parseCommandIntoArgv("abcdef", &buf, &scratch);
+    try std.testing.expect(parsed.truncated);
 }
 
 // ============================================================================
@@ -36428,11 +36846,12 @@ test "reportCommandFailure varies help by command kind" {
 
 test "buildRuntimeArgv builds default and custom argv" {
     var buf: [64][]const u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 3), buildRuntimeArgv(null, &buf, false));
+    var scratch: [1024]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), buildRuntimeArgv(null, &buf, false, &scratch));
     try std.testing.expectEqualStrings("zig", buf[0]);
     try std.testing.expectEqualStrings("build", buf[1]);
     try std.testing.expectEqualStrings("test", buf[2]);
-    try std.testing.expectEqual(@as(usize, 2), buildRuntimeArgv("sh run.sh", &buf, false));
+    try std.testing.expectEqual(@as(usize, 2), buildRuntimeArgv("sh run.sh", &buf, false, &scratch));
     try std.testing.expectEqualStrings("sh", buf[0]);
     try std.testing.expectEqualStrings("run.sh", buf[1]);
 }
@@ -66927,33 +67346,37 @@ test "hasErrorHandling ignores try and catch prose in strings and comments (EPH-
 }
 
 test "hasBasicIndexGuard and hasAndComparisonGuard ignore prose (EPH-I0298)" {
+    const loc_n = IndexExprLoc{ .var_name = "n", .bracket_pos = 17 };
+    const loc_i = IndexExprLoc{ .var_name = "i", .bracket_pos = 24 };
     // "while"/"and" in a comment or string never fakes a guard.
-    try std.testing.expect(!hasBasicIndexGuard("x = f(); // while a > 0"));
-    try std.testing.expect(!hasBasicIndexGuard("s = \"a while b > 0\";"));
-    try std.testing.expect(!hasAndComparisonGuard("x = f(); // a and b > c"));
-    try std.testing.expect(!hasAndComparisonGuard("s = \"a and b > c\";"));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // while a > 0", loc_n));
+    try std.testing.expect(!hasBasicIndexGuard("s = \"a while b > 0\";", loc_n));
+    try std.testing.expect(!hasAndComparisonGuard("x = f(); // a and b > c", loc_i));
+    try std.testing.expect(!hasAndComparisonGuard("s = \"a and b > c\";", loc_i));
     // Real guards stay detected.
-    try std.testing.expect(hasBasicIndexGuard("while (n > 0) {"));
-    try std.testing.expect(hasAndComparisonGuard("if (a and b > c) {"));
+    try std.testing.expect(hasBasicIndexGuard("while (n > 0) { a[n - 1]; }", loc_n));
+    try std.testing.expect(hasAndComparisonGuard("if (i > 0 and j < n) { a[i - 1]; }", loc_i));
 }
 
 test "guard detectors are code-position scans on the independent arms (EPH-I0874)" {
+    const loc_i = IndexExprLoc{ .var_name = "i", .bracket_pos = 25 };
+    const loc_s = IndexExprLoc{ .var_name = "s.len", .bracket_pos = 27 };
     // The keywordless arms ("endsWith", "startsWith", "== 0 or",
     // "!= 0 and") and the comparison patterns count only at code
     // positions: comment prose and string data never fake a guard.
-    try std.testing.expect(!hasBasicIndexGuard("x = f(); // endsWith"));
-    try std.testing.expect(!hasBasicIndexGuard("x = f(); // startsWith"));
-    try std.testing.expect(!hasBasicIndexGuard("x = f(); // i == 0 or j == 0"));
-    try std.testing.expect(!hasBasicIndexGuard("x = f(); // i != 0 and j != 0"));
-    try std.testing.expect(!hasBasicIndexGuard("const s = \"i == 0 or j\";"));
-    try std.testing.expect(!hasBasicIndexGuard("const s = \"endsWith(\\\"x\\\");\";"));
-    try std.testing.expect(!hasAndComparisonGuard("if (a and b) { // x > y"));
-    try std.testing.expect(!hasAndComparisonGuard("if (a and b) { s = \"x > y\"; }"));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // endsWith", loc_s));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // startsWith", loc_s));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // i == 0 or j == 0", loc_i));
+    try std.testing.expect(!hasBasicIndexGuard("x = f(); // i != 0 and j != 0", loc_i));
+    try std.testing.expect(!hasBasicIndexGuard("const s = \"i == 0 or j\";", loc_i));
+    try std.testing.expect(!hasBasicIndexGuard("const s = \"endsWith(\\\"x\\\");\";", loc_s));
+    try std.testing.expect(!hasAndComparisonGuard("if (a and b) { // x > y", loc_i));
+    try std.testing.expect(!hasAndComparisonGuard("if (a and b) { s = \"x > y\"; }", loc_i));
     // Real guards stay detected.
-    try std.testing.expect(hasBasicIndexGuard("if (s.endsWith(\".zig\")) {"));
-    try std.testing.expect(hasBasicIndexGuard("if (i == 0 or j == 0) {"));
-    try std.testing.expect(hasBasicIndexGuard("if (i != 0 and j != 0) {"));
-    try std.testing.expect(hasAndComparisonGuard("if (i > 0 and j < n) {"));
+    try std.testing.expect(hasBasicIndexGuard("if (s.endsWith(\".zig\")) { a[s.len - 1]; }", loc_s));
+    try std.testing.expect(hasBasicIndexGuard("if (i == 0 or j == 0) { a[i - 1]; }", loc_i));
+    try std.testing.expect(hasBasicIndexGuard("if (i != 0 and j != 0) { a[i - 1]; }", loc_i));
+    try std.testing.expect(hasAndComparisonGuard("if (i > 0 and j < n) { a[i - 1]; }", loc_i));
 }
 
 test "hasExitKeyword ignores exit keywords in strings and comments (EPH-I0298)" {
@@ -67641,14 +68064,23 @@ test "hasPairedIncrementInLines misses an increment beyond the window (EPH-I0225
 test "hasShortCircuitGuardOnPriorLines finds a guard inside the window (EPH-I0225)" {
     var buf: [6][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "arg,", "assert(offset == 0 or", 1);
-    try std.testing.expect(hasShortCircuitGuardOnPriorLines(lines, lines.len - 1));
+    try std.testing.expect(hasShortCircuitGuardOnPriorLines(lines, lines.len - 1, "offset"));
 }
 
 test "hasShortCircuitGuardOnPriorLines misses a guard beyond the window (EPH-I0225)" {
     var buf: [20][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "arg,", "assert(offset == 0 or", 1);
     // The guard is 18 lines back, past the 10-line window (accepted FN).
-    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1));
+    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1, "offset"));
+}
+
+test "hasShortCircuitGuardOnPriorLines binds the index var (EPH-I0506)" {
+    // band-B12 F17: the prior-line guard counts only for its own var —
+    // `assert(offset == 0 or ...)` guards an `offset` index, not `n`.
+    var buf: [6][]const u8 = undefined;
+    const lines = guardScanFixture(&buf, "arg,", "assert(offset == 0 or", 1);
+    try std.testing.expect(hasShortCircuitGuardOnPriorLines(lines, lines.len - 1, "offset"));
+    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1, "n"));
 }
 
 test "findEnclosingIfCondition finds an enclosing if inside the window (EPH-I0225)" {
@@ -67696,7 +68128,7 @@ test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
     // after at most its window of lines.
     try std.testing.expect(!hasNullGuard(lines, lines.len - 1, 0, "x"));
     try std.testing.expect(!hasPairedIncrementInLines(lines, "x"));
-    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1));
+    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1, "x"));
     try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1, 0) == null);
     try std.testing.expect(findEnclosingIfLine(lines, lines.len - 1) == null);
     try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "x"));
@@ -69062,6 +69494,287 @@ test "guard helpers match vars on identifier boundaries (EPH-I0493)" {
         "}",
     };
     try std.testing.expect(!hasNullGuard(&null_lines, 1, 0, "x"));
+}
+
+test "same-line decrement guards relate to the decremented var (EPH-I0506)" {
+    // band-B12 F17: hasGuardOnLine's comparisons must bind the var —
+    // `if (j > 0) x -= 1;` stays unguarded, `if (x > 0) x -= 1;` and
+    // the zero-exclusion exit stay silent.
+    try std.testing.expect(!hasGuardOnLine("if (j > 0) x -= 1;", "x"));
+    try std.testing.expect(hasGuardOnLine("if (x > 0) x -= 1;", "x"));
+    try std.testing.expect(hasGuardOnLine("if (x == 0) return; x -= 1;", "x"));
+    try std.testing.expect(!hasGuardOnLine("if (j == 0) return; x -= 1;", "x"));
+    // An upper-bound comparison proves no lower bound.
+    try std.testing.expect(!hasGuardOnLine("if (x < n) x -= 1;", "x"));
+}
+
+test "lineHasIf requires a word boundary (EPH-I0506)" {
+    // band-B12 F17: the `if(`/`if (` substrings matched `dif(` and
+    // `serif (`. The keyword needs a left word boundary.
+    try std.testing.expect(!lineHasIf("dif (x) y"));
+    try std.testing.expect(!lineHasIf("serif (x)"));
+    try std.testing.expect(!lineHasIf("serif(x)"));
+    try std.testing.expect(lineHasIf("if (x) y"));
+    try std.testing.expect(lineHasIf("if(x) y"));
+}
+
+test "ZA903: comparison after the index does not suppress (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17 probe 1: `arr[i - 1] > 0 and ...` — the comparison
+    // sits right of the index expression, so it proves nothing about
+    // the subtraction.
+    const content =
+        \\fn after_index(a: []u8, i: usize, b: bool) u8 {
+        \\    return a[i - 1] > 0 and b;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_after_index.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_after_index.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: upper-bound if-expression does not suppress (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17 probe 2: `if (i < n) arr[i - 1] else 0` — the
+    // condition proves no lower bound for the then arm, so the
+    // subtraction can still underflow at i == 0.
+    const content =
+        \\fn upper_bound(a: []u8, i: usize, n: usize) u8 {
+        \\    return if (i < n) a[i - 1] else 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_upper_bound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_upper_bound.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: unrelated-var same-line guard does not suppress (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17: `if (j > 0) return a[i - 1];` — the guard relates
+    // to j, the index to i; the comparison must bind the index var.
+    const content =
+        \\fn unrelated(a: []u8, i: usize, j: usize) u8 {
+        \\    if (j > 0) return a[i - 1];
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_unrelated.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_unrelated.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: dif-shaped if does not suppress (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17: the `if (` substring matched identifiers ending in
+    // `if` followed by ` (` — `dif (i > 0)` (the audit's `diff(` shape
+    // reads the same mechanism). The keyword now needs a left word
+    // boundary.
+    const content =
+        \\fn dif_shape(a: []u8, i: usize) u8 {
+        \\    const r = dif (i > 0) a[i - 1];
+        \\    return r;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_dif_shape.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_dif_shape.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA901: unrelated-var same-line guard does not suppress (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17 (decrement family): `if (j > 0) x -= 1;` — the guard
+    // relates to j, the decrement to x.
+    const content =
+        \\fn unrelated_dec(j: usize, x: usize) usize {
+        \\    if (j > 0) x -= 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_unrelated_dec.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_unrelated_dec.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA903: short-circuit pattern after the index does not suppress (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17: `values[offset - 1] == 0 or ...` — the short-circuit
+    // pattern sits right of the index expression and its operand is the
+    // indexed value, not the index var.
+    const content =
+        \\fn short_after(values: []const u8, offset: usize) bool {
+        \\    return values[offset - 1] == 0 or offset > 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_short_after.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_short_after.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: same-line guards that relate to the index var stay silent (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The constraint arm keeps the sound same-line shapes silent: a
+    // lower-bound if, both if-expression arms, the and-conjunction,
+    // and the endsWith .len guard.
+    const content =
+        \\fn sound(a: []u8, i: usize, n: usize, s: []const u8) u8 {
+        \\    if (i > 0) return a[i - 1];
+        \\    const v = if (i > 0) a[i - 1] else 0;
+        \\    const w = if (i == 0) 0 else a[i - 1];
+        \\    const x = if (i > 0 and i < n) a[i - 1] else 0;
+        \\    const y = s.endsWith(".zig") and s[s.len - 1] == 'g';
+        \\    _ = y;
+        \\    return v + w + x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_sound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_sound.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: != 0 with an or-tail does not suppress (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17: the `!= 0` guard needs tail discipline — `x != 0 or y`
+    // runs the guarded body when y holds and x == 0, so the subtraction
+    // can underflow. The `and`-tail keeps the exclusion: the body runs
+    // only when x != 0. Exactly one finding pins both sides.
+    const content =
+        \\fn neq_or_tail(a: []u8, x: usize, y: bool) u8 {
+        \\    if (x != 0 or y) return a[x - 1];
+        \\    return 0;
+        \\}
+        \\fn neq_and_tail(a: []u8, x: usize, y: bool) u8 {
+        \\    if (x != 0 and y) return a[x - 1];
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_neq_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_neq_tail.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: nested bracket index keeps the same-line guard (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17: `a[b[i - 1]]` under `if (i > 0)` — the extractor must
+    // descend into the compound index and bind the inner `i`, or the
+    // genuinely guarded subtraction fires.
+    const content =
+        \\fn nested_index(a: []u8, b: []usize, i: usize) u8 {
+        \\    if (i > 0) return a[b[i - 1]];
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_nested.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: multiline > 0 and guard stays silent (EPH-I0506)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17: the `> 0 and` short-circuit arm — `if (offset > 0 and`
+    // on the opener line zero-excludes the index var on the continuation
+    // line's `values[offset - 1]` subtraction.
+    const content =
+        \\fn short_and_multi(values: []const u8, offset: usize) bool {
+        \\    if (offset > 0 and
+        \\        values[offset - 1] > 0) {
+        \\        return true;
+        \\    }
+        \\    return false;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_short_and_multi.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_short_and_multi.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
 }
 
 test "ZA901: max_x guard does not suppress an x candidate (EPH-I0493)" {

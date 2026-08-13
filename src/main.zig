@@ -24926,9 +24926,13 @@ fn hasNullGuard(
         i -= 1;
         const line = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(line)) continue;
-        // Both matches anchor on code positions (LiteralState mask): a
-        // string that carries the name or `== null` is data, not a guard
-        // predicate, and cannot anchor the judge (EPH-I0899).
+        // The name pre-filter is a code-position gate only; the binding
+        // check (lineHasBoundNullGuard → nullPredicateBinds) carries the
+        // identifier-boundary exactness: `ax == null` does not bind `x`
+        // (EPH-I0493). Both matches anchor on code positions
+        // (LiteralState mask): a string that carries the name or
+        // `== null` is data, not a guard predicate, and cannot anchor
+        // the judge (EPH-I0899).
         if (findTagInCode(line, name, 0) == null) continue;
         const lookup = NullGuardLookup{ .lines = lines, .i = i, .limit = current_idx };
         if (lineHasBoundNullGuard(line, lookup, name)) return true;
@@ -25433,18 +25437,25 @@ fn extractUnwrappedVar(t: []const u8, dot_q_pos: usize) ?[]const u8 {
 /// line, or null when the line is not that guard shape. Spaces and tabs
 /// between the variable name and `==`, and between `null` and `)`, are
 /// tolerated. The position anchors guardLineHasSameLineExit on the
-/// guard's own condition group (EPH-I0892).
+/// guard's own condition group (EPH-I0892). The name is matched on
+/// identifier boundaries (`ax == null` does not guard `x` — EPH-I0493),
+/// and every occurrence is tried, so a later genuine predicate still
+/// binds after an earlier non-matching occurrence.
 fn hasNullEqualityCheck(ctx: []const u8, var_name: []const u8) ?usize {
-    const var_pos = mem.indexOf(u8, ctx, var_name) orelse return null;
-    var after = var_pos + var_name.len;
-    while (after < ctx.len and (ctx[after] == ' ' or ctx[after] == '\t')) after += 1;
-    if (after + "== null".len > ctx.len) return null;
-    if (!mem.startsWith(u8, ctx[after..], "== null")) return null;
-    const tail = after + "== null".len;
-    if (tail >= ctx.len) return null;
-    if (ctx[tail] == ')') return after;
-    if ((ctx[tail] == ' ' or ctx[tail] == '\t') and tail + 1 < ctx.len and ctx[tail + 1] == ')') {
-        return after;
+    var from: usize = 0;
+    while (nextBoundaryIdent(ctx, var_name, &from)) |var_pos| {
+        var after = var_pos + var_name.len;
+        while (after < ctx.len and (ctx[after] == ' ' or ctx[after] == '\t')) after += 1;
+        if (after + "== null".len > ctx.len) continue;
+        if (!mem.startsWith(u8, ctx[after..], "== null")) continue;
+        const tail = after + "== null".len;
+        if (tail >= ctx.len) continue;
+        if (ctx[tail] == ')') return after;
+        if ((ctx[tail] == ' ' or ctx[tail] == '\t') and
+            tail + 1 < ctx.len and ctx[tail + 1] == ')')
+        {
+            return after;
+        }
     }
     return null;
 }
@@ -25765,24 +25776,50 @@ const GuardLineCtx = struct {
 /// proven at block entry holds from its recorded line onward; a guard
 /// collected in this same block holds from its own line onward. Either
 /// way, a guard on a later line must not silence an earlier line
-/// (EPH-I0486 temporal rule).
-fn isGuardedAtLine(ctx: GuardLineCtx, var_name: []const u8) bool {
+/// (EPH-I0486 temporal rule). The decrement amount re-verifies an
+/// assert-sourced guard: an assert whose literal bound is below the
+/// amount covers nothing (EPH-I0495). A null amount (non-literal
+/// decrement) keeps the shape-only behavior for the recorded guard.
+fn isGuardedAtLine(ctx: GuardLineCtx, var_name: []const u8, decrement_amount: ?usize) bool {
     if (ctx.entry_guards.get(var_name)) |guard_idx| {
-        if (guard_idx <= ctx.idx) return true;
+        if (guard_idx <= ctx.idx and
+            guardCoversDecrement(ctx, guard_idx, var_name, decrement_amount)) return true;
     }
-    if (ctx.local_guards.get(var_name)) |guard_idx| return guard_idx <= ctx.idx;
+    if (ctx.local_guards.get(var_name)) |guard_idx| {
+        if (guard_idx <= ctx.idx and
+            guardCoversDecrement(ctx, guard_idx, var_name, decrement_amount)) return true;
+    }
     return false;
 }
 
+/// True when the guard recorded at `guard_idx` covers a decrement of
+/// `var_name` by `amount`. A non-assert guard covers any amount; an
+/// assert guard covers only when its bound is at least the amount
+/// (`assert(x >= 0); x -= 100` underflows at x == 0 — EPH-I0495). A
+/// null amount keeps the recorded guard's old shape-only behavior. A
+/// guard line the assert-bound judge does not bind keeps its verdict:
+/// the CFG collection already keyed it by the guarded var.
+fn guardCoversDecrement(
+    ctx: GuardLineCtx,
+    guard_idx: usize,
+    var_name: []const u8,
+    amount: ?usize,
+) bool {
+    if (amount == null) return true;
+    const guard_line = mem.trim(u8, ctx.lines[guard_idx], " \t\r");
+    if (mem.indexOf(u8, guard_line, "assert") == null) return true;
+    return judgeAssertBound(guard_line, var_name, amount.?) != .uncovered;
+}
+
 /// Check if a decrement is guarded by various patterns
-fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8) bool {
-    if (isGuardedAtLine(ctx, var_name)) return true;
+fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8, decrement_amount: ?usize) bool {
+    if (isGuardedAtLine(ctx, var_name, decrement_amount)) return true;
     if (hasGuardOnLine(ctx.t, var_name)) return true;
     if (hasBreakGuardOnPriorLines(ctx.lines, ctx.idx, var_name)) return true;
     if (isSignedVarInContext(ctx.lines, ctx.idx, var_name)) return true;
     if (hasPairedIncrementInLines(ctx.lines[0..ctx.idx], var_name)) return true;
     if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
-    if (hasAssertGeGuard(ctx.lines, ctx.idx, var_name)) return true;
+    if (hasAssertGeGuard(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
     if (hasEnclosingVarGuard(ctx.lines, ctx.idx, var_name)) return true;
     if (hasElseBranchGuard(ctx.lines, ctx.idx)) return true;
     return false;
@@ -25795,7 +25832,7 @@ fn isArrayLenCFGGuarded(ctx: GuardLineCtx) bool {
     if (base.len + 4 > buf.len) return false;
     @memcpy(buf[0..base.len], base);
     @memcpy(buf[base.len..][0..4], ".len");
-    return isGuardedAtLine(ctx, buf[0 .. base.len + 4]);
+    return isGuardedAtLine(ctx, buf[0 .. base.len + 4], null);
 }
 
 /// Check if array index arithmetic is guarded by various patterns
@@ -25837,6 +25874,28 @@ fn findDecrementOp(t: []const u8) ?usize {
     return null;
 }
 
+/// Numeric decrement amount after the `-=` at `pos` (`x -= 100` → 100),
+/// or null when the amount is not a plain decimal literal: `x -= n`,
+/// `x -= 0x10`, `x -= 100_000`, and compound right sides (`x -= 100 + 5`)
+/// return null. The digit run must end at a structural terminator
+/// (`;`, `)`, `,`, `}`, or end of line) — a prefix of a compound
+/// expression is not the amount, and reporting 100 for `100 + 5` would
+/// let `assert(x >= 101)` wrongly cover the true amount 105 (EPH-I0495).
+fn parseDecrementAmount(t: []const u8, pos: usize) ?usize {
+    var j = pos + 2;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    const start = j;
+    while (j < t.len and t[j] >= '0' and t[j] <= '9') j += 1;
+    const digits_end = j;
+    if (digits_end == start) return null;
+    if (digits_end < t.len and
+        (t[digits_end] == 'x' or t[digits_end] == 'b' or
+            t[digits_end] == 'o' or t[digits_end] == '_')) return null;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j < t.len and t[j] != ';' and t[j] != ')' and t[j] != ',' and t[j] != '}') return null;
+    return std.fmt.parseInt(usize, t[start..digits_end], 10) catch null;
+}
+
 /// Shared context for the CFG-based panic-pattern checks: the run-wide
 /// plumbing (sink, source lines, path) plus the current block's
 /// entry-guard set (with holds-from lines), its local guards with lines
@@ -25868,7 +25927,8 @@ fn checkDecrementOverflow(
         .entry_guards = ctx.entry_guards,
         .local_guards = ctx.local_guards,
     };
-    if (isDecrementGuarded(gctx, var_name)) return;
+    const amount = parseDecrementAmount(t, col);
+    if (isDecrementGuarded(gctx, var_name, amount)) return;
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.file_path,
         .line = line_num,
@@ -26093,11 +26153,20 @@ fn extractDecrementVar(t: []const u8, decrement_pos: usize) ?[]const u8 {
 
 /// Check if variable is signed type in context
 fn isSignedVarInContext(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
-    const signed_types = [_][]const u8{ ": i8", ": i16", ": i32", ": i64", ": i128", ": isize" };
     const check_start = if (current_idx > 10) current_idx - 10 else 0;
     for (lines[check_start .. current_idx + 1]) |line| {
         const ctx = mem.trim(u8, line, " \t\r");
-        const var_pos = mem.indexOf(u8, ctx, var_name) orelse continue;
+        if (lineDeclaresSignedVar(ctx, var_name)) return true;
+    }
+    return false;
+}
+
+/// True when any identifier-bounded occurrence of `var_name` on the line
+/// is followed by a signed type annotation (`var x: i32 = 0` — EPH-I0493).
+fn lineDeclaresSignedVar(ctx: []const u8, var_name: []const u8) bool {
+    const signed_types = [_][]const u8{ ": i8", ": i16", ": i32", ": i64", ": i128", ": isize" };
+    var from: usize = 0;
+    while (nextBoundaryIdent(ctx, var_name, &from)) |var_pos| {
         const after_var = ctx[var_pos + var_name.len ..];
         for (signed_types) |stype| {
             if (mem.startsWith(u8, after_var, stype)) return true;
@@ -26122,10 +26191,12 @@ fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bo
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) {
             return false;
         }
-        const var_pos = mem.indexOf(u8, ctx, var_name) orelse continue;
-        const after_var = ctx[var_pos + var_name.len ..];
-        if (mem.startsWith(u8, after_var, " += 1") or mem.startsWith(u8, after_var, "+=1"))
-            return true;
+        var from: usize = 0;
+        while (nextBoundaryIdent(ctx, var_name, &from)) |var_pos| {
+            const after_var = ctx[var_pos + var_name.len ..];
+            if (mem.startsWith(u8, after_var, " += 1") or mem.startsWith(u8, after_var, "+=1"))
+                return true;
+        }
     }
     return false;
 }
@@ -26364,7 +26435,7 @@ const ZeroGuardCtx = struct {
 const max_zero_check_guard_body_lines = 6;
 
 fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
-    if (mem.indexOf(u8, ctx.t, ctx.var_name) == null) return false;
+    if (!mentionsIdent(ctx.t, ctx.var_name)) return false;
     // The matched predicate anchors the judge on the guard's own
     // condition group: a leading call's group must not own the verdict
     // (EPH-I0892).
@@ -26434,20 +26505,87 @@ fn isInComptimeBlock(lines: []const []const u8, current_idx: usize) bool {
     return false;
 }
 
+/// Verdict for one assert line against the decrement amount: covered —
+/// the assert's literal bound is at least the amount (or the bound is
+/// not a literal and the shape-only heuristic holds); uncovered — the
+/// bound is below the amount; not_binding — no `>=`/`>` comparison on
+/// the line has the decremented var as its operand (EPH-I0495).
+const AssertBoundVerdict = enum { covered, uncovered, not_binding };
+
+/// Numeric prefix of `t` (`0)`, `5;` → 0/5), or null when the text does
+/// not start with a plain decimal literal. Hex and digit-separator
+/// forms return null: the comparison needs the exact bound (EPH-I0495).
+fn parseNumericBound(t: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < t.len and t[i] >= '0' and t[i] <= '9') i += 1;
+    if (i == 0) return null;
+    if (i < t.len and (t[i] == 'x' or t[i] == 'b' or t[i] == 'o' or t[i] == '_')) return null;
+    return std.fmt.parseInt(usize, t[0..i], 10) catch null;
+}
+
+/// Judge one assert line's bound against the decrement amount: any
+/// `>=`/`>` comparison whose operand is `var_name` with a literal bound
+/// at least the amount covers the decrement. A comparison with a
+/// non-literal bound keeps the shape-only heuristic (covered — the
+/// exact comparison needs both literals, documented). A line whose
+/// comparisons never bind `var_name` is not this var's guard
+/// (not_binding — EPH-I0493, EPH-I0495).
+fn judgeAssertBound(ctx: []const u8, var_name: []const u8, amount: usize) AssertBoundVerdict {
+    const ops = [_][]const u8{ ">=", "> " };
+    var saw_binding = false;
+    for (ops) |op| {
+        var search: usize = 0;
+        while (mem.indexOfPos(u8, ctx, search, op)) |pos| {
+            search = pos + op.len;
+            const operand_start = identStartBefore(ctx, pos) orelse continue;
+            const operand = mem.trim(u8, ctx[operand_start..pos], " \t");
+            if (!mem.eql(u8, operand, var_name)) continue;
+            saw_binding = true;
+            const rhs = mem.trimStart(u8, ctx[pos + op.len ..], " \t");
+            const bound = parseNumericBound(rhs) orelse return .covered;
+            const floor = if (mem.eql(u8, op, ">=")) bound else bound +| 1;
+            if (floor >= amount) return .covered;
+        }
+    }
+    return if (saw_binding) .uncovered else .not_binding;
+}
+
+/// True when the assert line's bound covers the decrement: the
+/// amount-aware verdict (covered) or the shape-only fallback for a
+/// non-literal amount (EPH-I0495).
+fn assertLineCoversDecrement(
+    ctx: []const u8,
+    var_name: []const u8,
+    decrement_amount: ?usize,
+) bool {
+    if (mem.indexOf(u8, ctx, "assert") == null) return false;
+    if (!mentionsIdent(ctx, var_name)) return false;
+    if (decrement_amount) |amount| {
+        return judgeAssertBound(ctx, var_name, amount) == .covered;
+    }
+    if (mem.indexOf(u8, ctx, ">=") != null) return true;
+    return mem.indexOf(u8, ctx, "> ") != null;
+}
+
 /// Check for assert(var >= n) on prior lines as guard for var -= n
 /// Pattern: assert(item.meta.ref >= n); ... item.meta.ref -= n;
-fn hasAssertGeGuard(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+/// The parsed bound is related to the decrement amount: the assert
+/// covers only when the bound is at least the amount (EPH-I0495). A
+/// non-literal amount or bound keeps the shape-only heuristic (any
+/// `>=`/`>` assert on the var suppresses — documented; the exact
+/// comparison needs both literals).
+fn hasAssertGeGuard(
+    lines: []const []const u8,
+    current_idx: usize,
+    var_name: []const u8,
+    decrement_amount: ?usize,
+) bool {
     const check_start = if (current_idx > 5) current_idx - 5 else 0;
     for (lines[check_start..current_idx]) |line| {
         const ctx = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
-
-        // Check for assert(var >= ...) pattern
-        if (mem.indexOf(u8, ctx, "assert") != null and mem.indexOf(u8, ctx, var_name) != null) {
-            if (mem.indexOf(u8, ctx, ">=") != null) return true;
-            if (mem.indexOf(u8, ctx, "> ") != null) return true;
-        }
+        if (assertLineCoversDecrement(ctx, var_name, decrement_amount)) return true;
     }
     return false;
 }
@@ -26467,12 +26605,17 @@ fn isLenGuardLine(ctx: []const u8) bool {
     return lineHasIf(ctx) and hasLenGuardPattern(ctx);
 }
 
+/// Check for early-return length guards that protect array index arithmetic.
+/// The candidate line is parsed first: the indexed array's base binds the
+/// guard, so `if (a.len == 0) return;` cannot silence a `b[i - 1]`
+/// candidate (EPH-I0496, band-B12 F14). The 30-line window walk accepts
+/// a `.len` guard only when one of its bases matches the candidate's.
 fn hasEarlyReturnLengthGuard(
     lines: []const []const u8,
     current_idx: usize,
     current_line: []const u8,
 ) bool {
-    _ = current_line;
+    const base = extractIndexedArrayBase(current_line) orelse return false;
     const check_start = if (current_idx > 30) current_idx - 30 else 0;
     var i = check_start;
     while (i < current_idx) : (i += 1) {
@@ -26480,11 +26623,75 @@ fn hasEarlyReturnLengthGuard(
         if (isCommentOrMultilineString(ctx)) continue;
         if (isFuncBoundary(ctx)) return false;
         if (!isLenGuardLine(ctx)) continue;
+        if (!lenGuardMatchesBase(ctx, base)) continue;
         if (hasExitStatement(ctx)) return true;
         const block_end = if (i + 6 < current_idx) i + 6 else current_idx;
         if (hasExitInFollowingBlock(lines, i + 1, block_end)) return true;
     }
     return false;
+}
+
+/// Array base of the index expression that subtracts on `t`: the
+/// ident/dot chain before the bracket containing the subtraction
+/// (`b[i - 1]` → `b`, `arr[x.len - 1]` → `arr`, `self.items[i - 1]` →
+/// `self.items`). Null when no subtraction index exists or the base is
+/// not a plain chain (a call-result base is not bound — EPH-I0496).
+fn extractIndexedArrayBase(t: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '[') continue;
+        const end = findMatchingBracket(t, i) orelse continue;
+        const inside = t[i + 1 .. end];
+        if (isSafeZeroBasedRange(inside)) {
+            i = end;
+            continue;
+        }
+        if (findIndexSubtraction(inside) == null) {
+            i = end;
+            continue;
+        }
+        const start = identStartBefore(t, i) orelse return null;
+        return mem.trim(u8, t[start..i], " \t");
+    }
+    return null;
+}
+
+/// True when any `.len` occurrence on a guard line carries the
+/// candidate's base: `if (a.len == 0 or b.len == 0) return;` binds base
+/// `b` on its second occurrence (EPH-I0496).
+fn lenGuardMatchesBase(ctx: []const u8, base: []const u8) bool {
+    var len_pos: usize = 0;
+    while (mem.indexOfPos(u8, ctx, len_pos, ".len")) |lp| {
+        len_pos = lp + ".len".len;
+        const gbase = lenGuardBase(ctx, lp) orelse continue;
+        if (mem.eql(u8, gbase, base)) return true;
+    }
+    return false;
+}
+
+/// The ident/dot chain before a `.len` occurrence (`a` in `a.len == 0`,
+/// `self.items` in `self.items.len < n`), or null when the occurrence
+/// is not a plain chain. A transparent paren group directly before the
+/// `.len` binds its inner chain: `(x).len` binds `x` — the parens
+/// change nothing (EPH-I0496). A call head is not transparent:
+/// `foo(x).len` is a call result and says nothing about `x`, so it
+/// never silences an `x[i - 1]` candidate (the operandFormStart paren
+/// rule mirrored from EPH-I0906).
+fn lenGuardBase(t: []const u8, len_pos: usize) ?[]const u8 {
+    // A paren group directly before the `.len` is transparent only
+    // when its content is exactly one plain chain and the open paren
+    // has no call/subscript head.
+    if (len_pos > 0 and t[len_pos - 1] == ')') {
+        const open = parenOpenBackAt(t, len_pos - 1) orelse return null;
+        if (open > 0 and (isIdent(t[open - 1]) or t[open - 1] == '.' or
+            t[open - 1] == ']' or t[open - 1] == ')')) return null;
+        const content = mem.trim(u8, t[open + 1 .. len_pos - 1], " \t");
+        const inner = identStartBefore(content, content.len) orelse return null;
+        if (inner != 0) return null;
+        return content;
+    }
+    const start = identStartBefore(t, len_pos) orelse return null;
+    return t[start..len_pos];
 }
 
 /// Extract index variable and subtrahend from [VAR - N] pattern
@@ -26534,10 +26741,17 @@ fn initValueExceedsSubtrahend(ctx: []const u8, subtrahend: usize) bool {
 }
 
 /// Check if loop initialization guarantees minimum index value
+/// A `var i = N` init (N >= subtrahend), with no reassignment of i
+/// between the init and the candidate, proves the subtraction cannot
+/// underflow. The candidate must sit inside a loop body (EPH-I0497):
+/// without the loop the init says nothing about the iteration; a
+/// reassignment (`i = 0`) between init and use breaks the proof. The
+/// window is 20 lines and stops at the function boundary.
 fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
     const info = extractIndexSubtraction(current_line) orelse return false;
+    if (!hasEnclosingLoopHeader(lines, current_idx)) return false;
     const check_start = if (current_idx > 20) current_idx - 20 else 0;
-    for (lines[check_start..current_idx]) |line| {
+    for (lines[check_start..current_idx], check_start..) |line, init_idx| {
         const ctx = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
         if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
@@ -26546,9 +26760,63 @@ fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line:
         const has_const = mem.indexOf(u8, ctx, "const ") != null;
         const has_decl = has_var or has_const;
         if (!has_decl) continue;
-        if (mem.indexOf(u8, ctx, info.idx_var) == null) continue;
+        if (!mentionsIdent(ctx, info.idx_var)) continue;
         if (mem.indexOf(u8, ctx, "= ") == null) continue;
-        if (initValueExceedsSubtrahend(ctx, info.subtrahend)) return true;
+        if (!initValueExceedsSubtrahend(ctx, info.subtrahend)) continue;
+        if (indexVarReassignedAfter(lines, init_idx + 1, current_idx, info.idx_var)) continue;
+        return true;
+    }
+    return false;
+}
+
+/// True when `current_idx` sits inside a loop body: a `while`/`for`
+/// header line opens an enclosing block above the candidate before the
+/// function boundary. A loop that closed before the candidate does not
+/// enclose it (EPH-I0497).
+fn hasEnclosingLoopHeader(lines: []const []const u8, current_idx: usize) bool {
+    var brace_depth: i32 = 0;
+    var i = current_idx;
+    while (i > 0) {
+        i -= 1;
+        const ctx = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        brace_depth = trackBraceDepthBackward(ctx, brace_depth);
+        if (isFuncBoundary(ctx)) return false;
+        if (isLoopBoundary(ctx) and brace_depth < 0) return true;
+    }
+    return false;
+}
+
+/// True when any line in [start, end) reassigns `idx_var`: a
+/// reassignment between the init and the candidate breaks the init
+/// guard (EPH-I0497).
+fn indexVarReassignedAfter(
+    lines: []const []const u8,
+    start: usize,
+    end: usize,
+    idx_var: []const u8,
+) bool {
+    for (start..end) |k| {
+        const ctx = mem.trim(u8, lines[k], " \t\r");
+        if (isCommentOrMultilineString(ctx)) continue;
+        if (lineReassignsIndexVar(ctx, idx_var)) return true;
+    }
+    return false;
+}
+
+/// True when `t` assigns `idx_var`: a plain or compound assignment
+/// (`i = 0`, `i -= 1`, `i += 1`, `i *= 2`) at an identifier-bounded
+/// occurrence. Comparisons (`i == 0`) and reads are not assignments
+/// (EPH-I0497).
+fn lineReassignsIndexVar(t: []const u8, idx_var: []const u8) bool {
+    var from: usize = 0;
+    while (nextBoundaryIdent(t, idx_var, &from)) |pos| {
+        const after = mem.trimStart(u8, t[pos + idx_var.len ..], " \t");
+        if (mem.startsWith(u8, after, "==")) continue;
+        if (mem.startsWith(u8, after, "=")) return true;
+        if (mem.startsWith(u8, after, "-=") or mem.startsWith(u8, after, "+=") or
+            mem.startsWith(u8, after, "*=") or mem.startsWith(u8, after, "/=") or
+            mem.startsWith(u8, after, "%=")) return true;
     }
     return false;
 }
@@ -26575,7 +26843,7 @@ fn extractIndexSubVar(t: []const u8) ?[]const u8 {
 
 /// Check if a line has a conditional (if/while) with comparison guard for a variable
 fn hasConditionalGuardForVar(ctx: []const u8, var_name: []const u8) bool {
-    if (mem.indexOf(u8, ctx, var_name) == null) return false;
+    if (!mentionsIdent(ctx, var_name)) return false;
     const has_cond = mem.indexOf(u8, ctx, "if ") != null or
         mem.indexOf(u8, ctx, "if(") != null or
         mem.indexOf(u8, ctx, "while ") != null or
@@ -26925,7 +27193,7 @@ fn hasComparisonGuardPattern(line: []const u8) bool {
 
 /// Check if a line contains a guard for a variable
 fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
-    if (mem.indexOf(u8, line, var_name) == null) return false;
+    if (!mentionsIdent(line, var_name)) return false;
     if (hasComparisonGuardPattern(line)) return true;
     if (mem.indexOf(u8, line, "while") != null and mem.indexOf(u8, line, ">") != null) return true;
     if (mem.indexOf(u8, line, "== 0") != null and hasExitStatement(line)) return true;
@@ -26975,17 +27243,25 @@ fn extractCastIdent(line: []const u8, lparen: usize) ?[]const u8 {
     return line[start..i];
 }
 
+/// Position of the next boundary-checked occurrence of `ident` in `t` at
+/// or after `from.*`, advancing `from.*` past the match. Both sides are
+/// identifier-boundary-checked: `x` does not match `max_x` or `x2`
+/// (EPH-I0493, band-B12 F10).
+fn nextBoundaryIdent(t: []const u8, ident: []const u8, from: *usize) ?usize {
+    while (mem.indexOfPos(u8, t, from.*, ident)) |idx| {
+        from.* = idx + ident.len;
+        const left_ok = idx == 0 or !isIdent(t[idx - 1]);
+        const right_ok = idx + ident.len >= t.len or !isIdent(t[idx + ident.len]);
+        if (left_ok and right_ok) return idx;
+    }
+    return null;
+}
+
 /// Boundary-checked identifier presence (patterns.md F2: a substring search
 /// for `x` must not match `max_x`).
 fn mentionsIdent(t: []const u8, ident: []const u8) bool {
-    var pos: usize = 0;
-    while (mem.indexOfPos(u8, t, pos, ident)) |idx| {
-        pos = idx + ident.len;
-        const left_ok = idx == 0 or !isIdent(t[idx - 1]);
-        const right_ok = idx + ident.len >= t.len or !isIdent(t[idx + ident.len]);
-        if (left_ok and right_ok) return true;
-    }
-    return false;
+    var from: usize = 0;
+    return nextBoundaryIdent(t, ident, &from) != null;
 }
 
 /// Comparison operator presence, skipping shifts — `x << 2` is not a bound.
@@ -68182,6 +68458,526 @@ test "ZA901: trailing-comment return does not arm the == 0 guard (EPH-I0494)" {
         "test_za901_phantom_exit.zig",
         RULE_DECREMENT_WITHOUT_CHECK,
     ) == 1);
+}
+
+test "guard helpers match vars on identifier boundaries (EPH-I0493)" {
+    // F10: substring var matching let `x` match `max_x` in nine guard
+    // helpers. Every helper now gates on boundary-checked matching.
+    try std.testing.expect(!mentionsIdent("var max_x = 1;", "x"));
+    try std.testing.expect(mentionsIdent("var x = 1;", "x"));
+    try std.testing.expect(!hasGuardOnLine("if (max_x > 0) return;", "x"));
+    try std.testing.expect(hasGuardOnLine("if (x > 0) return;", "x"));
+    try std.testing.expect(!hasConditionalGuardForVar("if (max_x > 0) {", "x"));
+    try std.testing.expect(hasConditionalGuardForVar("if (x > 0) {", "x"));
+    try std.testing.expect(hasNullEqualityCheck("if (ax == null) return 0;", "x") == null);
+    try std.testing.expect(hasNullEqualityCheck("if (x == null) return 0;", "x") != null);
+    // isSignedVarInContext: max_x's i32 type does not make x signed.
+    const signed_lines = [_][]const u8{
+        "fn f(y: u32) void {",
+        "    var max_x: i32 = 0;",
+        "    var x: u32 = y;",
+        "    x -= 1;",
+        "    _ = x;",
+        "    _ = max_x;",
+        "}",
+    };
+    try std.testing.expect(!isSignedVarInContext(&signed_lines, 3, "x"));
+    const signed_pos = [_][]const u8{
+        "fn f() void {",
+        "    var x: i32 = 0;",
+        "    x -= 1;",
+        "}",
+    };
+    try std.testing.expect(isSignedVarInContext(&signed_pos, 2, "x"));
+    // hasPairedIncrementInLines: x_total's increment is not total's.
+    const pair_lines = [_][]const u8{ "x_total += 1;", "total -= 1;" };
+    try std.testing.expect(!hasPairedIncrementInLines(&pair_lines, "total"));
+    const pair_ok = [_][]const u8{ "total += 1;", "total -= 1;" };
+    try std.testing.expect(hasPairedIncrementInLines(&pair_ok, "total"));
+    // isZeroCheckGuard: max_x == 0 does not guard x.
+    const zero_lines = [_][]const u8{
+        "fn f() void {",
+        "    if (max_x == 0) return;",
+        "}",
+    };
+    try std.testing.expect(!isZeroCheckGuard(.{
+        .t = "    if (max_x == 0) return;",
+        .var_name = "x",
+        .lines = &zero_lines,
+        .line_idx = 1,
+        .current_idx = 2,
+    }));
+    // hasNullGuard: the binding layer keeps ax == null off x (pin for the
+    // site the batch-9 binding fix already made exact).
+    const null_lines = [_][]const u8{
+        "fn f() void {",
+        "    if (ax == null) return;",
+        "}",
+    };
+    try std.testing.expect(!hasNullGuard(&null_lines, 1, 0, "x"));
+}
+
+test "ZA901: max_x guard does not suppress an x candidate (EPH-I0493)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // F10: `if (max_x > 0) {` guarded `x -= 1` inside the block — the
+    // substring `x` inside `max_x` armed hasConditionalGuardForVar. The
+    // boundary check drops the phantom and ZA901 fires.
+    const content =
+        \\fn maxx_guard(x: u32, max_x: u32) void {
+        \\    if (max_x > 0) {
+        \\        _ = max_x;
+        \\        x -= 1;
+        \\    }
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_maxx_guard.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_maxx_guard.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: assert bound below the decrement amount still fires (EPH-I0495)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // F13: any `assert(x >= N)` suppressed any `x -= M`. The bound now
+    // relates to the amount: `assert(x >= 0)` cannot cover `x -= 100`
+    // (x == 0 underflows), so ZA901 fires.
+    const content =
+        \\fn weak_assert(x: usize) void {
+        \\    assert(x >= 0);
+        \\    x -= 100;
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_weak_assert.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_weak_assert.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: assert bound at least the decrement amount stays silent (EPH-I0495)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn strong_assert(x: usize) void {
+        \\    assert(x >= 100);
+        \\    x -= 100;
+        \\    _ = x;
+        \\    var y = x;
+        \\    assert(y > 0);
+        \\    y -= 1;
+        \\    _ = y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_strong_assert.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_strong_assert.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "parseDecrementAmount reads only a terminated decimal literal (EPH-I0495)" {
+    // A compound right side (`100 + 5`) is not a plain decimal literal:
+    // the prefix must not report 100, or `assert(x >= 101)` would
+    // wrongly cover the true amount 105 (batch-23 review F4).
+    try std.testing.expectEqual(@as(?usize, 100), parseDecrementAmount("x -= 100;", 3));
+    try std.testing.expectEqual(@as(?usize, 100), parseDecrementAmount("x -= 100 ", 3));
+    try std.testing.expectEqual(@as(?usize, 100), parseDecrementAmount("x -= 100, y", 3));
+    try std.testing.expectEqual(@as(?usize, 100), parseDecrementAmount("x -= 100)", 3));
+    try std.testing.expectEqual(@as(?usize, 100), parseDecrementAmount("x -= 100", 3));
+    try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= 100 + 5", 3));
+    try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= 100 - 5", 3));
+    try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= 100*2", 3));
+    try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= n", 3));
+    try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= 0x10", 3));
+    try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= 100_000", 3));
+}
+
+test "ZA903: mismatched-array .len guard does not suppress the candidate (EPH-I0496)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // F14: `if (a.len == 0) return;` silenced `b[i - 1]` — the .len
+    // guard was never tied to the indexed array. The candidate base is
+    // bound first; a guard on `a` cannot cover `b`, so ZA903 fires. The
+    // 30-line walk only engages past its window start (the
+    // function-boundary stop — pre-existing window shape), so the guard
+    // sits 30 lines above the candidate.
+    const content =
+        \\fn len_mismatch(a: []u8, b: []u8, i: usize) u8 {
+        \\    if (a.len == 0) return 0;
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    return b[i - 1];
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_len_mismatch.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_len_mismatch.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: matching-array .len guard stays silent (EPH-I0496)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn len_match(a: []u8, b: []u8, i: usize) u8 {
+        \\    if (b.len == 0) return 0;
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    sink(a);
+        \\    return b[i - 1];
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_len_match.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_len_match.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: transparent-paren .len guard binds the inner base (EPH-I0496)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `(x).len == 0` guards `x[i - 1]` — the parens change nothing, so
+    // the guard binds base `x` and the candidate stays silent
+    // (batch-23 review F3). The guard sits 30 lines above the candidate
+    // so the window walk clears the function boundary.
+    const content =
+        \\fn len_paren(x: []u8, i: usize) u8 {
+        \\    if ((x).len == 0) return 0;
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    return x[i - 1];
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_len_paren.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_len_paren.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: call-result .len guard does not suppress the candidate (EPH-I0496)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `foo(x).len == 0` is a call-result guard: it says nothing about
+    // `x`, so it must not silence `x[i - 1]` (batch-23 review F3). The
+    // guard sits 30 lines above the candidate so the window walk clears
+    // the function boundary.
+    const content =
+        \\fn len_call(x: []u8, i: usize) u8 {
+        \\    if (foo(x).len == 0) return 0;
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    sink(x);
+        \\    return x[i - 1];
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+        \\fn foo(v: []u8) []u8 {
+        \\    return v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_len_call.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_len_call.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: loop-init guard without a loop does not suppress (EPH-I0497)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // F15: `var i = 5;` before the candidate suppressed without any
+    // loop, and a later `i = 0;` was ignored. The loop requirement alone
+    // drops this shape: no `while`/`for` encloses the candidate, so
+    // ZA903 fires. The 20-line window only engages past its start (the
+    // function-boundary stop — pre-existing window shape).
+    const content =
+        \\fn loop_init_none(arr: []u8) u8 {
+        \\    var i = 5;
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    i = 0;
+        \\    return arr[i - 1];
+        \\    return 0;
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_loop_init_none.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_loop_init_none.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: loop-init guard with a reassignment does not suppress (EPH-I0497)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn loop_init_reassign(arr: []u8, n: usize) u8 {
+        \\    var i = 5;
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    while (n > 0) {
+        \\        i = 0;
+        \\        sink(arr);
+        \\        return arr[i - 1];
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_loop_init_reassign.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_loop_init_reassign.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: loop-init guard without a reassignment stays silent (EPH-I0497)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn loop_init_sound(arr: []u8, n: usize) u8 {
+        \\    var i = 1;
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    sink(arr);
+        \\    while (n > 0) {
+        \\        sink(arr);
+        \\        sink(arr);
+        \\        return arr[i - 1];
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn sink(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_loop_init_sound.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_loop_init_sound.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
 }
 
 test "ZA301: outer fn with local struct method is reported" {

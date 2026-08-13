@@ -25846,6 +25846,7 @@ fn isArrayIndexGuarded(ctx: GuardLineCtx) bool {
     if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
     if (hasEarlyReturnLengthGuard(ctx.lines, ctx.idx, ctx.t)) return true;
     if (hasLoopInitGuard(ctx.lines, ctx.idx, ctx.t)) return true;
+    if (hasRangeEndInitGuard(ctx.lines, ctx.idx, ctx.t)) return true;
     if (hasEnclosingBlockGuard(ctx.lines, ctx.idx, ctx.t)) return true;
     return false;
 }
@@ -26451,21 +26452,26 @@ fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
     return hasExitInFollowingBlock(ctx.lines, ctx.line_idx + 1, block_end);
 }
 
+/// True when a zero-check break/continue/return guard on a prior line
+/// dominates the candidate. The 10-line window stops at a function
+/// boundary and at any loop opener: a guard above a loop opener never
+/// dominates an access inside its body — the loop's later iterations
+/// reach the access without re-passing the guard (EPH-I0498). The
+/// boundary check runs before the opener's own `{` is folded, so a
+/// canonical `while (...) {` stops the walk like a brace-less header.
 fn hasBreakGuardOnPriorLines(
     lines: []const []const u8,
     current_idx: usize,
     var_name: []const u8,
 ) bool {
     const check_start = if (current_idx > 10) current_idx - 10 else 0;
-    var brace_depth: i32 = 0;
     var i = current_idx;
     while (i > check_start) {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        brace_depth = trackBraceDepthBackward(ctx, brace_depth);
         if (isFuncBoundary(ctx)) return false;
-        if (brace_depth >= 0 and isLoopBoundary(ctx)) return false;
+        if (isLoopBoundary(ctx)) return false;
         const zctx: ZeroGuardCtx = .{
             .t = ctx,
             .var_name = var_name,
@@ -26707,6 +26713,17 @@ fn extractIndexSubtraction(line: []const u8) ?IdxSub {
             i = end;
             continue;
         };
+        // A `[0 .. x - N]` slice-end form is not an `[VAR - N]` index
+        // subtraction: the var sits after the `..`, and parsing it here
+        // would yield a garbage var name ("0 .. x") that could read a
+        // witness it does not own (EPH-I0499). The slice-end form has
+        // its own witness guard, hasRangeEndInitGuard. A subtraction
+        // BEFORE the `..` is the range START (`buf[x - 1 .. y]`), a
+        // real `[VAR - N]` bracket that keeps parsing (batch 24
+        // review F2).
+        if (mem.indexOf(u8, inside, "..")) |range_pos| {
+            if (sub > range_pos) return null;
+        }
         const idx_var = mem.trim(u8, inside[0..sub], " \t");
         if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
         // Parse the numeric subtrahend after the '-', skipping whitespace.
@@ -26750,11 +26767,28 @@ fn initValueExceedsSubtrahend(ctx: []const u8, subtrahend: usize) bool {
 fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line: []const u8) bool {
     const info = extractIndexSubtraction(current_line) orelse return false;
     if (!hasEnclosingLoopHeader(lines, current_idx)) return false;
+    return hasInitWitness(lines, current_idx, info);
+}
+
+/// True when a prior declaration initializes `info.idx_var` to a
+/// literal at least `info.subtrahend` with no reassignment between
+/// (EPH-I0497, EPH-I0499). The 20-line window stops at the function
+/// boundary. Shared by the [i - N] iteration form (hasLoopInitGuard)
+/// and the [0 .. x - N] slice-end form (hasRangeEndInitGuard).
+fn hasInitWitness(lines: []const []const u8, current_idx: usize, info: IdxSub) bool {
     const check_start = if (current_idx > 20) current_idx - 20 else 0;
     for (lines[check_start..current_idx], check_start..) |line, init_idx| {
         const ctx = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        if (mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
+        // A nested fn signature inside the window is a scope boundary;
+        // the walk must not descend into it. The callers pass the
+        // function's own lines, so the outer signature always sits at
+        // index 0 and is the one exemption (EPH-I0499). At a deeper
+        // window (check_start > 0) the first window line is an
+        // arbitrary mid-function line: a signature there is a boundary
+        // like any other (batch 24 review F-A).
+        if (init_idx > 0 and
+            mem.indexOf(u8, ctx, "fn ") != null and mem.indexOf(u8, ctx, "(") != null) return false;
 
         const has_var = mem.indexOf(u8, ctx, "var ") != null;
         const has_const = mem.indexOf(u8, ctx, "const ") != null;
@@ -26767,6 +26801,128 @@ fn hasLoopInitGuard(lines: []const []const u8, current_idx: usize, current_line:
         return true;
     }
     return false;
+}
+
+/// The `x` and `N` of a `[0 .. x - N]` slice-end bracket body, or null
+/// when the body is not the form. Shared by the line-level finder
+/// (extractRangeEndSubtraction) and the per-bracket completeness pass
+/// (everyLaterBracketWitnessed).
+fn rangeEndSubOf(inside: []const u8) ?IdxSub {
+    const sub = findIndexSubtraction(inside) orelse return null;
+    const range_pos = mem.indexOf(u8, inside, "..") orelse return null;
+    if (!mem.eql(u8, mem.trim(u8, inside[0..range_pos], " \t"), "0")) return null;
+    if (sub <= range_pos + 1) return null;
+    const idx_var = mem.trim(u8, inside[range_pos + 2 .. sub], " \t");
+    if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
+    var dpos = sub + 1;
+    while (dpos < inside.len and (inside[dpos] == ' ' or inside[dpos] == '\t')) dpos += 1;
+    var dend = dpos;
+    while (dend < inside.len and inside[dend] >= '0' and inside[dend] <= '9') dend += 1;
+    if (dend == dpos) return null;
+    const val = std.fmt.parseInt(usize, inside[dpos..dend], 10) catch return null;
+    return .{ .idx_var = idx_var, .subtrahend = val };
+}
+
+/// The `VAR` and `N` of an `[VAR - N]` index-subtraction bracket body,
+/// or null when the body is not the form: a slice-end body puts the
+/// var after the `..` (EPH-I0499), and a subtraction before the `..`
+/// is the range START — a real `[VAR - N]` body (batch 24 review F2).
+fn indexSubOf(inside: []const u8) ?IdxSub {
+    const sub = findIndexSubtraction(inside) orelse return null;
+    if (mem.indexOf(u8, inside, "..")) |range_pos| {
+        if (sub > range_pos) return null;
+    }
+    const idx_var = mem.trim(u8, inside[0..sub], " \t");
+    if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
+    var dpos = sub + 1;
+    while (dpos < inside.len and (inside[dpos] == ' ' or inside[dpos] == '\t')) dpos += 1;
+    var dend = dpos;
+    while (dend < inside.len and inside[dend] >= '0' and inside[dend] <= '9') dend += 1;
+    if (dend == dpos) return null;
+    const val = std.fmt.parseInt(usize, inside[dpos..dend], 10) catch return null;
+    return .{ .idx_var = idx_var, .subtrahend = val };
+}
+
+/// The `x` and `N` of a `[0 .. x - N]` slice-end subtraction on `t`,
+/// or null when the line does not carry the form: a bracket whose
+/// range starts at literal 0, with a subtraction after the `..`
+/// (EPH-I0499). The end underflows when x < N, so the form is a ZA903
+/// candidate unless a witness proves x >= N. Only the candidate
+/// bracket serves as the witness target: the candidate finder selects
+/// the FIRST subtraction-bearing bracket (hasArrayIndexSubtraction),
+/// so an earlier bracket that carries its own subtraction binds the
+/// verdict — a later range witness must not silence it (batch 24
+/// review F1).
+fn extractRangeEndSubtraction(t: []const u8) ?IdxSub {
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '[') continue;
+        const end = findMatchingBracket(t, i) orelse continue;
+        const inside = t[i + 1 .. end];
+        if (findIndexSubtraction(inside) == null) {
+            i = end;
+            continue;
+        }
+        return rangeEndSubOf(inside);
+    }
+    return null;
+}
+
+/// ZA903 witness for the `[0 .. x - N]` slice-end form: the end
+/// underflows when x < N, so the form fires unless a prior declaration
+/// initializes x to a literal >= N with no reassignment between
+/// (EPH-I0499). The slice end is evaluated once per expression, so no
+/// enclosing loop is required — unlike the [i - N] iteration form's
+/// hasLoopInitGuard. The witness covers only its own bracket: every
+/// LATER subtraction-bearing bracket must carry its own witness or
+/// scope guard, or the line still fires (batch 24 review F-B).
+fn hasRangeEndInitGuard(
+    lines: []const []const u8,
+    current_idx: usize,
+    current_line: []const u8,
+) bool {
+    const info = extractRangeEndSubtraction(current_line) orelse return false;
+    if (!hasInitWitness(lines, current_idx, info)) return false;
+    return everyLaterBracketWitnessed(lines, current_idx, current_line);
+}
+
+/// True when every subtraction-bearing bracket AFTER the line's first
+/// one carries its own witness or scope guard. The witness guards bind
+/// per bracket: `buf[0 .. n - 1][i - 1]` with a witnessed `n` still
+/// fires when `i` has no witness, so the range witness cannot silence
+/// a later unwitnessed subtraction (batch 24 review F-B). A range-end
+/// body needs its own init witness; an index body needs an init
+/// witness or an enclosing scope guard; an unclassifiable body stays a
+/// finding — no witness can prove it safe.
+fn everyLaterBracketWitnessed(
+    lines: []const []const u8,
+    current_idx: usize,
+    t: []const u8,
+) bool {
+    var i: usize = 0;
+    var past_first = false;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '[') continue;
+        const end = findMatchingBracket(t, i) orelse continue;
+        const inside = t[i + 1 .. end];
+        if (findIndexSubtraction(inside) == null) {
+            i = end;
+            continue;
+        }
+        if (!past_first) {
+            past_first = true;
+            i = end;
+            continue;
+        }
+        if (rangeEndSubOf(inside)) |rinfo| {
+            if (!hasInitWitness(lines, current_idx, rinfo)) return false;
+        } else if (indexSubOf(inside)) |iinfo| {
+            if (!hasInitWitness(lines, current_idx, iinfo) and
+                !hasEnclosingGuardForVar(lines, current_idx, iinfo.idx_var)) return false;
+        } else return false;
+        i = end;
+    }
+    return true;
 }
 
 /// True when `current_idx` sits inside a loop body: a `while`/`for`
@@ -26957,7 +27113,11 @@ fn findIndexSubtraction(inside: []const u8) ?usize {
     return null;
 }
 
-/// Check if bracket contents are a safe zero-based range pattern [0 .. x - N]
+/// True when `inside` is the `[0 .. x - N]` zero-based slice-end form.
+/// The form is NOT safe on its own: `x - N` underflows when x < N
+/// (EPH-I0499). The candidate finder treats it as any other index
+/// subtraction; only the base extraction keeps skipping it — a range
+/// bracket is not an `[x - N]` bracket for the .len-guard binding.
 fn isSafeZeroBasedRange(inside: []const u8) bool {
     const range_pos = mem.indexOf(u8, inside, "..") orelse return false;
     const sub_pos = findIndexSubtraction(inside) orelse return false;
@@ -26973,10 +27133,6 @@ fn hasArrayIndexSubtraction(t: []const u8) ?usize {
         if (t[i] != '[') continue;
         const end = findMatchingBracket(t, i) orelse continue;
         const inside = t[i + 1 .. end];
-        if (isSafeZeroBasedRange(inside)) {
-            i = end;
-            continue;
-        }
         if (findIndexSubtraction(inside)) |sub_pos| {
             return i + 1 + sub_pos;
         }
@@ -27459,17 +27615,32 @@ fn analyzeIntCastGuards(
 /// ZR104 for a zig fmt spawn failure (EPH-I0232): an empty list would
 /// read as ran-clean, so the failure becomes a finding. ZR104, not
 /// ZA601: a missing zig is a command failure, not a format finding.
+/// A StreamTooLong names the capture cap like the runtime band's
+/// reportRunFailure does (EPH-I0501).
 fn reportFmtFailure(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
     err: std.process.RunError,
 ) !void {
-    const msg = try std.fmt.allocPrint(
-        allocator,
-        "cannot run zig fmt: {s}",
-        .{@errorName(err)},
-    );
+    const msg = if (err == error.StreamTooLong)
+        try std.fmt.allocPrint(
+            allocator,
+            "zig fmt output exceeded the {d} MB capture limit",
+            .{runtime_capture_limit_bytes / (1024 * 1024)},
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "cannot run zig fmt: {s}",
+            .{@errorName(err)},
+        );
     errdefer allocator.free(msg);
+    // The action must match the cause: StreamTooLong proves zig ran, so
+    // the missing-zig help would mislead (batch 24 review F3).
+    const help = if (err == error.StreamTooLong)
+        "rerun on a smaller path set or report the case"
+    else
+        "check that zig is installed and on PATH";
     try issues.append(allocator, .{
         .file = "build.zig",
         .line = 1,
@@ -27477,7 +27648,7 @@ fn reportFmtFailure(
         .severity = .err,
         .rule = RULE_RUNTIME_TEST_FAILURE,
         .message = msg,
-        .help = "check that zig is installed and on PATH",
+        .help = help,
         .message_owned = true,
     });
 }
@@ -27576,9 +27747,12 @@ fn runFmtCheck(
     allocator: Allocator,
     path: []const u8,
 ) !std.ArrayListUnmanaged(Issue) {
-    const result = std.process.run(allocator, diag.io, .{
-        .argv = &.{ tool_zig_path, "fmt", "--check", path },
-    }) catch |err| {
+    const result = runChildCapped(
+        allocator,
+        diag.io,
+        &.{ tool_zig_path, "fmt", "--check", path },
+        .inherit,
+    ) catch |err| {
         std.debug.print("error: cannot run zig fmt: {}\n", .{err});
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
         try reportFmtFailure(allocator, &issues, err);
@@ -27835,6 +28009,24 @@ fn reportRunFailure(
 /// outputs fail with StreamTooLong instead of growing unbounded.
 const runtime_capture_limit_bytes = 10 * 1024 * 1024;
 
+/// Spawn a child with the capture caps on both streams. The runtime
+/// band and the fmt band share this spawn so no capture path can grow
+/// unbounded (EPH-I0501): `zig fmt --check` on a hostile tree is a
+/// child like any other.
+fn runChildCapped(
+    allocator: Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: std.process.Child.Cwd,
+) std.process.RunError!std.process.RunResult {
+    return std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .stdout_limit = .limited(runtime_capture_limit_bytes),
+        .stderr_limit = .limited(runtime_capture_limit_bytes),
+    });
+}
+
 /// Options for one runtime-analysis pass: verbosity plus an optional
 /// custom command replacing the default `zig build test`.
 const RuntimeOptions = struct {
@@ -27855,12 +28047,12 @@ fn runRuntimeAnalysis(
     var argv_buf: [64][]const u8 = undefined;
     const argv_len = buildRuntimeArgv(opts.custom_command, &argv_buf, opts.verbose);
 
-    const result = std.process.run(allocator, io, .{
-        .argv = argv_buf[0..argv_len],
-        .cwd = .{ .path = path },
-        .stdout_limit = .limited(runtime_capture_limit_bytes),
-        .stderr_limit = .limited(runtime_capture_limit_bytes),
-    }) catch |err| {
+    const result = runChildCapped(
+        allocator,
+        io,
+        argv_buf[0..argv_len],
+        .{ .path = path },
+    ) catch |err| {
         const cmd_str = opts.custom_command orelse "zig build test";
         std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
         try reportRunFailure(allocator, &issues, cmd_str, err);
@@ -28276,11 +28468,11 @@ fn handleRunnerBlock(
     for (lines) |line| try classifyGPATable(ctx, verbose, line);
 }
 
-/// Parse test output for failures and panics
+/// Parse test output for failures and panics. The `" panic:"` form is a
+/// substring of `"panic:"`, so one match covers both markers
+/// (EPH-I0503).
 fn isPanicLine(t: []const u8) bool {
-    if (mem.indexOf(u8, t, "panic:") != null) return true;
-    return mem.indexOf(u8, t, "thread ") != null and
-        mem.indexOf(u8, t, " panic:") != null;
+    return mem.indexOf(u8, t, "panic:") != null;
 }
 
 const panic_issue_spec = RuntimeIssueSpec{
@@ -36326,6 +36518,40 @@ test "reportFmtFailure reports a missing zig as a command failure" {
     try std.testing.expectEqualStrings("cannot run zig fmt: FileNotFound", issues.items[0].message);
     try std.testing.expect(issues.items[0].message_owned);
     try std.testing.expectEqualStrings("check that zig is installed and on PATH", issues.items[0].help.?);
+}
+
+test "reportFmtFailure names the capture cap for StreamTooLong (EPH-I0501)" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    try reportFmtFailure(allocator, &issues, error.StreamTooLong);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
+    try std.testing.expectEqualStrings(
+        "zig fmt output exceeded the 10 MB capture limit",
+        issues.items[0].message,
+    );
+    try std.testing.expect(issues.items[0].message_owned);
+    // The action must match the cause: zig demonstrably ran, so the
+    // installed-and-on-PATH help would mislead (batch 24 review F3).
+    try std.testing.expectEqualStrings(
+        "rerun on a smaller path set or report the case",
+        issues.items[0].help.?,
+    );
+}
+
+test "runChildCapped trips StreamTooLong on unbounded child output (EPH-I0501)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    // `yes` writes unbounded output and trips the 10 MB cap fast. The
+    // fmt band's spawn shares this helper, so a hostile zig on PATH
+    // cannot grow ephor's heap without bound (F21).
+    try std.testing.expectError(error.StreamTooLong, runChildCapped(
+        allocator,
+        std.testing.io,
+        &.{"yes"},
+        .inherit,
+    ));
 }
 
 test "runFmtCheck reports ZR104 when the scanned path does not exist" {
@@ -68144,6 +68370,73 @@ test "ZA901: while-header guard still covers the loop body (EPH-I0486 lock)" {
     ) == 1);
 }
 
+test "hasBreakGuardOnPriorLines stops at a canonical while opener (EPH-I0498)" {
+    // A guard above a loop opener does not dominate an access inside
+    // its body: the loop's later iterations reach the access without
+    // re-passing the guard. Pre-fix the opener's own `{` folded the
+    // depth negative and the walk ran past it to the stale guard.
+    const lines = [_][]const u8{
+        "fn f(x: usize, y: usize) void {",
+        "    var m = x;",
+        "    while (y > 0) {",
+        "        if (m == 0) break;",
+        "        while (y > 1) {",
+        "            m -= 1;",
+        "        }",
+        "        y -= 1;",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(!hasBreakGuardOnPriorLines(&lines, 5, "m"));
+    // The same-loop guard still dominates: the scan finds it before
+    // reaching the opener.
+    const same_lines = [_][]const u8{
+        "fn f(x: usize) void {",
+        "    var m = x;",
+        "    while (m > 0) {",
+        "        if (m == 0) break;",
+        "        m -= 1;",
+        "    }",
+        "}",
+    };
+    try std.testing.expect(hasBreakGuardOnPriorLines(&same_lines, 4, "m"));
+}
+
+test "ZA901: pre-loop break guard does not suppress the loop-body decrement (EPH-I0498)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The guard breaks the enclosing y-loop; the inner loop's
+    // iterations reach `m -= 1` without re-passing it. Pre-fix the
+    // stale guard silenced the decrement (F18).
+    const content =
+        \\fn dec_stale(x: usize, y: usize) usize {
+        \\    var m = x;
+        \\    while (y > 0) {
+        \\        if (m == 0) break;
+        \\        while (y > 1) {
+        \\            m -= 1;
+        \\        }
+        \\        y -= 1;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_stale.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_stale.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
 test "ZA903: else-arm index arithmetic stays silent past a guarded if (EPH-I0487)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -68333,9 +68626,11 @@ test "ZA903 matcher: unspaced bracket subtraction forms" {
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[x.len-1];") != null);
     // Addition is not subtraction.
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[i+1];") == null);
-    // Zero-based ranges stay exempt at any spacing.
-    try std.testing.expect(hasArrayIndexSubtraction("const y = a[0 .. i-1];") == null);
-    try std.testing.expect(hasArrayIndexSubtraction("const y = a[0 .. i - 1];") == null);
+    // Zero-based slice-end ranges fire too: `[0 .. i - 1]` underflows
+    // when i < 1, so the candidate exists at any spacing (EPH-I0499).
+    // The witness guard (hasRangeEndInitGuard) decides the verdict.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[0 .. i-1];") != null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[0 .. i - 1];") != null);
     // A leading minus is a negative literal, not a subtraction.
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[-1];") == null);
     // A char literal '-' is data; char arithmetic is a real subtraction.
@@ -68344,6 +68639,258 @@ test "ZA903 matcher: unspaced bracket subtraction forms" {
     // A dereferenced index is a real operand; a bare `* -` is multiplication.
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[ptr.* - 1];") != null);
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[x * -1];") == null);
+}
+
+test "hasRangeEndInitGuard requires a literal init witness (EPH-I0499)" {
+    const lines = [_][]const u8{
+        "fn f(n: usize, arr: []usize) usize {",
+        "    const k = 5;",
+        "    _ = k;",
+        "    return arr[0 .. n - 1][0];",
+        "}",
+    };
+    // The slice end `n - 1` underflows when n < 1. A literal init of
+    // the end var proves the safe boundary; a parameter init proves
+    // nothing.
+    try std.testing.expect(!hasRangeEndInitGuard(&lines, 3, lines[3]));
+
+    const witnessed = [_][]const u8{
+        "fn f(arr: []usize) usize {",
+        "    const n = 1;",
+        "    return arr[0 .. n - 1][0];",
+        "}",
+    };
+    // `const n = 1` is exactly the empty-slice boundary (x == N): the
+    // subtraction cannot underflow, so the shape stays silent.
+    try std.testing.expect(hasRangeEndInitGuard(&witnessed, 2, witnessed[2]));
+
+    const reassigned = [_][]const u8{
+        "fn f(arr: []usize) usize {",
+        "    var n = 5;",
+        "    n = 0;",
+        "    return arr[0 .. n - 1][0];",
+        "}",
+    };
+    // A reassignment between the init and the candidate breaks the
+    // witness: the init proves nothing about the end value.
+    try std.testing.expect(!hasRangeEndInitGuard(&reassigned, 3, reassigned[3]));
+}
+
+test "ZA903: no-witness slice-end range fires (EPH-I0499)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `arr[0 .. n - 1]` with `n` a parameter: n < 1 underflows the
+    // slice end. Pre-fix the range form was exempt (F19b).
+    const content =
+        \\fn range_nowit(n: usize, arr: []usize) usize {
+        \\    return arr[0 .. n - 1][0];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_rangenowit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_rangenowit.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: empty-slice range with an init witness stays silent (EPH-I0499)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const n = 1; arr[0 .. n - 1]` slices `arr[0 .. 0]` — the empty
+    // slice. The init witness keeps the safe boundary silent.
+    const content =
+        \\fn range_empty(arr: []usize) usize {
+        \\    const n = 1;
+        \\    return arr[0 .. n - 1][0];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_rangeempty.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_rangeempty.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: range-end witness does not cover an earlier unwitnessed index (batch 24 review F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `arr[b - 1][0 .. x - 1][0]` with `const x = 5` and b a parameter:
+    // the range-end witness proves x >= 1, not b >= 1. The candidate
+    // finder selects the FIRST subtraction-bearing bracket (`[b - 1]`);
+    // pre-fix the witness guard scanned every bracket, so the later
+    // range witness silenced the unwitnessed `b - 1` candidate (FN).
+    const content =
+        \\fn range_mixed(b: usize, arr: []usize) usize {
+        \\    const x = 5;
+        \\    return arr[b - 1][0 .. x - 1][0];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_mixed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_mixed.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: range-start subtraction honors the init witness (batch 24 review F2)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[x - 1 .. i]`: the subtraction is the range START, a real
+    // `[VAR - N]` bracket. The `var x = 5` init witness inside the
+    // loop keeps the shape silent. Pre-fix the blanket `..` rejection
+    // dropped the bracket, so the witness never applied (FP).
+    const content =
+        \\fn slice_start(buf: []const u8) []const u8 {
+        \\    var x = 5;
+        \\    var i = 0;
+        \\    while (i < buf.len) : (i += 1) {
+        \\        _ = buf[x - 1 .. i];
+        \\    }
+        \\    return buf[0..0];
+        \\}
+        \\fn sink(v: []const u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_slicestart.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_slicestart.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "hasInitWitness stops at a nested fn at the window edge (batch 24 review F-A)" {
+    // The nested fn signature sits at the window edge (current_idx - 20
+    // == check_start for current_idx 23). The window's first line is
+    // the outer signature only when the window starts at index 0; at a
+    // deeper window the edge line is an arbitrary mid-function line, so
+    // a signature there is a scope boundary. The `const x = 5` inside
+    // the nested fn must not witness the outer `x` (batch 24 review
+    // F-A).
+    const lines = [_][]const u8{
+        "fn outer(x: usize, arr: []usize) usize {",
+        "    const pad = 1;",
+        "    _ = pad;",
+        "    fn inner(i: usize) usize {",
+        "        const x = 5;",
+        "        _ = x;",
+        "        return i;",
+        "    }",
+        "    const pad2 = 2;",
+        "    _ = pad2;",
+        "    const pad3 = 3;",
+        "    _ = pad3;",
+        "    const pad4 = 4;",
+        "    _ = pad4;",
+        "    const pad5 = 5;",
+        "    _ = pad5;",
+        "    const pad6 = 6;",
+        "    _ = pad6;",
+        "    const pad7 = 7;",
+        "    _ = pad7;",
+        "    const pad8 = 8;",
+        "    _ = pad8;",
+        "    _ = inner(x);",
+        "    return arr[0 .. x - 1][0];",
+        "}",
+    };
+    // The witness search must reject the inner `const x = 5`: the
+    // boundary check turns the guard off, so the outer shape stays a
+    // finding.
+    try std.testing.expect(!hasRangeEndInitGuard(&lines, 23, lines[23]));
+}
+
+test "ZA903: a range-end witness does not silence a later unwitnessed index (batch 24 review F-B)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[0 .. n - 1][i - 1]` with `const n = 5` and i a parameter:
+    // the range-end witness proves n >= 1, not i >= 1. Pre-fix the
+    // witness silenced the whole line, so the `[i - 1]` underflow was
+    // never judged (FN regression: pre-batch-24 the range bracket was
+    // exempt from candidate selection, so `[i - 1]` was the candidate
+    // and the line fired).
+    const content =
+        \\fn range_later(i: usize, buf: []usize) usize {
+        \\    const n = 5;
+        \\    return buf[0 .. n - 1][i - 1];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_range_later.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_range_later.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: a witnessed later index keeps the range line silent (batch 24 review F-B)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `buf[0 .. n - 1][b - 1]` with `const n = 5; const b = 5;`: both
+    // brackets carry an init witness, so the line stays silent. The
+    // F-B fix must not trade the FN for an FP.
+    const content =
+        \\fn range_later2(buf: []usize) usize {
+        \\    const n = 5;
+        \\    const b = 5;
+        \\    return buf[0 .. n - 1][b - 1];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_range_later2.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_range_later2.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
 }
 
 test "ZA903: unspaced index subtraction fires end-to-end" {

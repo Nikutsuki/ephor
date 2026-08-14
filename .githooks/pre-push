@@ -8,29 +8,47 @@
 fail=0
 zero_sha="0000000000000000000000000000000000000000"
 
+# Secret patterns for the added-lines scan (EPH-I0948). The quote classes
+# carry a literal apostrophe: the \x27 hex escape is not portable to BSD
+# ERE, where it reads as literal x, 2, 7 and corrupts the negated password
+# value class.
+secret_re='BEGIN (RSA|EC|OPENSSH|PGP|DSA) PRIVATE KEY|api[_-]?key["'\'']?\s*[:=]\s*["'\''][A-Za-z0-9_/-]{16,}|secret["'\'']?\s*[:=]\s*["'\''][A-Za-z0-9_/-]{16,}|password["'\'']?\s*[:=]\s*["'\''][^"'\'']{8,}|ghp_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|sk-[A-Za-z0-9]{32,}'
+
 while read local_ref local_sha remote_ref remote_sha; do
-    # Determine the commit range being pushed
-    if [ "$remote_sha" = "$zero_sha" ]; then
-        range="$local_sha"
-    else
+    # Compute the pushed delta for the scans (EPH-I0947). The delta exists
+    # only when the old remote commit resolves locally. A new ref (remote
+    # sha is all zeros) has no old commit, and a rewritten history pushed
+    # without a prior fetch prunes the old commit; both shapes skip the
+    # scans and print a manual-review NOTE instead.
+    range=""
+    if [ "$remote_sha" != "$zero_sha" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
         range="${remote_sha}..${local_sha}"
     fi
 
-    # 1. Secret pattern scan (added lines only)
-    secrets=$(git diff "$range" 2>/dev/null | grep '^+' | grep -iE \
-        'BEGIN (RSA|EC|OPENSSH|PGP|DSA) PRIVATE KEY|api[_-]?key["\x27]?\s*[:=]\s*["\x27][A-Za-z0-9_/-]{16,}|secret["\x27]?\s*[:=]\s*["\x27][A-Za-z0-9_/-]{16,}|password["\x27]?\s*[:=]\s*["\x27][^"\x27]{8,}|ghp_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9_-]{20}|sk-[A-Za-z0-9]{32,}' | head -5)
-    if [ -n "$secrets" ]; then
-        echo "PUSH BLOCKED: possible secret in pushed changes:"
-        echo "$secrets"
-        fail=1
-    fi
+    if [ -n "$range" ]; then
+        # 1. Secret pattern scan (added lines only)
+        secrets=$(git diff "$range" 2>/dev/null | grep '^+' | grep -iE "$secret_re" | head -5)
+        if [ -n "$secrets" ]; then
+            echo "PUSH BLOCKED: possible secret in pushed changes:"
+            echo "$secrets"
+            fail=1
+        fi
 
-    # 4. Personal dev files must never be pushed (additions only —
-    # removal commits must pass)
-    bad_files=$(git diff --name-only --diff-filter=A "$range" 2>/dev/null | grep -E '^\.opencode/|^opencode\.json$|^AGENTS\.md$' | head -5)
-    if [ -n "$bad_files" ]; then
-        echo "PUSH BLOCKED: personal dev files must not be tracked: $bad_files"
-        fail=1
+        # 4. Personal dev files must never be pushed (additions only —
+        # removal commits must pass)
+        bad_files=$(git diff --name-only --diff-filter=A "$range" 2>/dev/null | grep -E '^\.opencode/|^opencode\.json$|^AGENTS\.md$' | head -5)
+        if [ -n "$bad_files" ]; then
+            echo "PUSH BLOCKED: personal dev files must not be tracked: $bad_files"
+            fail=1
+        fi
+    else
+        echo "NOTE: the pushed delta for ${remote_ref} cannot be computed."
+        if [ "$remote_sha" = "$zero_sha" ]; then
+            echo "      The ref is new, so no old commit exists to diff against."
+        else
+            echo "      The old commit ${remote_sha} does not resolve locally."
+        fi
+        echo "      Review the pushed commits manually before this push."
     fi
 
     # 2. Quality gate on pushes to main (fmt + build + test) plus version

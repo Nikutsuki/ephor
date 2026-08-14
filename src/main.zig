@@ -25893,12 +25893,13 @@ fn guardCoversDecrement(
 fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8, decrement_amount: ?usize) bool {
     if (isGuardedAtLine(ctx, var_name, decrement_amount)) return true;
     if (hasGuardOnLine(ctx.t, var_name)) return true;
-    // The ZA901 chain keeps the legacy shape-only backstop (null
-    // amount): the `== 0` exit proves var >= 1, but `x -= N` needs
-    // N <= 1 and the walk does not scan for a guard-to-decrement
-    // reassignment. Pre-existing amount-blindness, tracked residual
-    // (EPH-I0959 scoped the ZA903 chain).
-    if (hasBreakGuardOnPriorLines(ctx.lines, ctx.idx, var_name, null)) return true;
+    // The prior-line backstop is amount-aware: the `== 0` exit proves
+    // var >= 1, so it covers decrements <= 1 only — `x -= 2` under the
+    // guard still underflows at x == 1, and a guard-to-decrement
+    // reassignment (`x = 0;`) defeats the exclusion (EPH-I0960). A
+    // non-literal amount (`x -= n`) keeps the null-amount shape-only
+    // verdict.
+    if (hasBreakGuardOnPriorLines(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
     if (isSignedVarInContext(ctx.lines, ctx.idx, var_name)) return true;
     if (hasPairedIncrementInLines(ctx.lines[0..ctx.idx], var_name)) return true;
     if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
@@ -26584,9 +26585,9 @@ fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
 /// Context for the prior-line zero-check guard walk: the candidate's
 /// function slice, its line index, the guarded variable, and the
 /// candidate's subtraction amount. A null amount keeps the legacy
-/// shape-only behavior (the ZA901 decrement chain); a non-null amount
-/// makes the walk judge the guard's proven bound and the
-/// guard-to-candidate reassignment (EPH-I0936, EPH-I0959).
+/// shape-only behavior (a non-literal decrement `x -= n`); a non-null
+/// amount makes the walk judge the guard's proven bound and the
+/// guard-to-candidate reassignment (EPH-I0936, EPH-I0959, EPH-I0960).
 const PriorGuardCtx = struct {
     lines: []const []const u8,
     current_idx: usize,
@@ -26600,9 +26601,9 @@ const PriorGuardCtx = struct {
 /// zero. The `== 0` exit proves var >= 1, so it covers subtrahends
 /// <= 1 only: `arr[x - 2]` under `if (x == 0) return;` still
 /// underflows at x == 1, and `x = 0;` after the guard defeats the
-/// exclusion entirely (EPH-I0959). A null amount keeps the legacy
-/// ZA901 shape-only verdict: the guard counts regardless of amount or
-/// reassignment (pre-existing, tracked residual).
+/// exclusion entirely (EPH-I0959, EPH-I0960). A null amount keeps the
+/// legacy shape-only verdict: the guard counts regardless of amount or
+/// reassignment (a non-literal decrement `x -= n`).
 fn zeroGuardDominates(pctx: PriorGuardCtx, guard_idx: usize) bool {
     const sub = pctx.subtrahend orelse return true;
     if (sub > 1) return false;
@@ -26627,12 +26628,12 @@ fn zeroGuardDominates(pctx: PriorGuardCtx, guard_idx: usize) bool {
 ///
 /// The `== 0` exit proves var >= 1, which covers only subtrahends
 /// <= 1: with `subtrahend = 2` the walk keeps going past the guard and
-/// the candidate fires (EPH-I0959). A guard whose exclusion a later
-/// reassignment breaks (probe C: `x = 0;` between guard and candidate)
-/// does not dominate either; the walk passes it and keeps scanning for
-/// an earlier guard (the reassignment defeats that guard too, so an
-/// earlier find still fires). A null `subtrahend` keeps the legacy
-/// shape-only verdict for the ZA901 decrement chain.
+/// the candidate fires (EPH-I0959, EPH-I0960). A guard whose exclusion
+/// a later reassignment breaks (probe C: `x = 0;` between guard and
+/// candidate) does not dominate either; the walk passes it and keeps
+/// scanning for an earlier guard (the reassignment defeats that guard
+/// too, so an earlier find still fires). A null `subtrahend` keeps the
+/// legacy shape-only verdict for a non-literal decrement (`x -= n`).
 fn hasBreakGuardOnPriorLines(
     lines: []const []const u8,
     current_idx: usize,
@@ -27148,10 +27149,12 @@ fn hasInitWitness(
 /// binds `n`; a call-head or paren-group end (`f(n - 1)`, `(n - 1)`)
 /// binds the argument var the subtraction actually runs on — `f(n - 1)`
 /// evaluates `n - 1` before the call, so an init witness on `n` proves
-/// the end safe (EPH-I0938). A call head with a second subtraction
-/// (`f(n - 1, m - 1)`) and a call-result end (`f(n) - 1`) stay
-/// unclassifiable: no single witness covers the whole body, so they
-/// always fire (documented).
+/// the end safe (EPH-I0938). A plain-span compound end (`n - 1 - 2`)
+/// binds the summed literal subtrahends (EPH-I0958). A call head with a
+/// second subtraction (`f(n - 1, m - 1)`), a call-result end
+/// (`f(n) - 1`), and a plain-span compound end with a non-literal
+/// operand (`n - 1 - m`) stay unclassifiable: no single witness covers
+/// the whole body, so they always fire (documented).
 fn rangeEndSubOf(inside: []const u8) ?IdxSub {
     const sub = findIndexSubtraction(inside) orelse return null;
     const range_pos = mem.indexOf(u8, inside, "..") orelse return null;
@@ -27170,9 +27173,9 @@ fn rangeEndSubOf(inside: []const u8) ?IdxSub {
     if (var_end > 0 and span[var_end - 1] != '(') return null;
     // A paren-wrapped body with a second subtraction subtracts another
     // operand (`f(n - 1, m - 1)`, `(n - 1) - 2`): one witness cannot
-    // cover it, so the shape stays a finding. A plain span has no
-    // second operand, so the compound-end class (`n - 1 - 2`) keeps its
-    // first-subtraction binding (recorded residual, EPH-I0938).
+    // cover it, so the shape stays a finding. A plain span binds the
+    // summed subtrahends of its compound end (`n - 1 - 2` binds
+    // {n, 3}, EPH-I0958).
     if (var_end > 0 and findIndexSubtraction(inside[sub + 1 ..]) != null) return null;
     var dpos = sub + 1;
     while (dpos < inside.len and (inside[dpos] == ' ' or inside[dpos] == '\t')) dpos += 1;
@@ -27180,7 +27183,51 @@ fn rangeEndSubOf(inside: []const u8) ?IdxSub {
     while (dend < inside.len and inside[dend] >= '0' and inside[dend] <= '9') dend += 1;
     if (dend == dpos) return null;
     const val = std.fmt.parseInt(usize, inside[dpos..dend], 10) catch return null;
+    // A plain span binds the summed literal subtrahends of its
+    // compound end. A wrapped span (a call head, a paren group) keeps
+    // the single-subtrahend binding: the second-subtraction check above
+    // already excluded every `-`-bearing tail, and a `-`-free tail (an
+    // addition, a closer) cannot make the end underflow beyond the
+    // subtraction's own operand — `f(n - 1) + 5` is safe whenever
+    // n - 1 is (EPH-I0958 review r1 finding 2).
+    if (var_end == 0) {
+        const total = compoundEndSubtrahend(inside, dpos, dend) orelse return null;
+        return .{ .idx_var = span[var_end..], .subtrahend = total };
+    }
     return .{ .idx_var = span[var_end..], .subtrahend = val };
+}
+
+/// The summed literal subtrahends of a plain-span compound end
+/// (`n - 1 - 2` binds 3), or null when the sum is unknowable. A
+/// non-literal second operand (`n - 1 - m`) or trailing content
+/// (`n - 1 - 2 + 5`) makes the amount unknowable: no single witness
+/// covers the end, so the shape stays a finding (EPH-I0958). The scan
+/// for the next `-` starts at the previous operand's first digit, so
+/// the operator sees its left operand inside the slice. The first
+/// operand sits at [first_digit, first_end).
+fn compoundEndSubtrahend(
+    inside: []const u8,
+    first_digit: usize,
+    first_end: usize,
+) ?usize {
+    var total = std.fmt.parseInt(usize, inside[first_digit..first_end], 10) catch return null;
+    var scan = first_digit;
+    var tail_start = first_end;
+    while (findIndexSubtraction(inside[scan..])) |more_rel| {
+        const more = scan + more_rel;
+        var m = more + 1;
+        while (m < inside.len and (inside[m] == ' ' or inside[m] == '\t')) m += 1;
+        var m_end = m;
+        while (m_end < inside.len and inside[m_end] >= '0' and inside[m_end] <= '9') m_end += 1;
+        if (m_end == m) return null;
+        total +|= std.fmt.parseInt(usize, inside[m..m_end], 10) catch return null;
+        scan = m;
+        tail_start = m_end;
+    }
+    // The tail after the last operand must be empty, or only the paren
+    // closes that terminate a call-head or group end (`f(n - 1)`).
+    if (mem.trim(u8, inside[tail_start..], " \t)").len != 0) return null;
+    return total;
 }
 
 /// The `VAR` and `N` of an `[VAR - N]` index-subtraction bracket body,
@@ -27459,15 +27506,73 @@ fn hasConditionalGuardForVar(ctx: []const u8, var_name: []const u8) bool {
 /// walk sees the arm's close, not its open, so the crossing carries no
 /// antecedent (EPH-I0963). The caller gates on the line's balance and
 /// the walk depth: a closed arm nets -1, so `line_balance >= 0` rejects
-/// it (batch 30 r4 sign correction).
+/// it (batch 30 r4 sign correction). A mid-line else-open (`if (n > 1)
+/// { return arr[0]; } else {`) is detected through its `else` keyword:
+/// the line's final open brace must be the arm's — a self-contained
+/// if/else statement whose arms closed on the line (`if (a) { } else {
+/// }`) is transparent to the walk (EPH-I0965).
 const ElseOpenKind = enum { plain, chain };
 
+/// Position of the `else` keyword that opens an else arm on the line:
+/// the last `else` word outside strings and comments that directly
+/// follows a closing brace (after whitespace). The last keyword wins:
+/// `} else if (b) { } else {` opens its arm at the final else. The
+/// classic `} else {` line qualifies at its first char; a mid-line
+/// else-open (`if (n > 1) { return arr[0]; } else {`) qualifies through
+/// the same brace-predecessor rule (EPH-I0965). A ternary `else`
+/// (`x = if (a) 1 else 2`) never follows a brace and never qualifies.
+fn elseKeywordPos(t: []const u8) ?usize {
+    // One classifier walk plus one comment-start walk (EPH-I0153).
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var from = t.len;
+    while (mem.lastIndexOf(u8, t[0..from], "else")) |pos| {
+        from = pos;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + 4 < t.len and isIdent(t[pos + 4])) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        var k = pos;
+        while (k > 0 and (t[k - 1] == ' ' or t[k - 1] == '\t')) k -= 1;
+        if (k == 0 or t[k - 1] != '}') continue;
+        return pos;
+    }
+    return null;
+}
+
+/// The arm's own region of an else-open line: the suffix after the
+/// `else` keyword. The opener walks judge only this region — the
+/// condition before the `else` is the ANTECEDENT, negated for the arm
+/// below, so it must never guard an else-arm candidate (EPH-I0965).
+fn elseArmRegion(ctx: []const u8) []const u8 {
+    const pos = elseKeywordPos(ctx) orelse return ctx;
+    return ctx[pos + 4 ..];
+}
+
+/// True when the else-open line is the CLASSIC shape: the antecedent's
+/// close brace is the line's first code char, so the antecedent opener
+/// sits on a line above and the walk must skip it. A mid-line
+/// else-open carries its antecedent on the same line (already excluded
+/// through the arm region), so the next opener above is an outer guard
+/// that still dominates the candidate (EPH-I0965 review r1 finding 1).
+fn isClassicElseOpen(ctx: []const u8) bool {
+    return ctx.len > 0 and ctx[0] == '}';
+}
+
 fn elseOpenKind(ctx: []const u8) ?ElseOpenKind {
-    if (ctx.len == 0 or ctx[0] != '}') return null;
-    const rest = mem.trimStart(u8, ctx[1..], " \t");
-    if (!mem.startsWith(u8, rest, "else")) return null;
-    if (rest.len > 4 and isIdent(rest[4])) return null;
-    const after = mem.trimStart(u8, rest[4..], " \t");
+    if (ctx.len == 0) return null;
+    if (ctx[0] != '}') {
+        // Mid-line else-open: the arm must stay open at the line's end
+        // (the line's last brace is the arm's `{`). An if/else whose
+        // arms closed on the line does not open the candidate's
+        // container — it is a self-contained statement, transparent to
+        // the walk (EPH-I0965).
+        var last = ctx.len;
+        while (last > 0 and (ctx[last - 1] == ' ' or ctx[last - 1] == '\t')) last -= 1;
+        if (last == 0 or ctx[last - 1] != '{') return null;
+    }
+    const else_pos = elseKeywordPos(ctx) orelse return null;
+    const after = mem.trimStart(u8, ctx[else_pos + 4 ..], " \t");
     if (after.len == 0) return null;
     if (after[0] == '{') return .plain;
     if (mem.startsWith(u8, after, "if")) return .chain;
@@ -27537,11 +27642,11 @@ fn allmanHeaderGuardHasBound(
 /// judgment inherits the chain's amount-blind or-tail residual
 /// (band-B12 F17, EPH-I0506). An else-open counts only when the walk
 /// crosses it at depth 0 and the line does not close the arm on its own
-/// line (batch 30 r4, review r3 Finding 1). An else-open whose `}` is
-/// not the line's first code char (`if (x > 1) { ... } else {` above the
-/// candidate) is not detected: the trailing `{` is judged a plain
-/// opener and the antecedent is credited for the else-arm candidate
-/// (EPH-I0965 residual).
+/// line (batch 30 r4, review r3 Finding 1). A mid-line else-open
+/// (`if (x > 1) { ... } else {` above the candidate) is detected through
+/// its `else` keyword, and the opener check judges only the arm's own
+/// region after the `else` — the antecedent condition on the same line
+/// is negated for the arm below (EPH-I0965).
 fn hasEnclosingGuardForVar(
     lines: []const []const u8,
     current_idx: usize,
@@ -27558,11 +27663,16 @@ fn hasEnclosingGuardForVar(
         const line_balance = countCurlyBalance(ctx);
         const depth_before = brace_depth;
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
-        // The opener check runs before the else-open flag: a line like
-        // `} else { if (q) {` opens the candidate's own block AND the
-        // else arm — its own condition still guards the candidate.
+        // The else-open flag is computed before the opener check: on an
+        // else-open line the condition before the `else` keyword is the
+        // antecedent, negated for the arm below, so the opener check
+        // judges only the arm's own region after the `else`. A line
+        // like `} else { if (q) {` still credits the arm's own
+        // condition (EPH-I0965).
+        const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
         if (brace_depth < 0) {
-            if (!skip_antecedent and hasConditionalGuardForVar(ctx, var_name)) return true;
+            if (!skip_antecedent and
+                hasConditionalGuardForVar(elseArmRegion(ctx), var_name)) return true;
             skip_antecedent = false;
             brace_depth = 0;
             // An Allman body open is the bare `{` line under the opener:
@@ -27580,11 +27690,17 @@ fn hasEnclosingGuardForVar(
         // not guard the candidate. A closed same-line arm (`} else {
         // x(); }`) nets -1, so line_balance < 0 rejects it: the
         // crossing is the arm's close, no antecedent skip applies.
-        const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
         if (kind) |k| {
             if (!skip_antecedent and k == .chain and
-                hasConditionalGuardForVar(ctx, var_name)) return true;
-            skip_antecedent = true;
+                hasConditionalGuardForVar(elseArmRegion(ctx), var_name)) return true;
+            // Only a CLASSIC else-open (`} else {`) has its antecedent
+            // on a line above: the next opener crossed is that
+            // antecedent and must be skipped. A mid-line else-open
+            // carries its antecedent on the same line, already excluded
+            // through the arm region — the next opener above is an
+            // outer guard that still dominates the candidate
+            // (EPH-I0965 review r1 finding 1).
+            if (isClassicElseOpen(ctx)) skip_antecedent = true;
         }
         if (isFuncBoundary(ctx)) return false;
     }
@@ -27605,7 +27721,8 @@ fn hasEnclosingGuardForVar(
 /// body never runs and any bound is safe (EPH-I0964).
 fn guardBoundOnVar(t: []const u8, var_name: []const u8) ?usize {
     const span = guardConditionSpan(t) orelse return null;
-    return guardExprBound(t, var_name, span.start, span.end);
+    var budget = GuardDepthBudget{ .remaining = max_guard_expr_depth, .exhausted = false };
+    return guardExprBound(t, var_name, span, &budget);
 }
 
 /// The guard condition region on the opener line: the paren group of
@@ -27618,6 +27735,27 @@ fn guardBoundOnVar(t: []const u8, var_name: []const u8) ?usize {
 /// is not the opener's condition. The keyword's group must close on
 /// the line: a multi-line condition is not judged.
 const GuardSpan = struct { start: usize, end: usize };
+
+/// The guard-condition judge's recursion budget: how much budget the
+/// current call may still spend, and whether the budget ran out at any
+/// point in the recursion below. A hostile generated condition (one
+/// line with ~250K top-level or/and keywords or paren groups, well
+/// under the 1MB file cap — no per-line cap) recurses once per keyword
+/// past the cap and overflows the 8MB stack: the analyzer segfaults
+/// (EPH-I0966). Past the cap the judge returns null, and the null must
+/// never suppress the candidate: the `and` combination keeps the other
+/// arm only while the budget holds, so an exhausted judge poisons the
+/// whole result and the warning fires.
+const GuardDepthBudget = struct {
+    remaining: usize,
+    exhausted: bool,
+};
+
+/// The recursion budget for guardExprBound/guardTermBound. A condition
+/// deeper than this is not analyzed: the judge returns null (the
+/// conservative direction — the candidate fires) instead of overflowing
+/// the stack (EPH-I0966).
+const max_guard_expr_depth = 512;
 
 fn guardConditionSpan(t: []const u8) ?GuardSpan {
     var from: usize = 0;
@@ -27700,27 +27838,41 @@ fn matchingCloseParenOnLine(t: []const u8, lparen: usize) ?usize {
 /// disjunction combines its arms by min — the body runs when ANY arm
 /// holds, so the weakest arm's bound is the only one every body path
 /// clears. A conjunction combines its arms by max. A term or arm that
-/// proves nothing yields null, and null nulls its disjunction.
+/// proves nothing yields null, and null nulls its disjunction. The
+/// recursion spends one budget unit per top-level or/and keyword:
+/// past `max_guard_expr_depth` the judge returns null and poisons the
+/// result upward, so a hostile generated condition can never overflow
+/// the stack nor suppress the candidate (EPH-I0966).
 fn guardExprBound(
     t: []const u8,
     var_name: []const u8,
-    start: usize,
-    end: usize,
+    span: GuardSpan,
+    budget: *GuardDepthBudget,
 ) ?usize {
+    if (budget.remaining == 0) {
+        budget.exhausted = true;
+        return null;
+    }
+    budget.remaining -= 1;
+    const start = span.start;
+    const end = span.end;
     if (topLevelKeywordPos(t, "or", start, end)) |op| {
-        const left = guardExprBound(t, var_name, start, op);
-        const right = guardExprBound(t, var_name, op + 2, end);
+        const left = guardExprBound(t, var_name, .{ .start = start, .end = op }, budget);
+        const right = guardExprBound(t, var_name, .{ .start = op + 2, .end = end }, budget);
         if (left == null or right == null) return null;
         return @min(left.?, right.?);
     }
     if (topLevelKeywordPos(t, "and", start, end)) |op| {
-        const left = guardExprBound(t, var_name, start, op);
-        const right = guardExprBound(t, var_name, op + 3, end);
+        const left = guardExprBound(t, var_name, .{ .start = start, .end = op }, budget);
+        const right = guardExprBound(t, var_name, .{ .start = op + 3, .end = end }, budget);
+        // The budgeted null must not suppress: once the budget ran out
+        // below, the other arm's bound is not substituted (EPH-I0966).
+        if (budget.exhausted) return null;
         if (left == null) return right;
         if (right == null) return left;
         return @max(left.?, right.?);
     }
-    return guardTermBound(t, var_name, start, end);
+    return guardTermBound(t, var_name, span, budget);
 }
 
 /// Position of the next `needle` keyword at paren depth 0 inside
@@ -27765,16 +27917,28 @@ fn topLevelKeywordPos(
 /// depth, a parenthesized subexpression (recursion), or a
 /// non-comparison (a call, another var, a negation) — only the
 /// comparison forms prove anything, and a comparison inside a call's
-/// argument list is never a guard (EPH-I0961).
-fn guardTermBound(t: []const u8, var_name: []const u8, s: usize, e: usize) ?usize {
-    var start = s;
-    while (start < e and (t[start] == ' ' or t[start] == '\t')) start += 1;
-    if (start == e) return null;
-    var end = e;
+/// argument list is never a guard (EPH-I0961). Each paren-group
+/// recursion spends the shared budget, so a hostile paren chain past
+/// `max_guard_expr_depth` returns null (the candidate fires) instead of
+/// overflowing the stack (EPH-I0966).
+fn guardTermBound(
+    t: []const u8,
+    var_name: []const u8,
+    span: GuardSpan,
+    budget: *GuardDepthBudget,
+) ?usize {
+    if (budget.remaining == 0) {
+        budget.exhausted = true;
+        return null;
+    }
+    var start = span.start;
+    while (start < span.end and (t[start] == ' ' or t[start] == '\t')) start += 1;
+    if (start == span.end) return null;
+    var end = span.end;
     while (end > start and (t[end - 1] == ' ' or t[end - 1] == '\t')) end -= 1;
     if (t[start] == '(') {
         const close = parenGroupClose(t, start, end) orelse return null;
-        return guardExprBound(t, var_name, start + 1, close);
+        return guardExprBound(t, var_name, .{ .start = start + 1, .end = close }, budget);
     }
     const op = topLevelComparisonOp(t, start, end) orelse return null;
     if (!comparisonLhsIsVar(t, op, var_name)) return null;
@@ -27891,11 +28055,11 @@ fn openerCoversBound(ctx: EnclosingBoundCtx, opener_line: []const u8, opener_idx
 /// n <= 1 — so the antecedent is skipped; an else-if arm's own
 /// condition still guards its body (EPH-I0963). An else-open counts
 /// only when the walk crosses it at depth 0 and the line does not close
-/// the arm on its own line (batch 30 r4, review r3 Finding 1). An
-/// else-open whose `}` is not the line's first code char
-/// (`if (n > 1) { ... } else {` above the candidate) is not detected:
-/// the trailing `{` is judged a plain opener and the antecedent is
-/// credited for the else-arm candidate (EPH-I0965 residual).
+/// the arm on its own line (batch 30 r4, review r3 Finding 1). A
+/// mid-line else-open (`if (n > 1) { ... } else {` above the candidate)
+/// is detected through its `else` keyword, and the opener check judges
+/// only the arm's own region after the `else` — the antecedent
+/// condition on the same line is negated for the arm below (EPH-I0965).
 fn hasEnclosingBoundForVar(
     lines: []const []const u8,
     current_idx: usize,
@@ -27919,11 +28083,15 @@ fn hasEnclosingBoundForVar(
         const line_balance = countCurlyBalance(ctx);
         const depth_before = brace_depth;
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
-        // The opener check runs before the else-open flag: a line like
-        // `} else { if (q) {` opens the candidate's own block AND the
-        // else arm — its own condition still guards the candidate.
+        // The else-open flag is computed before the opener check: on an
+        // else-open line the condition before the `else` keyword is the
+        // antecedent, negated for the arm below, so the opener check
+        // judges only the arm's own region after the `else`. A line
+        // like `} else { if (q) {` still credits the arm's own
+        // condition (EPH-I0965).
+        const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
         if (brace_depth < 0) {
-            if (!skip_antecedent and openerCoversBound(bctx, ctx, i)) return true;
+            if (!skip_antecedent and openerCoversBound(bctx, elseArmRegion(ctx), i)) return true;
             skip_antecedent = false;
             brace_depth = 0;
             // An Allman body open is the bare `{` line under the opener
@@ -27941,11 +28109,17 @@ fn hasEnclosingBoundForVar(
         // not guard the candidate. A closed same-line arm (`} else {
         // x(); }`) nets -1, so line_balance < 0 rejects it: the
         // crossing is the arm's close, no antecedent skip applies.
-        const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
         if (kind) |k| {
             if (!skip_antecedent and k == .chain and
-                openerCoversBound(bctx, ctx, i)) return true;
-            skip_antecedent = true;
+                openerCoversBound(bctx, elseArmRegion(ctx), i)) return true;
+            // Only a CLASSIC else-open (`} else {`) has its antecedent
+            // on a line above: the next opener crossed is that
+            // antecedent and must be skipped. A mid-line else-open
+            // carries its antecedent on the same line, already excluded
+            // through the arm region — the next opener above is an
+            // outer guard that still dominates the candidate
+            // (EPH-I0965 review r1 finding 1).
+            if (isClassicElseOpen(ctx)) skip_antecedent = true;
         }
         if (isFuncBoundary(ctx)) return false;
     }
@@ -28367,7 +28541,11 @@ fn comparisonOrRootNulls(t: []const u8, var_name: []const u8, op_pos: usize) boo
     const start = if (group_start) |gs| gs + 1 else 0;
     const end = if (group_start) |gs| (matchingCloseParenOnLine(t, gs) orelse t.len) else t.len;
     if (topLevelKeywordPos(t, "or", start, end) == null) return false;
-    return guardExprBound(t, var_name, start, end) == null;
+    // The budgeted judge returns null past max_guard_expr_depth, and
+    // the null keeps the comparison from suppressing — the candidate
+    // fires (EPH-I0966).
+    var budget = GuardDepthBudget{ .remaining = max_guard_expr_depth, .exhausted = false };
+    return guardExprBound(t, var_name, .{ .start = start, .end = end }, &budget) == null;
 }
 
 /// True when the `>` at `pos` starts a lower-bound comparison: `>` or
@@ -70802,13 +70980,17 @@ test "ZA901: guard above a closed sibling loop keeps the prong decrement silent 
     // guard -> sibling loop -> switch prong is sequential control flow:
     // the guard above the loop dominates the prong decrement, so the
     // prong stays silent. Pre-fix the batch-24 unconditional opener
-    // stop masked the guard and the prong fired (FP).
+    // stop masked the guard and the prong fired (FP). The sibling loop
+    // writes its OWN counter: a write to the guarded var between the
+    // guard and the candidate would defeat the guard's proof under the
+    // amount-aware backstop (EPH-I0960).
     const content =
-        \\fn dec_prong(x: usize, k: u8) usize {
+        \\fn dec_prong(x: usize, y: usize, k: u8) usize {
         \\    var m = x;
+        \\    var n = y;
         \\    if (m == 0) return 0;
-        \\    while (m > 3) {
-        \\        m -= 1;
+        \\    while (n > 3) {
+        \\        n -= 1;
         \\    }
         \\    switch (k) {
         \\        1 => {
@@ -72516,6 +72698,230 @@ test "ZA903: loop-body zero-check break with subtrahend 2 fires (EPH-I0959)" {
     ) == 1);
 }
 
+test "ZA901: decrement amount 2 under a zero-check exit fires (EPH-I0960)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `== 0` exit proves m >= 1, which covers `-= 1` only: m == 1
+    // underflows `m -= 2`. Pre-fix the amount-blind backstop silenced
+    // the decrement (FN).
+    const content =
+        \\fn dec_sub2(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    m -= 2;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_sub2_exit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_sub2_exit.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: guard-to-decrement reassignment defeats the zero-check exit (EPH-I0960)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `m = 0;` between the guard and the decrement re-introduces zero:
+    // the exit does not dominate the decrement. Pre-fix the backstop
+    // did not scan the guard-to-decrement window (FN).
+    const content =
+        \\fn dec_reassign(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    m = 0;
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_reassign_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_reassign_guard.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA901: decrement amount 1 under a zero-check exit stays silent (EPH-I0960)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `== 0` exit proves m >= 1, which covers `-= 1`: the
+    // decrement stays legitimate. A non-literal amount (`m -= x`) keeps
+    // the shape-only verdict too.
+    const content =
+        \\fn dec_sub1(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn dec_nonliteral(x: usize, n: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    m -= n;
+        \\    return m;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_sub1_silent.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_sub1_silent.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "ZA903: compound range end binds the summed subtrahends (EPH-I0958)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `n - 1 - 2` evaluates 2 - 1 - 2 = -1 at runtime with `const n =
+    // 2`: the end binds {n, 3}, so an init witness on the FIRST
+    // subtrahend no longer silences it. Pre-fix the plain span kept
+    // its first-subtraction binding and the candidate stayed silent
+    // (FN).
+    const fire =
+        \\fn comp_sub(arr: []usize, m: usize) usize {
+        \\    const n = 2;
+        \\    return arr[0 .. n - 1 - 2][0];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_compound_fire.zig", fire);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_compound_fire.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+
+    // `const n = 4` proves n >= 3 (4 - 3 = 1), so the twin stays
+    // silent; a non-literal operand (`n - 1 - k`) makes the summed
+    // amount unknowable and the shape fires even with `const n = 4`.
+    const silent =
+        \\fn comp_ok(arr: []usize, m: usize) usize {
+        \\    const n = 4;
+        \\    return arr[0 .. n - 1 - 2][0];
+        \\}
+        \\fn comp_nonliteral(arr: []usize, m: usize, k: usize) usize {
+        \\    const n = 4;
+        \\    return arr[0 .. n - 1 - k][0];
+        \\}
+        \\fn sink2(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run2 = try runCFGMemoryTest(&diag, allocator, "test_za903_compound_mix.zig", silent);
+    defer run2.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run2.issues.items,
+        "test_za903_compound_mix.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: wrapped range end with an additive tail stays silent (EPH-I0958 r1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A wrapped span (a call head, a paren group) keeps the
+    // single-subtrahend binding: the second-subtraction check already
+    // excluded every `-`-bearing tail, and a `-`-free tail cannot make
+    // the end underflow beyond the subtraction's own operand —
+    // `f(k - 1) + 5` is safe whenever k - 1 is. Pre-fix (batch-36 c1)
+    // the compound-end tail check fired on both wrapped shapes (FP).
+    const content =
+        \\fn wrapped_tail(arr: []usize, n: usize, m: usize) usize {
+        \\    const k = 2;
+        \\    return arr[0 .. f(k - 1) + 5][0];
+        \\}
+        \\fn wrapped_clamp(arr: []usize, n: usize, m: usize) usize {
+        \\    const k = 2;
+        \\    return arr[0 .. min(k - 1, m) + 1][0];
+        \\}
+        \\fn f(a: usize) usize {
+        \\    return a;
+        \\}
+        \\fn min(a: usize, b: usize) usize {
+        \\    return if (a < b) a else b;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_wrapped_tail_silent.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_wrapped_tail_silent.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: wrapped range end with a subtractive tail still fires (EPH-I0958 r1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `f(k - 1) - 5` carries a second subtraction in the tail: the
+    // second-subtraction check keeps the shape unclassifiable, so the
+    // witness on the first operand cannot silence it.
+    const content =
+        \\fn wrapped_sub(arr: []usize, n: usize, m: usize) usize {
+        \\    const k = 2;
+        \\    return arr[0 .. f(k - 1) - 5][0];
+        \\}
+        \\fn f(a: usize) usize {
+        \\    return a;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_wrapped_sub_fire.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_wrapped_sub_fire.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
 test "ZA903: guard-to-candidate reassignment defeats the zero-check exit (EPH-I0959)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -72786,6 +73192,65 @@ test "ZA903: disjunction and negcall enclosing guards fire (EPH-I0961)" {
     ) == 0);
 }
 
+test "guardExprBound recursion is capped by the depth budget (EPH-I0966)" {
+    // A hostile generated condition (one line with ~250K top-level
+    // keywords, well under the 1MB file cap — no per-line cap)
+    // recursed once per keyword and overflowed the 8MB stack: the
+    // pre-fix analyzer SIGABRTed (exit 134). Past the budget the judge
+    // returns null — the conservative direction, the candidate fires.
+    var buf: [6000]u8 = undefined;
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < 600) : (i += 1) {
+        if (i > 0) {
+            @memcpy(buf[len..][0..4], " or ");
+            len += 4;
+        }
+        @memcpy(buf[len..][0..5], "n > 0");
+        len += 5;
+    }
+    var budget = GuardDepthBudget{ .remaining = max_guard_expr_depth, .exhausted = false };
+    const span = GuardSpan{ .start = 0, .end = len };
+    try std.testing.expect(guardExprBound(buf[0..len], "n", span, &budget) == null);
+    try std.testing.expect(budget.exhausted);
+
+    // The budgeted null must never suppress: once the budget ran out
+    // in the deep right arm of `n > 5 and <deep chain>`, the `and`
+    // combination must NOT substitute the left arm's bound.
+    var buf2: [6200]u8 = undefined;
+    @memcpy(buf2[0..10], "n > 5 and ");
+    var len2: usize = 10;
+    var j: usize = 0;
+    while (j < 600) : (j += 1) {
+        if (j > 0) {
+            @memcpy(buf2[len2..][0..4], " or ");
+            len2 += 4;
+        }
+        @memcpy(buf2[len2..][0..5], "n > 0");
+        len2 += 5;
+    }
+    var budget2 = GuardDepthBudget{ .remaining = max_guard_expr_depth, .exhausted = false };
+    const span2 = GuardSpan{ .start = 0, .end = len2 };
+    try std.testing.expect(guardExprBound(buf2[0..len2], "n", span2, &budget2) == null);
+
+    // A paren chain past the cap spends the budget the same way.
+    var buf3: [1800]u8 = undefined;
+    var len3: usize = 0;
+    for (0..600) |_| {
+        buf3[len3] = '(';
+        len3 += 1;
+    }
+    @memcpy(buf3[len3..][0..5], "n > 0");
+    len3 += 5;
+    for (0..600) |_| {
+        buf3[len3] = ')';
+        len3 += 1;
+    }
+    var budget3 = GuardDepthBudget{ .remaining = max_guard_expr_depth, .exhausted = false };
+    const span3 = GuardSpan{ .start = 0, .end = len3 };
+    try std.testing.expect(guardExprBound(buf3[0..len3], "n", span3, &budget3) == null);
+}
+
 test "ZA903: guard-to-candidate reassignment defeats the enclosing bound (EPH-I0962)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -73016,6 +73481,218 @@ test "ZA901: else-open skip does not over-apply below closed arms (EPH-I0963 r4)
         run.issues.items,
         "test_r4_else_dec.zig",
         RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
+test "ZA903: mid-line else-open escapes the antecedent credit (EPH-I0965)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // f2a: the else-open line carries the antecedent's close AND the
+    // arm's own open (`if (n > 1) { return arr[0]; } else {`). The else
+    // arm runs at n <= 1, so the antecedent's bound must not silence
+    // the candidate. Pre-fix the mid-line else was not detected, the
+    // trailing `{` was judged a plain opener, and the antecedent was
+    // credited (FN).
+    const fire =
+        \\fn else_mid(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { return arr[0]; } else {
+        \\        return arr[0 .. n - 2][0];
+        \\    }
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_else_mid_fire.zig", fire);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_else_mid_fire.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+
+    // The then-branch twin of the SPLIT shape stays silent (the arm
+    // closes on the else-open line — same-line class, fires pre-fix and
+    // post-fix; covered by the f2b test below). A mid-line else-if
+    // credits only the chain arm's OWN condition, and a self-contained
+    // if/else whose arms close on the line stays transparent (the outer
+    // opener still guards the candidate below it).
+    const silent =
+        \\fn else_if_own(arr: []usize, n: usize, m: usize) usize {
+        \\    if (n > 1) { return arr[0]; } else if (m > 0) {
+        \\        return arr[0 .. m - 1][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn outer_guard(arr: []usize, n: usize, q: bool) usize {
+        \\    if (n > 1) {
+        \\        if (q) { sink(1); } else { sink(2); }
+        \\        return arr[0 .. n - 2][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn sink2(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run2 = try runCFGMemoryTest(&diag, allocator, "test_za903_else_mid_silent.zig", silent);
+    defer run2.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run2.issues.items,
+        "test_za903_else_mid_silent.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: one-line if/else chains keep their verdict (EPH-I0965 f2b)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The walk never examines the candidate's own line, so the all-one-
+    // line chains fire exactly as before the fix: the else-arm candidate
+    // (n <= 1 underflows n - 2) and the then-arm candidates (the same-
+    // line antecedent stays invisible). The split then-twin (arm closes
+    // on the else-open line) fires the same way, pre-fix and post-fix.
+    // No FP introduced by the mid-line else detection.
+    const content =
+        \\fn chain_one(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { return arr[0]; } else { return arr[0 .. n - 2][0]; }
+        \\}
+        \\fn then_one(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { return arr[0 .. n - 2][0]; } else { return arr[0]; }
+        \\}
+        \\fn then_twin(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { return arr[0 .. n - 2][0]; } else {
+        \\        return arr[0];
+        \\    }
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_oneline_chain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_oneline_chain.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 3);
+}
+
+test "ZA903: mid-line else-if with a foreign condition fires (EPH-I0965)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The mid-line else-if arm's own condition guards only its own var:
+    // `m > 0` proves nothing about n, so `arr[0 .. n - 2]` in the arm
+    // fires; the antecedent `n > 1` on the same line is negated.
+    const content =
+        \\fn else_if_foreign(arr: []usize, n: usize, m: usize) usize {
+        \\    if (n > 1) { return arr[0]; } else if (m > 0) {
+        \\        return arr[0 .. n - 2][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_else_mid_foreign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_else_mid_foreign.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: mid-line else-if skip does not over-apply under an outer guard (EPH-I0965 r1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The mid-line else-open carries its antecedent on its own line
+    // (excluded through the arm region), so the NEXT opener above is an
+    // outer guard that still dominates the candidate: n > 1 proves
+    // n >= 2, and the inner chain arm runs only at n <= 3, so
+    // arr[0 .. n - 2] reads n - 2 in {0, 1} — safe. Pre-fix (batch-36
+    // c1) the mid-line else set the antecedent skip and the outer
+    // guard was skipped (FP).
+    const content =
+        \\fn nested_chain(arr: []usize, n: usize, m: usize) usize {
+        \\    if (n > 1) {
+        \\        if (n > 3) { return arr[0]; } else if (m > 0) {
+        \\            return arr[0 .. n - 2][0];
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn nested_plain(arr: []usize, n: usize, m: usize) usize {
+        \\    if (n > 1) {
+        \\        if (n > 3) { return arr[0]; } else {
+        \\            return arr[0 .. n - 2][0];
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_outer_guard_silent.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_outer_guard_silent.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 0);
+}
+
+test "ZA903: classic else-open skip survives a mid-line else above it (EPH-I0965 r1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The classic else-open (`} else {`) still skips its antecedent
+    // even when a mid-line else sits between it and the candidate: the
+    // else-arm candidate runs at n <= 1 and must fire, and the mid-line
+    // else inside the arm does not disturb the classic skip.
+    const content =
+        \\fn classic_skip(arr: []usize, n: usize, m: usize) usize {
+        \\    if (n > 1) {
+        \\        return arr[0];
+        \\    } else {
+        \\        if (m > 0) { sink(1); } else {
+        \\            return arr[0 .. n - 2][0];
+        \\        }
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_classic_skip.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_classic_skip.zig",
+        RULE_INDEX_ARITHMETIC,
     ) == 1);
 }
 

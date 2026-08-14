@@ -24424,10 +24424,13 @@ fn checkCatchUnreachable(ctx: CatchVerdictCtx) ?Issue {
         // runtime. Per-site: a suppression clears only the site it names,
         // so a later real catch on the line still fires (band-B12 F24).
         if (isInsideTypeOf(ctx.t, site.col, ctx.preceding_lines)) continue;
-        // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe
-        if (isBufPrintCatchUnreachable(ctx.t, ctx.preceding_lines)) continue;
-        // Suppress stdlib functions called with string literals (parseIp("0.0.0.0", ...))
-        if (isSafeStdlibLiteralCall(ctx.t, ctx.preceding_lines)) continue;
+        // Suppress bufPrint/bufPrintZ — only error is NoSpaceLeft, provably safe.
+        // Per-site like the @TypeOf arm: a suppression clears only its own
+        // call, so a later real catch on the line still fires (EPH-I0945).
+        if (isBufPrintCatchUnreachable(ctx.t, site.col, ctx.preceding_lines)) continue;
+        // Suppress stdlib functions called with string literals (parseIp("0.0.0.0", ...)).
+        // Per-site like the @TypeOf arm (EPH-I0945).
+        if (isSafeStdlibLiteralCall(ctx.t, site.col, ctx.preceding_lines)) continue;
         return .{
             .file = ctx.path,
             .line = ctx.line,
@@ -24531,13 +24534,89 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
     return false;
 }
 
+/// The byte position of the `)` that closes the catch site's call group:
+/// the first non-whitespace byte before `pos`, when that byte is a `)`.
+/// Null when the catch follows a `}` (switch catch) or line start.
+fn callCloseParen(t: []const u8, pos: usize) ?usize {
+    var q = pos;
+    while (q > 0 and (t[q - 1] == ' ' or t[q - 1] == '\t')) q -= 1;
+    if (q == 0 or t[q - 1] != ')') return null;
+    return q - 1;
+}
+
+/// Position just after the opening `(` when the catch at `pos` attaches
+/// to a call opened by one of `needles` on this line; null otherwise.
+/// The site's `)` must close the opener's paren group: the group stays
+/// open through the byte before that `)` (band-B12 F24 per-site
+/// discipline — a suppression clears only its own call).
+fn siteCallArgStart(t: []const u8, pos: usize, needles: []const []const u8) ?usize {
+    const q = callCloseParen(t, pos) orelse return null;
+    for (needles) |name| {
+        var start: usize = 0;
+        while (mem.indexOfPos(u8, t, start, name)) |p| {
+            start = p + name.len;
+            if (p + name.len > q) break;
+            if (isInsideString(t, p)) continue;
+            if (parensStayOpen(t, p + name.len, q)) return p + name.len;
+        }
+    }
+    return null;
+}
+
+/// True when the paren group closed at `q` (a `)` position) opens on the
+/// same line: a backward, quote-masked walk finds the matching `(`.
+/// When the walk runs off the line start with the group still open, the
+/// opener lives on a preceding line. A net-prefix balance cannot answer
+/// this: the group's own closing `)` nets it to 0 when a second catch
+/// site follows on the line (EPH-I0969).
+fn groupOpensOnLine(t: []const u8, q: usize) bool {
+    var mbuf: [256]u8 = undefined;
+    const code = maskOrRaw(t[0..q], &mbuf);
+    var depth: isize = 1;
+    var i = q;
+    while (i > 0) {
+        i -= 1;
+        if (code[i] == ')') depth += 1;
+        if (code[i] == '(') depth -= 1;
+        if (depth == 0) return true;
+    }
+    return false;
+}
+
+/// The call's opener line for the multi-line fallback: the site's `)`
+/// does not close on the current line (its group opens on a preceding
+/// line), so the paren-balanced walk locates the opener. Null when the
+/// group's matching `(` is on the current line — the per-site answer is
+/// final, and the whole-line fallback must not re-suppress a second real
+/// catch on the line (band-B12 F24, EPH-I0969).
+fn callOpenerLine(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) ?[]const u8 {
+    const q = callCloseParen(t, pos) orelse return null;
+    if (groupOpensOnLine(t, q)) return null;
+    return findCallSiteLine(t, preceding_lines);
+}
+
+/// Stdlib parse calls whose string-literal first argument makes a
+/// catch-unreachable deliberate (band-B12 F12, EPH-I0505).
+const safe_stdlib_literal_fns = [_][]const u8{
+    "parseIp(",  "parseIp4(",      "parseIp6(",
+    "parseInt(", "parseUnsigned(",
+};
+
+/// bufPrint/bufPrintZ openers for the per-site catch check (EPH-I0945).
+const buf_print_fns = [_][]const u8{ "bufPrint(", "bufPrintZ(" };
+
 /// Check if `catch unreachable` comes from a bufPrint/bufPrintZ call.
 /// These functions only return error.NoSpaceLeft — programmers size the buffer
 /// to fit max output, making catch unreachable provably correct.
-/// Uses paren-balanced lookback for multi-line calls.
-fn isBufPrintCatchUnreachable(t: []const u8, preceding_lines: ?[]const []const u8) bool {
-    if (hasBufPrintCall(t)) return true;
-    const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
+/// Per-site on the current line; multi-line calls fall back to the
+/// paren-balanced call-line walk (EPH-I0945).
+fn isBufPrintCatchUnreachable(
+    t: []const u8,
+    pos: usize,
+    preceding_lines: ?[]const []const u8,
+) bool {
+    if (siteCallArgStart(t, pos, &buf_print_fns) != null) return true;
+    const call_line = callOpenerLine(t, pos, preceding_lines) orelse return false;
     return hasBufPrintCall(call_line);
 }
 
@@ -24549,13 +24628,22 @@ fn isBufPrintCatchUnreachable(t: []const u8, preceding_lines: ?[]const []const u
 /// malformed-literal panic stays an accepted false negative. Decision
 /// recorded (band-B12 F12, EPH-I0505): the doc arm, because a textual
 /// analyzer cannot verify comptime validation of the literal.
-fn isSafeStdlibLiteralCall(t: []const u8, preceding_lines: ?[]const []const u8) bool {
-    const call_line = findCallSiteLine(t, preceding_lines) orelse return false;
-    const safe_fns = [_][]const u8{
-        "parseIp(",  "parseIp4(",      "parseIp6(",
-        "parseInt(", "parseUnsigned(",
-    };
-    for (safe_fns) |fn_name| {
+/// Per-site on the current line; multi-line calls fall back to the
+/// call-line walk (EPH-I0945).
+fn isSafeStdlibLiteralCall(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) bool {
+    if (siteCallArgStart(t, pos, &safe_stdlib_literal_fns)) |arg_start| {
+        // Verify first argument is a string literal
+        const after = mem.trim(u8, t[arg_start..], " \t");
+        return mem.startsWith(u8, after, "\"");
+    }
+    const call_line = callOpenerLine(t, pos, preceding_lines) orelse return false;
+    return lineHasSafeStdlibLiteralCall(call_line);
+}
+
+/// Whole-line check of a call line for a safe stdlib parse call with a
+/// string-literal first argument (multi-line fallback, line-granular).
+fn lineHasSafeStdlibLiteralCall(call_line: []const u8) bool {
+    for (safe_stdlib_literal_fns) |fn_name| {
         const pos = mem.indexOf(u8, call_line, fn_name) orelse continue;
         if (isInsideString(call_line, pos)) continue;
         // Verify first argument is a string literal
@@ -28610,15 +28698,93 @@ fn lineBoundsCastValue(t: []const u8, ident: []const u8) bool {
 /// the casted value bounds it. `const y = @min(x, 255);` proves nothing
 /// about x (band-B12 F26a): the clamp argument is not the bounded value.
 /// Comparison operators (`==`, `!=`, `<=`, `>=`) are not assignments.
+/// Anchors at the assignment whose lhs is the bare ident: scanning every
+/// `=` lets a typed declaration (`const x: u32 = ...`) and a later
+/// statement on the line (`const d = 3;` after the clamp) keep the proof
+/// (EPH-I0946). The rhs must be the clamp call itself — containment is
+/// not identity: `foo(@min(x, 255))` and `@min(x, 255) + 1` assign more
+/// than the clamp and prove nothing (EPH-I0970).
 fn isClampAssignment(t: []const u8, ident: []const u8) bool {
     if (mem.indexOf(u8, t, "@min(") == null and mem.indexOf(u8, t, "@max(") == null)
         return false;
-    const eq = mem.lastIndexOfScalar(u8, t, '=') orelse return false;
-    if (eq > 0 and (t[eq - 1] == '=' or t[eq - 1] == '!' or
-        t[eq - 1] == '<' or t[eq - 1] == '>')) return false;
-    var lhs = mem.trim(u8, t[0..eq], " \t");
+    var pos: usize = 0;
+    while (mem.indexOfScalarPos(u8, t, pos, '=')) |eq| {
+        pos = eq + 1;
+        if (eq > 0 and (t[eq - 1] == '=' or t[eq - 1] == '!' or
+            t[eq - 1] == '<' or t[eq - 1] == '>')) continue;
+        if (!assignmentTargetsIdent(t, eq, ident)) continue;
+        // The anchored assignment's rhs is the clamp call: `x = 5;
+        // const y = @min(w, 255);` must not prove x (EPH-I0946,
+        // EPH-I0970).
+        if (statementCarriesClamp(t, eq)) return true;
+    }
+    return false;
+}
+
+/// True when the statement starting at `eq` assigns the clamp call's
+/// result directly: the trimmed rhs, modulo balanced wrapping parens, is
+/// exactly `@min(...)` or `@max(...)` with the call's close paren ending
+/// the rhs. Containment is not identity — `foo(@min(x, 255))` and
+/// `@min(x, 255) + 1` assign more than the clamp result, so neither
+/// bounds the casted value (EPH-I0970). Line-granularity residual: a
+/// clamp whose rhs continues to a later line (`const c = @min(x,
+/// 255);`) loses the proof on the opener line (EPH-I0971).
+fn statementCarriesClamp(t: []const u8, eq: usize) bool {
+    var end = eq + 1;
+    while (end < t.len and t[end] != ';') end += 1;
+    var rhs = mem.trim(u8, t[eq + 1 .. end], " \t");
+    // Strip balanced wrapping parens: `(@min(x, 255))` is still the call.
+    while (rhs.len >= 2 and rhs[0] == '(' and rhs[rhs.len - 1] == ')') {
+        const inner = rhs[1 .. rhs.len - 1];
+        if (parenBalance(inner) != 0) break;
+        rhs = mem.trim(u8, inner, " \t");
+    }
+    const name = if (mem.startsWith(u8, rhs, "@min("))
+        "@min("
+    else if (mem.startsWith(u8, rhs, "@max("))
+        "@max("
+    else
+        return false;
+    // The call's close paren must end the rhs — `@min(x, 255) + 1`
+    // assigns more than the clamp result.
+    var mode: QuoteMode = .none;
+    var i = name.len;
+    var depth: usize = 1;
+    while (i < rhs.len) : (i += 1) {
+        const c = rhs[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '(') depth += 1;
+        if (c == ')') {
+            depth -= 1;
+            if (depth == 0) return i + 1 == rhs.len;
+        }
+    }
+    return false;
+}
+
+/// True when the statement ending at `eq` assigns to `ident`: the lhs
+/// runs from the last `;` (or line start) to the `=`, stripped of a
+/// `const`/`var` keyword and an optional `: T` annotation (EPH-I0946).
+/// The sibling arm isConstLiteralInit accepts the annotation by
+/// ident-prefix matching; this arm strips it so the bare-ident equality
+/// check sees the same shape.
+fn assignmentTargetsIdent(t: []const u8, eq: usize, ident: []const u8) bool {
+    var start: usize = 0;
+    var i = eq;
+    while (i > 0) {
+        i -= 1;
+        if (t[i] == ';') {
+            start = i + 1;
+            break;
+        }
+    }
+    var lhs = mem.trim(u8, t[start..eq], " \t");
     if (mem.startsWith(u8, lhs, "const ")) lhs = mem.trim(u8, lhs["const ".len..], " \t");
     if (mem.startsWith(u8, lhs, "var ")) lhs = mem.trim(u8, lhs["var ".len..], " \t");
+    if (mem.indexOfScalar(u8, lhs, ':')) |colon| lhs = mem.trim(u8, lhs[0..colon], " \t");
     return mem.eql(u8, lhs, ident);
 }
 
@@ -28654,12 +28820,9 @@ fn braceBalance(t: []const u8) isize {
 /// >= 0 — a negative depth means the loop body closed before the cast.
 /// A `}` on the header line closes the body on that line, so a cast below
 /// the line is outside the loop (band-B12 F26d).
-///
-/// Residual (batch 27 review F-1, EPH-I0944): a `}` on a non-`\\` line
-/// after a mid-line `\\` opener (invalid Zig) drives the lookback's depth
-/// negative here, so a genuine header below is rejected and the cast fires
-/// a spurious ZA904 note. Documented, not fixed; same status as the
-/// >256-col raw-line residual in maskLineLiterals.
+/// The cross-line literal mask of hasCastBoundsProof (EPH-I0944) keeps a
+/// continuation line's `}` out of `depth`; the mask is built before this
+/// judge runs.
 fn isRangeForProof(t: []const u8, ident: []const u8, depth: isize) bool {
     if (depth < 0) return false;
     if (!isForRangeIndex(t, ident)) return false;
@@ -28673,27 +28836,94 @@ fn maskOrRaw(t: []const u8, buf: []u8) []const u8 {
     return if (t.len > buf.len) t else maskLineLiterals(t, buf);
 }
 
+/// True when the line opens a multiline string at a code position: a
+/// `\\` pair before any `//` comment and outside string/char literals.
+/// `\\`-starting lines are whole-line string data, not openers — their
+/// own continuation lines all start with `\\` and are skipped
+/// individually (EPH-I0944).
+fn hasMidLineMultilineOpener(t: []const u8) bool {
+    if (mem.startsWith(u8, t, "\\\\")) return false;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (types.isMultilineOpenerAt(t, i)) return true;
+        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return false;
+    }
+    return false;
+}
+
+/// True when the line ends a multiline string under the cross-line
+/// model: it starts with an expression terminator (`;` or `,`), or it
+/// starts with a closer that validly follows the string expression
+/// (`);`, `};`, `],` shapes). A `}` line is code only when a
+/// `;`/`,`/`)` follows the brace — `} text` stays string content
+/// (EPH-I0944 continuation pin; EPH-I0972).
+fn isMultilineStringTerminator(t: []const u8) bool {
+    if (mem.startsWith(u8, t, ";") or mem.startsWith(u8, t, ",")) return true;
+    if (mem.startsWith(u8, t, ")") or mem.startsWith(u8, t, "]")) return true;
+    if (!mem.startsWith(u8, t, "}")) return false;
+    const rest = mem.trim(u8, t[1..], " \t");
+    return mem.startsWith(u8, rest, ";") or
+        mem.startsWith(u8, rest, ",") or mem.startsWith(u8, rest, ")");
+}
+
+/// Cross-line literal mask for the ZA904 lookback window (EPH-I0944):
+/// `out[i - start]` is true when line `i` is multiline-string content
+/// whose braces must not count. A mid-line `\\` opener makes each
+/// following line content until a terminator line ends the string.
+/// Terminators are `;`/`,`-starting lines and closer lines (`);`, `};`,
+/// `],`) — they stay code, so `; }` keeps its real `}` and a
+/// `);`-closed call does not swallow the code after it (EPH-I0972).
+/// `\\`-starting lines are content in every state and the walk skips
+/// them via isCommentOrMultilineString.
+/// Residual: a single-line `\\` string whose real terminator is not
+/// terminator-shaped (`const msg = \\usage;` then `const y = 5;`) makes
+/// the state swallow code lines until the next terminator-shaped line
+/// (EPH-I0972).
+fn classifyMultilineContent(lines: []const []const u8, start: usize, idx: usize, out: []bool) void {
+    var in_string = false;
+    for (start..idx) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (!in_string) {
+            out[i - start] = false;
+            if (hasMidLineMultilineOpener(t)) in_string = true;
+            continue;
+        }
+        // The terminator starts with an expression terminator (`;` or
+        // `,`) or a closer that validly follows the string (`);`, `};`);
+        // it stays code and ends the string. Every other line below the
+        // opener is string content.
+        if (isMultilineStringTerminator(t)) {
+            in_string = false;
+            out[i - start] = false;
+            continue;
+        }
+        out[i - start] = true;
+    }
+}
+
 /// Bounded lookback (10 lines) over the current line's prefix and the
 /// enclosing block's preceding lines for a bounds proof on `ident`.
 /// Stops at function boundaries — a guard in another function proves
 /// nothing. Comment/multiline-string lines are skipped with the same
 /// discipline as the detection pass (patterns.md F1).
 ///
-/// Residual (batch 27 review F-1, EPH-I0944): a non-`\\` line after a
-/// mid-line `\\` opener (`const msg = \\usage` then `} text`) is code
-/// under the line model — EPH-I0671: the opener swallows only its own
-/// line, and LiteralState.forLine treats only `\\`-starting lines as
-/// whole-line data — so the continuation line's `}` feeds braceBalance
-/// as a real brace. The depth then goes negative and a genuine range-for
-/// header below is rejected, so a provably-bounded cast fires a spurious
-/// ZA904 note. Pre-fix code was silent on the shape. The shape is invalid
-/// Zig (a multiline string is a run of consecutive `\\` lines; ZR104
-/// already flags the file) and shows no corpus delta in the A/B corpus
-/// (zls/ghostty/sig/tigerbeetle byte-identical). Same status as the
-/// >256-col raw-line residual documented in maskLineLiterals: named, not
-/// fixed. A fix needs a cross-line literal-state model that must not
-/// swallow the string's own terminator line in valid Zig (`; }`), or a
-/// parse-validity gate for line rules.
+/// Cross-line literal state (EPH-I0944): a mid-line `\\` opener
+/// (`const msg = \\usage`) makes the following lines multiline-string
+/// content — a `}`-starting continuation line no longer feeds
+/// braceBalance as a real brace, so the range-for depth stays 0 and a
+/// genuine header below still proves the cast. The string's terminator
+/// line stays code: `; }` keeps its real `}` and a cast below the closed
+/// loop fires. The invalid-Zig continuation shape (ZR104 flags it) now
+/// behaves like the valid `\\`-starting shape. Residual: a single-line
+/// `\\` string whose real terminator does not start with `;`/`,` (see
+/// classifyMultilineContent) — the mask swallows code until the next
+/// terminator-shaped line.
 fn hasCastBoundsProof(
     lines: []const []const u8,
     idx: usize,
@@ -28706,11 +28936,14 @@ fn hasCastBoundsProof(
     if (isRangeForProof(maskOrRaw(prefix, &pbuf), ident, 0)) return true;
     const lookback = 10;
     const start = if (idx > lookback) idx - lookback else 0;
+    var content_mask: [lookback]bool = undefined;
+    classifyMultilineContent(lines, start, idx, &content_mask);
     var i = idx;
     var depth: isize = 0;
     while (i > start) {
         i -= 1;
         const t = mem.trim(u8, lines[i], " \t\r");
+        if (content_mask[i - start]) continue;
         if (isCommentOrMultilineString(t)) continue;
         if (isFuncBoundary(t)) return false;
         var mask_buf: [256]u8 = undefined;
@@ -65390,6 +65623,175 @@ test "ZA202 second catch site fires after a @TypeOf-suppressed first (EPH-I0508 
     );
 }
 
+test "ZA202 second catch site fires after a bufPrint-suppressed first (EPH-I0945)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The bufPrint suppression clears only the bufPrint catch site; the
+    // second real catch unreachable on the same line must still fire.
+    // Pre-fix the whole-line predicate suppressed both sites (EPH-I0945).
+    const test_content =
+        \\fn f() void {
+        \\    const a = std.fmt.bufPrint(&buf, "{s}", .{s}) catch unreachable; foo() catch unreachable;
+        \\    _ = a;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_bufprint_site.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_bufprint_site.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "test_za202_bufprint_site.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
+test "ZA202 second catch site fires after a safe-stdlib-suppressed first (EPH-I0945)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The parseIp-with-literal suppression clears only its own site; the
+    // second real catch unreachable on the same line must still fire.
+    // Pre-fix the whole-line predicate suppressed both sites (EPH-I0945).
+    const test_content =
+        \\fn f() void {
+        \\    const a = std.net.Address.parseIp("1.2.3.4", 80) catch unreachable; foo() catch unreachable;
+        \\    _ = a;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_stdlib_site.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_stdlib_site.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "test_za202_stdlib_site.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
+test "ZA202 second catch site fires on a multi-line bufPrint closing line (EPH-I0969)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The bufPrint call opens on a preceding line and closes on the
+    // second site's line. The first catch (bufPrint's own) is suppressed;
+    // the closing line's net prefix balance nets to 0 when the group's
+    // own `)` precedes the second site, so the fallback must match the
+    // site's `(` per-site, not by balance (EPH-I0969).
+    const test_content =
+        \\fn f() void {
+        \\    const a = std.fmt.bufPrint(&buf,
+        \\        "{s}", .{"hi"}) catch unreachable; foo() catch unreachable;
+        \\    _ = a;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_ml_bufprint.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_ml_bufprint.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "test_za202_ml_bufprint.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
+test "ZA202 second catch site fires on a zig-fmt bufPrint closing line (EPH-I0969)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // zig-fmt style: the closing line is only `) catch ...` plus the
+    // second site. The first `)` sits at line start, so the site-2 group
+    // opens on this line and must not reach the whole-line fallback
+    // (EPH-I0969).
+    const test_content =
+        \\fn f() void {
+        \\    const a = std.fmt.bufPrint(
+        \\        &buf,
+        \\        "{s}",
+        \\        .{"hi"},
+        \\    ) catch unreachable; foo() catch unreachable;
+        \\    _ = a;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_ml_bufprint2.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_ml_bufprint2.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "test_za202_ml_bufprint2.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
+test "ZA202 second catch site fires on a multi-line safe-stdlib closing line (EPH-I0969)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The parseIp call opens on a preceding line; the closing line's
+    // second catch (foo) must fire even though the parseIp fallback
+    // would otherwise swallow the whole line (EPH-I0969).
+    const test_content =
+        \\fn f() void {
+        \\    const a = std.net.Address.parseIp("1.2.3.4",
+        \\        80) catch unreachable; foo() catch unreachable;
+        \\    _ = a;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za202_ml_stdlib.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za202_ml_stdlib.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "test_za202_ml_stdlib.zig", RULE_CATCH_UNREACHABLE),
+    );
+}
+
 test "ZA203 orelse unreachable fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -68102,7 +68504,7 @@ test "findCallSiteLine: comment parens cannot skip the real opener (EPH-I0794)" 
     const line = ") catch unreachable;";
     const got = findCallSiteLine(line, &prev) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("const b = riskyCall( // )", got);
-    try std.testing.expect(!isBufPrintCatchUnreachable(line, &prev));
+    try std.testing.expect(!isBufPrintCatchUnreachable(line, mem.indexOf(u8, line, "catch").?, &prev));
 }
 
 test "isDeferCatchMultiline: trailing comment must not hide a boundary (EPH-I0783)" {
@@ -68179,9 +68581,17 @@ test "ZA201 fires on a catch after a terminated one-line defer (EPH-I0490)" {
 }
 
 test "isBufPrintCatchUnreachable detects same-line pattern" {
-    try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable", null));
-    try std.testing.expect(isBufPrintCatchUnreachable("std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable", null));
-    try std.testing.expect(!isBufPrintCatchUnreachable(") catch unreachable;", null));
+    try std.testing.expect(isBufPrintCatchUnreachable(
+        "std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable",
+        mem.indexOf(u8, "std.fmt.bufPrint(&buf, \"{d}\", .{x}) catch unreachable", "catch").?,
+        null,
+    ));
+    try std.testing.expect(isBufPrintCatchUnreachable(
+        "std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable",
+        mem.indexOf(u8, "std.fmt.bufPrintZ(&buf, \"{d}\", .{x}) catch unreachable", "catch").?,
+        null,
+    ));
+    try std.testing.expect(!isBufPrintCatchUnreachable(") catch unreachable;", 2, null));
 }
 
 test "isBufPrintCatchUnreachable detects multi-line pattern" {
@@ -68192,7 +68602,7 @@ test "isBufPrintCatchUnreachable detects multi-line pattern" {
         "    .{block_num},",
     };
     // catch unreachable is on the closing line, bufPrint( is 4 lines back
-    try std.testing.expect(isBufPrintCatchUnreachable(") catch unreachable;", &prev));
+    try std.testing.expect(isBufPrintCatchUnreachable(") catch unreachable;", 2, &prev));
 }
 
 test "hasBufPrintCall detects bufPrint patterns" {
@@ -83486,6 +83896,100 @@ test "ZA904: @min clamp for a different variable does not suppress (EPH-I0510 F2
     );
 }
 
+test "ZA904: typed-const clamp declaration proves the bound (EPH-I0946)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const c: u8 = @min(x, 255);` clamps c exactly like the untyped
+    // form. Pre-fix the lhs kept the `: u8` annotation, the bare-ident
+    // equality check failed, and the clamp proof was missed (EPH-I0946).
+    const content =
+        \\fn typed_clamp(x: u32) u8 {
+        \\    const c: u8 = @min(x, 255);
+        \\    return @as(u8, @intCast(c));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_typed_clamp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_typed_clamp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: clamp assignment not first on the line proves the bound (EPH-I0946)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The clamp is the first statement and a later statement carries the
+    // line's last `=`. Pre-fix the last-`=` anchor looked left of the
+    // wrong assignment and the clamp proof was missed (EPH-I0946).
+    const content =
+        \\fn multi_clamp(x: u32) u8 {
+        \\    const c = @min(x, 255); const d = 3;
+        \\    _ = d;
+        \\    return @as(u8, @intCast(c));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_multi_clamp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_multi_clamp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: clamp inside a call argument does not prove the bound (EPH-I0970)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const c = foo(@min(x, 255));` assigns foo's result, not the clamp
+    // result — containment is not identity, so the cast on c must fire
+    // (EPH-I0970).
+    const content =
+        \\fn nested_clamp(x: u32) u8 {
+        \\    const d = 3; const c = foo(@min(x, 255));
+        \\    _ = d;
+        \\    return @as(u8, @intCast(c));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_nested_clamp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_nested_clamp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: clamp plus an offset does not prove the bound (EPH-I0970)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const c = @min(x, 255) + 1;` can reach 256 — the rhs is not the
+    // clamp call itself, so the cast on c must fire (EPH-I0970).
+    const content =
+        \\fn offset_clamp(x: u32) u8 {
+        \\    const d = 3; const c = @min(x, 255) + 1;
+        \\    _ = d;
+        \\    return @as(u8, @intCast(c));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_offset_clamp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_offset_clamp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
 test "ZA904: string-literal comparisons never prove a bound (EPH-I0510 F26c)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -83543,8 +84047,8 @@ test "ZA904: range-for proof survives a braced multiline string in the loop body
     // the cast: the `\\{`/`\\}` lines are whole-line string data (skipped
     // by isCommentOrMultilineString), so the depth stays 0 and the header
     // proves the in-loop cast (band-B12 F26d). The invalid-Zig
-    // continuation shape (`const msg = \\usage` then `} text`) stays a
-    // documented residual (EPH-I0944).
+    // continuation shape (`const msg = \\usage` then `} text`) is masked
+    // by the cross-line literal model — see the EPH-I0944 pin below.
     const content =
         \\fn braced_msg(n: usize) void {
         \\    for (0..n) |i| {
@@ -83561,6 +84065,159 @@ test "ZA904: range-for proof survives a braced multiline string in the loop body
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "app_braced_msg.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: continuation line after a mid-line string opener stays masked (EPH-I0944)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A `}`-starting continuation line after a mid-line `\\` opener is
+    // string content under the cross-line literal model: its `}` must not
+    // drive the lookback depth negative, so the range-for header still
+    // proves the in-loop cast. Pre-fix the `}` counted as a real brace
+    // and the cast fired a spurious note (EPH-I0944).
+    const content =
+        \\fn braced_msg(n: usize) void {
+        \\    for (0..n) |i| {
+        \\        const msg = \\usage
+        \\        } text
+        \\        use8(@intCast(i));
+        \\        _ = msg;
+        \\    }
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_cont_msg.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_cont_msg.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: the ; } string terminator keeps its real brace (EPH-I0944)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `; }` ends the multiline string AND closes the loop body on the
+    // same line: the `}` is real code, so the cast below the loop is
+    // outside the range-for and must fire. The cross-line model must
+    // never swallow the string's own terminator line (EPH-I0944).
+    const content =
+        \\fn terminator_close(n: usize) u8 {
+        \\    for (0..n) |i| {
+        \\        const msg = \\usage
+        \\        \\cont
+        \\        ; }
+        \\    return @as(u8, @intCast(i));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_term_msg.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_term_msg.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: a );-closed string call keeps the code after it code (EPH-I0972)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zig-fmt closes a call whose last argument is a multiline string
+    // with `);` on its own line. That closer line is code: the clamp
+    // line below it must stay code and prove the cast. Pre-fix the
+    // closer was masked as string content and the clamp was swallowed,
+    // firing a spurious note (EPH-I0972).
+    const content =
+        \\fn use8ret(s: []const u8) u8 {
+        \\    return s[0];
+        \\}
+        \\
+        \\fn f(n: usize) u8 {
+        \\    for (0..n) |i| {
+        \\        const s = use8ret(\\alpha
+        \\            \\beta
+        \\        );
+        \\        _ = s;
+        \\        const c = @min(i, 255);
+        \\        return @as(u8, @intCast(c));
+        \\    }
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_paren_term_fp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_paren_term_fp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: a );-closed string call keeps the loop close real (EPH-I0972)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `);` closer is code, so the loop's own `}` below it still
+    // drives the lookback depth negative and the out-of-loop cast fires.
+    // Pre-fix the loop close was swallowed and the cast was wrongly
+    // proven (EPH-I0972).
+    const content =
+        \\fn use8ret(s: []const u8) u8 {
+        \\    return s[0];
+        \\}
+        \\
+        \\fn f(n: usize) u8 {
+        \\    for (0..n) |i| {
+        \\        const s = use8ret(\\alpha
+        \\            \\beta
+        \\        );
+        \\        _ = s;
+        \\    }
+        \\    return @as(u8, @intCast(i));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_paren_term_fn.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_paren_term_fn.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: a };-closed string array keeps the code after it code (EPH-I0972)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // zig-fmt closes a container whose last element is a multiline
+    // string with `};` on its own line — code, like the `);` call
+    // closer. The clamp line below must stay code (EPH-I0972).
+    const content =
+        \\fn f(n: usize) u8 {
+        \\    for (0..n) |i| {
+        \\        const arr = [_][]const u8{ \\alpha
+        \\            \\beta
+        \\        };
+        \\        _ = arr;
+        \\        const c = @min(i, 255);
+        \\        return @as(u8, @intCast(c));
+        \\    }
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_brace_term_fp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_brace_term_fp.zig", RULE_INTCAST_NO_BOUNDS),
     );
 }
 

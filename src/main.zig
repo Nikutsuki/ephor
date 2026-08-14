@@ -236,10 +236,12 @@ fn testDiagCtx() DiagCtx {
 /// instead of vanishing silently.
 ///
 /// The other read caps are different classes and stay separate: config
-/// files read at 64 KiB, build.zig variants at 512 KiB-4 MiB by call
-/// site, the known-issues list at 10 MiB, and the runtime capture limits
-/// (10 MiB test output, 1 MiB ast-check output) bound child processes,
-/// not source reads.
+/// files read at 64 KiB, build.zig reads at 512 KiB (integration update)
+/// and 1 MiB (entry extraction, init path detection, init patching) by
+/// call site, the known-issues list at 10 MiB, and the runtime capture
+/// limits (10 MiB test output, 1 MiB ast-check output) bound child
+/// processes, not source reads. Build-path ref scans share this cap
+/// (band-B03 F21, EPH-I0376).
 const max_source_file_bytes = 10 * 1024 * 1024;
 
 /// Print a CLI/config diagnostic unless the run has muted the channel.
@@ -10203,6 +10205,11 @@ const TryAllocCollectCtx = struct {
 /// Collect a try allocation from a line, skipping arena/no-free.
 /// `phys` is the trimmed physical line: the recorded name must slice into
 /// file content, not into a join buffer reused by the caller's loop.
+/// Line-granular model: one record per line. extractVarDeclName and
+/// findAllocCall take the first match on the line, so a multi-statement
+/// line records the first decl name and the first alloc call
+/// (`const a = g(); const b = try alloc...` records `a` as the name)
+/// (band-B03 F11, EPH-I0378).
 fn collectTryAllocFromLine(
     t: []const u8,
     phys: []const u8,
@@ -10249,9 +10256,13 @@ fn tryAppendCleanupInfo(
     allocator: Allocator,
 ) !void {
     if (!hasRealCleanupPattern(items)) return;
+    const content = try allocator.dupe(u8, items);
+    // The dupe is owned by the record only after the append commits; a
+    // failed append must release it (band-B03 F15, EPH-I0375).
+    errdefer allocator.free(content);
     try errdefers.append(allocator, .{
         .line = site.line,
-        .content = try allocator.dupe(u8, items),
+        .content = content,
     });
 }
 
@@ -10268,12 +10279,21 @@ fn collectDeferFromLine(
     site: StmtSite,
     ctx: *const CleanupCollectCtx,
 ) !void {
-    const is_errdefer = mem.startsWith(u8, t, "errdefer ");
-    const is_defer = mem.startsWith(u8, t, "defer ");
+    // Both keyword forms are valid Zig: the space form and the direct
+    // brace form (`errdefer{`). isDeferOrErrdefer accepts both, so
+    // collection must too (band-B03 F9, EPH-I0372).
+    const is_errdefer = mem.startsWith(u8, t, "errdefer ") or
+        mem.startsWith(u8, t, "errdefer{");
+    const is_defer = mem.startsWith(u8, t, "defer ") or
+        mem.startsWith(u8, t, "defer{");
     if (!is_errdefer and !is_defer) return;
 
-    const prefix_len: usize = if (is_errdefer) 9 else 6;
-    const content = if (prefix_len < t.len) t[prefix_len..] else "";
+    // The statement starts right after the keyword, plus the one
+    // optional space. `errdefer` and `defer` are 8 and 5 letters.
+    const kw_len: usize = if (is_errdefer) 8 else 5;
+    var brace_pos = kw_len;
+    if (brace_pos < t.len and t[brace_pos] == ' ') brace_pos += 1;
+    const content = t[brace_pos..];
 
     if (!mem.startsWith(u8, content, "{")) {
         try tryAppendCleanupInfo(t, site, ctx.errdefers, ctx.allocator);
@@ -10287,7 +10307,7 @@ fn collectDeferFromLine(
     // scan skips the opening brace exactly like the prefix-stripped form.
     try ctx.bs.content.appendSlice(ctx.allocator, t);
     try ctx.bs.content.append(ctx.allocator, ' ');
-    for (t[prefix_len + 1 ..]) |c| {
+    for (t[brace_pos + 1 ..]) |c| {
         if (c == '{') ctx.bs.depth += 1;
         if (c == '}' and ctx.bs.depth > 0) ctx.bs.depth -= 1;
     }
@@ -10420,6 +10440,11 @@ const ErrdeferGapCtx = struct {
 /// errdefer covers only while its own block is open AND the alloc is
 /// still alive — the block's normal exit cancels the errdefer without
 /// freeing (EPH-I0367, band-B03 F3; spans from scopeEndOf).
+/// Line-granular model: a trigger on the alloc's own line never counts
+/// (`trigger_line <= alloc.line`). Each physical line yields one
+/// distinct trigger line, so a second `try` on the alloc line is
+/// invisible to the gap test; a no-free try line appends twice, and the
+/// duplicate is idempotent (band-B03 F11, EPH-I0378).
 fn isGapTrigger(
     alloc: *const TryAlloc,
     matched: ?MatchedCleanup,
@@ -10495,6 +10520,18 @@ fn hasErrorReturnGap(
     return false;
 }
 
+/// Issue text for one ZA103 gap: the pair names the allocation verb
+/// the record carries (band-B03 F10, EPH-I0373).
+fn errdeferGapText(is_create: bool) struct { message: []const u8, help: []const u8 } {
+    return if (is_create) .{
+        .message = "create without errdefer before next try",
+        .help = "add errdefer destroy immediately after create",
+    } else .{
+        .message = "allocation without errdefer before next try",
+        .help = "add errdefer immediately after allocation",
+    };
+}
+
 fn checkErrdeferGaps(
     allocator: Allocator,
     try_allocs: []TryAlloc,
@@ -10511,16 +10548,15 @@ fn checkErrdeferGaps(
         const try_gap = hasErrdeferGap(alloc, matched, ctx.try_lines);
         if (!try_gap and !hasErrorReturnGap(alloc, matched, ctx))
             continue;
+        const text = errdeferGapText(alloc.is_create);
         try issues.append(allocator, .{
             .file = ctx.file_path,
             .line = alloc.line,
             .col = alloc.col,
             .severity = .warning,
             .rule = RULE_ALLOC_NO_ERRDEFER,
-            .message = "allocation without errdefer " ++
-                "before next try",
-            .help = "add errdefer immediately " ++
-                "after allocation",
+            .message = text.message,
+            .help = text.help,
         });
     }
 }
@@ -10583,6 +10619,12 @@ const ErrdeferLineCtx = struct {
 /// Scan one physical line for try-allocations, error returns, and cleanup
 /// blocks, appending into the ctx lists. Returns early on comment lines and
 /// lines consumed by an in-flight multi-line cleanup block.
+/// Line-granular model: one alloc record per physical line. A no-free
+/// try line appends the same trigger line twice — once at its no-free
+/// detection site (the no_free branch below or a no-free branch inside
+/// collectTryAllocFromLine) and once at the has_try append; the gap test
+/// is idempotent over duplicates, so the duplicates do not change the
+/// verdict (band-B03 F11, EPH-I0378).
 fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !void {
     const actual_line = ctx.func_line + idx;
     const t = mem.trim(u8, line, " \t\r");
@@ -10828,7 +10870,10 @@ const ImportGraph = struct {
         defer keys.deinit(self.allocator);
         var reachable_iter = self.reachable.keyIterator();
         while (reachable_iter.next()) |key| {
-            keys.append(self.allocator, key.*) catch continue;
+            // The table deinit below drops the storage but not the keys,
+            // so a failed append must free the key on the spot instead
+            // of stranding it (band-B03 F15, EPH-I0375).
+            keys.append(self.allocator, key.*) catch self.allocator.free(key.*);
         }
         self.reachable.deinit();
         for (keys.items) |key| {
@@ -10838,7 +10883,7 @@ const ImportGraph = struct {
         keys.clearRetainingCapacity();
         var marked_iter = self.marked_dirs.keyIterator();
         while (marked_iter.next()) |key| {
-            keys.append(self.allocator, key.*) catch continue;
+            keys.append(self.allocator, key.*) catch self.allocator.free(key.*);
         }
         self.marked_dirs.deinit(self.allocator);
         for (keys.items) |key| {
@@ -10920,9 +10965,11 @@ const ImportGraph = struct {
     }
 
     /// Open one directory entry for descent, or null when the walk must
-    /// skip it (skip-list name) or cannot open it (EPH-I0761).
+    /// skip it (skip-list name) or cannot open it (EPH-I0761). The main
+    /// walk prunes with the same predicate as the nested discovery walks
+    /// (band-B03 F23, EPH-I0377): one skip set keeps coverage consistent.
     fn openSubdir(io: std.Io, dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
-        if (isScanSkipDir(name)) return null;
+        if (isSkippableDir(name)) return null;
         return dir.openDir(io, name, .{ .iterate = true }) catch null;
     }
 
@@ -10945,6 +10992,27 @@ const ImportGraph = struct {
         );
     }
 
+    /// Allocate the two owned path slices for one file analysis: the
+    /// caller-supplied path and its realpath. On a realpath or dupe
+    /// failure the pair degrades to the caller path shared by both
+    /// fields (ptr-equal), which FileAnalysis.deinit already handles.
+    /// The caller owns the result either way (band-B03 F15, EPH-I0375).
+    fn ownedPathPair(
+        allocator: Allocator,
+        io: std.Io,
+        file_path: []const u8,
+    ) !struct { path: []const u8, resolved: []const u8 } {
+        const path_copy = try allocator.dupe(u8, file_path);
+        errdefer allocator.free(path_copy);
+        var buf: [Fs.max_path_bytes]u8 = undefined;
+        const r = Fs.cwd(io).realpath(file_path, &buf) catch
+            return .{ .path = path_copy, .resolved = path_copy };
+        const resolved = allocator.dupe(u8, r) catch
+            return .{ .path = path_copy, .resolved = path_copy };
+        errdefer allocator.free(resolved);
+        return .{ .path = path_copy, .resolved = resolved };
+    }
+
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
         const content = Fs.cwd(self.diag.io).readFileAlloc(
             self.allocator,
@@ -10957,35 +11025,43 @@ const ImportGraph = struct {
             if (err == error.StreamTooLong) try self.noteSkippedFile(file_path);
             return;
         };
+        // OOM discipline across the multi-step init (band-B03 F15,
+        // EPH-I0375): each owned value is freed by its flag until the
+        // analysis owns it, and by analysis.deinit from then on. The
+        // flags flip at the ownership handoffs so no path frees twice.
+        var content_owned = true;
+        errdefer if (content_owned) self.allocator.free(content);
         self.resident_bytes += content.len;
         self.warnIfCorpusBytesCrossed();
         const has_tests = mem.indexOf(u8, content, "test \"") != null;
         const pub_fn_count = types.countOccurrences(content, "pub fn ");
-        const path_copy = try self.allocator.dupe(u8, file_path);
-        const resolved_copy = blk: {
-            var buf: [Fs.max_path_bytes]u8 = undefined;
-            const r = Fs.cwd(self.diag.io).realpath(file_path, &buf) catch {
-                break :blk path_copy;
-            };
-            break :blk self.allocator.dupe(u8, r) catch path_copy;
+        const pair = try ownedPathPair(self.allocator, self.diag.io, file_path);
+        var pair_owned = true;
+        errdefer if (pair_owned) {
+            self.allocator.free(pair.path);
+            if (pair.resolved.ptr != pair.path.ptr) self.allocator.free(pair.resolved);
         };
         var analysis = FileAnalysis{
-            .path = path_copy,
-            .resolved_path = resolved_copy,
+            .path = pair.path,
+            .resolved_path = pair.resolved,
             .imports = .empty,
             .content = content,
             .has_tests = has_tests,
             .pub_function_count = pub_fn_count,
             .line_count = types.countLines(content),
         };
+        content_owned = false;
+        pair_owned = false;
+        var analysis_owned = true;
+        errdefer if (analysis_owned) analysis.deinit(self.allocator);
         try self.extractImports(content, file_path, &analysis);
+        // A failed put must release the analysis: the content, the path
+        // copies, and the imports all belong to it (band-B03 F15,
+        // EPH-I0375).
         try self.files.put(analysis.path, analysis);
-        if (resolved_copy.ptr != path_copy.ptr) {
-            try self.resolved_to_key.put(
-                self.allocator,
-                resolved_copy,
-                path_copy,
-            );
+        analysis_owned = false;
+        if (pair.resolved.ptr != pair.path.ptr) {
+            try self.resolved_to_key.put(self.allocator, pair.resolved, pair.path);
         }
     }
 
@@ -11396,7 +11472,10 @@ const ImportGraph = struct {
     }
 
     /// After markReachable, scan reachable files for b.path("...") references
-    /// and mark those targets as reachable too.
+    /// and mark those targets as reachable too. The read cap is shared
+    /// with the main analysis read (max_source_file_bytes): a file the
+    /// analysis holds must not lose its build-path refs to a smaller
+    /// cap (band-B03 F21, EPH-I0376).
     fn markBuildPathReferences(self: *ImportGraph, cfg: *const Config) !void {
         var root_buf: [Fs.max_path_bytes]u8 = undefined;
         const build_root = self.findBuildRoot(cfg, &root_buf) orelse return;
@@ -11413,7 +11492,7 @@ const ImportGraph = struct {
             const content = Fs.cwd(self.diag.io).readFileAlloc(
                 self.allocator,
                 path,
-                4 * 1024 * 1024,
+                max_source_file_bytes,
             ) catch continue;
             defer self.allocator.free(content);
             self.scanContentBuildPathRefs(content, build_root);
@@ -11576,18 +11655,16 @@ const ImportGraph = struct {
         "deps",       ".packages", "vendor",
     };
 
-    fn isScanSkipDir(name: []const u8) bool {
-        if (name.len > 0 and name[0] == '.') return true;
-        return mem.eql(u8, name, "zig-cache") or
-            mem.eql(u8, name, "zig-out");
-    }
-
+    /// True when the walk must prune `name`: any dot-prefixed directory
+    /// (hidden dirs: .git, .zig-cache, .zig-global-cache, .tmp, .claude,
+    /// etc.) plus the shared skip list. direnv-per-project layouts
+    /// produce many such dirs under the scan root — failing to skip them
+    /// caused severe slowdowns in recursive traversals (thousands of
+    /// openat/realpath calls into cache directories). One predicate
+    /// serves every walk — the main source walk and the nested
+    /// discovery walks — so coverage is consistent (band-B03 F23,
+    /// EPH-I0377).
     fn isSkippableDir(name: []const u8) bool {
-        // Skip all dot-prefixed directories (hidden dirs: .git, .zig-cache,
-        // .zig-global-cache, .tmp, .claude, etc.). direnv-per-project layouts
-        // produce many such dirs under the scan root — failing to skip them
-        // caused severe slowdowns in recursive traversals (thousands of
-        // openat/realpath calls into cache directories).
         if (name.len > 0 and name[0] == '.') return true;
         for (skip_dirs) |d| {
             if (mem.eql(u8, name, d)) return true;
@@ -11635,77 +11712,6 @@ const ImportGraph = struct {
             if (isBuildManagedDir(entry.name))
                 self.markAllZigFilesReachable(subdir);
             self.scanForNestedBuildZig(subdir, depth + 1) catch continue;
-        }
-    }
-
-    /// Scan all reachable files under a sub-project directory for b.path() references
-    fn scanSubprojectBuildPaths(self: *ImportGraph, subdir: []const u8) !void {
-        var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const abs_subdir = Fs.cwd(self.diag.io).realpath(subdir, &rbuf) catch return;
-
-        // Snapshot reachable paths to check which are in this sub-project
-        var to_scan: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer to_scan.deinit(self.allocator);
-        {
-            var iter = self.reachable.iterator();
-            while (iter.next()) |entry| {
-                if (!isPathAncestorOrEqual(abs_subdir, entry.key_ptr.*)) continue;
-                try to_scan.append(self.allocator, entry.key_ptr.*);
-            }
-        }
-        for (to_scan.items) |path| {
-            self.scanFileBuildPathRefs(path, subdir);
-        }
-    }
-
-    /// Resolve a b.path() .zig reference and mark as reachable
-    fn resolveAndMarkBuildPath(
-        self: *ImportGraph,
-        base_dir: []const u8,
-        ref_path: []const u8,
-    ) void {
-        if (!mem.endsWith(u8, ref_path, ".zig")) return;
-        const full = std.fmt.allocPrint(
-            self.allocator,
-            "{s}/{s}",
-            .{ base_dir, ref_path },
-        ) catch return;
-        defer self.allocator.free(full);
-        var rbuf: [Fs.max_path_bytes]u8 = undefined;
-        const resolved = Fs.cwd(self.diag.io).realpath(full, &rbuf) catch return;
-        if (!self.isWithinScanRoot(resolved)) return;
-        if (!self.reachable.contains(resolved))
-            self.markReachableResolved(resolved) catch return;
-    }
-
-    /// Scan a specific file for b.path("...") references and resolve them
-    /// relative to the given base directory. Refs are masked to code
-    /// positions (EPH-I0227): a b.path("...") inside a string, comment, or
-    /// `\\` multiline-string body is text and must not mark its target.
-    fn scanFileBuildPathRefs(
-        self: *ImportGraph,
-        file_path: []const u8,
-        base_dir: []const u8,
-    ) void {
-        const content = Fs.cwd(self.diag.io).readFileAlloc(
-            self.allocator,
-            file_path,
-            4 * 1024 * 1024,
-        ) catch return;
-        defer self.allocator.free(content);
-
-        const bp_tag = "b.path(\"";
-        var lines = mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            var from: usize = 0;
-            while (findTagInCode(line, bp_tag, from)) |idx| {
-                const str_start = idx + bp_tag.len;
-                var str_end = str_start;
-                while (str_end < line.len and line[str_end] != '"') str_end += 1;
-                if (str_end > str_start)
-                    self.resolveAndMarkBuildPath(base_dir, line[str_start..str_end]);
-                from = str_end + 1;
-            }
         }
     }
 
@@ -36624,6 +36630,145 @@ test "ImportGraph.isSkippableDir skips dot-prefixed directories" {
     try std.testing.expect(!ImportGraph.isSkippableDir("tests"));
 }
 
+test "main walk prunes dependency dirs with the shared skip predicate (EPH-I0377)" {
+    // One skip predicate serves every walk: the main source walk must
+    // prune the dependency and build-output dirs the nested discovery
+    // walks prune. Pre-fix the main walk used a weaker predicate and
+    // analyzed files under these dirs (band-B03 F23).
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.zig", .data = "pub fn a() void {}\n" });
+    try tmp.dir.createDirPath(std.testing.io, "node_modules");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "node_modules/dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.createDirPath(std.testing.io, "deps");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "deps/dep2.zig", .data = "pub fn d2() void {}\n" });
+    try tmp.dir.createDirPath(std.testing.io, "vendor");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "vendor/v.zig", .data = "pub fn v() void {}\n" });
+    try tmp.dir.createDirPath(std.testing.io, ".build");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".build/b.zig", .data = "pub fn b() void {}\n" });
+    try tmp.dir.createDirPath(std.testing.io, ".packages");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".packages/p.zig", .data = "pub fn p() void {}\n" });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.scanDirectory(root);
+
+    try std.testing.expectEqual(@as(usize, 1), graph.files.count());
+    var iter = graph.files.keyIterator();
+    try std.testing.expect(mem.endsWith(u8, iter.next().?.*, "/src/a.zig"));
+}
+
+test "markBuildPathReferences reads with the shared source cap (EPH-I0376)" {
+    // The cap-boundary regression pin lives on the LIVE read site
+    // (markBuildPathReferences, three production callers): a b.path()
+    // ref beyond the old 4 MiB ref-scan cap is found now that the ref
+    // scan shares max_source_file_bytes with the main analysis read
+    // (band-B03 F21). Pre-fix the read tripped the 4 MiB limit and the
+    // ref was silently missed. The per-file ref scanner this pin
+    // originally rode was deleted (EPH-I0374 cascade, reviewer r2).
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // build.zig makes findBuildRoot resolve to the tmp root; the nested
+    // build discovery then finds no subdirectories, so the only marking
+    // path for target.zig is the b.path() ref scan itself.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "pub fn build(b: *std.Build) void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target.zig", .data = "pub fn t() void {}\n" });
+
+    const pad = try allocator.alloc(u8, 4 * 1024 * 1024 + 4096);
+    defer allocator.free(pad);
+    @memset(pad, ' ');
+    const file_content = try std.mem.concat(allocator, u8, &.{ pad, "b.path(\"target.zig\")" });
+    defer allocator.free(file_content);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.zig", .data = file_content });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const big_path = try std.fmt.allocPrint(allocator, "{s}/big.zig", .{root});
+    // The map takes ownership of the key (deinit frees it); the pin must
+    // not free it again.
+    try graph.reachable.put(big_path, {});
+
+    var cfg = testConfig();
+    cfg.path = root;
+    try graph.markBuildPathReferences(&cfg);
+
+    const target = try std.fmt.allocPrint(allocator, "{s}/target.zig", .{root});
+    defer allocator.free(target);
+    try std.testing.expect(graph.reachable.contains(target));
+}
+
+test "analyzeFile releases the analysis when the graph insert fails (EPH-I0375)" {
+    // OOM sweep over analyzeFile's allocations on a real file. Pre-fix,
+    // a files.put failure dropped the analysis (content, path copies,
+    // imports) without freeing it (band-B03 F15).
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.zig", .data = "const x = @import(\"std\");\npub fn f() void {}\n" });
+    const file_path = try tmpFilePath(allocator, &tmp, "f.zig");
+    defer allocator.free(file_path);
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var graph = ImportGraph.init(probe.allocator(), &diag);
+        defer graph.deinit();
+        try graph.analyzeFile(file_path);
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var graph = ImportGraph.init(failing.allocator(), &diag);
+        defer graph.deinit();
+        graph.analyzeFile(file_path) catch continue;
+    }
+}
+
+test "ImportGraph.deinit frees reachable keys when the key list append fails (EPH-I0375)" {
+    // deinit collects owned map keys into a list before freeing them.
+    // A failed append must free the key on the spot: the table deinit
+    // drops the storage, not the keys, so an unappended key would
+    // strand (band-B03 F15).
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var graph = ImportGraph.init(probe.allocator(), &diag);
+        defer graph.deinit();
+        const key = try probe.allocator().dupe(u8, "/k.zig");
+        try graph.reachable.put(key, {});
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var graph = ImportGraph.init(failing.allocator(), &diag);
+        defer graph.deinit();
+        const key = failing.allocator().dupe(u8, "/k.zig") catch continue;
+        graph.reachable.put(key, {}) catch {
+            failing.allocator().free(key);
+            continue;
+        };
+    }
+}
+
 /// Test helper: build the ImportInfo for a chain node's import of the
 /// file `/chain/f<j>.zig`. The caller's FileAnalysis owns the result.
 fn makeChainImport(allocator: Allocator, j: usize) !ImportInfo {
@@ -37498,12 +37643,14 @@ test "build-path scanners ignore refs inside strings (EPH-I0227)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // Refs on `\\` multiline-string body lines are doc text. Pre-fix both
+    // Refs on `\\` multiline-string body lines are doc text. Pre-fix the
     // content scanners matched them and marked the targets reachable.
+    // The per-file scanner variant that also rode this masking was
+    // deleted (EPH-I0374 cascade, reviewer r2): the content scanners are
+    // the live path, and they use the same findTagInCode mask.
     try tmp.dir.createDirPath(std.testing.io, "src");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/f_p.zig", .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/f_j.zig", .data = "" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/f_f.zig", .data = "" });
     const content = "const docs =\n" ++
         "    \\\\const exe = b.addExecutable(.{ .root_source_file = b.path(\"src/f_p.zig\") });\n" ++
         "    \\\\const m = b.pathJoin(&.{ \"src\", \"f_j.zig\" });\n" ++
@@ -37514,19 +37661,6 @@ test "build-path scanners ignore refs inside strings (EPH-I0227)" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     graph.scanContentBuildPathRefs(content, root);
-    try std.testing.expectEqual(@as(u32, 0), graph.reachable.count());
-
-    // The per-file variant carries the same masking.
-    const file_content = "const docs =\n" ++
-        "    \\\\const exe = b.addExecutable(.{ .root_source_file = b.path(\"src/f_f.zig\") });\n" ++
-        ";\n";
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "nested.zig",
-        .data = file_content,
-    });
-    const nested = try tmpFilePath(allocator, &tmp, "nested.zig");
-    defer allocator.free(nested);
-    graph.scanFileBuildPathRefs(nested, root);
     try std.testing.expectEqual(@as(u32, 0), graph.reachable.count());
 }
 
@@ -44744,6 +44878,180 @@ test "ZA103: alloc's own multi-line catch is not a gap trigger" {
         "test_alloc_own_catch.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
+}
+
+test "ZA103: no-space errdefer block covers a later try (EPH-I0372)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `errdefer{` is a valid block form. Collection must not require
+    // the trailing space: pre-fix the block was invisible, the later
+    // try fired a gap, and the errdefer that frees `buf` could not
+    // match (band-B03 F9).
+    const content =
+        \\fn no_space_cleanup(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer{allocator.free(buf);}
+        \\    const more = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(more);
+        \\    store(buf, more);
+        \\}
+        \\fn store(b: []u8, m: []u8) void {
+        \\    _ = b;
+        \\    _ = m;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_no_space_errdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        run.issues.items,
+        "test_no_space_errdefer.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ));
+}
+
+test "ZA103: create without errdefer names the create in the message (EPH-I0373)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The message must name the allocation verb: is_create was written
+    // per record and never read at the emit site (band-B03 F10). The
+    // receiver is a compat global allocator name so the type-based
+    // .create() check accepts the call.
+    const content =
+        \\fn create_gap(allocator: std.mem.Allocator) !void {
+        \\    const obj = try page_allocator.create(Widget);
+        \\    try validate();
+        \\    allocator.destroy(obj);
+        \\}
+        \\const Widget = struct {};
+        \\fn validate() !void {
+        \\    return error.Nope;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_create_gap.zig", content);
+    defer run.deinit(allocator);
+
+    var found = false;
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
+            mem.indexOf(u8, issue.message, "create without errdefer") != null)
+        {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "ZA103: multi-decl line records the first name, so the free of the second misses (EPH-I0378)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented line-granularity bound (band-B03 F11): the record
+    // carries the FIRST decl name (`a`), so the errdefer that frees `b`
+    // cannot match and the later try fires a gap. Column-aware
+    // extraction would silence it.
+    const content =
+        \\fn multi_decl(allocator: std.mem.Allocator) !void {
+        \\    const a = g(); const b = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(b);
+        \\    const more = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(more);
+        \\    store(a, b, more);
+        \\}
+        \\fn g() u8 {
+        \\    return 0;
+        \\}
+        \\fn store(x: u8, b: []u8, m: []u8) void {
+        \\    _ = x;
+        \\    _ = b;
+        \\    _ = m;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_multi_decl.zig", content);
+    defer run.deinit(allocator);
+
+    // The gap fires for the mis-named record; the properly named `more`
+    // record stays silent.
+    try std.testing.expectEqual(@as(usize, 1), countRuleIssues(
+        run.issues.items,
+        "test_multi_decl.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ));
+}
+
+test "ZA103: a second try on the alloc's own line is not a trigger (EPH-I0378)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented line-granularity bound (band-B03 F11): the trigger
+    // test excludes the alloc's own line, and one line yields one
+    // trigger line, so a same-line second try never fires a gap. The
+    // second alloc is invisible to collection entirely.
+    const content =
+        \\fn same_line_try(allocator: std.mem.Allocator) !void {
+        \\    const a = try allocator.alloc(u8, 64); const b = try allocator.alloc(u8, 64);
+        \\    store(a, b);
+        \\}
+        \\fn store(x: []u8, y: []u8) void {
+        \\    _ = x;
+        \\    _ = y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_same_line_try.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        run.issues.items,
+        "test_same_line_try.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ));
+}
+
+test "tryAppendCleanupInfo releases the dupe when the append fails (EPH-I0375)" {
+    // OOM sweep over one call's allocations: the content dupe and the
+    // list append. Pre-fix, an append failure after a successful dupe
+    // dropped the dupe without freeing it (band-B03 F15).
+    const allocator = std.testing.allocator;
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    var probe_list: std.ArrayListUnmanaged(ErrdeferInfo) = .empty;
+    defer {
+        for (probe_list.items) |e| allocator.free(e.content);
+        probe_list.deinit(allocator);
+    }
+    try tryAppendCleanupInfo(
+        "errdefer allocator.free(buf);",
+        .{ .line = 1 },
+        &probe_list,
+        probe.allocator(),
+    );
+    const total_allocs = probe.allocations;
+    try std.testing.expect(total_allocs >= 2);
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var list: std.ArrayListUnmanaged(ErrdeferInfo) = .empty;
+        defer list.deinit(allocator);
+        tryAppendCleanupInfo(
+            "errdefer allocator.free(buf);",
+            .{ .line = 1 },
+            &list,
+            failing.allocator(),
+        ) catch continue;
+        for (list.items) |e| allocator.free(e.content);
+    }
 }
 
 test "analyzeCFGMemory detects use-after-free (ZA105)" {

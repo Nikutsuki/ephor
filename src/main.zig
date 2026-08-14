@@ -28154,11 +28154,12 @@ fn isPlainIdentChain(s: []const u8) bool {
 /// arrows), and `!=` with a literal-zero right side. The comparison's
 /// left side must be the var; an upper-bound comparison (`<`, `<=`)
 /// proves no lower bound, and a comparison on another var guards
-/// nothing. A `!= 0` arm with an `or`-tail proves nothing: `x != 0 or
-/// y` runs the guarded body when y holds and x == 0, so the subtraction
-/// can underflow. The `>` arm has no tail discipline — `x > 0 or y`
-/// stays an accepted residual, the shape the pre-fix `> 0` substring
-/// matched (band-B12 F17, EPH-I0506).
+/// nothing. An `or`-root with an arm that proves nothing for the var
+/// proves nothing: `x != 0 or y` and `y > 0 or x > 0` run the guarded
+/// body when the other arm holds, so the subtraction can underflow. An
+/// `or` outside the comparison's own paren group (`(x > 0) or y`) stays
+/// an accepted residual, shared with the pre-fix arms (band-B12 F17,
+/// EPH-I0506, EPH-I0942).
 fn hasLowerBoundGuardForVar(t: []const u8, var_name: []const u8, limit: usize) bool {
     // One classifier walk plus one comment-start walk (EPH-I0153).
     var cls = LineClassifier.init(t);
@@ -28171,15 +28172,53 @@ fn hasLowerBoundGuardForVar(t: []const u8, var_name: []const u8, limit: usize) b
         if (!is_gt and zero_end == null) continue;
         if (cls.isInsideString(i)) continue;
         if (comment_start != null and i >= comment_start.?) continue;
-        // An `or`-tail re-enters zero on its right side (`x != 0 or y`
-        // runs the guarded body when y holds and x == 0); an `and`-tail
-        // keeps the exclusion. The `>` arm has no tail discipline —
-        // `x > 0 or y` stays an accepted residual (band-B12 F17,
-        // EPH-I0506).
-        if (zero_end != null and mem.startsWith(u8, t[zero_end.?..], " or")) continue;
+        // An `or`-root with an arm that proves nothing for the var
+        // re-enters the body when that arm holds (`x != 0 or y`, `y > 0
+        // or x > 0`, whitespace variants); an `and`-tail or a same-var
+        // or-root keeps the guard (band-B12 F17, EPH-I0506, EPH-I0942).
+        if (comparisonOrRootNulls(t, var_name, i)) continue;
         if (comparisonLhsIsVar(t, i, var_name)) return true;
     }
     return false;
+}
+
+/// Position of the paren group open that encloses `pos` on the line, or
+/// null when `pos` sits at paren depth 0. The walk counts `)` as opens
+/// going backwards; the first `(` reached at depth 0 is the group open.
+/// String and comment bytes are not tracked (contrived inputs only,
+/// same as findMatchingBracket).
+fn enclosingParenGroupStart(t: []const u8, pos: usize) ?usize {
+    var depth: usize = 0;
+    var i = pos;
+    while (i > 0) {
+        i -= 1;
+        if (t[i] == ')') {
+            depth += 1;
+            continue;
+        }
+        if (t[i] != '(') continue;
+        if (depth == 0) return i;
+        depth -= 1;
+    }
+    return null;
+}
+
+/// True when the boolean expression enclosing the comparison at
+/// `op_pos` proves no bound for `var_name`: the expression has a
+/// top-level `or` and the or-root min-combine returns null. `y > 0 or
+/// x > 0` and `x != 0  or y` run the guarded body when the other arm
+/// holds, so the comparison cannot suppress. An `and`-tail and an
+/// or-root whose arms all bound the var (`x > 0 or x > 5`) keep the
+/// guard. A var-RHS arm (`x > y`) keeps its shape-only acceptance
+/// without an `or`; `x > y or x > z` stays an accepted false positive,
+/// the literal-bound judge cannot prove var bounds (band-B12 F17,
+/// EPH-I0506, EPH-I0942).
+fn comparisonOrRootNulls(t: []const u8, var_name: []const u8, op_pos: usize) bool {
+    const group_start = enclosingParenGroupStart(t, op_pos);
+    const start = if (group_start) |gs| gs + 1 else 0;
+    const end = if (group_start) |gs| (matchingCloseParenOnLine(t, gs) orelse t.len) else t.len;
+    if (topLevelKeywordPos(t, "or", start, end) == null) return false;
+    return guardExprBound(t, var_name, start, end) == null;
 }
 
 /// True when the `>` at `pos` starts a lower-bound comparison: `>` or
@@ -68380,6 +68419,24 @@ test "guard detectors are code-position scans on the independent arms (EPH-I0874
     try std.testing.expect(hasAndComparisonGuard("if (i > 0 and j < n) { a[i - 1]; }", loc_i));
 }
 
+test "hasLowerBoundGuardForVar rejects or-roots that prove nothing (EPH-I0942)" {
+    // band-B12 F17 residual: the `>` arm had no tail discipline —
+    // `y > 0 or x > 0` ran the guarded body at x == 0 when only y
+    // held, so the subtraction stayed silent. The `!=` arm's raw
+    // `" or"` check also missed the whitespace variant `x != 0  or y`.
+    // Both arms now reject any or-root that proves nothing for the var;
+    // an `and`-tail and a same-var or-root keep the guard.
+    const limit: usize = 1000;
+    try std.testing.expect(!hasLowerBoundGuardForVar("while (y > 0 or x > 0) a[x - 1];", "x", limit));
+    try std.testing.expect(!hasLowerBoundGuardForVar("while (x > 0 or y > 0) a[x - 1];", "x", limit));
+    try std.testing.expect(!hasLowerBoundGuardForVar("while (x > 0 or y) a[x - 1];", "x", limit));
+    try std.testing.expect(!hasLowerBoundGuardForVar("while (x != 0 or y) a[x - 1];", "x", limit));
+    try std.testing.expect(!hasLowerBoundGuardForVar("while (x != 0  or y) a[x - 1];", "x", limit));
+    try std.testing.expect(hasLowerBoundGuardForVar("while (x > 0 and y) a[x - 1];", "x", limit));
+    try std.testing.expect(hasLowerBoundGuardForVar("while (x > 0 or x > 5) a[x - 1];", "x", limit));
+    try std.testing.expect(hasLowerBoundGuardForVar("while (x > 0) a[x - 1];", "x", limit));
+}
+
 test "hasExitKeyword ignores exit keywords in strings and comments (EPH-I0298)" {
     // Exit keywords in prose never prove the over-limit path exits.
     try std.testing.expect(!hasExitKeyword("x = f(); // return"));
@@ -72653,6 +72710,71 @@ test "ZA903: != 0 with an or-tail does not suppress (EPH-I0506)" {
     try std.testing.expect(countRuleIssues(
         run.issues.items,
         "test_za903_neq_tail.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "ZA903: or-tails do not suppress on the > arm or whitespace variants (EPH-I0942)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F17 residual (EPH-I0942): `y > 0 or x > 0` ran the body
+    // at x == 0 when only y held, so the subtraction stayed silent; the
+    // `!=` arm's raw `" or"` check missed `x != 0  or y`. Both arms now
+    // reject an or-root that proves nothing for the var. An `and`-tail
+    // keeps the exclusion. Exactly two findings pin both sides.
+    const content =
+        \\fn gt_or_tail(a: []u8, x: usize, y: usize) u8 {
+        \\    if (y > 0 or x > 0) return a[x - 1];
+        \\    return 0;
+        \\}
+        \\fn gt_and_tail(a: []u8, x: usize, y: bool) u8 {
+        \\    if (x > 0 and y) return a[x - 1];
+        \\    return 0;
+        \\}
+        \\fn neq_ws_or_tail(a: []u8, x: usize, y: bool) u8 {
+        \\    if (x != 0  or y) return a[x - 1];
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_or_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_or_tail.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 2);
+}
+
+test "ZA903: a b.len guard does not silence an a[a.len - 1] candidate (EPH-I0933)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B12 F14 done-when: the CFG .len key is exact — the guard
+    // records b.len, the candidate queries a.len, so a guard on a
+    // different array cannot silence the candidate. The same-array
+    // control stays silent. Exactly one finding pins both (EPH-I0933).
+    const content =
+        \\fn other_len_guard(a: []u8, b: []u8) u8 {
+        \\    if (b.len == 0) return 0;
+        \\    return a[a.len - 1];
+        \\}
+        \\fn same_len_guard(a: []u8) u8 {
+        \\    if (a.len == 0) return 0;
+        \\    return a[a.len - 1];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_len_base.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_len_base.zig",
         RULE_INDEX_ARITHMETIC,
     ) == 1);
 }

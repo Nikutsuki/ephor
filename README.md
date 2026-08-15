@@ -256,6 +256,8 @@ note: scan includes <N> entry points outside <path> (entry points always join th
 
 A target config's `path_dir` is containment-checked and then discarded. The scan root comes from the CLI path, the trusted working-directory config, or auto-detection.
 
+The directory walk prunes a hardcoded set: every dot-prefixed directory (`.git`, `.zig-cache`, and other hidden dirs) plus `zig-out`, `zig-cache`, `.build`, `node_modules`, `deps`, `.packages`, and `vendor` (one predicate serves the main walk and the nested discovery walks, EPH-I0377). First-party code under a directory with one of these names is not scanned. The config `exclude` list applies on top of this set.
+
 The `.ephor-ignore` auto-load honors the same trust decision. Ephor refuses an untrusted file with one skip note:
 
 ```
@@ -960,7 +962,7 @@ Ephor has four analysis entry points:
 | `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA110, ZA607, ZA8xx, ZA9xx | `CFGState` with file-level `no_free_fields` |
 | `analyzeAstTier` | Project import graph, per-file AST | ZA111 | `std.Ast` parse per file (`src/ast_tier.zig`); files with parse errors are skipped |
 
-Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression.
+Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression. ZA103 is the one exception: its errdefer verdict uses a line-interval model, not the CFG (see the Memory Analysis Path section).
 
 ### TypeContext: The Core Data Structure
 
@@ -1091,12 +1093,12 @@ If no tier resolved the call, the discard is reported (conservative: better to f
 
 ### Memory Analysis Path (ZA101-ZA106)
 
-Memory analysis uses a **CFG-based approach** through three specialized analyzers:
+Memory analysis runs three specialized analyzers. ZA101, ZA102, ZA105, and ZA106 use the CFG-based approach. ZA103 is a line-interval model, not CFG-based: the alloc line, the trigger lines (later `try` or error return), and the errdefer line sit between them at the alloc's indent or deeper, and the CFG contributes nothing to the verdict. The function name keeps the historical `analyzeCFG*` prefix (EPH-I0682, design-cfg-soundness F15).
 
 | Analyzer | Rules | Purpose |
 |----------|-------|---------|
 | `analyzeCFGDeferCoverage` | ZA101, ZA102 | Allocation without matching `defer free()`/`defer destroy()` |
-| `analyzeCFGErrdeferCoverage` | ZA103 | Allocation without `errdefer` before next `try` |
+| `analyzeCFGErrdeferCoverage` | ZA103 | Allocation without `errdefer` before a later `try` or error return (line-interval model, not CFG) |
 | `analyzeCFGMemorySafety` | ZA105, ZA106 | Use-after-free, double-free |
 
 **Analysis pipeline per file** (`analyzeCFGFile`):

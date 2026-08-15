@@ -8487,7 +8487,10 @@ fn collectCFGAllocations(
         try allocs.append(ctx.allocator, .{
             .name = name,
             .line = actual_line,
-            .col = alloc_info.col + 1,
+            // The col comes from the JOINED text, which can exceed the
+            // physical line for a split-RHS decl; clamp it into the
+            // physical line so Issue.col stays displayable (EPH-I0986).
+            .col = @min(alloc_info.col + 1, phys.len),
             .block = block,
             .is_create = alloc_info.is_create,
         });
@@ -8502,6 +8505,10 @@ fn collectCFGAllocations(
 /// inside strings or comments are text, never statement structure
 /// (EPH-I0675 makes the span verdict-bearing, and an unbalanced `(` inside
 /// a string would otherwise inflate the span past the real statement).
+/// Lines longer than the 16 KiB mask buffer fall back to the raw line, so
+/// a literal brace or semicolon on an over-cap line still counts as
+/// structure (documented bound, EPH-I0444: generated or giant lines
+/// only).
 fn findAllocStatementEnd(lines: []const []const u8, start: usize) usize {
     var brace_depth: i32 = 0;
     var blank_buf: [16 * 1024]u8 = undefined;
@@ -9812,7 +9819,10 @@ const ErrdeferInfo = struct {
 };
 
 /// Check if line contains a try allocation (not in no-free allocator)
-fn isTryAllocation(t: []const u8) bool {
+fn isTryAllocation(
+    t: []const u8,
+    alloc_names: ?*const std.StringHashMapUnmanaged(void),
+) bool {
     // Token-matched: "try " in a string literal or trailing comment never
     // fakes a try allocation (EPH-I0298).
     const has_try = hasToken(t, "try");
@@ -9821,7 +9831,7 @@ fn isTryAllocation(t: []const u8) bool {
         !mem.startsWith(u8, t, "var ")) return false;
 
     // Check all allocation method patterns from compat layer
-    return findAllocCall(t, null) != null;
+    return findAllocCall(t, alloc_names) != null;
 }
 
 /// The expression of a bare `return <identifier>;` — exactly one identifier
@@ -10197,8 +10207,12 @@ fn continueBlockCollection(
     // Collected content is masked code: a name inside a string or a
     // trailing comment is text, never a freed variable, so the cleanup
     // record cannot fake coverage for it (band-B03 F19, EPH-I0380).
-    // The depth scan below counts braces on the RAW line — string braces
-    // must keep balancing the block.
+    // The depth scan below runs on the SAME masked code: a lone `{` or
+    // `}` inside a string is text, never block structure. A balanced
+    // string pair is neutral under both scans; the mask changes only the
+    // unbalanced cases — a raw lone `{` inflates the depth past the real
+    // close and swallows following lines, a raw lone `}` closes the block
+    // early and drops its cleanup record (EPH-I0987).
     var blank_buf: [16 * 1024]u8 = undefined;
     const masked = maskedCodeLine(t, &blank_buf);
     try bs.content.appendSlice(allocator, masked);
@@ -10207,7 +10221,7 @@ fn continueBlockCollection(
     // the char scan — hoist the invariant literal out of the loop so its
     // braces don't count toward nesting depth (ZA302).
     const site: StmtSite = .{ .line = bs.start };
-    for (t) |c| {
+    for (masked) |c| {
         if (c == '{') bs.depth += 1;
         if (c == '}' and bs.depth > 0) bs.depth -= 1;
         if (bs.depth == 0) {
@@ -10229,6 +10243,10 @@ const TryAllocCollectCtx = struct {
     no_free_fields: *const std.StringHashMapUnmanaged(void),
     lines: []const []const u8,
     func_line: usize,
+    /// Type-tracked allocator names for the .create() receiver gate: the
+    /// same set the ZA101 path builds, so a create on a tracked local
+    /// allocator is visible to ZA103 too (EPH-I0981).
+    alloc_names: *const std.StringHashMapUnmanaged(void),
 };
 
 /// Collect a try allocation from a line, skipping arena/no-free.
@@ -10260,7 +10278,7 @@ fn collectTryAllocFromLine(
         return;
     }
     if (extractVarDeclName(phys)) |name| {
-        const alloc_info = findAllocCall(t, null) orelse return;
+        const alloc_info = findAllocCall(t, ctx.alloc_names) orelse return;
         // orelse-return RHS allocs escape to the caller — never bound to the var
         if (isOrelseReturnAlloc(t, alloc_info.col)) return;
         // The statement span ends at the first `;` at brace depth 0: a
@@ -10272,7 +10290,10 @@ fn collectTryAllocFromLine(
         try ctx.try_allocs.append(ctx.allocator, .{
             .name = name,
             .line = site.line,
-            .col = alloc_info.col + 1,
+            // The col comes from the joined text, which can exceed the
+            // physical line for a split-RHS decl; clamp it into the
+            // physical line so Issue.col stays displayable (EPH-I0986).
+            .col = @min(alloc_info.col + 1, phys.len),
             .is_create = alloc_info.is_create,
             .stmt_end = stmt_end,
         });
@@ -10347,9 +10368,12 @@ fn collectDeferFromLine(
     // Keep the statement prefix in the collected content so the cleanup
     // record preserves the defer/errdefer kind (EPH-I0367); the depth
     // scan skips the opening brace exactly like the prefix-stripped form.
+    // The scan runs on masked code like continueBlockCollection's: a lone
+    // `{` inside a string on the opening line must not inflate the block
+    // depth past the real close (EPH-I0987).
     try ctx.bs.content.appendSlice(ctx.allocator, masked);
     try ctx.bs.content.append(ctx.allocator, ' ');
-    for (t[brace_pos + 1 ..]) |c| {
+    for (masked[brace_pos + 1 ..]) |c| {
         if (c == '{') ctx.bs.depth += 1;
         if (c == '}' and ctx.bs.depth > 0) ctx.bs.depth -= 1;
     }
@@ -10563,7 +10587,11 @@ fn hasErrorReturnGap(
 ) bool {
     const alloc_idx = alloc.line - ctx.func_line;
     if (alloc_idx >= ctx.lines.len) return false;
-    const stmt_end = ctx.func_line + findAllocStatementEnd(ctx.lines, alloc_idx);
+    // The record carries the statement span: collectTryAllocFromLine
+    // computed it from the same lines array and start index, so a
+    // recompute here is identical work that can drift on a later
+    // one-site edit (EPH-I0988).
+    const stmt_end = alloc.stmt_end;
     for (ctx.error_returns) |er| {
         if (er <= stmt_end) continue;
         if (!isGapTrigger(alloc, matched, er)) continue;
@@ -10573,16 +10601,34 @@ fn hasErrorReturnGap(
     return false;
 }
 
-/// Issue text for one ZA103 gap: the pair names the allocation verb
-/// the record carries (band-B03 F10, EPH-I0373).
-fn errdeferGapText(is_create: bool) struct { message: []const u8, help: []const u8 } {
-    return if (is_create) .{
-        .message = "create without errdefer before next try",
-        .help = "add errdefer destroy immediately after create",
-    } else .{
-        .message = "allocation without errdefer before next try",
-        .help = "add errdefer immediately after allocation",
-    };
+/// Message pair for one ZA103 gap.
+const ErrdeferGapMsg = struct { message: []const u8, help: []const u8 };
+
+const gap_msg_alloc_try: ErrdeferGapMsg = .{
+    .message = "allocation without errdefer before next try",
+    .help = "add errdefer immediately after allocation",
+};
+const gap_msg_alloc_err_ret: ErrdeferGapMsg = .{
+    .message = "allocation without errdefer before an error return",
+    .help = "add errdefer immediately after allocation",
+};
+const gap_msg_create_try: ErrdeferGapMsg = .{
+    .message = "create without errdefer before next try",
+    .help = "add errdefer destroy immediately after create",
+};
+const gap_msg_create_err_ret: ErrdeferGapMsg = .{
+    .message = "create without errdefer before an error return",
+    .help = "add errdefer destroy immediately after create",
+};
+
+/// Issue text for one ZA103 gap: the pair names the allocation verb the
+/// record carries (band-B03 F10, EPH-I0373) and the trigger kind that
+/// leaked the alloc — a later `try` or an error return (EPH-I0983).
+fn errdeferGapText(is_create: bool, is_try_trigger: bool) ErrdeferGapMsg {
+    return if (is_create)
+        (if (is_try_trigger) gap_msg_create_try else gap_msg_create_err_ret)
+    else
+        (if (is_try_trigger) gap_msg_alloc_try else gap_msg_alloc_err_ret);
 }
 
 fn checkErrdeferGaps(
@@ -10599,9 +10645,11 @@ fn checkErrdeferGaps(
             alloc.has_errdefer = true;
         }
         const try_gap = hasErrdeferGap(alloc, matched, ctx.try_lines);
-        if (!try_gap and !hasErrorReturnGap(alloc, matched, ctx))
-            continue;
-        const text = errdeferGapText(alloc.is_create);
+        const error_return_gap = !try_gap and hasErrorReturnGap(alloc, matched, ctx);
+        if (!try_gap and !error_return_gap) continue;
+        // The try-trigger class keeps the classic wording; an error-return
+        // trigger names its own kind (EPH-I0983).
+        const text = errdeferGapText(alloc.is_create, try_gap);
         try issues.append(allocator, .{
             .file = ctx.file_path,
             .line = alloc.line,
@@ -10712,7 +10760,7 @@ fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !
         (split_joined != null and hasRealKeyword(joined, "try "));
     if (hasRealKeyword(t, "return error."))
         try ctx.error_returns.append(ctx.allocator, actual_line);
-    if (has_try and isTryAllocation(joined)) {
+    if (has_try and isTryAllocation(joined, ctx.collect_ctx.alloc_names)) {
         // Standalone/multiline first-arg allocator checks (no-free set or arena)
         const no_free = isNoFreeAllocLine(skip_ctx);
         if (no_free) try ctx.collect_ctx.try_lines.append(ctx.allocator, actual_line);
@@ -10720,6 +10768,41 @@ fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !
     }
     try collectDeferFromLine(t, site, ctx.cleanup_ctx);
     if (has_try) try ctx.collect_ctx.try_lines.append(ctx.allocator, actual_line);
+}
+
+/// Pre-scan sets for one function body: the no-free names and fields
+/// plus the tracked allocator names for the .create() gate (EPH-I0981).
+/// The three maps share one lifetime, so one deinit releases all.
+const ErrdeferPrescan = struct {
+    no_free_names: std.StringHashMapUnmanaged(void),
+    local_no_free_fields: std.StringHashMapUnmanaged(void),
+    all_alloc_names: std.StringHashMapUnmanaged(void),
+
+    fn deinit(self: *ErrdeferPrescan, a: Allocator) void {
+        self.no_free_names.deinit(a);
+        self.local_no_free_fields.deinit(a);
+        self.all_alloc_names.deinit(a);
+    }
+};
+
+/// Build the prescan sets: errdefer releases a map the moment a later
+/// collection fails, so the partial set never leaks.
+fn prescanErrdeferSets(
+    a: Allocator,
+    lines: []const []const u8,
+    file_fields: ?*const std.StringHashMapUnmanaged(void),
+) !ErrdeferPrescan {
+    var local_no_free_fields = try collectNoFreeFieldNames(a, lines);
+    errdefer local_no_free_fields.deinit(a);
+    var no_free_names = try collectNoFreeAllocatorNames(a, lines, file_fields);
+    errdefer no_free_names.deinit(a);
+    var all_alloc_names = try collectAllAllocatorNames(a, lines);
+    errdefer all_alloc_names.deinit(a);
+    return .{
+        .no_free_names = no_free_names,
+        .local_no_free_fields = local_no_free_fields,
+        .all_alloc_names = all_alloc_names,
+    };
 }
 
 /// Scan function-body lines for try-allocations, error returns, and
@@ -10742,22 +10825,21 @@ fn scanErrdeferLines(
     // sweep).
     errdefer state.deinit(allocator);
 
-    // Pre-scan: build set of no-free allocator names by tracking type-based
-    // initialization and .allocator() aliases
-    var local_no_free_fields = try collectNoFreeFieldNames(allocator, lines);
-    defer local_no_free_fields.deinit(allocator);
-    var no_free_names = try collectNoFreeAllocatorNames(allocator, lines, file_no_free_fields);
-    defer no_free_names.deinit(allocator);
+    // Pre-scan: no-free names/fields plus the tracked allocator names
+    // for the .create() gate (EPH-I0981).
+    var prescan = try prescanErrdeferSets(allocator, lines, file_no_free_fields);
+    defer prescan.deinit(allocator);
     // Merge file-level fields: use file-level if available, else local only
-    const effective_fields = file_no_free_fields orelse &local_no_free_fields;
+    const effective_fields = file_no_free_fields orelse &prescan.local_no_free_fields;
     const collect_ctx: TryAllocCollectCtx = .{
         .try_allocs = &state.try_allocs,
         .try_lines = &state.try_lines_list,
         .allocator = allocator,
-        .no_free_names = &no_free_names,
+        .no_free_names = &prescan.no_free_names,
         .no_free_fields = effective_fields,
         .lines = lines,
         .func_line = func_line,
+        .alloc_names = &prescan.all_alloc_names,
     };
     const cleanup_ctx: CleanupCollectCtx = .{
         .bs = &state.bs,
@@ -23562,12 +23644,15 @@ fn joinParenContinuation(
 /// (and the wrapped-args form). The decl line ends with `=`, the alloc's
 /// `try` starts the next line, so no single physical line carries both the
 /// decl and the alloc pattern (design-line-model F-02, EPH-I0675). Joins
-/// only the unambiguous shape: the next line starts with `try ` after trim
-/// and its joined text matches an alloc pattern. Returns the composed
-/// logical line (`const x = try allocator.alloc(u8, n);`) or null when the
-/// shape does not fire — callers keep the paren join, so a decl without a
-/// try-alloc next line stays exactly as before. Over-long wrapped allocs
-/// that do not fit the buffer fall back to null (the pre-fix verdict).
+/// the shape only when the continuation carries the alloc's own `try`
+/// before the alloc: `try ` at the line start or a call nesting the
+/// try-alloc (`f(try allocator.alloc(...))`, EPH-I0984 — the single-line
+/// form detects that nesting too, so the join mirrors it). Returns the
+/// composed logical line (`const x = try allocator.alloc(u8, n);`) or
+/// null when the shape does not fire — callers keep the paren join, so a
+/// decl without a try-alloc next line stays exactly as before. Over-long
+/// wrapped allocs that do not fit the buffer fall back to null (the
+/// pre-fix verdict).
 fn joinSplitDeclRhs(
     lines: []const []const u8,
     idx: usize,
@@ -23577,10 +23662,12 @@ fn joinSplitDeclRhs(
     if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return null;
     if (t.len == 0 or t[t.len - 1] != '=') return null;
     if (idx + 1 >= lines.len) return null;
-    const next = mem.trim(u8, lines[idx + 1], " \t\r");
-    if (!mem.startsWith(u8, next, "try ")) return null;
     const alloc = joinParenContinuation(lines, idx + 1, buf);
-    if (findAllocCall(alloc, null) == null) return null;
+    const info = findAllocCall(alloc, null) orelse return null;
+    // The alloc's own `try` must sit on the continuation before the alloc
+    // column. A "try " earlier inside a string only widens the join, and
+    // the joined line still passes the string-aware alloc pattern check.
+    if (mem.indexOf(u8, alloc[0..info.col], "try ") == null) return null;
     if (t.len + 1 + alloc.len > buf.len) return null;
     // The alloc text may live in `lines` — a balanced call returns the
     // trimmed line, not a buffer copy. Shift it into place (overlap-safe
@@ -23680,11 +23767,14 @@ fn isAllocatorCreateTypeBased(
     const name = extractCreateCaller(t, create_pos) orelse return false;
     // Uppercase first letter = Type.create() factory method, NOT an allocator
     if (name.len > 0 and name[0] >= 'A' and name[0] <= 'Z') return false;
-    // Check tracked allocator variable set (type-based)
+    // Check tracked allocator variable set (type-based), then the compat
+    // global names. The global fallback applies WITH a set present too:
+    // ZA101 feeds the set while ZA103 historically fed null, so
+    // `page_allocator.create` fired only in the null path — the union
+    // keeps both analyzers consistent on global receivers (EPH-I0981).
     if (alloc_names) |names| {
-        return names.contains(name);
+        if (names.contains(name)) return true;
     }
-    // Fallback when no tracked set available: check known stdlib globals (compat layer)
     for (compat.getGlobalAllocNames()) |g| {
         if (mem.eql(u8, name, g)) return true;
     }
@@ -44079,6 +44169,256 @@ test "ZA103: errdefer with a comment mentioning the alloc still covers (EPH-I038
         "test_comment_mention.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
+}
+
+test "ZA103: lone `{` in a string keeps a multi-line errdefer block open (EPH-I0987)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The block collector's depth scan runs on masked code: the lone `{`
+    // inside the string must not inflate the depth past the real close.
+    // The raw scan never closed the block, swallowed the later alloc's
+    // line, and left it uncovered-silent (FN direction).
+    const content =
+        \\fn blockOpenBrace(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer { log("{", .{});
+        \\        allocator.free(buf);
+        \\    }
+        \\    const more = try allocator.alloc(u8, 64);
+        \\    try g();
+        \\}
+        \\fn log(fmt: []const u8, args: anytype) void {
+        \\    _ = fmt;
+        \\    _ = args;
+        \\}
+        \\fn g() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_block_open_brace.zig", content);
+    defer run.deinit(allocator);
+
+    // `more` is a real alloc outside the block; its line must not be
+    // swallowed, so the later try fires the gap.
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_block_open_brace.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: lone `}` in a string does not close a multi-line errdefer block early (EPH-I0987)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The raw scan closed the block at the string's `}`: the record
+    // dropped the real free, so the alloc looked uncovered (FP direction).
+    const content =
+        \\fn blockCloseBrace(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer {
+        \\        log("}", .{});
+        \\        allocator.free(buf);
+        \\    }
+        \\    try g();
+        \\}
+        \\fn log(fmt: []const u8, args: anytype) void {
+        \\    _ = fmt;
+        \\    _ = args;
+        \\}
+        \\fn g() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_block_close_brace.zig", content);
+    defer run.deinit(allocator);
+
+    // The block closes at the real `}` and the free inside covers buf.
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_block_close_brace.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: create on a tracked local allocator fires (EPH-I0981)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The .create() receiver gate ran on the compat global names only:
+    // `allocator` here is a tracked local (std.testing.allocator alias),
+    // invisible to the null-set fallback, so the gap stayed silent.
+    const content =
+        \\fn localCreate() !void {
+        \\    const allocator = std.testing.allocator;
+        \\    const obj = try allocator.create(Widget);
+        \\    try validate();
+        \\}
+        \\const Widget = struct {};
+        \\fn validate() !void {
+        \\    return error.Nope;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_local_create.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_local_create.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "joinSplitDeclRhs joins a try-alloc nested in a call on the continuation line (EPH-I0984)" {
+    // `const x =\n f(try allocator.alloc(u8, n));`: the continuation
+    // carries the alloc's try inside a call. The single-line form detects
+    // the nesting, so the split form joins it too (parity).
+    const lines = [_][]const u8{
+        "    const x =",
+        "        f(try allocator.alloc(u8, 100));",
+        "    _ = x;",
+    };
+    var buf: [max_join_bytes]u8 = undefined;
+    const joined = joinSplitDeclRhs(&lines, 0, &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(mem.eql(u8, joined, "const x = f(try allocator.alloc(u8, 100));"));
+}
+
+test "ZA103: split-RHS try-alloc nested in a call fires with the decl name (EPH-I0984)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn nestedRhs(allocator: std.mem.Allocator) !void {
+        \\    const buf =
+        \\        f(try allocator.alloc(u8, 64));
+        \\    _ = buf;
+        \\    try g();
+        \\}
+        \\fn f(x: []u8) []u8 {
+        \\    return x;
+        \\}
+        \\fn g() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_split_rhs.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_nested_split_rhs.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: gap message names the trigger kind, try and error return (EPH-I0983)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The error-return trigger class used to claim "before next try" even
+    // though no try follows the alloc. Each trigger kind names itself.
+    const err_ret_content =
+        \\fn errRet(allocator: std.mem.Allocator, bad: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (bad) return error.Bad;
+        \\    store(buf);
+        \\}
+        \\fn store(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var err_run = try runCFGMemoryTest(&diag, allocator, "test_msg_err_ret.zig", err_ret_content);
+    defer err_run.deinit(allocator);
+
+    var err_ret_named = false;
+    for (err_run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
+            mem.indexOf(u8, issue.message, "before an error return") != null)
+            err_ret_named = true;
+    }
+    try std.testing.expect(err_ret_named);
+
+    const try_content =
+        \\fn tryMsg(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    try g();
+        \\}
+        \\fn g() !void {}
+    ;
+    var try_run = try runCFGMemoryTest(&diag, allocator, "test_msg_try.zig", try_content);
+    defer try_run.deinit(allocator);
+
+    var try_named = false;
+    for (try_run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
+            mem.indexOf(u8, issue.message, "before next try") != null)
+            try_named = true;
+    }
+    try std.testing.expect(try_named);
+}
+
+test "ZA103/ZA101: issue col stays inside the physical line on split-RHS and wrapped shapes (EPH-I0986)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The alloc col is computed on the JOINED line, which exceeds the
+    // short decl line on a split RHS; the emitted col must clamp into the
+    // physical line so Issue.col stays displayable.
+    const split_content =
+        \\fn splitCol(allocator: std.mem.Allocator) !void {
+        \\    const buf =
+        \\        try allocator.alloc(u8, 64);
+        \\    try g();
+        \\}
+        \\fn g() !void {}
+    ;
+    var split_run = try runCFGMemoryTest(&diag, allocator, "test_col_split.zig", split_content);
+    defer split_run.deinit(allocator);
+    try expectColInLine(split_run.issues.items, "test_col_split.zig", split_content);
+
+    // The canonical wrapped-args form keeps the same invariant.
+    const wrapped_content =
+        \\fn wrappedCol(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(
+        \\        u8,
+        \\        64,
+        \\    );
+        \\    _ = buf;
+        \\    try g();
+        \\}
+        \\fn g() !void {}
+    ;
+    var wrapped_run = try runCFGMemoryTest(&diag, allocator, "test_col_wrapped.zig", wrapped_content);
+    defer wrapped_run.deinit(allocator);
+    try expectColInLine(wrapped_run.issues.items, "test_col_wrapped.zig", wrapped_content);
+}
+
+/// Every alloc-family issue col must sit inside its physical line: the
+/// joined-logical-line col drifts past the EOL on split RHSs and wrapped
+/// calls (EPH-I0986).
+fn expectColInLine(issues: []const Issue, file: []const u8, content: []const u8) !void {
+    var line_no: usize = 1;
+    var split = std.mem.splitScalar(u8, content, '\n');
+    while (split.next()) |raw_line| {
+        const physical = mem.trim(u8, raw_line, " \t\r");
+        for (issues) |issue| {
+            if (issue.line != line_no or !mem.eql(u8, issue.file, file)) continue;
+            const in_family = mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER) or
+                mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER) or
+                mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER);
+            if (!in_family) continue;
+            try std.testing.expect(issue.col <= physical.len);
+        }
+        line_no += 1;
+    }
 }
 
 test "ZA103: multi-line errdefer block with a string-only name mention does not cover (EPH-I0380 F19)" {
@@ -69773,10 +70113,10 @@ test "firstVarReadPos ignores string-data comment openers and real comments (EPH
 test "isTryAllocation ignores try prose in strings and comments (EPH-I0298)" {
     // "try " in a trailing comment faked a try allocation on a plain alloc
     // line, forcing errdefer coverage the code never owed.
-    try std.testing.expect(!isTryAllocation("const buf = allocator.alloc(u8, 10); // a try b"));
-    try std.testing.expect(!isTryAllocation("const s = \"a try b\"; const buf = allocator.alloc(u8, 10);"));
+    try std.testing.expect(!isTryAllocation("const buf = allocator.alloc(u8, 10); // a try b", null));
+    try std.testing.expect(!isTryAllocation("const s = \"a try b\"; const buf = allocator.alloc(u8, 10);", null));
     // Real try allocations stay detected.
-    try std.testing.expect(isTryAllocation("const buf = try allocator.alloc(u8, 10);"));
+    try std.testing.expect(isTryAllocation("const buf = try allocator.alloc(u8, 10);", null));
 }
 
 test "hasErrorHandling ignores try and catch prose in strings and comments (EPH-I0298)" {

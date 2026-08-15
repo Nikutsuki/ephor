@@ -25805,6 +25805,14 @@ fn isGuardEstablishingLine(t: []const u8) bool {
     return findTagInCode(t, "assert(", 0) != null;
 }
 
+/// The line's guard-source text: for an else-open line, the arm's own
+/// region after the `else` keyword, trimmed so a chain arm's opener
+/// classifies at position 0 (EPH-I0993); otherwise the whole line.
+fn guardSourceForLine(t: []const u8) []const u8 {
+    if (elseOpenKind(t) != null) return mem.trimStart(u8, elseArmRegion(t), " \t");
+    return t;
+}
+
 /// Scan a range of lines for guard patterns, adding to the given map.
 /// Only guard-establishing lines feed the set (EPH-I0486); each var
 /// records the line of its earliest guard in the range.
@@ -25820,8 +25828,23 @@ fn scanLinesForGuards(
         if (idx >= ctx.lines.len) continue;
         const t = mem.trim(u8, ctx.lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (!isGuardEstablishingLine(t)) continue;
-        const var_name = extractGuardedVar(t) orelse continue;
+        // An else-open line's condition before the `else` keyword is the
+        // antecedent — NEGATED for the arm below (`if (m > 1) { ... }
+        // else { m -= 1; }` runs the arm at m <= 1). The scan reads only
+        // the arm's own region after the `else`, or the antecedent's
+        // guard is recorded into the else-arm block and masks its
+        // unguarded decrements (EPH-I0980 probe, 2026-08-14). The arm
+        // region keeps the whitespace after the `else` keyword: an
+        // else-if chain line (`} else if (m > 3) {`) yields
+        // `" if (m > 3) {"`, and the opener classifiers match at
+        // position 0 — untrimmed, the chain arm's own condition never
+        // records into guarded_per_block, and a decrement in the arm
+        // past the 40-line opener walk fires (FP, EPH-I0993). The
+        // plain-else region (`" {"` or empty) still fails every gate,
+        // so the EPH-I0980 else-arm FN fix holds.
+        const guard_source = guardSourceForLine(t);
+        if (!isGuardEstablishingLine(guard_source)) continue;
+        const var_name = extractGuardedVar(guard_source) orelse continue;
         const gop = try guards.getOrPut(ctx.allocator, var_name);
         if (!gop.found_existing) gop.value_ptr.* = idx;
     }
@@ -26801,6 +26824,16 @@ const PriorGuardCtx = struct {
 /// exclusion entirely (EPH-I0959, EPH-I0960). A null amount keeps the
 /// legacy shape-only verdict: the guard counts regardless of amount or
 /// reassignment (a non-literal decrement `x -= n`).
+///
+/// The defeat scan is intentionally COARSE: ANY write between the guard
+/// and the candidate defeats the proof, even a write that provably
+/// cannot introduce zero — a same-var increment (`m += 5`) or a
+/// bounded loop decrement (`while (m > 3) m -= 1;` — the loop body
+/// keeps m >= 3, so the candidate after the loop is safe). Judging
+/// those writes needs per-write-site guard reachability (the write's
+/// own enclosing guard, the loop-exit bound) that this shared line
+/// walk does not carry, so the shape stays a finding — a documented
+/// false-positive class, not a fix (EPH-I0978).
 fn zeroGuardDominates(pctx: PriorGuardCtx, guard_idx: usize) bool {
     const sub = pctx.subtrahend orelse return true;
     if (sub > 1) return false;
@@ -27242,14 +27275,14 @@ fn extractIndexSubtraction(line: []const u8) ?IdxSub {
         }
         const idx_var = mem.trim(u8, inside[0..sub], " \t");
         if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
-        // Parse the numeric subtrahend after the '-', skipping whitespace.
+        // Parse the numeric subtrahend after the '-', skipping
+        // whitespace. The literal parser covers the base prefixes and
+        // the underscore separators, or the witness binds a wrong
+        // amount (`0x1` as 0, `1_0` as 1 — EPH-I0977).
         var dpos = i + 1 + sub + 1;
         while (dpos < line.len and (line[dpos] == ' ' or line[dpos] == '\t')) dpos += 1;
-        var dend = dpos;
-        while (dend < line.len and line[dend] >= '0' and line[dend] <= '9') dend += 1;
-        if (dend == dpos) return null;
-        const val = std.fmt.parseInt(usize, line[dpos..dend], 10) catch return null;
-        return .{ .idx_var = idx_var, .subtrahend = val };
+        const lit = parseNumericLiteral(line, dpos) orelse return null;
+        return .{ .idx_var = idx_var, .subtrahend = lit.value };
     }
     return null;
 }
@@ -27337,6 +27370,53 @@ fn hasInitWitness(
     return false;
 }
 
+/// A numeric literal token and its value: the token's end (exclusive)
+/// and the parsed amount.
+const NumLit = struct {
+    end: usize,
+    value: usize,
+};
+
+/// The Zig integer literal starting at `start` and its value, or null
+/// when the token is not well-formed. The base-0 std parse owns the
+/// prefix and underscore semantics: `0x`/`0X` hex, `0b`/`0B` binary,
+/// `0o`/`0O` octal, and underscore-separated digits (`1_0` is 10,
+/// `0x1_0` is 16). The digit scan skips underscores and consumes the
+/// base's full alphabet (hex digits for a hex token); the token ends
+/// at the first character outside both. The parse then owns the valid
+/// prefix only, so a trailing letter truncates the token (`0x1g`
+/// parses as 1, the scan ends before the `g`). Null comes only from a
+/// bare `0x` prefix, an underscore at the digit-run boundary (`0x_1`,
+/// `1_`), a digit the base rejects (`0b2`), or overflow, and the
+/// caller's conservative verdict then holds and the shape stays a
+/// finding (EPH-I0977).
+fn parseNumericLiteral(inside: []const u8, start: usize) ?NumLit {
+    if (start >= inside.len or !std.ascii.isDigit(inside[start])) return null;
+    var base: u8 = 10;
+    var digits = start;
+    if (inside[start] == '0' and start + 1 < inside.len) {
+        switch (inside[start + 1]) {
+            'x', 'X' => base = 16,
+            'b', 'B' => base = 2,
+            'o', 'O' => base = 8,
+            else => {},
+        }
+        if (base != 10) digits = start + 2;
+    }
+    var end = digits;
+    while (end < inside.len) : (end += 1) {
+        const c = inside[end];
+        if (c == '_') continue;
+        if (std.ascii.isDigit(c)) continue;
+        if (base == 16 and std.ascii.isHex(c)) continue;
+        break;
+    }
+    if (end == digits) return null;
+    if (inside[end - 1] == '_') return null;
+    const value = std.fmt.parseInt(usize, inside[start..end], 0) catch return null;
+    return .{ .end = end, .value = value };
+}
+
 /// The `x` and `N` of a `[0 .. x - N]` slice-end bracket body, or null
 /// when the body is not the form. Shared by the line-level finder
 /// (extractRangeEndSubtraction) and the per-bracket completeness pass
@@ -27376,10 +27456,7 @@ fn rangeEndSubOf(inside: []const u8) ?IdxSub {
     if (var_end > 0 and findIndexSubtraction(inside[sub + 1 ..]) != null) return null;
     var dpos = sub + 1;
     while (dpos < inside.len and (inside[dpos] == ' ' or inside[dpos] == '\t')) dpos += 1;
-    var dend = dpos;
-    while (dend < inside.len and inside[dend] >= '0' and inside[dend] <= '9') dend += 1;
-    if (dend == dpos) return null;
-    const val = std.fmt.parseInt(usize, inside[dpos..dend], 10) catch return null;
+    const lit = parseNumericLiteral(inside, dpos) orelse return null;
     // A plain span binds the summed literal subtrahends of its
     // compound end. A wrapped span (a call head, a paren group) keeps
     // the single-subtrahend binding: the second-subtraction check above
@@ -27388,10 +27465,10 @@ fn rangeEndSubOf(inside: []const u8) ?IdxSub {
     // subtraction's own operand — `f(n - 1) + 5` is safe whenever
     // n - 1 is (EPH-I0958 review r1 finding 2).
     if (var_end == 0) {
-        const total = compoundEndSubtrahend(inside, dpos, dend) orelse return null;
+        const total = compoundEndSubtrahend(inside, dpos, lit.end) orelse return null;
         return .{ .idx_var = span[var_end..], .subtrahend = total };
     }
-    return .{ .idx_var = span[var_end..], .subtrahend = val };
+    return .{ .idx_var = span[var_end..], .subtrahend = lit.value };
 }
 
 /// The summed literal subtrahends of a plain-span compound end
@@ -27407,19 +27484,21 @@ fn compoundEndSubtrahend(
     first_digit: usize,
     first_end: usize,
 ) ?usize {
-    var total = std.fmt.parseInt(usize, inside[first_digit..first_end], 10) catch return null;
+    // The caller bounds the first operand with the same parser, so the
+    // defensive end match keeps the two scans consistent (EPH-I0977).
+    var lit = parseNumericLiteral(inside, first_digit) orelse return null;
+    if (lit.end != first_end) return null;
+    var total = lit.value;
     var scan = first_digit;
     var tail_start = first_end;
     while (findIndexSubtraction(inside[scan..])) |more_rel| {
         const more = scan + more_rel;
         var m = more + 1;
         while (m < inside.len and (inside[m] == ' ' or inside[m] == '\t')) m += 1;
-        var m_end = m;
-        while (m_end < inside.len and inside[m_end] >= '0' and inside[m_end] <= '9') m_end += 1;
-        if (m_end == m) return null;
-        total +|= std.fmt.parseInt(usize, inside[m..m_end], 10) catch return null;
+        lit = parseNumericLiteral(inside, m) orelse return null;
+        total +|= lit.value;
         scan = m;
-        tail_start = m_end;
+        tail_start = lit.end;
     }
     // The tail after the last operand must be empty, or only the paren
     // closes that terminate a call-head or group end (`f(n - 1)`).
@@ -27440,11 +27519,8 @@ fn indexSubOf(inside: []const u8) ?IdxSub {
     if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
     var dpos = sub + 1;
     while (dpos < inside.len and (inside[dpos] == ' ' or inside[dpos] == '\t')) dpos += 1;
-    var dend = dpos;
-    while (dend < inside.len and inside[dend] >= '0' and inside[dend] <= '9') dend += 1;
-    if (dend == dpos) return null;
-    const val = std.fmt.parseInt(usize, inside[dpos..dend], 10) catch return null;
-    return .{ .idx_var = idx_var, .subtrahend = val };
+    const lit = parseNumericLiteral(inside, dpos) orelse return null;
+    return .{ .idx_var = idx_var, .subtrahend = lit.value };
 }
 
 /// The `x` and `N` of a `[0 .. x - N]` slice-end subtraction on `t`,
@@ -27627,7 +27703,11 @@ fn initReassignScanEnd(lines: []const []const u8, current_idx: usize) usize {
 /// reassignment between the init and the scan end breaks the init
 /// guard. The caller extends the end past the candidate to the loop
 /// body's close, so an after-candidate write still breaks the proof
-/// (EPH-I0497, EPH-I0934).
+/// (EPH-I0497, EPH-I0934). The scan is intentionally COARSE — every
+/// write defeats, including a bounded one that cannot introduce zero
+/// (`m += 5`, `while (m > 3) m -= 1;`): the bounded-write judgment
+/// would need the write's own guard reachable from this line window,
+/// so the class stays a documented finding, not a fix (EPH-I0978).
 fn indexVarReassignedAfter(
     lines: []const []const u8,
     start: usize,
@@ -27719,12 +27799,20 @@ const ElseOpenKind = enum { plain, chain };
 /// the same brace-predecessor rule (EPH-I0965). A ternary `else`
 /// (`x = if (a) 1 else 2`) never follows a brace and never qualifies.
 fn elseKeywordPos(t: []const u8) ?usize {
-    // One classifier walk plus one comment-start walk (EPH-I0153).
+    // One classifier walk plus one comment-start walk (EPH-I0153). The
+    // classifier's queries must ascend (types.zig assert), so the scan
+    // runs FORWARD and the last qualifying else wins. Pre-fix the scan
+    // walked backward with lastIndexOf: a later "else" inside a string
+    // or comment re-queried the classifier at an earlier position and
+    // panicked — `} else { const s = "} else {";` and the comment twin
+    // (EPH-I0980 probe, 2026-08-14).
     var cls = LineClassifier.init(t);
     const comment_start = findCommentStart(t);
-    var from = t.len;
-    while (mem.lastIndexOf(u8, t[0..from], "else")) |pos| {
-        from = pos;
+    var from: usize = 0;
+    var last: ?usize = null;
+    while (mem.indexOf(u8, t[from..], "else")) |rel| {
+        const pos = from + rel;
+        from = pos + 4;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos + 4 < t.len and isIdent(t[pos + 4])) continue;
         if (cls.isInsideString(pos)) continue;
@@ -27732,9 +27820,9 @@ fn elseKeywordPos(t: []const u8) ?usize {
         var k = pos;
         while (k > 0 and (t[k - 1] == ' ' or t[k - 1] == '\t')) k -= 1;
         if (k == 0 or t[k - 1] != '}') continue;
-        return pos;
+        last = pos;
     }
-    return null;
+    return last;
 }
 
 /// The arm's own region of an else-open line: the suffix after the
@@ -29659,9 +29747,20 @@ fn runFmtCheck(
             if (code != 0 and failure_hidden)
                 try reportFmtTermFailure(allocator, &issues, path, result);
         },
-        // A signal kill truncates the filename list, so the failure
-        // finding fires on top of any parsed names (ZR106 precedent).
-        .signal, .stopped, .unknown => try reportFmtTermFailure(allocator, &issues, path, result),
+        // A signal-killed child that still produced names truncates the
+        // list, so the failure finding fires on top of the parsed names
+        // (ZR106 precedent). A child killed before ANY output is the
+        // input-pathological class: zig fmt's own parser crashes (signal
+        // 11) on hostile single lines, deterministically and without
+        // output — the crash is not an ephor analysis result, and the
+        // finding is noise on such inputs (EPH-I0979). The empty list
+        // does not read as ran-clean for an actionable reason: the
+        // EPH-I0722 protection covers .exited failures (a missing path,
+        // syntax errors), which the user can fix; a crashed child cannot
+        // be fixed from ephor.
+        .signal, .stopped, .unknown => {
+            if (issues.items.len != 0) try reportFmtTermFailure(allocator, &issues, path, result);
+        },
     }
     return issues;
 }
@@ -38866,6 +38965,36 @@ test "fmtTermMessage falls back to the exit code without diagnostics" {
     const msg = try fmtTermMessage(allocator, .{ .exited = 2 }, "note: no error here\n");
     defer allocator.free(msg);
     try std.testing.expectEqualStrings("zig fmt exited with code 2 and no diagnostics", msg);
+}
+
+test "runFmtCheck stays silent when zig fmt crashes on a hostile line (EPH-I0979)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // zig fmt's own parser stack-overflows (signal 11) on a single
+    // line with 20K `or` keywords (~140 KB); the pinned 0.16.0
+    // toolchain crashes deterministically and prints nothing before
+    // the crash (probe 2026-08-14). The signal-killed child is not an
+    // ephor analysis result, so the fmt band reports no ZR104 — the
+    // EPH-I0722 empty-list protection stays on the .exited class (a
+    // missing path, syntax errors), which the user can fix.
+    // 20K tokens is 2x the measured 10K crash threshold.
+    const hostile_or_tokens = 20000;
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "fn hostile(n: usize) bool {\n    if (n>0 ");
+    for (0..hostile_or_tokens) |_| try content.appendSlice(allocator, "or n>0 ");
+    try content.appendSlice(allocator, ") return true;\n    return false;\n}\n");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hostile.zig", .data = content.items });
+    const path = try tmpFilePath(allocator, &tmp, "hostile.zig");
+    defer allocator.free(path);
+
+    var issues = try runFmtCheck(&diag, allocator, path);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 test "fmtTermMessage sanitizes hostile bytes in the error line" {
@@ -73895,6 +74024,64 @@ test "ZA901: decrement amount 1 under a zero-check exit stays silent (EPH-I0960)
     ) == 0);
 }
 
+test "ZA901/ZA903: bounded writes defeat the prior guard proof (EPH-I0978 doc-arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented coarse-defeat class (EPH-I0978): the shared defeat
+    // scan treats ANY guard-to-candidate write as breaking the proof,
+    // even a write that provably cannot introduce zero — a same-var
+    // increment (`m += 5`) or a bounded loop decrement (`while (m > 3)
+    // m -= 1;`, whose body keeps m >= 3). Both shapes are safe but
+    // FIRE by design: the bounded-write judgment needs per-write-site
+    // guard reachability the shared line walk does not carry. The pins
+    // assert the current verdict so a future mechanism change flips
+    // them loudly.
+    const content =
+        \\fn inc_then_dec(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    m += 5;
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn loop_preserves(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) return 0;
+        \\    while (m > 3) {
+        \\        m -= 1;
+        \\    }
+        \\    m -= 1;
+        \\    return m;
+        \\}
+        \\fn za903_loop_write(arr: []usize, m: usize) usize {
+        \\    if (m == 0) return 0;
+        \\    while (m > 3) { m -= 1; }
+        \\    return arr[m - 1];
+        \\}
+        \\fn za903_inc_write(arr: []usize, m: usize) usize {
+        \\    if (m == 0) return 0;
+        \\    m += 5;
+        \\    return arr[m - 1];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za9_coarse_defeat.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za9_coarse_defeat.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 2);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za9_coarse_defeat.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 2);
+}
+
 test "ZA903: compound range end binds the summed subtrahends (EPH-I0958)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -73948,6 +74135,159 @@ test "ZA903: compound range end binds the summed subtrahends (EPH-I0958)" {
         "test_za903_compound_mix.zig",
         RULE_INDEX_ARITHMETIC,
     ) == 1);
+}
+
+test "ZA903: non-decimal range-end subtrahends parse by base (EPH-I0977)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Pre-fix the digit scan stopped at the literal suffix (`0x1` as
+    // 0, `1_0` as 1), and the leftover suffix ("x1", "_0") made the
+    // compound tail check reject the range end as unclassifiable, so
+    // every non-decimal twin fired as unknowable regardless of n.
+    // The base-0 std parse owns the
+    // prefix and underscore semantics (EPH-I0977). The fire twins
+    // pin the parse: the fire-twin amounts exceed their witnesses
+    // (hex/bin/oct/mix by one; `1_0` = 10 exceeds n = 4 by six).
+    // `n - 0x2` with n = 2 is SILENT — 0x2 is 2 and 2 - 2 does not
+    // underflow (the issue text's fire expectation was an arithmetic
+    // slip; the n = 1 twin fires).
+    const content =
+        \\fn hex_ok(arr: []usize) usize {
+        \\    const n = 4;
+        \\    return arr[0 .. n - 0x1][0];
+        \\}
+        \\fn hex_fire(arr: []usize) usize {
+        \\    const n = 0;
+        \\    return arr[0 .. n - 0x1][0];
+        \\}
+        \\fn hex_upper_fire(arr: []usize) usize {
+        \\    const n = 0;
+        \\    return arr[0 .. n - 0X1][0];
+        \\}
+        \\fn hex2_ok(arr: []usize) usize {
+        \\    const n = 2;
+        \\    return arr[0 .. n - 0x2][0];
+        \\}
+        \\fn hex2_fire(arr: []usize) usize {
+        \\    const n = 1;
+        \\    return arr[0 .. n - 0x2][0];
+        \\}
+        \\fn us_ok(arr: []usize) usize {
+        \\    const n = 10;
+        \\    return arr[0 .. n - 1_0][0];
+        \\}
+        \\fn us_fire(arr: []usize) usize {
+        \\    const n = 4;
+        \\    return arr[0 .. n - 1_0][0];
+        \\}
+        \\fn us100_ok(arr: []usize) usize {
+        \\    const n = 100;
+        \\    return arr[0 .. n - 1_0_0][0];
+        \\}
+        \\fn bin_ok(arr: []usize) usize {
+        \\    const n = 5;
+        \\    return arr[0 .. n - 0b101][0];
+        \\}
+        \\fn bin_fire(arr: []usize) usize {
+        \\    const n = 4;
+        \\    return arr[0 .. n - 0b101][0];
+        \\}
+        \\fn oct_ok(arr: []usize) usize {
+        \\    const n = 15;
+        \\    return arr[0 .. n - 0o17][0];
+        \\}
+        \\fn oct_fire(arr: []usize) usize {
+        \\    const n = 14;
+        \\    return arr[0 .. n - 0o17][0];
+        \\}
+        \\fn mix_ok(arr: []usize) usize {
+        \\    const n = 16;
+        \\    return arr[0 .. n - 0x1_0][0];
+        \\}
+        \\fn mix_fire(arr: []usize) usize {
+        \\    const n = 15;
+        \\    return arr[0 .. n - 0x1_0][0];
+        \\}
+        \\fn compound_ok(arr: []usize) usize {
+        \\    const n = 11;
+        \\    return arr[0 .. n - 0x1 - 1_0][0];
+        \\}
+        \\fn compound_fire(arr: []usize) usize {
+        \\    const n = 10;
+        \\    return arr[0 .. n - 0x1 - 1_0][0];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_nondec.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_nondec.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 8);
+}
+
+test "ZA903: non-decimal index-form subtrahends bind the witness amount (EPH-I0977)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The index-form witness parser (extractIndexSubtraction) carried
+    // the same digits-only scan: `var i = 0` + `arr[i - 0x1]` bound
+    // {i, 0} and stayed silent (unsound FN), and `var i = 9` +
+    // `arr[i - 1_0]` bound {i, 1} (9 >= 1) and stayed silent against
+    // the true amount 10. Post-fix both fire, matching the decimal
+    // twins. The zero-check backstop controls: sub 1 is covered,
+    // sub 2 is not (EPH-I0977).
+    const content =
+        \\fn idx_loop_ok(arr: []usize) usize {
+        \\    var i = 2;
+        \\    var j = 0;
+        \\    while (j < 10) : (j += 1) {
+        \\        arr[i - 0x1];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn idx_loop_fire(arr: []usize) usize {
+        \\    var i = 0;
+        \\    var j = 0;
+        \\    while (j < 10) : (j += 1) {
+        \\        arr[i - 0x1];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn idx_us_fire(arr: []usize) usize {
+        \\    var i = 9;
+        \\    var j = 0;
+        \\    while (j < 10) : (j += 1) {
+        \\        arr[i - 1_0];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn idx_zero_ok(arr: []usize, n: usize) usize {
+        \\    if (n == 0) return 0;
+        \\    return arr[n - 0x1];
+        \\}
+        \\fn idx_zero_fire(arr: []usize, n: usize) usize {
+        \\    if (n == 0) return 0;
+        \\    return arr[n - 0x2];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_idx_nondec.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_idx_nondec.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 3);
 }
 
 test "ZA903: wrapped range end with an additive tail stays silent (EPH-I0958 r1)" {
@@ -74794,6 +75134,225 @@ test "ZA903: classic else-open skip survives a mid-line else above it (EPH-I0965
         "test_za903_classic_skip.zig",
         RULE_INDEX_ARITHMETIC,
     ) == 1);
+}
+
+test "ZA903: else-open line edges — string, comment, and ident-adjacent else (EPH-I0980)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else-keyword classifier must skip an `else` inside a string
+    // or comment and an ident-adjacent one (`xelse`, `elsewhere`), and
+    // still open the arm at the line's real `else`. Pre-fix a string
+    // or comment carrying `} else {` after the real keyword made the
+    // backward scan re-query the line classifier at an earlier
+    // position and PANICKED (ReleaseSafe assert); the arm candidate
+    // then never ran. All four arms run at n <= 1 and fire
+    // (EPH-I0980 probe, 2026-08-14).
+    const content =
+        \\fn else_str_trap(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { return arr[0]; } else { const s = "} else {";
+        \\        return arr[0 .. n - 2][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn else_cmt_trap(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { return arr[0]; } else { // } else {
+        \\        return arr[0 .. n - 2][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn else_xident(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { xelse(arr); } else {
+        \\        return arr[0 .. n - 2][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn else_elsewhere(arr: []usize, n: usize) usize {
+        \\    if (n > 1) { elsewhere(arr); } else {
+        \\        return arr[0 .. n - 2][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn xelse(v: []usize) void {}
+        \\fn elsewhere(v: []usize) void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_else_edges.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_else_edges.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 4);
+}
+
+test "ZA903: two-else chain opens the final arm; plain-span junk tail fires (EPH-I0980)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The last else keyword wins: the final `} else {` arm of a
+    // two-else chain runs at m <= 1 (both antecedents failed), so the
+    // m - 2 end fires. The plain-span trailing-junk tail (`k - 1 - 2 +
+    // 5`) makes the summed amount unknowable: no single witness covers
+    // the end, so it fires even with k = 20 (EPH-I0958 direction,
+    // EPH-I0980).
+    const content =
+        \\fn two_else_chain(arr: []usize, m: usize) usize {
+        \\    if (m > 1) {
+        \\        if (m > 1) { return arr[0]; } else { return arr[1]; }
+        \\    } else if (m > 1) { return arr[2]; } else {
+        \\        return arr[0 .. m - 2][0];
+        \\    }
+        \\    return arr[0];
+        \\}
+        \\fn junk_tail(arr: []usize) usize {
+        \\    const k = 20;
+        \\    return arr[0 .. k - 1 - 2 + 5][0];
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_else_chain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za903_else_chain.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 2);
+}
+
+test "ZA901: decrement in a mid-line else arm fires (EPH-I0980)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The mid-line else arm runs at m <= 1, so `m -= 1` underflows at
+    // m == 0. Pre-fix the CFG guard scan recorded the antecedent's
+    // guard (`m > 1`) as a LOCAL guard of the else-arm block and the
+    // decrement stayed silent (FN); the scan now reads only the arm's
+    // own region after the `else`. The foreign-var twin and the
+    // classic-else twin fire the same way (controls).
+    const content =
+        \\fn mid_same_var(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) { return 0; } else {
+        \\        m -= 1;
+        \\        return m;
+        \\    }
+        \\}
+        \\fn mid_foreign_var(x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (q > 1) { return 0; } else {
+        \\        m -= 1;
+        \\        return m;
+        \\    }
+        \\}
+        \\fn classic_else(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) {
+        \\        return 0;
+        \\    } else {
+        \\        m -= 1;
+        \\    }
+        \\    return m;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_else_dec_fire.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_else_dec_fire.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 3);
+}
+
+test "ZA901: chain-arm own condition guards a decrement past the opener walk (EPH-I0993)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else-if arm's own condition (`m > 3`) must guard the
+    // decrement below it. Pre-fix the arm region kept the whitespace
+    // after the `else` keyword, so the guard scan never recorded the
+    // chain arm's own condition and the decrement fired (FP); the
+    // region is now trimmed (EPH-I0993). The decrement sits 46 lines
+    // below the chain line — past the 40-line opener walk — so only
+    // the CFG guard meet can silence it; the filler makes the pin
+    // discriminating.
+    const content =
+        \\fn chain_arm(x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (m == 1) { return 0; } else if (m > 3) {
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        m -= 1;
+        \\        return m;
+        \\    }
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_chain_arm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_chain_arm.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
 }
 
 test "ZA903: maxInt comparison RHS cannot crash and saturates (EPH-I0964)" {

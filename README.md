@@ -444,6 +444,8 @@ discard high bits); its message names the real defect — silent data loss.
 
 **When to enable ZA9xx:** Before switching from `Debug` to `ReleaseFast` builds — in debug mode, integer overflow panics helpfully; in `ReleaseFast` it becomes undefined behavior. Also useful for security-sensitive or financial code where overflow = vulnerability.
 
+**ZA901/ZA903 guard-walk note:** the zero-check backstop is amount-aware, but a write between the guard and the candidate defeats the proof even when the write provably cannot introduce zero (for example `m += 5`, or a `while (m > 3) m -= 1;` loop before `m -= 1`). Judging those writes needs per-write-site guard reachability that the line walk cannot carry. The class is tracked in the Known False Positive Patterns table.
+
 ### Tests (ZT1xx)
 
 | Rule | Severity | Default | Description |
@@ -1150,6 +1152,7 @@ All limitations fall through to `.unknown`, which triggers vocab-based detection
 | Pattern | Rule | Root Cause | Status |
 |---------|------|------------|--------|
 | Arena allocator via `std.mem.Allocator` interface | ZA101/ZA103 | Type erasure — arena loses no-free semantics when passed as generic `Allocator` | Open (by design: type-based detection cannot resolve erased types) |
+| Write between the zero-check guard and the candidate | ZA901/ZA903 | The defeat scan treats any write as defeating the proof, even one that cannot introduce zero (`m += 5`, `while (m > 3) m -= 1;` before the decrement) | Open (by design: judging those writes needs per-write-site guard reachability the line walk cannot carry) |
 
 Note: Arena allocations through **struct field chains** (e.g., `self.arena.allocator().alloc(...)`) are correctly suppressed when the field is declared with a no-free allocator type like `std.heap.ArenaAllocator`. Only type-erased fields (declared as `std.mem.Allocator`) remain as known false positives.
 

@@ -328,7 +328,7 @@ An override that is not absolute or does not resolve prints a warning and falls 
 | **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
 | **ZA303** | warning | ON | Function has too many parameters (default: 4; counted across multi-line signatures) |
 | **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
-| **ZA305** | warning | OFF | Function has high cyclomatic complexity — McCabe CCN (default: 15) |
+| **ZA305** | warning | OFF | Function has high cyclomatic complexity — McCabe CCN (default: 10) |
 | **ZA306** | warning | OFF | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
 
 **Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they're metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they're compile-time unrolled.
@@ -337,7 +337,7 @@ An override that is not absolute or does not resolve prints a warning and falls 
 
 ### Cyclomatic Complexity (ZA305)
 
-McCabe's cyclomatic complexity counts independent execution paths. Every `if`, `while`, `for`, `switch`, `catch`, `try`, `orelse`, `and`, and `or` adds 1 to the count. Each `=>` switch arm also adds 1 to the count. A function with no branching has a CCN of 1. Default threshold: 15.
+McCabe's cyclomatic complexity counts independent execution paths. Every `if`, `while`, `for`, `switch`, `catch`, `try`, `orelse`, `and`, and `or` adds 1 to the count. Each `=>` switch arm also adds 1 to the count. A function with no branching has a CCN of 1. Default threshold: 10.
 
 ### Cognitive Complexity (ZA306)
 
@@ -345,7 +345,7 @@ Sonar-style cognitive complexity weights branches by nesting depth. An `if` at t
 
 ### Enabling ZA305 and ZA306
 
-ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306"` from the `"disable"` array in `ephor.json`, or add them to the `"enable"` array to explicitly enable them. The default thresholds are `max_cyclomatic: 15` and `max_cognitive: 15`; lower values are stricter.
+ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306"` from the `"disable"` array in `ephor.json`, or add them to the `"enable"` array to explicitly enable them. The default thresholds are `max_cyclomatic: 10` and `max_cognitive: 15`; lower values are stricter.
 
 ### Unused Code (ZA4xx)
 

@@ -748,7 +748,7 @@ pub const Thresholds = struct {
     max_branches: usize = 12,
     max_line_length: usize = 100,
     max_file_bytes: usize = 50_000,
-    max_cyclomatic: usize = 15,
+    max_cyclomatic: usize = 10, // McCabe-canonical default; unified complexity standard (EPH-I0992)
     max_cognitive: usize = 15,
 };
 

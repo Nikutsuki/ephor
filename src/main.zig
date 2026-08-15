@@ -32181,7 +32181,7 @@ fn writeDefaultConfig(io: std.Io) !void {
         \\    "max_params": 4,
         \\    "max_branches": 12,
         \\    "max_line_length": 100,
-        \\    "max_cyclomatic": 15,
+        \\    "max_cyclomatic": 10,
         \\    "max_cognitive": 15
         \\  }
         \\}
@@ -32405,7 +32405,7 @@ fn createInstallConfig(io: std.Io, allocator: Allocator, ver: []const u8) !void 
         \\    "max_params": 4,
         \\    "max_branches": 12,
         \\    "max_line_length": 100,
-        \\    "max_cyclomatic": 15,
+        \\    "max_cyclomatic": 10,
         \\    "max_cognitive": 15
         \\  }}
         \\}}
@@ -32941,7 +32941,7 @@ fn buildMissingKeysJson(allocator: Allocator, mig: MissingThresholdKeys) ![]u8 {
     try buf.append(allocator, '\n');
 
     const entries = [_]ThresholdKeyEntry{
-        .{ .present = mig.has_cyclo, .text = "\"max_cyclomatic\": 15" },
+        .{ .present = mig.has_cyclo, .text = "\"max_cyclomatic\": 10" },
         .{ .present = mig.has_cog, .text = "\"max_cognitive\": 15" },
     };
     var emitted_any = false;
@@ -34762,7 +34762,7 @@ fn printHelp() void {
         \\      "max_params": 4,
         \\      "max_branches": 12,
         \\      "max_line_length": 100,
-        \\      "max_cyclomatic": 15,
+        \\      "max_cyclomatic": 10,
         \\      "max_cognitive": 15,
         \\      "max_file_bytes": 50000
         \\    }
@@ -62079,7 +62079,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\{
         \\  "thresholds": {
         \\    "max_cognitive": 12,
-        \\    "max_cyclomatic": 15
+        \\    "max_cyclomatic": 10
         \\  }
         \\}
         ,
@@ -62115,7 +62115,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\{
         \\  "thresholds": {
         \\    "max_function_lines": 50,
-        \\    "max_cyclomatic": 15,
+        \\    "max_cyclomatic": 10,
         \\    "max_cognitive": 15
         \\  }
         \\}
@@ -62134,7 +62134,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\{
         \\  "thresholds": {
         \\    "max_function_lines": 50,
-        \\    "max_cyclomatic": 15,
+        \\    "max_cyclomatic": 10,
         \\    "max_cognitive": 15
         \\  }
         \\}
@@ -62150,7 +62150,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         .expected =
         \\{
         \\  "thresholds": {
-        \\  "max_cyclomatic": 15,
+        \\  "max_cyclomatic": 10,
         \\  "max_cognitive": 15
         \\}
         \\}
@@ -62248,7 +62248,7 @@ const missing_keys_cases = [_]MissingKeysCase{
         },
         .expected =
         \\,
-        \\    "max_cyclomatic": 15,
+        \\    "max_cyclomatic": 10,
         \\    "max_cognitive": 15
         ,
     },
@@ -62275,7 +62275,7 @@ const missing_keys_cases = [_]MissingKeysCase{
         },
         .expected =
         \\
-        \\  "max_cyclomatic": 15
+        \\  "max_cyclomatic": 10
         ,
     },
 };
@@ -70361,9 +70361,11 @@ test "ZA305: keyword-heavy trailing comment does not inflate CCN (EPH-I0226)" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // 14 real decision points (CCN 15, at the threshold). The trailing
-    // comment added 4 phantom points pre-fix (raw 19) and fired ZA305.
-    // The nested chain keeps the fn out of the flat-chain 2x multiplier.
+    // 14 real decision points (CCN 15). The threshold is pinned
+    // explicitly at 15: this test pins comment-inflation, not the
+    // default threshold (10 since EPH-I0992). The trailing comment
+    // added 4 phantom points pre-fix (raw 19) and fired ZA305. The
+    // nested chain keeps the fn out of the flat-chain 2x multiplier.
     const code =
         \\fn commentInflated(x: u32) u32 {
         \\    if (x == 1) {
@@ -70394,7 +70396,8 @@ test "ZA305: keyword-heavy trailing comment does not inflate CCN (EPH-I0226)" {
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "comment.zig"), {});
 
-    var issues = try analyzeComplexity(allocator, &graph, .{});
+    const th = Thresholds{ .max_cyclomatic = 15 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
     defer deinitIssues(&issues, allocator);
     try expectNoCyclomaticWarnings(issues.items, "comment.zig");
 }
@@ -70981,7 +70984,7 @@ test "ZA305: 5-decision-point function no warning at default threshold" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // 5 decision points (4 if + 1 while) → CCN = 6, below default 15
+    // 5 decision points (4 if + 1 while) → CCN = 6, below default 10
     const code =
         \\fn moderate(x: u32) u32 {
         \\    if (x == 0) return 1;
@@ -71179,7 +71182,7 @@ test "ZA305: try and catch contribute to cyclomatic" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // 3 try + 1 catch = 4 decision points, CCN = 5, below 15
+    // 3 try + 1 catch = 4 decision points, CCN = 5, below default 10
     const code =
         \\fn load() !void {
         \\    try open();
@@ -71276,7 +71279,7 @@ test "ZA305/ZA306: switch arms count as decision points" {
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "switch.zig"), {});
 
-    // 16 switch arms + 1 switch = 17 decision points; threshold 15 should fire ZA305
+    // 16 switch arms + 1 switch = 17 decision points; threshold 10 should fire ZA305
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
 

@@ -668,6 +668,10 @@ const cf_patterns = [_]CFPatternEntry{
     .{ .prefix = "} else if", .exact = false, .result = .else_if },
     .{ .prefix = "} else", .exact = false, .result = .else_start },
     // Line-start else-if (close on previous line); word-delimited like if/if(
+    // A bare `else if` line (condition on a later line, Allman style)
+    // carries no trailing token; the exact entry catches it before the
+    // spaced and paren forms (EPH-I0323, band-B01a F8).
+    .{ .prefix = "else if", .exact = true, .result = .else_if },
     .{ .prefix = "else if ", .exact = false, .result = .else_if },
     .{ .prefix = "else if(", .exact = false, .result = .else_if },
     .{ .prefix = "else {", .exact = true, .result = .else_start },
@@ -690,7 +694,8 @@ const cf_patterns = [_]CFPatternEntry{
     .{ .prefix = "}", .exact = true, .result = .block_end },
 };
 
-/// Detect control flow pattern on a line
+/// True for a catch line whose braces stay open; the unbalanced shape
+/// then classifies as a catch block opener.
 fn isUnbalancedCatchBlock(trimmed: []const u8) bool {
     if (mem.indexOf(u8, trimmed, "catch ") == null) return false;
     if (mem.indexOf(u8, trimmed, "{") == null) return false;
@@ -772,6 +777,8 @@ fn isArmHeaderLine(t: []const u8) bool {
     return true;
 }
 
+/// Detect the control-flow pattern of a trimmed line; first table match
+/// wins, and non-control lines fall through to the catch and prong tests.
 fn detectCFPattern(t: []const u8) CFPattern {
     const trimmed = mem.trim(u8, t, " \t\r");
 
@@ -1447,6 +1454,8 @@ const CFGBuildCtx = struct {
         return line_scan.out;
     }
 
+    /// Open a conditional branch: the true and false paths model
+    /// conditional execution, so fills inside the body stay conditional.
     fn handleBranch(self: *CFGBuildCtx, bt: BlockType, t: []const u8, line: usize) !void {
         const true_block = try self.cfg.addBlock();
         const false_block = try self.cfg.addBlock();
@@ -1472,6 +1481,8 @@ const CFGBuildCtx = struct {
         self.setStartLine(line);
     }
 
+    /// Mark the current block as a return exit; no fall-through edge
+    /// leaves it.
     fn handleReturn(self: *CFGBuildCtx) !void {
         self.cfg.blocks.items[self.current_block].is_return = true;
         try self.cfg.exit_blocks.append(self.allocator, self.current_block);
@@ -1526,6 +1537,8 @@ const CFGBuildCtx = struct {
         }
     }
 
+    /// Open a switch entry; every arm branches from the current header
+    /// block, and arm closes fall into the entry's merge.
     fn handleSwitchStart(self: *CFGBuildCtx) !void {
         const merge_block = try self.cfg.addBlock();
         try self.block_stack.append(self.allocator, .{
@@ -1535,18 +1548,24 @@ const CFGBuildCtx = struct {
         });
     }
 
+    /// Open an arm of the innermost switch: branch from its header and
+    /// record the arm span. The stack scan runs top-down, so an arm of a
+    /// switch nested inside another arm wires to its own header and merge,
+    /// never to the outer switch (EPH-I0318, band-B01a F3).
     fn handleSwitchArm(self: *CFGBuildCtx, code: []const u8, line: usize) !void {
-        for (self.block_stack.items, 0..) |entry, i| {
+        var i = self.block_stack.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.block_stack.items[i];
             if (entry.block_type != .switch_block) continue;
-            const switch_entry = self.block_stack.items[i];
-            const switch_header = switch_entry.catch_origin_block;
+            const switch_header = entry.catch_origin_block;
             // A jump-terminal arm (break/continue) already wired its exit —
             // it does not fall into the switch merge (EPH-I0094).
             if (self.current_block != switch_header and
                 !self.cfg.blocks.items[self.current_block].is_return and
                 !self.cfg.blocks.items[self.current_block].is_jump_terminal)
             {
-                try self.cfg.addEdge(self.current_block, switch_entry.merge_block, .sequential);
+                try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
             }
             const arm_block = try self.cfg.addBlock();
             try self.cfg.addEdge(switch_header, arm_block, .branch_true);
@@ -1564,7 +1583,7 @@ const CFGBuildCtx = struct {
                 .end_col = code.len,
                 .block = arm_block,
             });
-            break;
+            return;
         }
     }
 
@@ -1670,32 +1689,19 @@ const CFGBuildCtx = struct {
         // A jump-terminal body (break/continue) already wired its exit, so
         // no fall-through edge leaves it (EPH-I0094).
         const terminal = self.cfg.blocks.items[self.current_block].is_jump_terminal;
-        switch (entry.block_type) {
-            .catch_block => {
-                if (!terminal and !self.cfg.blocks.items[self.current_block].is_return)
-                    try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
-                self.current_block = entry.merge_block;
-                self.setStartLine(line + 1);
-            },
-            .while_block, .for_block => {
-                if (!terminal)
-                    try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
-                self.current_block = entry.merge_block;
-                self.setStartLine(line + 1);
-            },
-            .switch_block => {
-                if (!terminal and !self.cfg.blocks.items[self.current_block].is_return)
-                    try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
-                self.current_block = entry.merge_block;
-                self.setStartLine(line + 1);
-            },
-            else => {
-                if (!terminal)
-                    try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
-                self.current_block = entry.merge_block;
-                self.setStartLine(line + 1);
-            },
+        if (isLoopBlock(entry.block_type)) {
+            if (!terminal)
+                try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
+        } else {
+            // A return-terminal body exits too; only catch and switch
+            // bodies can carry one here, because the inline-return else
+            // pushes no entry and a virtual else body is a single
+            // statement that never sets the return flag (EPH-I0322).
+            if (!terminal and !self.cfg.blocks.items[self.current_block].is_return)
+                try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
         }
+        self.current_block = entry.merge_block;
+        self.setStartLine(line + 1);
     }
 
     /// Close the top entry; an if/else close defers its merge wiring into
@@ -1834,6 +1840,8 @@ const CFGBuildCtx = struct {
         self.setStartLine(line);
     }
 
+    /// Route a line pattern to its CFG handler; patterns that neither
+    /// open nor pop change nothing in the graph.
     fn dispatchPattern(self: *CFGBuildCtx, pattern: CFPattern, t: []const u8, line: usize) !void {
         switch (pattern) {
             .if_start => try self.handleBranch(.if_block, t, line),
@@ -2053,10 +2061,18 @@ const CFGBuildCtx = struct {
             .close_control, .close_virtual => {
                 try self.closeBodyMarkers(event);
                 if (walk.record_arms) try self.recordArmSpan(walk, event);
-                if (next_is_else) return;
+                if (next_is_else) return self.finishDeferredBeforeElse(walk.line);
                 try self.handleBlockEndOrDefer(walk.line);
             },
         }
+    }
+
+    /// Finish a deferral left by an earlier same-line close before an else
+    /// keyword claims the entry a skipped close would pop (`} } else {`).
+    /// A single close before the else defers nothing, so the null check
+    /// keeps the call a no-op there (EPH-I0317, band-B01a F1).
+    fn finishDeferredBeforeElse(self: *CFGBuildCtx, line: usize) !void {
+        if (self.pending_else != null) try self.finishPendingElse(line);
     }
 
     /// Consume same-line body classifications at a close event: a virtual
@@ -2119,6 +2135,8 @@ fn elseChainsIntoIf(t: []const u8) bool {
     return after_else.len == 2 or !isIdent(after_else[2]);
 }
 
+/// Build the control-flow graph for one function body; the caller owns
+/// the returned graph and frees it with deinit.
 fn buildCFG(
     allocator: Allocator,
     func_name: []const u8,
@@ -2743,6 +2761,8 @@ fn isElementWriteThrough(after: []const u8) bool {
     return false;
 }
 
+/// True when the occurrence is the write target; a write does not read
+/// the old value.
 fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
     if (pos + name.len >= t.len) return false;
     const after = t[pos + name.len ..];
@@ -2821,8 +2841,7 @@ fn getBlockPredecessors(
     return preds;
 }
 
-/// Check if a variable has an unconditional fill before any use
-/// Returns true if filled before use, false if used first or no fill found
+/// True when the trimmed line starts an if or else construct.
 fn isConditionalStart(check_line: []const u8) bool {
     return mem.startsWith(u8, check_line, "if ") or
         mem.startsWith(u8, check_line, "if(") or
@@ -2881,6 +2900,8 @@ fn declInitializerStart(t: []const u8) ?usize {
     return null;
 }
 
+/// True when the line reads the var; declarations, fills, and assignment
+/// targets do not read it.
 fn isRealUseOfVar(check_line: []const u8, name: []const u8) bool {
     // Decl lines: the LHS name is the declaration, not a read — only RHS
     // occurrences after the `=` read the var (EPH-I0101).
@@ -3242,6 +3263,8 @@ const CondNesting = struct {
     }
 };
 
+/// True when a fill of the var runs before any use on every path.
+/// A genuine read before the fill ends the scan with false.
 fn hasUnconditionalFillBeforeUse(
     lines: []const []const u8,
     start_idx: usize,
@@ -51367,6 +51390,52 @@ test "buildCFG: switch nested in switch arm keeps both switches on the stack" {
     try std.testing.expect(cfgHasEdge(&cfg, header, else_arm.?, .branch_true));
 }
 
+test "buildCFG: nested int prongs branch from the inner switch header (EPH-I0318)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: u8, b: u8) void {", // 1
+        "    var x: u8 = undefined;", // 2
+        "    switch (a) {", // 3: outer header
+        "        1 => {", // 4: outer arm
+        "            switch (b) {", // 5: inner header
+        "                10 => { x = 1; },", // 6: inner arm
+        "                _ => { x = 2; },", // 7: inner arm
+        "            }", // 8
+        "        },", // 9
+        "        _ => { x = 3; },", // 10
+        "    }", // 11
+        "    use(x);", // 12
+        "}", // 13
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // The inner arm must branch from the inner header (the block holding
+    // line 5), and the outer header must source no edge to it. The
+    // innermost-first stack scan in handleSwitchArm is the mechanism the
+    // ZA607 nested-prong pin observes only through its downstream verdict
+    // (EPH-I0318, band-B01a F3). The outer arm block's range covers line
+    // 6 too, so findBlockForLine cannot name the arm; identify it by
+    // start_line, the idiom the nested-switch test above uses.
+    const outer_header = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
+    const inner_header = findBlockForLine(&cfg, 5) orelse return error.TestUnexpectedResult;
+    var outer_arm: ?usize = null;
+    var inner_arm: ?usize = null;
+    for (cfg.blocks.items, 0..) |block, i| {
+        if (block.start_line == 4) outer_arm = i;
+        if (block.start_line == 6) inner_arm = i;
+    }
+    try std.testing.expect(outer_arm != null);
+    try std.testing.expect(inner_arm != null);
+    try std.testing.expect(cfgHasEdge(&cfg, inner_header, inner_arm.?, .branch_true));
+    try std.testing.expect(!cfgHasEdge(&cfg, outer_header, inner_arm.?, .branch_true));
+    try std.testing.expect(cfgHasEdge(&cfg, outer_header, outer_arm.?, .branch_true));
+}
+
 // ============================================================================
 // CFG ordered per-line event tests (EPH-I0079 A2)
 // ============================================================================
@@ -51713,6 +51782,45 @@ test "buildCFG: multi-line else-if chain pairs each close with its else" {
     try std.testing.expect(cfgHasEdge(&cfg, j_block, i_block, .sequential));
 }
 
+test "buildCFG: bare Allman else-if line opens the chain (EPH-I0323)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a) {", // 2
+        "        g();", // 3
+        "    }", // 4: lone close defers the if entry
+        "    else if", // 5: bare else-if line, condition on the next line
+        "    (b) { h(); }", // 6
+        "    i();", // 7
+        "}", // 8
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // The exact `else if` pattern claims the deferred close, so the chain
+    // opens: the else body becomes the new condition header with a true
+    // arm and a false fallthrough (pre-fix the bare line matched nothing,
+    // the deferred close finished as no-else, and the chain vanished —
+    // band-B01a F8).
+    const entry = cfg.entry_block;
+    const elseif_header = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    const arm = cfgSucc(&cfg, elseif_header, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const fallthrough = cfgSucc(&cfg, elseif_header, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(arm, findBlockForLine(&cfg, 6));
+    // The arm and the fallthrough join one merge that holds the line after
+    // the chain.
+    const merge = findBlockForLine(&cfg, 7) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, arm, merge, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, fallthrough, merge, .sequential));
+}
+
 test "buildCFG: two closes on one line preserve the inner merge wiring (EPH-I0091)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -51746,6 +51854,88 @@ test "buildCFG: two closes on one line preserve the inner merge wiring (EPH-I009
     try std.testing.expect(cfgHasEdge(&cfg, inner_body, inner_merge, .sequential));
     const h_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cfgHasEdge(&cfg, inner_merge, h_block, .sequential));
+}
+
+test "buildCFG: text between two same-line closes keeps the inner fall-through (EPH-I0317)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a) {", // 2
+        "        if (b) {", // 3
+        "            g();", // 4
+        "        } h(); }", // 5: close, text, close on one line
+        "    i();", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // The first close defers the inner entry, and the text between the
+    // closes keeps the deferral pending. The second close then hits the
+    // EPH-I0091 finish-before-overwrite guard in handleBlockEndOrDefer,
+    // which wires the inner body into the inner merge before it claims
+    // the slot. This line has no else keyword, so finishDeferredBeforeElse
+    // never runs here; the pin guards the interleaved-text variant the
+    // two-closes-one-line EPH-I0091 test lacks.
+    const entry = cfg.entry_block;
+    const outer_true = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const inner_body = cfgSucc(&cfg, outer_true, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const inner_merge = cfgSucc(&cfg, outer_true, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, inner_body, inner_merge, .sequential));
+    const i_block = findBlockForLine(&cfg, 6) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, inner_merge, i_block, .sequential));
+}
+
+test "buildCFG: else after two same-line closes pairs with the outer entry (EPH-I0317)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(a: bool, b: bool) void {", // 1
+        "    if (a) {", // 2
+        "        if (b) {", // 3
+        "            g();", // 4
+        "        } } else {", // 5: both closes and the else on one line
+        "            h();", // 6
+        "        }", // 7
+        "    i();", // 8
+        "}", // 9
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // The second close precedes the else keyword, so the walk skips it and
+    // the else must claim the entry THAT close would have popped — the
+    // outer if. The deferred inner entry is finished first (pre-fix: the
+    // else claimed the inner deferral, the outer entry lingered, and the
+    // inner body never wired its fall-through — band-B01a F1).
+    const entry = cfg.entry_block;
+    const outer_true = cfgSucc(&cfg, entry, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const inner_body = cfgSucc(&cfg, outer_true, .branch_true) orelse
+        return error.TestUnexpectedResult;
+    const inner_merge = cfgSucc(&cfg, outer_true, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    // The first entry's fall-through edge survives the else claim.
+    try std.testing.expect(cfgHasEdge(&cfg, inner_body, inner_merge, .sequential));
+    // The else body sits on the entry's false edge and owns the h(); line.
+    const else_body = cfgSucc(&cfg, entry, .branch_false) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(else_body, findBlockForLine(&cfg, 6));
+    // The true path (through the inner merge) and the else path join one
+    // merge that holds the line after the construct.
+    const merge = findBlockForLine(&cfg, 8) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cfgHasEdge(&cfg, inner_merge, merge, .sequential));
+    try std.testing.expect(cfgHasEdge(&cfg, else_body, merge, .sequential));
 }
 
 test "buildCFG: Allman else brace after same-line if is a control open (EPH-I0089)" {
@@ -52593,6 +52783,38 @@ test "ZA607: while-body fill alone does not cover the zero-trip path" {
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_while_body.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: no-space while header keeps the body fill conditional (EPH-I0320)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // isLoopStart must see the no-space `while(` form, or the fill-before-
+    // use filter treats the loop as a plain statement and the body fill as
+    // unconditional, so the zero-trip read stays silent (band-B01a F5).
+    // detectCFPattern already accepts the no-space form; the fill scan
+    // must stay in step.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn whileNoSpace(i: u32) void {
+        \\    var x: u32 = undefined;
+        \\    while(i < 3) : (i += 1) {
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_nospace.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_while_nospace.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -59102,18 +59324,19 @@ test "ZA607: arrow text inside an arm string stays silent (EPH-I0679)" {
     );
 }
 
-test "ZA607: nested int prongs pin the outer-switch attachment (EPH-I0679)" {
+test "ZA607: nested int prongs wire to the inner switch header (EPH-I0318)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Pins the documented approximation of EPH-I0318: handleSwitchArm scans
-    // the block stack outermost-first, so the inner switch's integer prongs
-    // attach as arm blocks to the OUTER switch header. Every path fills x,
-    // so the correct verdict is 0. The approximation flags 1 (a phantom
-    // path from the outer header reaches the merge unfilled). The I0318
-    // fix (innermost-first scan) must flip this pin deliberately.
+    // handleSwitchArm scans the block stack innermost-first, so the inner
+    // switch's integer prongs attach as arm blocks to the INNER header
+    // (EPH-I0318, band-B01a F3). Every path fills x, so the correct
+    // verdict is 0. Pre-fix the scan took the outermost entry: the inner
+    // arms branched from the outer header, and a phantom path from the
+    // outer header reached the merge unfilled, flagging 1 (pinned here
+    // as the approximation until the fix landed).
     const content =
         \\fn use(v: u8) void {
         \\    _ = v;
@@ -59136,7 +59359,7 @@ test "ZA607: nested int prongs pin the outer-switch attachment (EPH-I0679)" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        1,
+        0,
         countRuleIssues(run.issues.items, "da_i0679_nested.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }

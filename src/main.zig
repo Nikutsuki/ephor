@@ -6763,6 +6763,16 @@ fn analyzeCFGMemorySafety(
     );
     defer allocs.deinit();
     if (allocs.count() == 0) return issues;
+    // Allocation-count cap: each allocation re-scans the whole body, so an
+    // over-cap function costs the family minutes (EPH-I0350).
+    if (try overAllocCapEmitsNote(.{
+        .a = allocator,
+        .out = &issues,
+        .file_path = body.file_path,
+        .func_line = body.func_line,
+        .rule = RULE_USE_AFTER_FREE,
+        .cap_noun = mem_alloc_cap_noun,
+    }, allocs.count())) return issues;
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
@@ -6863,7 +6873,15 @@ fn collectAliases(
 /// flowed in. hasDirectReassignment also matches an initializer declaration
 /// (`const buf = try alloc(...)`), which is what lets a per-iteration
 /// binding inside a loop body reset the state on every pass.
-const BlockFreeOp = enum { preserves, sets, resets };
+/// cond_sets marks a free that runs on some paths through the block only:
+/// the free sits on or inside a switch arm of an inline switch expression,
+/// whose arms share the enclosing CFG block. The def lattice must not read
+/// it as a definite free, so cond_sets preserves def and sets may
+/// (EPH-I0356, band-B02 F16 arm-state leak). The arm-block carve-out keeps
+/// plain .sets for statement-form switch arms: their blocks carry one arm's
+/// path, so a free there is definite on that path and the merge meet
+/// combines the arms.
+const BlockFreeOp = enum { preserves, sets, resets, cond_sets };
 
 /// Per-block free tracking state for memory safety analysis. The entry/exit
 /// arrays hold the propagated fixpoint (EPH-I0676): def_* is the MUST
@@ -6948,6 +6966,10 @@ fn collectMemSafetyAllocs(
     };
 
     var allocs = std.StringHashMap(CFGAllocation).init(allocator);
+    // The map has no self-owning defer: a put failure after earlier
+    // successful puts would drop the storage of the entries already
+    // inserted (OOM-path leak, EPH-I0895 sweep; B45-1).
+    errdefer allocs.deinit();
     // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
     var join_buf: [max_join_bytes]u8 = undefined;
     for (lines, 0..) |_, idx| {
@@ -7226,6 +7248,21 @@ fn computeCaptureShadowedLines(
     return shadowed;
 }
 
+/// The free op for a block free at free_line (EPH-I0356): a statement-form
+/// switch arm block keeps .sets — its paths run one arm, so the free is
+/// definite on that path and the merge meet combines the arms. A free
+/// inside an inline-switch arm region of a shared block is conditional:
+/// the def lattice must not claim it, or post-join uses grade err on the
+/// sibling-arm paths that never freed. A plain block free stays definite.
+fn freeOpForFree(scan: *const VarFreeCtx, block: BasicBlock, free_line: usize) BlockFreeOp {
+    if (block.start_line > 0 and block.start_line <= block.end_line and
+        isArmHeaderLine(mem.trim(u8, scan.lines[block.start_line - scan.func_line], " \t\r")))
+        return .sets;
+    if (freeArmRegion(scan.lines, scan.func_line, block.start_line, free_line) != null)
+        return .cond_sets;
+    return .sets;
+}
+
 fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
     var r = BlockScanResult{};
     // Join buffer for zig-fmt wrapped frees: the argument of a wrapped
@@ -7251,7 +7288,7 @@ fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResul
         {
             r.free_seen = true;
             r.free_line = ln;
-            r.op = .sets;
+            r.op = freeOpForFree(scan, block, ln);
         } else if (hasDirectReassignment(t, scan.var_name)) {
             // A rebind hands a live state to the block's successors: the
             // var points at new memory, not the freed allocation.
@@ -7274,6 +7311,17 @@ const FreedMeet = struct { def: bool, may: bool };
 /// the targeted vote in loopCarriedFreeVote, not general back-edge flow —
 /// general flow conflates per-iteration rebinds with the tracked binding.
 /// A block with no counted forward pred is not definitely freed.
+///
+/// Unequal-path joins keep both verdicts (EPH-I0354, band-B02 F14): a free
+/// on one predecessor only drops neither lattice — def stays false while
+/// may stays true, so the downstream use grades the conditional warning
+/// (EPH-I0345) instead of vanishing or reading as definite. The
+/// "maybe freed reads as freed" FP (EPH-I0355) cannot fire: may gates the
+/// warning grade only, and the err grade requires the def meet.
+/// The loop-back skip is the EPH-I0358 accepted-FN class: a re-entered
+/// loop never widens the header entry from the carried free, so a use
+/// before a free in the loop body stays silent on iteration 2+ (pinned by
+/// "ZA105: use before free in a loop body stays silent (EPH-I0676)").
 fn meetFreedPreds(
     cfg: *const ControlFlowGraph,
     bstate: *const BlockFreeState,
@@ -7296,11 +7344,16 @@ fn meetFreedPreds(
     return .{ .def = has_forward_pred and def, .may = may };
 }
 
-fn applyFreeOp(op: BlockFreeOp, entry: bool) bool {
+/// Apply one block op to a lattice entry state. The two lattices push the
+/// same op but with different entry semantics: def asks whether every path
+/// frees (cond_sets cannot answer yes), may asks whether some path frees
+/// (cond_sets answers yes). EPH-I0356.
+fn applyFreeOp(op: BlockFreeOp, entry: bool, may_lattice: bool) bool {
     return switch (op) {
         .preserves => entry,
         .sets => true,
         .resets => false,
+        .cond_sets => may_lattice or entry,
     };
 }
 
@@ -7309,8 +7362,8 @@ fn applyFreeOp(op: BlockFreeOp, entry: bool) bool {
 /// when either lattice changed.
 fn updateFreeEntry(cfg: *const ControlFlowGraph, bstate: *BlockFreeState, bid: usize) bool {
     const meet = meetFreedPreds(cfg, bstate, bid);
-    const new_def_exit = applyFreeOp(bstate.free_op[bid], meet.def);
-    const new_may_exit = applyFreeOp(bstate.free_op[bid], meet.may);
+    const new_def_exit = applyFreeOp(bstate.free_op[bid], meet.def, false);
+    const new_may_exit = applyFreeOp(bstate.free_op[bid], meet.may, true);
     if (bstate.def_freed_entry[bid] == meet.def and
         bstate.def_freed_exit[bid] == new_def_exit and
         bstate.may_freed_entry[bid] == meet.may and
@@ -7412,13 +7465,16 @@ fn hasElseOrOrelseMarker(t: []const u8) bool {
 /// paired with a prong-body free of the same var. EPH-I0806: the
 /// indent-blind else/orelse clause suppressed a dominating free paired
 /// with a later free across a nested `} else {` or `} orelse {`). The
-/// `=>` clause counts arm-header lines only: an inline switch expression
-/// between the frees carries real arrows, but its arms are expression data
-/// and cannot separate statements that dominate the switch (EPH-I0062
-/// probe13). Comments and string literals never fabricate either marker
-/// class (EPH-I0342). An arm header that merely sits between the two frees
-/// at a shallow-enough indent still suppresses (accepted FN, same class as
-/// hasSwitchArmBetween's documented hole). Textual and fail-open toward
+/// `=>` clause counts arm-header lines whose arm contains the second free
+/// (armHeaderSeparates): an inline switch expression between the frees
+/// carries real arrows, but its arms are expression data and cannot
+/// separate statements that dominate the switch (EPH-I0062 probe13), and a
+/// post-join free past the switch close is not inside any arm (EPH-I0356,
+/// band-B02 F3 residual). Comments and string literals never fabricate
+/// either marker class (EPH-I0342). An arm header that merely sits between
+/// the two frees at a shallow-enough indent while the second free is
+/// itself another construct's arm header still suppresses (accepted FN,
+/// the any-switch-text-between class). Textual and fail-open toward
 /// reporting: out-of-range endpoints yield no separator.
 fn hasExclusiveBranchBetween(
     lines: []const []const u8,
@@ -7439,14 +7495,16 @@ fn hasExclusiveBranchBetween(
         if (countIndent(lines[idx]) > min_indent) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (hasElseOrOrelseMarker(t)) return true;
-        if (isArmHeaderLine(t)) return true;
+        if (isArmHeaderLine(t) and armHeaderSeparates(lines, func_line, ln, to_line))
+            return true;
     }
     return false;
 }
 
 /// Indent-aware exclusivity guard for use-after-free (EPH-I0010): true when a
 /// `=>` arm header in the free..use span sits at an indent no deeper than
-/// both statements — i.e. the two sit in mutually exclusive switch arms.
+/// both statements AND the use sits inside that header's arm — i.e. the two
+/// sit in mutually exclusive switch arms (armHeaderSeparates containment).
 /// Mirror of ZA106's hasSwitchArmBetween discipline. Arm headers nested
 /// DEEPER than either statement do not separate them: switch-expression arms
 /// (F1) and a switch whose join precedes the use (F2) are not exclusive
@@ -7456,10 +7514,29 @@ fn hasExclusiveBranchBetween(
 /// position of an outer switch is the exception: the line is a genuine arm
 /// header, but isArmHeaderLine misses the outer arrow and the pair still
 /// fires (EPH-I0834 residual, zero corpus occurrences). Textual and
-/// fail-open toward reporting: a genuine arm header that merely sits between
-/// free and use at a shallow-enough indent still suppresses (accepted FN —
-/// same class as hasSwitchArmBetween's documented hole; pinned by the
-/// EPH-I0062 residual test).
+/// fail-open toward reporting: an arm header that merely sits between free
+/// and use at a shallow-enough indent suppresses only when the use sits
+/// inside its arm (armHeaderSeparates); the use-on-a-later-arm-header-line
+/// geometry keeps suppressing (accepted FN — the any-switch-text-between
+/// class, pinned by the EPH-I0356 residual test).
+///
+/// The probe's six known evasion/limitation shapes and their disposition
+/// (EPH-I0353, band-B02 audit answer 2): (1) a comment line carrying
+/// `=>` or `} else {` between the statements — masked by the
+/// code-position scans (hasElseOrOrelseMarker, findProngArrow, EPH-I0342),
+/// pinned by the ZA106 comment/string separator tests; (2) a trailing
+/// comment on the second statement's own line — masked the same way,
+/// pinned by "trailing `=>` comment on the second free does not separate";
+/// (3) a string literal carrying the tokens — masked (LiteralState),
+/// pinned by the ZA105/ZA106 string-token tests; (4) an inline-arm free
+/// self-matching its own header — the span excludes the first statement's
+/// own line (EPH-I0343), pinned by "inline-arm free then direct post-join
+/// use fires"; (5) any genuine switch text merely sitting between the
+/// statements with the use on a later arm-header line — accepted FN,
+/// pinned by the EPH-I0356 residual test; (6) the
+/// conditional-free-without-return shape (band-B02 F5) — a
+/// may-reach free now grades warning (EPH-I0345) instead of going silent,
+/// pinned by "free on one path then use is a conditional use-after-free".
 fn hasExclusiveArmBetween(
     lines: []const []const u8,
     func_line: usize,
@@ -7476,6 +7553,91 @@ fn hasExclusiveArmBetween(
         .second = use_line,
         .min_indent = min_indent,
     });
+}
+
+/// Column of the `{` that opens a braced arm body after the prong arrow on
+/// an arm-header line, or null when the arm opens no brace group (its body
+/// is the single expression on the header line). The column is on the
+/// TRIMMED line, matching braceGroupEndLine's internal trim. The brace
+/// sits at a code position, so a `{` inside a string or comment never
+/// opens a body.
+fn armBodyOpenCol(t: []const u8) ?usize {
+    const trimmed = mem.trim(u8, t, " \t\r");
+    const arrow = findProngArrow(trimmed) orelse return null;
+    var lit = types.LiteralState.forLine(trimmed) orelse return null;
+    var i = arrow + 1;
+    while (i < trimmed.len) : (i += 1) {
+        if (lit.updateForChar(trimmed, i) == null) continue;
+        if (trimmed[i] == '{') return i;
+    }
+    return null;
+}
+
+/// True when the arm whose header sits at `header_line` separates the
+/// statement pair (first, second): the second statement is the arm's own
+/// expression (it sits on the header line itself) or lies inside the arm's
+/// braced body. A non-braced arm's region is its header line alone. An arm
+/// header that merely precedes the second statement without containing it —
+/// the switch closed and the statement runs after the join — never
+/// separates the pair: the post-join statement is reachable after every
+/// arm, including the free's (EPH-I0356, band-B02 F3 residual).
+fn armHeaderSeparates(
+    lines: []const []const u8,
+    func_line: usize,
+    header_line: usize,
+    second_line: usize,
+) bool {
+    if (header_line == second_line) return true;
+    if (header_line < func_line or second_line <= header_line) return false;
+    const h_idx = header_line - func_line;
+    if (h_idx >= lines.len) return false;
+    const open_col = armBodyOpenCol(lines[h_idx]) orelse return false;
+    const close_idx = braceGroupEndLine(lines, h_idx, open_col) orelse return false;
+    const s_idx = second_line - func_line;
+    return s_idx <= close_idx;
+}
+
+/// The line span of the switch arm whose execution can run the free at
+/// free_line, or null when the free is not arm-conditional: its line is not
+/// an arm header and no arm-header line at a strictly shallower indent
+/// opens a brace group that contains it. The span runs from the arm header
+/// line through its brace-group close (the header line itself for a
+/// non-braced arm). A use inside the span shares the free's arm (definite
+/// on the taken path); a use past it runs after the arm's join (conditional,
+/// EPH-I0356).
+fn freeArmRegion(
+    lines: []const []const u8,
+    func_line: usize,
+    block_start: usize,
+    free_line: usize,
+) ?BodyExtent {
+    if (free_line < func_line) return null;
+    const f_idx = free_line - func_line;
+    if (f_idx >= lines.len) return null;
+    if (isArmHeaderLine(mem.trim(u8, lines[f_idx], " \t\r"))) {
+        const open_col = armBodyOpenCol(lines[f_idx]) orelse
+            return .{ .first = free_line, .last = free_line };
+        const close_idx = braceGroupEndLine(lines, f_idx, open_col) orelse
+            return .{ .first = free_line, .last = free_line };
+        return .{ .first = free_line, .last = func_line + close_idx };
+    }
+    // The free sits in a braced arm body: the nearest preceding arm header
+    // at a strictly shallower indent whose brace group contains the line.
+    const free_indent = countIndent(lines[f_idx]);
+    var ln = free_line;
+    while (ln > block_start) {
+        ln -= 1;
+        if (ln < func_line) break;
+        const idx = ln - func_line;
+        if (idx >= lines.len) break;
+        if (countIndent(lines[idx]) >= free_indent) continue;
+        if (!isArmHeaderLine(mem.trim(u8, lines[idx], " \t\r"))) continue;
+        const open_col = armBodyOpenCol(lines[idx]) orelse continue;
+        const close_idx = braceGroupEndLine(lines, idx, open_col) orelse continue;
+        if (f_idx <= close_idx)
+            return .{ .first = func_line + idx, .last = func_line + close_idx };
+    }
+    return null;
 }
 
 fn findVarUseOnLine(t: []const u8, vn: []const u8) ?usize {
@@ -7631,7 +7793,12 @@ fn emitAliasSameBlockVerdict(
     if (hasExclusiveArmBetween(ctx.scan.lines, ctx.scan.func_line, sbf.freed_line, site.line)) {
         return .suppressed;
     }
-    try appendUAFIssue(ctx, site);
+    // The alias verdict mirrors the direct path's grade: an
+    // arm-conditional free with a post-join use stays conditional
+    // (EPH-I0356).
+    var graded = site;
+    graded.severity = sameBlockFreeSeverity(ctx, sbf, site.line);
+    try appendUAFIssue(ctx, graded);
     return .emitted;
 }
 
@@ -7712,7 +7879,11 @@ fn checkLineForUAF(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !
     // Lattice verdict (EPH-I0676): err requires the free on every reachable
     // path. A free on some paths only — the MAY reach — stays loud at the
     // warning grade, mirroring ZA106's conditional double-free (EPH-I0345,
-    // band-B02 F5). def implies may, so the err path is unchanged.
+    // band-B02 F5). def implies may, so the err path is unchanged. The
+    // "maybe freed reads as definite" FP (EPH-I0355, band-B02 F15) is
+    // structurally excluded: the may lattice only feeds the reach gate and
+    // the warning grade, and a free whose path cannot reach the use block
+    // never votes in the block's meet.
     const freed = ctx.scan.alloc_info.freed_line;
     if (freed == 0 or !ctx.bstate.may_freed_entry[bid]) return;
     // Check for reassignment between the free and this use
@@ -7733,6 +7904,30 @@ fn checkLineForUAF(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !
         .severity = severity,
         .freed_line = freed,
     });
+}
+
+/// The same-block free grades err when the use shares the free's arm
+/// region or the free is a plain block statement: the free definitely
+/// precedes the use when the block runs. It grades warning when the free is
+/// arm-conditional and the use runs after the arm's join — the sibling-arm
+/// paths never freed, so the free reaches the use on some paths only
+/// (EPH-I0356, mirror of the EPH-I0345 conditional grade).
+fn sameBlockFreeSeverity(
+    ctx: *const FreeScanCtx,
+    sbf: SameBlockFreeResult,
+    use_line: usize,
+) Severity {
+    if (sbf.freed_line == 0) return .err;
+    const bid = findBlockForLine(ctx.cfg, sbf.freed_line) orelse return .err;
+    const block_start = ctx.cfg.blocks.items[bid].start_line;
+    const region = freeArmRegion(
+        ctx.scan.lines,
+        ctx.scan.func_line,
+        block_start,
+        sbf.freed_line,
+    ) orelse return .err;
+    if (use_line <= region.last) return .err;
+    return .warning;
 }
 
 /// Check if a variable was freed in the same block; emit UAF if so.
@@ -7758,7 +7953,7 @@ fn checkSameBlockUAF(
             .var_name = ctx.scan.var_name,
             .line = actual_line,
             .col = use_col,
-            .severity = .err,
+            .severity = sameBlockFreeSeverity(ctx, sbf, actual_line),
             .freed_line = sbf.freed_line,
         });
     }
@@ -8025,7 +8220,10 @@ fn checkSameBlockDoubleFree(
             .t = t,
             .line = actual_line,
             .freed_line = freed,
-            .severity = .err,
+            // The first free in an inline-switch arm runs on its arm only:
+            // the second free is conditional when it runs after the arm's
+            // join (EPH-I0356, mirror of the ZA106 conditional grade).
+            .severity = sameBlockFreeSeverity(ctx, sbf, actual_line),
             .help = "remove duplicate free",
         });
     }
@@ -8155,19 +8353,25 @@ const FreeSpan = struct {
 
 /// True when the two frees sit in different switch arms: a `=>` arm header
 /// appears in the span (first, second] at an indent no deeper than both
-/// statements. Same-arm pairs have no arm header between them; a defer
-/// OUTSIDE the switch is shallower than any arm header (still reported).
-/// The span excludes the first statement's own line, so an inline arm free
-/// `.b => free(buf),` cannot self-match its own header when a post-join
-/// statement sits at the arm indent (EPH-I0343); the second line stays in,
-/// because `.b => use(buf)` proves sibling-arm exclusivity with the use's
-/// own header (EPH-I0010). Markers must be arm-header lines: the arrows of
-/// an inline switch expression and the `=>` inside strings or comments are
-/// not separators (EPH-I0062 probe13, EPH-I0342). Like
-/// hasExclusiveBranchBetween, this is textual: a genuine arm header that
-/// merely sits between the two frees at a shallow-enough indent also
-/// suppresses (accepted FN, consistent with the existing direct/direct
-/// double-free heuristic).
+/// statements, and the SECOND statement sits inside that header's arm (the
+/// header line itself or its braced body — armHeaderSeparates). Same-arm
+/// pairs have no arm header between them; a defer OUTSIDE the switch is
+/// shallower than any arm header (still reported). The span excludes the
+/// first statement's own line, so an inline arm free `.b => free(buf),`
+/// cannot self-match its own header when a post-join statement sits at the
+/// arm indent (EPH-I0343); the second line stays in, because
+/// `.b => use(buf)` proves sibling-arm exclusivity with the use's own
+/// header (EPH-I0010). The containment clause keeps a post-join statement
+/// at the arm indent from being suppressed by the NEXT arm's header: the
+/// switch already closed, so the statement runs after every arm, including
+/// the free's (EPH-I0356, band-B02 F3 residual). Markers must be
+/// arm-header lines: the arrows of an inline switch expression and the
+/// `=>` inside strings or comments are not separators (EPH-I0062 probe13,
+/// EPH-I0342). An arm header that sits between at a shallow-enough indent
+/// while its arm does not contain the second statement still suppresses
+/// when the second statement is itself an arm header of a later construct
+/// (accepted FN, the any-switch-text-between class, pinned by the
+/// EPH-I0356 residual test).
 fn hasSwitchArmBetween(
     lines: []const []const u8,
     func_line: usize,
@@ -8180,7 +8384,8 @@ fn hasSwitchArmBetween(
         if (idx >= lines.len) break;
         if (countIndent(lines[idx]) > span.min_indent) continue;
         const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isArmHeaderLine(t)) return true;
+        if (isArmHeaderLine(t) and
+            armHeaderSeparates(lines, func_line, ln, span.second)) return true;
     }
     return false;
 }
@@ -8522,6 +8727,15 @@ fn loopBodyLineExtent(
 /// body carries no rebind. This is the F14 "maybe-freed on re-entry"
 /// verdict: a targeted vote, not general back-edge flow, so per-iteration
 /// rebinds stay precise.
+///
+/// The re-entered-loop UAF direction is the accepted-FN mirror (EPH-I0358,
+/// band-B02 F16): a use BEFORE the free in the loop body reads freed memory
+/// on iteration 2+ while the meet skips the back edge, so the entry state
+/// never widens. The shape stays silent by design — the pre-loop path
+/// grounds the MUST meet and the MAY reach — and is pinned by "ZA105: use
+/// before free in a loop body stays silent (EPH-I0676)". The double-free
+/// direction stays loud through this vote (pinned by "ZA106: loop-body
+/// free double-frees on the next iteration (EPH-I0676)").
 fn loopCarriedFreeVote(ctx: *const FreeScanCtx, bid: usize, actual_line: usize) !bool {
     for (ctx.cfg.edges.items) |edge| {
         if (edge.kind != .loop_back) continue;
@@ -8717,6 +8931,10 @@ fn collectCFGAllocations(
     ctx: *const DeferCoverageCtx,
 ) !std.ArrayListUnmanaged(CFGAlloc) {
     var allocs = std.ArrayListUnmanaged(CFGAlloc).empty;
+    // The list has no self-owning defer: an append failure after earlier
+    // successful appends would drop the entries' storage (OOM-path leak,
+    // EPH-I0895 sweep; B45-1).
+    errdefer allocs.deinit(ctx.allocator);
 
     // Pre-scan: build type-tracked allocator sets
     var local_no_free_fields = try collectNoFreeFieldNames(ctx.allocator, ctx.body.lines);
@@ -8812,7 +9030,9 @@ fn countBraceBalance(line: []const u8) i32 {
 /// only when the success path also references the alloc after it — the
 /// error/success cleanup split — a discard-only tail leaks on success
 /// (EPH-I0349). The name check runs on the joined logical line, so a
-/// zig-fmt wrapped defer free stays visible (EPH-I0351).
+/// zig-fmt wrapped defer free stays visible (EPH-I0351). The name match is
+/// word-bounded (containsIdentifier): a defer freeing `buffer` must not
+/// cover an alloc named `buf` (EPH-I0357, band-B02 F17).
 fn hasNearbyDefer(
     lines: []const []const u8,
     alloc_end_idx: usize,
@@ -8831,7 +9051,7 @@ fn hasNearbyDefer(
         if (check_indent != alloc_indent) continue;
         const joined = joinParenContinuation(lines, check_idx, &join_buf);
         if (!hasRealCleanupPattern(joined) or
-            mem.indexOf(u8, joined, name) == null) continue;
+            !containsIdentifier(joined, name)) continue;
         if (hasExitBetween(lines, alloc_end_idx, check_idx)) continue;
         if (mem.startsWith(u8, scan_line, "errdefer ") and
             !hasHandoffReference(lines, check_idx, name)) continue;
@@ -8985,7 +9205,9 @@ fn hasGuardToken(seg: []const u8) bool {
 /// before the alloc always dominates. An errdefer counts only when the
 /// success path also references the alloc after it (EPH-I0349). The name
 /// check runs on the joined logical line, so a zig-fmt wrapped defer free
-/// stays visible (EPH-I0351).
+/// stays visible (EPH-I0351). The name match is word-bounded
+/// (containsIdentifier): a defer freeing `buffer` must not cover an alloc
+/// named `buf` (EPH-I0357, band-B02 F17).
 fn hasOuterScopeDefer(
     lines: []const []const u8,
     alloc_end_idx: usize,
@@ -9000,7 +9222,7 @@ fn hasOuterScopeDefer(
         if (countIndent(raw_line) >= alloc_indent) continue;
         const joined = joinParenContinuation(lines, check_idx, &join_buf);
         if (!hasRealCleanupPattern(joined) or
-            mem.indexOf(u8, joined, name) == null) continue;
+            !containsIdentifier(joined, name)) continue;
         if (check_idx > alloc_end_idx and
             hasExitBetween(lines, alloc_end_idx, check_idx)) continue;
         if (mem.startsWith(u8, scan_line, "errdefer ") and
@@ -9581,6 +9803,16 @@ fn analyzeCFGDeferCoverage(
     var allocs = try collectCFGAllocations(&ctx);
     defer allocs.deinit(allocator);
     if (allocs.items.len == 0) return issues;
+    // Allocation-count cap: each allocation re-scans the whole body, so an
+    // over-cap function costs the family minutes (EPH-I0350).
+    if (try overAllocCapEmitsNote(.{
+        .a = allocator,
+        .out = &issues,
+        .file_path = ctx.body.file_path,
+        .func_line = ctx.body.func_line,
+        .rule = RULE_ALLOC_NO_DEFER,
+        .cap_noun = mem_alloc_cap_noun,
+    }, allocs.items.len)) return issues;
 
     // Pre-pass: Remove allocations with immediate defer
     removeImmediateDeferAllocs(&allocs, ctx.body.lines, ctx.body.func_line);
@@ -9590,14 +9822,24 @@ fn analyzeCFGDeferCoverage(
     if (num_blocks == 0) return issues;
 
     // Phase 2-3: Check defer coverage for each allocation
-    for (allocs.items) |alloc| {
-        const issue = try checkDeferCoverageForAlloc(&ctx, alloc);
-        if (issue) |iss| {
-            try issues.append(allocator, iss);
-        }
-    }
+    try checkDeferCoverageLoop(&ctx, allocs.items, &issues);
 
     return issues;
+}
+
+/// Phase 2-3 of the defer-coverage analysis: run the per-allocation
+/// coverage check and append its issue.
+fn checkDeferCoverageLoop(
+    ctx: *const DeferCoverageCtx,
+    allocs: []const CFGAlloc,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    for (allocs) |alloc| {
+        const issue = try checkDeferCoverageForAlloc(ctx, alloc);
+        if (issue) |iss| {
+            try issues.append(ctx.allocator, iss);
+        }
+    }
 }
 
 /// Block coverage state for defer analysis
@@ -23373,8 +23615,87 @@ fn deinitIssuePayloads(items: []Issue, a: Allocator) void {
     for (items) |*issue| issue.deinit(a);
 }
 
-/// Run memory-related CFG analyses
-fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
+/// Per-function analysis caps for the ZA105/106 and ZA101/102 families
+/// (band-B02 F11, EPH-I0350). The family rescans the function body once
+/// per allocation: the per-line detectors walk every line and the
+/// same-block scans walk the block again per candidate line, so one
+/// function costs O(M x N^2) with M allocations and N lines, plus the
+/// per-alloc alias and defer-pairing passes. The 10 MiB source cap
+/// (EPH-I0150) bounds the input file, not the blowup: a single
+/// attacker-controlled function of hundreds of thousands of lines is a
+/// hang class. These caps bound the family's input; a function past either
+/// cap skips the family with a note. Measured 2026-08-16: an adversarial
+/// single-alloc function costs ~2.5 s at the 2048-line cap, and the
+/// four-project corpus runs at 0.91-4.34 s per project (zls 0.91, ghostty
+/// 4.34, sig 3.87, tigerbeetle 3.24).
+const max_mem_family_lines = 2048;
+const max_mem_family_allocs = 128;
+
+/// The cap nouns stay comptime-built from the constants so the note can
+/// never drift from the caps it names.
+const mem_line_cap_noun = std.fmt.comptimePrint(
+    "the {d}-line analysis cap",
+    .{max_mem_family_lines},
+);
+const mem_alloc_cap_noun = std.fmt.comptimePrint(
+    "the {d}-allocation analysis cap",
+    .{max_mem_family_allocs},
+);
+
+/// Emission bundle for a memory-family skip note.
+const MemCapNoteCtx = struct {
+    a: Allocator,
+    out: *std.ArrayListUnmanaged(Issue),
+    file_path: []const u8,
+    func_line: usize,
+    rule: []const u8,
+    cap_noun: []const u8,
+};
+
+/// Emit the skip note for a memory-family cap: the function exceeds the
+/// named cap, so ZA101/ZA102/ZA105/ZA106 skip it. A note never fails a
+/// gate; it keeps the skip visible in the report (EPH-I0350).
+fn appendMemFamilyCapNote(ctx: MemCapNoteCtx) !void {
+    const msg = try std.fmt.allocPrint(
+        ctx.a,
+        "function exceeds {s}; ZA101, ZA102, ZA105, and ZA106 skip it",
+        .{ctx.cap_noun},
+    );
+    errdefer ctx.a.free(msg);
+    try ctx.out.append(ctx.a, .{
+        .file = ctx.file_path,
+        .line = ctx.func_line,
+        .col = 1,
+        .severity = .note,
+        .rule = ctx.rule,
+        .message = msg,
+        .message_owned = true,
+        .help = "split the function into smaller units so ephor can analyze it",
+    });
+}
+
+/// True when the allocation count exceeds the family cap; the skip note is
+/// emitted then, and the caller returns without analyzing (EPH-I0350).
+fn overAllocCapEmitsNote(
+    p: MemCapNoteCtx,
+    alloc_count: usize,
+) !bool {
+    if (alloc_count <= max_mem_family_allocs) return false;
+    try appendMemFamilyCapNote(.{
+        .a = p.a,
+        .out = p.out,
+        .file_path = p.file_path,
+        .func_line = p.func_line,
+        .rule = p.rule,
+        .cap_noun = mem_alloc_cap_noun,
+    });
+    return true;
+}
+
+/// The memory-family tail that runs regardless of the caps: ZA103 errdefer
+/// coverage and the must-return-ref check (EPH-I0350 — the caps bound
+/// ZA101/ZA102/ZA105/ZA106 only).
+fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
     const body: FuncBodyCtx = .{
@@ -23382,33 +23703,6 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
         .func_line = run.func.start,
         .file_path = run.file.file_path,
     };
-    // Check if this function receives a no-free allocator via call-site propagation
-    const is_no_free_recipient = if (run.func.no_free_param_fns) |fns|
-        fns.contains(run.func.name)
-    else
-        false;
-    var r1 = try analyzeCFGMemorySafety(a, run.cfg, body, run.func.no_free_fields);
-    defer r1.deinit(a);
-    // The out.appendSlice transfer is the EPH-I0882 consumer side: on an
-    // OOM the array defer frees only the backing array, so r1's
-    // message_owned payloads would leak. The errdefer frees the payloads
-    // without the array; after a successful transfer the payloads belong
-    // to out and a later failure must not free them again (EPH-I0895).
-    var r1_owns_payloads = true;
-    errdefer if (r1_owns_payloads) deinitIssuePayloads(r1.items, a);
-    try out.appendSlice(a, r1.items);
-    r1_owns_payloads = false;
-    var r2 = if (is_no_free_recipient)
-        std.ArrayListUnmanaged(Issue).empty
-    else
-        try analyzeCFGDeferCoverage(.{
-            .allocator = a,
-            .cfg = run.cfg,
-            .body = body,
-            .file_no_free_fields = run.func.no_free_fields,
-        });
-    defer r2.deinit(a);
-    try out.appendSlice(a, r2.items);
     var r3 = if (run.func.in_test or is_no_free_recipient)
         std.ArrayListUnmanaged(Issue).empty
     else
@@ -23427,6 +23721,67 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
         .fstart = run.func.start,
         .fp = run.file.file_path,
     });
+}
+
+/// Run memory-related CFG analyses
+fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
+    const a = run.file.allocator;
+    const out = run.file.issues;
+    const body: FuncBodyCtx = .{
+        .lines = run.func.lines,
+        .func_line = run.func.start,
+        .file_path = run.file.file_path,
+    };
+    // Check if this function receives a no-free allocator via call-site propagation
+    const is_no_free_recipient = if (run.func.no_free_param_fns) |fns|
+        fns.contains(run.func.name)
+    else
+        false;
+    const over_line_cap = run.func.lines.len > max_mem_family_lines;
+    if (over_line_cap)
+        try appendMemFamilyCapNote(.{
+            .a = a,
+            .out = out,
+            .file_path = run.file.file_path,
+            .func_line = run.func.start,
+            .rule = RULE_USE_AFTER_FREE,
+            .cap_noun = mem_line_cap_noun,
+        });
+    var r1 = if (over_line_cap)
+        std.ArrayListUnmanaged(Issue).empty
+    else
+        try analyzeCFGMemorySafety(a, run.cfg, body, run.func.no_free_fields);
+    defer r1.deinit(a);
+    // The out.appendSlice transfer is the EPH-I0882 consumer side: on an
+    // OOM the array defer frees only the backing array, so r1's
+    // message_owned payloads would leak. The errdefer frees the payloads
+    // without the array; after a successful transfer the payloads belong
+    // to out and a later failure must not free them again (EPH-I0895).
+    var r1_owns_payloads = true;
+    errdefer if (r1_owns_payloads) deinitIssuePayloads(r1.items, a);
+    try out.appendSlice(a, r1.items);
+    r1_owns_payloads = false;
+    var r2 = if (over_line_cap or is_no_free_recipient)
+        std.ArrayListUnmanaged(Issue).empty
+    else
+        try analyzeCFGDeferCoverage(.{
+            .allocator = a,
+            .cfg = run.cfg,
+            .body = body,
+            .file_no_free_fields = run.func.no_free_fields,
+        });
+    defer r2.deinit(a);
+    // r2's list can carry the same owned payload r1's can: the alloc-cap
+    // skip note reaches it through analyzeCFGDeferCoverage's
+    // overAllocCapEmitsNote (EPH-I0350). The appendSlice transfer needs
+    // the same guard — on an OOM the array defer frees only the backing
+    // array, so the errdefer frees the payloads without the array; after
+    // a successful transfer the payloads belong to out (EPH-I0895, B45-1).
+    var r2_owns_payloads = true;
+    errdefer if (r2_owns_payloads) deinitIssuePayloads(r2.items, a);
+    try out.appendSlice(a, r2.items);
+    r2_owns_payloads = false;
+    try runDeferredTailAnalyses(run, is_no_free_recipient);
 }
 
 // ============================================================================
@@ -39945,6 +40300,70 @@ test "ZA105: runCFGMemoryAnalyses frees r1 payloads when appendSlice OOMs (EPH-I
     }
 }
 
+test "ZA105: runCFGMemoryAnalyses frees r2 payloads when appendSlice OOMs (EPH-I0895, B45-1)" {
+    const allocator = std.testing.allocator;
+    const path = "sweep_defer_cap.zig";
+
+    // The over-alloc-cap input (EPH-I0350 probe shape): more allocations
+    // than max_mem_family_allocs, fewer lines than the line cap. It makes
+    // analyzeCFGDeferCoverage return its alloc-cap skip note — the
+    // DeferCoverage family's first message_owned payload — so the r2
+    // transfer in runCFGMemoryAnalyses owns a payload that must be freed
+    // on an appendSlice OOM (B45-1). One function never exercises that
+    // append: the r1 transfer's growth leaves out enough slack, so a
+    // later function's r2 append is the first to allocate. Six functions
+    // cover the crossing for any ZA103 issue count.
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    const fn_count = 6;
+    for (0..fn_count) |f| {
+        const header = try std.fmt.allocPrint(
+            allocator,
+            "fn many{d}(allocator: std.mem.Allocator) !void {{\n",
+            .{f},
+        );
+        defer allocator.free(header);
+        try content.appendSlice(allocator, header);
+        for (0..max_mem_family_allocs + 8) |i| {
+            const line = try std.fmt.allocPrint(
+                allocator,
+                "    const b{d} = try allocator.alloc(u8, 64);\n",
+                .{i},
+            );
+            defer allocator.free(line);
+            try content.appendSlice(allocator, line);
+        }
+        for (0..max_mem_family_allocs + 8) |i| {
+            const line = try std.fmt.allocPrint(allocator, "    _ = b{d};\n", .{i});
+            defer allocator.free(line);
+            try content.appendSlice(allocator, line);
+        }
+        try content.appendSlice(allocator, "}\n");
+    }
+
+    // Measure the cold-run allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run).
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    try sweepCFGMemoryOnce(&probe, path, content.items);
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        if (sweepCFGMemoryOnce(&failing, path, content.items)) |_| {
+            // Success iteration: the pipeline ran clean under the budget.
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Byte balance at every failure point is the leak proof. Pre-fix
+        // the r2 transfer index leaks the alloc-cap note's owned message
+        // when out.appendSlice OOMs (EPH-I0895, B45-1).
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 /// Count issues for a rule within one file (test assertion helper).
 fn countRuleIssues(
     issues: []const Issue,
@@ -39956,6 +40375,97 @@ fn countRuleIssues(
         if (mem.eql(u8, issue.file, file) and mem.eql(u8, issue.rule, rule)) n += 1;
     }
     return n;
+}
+
+test "ZA105/ZA106/ZA101: over-line-cap function skips memory analysis with a note (EPH-I0350)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The family rescans the body per allocation (O(M x N^2) worst), so an
+    // over-cap function skips ZA101/ZA102/ZA105/ZA106 with one note
+    // (band-B02 F11). The note is a note: it never fails a gate.
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator,
+        \\fn big(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\
+    );
+    for (0..max_mem_family_lines + 16) |_| {
+        try content.appendSlice(allocator, "    _ = buf;\n");
+    }
+    try content.appendSlice(allocator, "}\n");
+
+    var run = try runCFGMemoryTest(&diag, allocator, "test_over_line_cap.zig", content.items);
+    defer run.deinit(allocator);
+
+    const file = "test_over_line_cap.zig";
+    // The skip note rides the family rule: count findings by severity, so
+    // the note does not read as a fired ZA105.
+    var findings: usize = 0;
+    var noted = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, file)) continue;
+        const in_family = mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) or
+            mem.eql(u8, issue.rule, RULE_DOUBLE_FREE) or
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER);
+        if (in_family and issue.severity != .note) findings += 1;
+        if (issue.severity == .note and mem.indexOf(u8, issue.message, "analysis cap") != null)
+            noted = true;
+    }
+    try std.testing.expect(findings == 0);
+    try std.testing.expect(noted);
+}
+
+test "ZA105/ZA106/ZA101: over-alloc-cap function skips memory analysis with a note (EPH-I0350)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The allocation-count cap bounds the M factor of O(M x N^2). A
+    // function with more than max_mem_family_allocs tracked allocations
+    // skips the family with a note.
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "fn many(allocator: std.mem.Allocator) !void {\n");
+    for (0..max_mem_family_allocs + 8) |i| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "    const b{d} = try allocator.alloc(u8, 64);\n",
+            .{i},
+        );
+        defer allocator.free(line);
+        try content.appendSlice(allocator, line);
+    }
+    for (0..max_mem_family_allocs + 8) |i| {
+        const line = try std.fmt.allocPrint(allocator, "    _ = b{d};\n", .{i});
+        defer allocator.free(line);
+        try content.appendSlice(allocator, line);
+    }
+    try content.appendSlice(allocator, "}\n");
+
+    var run = try runCFGMemoryTest(&diag, allocator, "test_over_alloc_cap.zig", content.items);
+    defer run.deinit(allocator);
+
+    const file = "test_over_alloc_cap.zig";
+    // The skip notes ride the family rules: count findings by severity, so
+    // the notes do not read as fired ZA105/ZA101.
+    var findings: usize = 0;
+    var noted = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, file)) continue;
+        const in_family = mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) or
+            mem.eql(u8, issue.rule, RULE_DOUBLE_FREE) or
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER);
+        if (in_family and issue.severity != .note) findings += 1;
+        if (issue.severity == .note and mem.indexOf(u8, issue.message, "analysis cap") != null)
+            noted = true;
+    }
+    try std.testing.expect(findings == 0);
+    try std.testing.expect(noted);
 }
 
 test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
@@ -41710,8 +42220,11 @@ test "ZA105: sibling-arm alias suppression does not end the scan (EPH-I0837)" {
 
     // The use on 6 sits in an arm exclusive with the free's arm: suppressed
     // (EPH-I0837). The use on 8 runs after the switch join, so it dangles on
-    // the free path and must fire err, mirroring the direct path's post-join
-    // verdict. The suppression says nothing about post-join lines.
+    // the free path and must fire — at the conditional warning grade, since
+    // the free runs on the `0` path only (EPH-I0356: the arm-conditional
+    // free no longer reads as a definite free past the join, mirroring the
+    // if-form grade of EPH-I0345). The suppression says nothing about
+    // post-join lines.
     const content =
         \\fn alias_post_switch_sibling(allocator: std.mem.Allocator, x: u8) !void {
         \\    const buf = try allocator.alloc(u8, 64);
@@ -41734,7 +42247,7 @@ test "ZA105: sibling-arm alias suppression does not end the scan (EPH-I0837)" {
     var post_join_fired = false;
     for (run.issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
-        try std.testing.expect(issue.severity == .err);
+        try std.testing.expect(issue.severity == .warning);
         post_join_fired = issue.line == 8;
     }
     try std.testing.expect(post_join_fired);
@@ -42498,6 +43011,238 @@ test "ZA106: shallow else between dominating frees still separates (EPH-I0806)" 
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
 }
 
+test "ZA105: inline-switch arm free then statement-level post-join use grades warning (EPH-I0356)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The const-prefixed inline switch arms share the enclosing CFG block,
+    // so the arm-conditional free used to read as definite: the post-join
+    // use graded err although the sibling-arm path never frees. The
+    // cond_sets op + same-block grade now mirror the if-form conditional
+    // warning (EPH-I0345).
+    const content =
+        \\fn f(allocator: std.mem.Allocator, k: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const y = switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => 1,
+        \\    };
+        \\    _ = y;
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arm_free_join_use.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_arm_free_join_use.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_warning = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        graded_warning = issue.severity == .warning and
+            mem.startsWith(u8, issue.message, "conditional use-after-free:");
+    }
+    try std.testing.expect(graded_warning);
+}
+
+test "ZA105: inline-switch arm free then nested post-join use fires (EPH-I0356)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The post-join use sits inside a following if at the ARM indent. The
+    // next arm's header used to suppress it (band-B02 F3 residual: the arm
+    // header between free and use at the free's indent); the containment
+    // rule (armHeaderSeparates) proves the use runs after the switch join
+    // and the warning fires. Pre-fix this shape was silent.
+    const content =
+        \\fn f(allocator: std.mem.Allocator, k: enum { a, b }, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const y = switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => 1,
+        \\    };
+        \\    _ = y;
+        \\    if (c) {
+        \\        _ = buf.len;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arm_free_nested_use.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_arm_free_nested_use.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
+}
+
+test "ZA105: same-arm free and use inside a braced inline-switch arm stays err (EPH-I0356)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The free and the use share the .a arm region: the free definitely
+    // precedes the use when the arm runs, so the same-block verdict keeps
+    // the err grade. The arm-conditional downgrade applies to post-join
+    // uses only.
+    const content =
+        \\fn use(d: []u8) void { _ = d; }
+        \\fn f(allocator: std.mem.Allocator, k: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const y = switch (k) {
+        \\        .a => {
+        \\            allocator.free(buf);
+        \\            use(buf);
+        \\        },
+        \\        .b => 1,
+        \\    };
+        \\    _ = y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_same_arm_inline_use.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_same_arm_inline_use.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: inline-switch arm free then post-join free grades warning (EPH-I0356)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The second free runs after the switch join: on the .a path it
+    // double-frees, on the .b path it is the only free — the conditional
+    // warning grade, mirroring the if-form conditional double-free.
+    const content =
+        \\fn f(allocator: std.mem.Allocator, k: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const y = switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => 1,
+        \\    };
+        \\    _ = y;
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arm_free_join_free.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_arm_free_join_free.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
+}
+
+test "ZA106: statement-form all-arms-free switch keeps the post-join err grade (EPH-I0356)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every statement-form arm frees, so the post-join use is definite:
+    // the arm-block carve-out keeps .sets on the arm blocks and the merge
+    // meet ANDs them to err. The shared-block inline twin under-grades to
+    // warning (documented bound — the block model cannot count arms).
+    const content =
+        \\fn f(allocator: std.mem.Allocator, k: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => allocator.free(buf),
+        \\    }
+        \\    _ = buf.len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_all_arms_free_stmt.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_all_arms_free_stmt.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        try std.testing.expect(issue.severity == .err);
+    }
+}
+
+test "ZA106: frees in const-prefixed inline sibling arms stay silent (EPH-I0356)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The second free sits on its own arm-header line: the arm region
+    // containment suppresses the pair as mutually exclusive (the
+    // H == second clause of armHeaderSeparates).
+    const content =
+        \\fn f(allocator: std.mem.Allocator, k: enum { a, b }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const y = switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => allocator.free(buf),
+        \\    };
+        \\    _ = y;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_inline_sibling_frees.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_inline_sibling_frees.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+}
+
+test "ZA105: use on another switch's arm header line stays suppressed (EPH-I0356 residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The use sits on the arm-header line of a LATER switch: the
+    // H == second clause reads it as an arm-region statement, so the pair
+    // suppresses. The two switches' arms are not mutually exclusive, so
+    // this is the surviving any-switch-text-between accepted FN — the
+    // shape-5 residual of the EPH-I0353 probe doc, pinned to keep it
+    // truthful.
+    const content =
+        \\fn use(d: []u8) void { _ = d; }
+        \\fn f(allocator: std.mem.Allocator, k: enum { a, b }, m: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    switch (k) {
+        \\        .a => allocator.free(buf),
+        \\        .b => {},
+        \\    }
+        \\    const z = switch (m) {
+        \\        0 => use(buf),
+        \\        else => 1,
+        \\    };
+        \\    _ = z;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_second_switch_arm_use.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_second_switch_arm_use.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
 test "ZA106: comment `=>` line between frees does not separate them (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -42827,7 +43572,7 @@ test "ZA105: single-line switch expression between free and use fires (EPH-I0062
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
 }
 
-test "ZA105: arm header of an intervening switch still separates (EPH-I0062 residual)" {
+test "ZA105: arm header of a switch whose join precedes the use does not separate (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -42835,10 +43580,13 @@ test "ZA105: arm header of an intervening switch still separates (EPH-I0062 resi
 
     // The free sits in a NON-last arm, so the `.b => {}` header on the
     // middle line is a genuine arm-header line at the arm indent. The
-    // textual layer cannot tell it belongs to a switch whose join
-    // precedes the nested use: documented accepted FN (the
-    // hasSwitchArmBetween documented-hole class), pinned to keep the
-    // helper doc truthful.
+    // containment rule (armHeaderSeparates) decides the header cannot
+    // separate the pair: the nested use runs after the switch join, so it
+    // is reachable on the free's arm and must fire at the conditional
+    // grade. Pre-fix this shape was the pinned accepted FN of the
+    // EPH-I0062 residual test (band-B02 F3: "the textual layer cannot
+    // tell"); the join-before-use geometry is now the mechanism's answer
+    // to the audit's F3 done-when.
     const content =
         \\fn handle(allocator: std.mem.Allocator, k: enum { a, b }, c: bool) !void {
         \\    const buf = try allocator.alloc(u8, 64);
@@ -42855,7 +43603,11 @@ test "ZA105: arm header of an intervening switch still separates (EPH-I0062 resi
     defer run.deinit(allocator);
 
     const file = "test_intervening_arm_sep.zig";
-    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 0);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
 }
 
 test "ZA106: frees in inline sibling arms stay silent (EPH-I0062 probe18)" {
@@ -43433,6 +44185,87 @@ test "ZA101: wrapped defer free covers the alloc (EPH-I0351 lock)" {
     try std.testing.expect(countRuleIssues(
         run.issues.items,
         "test_wrapped_defer_ok.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: nearby defer freeing a prefix-colliding name does not cover the alloc (EPH-I0357)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The defer frees `buffer`, not `buf`: the raw substring match used to
+    // let the prefix collision cover the alloc and hide the leak
+    // (band-B02 F17). The word-bounded match must keep the alloc
+    // uncovered, so ZA101 fires.
+    const content =
+        \\fn colliding_defer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer allocator.free(buffer);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_prefix_collision.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_defer_prefix_collision.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: outer-scope defer freeing a prefix-colliding name does not cover (EPH-I0357)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same collision through hasOuterScopeDefer: the defer textually
+    // before the alloc always dominates, but it frees a different name, so
+    // the inner alloc stays uncovered and ZA101 fires.
+    const content =
+        \\fn outer_colliding_defer(allocator: std.mem.Allocator, c: bool) !void {
+        \\    defer allocator.free(buffer);
+        \\    if (c) {
+        \\        const buf = try allocator.alloc(u8, 64);
+        \\        _ = buf;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_outer_defer_collision.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_outer_defer_collision.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: nearby defer freeing the exact name still covers (EPH-I0357 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The discriminating counter-case: the word-bounded match must not
+    // reject the genuine same-name defer, or every properly deferred alloc
+    // would warn.
+    const content =
+        \\fn exact_defer(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer allocator.free(buf);
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_exact_defer_ok.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_exact_defer_ok.zig",
         RULE_ALLOC_NO_DEFER,
     ) == 0);
 }

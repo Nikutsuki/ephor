@@ -25830,9 +25830,12 @@ fn isGuardEstablishingLine(t: []const u8) bool {
 
 /// The line's guard-source text: for an else-open line, the arm's own
 /// region after the `else` keyword, trimmed so a chain arm's opener
-/// classifies at position 0 (EPH-I0993); otherwise the whole line.
+/// classifies at position 0 (EPH-I0993). The region strips the
+/// antecedent even when the arm closes on the line: a closed
+/// same-line chain's antecedent is negated for the else arm, so it
+/// must never feed the record (EPH-I0996).
 fn guardSourceForLine(t: []const u8) []const u8 {
-    if (elseOpenKind(t) != null) return mem.trimStart(u8, elseArmRegion(t), " \t");
+    if (elseKeywordPos(t) != null) return mem.trimStart(u8, elseArmRegion(t), " \t");
     return t;
 }
 
@@ -26114,9 +26117,14 @@ fn isGuardedAtLine(ctx: GuardLineCtx, var_name: []const u8, decrement_amount: ?u
 }
 
 /// True when the guard recorded at `guard_idx` covers a decrement of
-/// `var_name` by `amount`. A non-assert guard covers any amount; an
-/// assert guard covers only when its bound is at least the amount
-/// (`assert(x >= 0); x -= 100` underflows at x == 0 — EPH-I0495). A
+/// `var_name` by `amount`. An assert guard covers only when its bound
+/// is at least the amount (`assert(x >= 0); x -= 100` underflows at
+/// x == 0 — EPH-I0495). A plain comparison guard covers only when its
+/// proven lower bound clears the amount: `if (m > 1)` proves m >= 2,
+/// so `m -= 1` and `m -= 2` stay silent and `m -= 5` fires
+/// (EPH-I0995). The judge reads the guard's own region: an else-open
+/// line's condition before the `else` is the negated antecedent, and a
+/// chain arm's own condition is the region after it (EPH-I0996). A
 /// null amount keeps the recorded guard's old shape-only behavior. A
 /// guard line the assert-bound judge does not bind keeps its verdict:
 /// the CFG collection already keyed it by the guarded var.
@@ -26127,15 +26135,74 @@ fn guardCoversDecrement(
     amount: ?usize,
 ) bool {
     if (amount == null) return true;
-    const guard_line = mem.trim(u8, ctx.lines[guard_idx], " \t\r");
-    if (mem.indexOf(u8, guard_line, "assert") == null) return true;
-    return judgeAssertBound(guard_line, var_name, amount.?) != .uncovered;
+    const guard_line = guardSourceForLine(mem.trim(u8, ctx.lines[guard_idx], " \t\r"));
+    if (mem.indexOf(u8, guard_line, "assert") != null)
+        return judgeAssertBound(guard_line, var_name, amount.?) != .uncovered;
+    return guardLineCoversAmount(guard_line, var_name, amount.?);
+}
+
+/// True when the guard line's condition proves `var_name >= amount`.
+/// The condition must close on the line; a continuation-line condition
+/// keeps the shape-only verdict (EPH-I0995). An Allman header's body
+/// open sits on the next line, so the K&R span misses it — the allman
+/// span judges the header the same way (EPH-I0976).
+fn guardLineCoversAmount(line: []const u8, var_name: []const u8, amount: usize) bool {
+    if (guardConditionSpan(line)) |span| return guardSpanCoversAmount(line, var_name, span, amount);
+    if (allmanGuardConditionSpan(line)) |span| {
+        return guardSpanCoversAmount(line, var_name, span, amount);
+    }
+    return true;
+}
+
+/// True when the Allman header's condition proves `var_name >= amount`
+/// (EPH-I0976). See guardLineCoversAmount.
+fn allmanLineCoversAmount(line: []const u8, var_name: []const u8, amount: usize) bool {
+    const span = allmanGuardConditionSpan(line) orelse return true;
+    return guardSpanCoversAmount(line, var_name, span, amount);
+}
+
+/// True when the guard-condition span proves `var_name >= amount`. A
+/// parsed bound decides by value; a null bound is classified: an
+/// or-tail whose arm proves nothing, a comparison in call position,
+/// and an overflowing literal RHS do not cover — the body can run
+/// unguarded (EPH-I0961, EPH-I0964). A comparison with an identifier
+/// RHS keeps the shape-only verdict — the exact bound needs both
+/// literals (EPH-I0495). The budget-exhausted null never suppresses
+/// (EPH-I0966).
+fn guardSpanCoversAmount(
+    line: []const u8,
+    var_name: []const u8,
+    span: GuardSpan,
+    amount: usize,
+) bool {
+    var budget = GuardDepthBudget{ .remaining = max_guard_expr_depth, .exhausted = false };
+    if (guardExprBound(line, var_name, span, &budget)) |bound| return bound >= amount;
+    if (budget.exhausted) return false;
+    if (topLevelKeywordPos(line, "or", span.start, span.end) != null) return false;
+    if (topLevelComparisonOp(line, span.start, span.end)) |op| {
+        if (!comparisonLhsIsVar(line, op, var_name)) return false;
+        if (comparisonRhsIsUnparseableNumeric(line, op, span)) return false;
+        return true;
+    }
+    return false;
+}
+
+/// True when the comparison at `op` has a numeric-form RHS the bound
+/// judge cannot parse: an overflowing decimal literal
+/// (`n > 18446744073709551616`) proves nothing (EPH-I0964). An
+/// identifier or paren RHS keeps the shape-only verdict.
+fn comparisonRhsIsUnparseableNumeric(line: []const u8, op: usize, span: GuardSpan) bool {
+    const is_ge = op + 1 < line.len and line[op + 1] == '=';
+    var j = op + 1 + @intFromBool(is_ge);
+    while (j < span.end and (line[j] == ' ' or line[j] == '\t')) j += 1;
+    if (j >= span.end) return false;
+    return line[j] >= '0' and line[j] <= '9';
 }
 
 /// Check if a decrement is guarded by various patterns
 fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8, decrement_amount: ?usize) bool {
     if (isGuardedAtLine(ctx, var_name, decrement_amount)) return true;
-    if (hasGuardOnLine(ctx.t, var_name)) return true;
+    if (hasGuardOnLine(ctx.t, var_name, decrement_amount)) return true;
     // The prior-line backstop is amount-aware: the `== 0` exit proves
     // var >= 1, so it covers decrements <= 1 only — `x -= 2` under the
     // guard still underflows at x == 1, and a guard-to-decrement
@@ -26147,7 +26214,7 @@ fn isDecrementGuarded(ctx: GuardLineCtx, var_name: []const u8, decrement_amount:
     if (hasPairedIncrementInLines(ctx.lines[0..ctx.idx], var_name)) return true;
     if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
     if (hasAssertGeGuard(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
-    if (hasEnclosingVarGuard(ctx.lines, ctx.idx, var_name)) return true;
+    if (hasEnclosingVarGuard(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
     if (hasElseBranchGuard(ctx.lines, ctx.idx)) return true;
     return false;
 }
@@ -26172,7 +26239,11 @@ fn isArrayLenCFGGuarded(ctx: GuardLineCtx) bool {
 /// 2026-08-13: the short-circuit is acceptable. The pre-batch-24
 /// verdict for those shapes was identical, ZA9xx is off-by-default
 /// globally, and a binding witness verdict would break the same-line
-/// guard suppressions.
+/// guard suppressions. The CFG guard meet binds the first
+/// subtraction bracket's own var through the block-or-exit witness: a
+/// chain arm's condition (`} else if (m > 3) {`) records into the arm
+/// block, so an in-arm candidate on m stays silent like the ZA901
+/// decrement twin (EPH-I0996).
 fn isArrayIndexGuarded(ctx: GuardLineCtx) bool {
     if (mem.indexOf(u8, ctx.t, "-|") != null) return true;
     if (hasIndexGuardOnLine(ctx.t)) return true;
@@ -26188,7 +26259,7 @@ fn isArrayIndexGuarded(ctx: GuardLineCtx) bool {
     if (hasEarlyReturnLengthGuard(ctx.lines, ctx.idx, ctx.t)) return true;
     if (hasLoopInitGuard(ctx.lines, ctx.idx, ctx.t)) return true;
     if (hasRangeEndInitGuard(ctx.lines, ctx.idx, ctx.t)) return true;
-    if (hasBlockOrExitGuard(ctx.lines, ctx.idx, ctx.t)) return true;
+    if (hasBlockOrExitGuard(ctx)) return true;
     return false;
 }
 
@@ -27311,22 +27382,70 @@ fn extractIndexSubtraction(line: []const u8) ?IdxSub {
 }
 
 /// Check if init value after = is >= subtrahend (direct or via + offset)
+/// The literal parser owns the base prefixes and the underscore
+/// separators: `var i = 0x10` witnesses 16, not a parse failure
+/// (EPH-I0994). A witness binds only when its literal closes the
+/// init text, or the operator after it cannot decrease the value: a
+/// remainder can reduce the init below the literal (`var i = 5 - 3`
+/// inits 2, `var i = 5 / 3` inits 1), so a first-token witness would
+/// silence a real underflow. The first arm keeps the close rule only;
+/// the plus arm binds only when the pre-plus region is one complete
+/// numeric literal (`var i = n - 100 + 10` inits n - 90, so a
+/// remainder witness on 10 would silence a real underflow) and owns
+/// the `+`-chain remainders (EPH-I0994).
 fn initValueExceedsSubtrahend(ctx: []const u8, subtrahend: usize) bool {
     const eq_pos = mem.lastIndexOf(u8, ctx, "= ") orelse return false;
     const after_eq = mem.trim(u8, ctx[eq_pos + 2 ..], " ;");
     if (after_eq.len == 0) return false;
-    if (after_eq[0] >= '0' and after_eq[0] <= '9') {
-        const init_val = std.fmt.parseInt(usize, after_eq, 10) catch return false;
-        if (init_val >= subtrahend) return true;
-    }
+    if (closingLiteralCovers(after_eq, subtrahend)) return true;
     if (mem.indexOf(u8, after_eq, "+ ")) |plus_pos| {
+        // The remainder witness must not bind when the pre-plus region
+        // is not one complete literal: `var i = n - 100 + 10 + 3`
+        // inits n - 87, and a witness on the `10 + 3` remainder would
+        // silence `arr[i - 6]` (EPH-I0994 chain residual). An
+        // identifier pre-plus (`var i = x + 10`) fires too: FP over FN
+        // is the correct direction for this rule.
+        const before_plus = mem.trim(u8, after_eq[0..plus_pos], " \t");
+        if (!closingLiteralCovers(before_plus, 0)) return false;
         const after_plus = mem.trim(u8, after_eq[plus_pos + 2 ..], " ;");
-        if (after_plus.len > 0 and after_plus[0] >= '0' and after_plus[0] <= '9') {
-            const offset = std.fmt.parseInt(usize, after_plus, 10) catch return false;
-            if (offset >= subtrahend) return true;
-        }
+        if (remainderLiteralCovers(after_plus, subtrahend)) return true;
     }
     return false;
+}
+
+/// True when `text` is one numeric literal of at least `subtrahend`.
+/// The literal must close the text: an operator after it can change
+/// the init value, and a decreasing operator (`-`, `/`, `%`, `*`,
+/// `&`, `^`, `>>`, `**`) makes the literal only an upper bound
+/// (EPH-I0994).
+fn closingLiteralCovers(text: []const u8, subtrahend: usize) bool {
+    const lit = parseNumericLiteral(text, 0) orelse return false;
+    return lit.end == text.len and lit.value >= subtrahend;
+}
+
+/// True when the numeric literal at the start of `text` proves the
+/// init value at least `subtrahend`: the literal closes the text, or
+/// the operator after it cannot decrease the value (`+`, `|`, `<<`).
+/// A decreasing operator makes the first token unverifiable —
+/// `var i = x + 10 / 20` inits x, so a witness of 10 would silence
+/// `arr[i - 6]` (EPH-I0994).
+fn remainderLiteralCovers(text: []const u8, subtrahend: usize) bool {
+    const lit = parseNumericLiteral(text, 0) orelse return false;
+    if (lit.value < subtrahend) return false;
+    if (lit.end == text.len) return true;
+    var j = lit.end;
+    while (j < text.len and (text[j] == ' ' or text[j] == '\t')) j += 1;
+    if (j >= text.len) return true;
+    return !literalAfterOpDecreases(text[j]);
+}
+
+/// True when the operator at `c` can make the value smaller than the
+/// literal before it. The decreasing set is exactly `-`, `/`, `%`,
+/// `*`, `&`, `^`, and `>`; the `>` start covers `>>` and the `*`
+/// start covers `**`. The remaining binary operators (`+`, `|`, `<<`)
+/// cannot decrease a non-negative left operand (EPH-I0994).
+fn literalAfterOpDecreases(c: u8) bool {
+    return c == '-' or c == '/' or c == '%' or c == '*' or c == '&' or c == '^' or c == '>';
 }
 
 /// Check if loop initialization guarantees minimum index value
@@ -27887,28 +28006,36 @@ fn elseOpenKind(ctx: []const u8) ?ElseOpenKind {
     return null;
 }
 
-/// True when the Allman header above the bare `{` body open at
-/// `open_idx` guards `var_name`. The header is the first non-comment
-/// line above; it must be a conditional/loop opener carrying no `{` and
-/// no statement end of its own — otherwise the `{` line is a separate
-/// block, not the opener's body (the crossClosedBlock discipline,
-/// EPH-I0951). Pre-fix the walk saw the header at depth 0 and the
-/// in-body decrement fired (EPH-I0952).
-fn allmanHeaderGuardHasVar(
+/// The Allman header lookup context: the function slice, the walk stop
+/// line, the body open's own line, and the guarded variable (EPH-I0952,
+/// EPH-I0995).
+const AllmanHeaderCtx = struct {
     lines: []const []const u8,
     stop: usize,
     open_idx: usize,
     var_name: []const u8,
-) bool {
-    var k = open_idx;
-    while (k > stop) {
+};
+
+/// True when the Allman header above the bare `{` body open at
+/// `ctx.open_idx` guards `ctx.var_name`. The header is the first
+/// non-comment line above; it must be a conditional/loop opener
+/// carrying no `{` and no statement end of its own — otherwise the `{`
+/// line is a separate block, not the opener's body (the
+/// crossClosedBlock discipline, EPH-I0951). Pre-fix the walk saw the
+/// header at depth 0 and the in-body decrement fired (EPH-I0952). A
+/// literal amount judges the header's proven bound: `if (m > 1)` covers
+/// `m -= 1` but not `m -= 5` (EPH-I0995).
+fn allmanHeaderGuardHasVar(ctx: AllmanHeaderCtx, amount: ?usize) bool {
+    var k = ctx.open_idx;
+    while (k > ctx.stop) {
         k -= 1;
-        const above = mem.trim(u8, lines[k], " \t\r");
+        const above = mem.trim(u8, ctx.lines[k], " \t\r");
         if (isCommentOrMultilineString(above)) continue;
         if (!lineCarriesOpenBrace(above) and
             !lineCarriesStatementEnd(above) and
             (isConditionalStart(above) or isLoopStart(above)) and
-            hasConditionalGuardForVar(above, var_name)) return true;
+            hasConditionalGuardForVar(above, ctx.var_name) and
+            allmanHeaderCoversAmount(above, ctx.var_name, amount)) return true;
         break;
     }
     return false;
@@ -27916,9 +28043,9 @@ fn allmanHeaderGuardHasVar(
 
 /// True when the Allman header above the bare `{` body open at
 /// `open_idx` proves the bound. The amount-aware twin of
-/// allmanHeaderGuardHasVar; the header must be a loop opener (an Allman
-/// `if` header stays unjudged: guardConditionSpan requires the `{` on
-/// the if's own line) (EPH-I0952).
+/// allmanHeaderGuardHasVar; the header must be a conditional or loop
+/// opener. An Allman `if` header proves the bound like the `while`
+/// header: its own condition governs the body (EPH-I0952, EPH-I0976).
 fn allmanHeaderGuardHasBound(
     bctx: EnclosingBoundCtx,
     stop: usize,
@@ -27931,11 +28058,20 @@ fn allmanHeaderGuardHasBound(
         if (isCommentOrMultilineString(above)) continue;
         if (!lineCarriesOpenBrace(above) and
             !lineCarriesStatementEnd(above) and
-            isLoopStart(above) and
-            openerCoversBound(bctx, above, k)) return true;
+            (isLoopStart(above) or isConditionalStart(above)) and
+            allmanOpenerCoversBound(bctx, above, k)) return true;
         break;
     }
     return false;
+}
+
+/// True when the Allman header's proven bound clears the decrement
+/// amount; a null amount keeps the shape-only verdict. A header that
+/// proves no bound does not cover — the body can run unguarded
+/// (EPH-I0961, EPH-I0995).
+fn allmanHeaderCoversAmount(header: []const u8, var_name: []const u8, amount: ?usize) bool {
+    if (amount == null) return true;
+    return allmanLineCoversAmount(header, var_name, amount.?);
 }
 
 /// Walk backwards through enclosing blocks, checking for a guarded variable
@@ -27954,11 +28090,14 @@ fn allmanHeaderGuardHasBound(
 /// (`if (x > 1) { ... } else {` above the candidate) is detected through
 /// its `else` keyword, and the opener check judges only the arm's own
 /// region after the `else` — the antecedent condition on the same line
-/// is negated for the arm below (EPH-I0965).
+/// is negated for the arm below (EPH-I0965). A literal amount judges
+/// the matched guard's proven bound: `if (m > 1) { ... m -= 5; }`
+/// fires because m >= 2 does not clear 5 (EPH-I0995).
 fn hasEnclosingGuardForVar(
     lines: []const []const u8,
     current_idx: usize,
     var_name: []const u8,
+    amount: ?usize,
 ) bool {
     const stop = current_idx -| enclosing_block_lookback;
     var brace_depth: i32 = 0;
@@ -27980,7 +28119,8 @@ fn hasEnclosingGuardForVar(
         const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
         if (brace_depth < 0) {
             if (!skip_antecedent and
-                hasConditionalGuardForVar(elseArmRegion(ctx), var_name)) return true;
+                hasConditionalGuardForVar(elseArmRegion(ctx), var_name) and
+                guardRegionCovers(elseArmRegion(ctx), var_name, amount)) return true;
             skip_antecedent = false;
             brace_depth = 0;
             // An Allman body open is the bare `{` line under the opener:
@@ -27989,7 +28129,12 @@ fn hasEnclosingGuardForVar(
             // K&R shape (EPH-I0952; the header lookup mirrors
             // crossClosedBlock, EPH-I0951).
             if (ctx.len > 0 and ctx[0] == '{' and
-                allmanHeaderGuardHasVar(lines, stop, i, var_name)) return true;
+                allmanHeaderGuardHasVar(.{
+                    .lines = lines,
+                    .stop = stop,
+                    .open_idx = i,
+                    .var_name = var_name,
+                }, amount)) return true;
         }
         // The else-open is the arm's opener only when the walk crosses
         // it at depth 0 — the arm's `{` then opens the candidate's own
@@ -28000,7 +28145,8 @@ fn hasEnclosingGuardForVar(
         // crossing is the arm's close, no antecedent skip applies.
         if (kind) |k| {
             if (!skip_antecedent and k == .chain and
-                hasConditionalGuardForVar(elseArmRegion(ctx), var_name)) return true;
+                hasConditionalGuardForVar(elseArmRegion(ctx), var_name) and
+                guardRegionCovers(elseArmRegion(ctx), var_name, amount)) return true;
             // Only a CLASSIC else-open (`} else {`) has its antecedent
             // on a line above: the next opener crossed is that
             // antecedent and must be skipped. A mid-line else-open
@@ -28013,6 +28159,15 @@ fn hasEnclosingGuardForVar(
         if (isFuncBoundary(ctx)) return false;
     }
     return false;
+}
+
+/// True when the guard region's proven lower bound clears the decrement
+/// amount; a null amount keeps the shape-only verdict. A region that
+/// proves no bound (an or-tail, a comparison in call position) does not
+/// cover — the body can run unguarded (EPH-I0961, EPH-I0995).
+fn guardRegionCovers(region: []const u8, var_name: []const u8, amount: ?usize) bool {
+    if (amount == null) return true;
+    return guardLineCoversAmount(region, var_name, amount.?);
 }
 
 /// The proven lower bound of a comparison on `var_name` in the opener
@@ -28080,7 +28235,62 @@ fn guardConditionSpan(t: []const u8) ?GuardSpan {
         var k = close + 1;
         while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
         if (k < t.len and t[k] == '{') return .{ .start = j + 1, .end = close };
+        // A brace-less body (`if (a > 0) a -= 1;`) is still the
+        // opener's condition; only the ternary-if exclusion (an `else`
+        // branch between the group and the statement end) rejects the
+        // group (EPH-I0995).
+        if (braceLessIfBodyEndsBeforeElse(t, close)) return .{ .start = j + 1, .end = close };
         from = close + 1;
+    }
+    return null;
+}
+
+/// True when the text after the if-group's close at `close` carries a
+/// code-position `;` before any code-position `else` keyword: the group
+/// opens a brace-less statement body. A ternary if-expression always
+/// carries its `else` before the statement's `;`, so the exclusion
+/// holds (EPH-I0995).
+fn braceLessIfBodyEndsBeforeElse(t: []const u8, close: usize) bool {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var i = close + 1;
+    while (i < t.len) : (i += 1) {
+        if (cls.isInsideString(i)) continue;
+        if (comment_start != null and i >= comment_start.?) return false;
+        if (t[i] == ';') return true;
+        if (isCodeElseAt(t, i)) return false;
+    }
+    return false;
+}
+
+/// True when a code-position `else` keyword starts at `i`: the word
+/// boundary keeps an identifier prefix (`xelse`, `elsewhere`) from
+/// matching (EPH-I0995).
+fn isCodeElseAt(t: []const u8, i: usize) bool {
+    if (!mem.startsWith(u8, t[i..], "else")) return false;
+    if (i > 0 and isIdent(t[i - 1])) return false;
+    if (i + 4 < t.len and isIdent(t[i + 4])) return false;
+    return true;
+}
+
+/// The guard-condition region of an Allman header: the first
+/// `if`/`while` keyword's paren group on the line. No `{` is required
+/// after the group — the Allman body open sits on the line below. The
+/// caller gates the header shape first (no open brace, no statement
+/// end), so the ternary-if exclusion cannot misread a value expression
+/// as an opener (EPH-I0976).
+fn allmanGuardConditionSpan(t: []const u8) ?GuardSpan {
+    var from: usize = 0;
+    while (nextGuardKeywordPos(t, from)) |kw| {
+        const kw_len: usize = if (t[kw] == 'w') 5 else 2;
+        var j = kw + kw_len;
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+        if (j >= t.len or t[j] != '(') {
+            from = kw + kw_len;
+            continue;
+        }
+        const close = matchingCloseParenOnLine(t, j) orelse return null;
+        return .{ .start = j + 1, .end = close };
     }
     return null;
 }
@@ -28348,6 +28558,22 @@ fn openerCoversBound(ctx: EnclosingBoundCtx, opener_line: []const u8, opener_idx
     return !indexVarReassignedAfter(ctx.lines, opener_idx + 1, ctx.current_idx, ctx.var_name);
 }
 
+/// True when the Allman header at `header_idx` proves the bound AND no
+/// line between the header and the candidate reassigns the var — the
+/// amount-aware twin of openerCoversBound. The header judge uses the
+/// Allman span: no `{` is required on the header line (EPH-I0976).
+fn allmanOpenerCoversBound(
+    ctx: EnclosingBoundCtx,
+    header: []const u8,
+    header_idx: usize,
+) bool {
+    const span = allmanGuardConditionSpan(header) orelse return false;
+    var budget = GuardDepthBudget{ .remaining = max_guard_expr_depth, .exhausted = false };
+    const bound = guardExprBound(header, ctx.var_name, span, &budget) orelse return false;
+    if (bound < ctx.min_bound) return false;
+    return !indexVarReassignedAfter(ctx.lines, header_idx + 1, ctx.current_idx, ctx.var_name);
+}
+
 /// Walk backwards through enclosing blocks, checking for a block opener
 /// whose condition proves `var_name >= min_bound`. The walk mirrors
 /// hasEnclosingGuardForVar (same lookback window, block-opener
@@ -28404,9 +28630,9 @@ fn hasEnclosingBoundForVar(
             brace_depth = 0;
             // An Allman body open is the bare `{` line under the opener
             // (EPH-I0952): the header's condition never registered because
-            // the depth went negative on the `{`. Judge a loop header above
-            // like the K&R shape. An Allman `if` header stays unjudged:
-            // guardConditionSpan requires the `{` on the if's own line.
+            // the depth went negative on the `{`. Judge the header above
+            // like the K&R shape — an Allman `if` header proves the bound
+            // the same way (EPH-I0976).
             if (ctx.len > 0 and ctx[0] == '{' and
                 allmanHeaderGuardHasBound(bctx, stop, i)) return true;
         }
@@ -28435,31 +28661,62 @@ fn hasEnclosingBoundForVar(
 }
 
 /// True when the line's first subtraction bracket sits in an enclosing
-/// lower-bound block or behind a prior-line zero-check exit, and every
-/// later subtraction bracket carries its own witness or scope guard
-/// (EPH-I0935, EPH-I0939). The scope guard binds the first bracket's
-/// own var: `if (j > 0) { arr[i - 1] }` proves nothing about i
-/// (band-B12 F17, EPH-I0506). Both witnesses prove a BOUND: the
-/// enclosing guard must show var >= subtrahend (`if (n > 0) {
-/// arr[0 .. n - 2] }` still underflows at n == 1), and the zero-check
-/// exit proves var >= 1, so it covers subtrahends <= 1 only
-/// (EPH-I0959). The first-bracket witness covers only its own bracket:
-/// a later unwitnessed bracket still fires.
-fn hasBlockOrExitGuard(
-    lines: []const []const u8,
-    current_idx: usize,
-    current_line: []const u8,
-) bool {
-    const sub = firstBracketSubVar(current_line) orelse return false;
-    if (!hasEnclosingBoundForVar(lines, current_idx, sub.idx_var, sub.subtrahend) and
-        !hasBreakGuardOnPriorLines(lines, current_idx, sub.idx_var, sub.subtrahend)) return false;
-    const scan_end = initReassignScanEnd(lines, current_idx);
-    return everyLaterBracketWitnessed(lines, current_idx, current_line, scan_end);
+/// lower-bound block, behind a prior-line zero-check exit, or under a
+/// CFG guard-meet record, and every later subtraction bracket carries
+/// its own witness or scope guard (EPH-I0935, EPH-I0939, EPH-I0996).
+/// The scope guard binds the first bracket's own var: `if (j > 0) {
+/// arr[i - 1] }` proves nothing about i (band-B12 F17, EPH-I0506).
+/// Both witnesses prove a BOUND: the enclosing guard must show var >=
+/// subtrahend (`if (n > 0) { arr[0 .. n - 2] }` still underflows at
+/// n == 1), and the zero-check exit proves var >= 1, so it covers
+/// subtrahends <= 1 only (EPH-I0959). The meet record is judged the
+/// same way, with the guard-to-candidate reassignment discipline
+/// (EPH-I0962, EPH-I0996). The first-bracket witness covers only its
+/// own bracket: a later unwitnessed bracket still fires.
+fn hasBlockOrExitGuard(ctx: GuardLineCtx) bool {
+    const sub = firstBracketSubVar(ctx.t) orelse return false;
+    if (!hasEnclosingBoundForVar(ctx.lines, ctx.idx, sub.idx_var, sub.subtrahend) and
+        !hasBreakGuardOnPriorLines(ctx.lines, ctx.idx, sub.idx_var, sub.subtrahend) and
+        !cfgGuardCoversBracket(ctx, sub)) return false;
+    const scan_end = initReassignScanEnd(ctx.lines, ctx.idx);
+    return everyLaterBracketWitnessed(ctx.lines, ctx.idx, ctx.t, scan_end);
+}
+
+/// True when the CFG guard meet holds a guard on the bracket's var at
+/// the candidate line whose proven bound clears the subtrahend, with no
+/// guard-to-candidate reassignment: `if (n > 1) { n = 1; arr[0 .. n - 2]
+/// }` underflows at n == 1 (EPH-I0962). The later of the entry and the
+/// local record anchors the scan — the local record re-establishes the
+/// guard after an intervening write (EPH-I0996). A record on the
+/// candidate's own line is never consulted: a one-line chain's records
+/// mix the arms (`if (q > 2) { n - 2 } else if (n > 1) { ... }` would
+/// let the else-if condition silence the then-arm), and the same-line
+/// guard classes have their own judges (EPH-I0965 f2b).
+fn cfgGuardCoversBracket(ctx: GuardLineCtx, sub: IdxSub) bool {
+    var guard_idx: ?usize = null;
+    if (ctx.entry_guards.get(sub.idx_var)) |gi| {
+        if (gi < ctx.idx) guard_idx = gi;
+    }
+    if (ctx.local_guards.get(sub.idx_var)) |gi| {
+        if (gi < ctx.idx and (guard_idx == null or gi > guard_idx.?)) guard_idx = gi;
+    }
+    const gi = guard_idx orelse return false;
+    if (!guardCoversDecrement(ctx, gi, sub.idx_var, sub.subtrahend)) return false;
+    // A guard on the candidate's own line leaves no scan range; a
+    // later line cannot exist between them.
+    const scan_start = gi + 1;
+    if (scan_start >= ctx.idx) return true;
+    return !indexVarReassignedAfter(ctx.lines, scan_start, ctx.idx, sub.idx_var);
 }
 
 /// Check if current line is inside an enclosing block guarded by if/while (var > 0) for decrements
-fn hasEnclosingVarGuard(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
-    return hasEnclosingGuardForVar(lines, current_idx, var_name);
+fn hasEnclosingVarGuard(
+    lines: []const []const u8,
+    current_idx: usize,
+    var_name: []const u8,
+    amount: ?usize,
+) bool {
+    return hasEnclosingGuardForVar(lines, current_idx, var_name, amount);
 }
 
 /// Check if a real operand ends at or before `pos` in an index expression:
@@ -29073,11 +29330,20 @@ fn hasComparisonGuardPattern(line: []const u8) bool {
 /// the comparison to the var: a lower-bound comparison (`>`, `>=`,
 /// `!= 0`) or a zero-exclusion exit (`if (x == 0) return;`). A
 /// comparison on another var — `if (j > 0) x -= 1;` — guards nothing
-/// (band-B12 F17, EPH-I0506).
-fn hasGuardOnLine(line: []const u8, var_name: []const u8) bool {
+/// (band-B12 F17, EPH-I0506). A literal amount judges the guard's
+/// proven bound: `if (m > 1) { m -= 5; }` fires because m >= 2 does
+/// not clear 5, and the zero-exit covers amounts <= 1 only
+/// (EPH-I0995). A null amount keeps the shape-only verdict.
+fn hasGuardOnLine(line: []const u8, var_name: []const u8, amount: ?usize) bool {
     if (!mentionsIdent(line, var_name)) return false;
-    if (hasLowerBoundGuardForVar(line, var_name, line.len)) return true;
-    if (hasExitStatement(line) and hasEqualsZeroGuardForVar(line, var_name)) return true;
+    if (hasLowerBoundGuardForVar(line, var_name, line.len)) {
+        if (amount) |amt| return guardLineCoversAmount(line, var_name, amt);
+        return true;
+    }
+    if (hasExitStatement(line) and hasEqualsZeroGuardForVar(line, var_name)) {
+        if (amount) |amt| return amt <= 1;
+        return true;
+    }
     return false;
 }
 
@@ -29407,16 +29673,52 @@ fn hasMidLineMultilineOpener(t: []const u8) bool {
 /// True when the line ends a multiline string under the cross-line
 /// model: it starts with an expression terminator (`;` or `,`), or it
 /// starts with a closer that validly follows the string expression
-/// (`);`, `};`, `],` shapes). A `}` line is code only when a
-/// `;`/`,`/`)` follows the brace — `} text` stays string content
-/// (EPH-I0944 continuation pin; EPH-I0972).
-fn isMultilineStringTerminator(t: []const u8) bool {
+/// (`);`, `};`, `],` shapes). A `}` line is code when the brace is
+/// bare (a container or block close on its own line — EPH-I0973) or a
+/// `;`/`,`/`)` follows the brace and the string region opened a
+/// container (`open_braces > 0` — `} ;` closes a container in valid
+/// Zig and a broken block in invalid Zig — EPH-I0974). `} text` stays
+/// string content (EPH-I0944 continuation pin). The `)`/`]` arms
+/// judge the closer tail: `);`-shaped and `) } ;`-shaped tails are
+/// code, a prose tail (`) } weird`) is a broken continuation in an
+/// invalid region and stays content (EPH-I0974).
+fn isMultilineStringTerminator(t: []const u8, open_braces: isize) bool {
     if (mem.startsWith(u8, t, ";") or mem.startsWith(u8, t, ",")) return true;
-    if (mem.startsWith(u8, t, ")") or mem.startsWith(u8, t, "]")) return true;
+    if (mem.startsWith(u8, t, ")")) return closerTailIsCode(t[1..]);
+    if (mem.startsWith(u8, t, "]")) return closerTailIsCode(t[1..]);
     if (!mem.startsWith(u8, t, "}")) return false;
     const rest = mem.trim(u8, t[1..], " \t");
-    return mem.startsWith(u8, rest, ";") or
-        mem.startsWith(u8, rest, ",") or mem.startsWith(u8, rest, ")");
+    if (rest.len == 0) return true;
+    return open_braces > 0 and closerTailIsCode(rest);
+}
+
+/// True when the rest of a closer line is a valid statement tail: an
+/// empty tail (a bare `)`/`]` close), a punctuation close (`;`, `,`,
+/// `)`, `]`), a nested closer (`}`-shaped), or a postfix keyword
+/// (`catch`, `orelse`, `else`, `and`, `or`). A tail that runs into
+/// prose (`) } weird`) is a broken continuation in an invalid region
+/// and stays string content (EPH-I0974).
+fn closerTailIsCode(rest: []const u8) bool {
+    const r = mem.trim(u8, rest, " \t");
+    if (r.len == 0) return true;
+    if (mem.startsWith(u8, r, ";") or mem.startsWith(u8, r, ",") or
+        mem.startsWith(u8, r, ")") or mem.startsWith(u8, r, "]")) return true;
+    if (mem.startsWith(u8, r, "}")) return closerTailIsCode(r[1..]);
+    return tailStartsWithKeyword(r);
+}
+
+/// True when the tail starts with a postfix keyword that validly
+/// continues a closed expression: `) catch unreachable;`, `) orelse
+/// 5;`, `) else 5;`, `) and b) {`, `) or b) {` (EPH-I0974). The word
+/// boundary keeps an identifier prefix (`orx`) from matching.
+fn tailStartsWithKeyword(r: []const u8) bool {
+    const keywords = [_][]const u8{ "catch", "orelse", "else", "and", "or" };
+    for (keywords) |kw| {
+        if (!mem.startsWith(u8, r, kw)) continue;
+        if (r.len > kw.len and isIdent(r[kw.len])) continue;
+        return true;
+    }
+    return false;
 }
 
 /// Cross-line literal mask for the ZA904 lookback window (EPH-I0944):
@@ -29425,27 +29727,35 @@ fn isMultilineStringTerminator(t: []const u8) bool {
 /// following line content until a terminator line ends the string.
 /// Terminators are `;`/`,`-starting lines and closer lines (`);`, `};`,
 /// `],`) — they stay code, so `; }` keeps its real `}` and a
-/// `);`-closed call does not swallow the code after it (EPH-I0972).
-/// `\\`-starting lines are content in every state and the walk skips
-/// them via isCommentOrMultilineString.
+/// `);`-closed call does not swallow the code after it (EPH-I0972). A
+/// bare `}` on its own line closes the container (EPH-I0973). The
+/// `}`-closer with `;`/`,`/`)` after the brace needs an open container
+/// in the region: `} ;` closes a container in valid Zig and a broken
+/// block in invalid Zig (EPH-I0974). `\\`-starting lines are content
+/// in every state and the walk skips them via
+/// isCommentOrMultilineString.
 /// Residual: a single-line `\\` string whose real terminator is not
 /// terminator-shaped (`const msg = \\usage;` then `const y = 5;`) makes
 /// the state swallow code lines until the next terminator-shaped line
 /// (EPH-I0972).
 fn classifyMultilineContent(lines: []const []const u8, start: usize, idx: usize, out: []bool) void {
     var in_string = false;
+    var open_braces: isize = 0;
+    var mask_buf: [256]u8 = undefined;
     for (start..idx) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (!in_string) {
             out[i - start] = false;
-            if (hasMidLineMultilineOpener(t)) in_string = true;
+            if (!hasMidLineMultilineOpener(t)) continue;
+            in_string = true;
+            open_braces = braceBalance(maskOrRaw(t, &mask_buf));
             continue;
         }
         // The terminator starts with an expression terminator (`;` or
         // `,`) or a closer that validly follows the string (`);`, `};`);
         // it stays code and ends the string. Every other line below the
         // opener is string content.
-        if (isMultilineStringTerminator(t)) {
+        if (isMultilineStringTerminator(t, open_braces)) {
             in_string = false;
             out[i - start] = false;
             continue;
@@ -29466,11 +29776,14 @@ fn classifyMultilineContent(lines: []const []const u8, start: usize, idx: usize,
 /// braceBalance as a real brace, so the range-for depth stays 0 and a
 /// genuine header below still proves the cast. The string's terminator
 /// line stays code: `; }` keeps its real `}` and a cast below the closed
-/// loop fires. The invalid-Zig continuation shape (ZR104 flags it) now
-/// behaves like the valid `\\`-starting shape. Residual: a single-line
-/// `\\` string whose real terminator does not start with `;`/`,` (see
-/// classifyMultilineContent) — the mask swallows code until the next
-/// terminator-shaped line.
+/// loop fires. The invalid-Zig continuation shapes (ZR104 flags them —
+/// `} text`, `) } weird`, `} ;` without an open container) stay masked
+/// like the valid `\\`-starting shape; a `)`/`]`-starting line whose
+/// tail reads as a valid closer (`);`, `)) {`, `) } ;`) is code even
+/// when the surrounding region is invalid (EPH-I0974). Residual: a
+/// single-line `\\` string whose real terminator does not start with
+/// `;`/`,` (see classifyMultilineContent) — the mask swallows code
+/// until the next terminator-shaped line.
 fn hasCastBoundsProof(
     lines: []const []const u8,
     idx: usize,
@@ -71269,14 +71582,14 @@ test "findEnclosingIfLine finds and misses by the same window (EPH-I0225)" {
 test "hasEnclosingGuardForVar finds a guard inside the window (EPH-I0225)" {
     var buf: [8][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "if (count > 0) {", 1);
-    try std.testing.expect(hasEnclosingGuardForVar(lines, lines.len - 1, "count"));
+    try std.testing.expect(hasEnclosingGuardForVar(lines, lines.len - 1, "count", null));
 }
 
 test "hasEnclosingGuardForVar misses a guard beyond the window (EPH-I0225)" {
     var buf: [50][]const u8 = undefined;
     const lines = guardScanFixture(&buf, "work();", "if (count > 0) {", 1);
     // The opener is 48 lines back, past the 40-line window (accepted FN).
-    try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "count"));
+    try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "count", null));
 }
 
 test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
@@ -71290,7 +71603,7 @@ test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
     try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1, "x"));
     try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1, 0) == null);
     try std.testing.expect(findEnclosingIfLine(lines, lines.len - 1) == null);
-    try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "x"));
+    try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "x", null));
 }
 
 // --- Integration tests with exact counts ---
@@ -74513,6 +74826,326 @@ test "ZA903: non-decimal index-form subtrahends bind the witness amount (EPH-I09
     ) == 3);
 }
 
+test "ZA903: Allman if header proves the bound above a bare-brace body (EPH-I0976)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (n > 2)` with the `{` on the next line: the header's own
+    // condition governs the bare-brace body, so `buf[n - 1]` stays
+    // silent like the K&R twin and the Allman-while twin. Pre-fix only
+    // loop headers were judged and the if twin fired (EPH-I0976).
+    const content =
+        \\fn allman_if_bound(n: usize) usize {
+        \\    var buf = [_]usize{0} ** 10;
+        \\    if (n > 2)
+        \\    {
+        \\        return buf[n - 1];
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_allman_if_bound.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(
+            run.issues.items,
+            "test_za903_allman_if_bound.zig",
+            RULE_INDEX_ARITHMETIC,
+        ),
+    );
+}
+
+test "ZA903: Allman if header below the subtrahend still fires (EPH-I0976)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The amount judgment binds the Allman if header like the loop
+    // twin: `n > 2` proves n >= 3, which does not cover `buf[n - 4]`
+    // (EPH-I0976).
+    const content =
+        \\fn allman_if_too_small(n: usize) usize {
+        \\    var buf = [_]usize{0} ** 10;
+        \\    if (n > 2)
+        \\    {
+        \\        return buf[n - 4];
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_allman_if_small.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za903_allman_if_small.zig",
+            RULE_INDEX_ARITHMETIC,
+        ),
+    );
+}
+
+test "ZA903: non-decimal init literals witness the loop-init bound (EPH-I0994)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `var i = 0x10` inits i to 16, which covers `arr[i - 1]`; the
+    // decimal-only init parse read the hex literal as unparseable and
+    // the loop-init witness failed (FP). The fire twin's init 0x1 is 1,
+    // which does not cover `arr[i - 2]` (EPH-I0994).
+    const content =
+        \\fn hex_init_ok(arr: []usize, n: usize) usize {
+        \\    var i = 0x10;
+        \\    while (n > 0) {
+        \\        return arr[i - 1];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn hex_init_fire(arr: []usize, n: usize) usize {
+        \\    var i = 0x1;
+        \\    while (n > 0) {
+        \\        return arr[i - 2];
+        \\    }
+        \\    return i;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_hex_init.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za903_hex_init.zig",
+            RULE_INDEX_ARITHMETIC,
+        ),
+    );
+}
+
+test "ZA903: loop-init witness requires the literal to close the init (EPH-I0994)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `var i = 5 - 3` inits 2 and `var i = 5 / 3` inits 1: the
+    // first-token literal is only an upper bound, so `arr[i - 5]`
+    // fires in both. `var i = 5 + 10 / 20` inits 5: the plus-arm
+    // remainder `10 / 20` does not close, so `arr[i - 6]` fires.
+    // `var i = 0 + 10 ^ 3` inits 9: xor can decrease the literal,
+    // so `arr[i - 10]` fires. `var i = n - 100 + 10 + 3` inits
+    // n - 87 and `var i = n - 100 + 10` inits n - 90: the pre-plus
+    // region is not one complete literal, so both fire.
+    // `var i = 5 + 3` inits 8 and `var i = 5 + 10 + 3` inits 18:
+    // the pre-plus literal closes and the remainder covers, so both
+    // stay silent. The revert-run baseline was the uncommitted
+    // r1-state body, where the same three shapes fired and the other
+    // five stayed silent (EPH-I0994).
+    const content =
+        \\fn sub_init_fire(arr: []usize, n: usize) usize {
+        \\    var i = 5 - 3;
+        \\    while (n > 0) {
+        \\        return arr[i - 5];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn div_init_fire(arr: []usize, n: usize) usize {
+        \\    var i = 5 / 3;
+        \\    while (n > 0) {
+        \\        return arr[i - 5];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn plus_rem_fire(arr: []usize, n: usize) usize {
+        \\    var i = 5 + 10 / 20;
+        \\    while (n > 0) {
+        \\        return arr[i - 6];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn plus_close_ok(arr: []usize, n: usize) usize {
+        \\    var i = 5 + 3;
+        \\    while (n > 0) {
+        \\        return arr[i - 3];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn xor_rem_fire(arr: []usize, n: usize) usize {
+        \\    var i = 0 + 10 ^ 3;
+        \\    while (n > 0) {
+        \\        return arr[i - 10];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn chain_pre_fire(arr: []usize, n: usize) usize {
+        \\    var i = n - 100 + 10 + 3;
+        \\    while (n > 0) {
+        \\        return arr[i - 6];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn preclose_fire(arr: []usize, n: usize) usize {
+        \\    var i = n - 100 + 10;
+        \\    while (n > 0) {
+        \\        return arr[i - 6];
+        \\    }
+        \\    return i;
+        \\}
+        \\fn chain_sound_ok(arr: []usize, n: usize) usize {
+        \\    var i = 5 + 10 + 3;
+        \\    while (n > 0) {
+        \\        return arr[i - 10];
+        \\    }
+        \\    return i;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_init_remainder.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 6),
+        countRuleIssues(
+            run.issues.items,
+            "test_za903_init_remainder.zig",
+            RULE_INDEX_ARITHMETIC,
+        ),
+    );
+}
+
+test "ZA903: chain-arm own condition witnesses an in-arm range end (EPH-I0996)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `} else if (m > 3) {` proves m >= 4, which covers the range end
+    // `arr[0 .. m - 3]` deep inside the arm — the ZA903 twin of the
+    // batch-41 chain-arm decrement verdict. Pre-fix isArrayIndexGuarded
+    // never consulted the CFG meet for the index var and fired. The
+    // wrong-var twin (`q > 3` guards q, not m) still fires (EPH-I0996).
+    const content =
+        \\fn chain_guarded(arr: []usize, x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (m == 1) { return 0; } else if (m > 3) {
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        return arr[0 .. m - 3][0];
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn chain_wrong_var(arr: []usize, x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (m == 1) { return 0; } else if (q > 3) {
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        sink(q);
+        \\        return arr[0 .. m - 3][0];
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn sink(v: usize) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_chain_arm.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za903_chain_arm.zig",
+            RULE_INDEX_ARITHMETIC,
+        ),
+    );
+}
+
 test "ZA903: wrapped range end with an additive tail stays silent (EPH-I0958 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -75740,8 +76373,8 @@ test "guard helpers match vars on identifier boundaries (EPH-I0493)" {
     // helpers. Every helper now gates on boundary-checked matching.
     try std.testing.expect(!mentionsIdent("var max_x = 1;", "x"));
     try std.testing.expect(mentionsIdent("var x = 1;", "x"));
-    try std.testing.expect(!hasGuardOnLine("if (max_x > 0) return;", "x"));
-    try std.testing.expect(hasGuardOnLine("if (x > 0) return;", "x"));
+    try std.testing.expect(!hasGuardOnLine("if (max_x > 0) return;", "x", null));
+    try std.testing.expect(hasGuardOnLine("if (x > 0) return;", "x", null));
     try std.testing.expect(!hasConditionalGuardForVar("if (max_x > 0) {", "x"));
     try std.testing.expect(hasConditionalGuardForVar("if (x > 0) {", "x"));
     try std.testing.expect(hasNullEqualityCheck("if (ax == null) return 0;", "x") == null);
@@ -75796,12 +76429,12 @@ test "same-line decrement guards relate to the decremented var (EPH-I0506)" {
     // band-B12 F17: hasGuardOnLine's comparisons must bind the var —
     // `if (j > 0) x -= 1;` stays unguarded, `if (x > 0) x -= 1;` and
     // the zero-exclusion exit stay silent.
-    try std.testing.expect(!hasGuardOnLine("if (j > 0) x -= 1;", "x"));
-    try std.testing.expect(hasGuardOnLine("if (x > 0) x -= 1;", "x"));
-    try std.testing.expect(hasGuardOnLine("if (x == 0) return; x -= 1;", "x"));
-    try std.testing.expect(!hasGuardOnLine("if (j == 0) return; x -= 1;", "x"));
+    try std.testing.expect(!hasGuardOnLine("if (j > 0) x -= 1;", "x", null));
+    try std.testing.expect(hasGuardOnLine("if (x > 0) x -= 1;", "x", null));
+    try std.testing.expect(hasGuardOnLine("if (x == 0) return; x -= 1;", "x", null));
+    try std.testing.expect(!hasGuardOnLine("if (j == 0) return; x -= 1;", "x", null));
     // An upper-bound comparison proves no lower bound.
-    try std.testing.expect(!hasGuardOnLine("if (x < n) x -= 1;", "x"));
+    try std.testing.expect(!hasGuardOnLine("if (x < n) x -= 1;", "x", null));
 }
 
 test "lineHasIf requires a word boundary (EPH-I0506)" {
@@ -76231,6 +76864,84 @@ test "parseDecrementAmount reads only a terminated decimal literal (EPH-I0495)" 
     try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= n", 3));
     try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= 0x10", 3));
     try std.testing.expectEqual(@as(?usize, null), parseDecrementAmount("x -= 100_000", 3));
+}
+
+test "ZA901: same-line if-guard judges the decrement amount (EPH-I0995)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (m > 1) { m -= 5; }` underflows at m == 2: the guard proves
+    // m >= 2, which clears `-= 1` and `-= 2` but not `-= 5`, so the
+    // oversized same-line decrement fires while the small twin stays
+    // silent. Pre-fix both were silent (any comparison guard covered
+    // any amount) (EPH-I0995).
+    const content =
+        \\fn ifarm_same_line_unsafe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) { m -= 5; } else {
+        \\        return 0;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn ifarm_same_line_safe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) { m -= 1; } else {
+        \\        return 0;
+        \\    }
+        \\    return m;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_amount_sameline.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za901_amount_sameline.zig",
+            RULE_DECREMENT_WITHOUT_CHECK,
+        ),
+    );
+}
+
+test "ZA901: multi-line arm guard judges the decrement amount (EPH-I0995)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The multi-line twin of the same-line pin: the arm block's entry
+    // guard is `m > 1`, so `m -= 5` fires and `m -= 1` stays silent
+    // (EPH-I0995).
+    const content =
+        \\fn ifarm_multiline_unsafe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) {
+        \\        m -= 5;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn ifarm_multiline_safe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) {
+        \\        m -= 1;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_amount_multiline.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za901_amount_multiline.zig",
+            RULE_DECREMENT_WITHOUT_CHECK,
+        ),
+    );
 }
 
 test "ZA903: mismatched-array .len guard does not suppress the candidate (EPH-I0496)" {
@@ -87114,6 +87825,109 @@ test "ZA904: a };-closed string array keeps the code after it code (EPH-I0972)" 
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "app_brace_term_fp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: a clamp rhs on the next line loses the proof — pinned residual (EPH-I0971)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const c = @min(x,` / `255);` — the clamp rhs continues on the
+    // next line, so the opener line carries no complete statement for
+    // the clamp-identity judge and the cast fires a spurious note. The
+    // shape is not zig-fmt-canonical (zig fmt joins the call onto one
+    // line), the failure direction is conservative (noise, never a
+    // missed defect), and the residual is documented at
+    // statementCarriesClamp. Pinned here so a future fix flips the
+    // verdict deliberately (EPH-I0971).
+    const content =
+        \\fn cont_clamp(x: u32) u8 {
+        \\    const c = @min(x,
+        \\        255);
+        \\    return @as(u8, @intCast(c));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_cont_clamp.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_cont_clamp.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: a bare } container close on its own line keeps the loop close real (EPH-I0973)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A multiline-string array element list closed by a bare `}` on its
+    // own line with `;` on the next is valid Zig (zig fmt rewrites the
+    // shape to `};`). The bare `}` is code: the loop's own close still
+    // drives the lookback depth negative and the out-of-loop cast
+    // fires. Pre-fix the bare `}` was masked as string content, the
+    // container stayed open, and the for-header wrongly proved the cast
+    // (EPH-I0973).
+    const content =
+        \\fn f(n: usize) u8 {
+        \\    for (0..n) |i| {
+        \\        const arr = .{ \\a ,
+        \\            \\b ,
+        \\        }
+        \\        ;
+        \\        _ = arr;
+        \\    }
+        \\    return @as(u8, @intCast(i));
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_bare_brace_fn.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "app_bare_brace_fn.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "ZA904: broken ) } continuations in invalid regions stay masked (EPH-I0974)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const msg = \\usage` then `) } weird` (or `} ;`) is invalid Zig
+    // (zig ast-check: expected ';' after statement). The closer arms
+    // must not unmask such lines: the prose tail is not a valid closer,
+    // and `} ;` without an open container is a broken block close, so
+    // both stay string content and the in-loop cast keeps its range-for
+    // proof. Pre-fix both fired a spurious note (EPH-I0974).
+    const content =
+        \\fn paren_broken(n: usize) u8 {
+        \\    for (0..n) |i| {
+        \\        const msg = \\usage
+        \\        ) } weird
+        \\        use8(@intCast(i));
+        \\        _ = msg;
+        \\    }
+        \\}
+        \\fn brace_broken(n: usize) u8 {
+        \\    for (0..n) |i| {
+        \\        const msg = \\usage
+        \\        } ;
+        \\        use8(@intCast(i));
+        \\        _ = msg;
+        \\    }
+        \\}
+        \\fn use8(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runIntCastTest(&diag, allocator, "app_invalid_cont.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "app_invalid_cont.zig", RULE_INTCAST_NO_BOUNDS),
     );
 }
 

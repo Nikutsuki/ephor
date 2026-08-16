@@ -2975,26 +2975,39 @@ fn identBefore(code: []const u8, pos: usize) []const u8 {
     return code[start..end];
 }
 
+/// Cap on one line's nested paren depth for the forward paren scans
+/// (EPH-I0340). A deeper nesting returns null — the callers fail safe
+/// (a header is not a container header, a position is not in a call
+/// arg). Real code nests far below this; the bound only guards hostile
+/// generated lines.
+const max_paren_stack = 64;
+
 /// Identifier of the keyword whose parenthesized header closes at
-/// `close_idx` on this line, or null: a depth-counted backward scan
-/// finds the matching `(`, and the identifier before it names the
-/// header. A multi-line header has no `(` on this line and returns
-/// null. Callers compare against the keywords they recognize.
+/// `close_idx` on this line, or null: a depth-counted scan finds the
+/// matching `(`, and the identifier before it names the header. A
+/// multi-line header has no `(` on this line and returns null. Callers
+/// compare against the keywords they recognize. The scan is
+/// literal-masked (EPH-I0340, band-B01b F-14): a paren inside a string
+/// or char literal is data — `switch ("(", y)` still names `switch`,
+/// and a `(` in a string no longer fakes the header paren.
 fn parenHeaderKeyword(code: []const u8, close_idx: usize) ?[]const u8 {
+    var cls = LineClassifier.init(code);
+    var stack: [max_paren_stack]usize = [_]usize{0} ** max_paren_stack;
     var depth: usize = 0;
-    var k = close_idx;
-    while (k > 0) {
-        k -= 1;
-        switch (code[k]) {
-            ')' => depth += 1,
-            '(' => {
-                if (depth == 0) return identBefore(code, k);
-                depth -= 1;
-            },
-            else => {},
+    var i: usize = 0;
+    while (i < close_idx and i < code.len) : (i += 1) {
+        if (cls.isInsideLiteral(i)) continue;
+        const c = code[i];
+        if (c == '(') {
+            if (depth >= max_paren_stack) return null;
+            stack[depth] = i;
+            depth += 1;
+        } else if (c == ')') {
+            depth -|= 1;
         }
     }
-    return null;
+    if (depth == 0) return null;
+    return identBefore(code, stack[depth - 1]);
 }
 
 /// True when the `)` at `close_idx` closes the parenthesized header of a
@@ -3422,20 +3435,32 @@ fn isBuiltinDestAt(t: []const u8, pos: usize) bool {
         mem.endsWith(u8, t[0..pos], "@memcpy(");
 }
 
-/// Position of the unmatched `(` before `pos` — the call or grouping paren
-/// whose argument list contains `pos` — or null.
+/// Position of the unmatched `(` before `pos` — the call or grouping
+/// paren whose argument list contains `pos` — or null. The scan is
+/// literal-masked (EPH-I0340, band-B01b F-14): a paren inside a string
+/// or char literal or a trailing comment is data and never counts — an
+/// unpaired `(` in a string (`f("( )", a)`) no longer fakes the call
+/// paren.
 fn unmatchedOpenParenBefore(t: []const u8, pos: usize) ?usize {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t) orelse t.len;
+    const scan_end = @min(pos, comment_start);
+    var stack: [max_paren_stack]usize = [_]usize{0} ** max_paren_stack;
     var depth: usize = 0;
-    var j = pos;
-    while (j > 0) {
-        j -= 1;
-        if (t[j] == ')') depth += 1;
-        if (t[j] == '(') {
-            if (depth == 0) return j;
-            depth -= 1;
+    var i: usize = 0;
+    while (i < scan_end and i < t.len) : (i += 1) {
+        if (cls.isInsideLiteral(i)) continue;
+        const c = t[i];
+        if (c == '(') {
+            if (depth >= max_paren_stack) return null;
+            stack[depth] = i;
+            depth += 1;
+        } else if (c == ')') {
+            depth -|= 1;
         }
     }
-    return null;
+    if (depth == 0) return null;
+    return stack[depth - 1];
 }
 
 /// True when var_name has a slice/index occurrence (`x[...]`) that is not
@@ -3564,8 +3589,11 @@ fn hasOnelineLoopClose(t: []const u8) bool {
     return false;
 }
 
-/// Compute gen set: which blocks assign a variable (includes loop fill patterns)
-/// State for tracking for-loop scope during gen-set computation
+/// State for tracking for-loop scope during gen-set computation: the
+/// current loop nesting, the block and line where the loop opened, and
+/// the per-line updates the gen walk feeds it (EPH-I0339). A loop may
+/// run zero times, so a fill inside its body is loop-carried — the
+/// gen-side scans credit it only through checkIndexedAssign.
 const ForLoopTracker = struct {
     in_loop: bool = false,
     start_bid: ?usize = null,
@@ -3657,7 +3685,105 @@ const DefAssignCtx = struct {
     lines: []const []const u8,
     func_line: usize,
     num_blocks: usize,
+    /// Edge-neighbor memo built once per function (EPH-I0335): the
+    /// per-variable worklist reads only a block's own preds and succs.
+    neighbors: *const BlockNeighbors,
 };
+
+/// Per-block edge-neighbor lists, built once per function analysis
+/// (EPH-I0335, band-B01b F-09). The worklist's entry computation reads
+/// only a block's own predecessors instead of scanning every edge per
+/// block per pass — the sweep's O(passes * B * E) became O(B + E) per
+/// variable. The pred lists exclude loop-back edges and terminal-return
+/// preds (the filters the former computeBlockEntry applied per query);
+/// the has-successor memo serves that filter.
+const BlockNeighbors = struct {
+    /// [num_blocks + 1]: pred_flat range per block
+    pred_offsets: []usize,
+    pred_flat: []usize,
+    /// [num_blocks + 1]: succ_flat range per block
+    succ_offsets: []usize,
+    succ_flat: []usize,
+    has_succ: []bool,
+
+    fn deinit(self: *BlockNeighbors, a: Allocator) void {
+        a.free(self.pred_offsets);
+        a.free(self.pred_flat);
+        a.free(self.succ_offsets);
+        a.free(self.succ_flat);
+        a.free(self.has_succ);
+    }
+};
+
+/// True when the edge must be excluded from the neighbor lists: a
+/// loop-back edge, or a terminal-return pred — a return-marked block
+/// without successors never flows its def state to the merge point
+/// (EPH-I0121).
+fn excludeNeighborEdge(
+    cfg: *const ControlFlowGraph,
+    edge: CFGEdge,
+    has_succ: []const bool,
+    num_blocks: usize,
+) bool {
+    if (edge.kind == .loop_back or edge.to >= num_blocks) return true;
+    return edge.from < num_blocks and
+        cfg.blocks.items[edge.from].is_return and
+        !has_succ[edge.from];
+}
+
+/// Build the per-block neighbor lists and the has-successor memo for
+/// one CFG. The terminal-return filter needs the complete has_succ
+/// set, so the build runs three passes over the edges: has_succ, count,
+/// fill (EPH-I0335).
+fn buildBlockNeighbors(
+    a: Allocator,
+    cfg: *const ControlFlowGraph,
+) !BlockNeighbors {
+    const num_blocks = cfg.blocks.items.len;
+    const pred_offsets = try a.alloc(usize, num_blocks + 1);
+    errdefer a.free(pred_offsets);
+    const succ_offsets = try a.alloc(usize, num_blocks + 1);
+    errdefer a.free(succ_offsets);
+    const has_succ = try a.alloc(bool, num_blocks);
+    errdefer a.free(has_succ);
+    @memset(pred_offsets, 0);
+    @memset(succ_offsets, 0);
+    @memset(has_succ, false);
+    for (cfg.edges.items) |edge| {
+        if (edge.from < num_blocks) has_succ[edge.from] = true;
+    }
+    for (cfg.edges.items) |edge| {
+        if (excludeNeighborEdge(cfg, edge, has_succ, num_blocks)) continue;
+        pred_offsets[edge.to + 1] += 1;
+        succ_offsets[edge.from + 1] += 1;
+    }
+    for (1..num_blocks + 1) |k| {
+        pred_offsets[k] += pred_offsets[k - 1];
+        succ_offsets[k] += succ_offsets[k - 1];
+    }
+    const pred_flat = try a.alloc(usize, pred_offsets[num_blocks]);
+    errdefer a.free(pred_flat);
+    const succ_flat = try a.alloc(usize, succ_offsets[num_blocks]);
+    errdefer a.free(succ_flat);
+    var pred_cursor = try a.dupe(usize, pred_offsets[0..num_blocks]);
+    defer a.free(pred_cursor);
+    var succ_cursor = try a.dupe(usize, succ_offsets[0..num_blocks]);
+    defer a.free(succ_cursor);
+    for (cfg.edges.items) |edge| {
+        if (excludeNeighborEdge(cfg, edge, has_succ, num_blocks)) continue;
+        pred_flat[pred_cursor[edge.to]] = edge.from;
+        pred_cursor[edge.to] += 1;
+        succ_flat[succ_cursor[edge.from]] = edge.to;
+        succ_cursor[edge.from] += 1;
+    }
+    return .{
+        .pred_offsets = pred_offsets,
+        .pred_flat = pred_flat,
+        .succ_offsets = succ_offsets,
+        .succ_flat = succ_flat,
+        .has_succ = has_succ,
+    };
+}
 
 /// Per-block assignment facts for one variable: the block-granular gen bits
 /// the worklist transfer needs (a block assigning the var anywhere has it
@@ -3852,8 +3978,7 @@ fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
-/// Check if a line calls a method on a variable: var_name.method(
-/// This covers patterns like: x.mul(...), x.initCapacity(...), x.div(...)
+/// True when every byte of `s` is an identifier character (EPH-I0339).
 fn isAllIdent(s: []const u8) bool {
     for (s) |c| {
         if (!isIdent(c)) return false;
@@ -3861,6 +3986,11 @@ fn isAllIdent(s: []const u8) bool {
     return true;
 }
 
+/// True when the occurrence at `abs_pos` is a method call on the local
+/// variable: `var_name.method(`. The receiver must be the bare local
+/// name — `other.x.init()` inits a field of other, never the local x
+/// (EPH-I0332, band-B01b F-06) — and the method name must be a plain
+/// identifier. String and comment occurrences are prose (EPH-I0339).
 fn isMethodCallAt(t: []const u8, abs_pos: usize, var_name: []const u8, cls: *LineClassifier) bool {
     if (abs_pos > 0 and isIdent(t[abs_pos - 1])) return false;
     // The receiver must be the bare local name: `other.x.init()` inits a
@@ -3879,6 +4009,10 @@ fn isMethodCallAt(t: []const u8, abs_pos: usize, var_name: []const u8, cls: *Lin
     return true;
 }
 
+/// Check if a line calls a method on a variable: var_name.method(
+/// This covers patterns like: x.mul(...), x.initCapacity(...), x.div(...)
+/// Indirect initialization: a method call on the var writes through
+/// self, so the var counts as initialized (EPH-I0339).
 fn hasMethodCallOnVar(t: []const u8, var_name: []const u8) bool {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
@@ -4122,6 +4256,7 @@ fn collectUndefinedVars(
     func_line: usize,
 ) !std.StringHashMap(usize) {
     var undef_vars = std.StringHashMap(usize).init(allocator);
+    errdefer undef_vars.deinit();
     var ct = ComptimeState{};
 
     for (lines, 0..) |line, idx| {
@@ -4174,6 +4309,7 @@ fn analyzeDefiniteAssignment(
     func_line: usize,
 ) !std.StringHashMap(usize) {
     var issues = std.StringHashMap(usize).init(allocator);
+    errdefer issues.deinit();
 
     var undef_vars = try collectUndefinedVars(
         allocator,
@@ -4195,12 +4331,16 @@ fn analyzeDefiniteAssignment(
     const num_blocks = cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
+    var neighbors = try buildBlockNeighbors(allocator, cfg);
+    defer neighbors.deinit(allocator);
+
     const da_ctx: DefAssignCtx = .{
         .allocator = allocator,
         .cfg = cfg,
         .lines = lines,
         .func_line = func_line,
         .num_blocks = num_blocks,
+        .neighbors = &neighbors,
     };
     var var_iter = undef_vars.iterator();
     while (var_iter.next()) |entry| {
@@ -4304,6 +4444,12 @@ fn removePayloadShadowedVars(
     for (remove.items) |vn| _ = undef_vars.remove(vn);
 }
 
+/// True when the variable is initialized indirectly anywhere in the
+/// body: a method call on it, an asm output constraint, a struct-field
+/// assignment, a mutable slice passed to a call, an inline-for element
+/// fill, or an array element assignment inside a loop (EPH-I0339). The
+/// whole-body scan runs once per candidate var; each sub-check is
+/// line-bounded.
 fn isIndirectlyInitialized(
     lines: []const []const u8,
     vn: []const u8,
@@ -4507,6 +4653,9 @@ const ReadScanCtx = struct {
     da: *const DefAssignCtx,
     def_entry: []const bool,
     first_effect: []const AssignEffect,
+    /// Per-variable early-return memo (EPH-I0335): the suppressor query
+    /// is O(1) instead of a per-read rescan.
+    early_returns: *const EarlyReturnMemo,
 };
 
 /// True when the read of var_name on body-line idx is potentially
@@ -4538,7 +4687,7 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     if (isNullGuardCorrelatedRead(sc.da.lines, idx, read_col, var_name)) return false;
     // Check if all paths that don't assign the variable have early returns.
     // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
-    if (hasEarlyReturnOnUnassignedPaths(sc.da.lines, var_name, idx)) return false;
+    if (earlyReturnSuppresses(sc.early_returns, idx)) return false;
     // Check if the read is on the RHS of an `or` short-circuit in a
     // condition where the LHS guards against the variable being
     // uninitialized.
@@ -4565,17 +4714,34 @@ fn checkVarDefiniteAssignment(
     var gen_sets = try computeGenSetForVar(ctx, var_name);
     defer gen_sets.deinit(ctx.allocator);
 
-    runDefiniteAssignmentWorklist(ctx.cfg, .{
+    // The early-return suppressor memo: one O(lines) build per variable
+    // instead of one rescan per read (EPH-I0335, band-B01b F-09).
+    var er_memo = try buildEarlyReturnMemo(ctx.allocator, ctx.lines, var_name);
+    defer er_memo.deinit(ctx.allocator);
+
+    // The queue worklist visits each block at most twice per variable
+    // (worklist_visit_cap_mult); the queue and the in-queue marks are
+    // per-variable scratch (EPH-I0335).
+    const queue = try ctx.allocator.alloc(usize, ctx.num_blocks *| 2 +| 1);
+    defer ctx.allocator.free(queue);
+    const in_queue = try ctx.allocator.alloc(bool, ctx.num_blocks);
+    defer ctx.allocator.free(in_queue);
+    @memset(in_queue, false);
+
+    // The visit-count return pins the 2B+1 drain bound in a test
+    // (EPH-I0335); the production caller needs only the fixpoint.
+    _ = runDefiniteAssignmentWorklist(ctx.neighbors, .{
         .gen = gen_sets.gen,
         .def_entry = def_entry,
         .def_exit = def_exit,
         .num_blocks = ctx.num_blocks,
-    });
+    }, queue, in_queue);
 
     const sc: ReadScanCtx = .{
         .da = ctx,
         .def_entry = def_entry,
         .first_effect = gen_sets.first_effect,
+        .early_returns = &er_memo,
     };
     for (ctx.lines, 0..) |_, idx| {
         const al = ctx.func_line + idx;
@@ -4614,15 +4780,21 @@ fn isCorrelatedGuardRead(
     //   if (cy.Trace and cond) {  // outer
     //       if (x != tempRetainedStart) {  // inner - nearest
     // We need to check the outer condition too.
+    // The walk hops at most max_guard_hops times and scans at most
+    // guard_candidate_window candidates per hop (EPH-I0335, band-B01b
+    // F-09): a deeper chain or a farther same-condition if is missed —
+    // accepted false negative, the EPH-I0225 window trade-off.
+    var guard_hops: usize = 0;
     var search_from = read_idx;
-    while (search_from > 0) {
+    while (search_from > 0 and guard_hops < max_guard_hops) : (guard_hops += 1) {
         const guard_cond = findEnclosingIfCondition(
             lines,
             search_from,
             if (search_from == read_idx) read_col else 0,
         ) orelse break;
 
-        for (0..read_idx) |i| {
+        const cand_start = read_idx -| guard_candidate_window;
+        for (cand_start..read_idx) |i| {
             const t = mem.trim(u8, lines[i], " \t\r");
             if (isCommentOrMultilineString(t)) continue;
             if (!hasIfCondition(t, guard_cond)) continue;
@@ -4977,13 +5149,17 @@ fn isNullGuardCorrelatedRead(
     var_name: []const u8,
 ) bool {
     const guard_cond = findEnclosingIfCondition(lines, read_idx, read_col) orelse return false;
-    if (!isNullInitializedVar(lines, guard_cond)) return false;
+    if (!isNullInitializedVar(lines, guard_cond, read_idx)) return false;
     return allGuardAssignsCorrelate(lines, read_idx, guard_cond, var_name);
 }
 
-/// Check if a variable is declared as `var name ... = null` anywhere in the lines.
-fn isNullInitializedVar(lines: []const []const u8, name: []const u8) bool {
-    for (lines) |line| {
+/// Check if a variable is declared as `var name ... = null` on a line
+/// before `limit`. The scan stops at the read line: Zig declarations
+/// precede uses, so a null decl after the read never explains it. The
+/// bound also keeps the scan O(read) per query instead of O(body)
+/// (EPH-I0335, band-B01b F-09).
+fn isNullInitializedVar(lines: []const []const u8, name: []const u8, limit: usize) bool {
+    for (lines[0..limit]) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         if (!mem.startsWith(u8, t, "var ")) continue;
@@ -5222,14 +5398,18 @@ fn hasCorrelatedSameBlockAssign(
 /// guard_correlation_radius lines is missed — accepted false negative,
 /// documented approximation. Every occurrence of the guard on a line is
 /// checked: a first non-assignment occurrence does not hide the
-/// assignment that follows it (EPH-I0843).
+/// assignment that follows it (EPH-I0843). The scan covers only the
+/// guard_assignment_window lines above the read — a farther non-null
+/// guard assignment is missed, which can only weaken a correlation
+/// failure (FN direction, EPH-I0335).
 fn allGuardAssignsCorrelate(
     lines: []const []const u8,
     limit: usize,
     guard: []const u8,
     var_name: []const u8,
 ) bool {
-    for (0..limit) |i| {
+    const scan_start = limit -| guard_assignment_window;
+    for (scan_start..limit) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         // The null verdict applies to the whole line: an assignment
@@ -5311,12 +5491,32 @@ const null_guard_lookback = 20;
 const paired_increment_lookback = 20;
 const short_circuit_lookback = 10;
 
+/// Backward window for the correlated-guard candidate scan (EPH-I0335,
+/// band-B01b F-09): an earlier same-condition if more than this many
+/// lines above the read is missed — accepted false negative, the same
+/// trade-off the EPH-I0225 windows set. The bound keeps the per-guard
+/// candidate scan O(window) instead of O(read_idx).
+const guard_candidate_window = 40;
+
+/// Cap on enclosing-guard hops per read (EPH-I0335): the walk steps to
+/// the next outer if on each hop. An if chain deeper than this is
+/// walked only in part — the outer guards are missed, accepted false
+/// negative (a missed suppression reports the read).
+const max_guard_hops = 40;
+
 /// Bounded radius for the null-guard correlation scan (EPH-I0331,
 /// band-B01b F-05): the var assignment must sit within this many lines of
 /// the guard assignment. A correlated pair farther apart is missed — the
 /// read fires — accepted false positive, documented at
 /// allGuardAssignsCorrelate.
 const guard_correlation_radius = 10;
+
+/// Backward window for the null-guard assignment scan (EPH-I0335,
+/// band-B01b F-09): a non-null guard assignment more than this many
+/// lines above the read is not scanned. Dropping it can only weaken a
+/// correlation failure — the read reports less, the FN direction the
+/// pair radius already accepts (EPH-I0331).
+const guard_assignment_window = 2 * guard_correlation_radius;
 
 /// Bounded forward window for the or-guard body scan (EPH-I0330,
 /// band-B01b F-04): the body assignment must appear within this many
@@ -5501,56 +5701,223 @@ fn hasIfCondition(t: []const u8, cond: []const u8) bool {
     return mem.eql(u8, line_cond, cond);
 }
 
-/// Check if all code paths that don't assign `var_name` before `read_idx`
-/// contain an early return/break/continue, making the variable definitely assigned
-/// at the read point.
-///
-/// Scans forward through the function lines to find if/else-if/else chains.
-/// For each complete chain (must have else or else-if ending), checks whether
-/// every branch either assigns the variable or exits.
-///
-/// Pattern: if (A) { x = 1; } else if (B) { x = 2; } else { return; }
-fn hasEarlyReturnOnUnassignedPaths(
+/// Per-variable memo for the early-return suppressor (EPH-I0335,
+/// band-B01b F-09): one forward pass collects every if/else chain; the
+/// per-read query is O(1). The former shape rescanned 0..read_idx per
+/// read — O(lines) per read, O(lines^2) per variable on hostile
+/// content.
+const EarlyReturnMemo = struct {
+    /// qualify[i]: some completed if/else chain suppresses the read at
+    /// line i — every branch completed at or before i assigns var_name
+    /// or exits, at least two branches completed, one assigns, and the
+    /// chain's final else ran before i.
+    qualify: []const bool,
+
+    fn deinit(self: *EarlyReturnMemo, a: Allocator) void {
+        a.free(self.qualify);
+    }
+};
+
+/// One parsed chain's events: the branch completions in order, the
+/// first-else line, and whether the arm list overflowed.
+const ChainEvents = struct {
+    events: [max_chain_branches]ChainBranchEvent = undefined,
+    count: usize = 0,
+    else_line: ?usize = null,
+    overflow: bool = false,
+};
+
+/// Parse one if/else chain into its branch events (EPH-I0335): the same
+/// ChainParseState walk the former per-read scan ran, at the
+/// full-function limit. The interval model gates on branch-completion
+/// lines, so the longer parse changes no per-read verdict: a branch
+/// completed after the read never contributes to it.
+fn collectChainEvents(
+    state: *ChainParseState,
     lines: []const []const u8,
     var_name: []const u8,
-    read_idx: usize,
-) bool {
-    // Forward scan: find if/else chains and check branch properties
+) ChainEvents {
+    var out = ChainEvents{};
+    while (state.i < lines.len) : (state.i += 1) {
+        const prev_else = state.has_else;
+        const prev_count = state.branches.count;
+        state.processLine(lines, lines.len);
+        if (!prev_else and state.has_else) out.else_line = state.i;
+        // One processLine call can add two branches: the line's own
+        // close and the one-line continuation arm
+        // (handleNextLineContinuation). Record every new branch.
+        var k = prev_count;
+        while (k < state.branches.count) : (k += 1) {
+            out.events[k] = .{
+                .end = state.branches.ends[k],
+                .assigns = branchAssignsVar(
+                    lines,
+                    state.branches.starts[k],
+                    state.branches.ends[k],
+                    var_name,
+                ),
+                .exits = branchHasExit(
+                    lines,
+                    state.branches.starts[k],
+                    state.branches.ends[k],
+                ),
+            };
+            out.count += 1;
+        }
+        if (state.done) break;
+    }
+    out.overflow = state.overflow;
+    return out;
+}
+
+/// Record one if-start's chain interval into the difference array: the
+/// chain suppresses the reads its interval covers (EPH-I0335). An
+/// overflowed arm list or a chain without a qualifying prefix records
+/// nothing.
+///
+/// Overflow caveat (EPH-I1004): the former per-read parse was bounded
+/// at the read, so it suppressed a read inside the else body of a
+/// 33-arm chain when the 32 branches before it were good. A longer
+/// chain overflowed the former walk too, so the divergence is exactly
+/// the 33-arm case. The full-chain parse overflows and records
+/// nothing, so the memo under-suppresses (FN direction) and the read
+/// now reports.
+fn recordIfStartInterval(
+    lines: []const []const u8,
+    i: usize,
+    var_name: []const u8,
+    diff: []i32,
+) void {
+    var state = ChainParseState{ .branch_start = i, .i = i };
+    const chain = collectChainEvents(&state, lines, var_name);
+    if (chain.overflow or chain.count < 2) return;
+    if (chain.else_line) |h| recordChainInterval(chain.events[0..chain.count], h, diff);
+}
+
+/// Build the early-return memo for one variable. The forward walk
+/// mirrors the former per-read scan exactly — the same if-start
+/// detection, chain parse, and skip rules — so the verdicts match at
+/// every read position. Each completed chain contributes the interval
+/// of read lines it suppresses; a difference array merges the intervals
+/// into the per-line qualify mask (EPH-I0335).
+///
+/// The suppressor's narrative: if all code paths that do not assign
+/// `var_name` before the read contain an early return, the variable is
+/// definitely assigned at the read point. Pattern: `if (A) { x = 1; }
+/// else if (B) { x = 2; } else { return; }` — every branch either
+/// assigns the variable or exits. The textual chain model is
+/// flow-blind: an else-if ARM's own fill and exit are branch-level
+/// facts, and the one-line else-if chain's arms are not modeled at all
+/// — `if (a) { x = 1; } else if (b) { return 1; } return x;` stays
+/// silent on the A=false,B=false uninit path because the CFG gives the
+/// if-arm's fill the entry-block credit (EPH-I0872, pinned by test;
+/// the chain parsers collect branches only past a depth-zero close, so
+/// a same-line else-if arm never joins the list).
+fn buildEarlyReturnMemo(
+    a: Allocator,
+    lines: []const []const u8,
+    var_name: []const u8,
+) !EarlyReturnMemo {
+    const n = lines.len;
+    const diff = try a.alloc(i32, n + 2);
+    defer a.free(diff);
+    @memset(diff, 0);
     var i: usize = 0;
-    while (i < read_idx) {
+    while (i < n) {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) {
             i += 1;
             continue;
         }
-
-        // Look for if-start at the current nesting level
         if (!isIfStart(t)) {
             i += 1;
             continue;
         }
-
-        // Found an if-start. Collect all branches of this if/else chain.
-        if (checkIfElseChainComplete(lines, i, read_idx, var_name))
-            return true;
-
-        // Skip past this if block to avoid re-processing
-        i = skipBracedBlock(lines, i, read_idx);
+        recordIfStartInterval(lines, i, var_name, diff);
+        i = skipBracedBlock(lines, i, n);
         i += 1;
     }
-    return false;
+    const qualify = try a.alloc(bool, n + 1);
+    var acc: i32 = 0;
+    for (0..n + 1) |r| {
+        acc += diff[r];
+        qualify[r] = acc > 0;
+    }
+    return .{ .qualify = qualify };
 }
 
+/// One completed branch of an if/else chain, in completion order.
+const ChainBranchEvent = struct {
+    end: usize,
+    assigns: bool,
+    exits: bool,
+};
+
+/// Cap on chain branches: BranchList's fixed buffers hold
+/// max_chain_branches arms, so the event list matches it (EPH-I0335).
+const max_chain_branches = 32;
+
+/// Record the read-lines interval one chain suppresses into the
+/// difference array. The chain qualifies a read when every branch
+/// completed at or before the read assigns var_name or exits, at least
+/// two branches completed, one assigns, and the chain's final else ran
+/// before the read — the same verdict the former per-read parse gave at
+/// that limit (EPH-I0335). The first non-qualifying branch's end caps
+/// the interval: the bad branch completed after the read cannot fail it
+/// yet, and one completed before the read fails it for every later
+/// read. The interval is (lo, hi]: diff marks the half-open range.
+fn recordChainInterval(
+    events: []const ChainBranchEvent,
+    else_line: usize,
+    diff: []i32,
+) void {
+    var first_bad: ?usize = null;
+    var first_assign: ?usize = null;
+    for (events, 0..) |ev, k| {
+        if (first_bad == null and !(ev.assigns or ev.exits)) first_bad = k;
+        if (first_assign == null and ev.assigns) first_assign = k;
+    }
+    const good_count = first_bad orelse events.len;
+    if (good_count < 2) return;
+    const fa = first_assign orelse return;
+    if (fa >= good_count) return;
+    const lo = @max(else_line, @max(events[1].end, events[fa].end));
+    if (first_bad) |jb| {
+        const hi = events[jb].end;
+        if (lo >= hi) return;
+        diff[lo + 1] += 1;
+        diff[hi + 1] -= 1;
+    } else {
+        diff[lo + 1] += 1;
+    }
+}
+
+/// True when a completed if/else chain suppresses the read at
+/// `read_idx`: every branch completed at or before the read assigns
+/// var_name or exits, at least two branches completed, one assigns, and
+/// the chain's final else ran before the read. O(1) per read
+/// (EPH-I0335).
+fn earlyReturnSuppresses(memo: *const EarlyReturnMemo, read_idx: usize) bool {
+    return memo.qualify[read_idx];
+}
+
+/// True when the line starts an if statement (`if ` or `if(`), the
+/// early-return chain scan's opener test (EPH-I0339).
 fn isIfStart(t: []const u8) bool {
     return mem.startsWith(u8, t, "if ") or mem.startsWith(u8, t, "if(");
 }
 
+/// True when the line starts an else-if arm: `} else if` (the prior
+/// arm's close on the same line) or a bare `else if` (EPH-I0339).
 fn isElseIfLine(t: []const u8) bool {
     return mem.startsWith(u8, t, "} else if") or
         mem.startsWith(u8, t, "else if ") or
         mem.startsWith(u8, t, "else if(");
 }
 
+/// True when the line starts a final else arm: `} else {` (the prior
+/// arm's close on the same line) or a bare `else {`. An `else if` line
+/// never matches — the chain continues (EPH-I0339).
 fn isElseLine(t: []const u8) bool {
     return mem.startsWith(u8, t, "} else {") or
         mem.startsWith(u8, t, "} else{") or
@@ -5581,12 +5948,12 @@ fn skipBracedBlock(
 /// Returns true if the variable is definitely assigned after the chain
 /// (every branch either assigns it or exits).
 const BranchList = struct {
-    starts: [32]usize = undefined,
-    ends: [32]usize = undefined,
+    starts: [max_chain_branches]usize = undefined,
+    ends: [max_chain_branches]usize = undefined,
     count: usize = 0,
 
     fn add(self: *BranchList, start: usize, end: usize) bool {
-        if (self.count >= 32) return false;
+        if (self.count >= max_chain_branches) return false;
         self.starts[self.count] = start;
         self.ends[self.count] = end;
         self.count += 1;
@@ -5734,64 +6101,6 @@ const ChainParseState = struct {
     }
 };
 
-fn checkIfElseChainComplete(
-    lines: []const []const u8,
-    if_start: usize,
-    limit: usize,
-    var_name: []const u8,
-) bool {
-    var state = ChainParseState{
-        .branch_start = if_start,
-        .i = if_start,
-    };
-
-    while (state.i < limit) : (state.i += 1) {
-        state.processLine(lines, limit);
-        if (state.done) break;
-    }
-
-    if (state.overflow) return false;
-    if (!state.has_else or state.branches.count < 2) return false;
-    return validateBranchCoverage(lines, &state.branches, var_name);
-}
-
-/// Collect else-if and else branches following an if block.
-/// Returns true if the chain ends with a final else.
-fn collectElseBranches(
-    lines: []const []const u8,
-    block_end: *usize,
-    limit: usize,
-    branches: *BranchList,
-) bool {
-    while (block_end.* + 1 < limit) {
-        const close_t = mem.trim(u8, lines[block_end.*], " \t\r");
-        const next_idx = skipCommentLines(lines, block_end.* + 1, limit);
-        if (next_idx >= limit) break;
-        const next_t = mem.trim(u8, lines[next_idx], " \t\r");
-
-        // "} else if" or "} else" on the closing line itself
-        if (isElseIfLine(close_t) or isElseLine(close_t)) {
-            const prev_end = branches.ends[branches.count - 1];
-            block_end.* = skipBracedBlock(lines, block_end.*, limit);
-            if (block_end.* >= limit) return false;
-            if (!branches.add(prev_end, block_end.*)) return false;
-            if (isElseLine(close_t)) return true;
-            continue;
-        }
-
-        // "else if" or "else" on the NEXT non-comment line (separated from })
-        if (isElseIfLine(next_t) or isElseLine(next_t)) {
-            block_end.* = skipBracedBlock(lines, next_idx, limit);
-            if (block_end.* >= limit) return false;
-            if (!branches.add(next_idx, block_end.*)) return false;
-            if (isElseLine(next_t)) return true;
-            continue;
-        }
-        break;
-    }
-    return false;
-}
-
 /// Skip comment and multiline-string lines starting at `start`.
 fn skipCommentLines(lines: []const []const u8, start: usize, limit: usize) usize {
     var idx = start;
@@ -5800,29 +6109,6 @@ fn skipCommentLines(lines: []const []const u8, start: usize, limit: usize) usize
         idx += 1;
     }
     return idx;
-}
-
-/// Validate that every branch assigns the variable or exits. The textual
-/// chain model is flow-blind: an else-if ARM's own fill and exit are
-/// branch-level facts, and the one-line else-if chain's arms are not
-/// modeled at all — `if (a) { x = 1; } else if (b) { return 1; } return
-/// x;` stays silent on the A=false,B=false uninit path because the CFG
-/// gives the if-arm's fill the entry-block credit (EPH-I0872, pinned by
-/// test; the chain parsers collect branches only past a depth-zero
-/// close, so a same-line else-if arm never joins the list).
-fn validateBranchCoverage(
-    lines: []const []const u8,
-    branches: *const BranchList,
-    var_name: []const u8,
-) bool {
-    var has_assignment = false;
-    for (0..branches.count) |bi| {
-        const assigns = branchAssignsVar(lines, branches.starts[bi], branches.ends[bi], var_name);
-        const exits = branchHasExit(lines, branches.starts[bi], branches.ends[bi]);
-        if (!assigns and !exits) return false;
-        if (assigns) has_assignment = true;
-    }
-    return has_assignment;
 }
 
 /// Check if a branch (lines[start..end]) assigns the variable. String and
@@ -5835,8 +6121,10 @@ fn branchAssignsVar(
     end: usize,
     var_name: []const u8,
 ) bool {
-    const actual_end = @min(end, lines.len - 1);
-    for (start..actual_end + 1) |i| {
+    // Saturating end cap: an empty slice yields an empty scan instead
+    // of underflowing (EPH-I0341, band-B01b F-15).
+    const actual_end = @min(end, lines.len -| 1);
+    for (@min(start, lines.len)..@min(actual_end + 1, lines.len)) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         // Check for assignment at any code position in the line
@@ -5863,9 +6151,11 @@ fn branchHasExit(
     start: usize,
     end: usize,
 ) bool {
-    const actual_end = @min(end, lines.len - 1);
+    // Saturating end cap: an empty slice yields an empty scan instead
+    // of underflowing (EPH-I0341, band-B01b F-15).
+    const actual_end = @min(end, lines.len -| 1);
     var depth: usize = 0;
-    for (start..actual_end + 1) |i| {
+    for (@min(start, lines.len)..@min(actual_end + 1, lines.len)) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         depth = computeBraceDepth(t, depth);
@@ -5992,6 +6282,11 @@ fn lastStatementExits(body: []const u8) bool {
     return isExitStatement(mem.trim(u8, body[scan.last_start..scan.last_end], " \t\r"));
 }
 
+/// True when the line starts an unconditional exit statement: return,
+/// break, continue, or unreachable, with the statement's own
+/// terminator. The branch-exit scan judges a branch's last statement
+/// with this (EPH-I0339). String or comment occurrences cannot match:
+/// the keyword must lead the line.
 fn isExitStatement(t: []const u8) bool {
     return mem.startsWith(u8, t, "return ") or
         mem.startsWith(u8, t, "return;") or
@@ -6158,57 +6453,84 @@ fn parenBalanceOutsideQuotes(t: []const u8) i32 {
     return balance;
 }
 
+/// Worklist visit cap: 2 * blocks + 1. The def-state equations are
+/// monotone (entry and exit flip false->true at most once per block),
+/// so the queue-driven fixpoint visits each block at most twice — the
+/// initial visit plus one re-visit per state flip (EPH-I0335, band-B01b
+/// F-09). The sweep form this replaces iterated up to the same
+/// 2 * blocks + 1 FULL PASSES over every edge — O(passes * B * E) per
+/// variable; the queue form is O(B + E) per variable. The cap is
+/// defensive: the monotone bound terminates the loop first. On a cap
+/// hit the loop stops with the under-approximate state — a read may
+/// report where a longer run would prove coverage, never the reverse
+/// (band-B01b F-13).
+const worklist_visit_cap_mult = 2;
+
+/// Drive the def-state fixpoint with a queue (EPH-I0335, band-B01b
+/// F-09): a block is revisited only when a predecessor's exit changed,
+/// instead of re-sweeping every block and edge per pass. Returns the
+/// visit count — the 2B+1 drain pin (a test asserts the queue drained
+/// below the cap, EPH-I1003).
 fn runDefiniteAssignmentWorklist(
-    cfg: *ControlFlowGraph,
+    nb: *const BlockNeighbors,
     flow: DefFlowSets,
-) void {
-    const max = @min(flow.num_blocks, std.math.maxInt(usize) / 2 - 1) *| 2 +| 1;
-    var changed = true;
-    var iters: usize = 0;
-    while (changed and iters < max) : (iters += 1) {
-        changed = false;
-        for (0..flow.num_blocks) |bid| {
-            const new_in = computeBlockEntry(cfg, flow.def_exit, bid);
-            const new_out = flow.gen[bid] or new_in;
-            if (flow.def_entry[bid] == new_in and flow.def_exit[bid] == new_out) continue;
-            flow.def_entry[bid] = new_in;
-            flow.def_exit[bid] = new_out;
-            changed = true;
+    queue: []usize,
+    in_queue: []bool,
+) usize {
+    const max_visits = flow.num_blocks *| worklist_visit_cap_mult +| 1;
+    var head: usize = 0;
+    var tail: usize = 0;
+    for (0..flow.num_blocks) |bid| {
+        queue[tail] = bid;
+        tail += 1;
+        in_queue[bid] = true;
+    }
+    var visits: usize = 0;
+    while (head < tail and visits < max_visits) : (visits += 1) {
+        const bid = queue[head];
+        head += 1;
+        in_queue[bid] = false;
+        const new_in = computeBlockEntry(nb, flow.def_exit, bid);
+        const new_out = flow.gen[bid] or new_in;
+        if (flow.def_entry[bid] == new_in and flow.def_exit[bid] == new_out) continue;
+        flow.def_entry[bid] = new_in;
+        flow.def_exit[bid] = new_out;
+        for (nb.succ_flat[nb.succ_offsets[bid]..nb.succ_offsets[bid + 1]]) |s| {
+            if (in_queue[s]) continue;
+            // The queue holds max_visits entries — the same 2B+1 bound
+            // the loop caps visits at. The sizing rests on the
+            // monotone def-state argument (EPH-I0335): a block's entry
+            // and exit flip false->true at most once, so total
+            // enqueues stay below the cap on the shapes the CFG
+            // builder produces. A breach is a builder-shape violation,
+            // not a fixpoint case: fail loudly here instead of writing
+            // past the queue (EPH-I1003).
+            std.debug.assert(tail < max_visits);
+            queue[tail] = s;
+            tail += 1;
+            in_queue[s] = true;
         }
     }
+    return visits;
 }
 
-/// True when the block has outgoing edges: a return-marked block with
-/// successors models a merge that also continues (a same-line nested if
-/// whose body return landed on the inner merge — EPH-I0121). Its def
-/// state flows to the continuation, so it is not a terminal return.
-fn blockHasSuccessors(cfg: *const ControlFlowGraph, bid: usize) bool {
-    for (cfg.edges.items) |edge| {
-        if (edge.from == bid) return true;
-    }
-    return false;
-}
-
+/// Entry def-state of one block: every qualifying predecessor's exit is
+/// assigned — the AND of the pred exits. The pred list already excludes
+/// loop-back edges and terminal-return preds (built once per function,
+/// EPH-I0335). A block without qualifying preds (the entry block) starts
+/// false: no path has established the assignment. A return-marked block
+/// WITH successors is a merge that continues: its def state flows to the
+/// continuation, so it is not a terminal return (EPH-I0121).
 fn computeBlockEntry(
-    cfg: *const ControlFlowGraph,
+    nb: *const BlockNeighbors,
     def_exit: []const bool,
     bid: usize,
 ) bool {
     var result: bool = true;
     var has_pred = false;
-    for (cfg.edges.items) |edge| {
-        if (edge.to != bid) continue;
-        if (edge.kind == .loop_back) continue;
-        // Skip TERMINAL return blocks — they never flow to the merge point,
-        // so they shouldn't affect definite assignment analysis.
-        // e.g., if (A) { x = 1; } else { return; } // x is definitely assigned here
-        // A return-marked block WITH successors is a merge that continues:
-        // its def state flows on (EPH-I0121).
-        if (edge.from < cfg.blocks.items.len and
-            cfg.blocks.items[edge.from].is_return and
-            !blockHasSuccessors(cfg, edge.from)) continue;
+    for (nb.pred_flat[nb.pred_offsets[bid]..nb.pred_offsets[bid + 1]]) |from| {
         has_pred = true;
-        if (!def_exit[edge.from]) result = false;
+        if (!def_exit[from]) result = false;
     }
     return if (has_pred) result else false;
 }
@@ -6237,6 +6559,15 @@ fn isBindingNameAt(t: []const u8, var_name: []const u8, i: usize) bool {
 /// bare @memset/@memcpy dest — a fill statement must not "read" its own
 /// destination, EPH-I0102; the grouping-paren form `&(x)` is the same
 /// address-of, EPH-I0822), or an assignment target.
+///
+/// The `.len` exemption is a deliberate false negative (EPH-I0338,
+/// band-B01b F-12): for an array or a comptime-known length the field
+/// is a compile-time property, and reading it cannot touch undefined
+/// memory. For a slice `.len` is a runtime field read — `var s: []u8 =
+/// undefined; n = s.len;` reads undefined data and stays silent. The
+/// type is not known at this text scan, so ephor keeps the exemption
+/// for all `.len` occurrences: the FP the type-based narrowing would
+/// remove is worth less than the FN it would accept.
 fn isReadExemptOccurrence(
     t: []const u8,
     var_name: []const u8,
@@ -6276,11 +6607,6 @@ fn firstVarReadPos(t: []const u8, var_name: []const u8) ?usize {
         if (!isReadExemptOccurrence(t, var_name, i, &cls)) return i;
     }
     return null;
-}
-
-/// Check if line reads a variable (not just assigns)
-fn hasVarRead(t: []const u8, var_name: []const u8) bool {
-    return firstVarReadPos(t, var_name) != null;
 }
 
 // ============================================================================
@@ -12646,10 +12972,14 @@ fn resolveStandaloneReturn(ctx: *const TypeContext, t: []const u8) ReturnKind {
 /// Given a line like "pub fn foo(self: *T, x: u32) !void {", returns "!void".
 /// Returns null if no valid return type can be extracted.
 fn extractFnReturnType(t: []const u8) ?[]const u8 {
-    // Find the fn keyword to ensure we're looking at a function
-    const fn_pos = mem.indexOf(u8, t, "fn ") orelse return null;
-    // Find the opening paren of params
-    const open_paren = mem.indexOfScalarPos(u8, t, fn_pos, '(') orelse return null;
+    // Find the fn keyword to ensure we're looking at a function. The
+    // probe is code-position-masked: a string like `const pat = "fn (";`
+    // and an identifier like `my_fn (` are not functions (EPH-I0949
+    // residual class, EPH-I0975).
+    const fn_pos = realTokenPos(t, "fn") orelse return null;
+    // Find the opening paren of params at a code position: a `(` inside
+    // a quoted fn name (`fn @"weird ("()`) or a default value is data.
+    const open_paren = findTagInCode(t, "(", fn_pos) orelse return null;
     // Walk to find the matching closing paren (handle nested parens)
     var depth: usize = 0;
     var close_paren: ?usize = null;
@@ -12715,7 +13045,9 @@ fn extractSelfTypeName(t: []const u8) ?[]const u8 {
 /// quoted name yields null, so a broken decl registers nothing
 /// (EPH-I0922).
 fn extractFnName(t: []const u8) ?[]const u8 {
-    const fn_pos = mem.indexOf(u8, t, "fn ") orelse return null;
+    // Code-position-masked fn probe: a string or identifier carrying
+    // `fn ` is not a function (EPH-I0949 residual class, EPH-I0975).
+    const fn_pos = realTokenPos(t, "fn") orelse return null;
     const name = pubFnNameAt(t, fn_pos + 3) orelse return null;
     return name.name;
 }
@@ -12873,7 +13205,10 @@ fn registerFnSignature(
     current_type: ?[]const u8,
     ctx: *TypeContext,
 ) !bool {
-    if (mem.indexOf(u8, t, "fn ") == null or mem.indexOf(u8, t, "(") == null) return false;
+    // Code-position-masked fn-paren guard: `const pat = "fn (";` and
+    // `my_fn (x)` are not function signatures (EPH-I0949 residual class,
+    // EPH-I0975).
+    if (!isFuncBoundary(t)) return false;
     const ret_text = extractFnReturnType(t) orelse return true;
     const rk = classifyReturnType(ret_text);
     const fn_name = extractFnName(t) orelse return true;
@@ -14643,7 +14978,11 @@ fn updateBraceDepth(t: []const u8, depth: *usize) void {
 fn isScopeEnd(t: []const u8, brace_depth: usize) bool {
     if (brace_depth == 0) return true;
     if (mem.startsWith(u8, t, "return ") or mem.startsWith(u8, t, "return;")) return true;
-    return mem.indexOf(u8, t, "fn ") != null and mem.indexOf(u8, t, "(") != null;
+    // The fn-paren probe is code-position-masked: a string literal like
+    // `const pat = "fn (";` must not end the scope early, and an
+    // identifier like `my_fn (` must not either (EPH-I0949 residual
+    // class, EPH-I0975).
+    return isFuncBoundary(t);
 }
 
 /// Line context bundle for ZA204 undefined tracking (keeps helpers ≤4 params)
@@ -51085,6 +51424,162 @@ test "integration: undefined variable read" {
     try std.testing.expect(def_issues.count() > 0);
 }
 
+test "definite-assignment worklist drains within the 2B+1 cap (EPH-I0335, EPH-I1003)" {
+    const allocator = std.testing.allocator;
+    // A small branchy function. The queue-driven fixpoint must visit
+    // each block at most twice (initial plus one re-visit per state
+    // flip): the sweep form it replaced made up to 2B+1 full passes
+    // over every edge. Pre-fix, a chain-shaped CFG of B blocks paid
+    // O(B^2) visits; the drain is the hermetic pin.
+    //
+    // The loop condition caps visits at 2B+1, so a <= assertion can
+    // never fail (EPH-I1003): the cap exits only with visits == 2B+1
+    // and returns that exact value. The strict form discriminates the
+    // two exits. It holds only when the queue drained, and fails only
+    // when the cap truncated the run — the F-13 under-approximation,
+    // where a read may report where a longer run would prove coverage.
+    // The monotone bound says the drain always comes first on the
+    // shapes the CFG builder produces (loop-back preds are excluded).
+    const lines = [_][]const u8{
+        "fn f(a: bool) !void {",
+        "    if (a) {",
+        "        try g();",
+        "    }",
+        "    try h();",
+        "}",
+    };
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+    var nb = try buildBlockNeighbors(allocator, &cfg);
+    defer nb.deinit(allocator);
+    const num_blocks = cfg.blocks.items.len;
+    const gen = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(gen);
+    @memset(gen, false);
+    const def_entry = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(def_entry);
+    const def_exit = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(def_exit);
+    @memset(def_entry, false);
+    @memset(def_exit, false);
+    const queue = try allocator.alloc(usize, num_blocks *| 2 +| 1);
+    defer allocator.free(queue);
+    const in_queue = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(in_queue);
+    @memset(in_queue, false);
+    const visits = runDefiniteAssignmentWorklist(&nb, .{
+        .gen = gen,
+        .def_entry = def_entry,
+        .def_exit = def_exit,
+        .num_blocks = num_blocks,
+    }, queue, in_queue);
+    try std.testing.expect(visits < num_blocks *| 2 +| 1);
+}
+
+test "definite-assignment converges on a 10k-line adversarial function (EPH-I0335)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // 1000 undefined vars, each read inside four nested same-condition
+    // ifs — the guard-walk and correlated-guard scans' worst shape.
+    // Pre-fix, the 11k-line input hung the analyzer past five minutes
+    // (the O(n^3) per-var scans and the O(B^2 * E) worklist); the
+    // bounded scans and the queue worklist finish the 11k shape in
+    // 10.7 s (A/B measured at dispatch on the ReleaseSafe binary). The
+    // verdicts stay exact: every uncovered read still reports.
+    var body: std.ArrayListUnmanaged([]const u8) = .empty;
+    var owned: std.ArrayListUnmanaged([]const u8) = .empty;
+    try body.append(allocator, "fn adversarial() void {");
+    try body.append(allocator, "    var g: ?u32 = null;");
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const decl = try std.fmt.allocPrint(
+            allocator,
+            "    var v{d}: u32 = undefined;",
+            .{i},
+        );
+        try owned.append(allocator, decl);
+        try body.append(allocator, decl);
+        var d: usize = 0;
+        while (d < 4) : (d += 1) {
+            try body.append(allocator, "    if (g != null) {");
+        }
+        const read = try std.fmt.allocPrint(
+            allocator,
+            "    const r{d} = v{d};",
+            .{ i, i },
+        );
+        try owned.append(allocator, read);
+        try body.append(allocator, read);
+        const fill = try std.fmt.allocPrint(
+            allocator,
+            "    if (r{d} == 0) {{ v{d} = 1; }}",
+            .{ i, i },
+        );
+        try owned.append(allocator, fill);
+        try body.append(allocator, fill);
+        d = 0;
+        while (d < 4) : (d += 1) {
+            try body.append(allocator, "    }");
+        }
+    }
+    try body.append(allocator, "}");
+    const lines = try body.toOwnedSlice(allocator);
+    defer {
+        for (owned.items) |s| allocator.free(s);
+        owned.deinit(allocator);
+        allocator.free(lines);
+    }
+
+    var cfg = try buildCFG(allocator, "adversarial", 1, lines);
+    defer cfg.deinit();
+
+    var def_issues = try analyzeDefiniteAssignment(allocator, &cfg, lines, 1);
+    defer def_issues.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1000), def_issues.count());
+}
+
+test "analyzeDefiniteAssignment: OOM mid-run unwinds both maps (EPH-I0337)" {
+    const allocator = std.testing.allocator;
+    const lines = [_][]const u8{
+        "fn f() u32 {",
+        "    var x: u32 = undefined;",
+        "    var y: u32 = undefined;",
+        "    return x + y;",
+        "}",
+    };
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // Measure the cold-run allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run).
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var def_issues = try analyzeDefiniteAssignment(probe.allocator(), &cfg, &lines, 1);
+        def_issues.deinit();
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var issues = analyzeDefiniteAssignment(failing.allocator(), &cfg, &lines, 1) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            // Byte balance at the failure point is the leak proof: the
+            // errdefers free the issues map and the undef-vars map on
+            // the OOM path (band-B01b F-11).
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        issues.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 // ============================================================================
 // CFG expression-brace guard tests (EPH-I0079 A1)
 // ============================================================================
@@ -55916,7 +56411,7 @@ test "ZA607: one-line else-if chain unassigned path stays silent (EPH-I0872, doc
     // block and covers every downstream path. The chain parsers collect
     // branches only past a depth-zero close, so the same-line else-if
     // arm never joins the list; the residual is documented at
-    // validateBranchCoverage and pinned here (EPH-I0872, adjudicated
+    // buildEarlyReturnMemo and pinned here (EPH-I0872, adjudicated
     // documentation-arm per the plan).
     const content =
         \\fn f(a: bool, b: bool) u32 {
@@ -57296,7 +57791,7 @@ test "ZA607: init call on other var does not mask read" {
 
 test "isAssignmentOp rejects switch prong arrow and comparisons" {
     // EPH-I0082: `=>` is a switch prong, not an assignment — accepting it
-    // blinded hasVarRead to genuine reads in prong position and poisoned
+    // blinded the read scan to genuine reads in prong position and poisoned
     // the gen set with a non-assignment.
     try std.testing.expect(isAssignmentOp("= 1;"));
     try std.testing.expect(isAssignmentOp("="));
@@ -59244,7 +59739,7 @@ test "ZA607: switch prong arrow does not count as assignment" {
     const allocator = gpa.allocator();
 
     // EPH-I0082: isAssignmentOp accepted `=>`, so `x => ...` both gen'd x
-    // and blinded hasVarRead to the genuine prong read.
+    // and blinded the genuine prong read.
     const content =
         \\fn reproSwitch(c: u32) u32 {
         \\    var x: u32 = undefined;
@@ -60751,6 +61246,24 @@ test "hasInlineElseReturn anchors on the real else token (EPH-I0097)" {
     try std.testing.expect(hasInlineElseReturn("} else return;"));
     try std.testing.expect(hasInlineElseReturn("} else return x;"));
     try std.testing.expect(!hasInlineElseReturn("} else {"));
+}
+
+test "unmatchedOpenParenBefore masks parens inside strings (EPH-I0340)" {
+    // `f("(", a)`: the string's unpaired `(` used to shift the backward
+    // scan onto the string's paren — the call paren was missed. The
+    // literal-masked scan finds f's `(`.
+    try std.testing.expectEqual(@as(?usize, 1), unmatchedOpenParenBefore("f(\"(\", a)", 8));
+    // Unmasked regions keep the call paren verdict.
+    try std.testing.expectEqual(@as(?usize, 1), unmatchedOpenParenBefore("f(g(a), x)", 9));
+    try std.testing.expectEqual(@as(?usize, 3), unmatchedOpenParenBefore("f(g(a))", 5));
+}
+
+test "isContainerParenHeader masks parens inside strings (EPH-I0340)" {
+    // `switch ("(", y) {`: the string's unpaired `(` used to name the
+    // header and the switch keyword was missed (depth drift, band-B01b
+    // F-14). The literal-masked scan names `switch`.
+    try std.testing.expect(isContainerParenHeader("switch (\"(\", y) {", 14));
+    try std.testing.expect(!isContainerParenHeader("f(\"(\", y) {", 10));
 }
 
 test "findFillCallOccurrence grouping-paren non-call matches (EPH-I0123 doc)" {
@@ -64306,6 +64819,29 @@ test "extractFnName extracts function names" {
     try std.testing.expectEqualStrings("foo", extractFnName("fn foo() void {").?);
     try std.testing.expectEqualStrings("bar", extractFnName("pub fn bar(x: u32) !void {").?);
     try std.testing.expect(extractFnName("const x = 42;") == null);
+}
+
+test "extractFnName masks fn inside strings and identifiers (EPH-I0975)" {
+    // The raw `fn ` match read a string or an identifier as a function
+    // declaration (the EPH-I0949 residual class).
+    try std.testing.expect(extractFnName("const pat = \"fn (\";") == null);
+    try std.testing.expect(extractFnName("my_fn (x);") == null);
+}
+
+test "extractFnReturnType masks fn ( inside strings (EPH-I0975)" {
+    try std.testing.expect(extractFnReturnType("const pat = \"fn (\";") == null);
+    try std.testing.expect(extractFnReturnType("my_fn (x);") == null);
+    try std.testing.expectEqualStrings("!void", extractFnReturnType("pub fn bar(x: u32) !void {").?);
+}
+
+test "registerFnSignature guard masks fn ( in strings (EPH-I0975)" {
+    var ctx = TypeContext.init();
+    defer ctx.deinit(std.testing.allocator);
+    // A string carrying `fn (` is not a signature: the guard rejects it
+    // before any registration.
+    try std.testing.expect(!try registerFnSignature(std.testing.allocator, "const pat = \"fn (\";", null, &ctx));
+    // The real signature still registers.
+    try std.testing.expect(try registerFnSignature(std.testing.allocator, "fn g() void {", null, &ctx));
 }
 
 test "extractFnName accepts quoted names (EPH-I0922)" {
@@ -70923,6 +71459,26 @@ test "isFillPattern: a fill-shaped debug string on a for line does not fill (EPH
     // print read as filling x. hasDirectFill pattern 2 masks literals,
     // so the line no longer counts as a fill.
     try std.testing.expect(!isFillPattern("for (items) |i| log(\"x[i] = 1\", .{x[i]});", "x"));
+}
+
+test "firstVarReadPos exempts .len occurrences (EPH-I0338 doc)" {
+    // The .len exemption is a documented false negative: a slice reads
+    // `.len` at runtime, but the type is unknown at this text scan, so
+    // every `.len` occurrence stays read-exempt (band-B01b F-12,
+    // isReadExemptOccurrence).
+    try std.testing.expect(firstVarReadPos("n = s.len;", "s") == null);
+    try std.testing.expect(firstVarReadPos("n = buf.len;", "buf") == null);
+    // Non-.len occurrences still read.
+    try std.testing.expect(firstVarReadPos("n = s.ptr;", "s") != null);
+}
+
+test "branchAssignsVar and branchHasExit accept an empty body (EPH-I0341)" {
+    // The `lines.len - 1` end cap underflowed on an empty slice (panic
+    // in ReleaseSafe, UB in ReleaseFast); the guard returns the
+    // documented empty-body verdict instead (band-B01b F-15).
+    const empty: []const []const u8 = &.{};
+    try std.testing.expect(!branchAssignsVar(empty, 0, 0, "x"));
+    try std.testing.expect(!branchHasExit(empty, 0, 0));
 }
 
 test "firstVarReadPos ignores string-data comment openers and real comments (EPH-I0412)" {
@@ -77920,6 +78476,15 @@ test "isScopeEnd unifies the depth and return/fn predicates (EPH-I0421)" {
     try std.testing.expect(isScopeEnd("fn g() void {", 1));
     try std.testing.expect(!isScopeEnd("x = 1;", 2));
     try std.testing.expect(!isScopeEnd("use(s);", 1));
+}
+
+test "isScopeEnd masks fn ( inside strings and identifiers (EPH-I0975)" {
+    // The raw `fn ` + `(` match read a string or an identifier as a
+    // scope boundary and flushed the pending undefined early (the
+    // EPH-I0949 residual class).
+    try std.testing.expect(!isScopeEnd("const pat = \"fn (\";", 2));
+    try std.testing.expect(!isScopeEnd("my_fn (x);", 2));
+    try std.testing.expect(isScopeEnd("fn g() void {", 1));
 }
 
 test "collectUndefinedField records one field with 1-based col (EPH-I0421)" {

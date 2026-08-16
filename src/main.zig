@@ -1778,17 +1778,19 @@ const CFGBuildCtx = struct {
     }
 
     /// Route a line pattern to its CFG handler; patterns that neither
-    /// open nor pop change nothing in the graph.
+    /// open nor pop change nothing in the graph. Only control openers
+    /// dispatch here: both callers (walkOneEvent open_control and the
+    /// walkLineEvents tail) guard with isControlOpener, so the
+    /// pop/arm/return patterns (block_end, switch_arm, return_stmt)
+    /// are unreachable here and route through their own walk handlers
+    /// (EPH-I0999; also relieves EPH-I0059 branch pressure).
     fn dispatchPattern(self: *CFGBuildCtx, pattern: CFPattern, t: []const u8, line: usize) !void {
         switch (pattern) {
             .if_start => try self.handleBranch(.if_block, t, line),
             .while_start => try self.handleBranch(.while_block, t, line),
             .for_start => try self.handleBranch(.for_block, t, line),
             .switch_start => try self.handleSwitchStart(),
-            .switch_arm => try self.handleSwitchArm(t, line),
             .else_start, .else_if => try self.handleElse(t, line),
-            .return_stmt => try self.handleReturn(),
-            .block_end => try self.handleBlockEnd(line),
             .catch_start => try self.handleCatchStart(line),
             else => {},
         }
@@ -26986,10 +26988,23 @@ fn guardCoversDecrement(
     amount: ?usize,
 ) bool {
     if (amount == null) return true;
-    const guard_line = guardSourceForLine(mem.trim(u8, ctx.lines[guard_idx], " \t\r"));
+    const raw = mem.trim(u8, ctx.lines[guard_idx], " \t\r");
+    const guard_line = guardSourceForLine(raw);
     if (mem.indexOf(u8, guard_line, "assert") != null)
         return judgeAssertBound(guard_line, var_name, amount.?) != .uncovered;
-    return guardLineCoversAmount(guard_line, var_name, amount.?);
+    // The guard source is a suffix of the raw line (the arm region of an
+    // else-open); the join starts at the same offset so a multi-line arm
+    // condition joins from its own `if`, never from the negated
+    // antecedent (EPH-I1000).
+    return guardLineCoversAmountWithJoin(
+        .{
+            .lines = ctx.lines,
+            .line_idx = guard_idx,
+            .first_offset = raw.len - guard_line.len,
+        },
+        var_name,
+        amount.?,
+    );
 }
 
 /// True when the guard line's condition proves `var_name >= amount`.
@@ -27005,11 +27020,195 @@ fn guardLineCoversAmount(line: []const u8, var_name: []const u8, amount: usize) 
     return true;
 }
 
+/// The join context for one guard line: the function's lines, the
+/// guard line's index, and the offset of the judge region in that
+/// line — 0 for a plain opener, past the `else` keyword for an
+/// else-arm region (EPH-I1000).
+const GuardJoinCtx = struct {
+    lines: []const []const u8,
+    line_idx: usize,
+    first_offset: usize,
+};
+
+/// True when the guard line's condition proves `var_name >= amount`,
+/// joining a condition that opens on the line but closes on a later
+/// line (a multi-line or/and-tail). The join feeds the same span and
+/// bound judges: `if (m > 1 or` + `m > 3) {` proves m >= 2, so
+/// `m -= 5` fires and `m -= 1` stays silent (EPH-I1000). A condition
+/// the join cannot assemble safely (a comment, an unterminated string,
+/// or past the caps) keeps the shape-only verdict — the span parse on
+/// the joined text is string/comment-aware, so a poisoned join yields
+/// no span and never narrows the old verdict (EPH-I1000). The text at
+/// `first_offset` in the line is the judge region; the join starts
+/// there so an else-open line's arm condition never borrows the
+/// negated antecedent's text (EPH-I1000).
+fn guardLineCoversAmountWithJoin(
+    ctx: GuardJoinCtx,
+    var_name: []const u8,
+    amount: usize,
+) bool {
+    const raw = mem.trim(u8, ctx.lines[ctx.line_idx], " \t\r");
+    const line = raw[ctx.first_offset..];
+    if (guardConditionSpan(line)) |span| return guardSpanCoversAmount(line, var_name, span, amount);
+    if (allmanGuardConditionSpan(line)) |span| {
+        return guardSpanCoversAmount(line, var_name, span, amount);
+    }
+    var buf: [joined_guard_buf]u8 = undefined;
+    const joined = joinGuardCondition(
+        ctx.lines,
+        ctx.line_idx,
+        ctx.first_offset,
+        &buf,
+    ) orelse return true;
+    if (guardConditionSpan(joined)) |span| {
+        return guardSpanCoversAmount(joined, var_name, span, amount);
+    }
+    if (allmanGuardConditionSpan(joined)) |span| {
+        return guardSpanCoversAmount(joined, var_name, span, amount);
+    }
+    return true;
+}
+
+/// The join caps for a multi-line guard condition: at most this many
+/// lines and this many bytes. A condition past the caps is not joined;
+/// the shape-only verdict stays (EPH-I1000).
+const max_joined_guard_lines = 8;
+const joined_guard_buf = 512;
+
+/// Verdict of one line's scan in a joined guard condition: the line
+/// ended without closing the condition, the condition's close paren
+/// was reached, or a poison (a comment, an unterminated string)
+/// aborted the join.
+const JoinLineVerdict = enum { continue_scan, closed, abort };
+
+/// Outcome of scanning one line of a joined guard condition: the
+/// updated paren depth and the close paren's position when closed
+/// (EPH-I1000).
+const JoinScanResult = struct {
+    verdict: JoinLineVerdict,
+    depth: usize,
+    close_pos: usize = 0,
+};
+
+/// True when `t` carries a guard keyword (`if`/`while`) whose paren
+/// group opens on the text: the join has a condition to track
+/// (EPH-I1000).
+fn regionOpensGuardGroup(t: []const u8) bool {
+    var from: usize = 0;
+    while (nextGuardKeywordPos(t, from)) |kw| {
+        const kw_len: usize = if (t[kw] == 'w') 5 else 2;
+        var j = kw + kw_len;
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+        if (j < t.len and t[j] == '(') return true;
+        from = kw + kw_len;
+    }
+    return false;
+}
+
+/// Index of the closing quote of the string that opens at `start`, or
+/// null when the string never closes on the line. A backslash escapes
+/// the next byte, so `\"` stays inside the string (EPH-I1000).
+fn joinStringEnd(t: []const u8, start: usize) ?usize {
+    var j = start;
+    while (j < t.len) : (j += 1) {
+        if (t[j] == '\\') {
+            j += 1;
+            continue;
+        }
+        if (t[j] == '"') return j;
+    }
+    return null;
+}
+
+/// Scan one line of a joined guard condition, tracking the paren depth
+/// of the condition's open group. String content is skipped; a comment
+/// on the line, an unterminated string, or the close paren each end
+/// the scan with their verdict (EPH-I1000).
+fn scanJoinLine(t: []const u8, start: usize, depth: usize) JoinScanResult {
+    const comment_start = findCommentStart(t);
+    var j = start;
+    var d = depth;
+    while (j < t.len) : (j += 1) {
+        if (comment_start != null and j >= comment_start.?) {
+            return .{ .verdict = .abort, .depth = d };
+        }
+        const c = t[j];
+        if (c == '"') {
+            j = joinStringEnd(t, j + 1) orelse return .{ .verdict = .abort, .depth = d };
+            continue;
+        }
+        if (c == '(') {
+            d += 1;
+            continue;
+        }
+        if (c != ')') continue;
+        d -= 1;
+        if (d == 0) return .{ .verdict = .closed, .depth = d, .close_pos = j };
+    }
+    return .{ .verdict = .continue_scan, .depth = d };
+}
+
+/// The joined text of a guard line whose condition opens on the line
+/// (at or after `first_offset`) but closes on a later line, or null
+/// when the condition cannot be joined. The join stops at the
+/// condition's close paren and appends each line up to that point — a
+/// trailing comment or body brace never enters the joined text. A
+/// comment, an unterminated string, or a condition past the caps
+/// returns null and the caller keeps the single-line shape-only
+/// verdict (EPH-I1000). The joined text starts at the region's own
+/// guard keyword: an else-open line's antecedent before the offset
+/// must never enter the join, or its condition hijacks the span parse
+/// and the arm's own condition never judges (EPH-I1000).
+fn joinGuardCondition(
+    lines: []const []const u8,
+    start_idx: usize,
+    first_offset: usize,
+    buf: []u8,
+) ?[]const u8 {
+    const first = mem.trim(u8, lines[start_idx], " \t\r");
+    if (first_offset >= first.len) return null;
+    const region = first[first_offset..];
+    if (!regionOpensGuardGroup(region)) return null;
+    var depth: usize = 0;
+    var out_len: usize = 0;
+    var line_count: usize = 0;
+    var offset = first_offset;
+    var i = start_idx;
+    while (i < lines.len) : (i += 1) {
+        if (line_count == max_joined_guard_lines) return null;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        const scan = scanJoinLine(t, offset, depth);
+        if (scan.verdict == .abort) return null;
+        depth = scan.depth;
+        const closed = scan.verdict == .closed;
+        const end: usize = if (closed) scan.close_pos + 1 else t.len;
+        const part = t[offset..end];
+        if (out_len + part.len + 1 > buf.len) return null;
+        @memcpy(buf[out_len..][0..part.len], part);
+        out_len += part.len;
+        if (closed) return buf[0..out_len];
+        buf[out_len] = ' ';
+        out_len += 1;
+        line_count += 1;
+        offset = 0;
+    }
+    return null;
+}
+
 /// True when the Allman header's condition proves `var_name >= amount`
-/// (EPH-I0976). See guardLineCoversAmount.
-fn allmanLineCoversAmount(line: []const u8, var_name: []const u8, amount: usize) bool {
-    const span = allmanGuardConditionSpan(line) orelse return true;
-    return guardSpanCoversAmount(line, var_name, span, amount);
+/// (EPH-I0976). A multi-line header condition joins like any other
+/// guard line (EPH-I1000).
+fn allmanLineCoversAmount(
+    lines: []const []const u8,
+    header_idx: usize,
+    var_name: []const u8,
+    amount: usize,
+) bool {
+    return guardLineCoversAmountWithJoin(
+        .{ .lines = lines, .line_idx = header_idx, .first_offset = 0 },
+        var_name,
+        amount,
+    );
 }
 
 /// True when the guard-condition span proves `var_name >= amount`. A
@@ -27018,8 +27217,11 @@ fn allmanLineCoversAmount(line: []const u8, var_name: []const u8, amount: usize)
 /// and an overflowing literal RHS do not cover — the body can run
 /// unguarded (EPH-I0961, EPH-I0964). A comparison with an identifier
 /// RHS keeps the shape-only verdict — the exact bound needs both
-/// literals (EPH-I0495). The budget-exhausted null never suppresses
-/// (EPH-I0966).
+/// literals, and a var-value analysis is beyond the line-granular
+/// model; the class stays accepted with the shape-only verdict to
+/// avoid FP noise on genuinely-guarded corpus code (verified: 8
+/// corpus sites; EPH-I1000 residual). The budget-exhausted null never
+/// suppresses (EPH-I0966).
 fn guardSpanCoversAmount(
     line: []const u8,
     var_name: []const u8,
@@ -28818,6 +29020,32 @@ fn elseKeywordPos(t: []const u8) ?usize {
     return last;
 }
 
+/// Position of the last `else` keyword that opens an else arm at or
+/// before `limit`, or null. The bounded twin of elseKeywordPos: the
+/// same-line guard judge uses it to tell a then-arm candidate (before
+/// any else) from an else-arm candidate (EPH-I1001). Positions ascend,
+/// so the scan stops at the first keyword past `limit`.
+fn elseKeywordBeforePos(t: []const u8, limit: usize) ?usize {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var from: usize = 0;
+    var last: ?usize = null;
+    while (mem.indexOf(u8, t[from..], "else")) |rel| {
+        const pos = from + rel;
+        if (pos >= limit) break;
+        from = pos + 4;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + 4 < t.len and isIdent(t[pos + 4])) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        var k = pos;
+        while (k > 0 and (t[k - 1] == ' ' or t[k - 1] == '\t')) k -= 1;
+        if (k == 0 or t[k - 1] != '}') continue;
+        last = pos;
+    }
+    return last;
+}
+
 /// The arm's own region of an else-open line: the suffix after the
 /// `else` keyword. The opener walks judge only this region — the
 /// condition before the `else` is the ANTECEDENT, negated for the arm
@@ -28886,7 +29114,7 @@ fn allmanHeaderGuardHasVar(ctx: AllmanHeaderCtx, amount: ?usize) bool {
             !lineCarriesStatementEnd(above) and
             (isConditionalStart(above) or isLoopStart(above)) and
             hasConditionalGuardForVar(above, ctx.var_name) and
-            allmanHeaderCoversAmount(above, ctx.var_name, amount)) return true;
+            allmanHeaderCoversAmount(ctx.lines, k, ctx.var_name, amount)) return true;
         break;
     }
     return false;
@@ -28919,10 +29147,16 @@ fn allmanHeaderGuardHasBound(
 /// True when the Allman header's proven bound clears the decrement
 /// amount; a null amount keeps the shape-only verdict. A header that
 /// proves no bound does not cover — the body can run unguarded
-/// (EPH-I0961, EPH-I0995).
-fn allmanHeaderCoversAmount(header: []const u8, var_name: []const u8, amount: ?usize) bool {
+/// (EPH-I0961, EPH-I0995). A multi-line header condition joins through
+/// the shared judge (EPH-I1000).
+fn allmanHeaderCoversAmount(
+    lines: []const []const u8,
+    header_idx: usize,
+    var_name: []const u8,
+    amount: ?usize,
+) bool {
     if (amount == null) return true;
-    return allmanLineCoversAmount(header, var_name, amount.?);
+    return allmanLineCoversAmount(lines, header_idx, var_name, amount.?);
 }
 
 /// Walk backwards through enclosing blocks, checking for a guarded variable
@@ -28971,7 +29205,7 @@ fn hasEnclosingGuardForVar(
         if (brace_depth < 0) {
             if (!skip_antecedent and
                 hasConditionalGuardForVar(elseArmRegion(ctx), var_name) and
-                guardRegionCovers(elseArmRegion(ctx), var_name, amount)) return true;
+                guardRegionCovers(lines, i, var_name, amount)) return true;
             skip_antecedent = false;
             brace_depth = 0;
             // An Allman body open is the bare `{` line under the opener:
@@ -28997,7 +29231,7 @@ fn hasEnclosingGuardForVar(
         if (kind) |k| {
             if (!skip_antecedent and k == .chain and
                 hasConditionalGuardForVar(elseArmRegion(ctx), var_name) and
-                guardRegionCovers(elseArmRegion(ctx), var_name, amount)) return true;
+                guardRegionCovers(lines, i, var_name, amount)) return true;
             // Only a CLASSIC else-open (`} else {`) has its antecedent
             // on a line above: the next opener crossed is that
             // antecedent and must be skipped. A mid-line else-open
@@ -29015,10 +29249,27 @@ fn hasEnclosingGuardForVar(
 /// True when the guard region's proven lower bound clears the decrement
 /// amount; a null amount keeps the shape-only verdict. A region that
 /// proves no bound (an or-tail, a comparison in call position) does not
-/// cover — the body can run unguarded (EPH-I0961, EPH-I0995).
-fn guardRegionCovers(region: []const u8, var_name: []const u8, amount: ?usize) bool {
+/// cover — the body can run unguarded (EPH-I0961, EPH-I0995). The
+/// region is the else-arm suffix of the line; a multi-line arm
+/// condition joins through the shared judge (EPH-I1000).
+fn guardRegionCovers(
+    lines: []const []const u8,
+    line_idx: usize,
+    var_name: []const u8,
+    amount: ?usize,
+) bool {
     if (amount == null) return true;
-    return guardLineCoversAmount(region, var_name, amount.?);
+    const raw = mem.trim(u8, lines[line_idx], " \t\r");
+    const region = elseArmRegion(raw);
+    return guardLineCoversAmountWithJoin(
+        .{
+            .lines = lines,
+            .line_idx = line_idx,
+            .first_offset = raw.len - region.len,
+        },
+        var_name,
+        amount.?,
+    );
 }
 
 /// The proven lower bound of a comparison on `var_name` in the opener
@@ -30185,10 +30436,27 @@ fn hasComparisonGuardPattern(line: []const u8) bool {
 /// proven bound: `if (m > 1) { m -= 5; }` fires because m >= 2 does
 /// not clear 5, and the zero-exit covers amounts <= 1 only
 /// (EPH-I0995). A null amount keeps the shape-only verdict.
+///
+/// A same-line else-arm candidate is judged by the arm's own region
+/// after the line's last `else` keyword (guardSourceForLine): the
+/// chain's antecedent conditions are negated for the arm below, so
+/// they must never cover its candidate — `if (m > 1) { return 0; }
+/// else { m -= 1; }` runs the decrement at m <= 1 and fires
+/// (EPH-I1001). The split mirrors the record path, so a chain arm's
+/// own condition (`} else if (m > 3) { m -= 2; }`) still covers its
+/// candidate (EPH-I0996). A then-arm candidate (no else keyword
+/// before the decrement) keeps the whole-line judge (EPH-I0995). The
+/// zero-exit branch keeps the full line: the `== 0` exit is the one
+/// antecedent whose negation proves a bound — the arm runs at m != 0,
+/// so `m -= 1` stays silent (EPH-I1001).
 fn hasGuardOnLine(line: []const u8, var_name: []const u8, amount: ?usize) bool {
     if (!mentionsIdent(line, var_name)) return false;
-    if (hasLowerBoundGuardForVar(line, var_name, line.len)) {
-        if (amount) |amt| return guardLineCoversAmount(line, var_name, amt);
+    const dec_col = findDecrementOp(line);
+    const in_else_arm = dec_col != null and
+        elseKeywordBeforePos(line, dec_col.?) != null;
+    const guard_ctx = if (in_else_arm) guardSourceForLine(line) else line;
+    if (hasLowerBoundGuardForVar(guard_ctx, var_name, guard_ctx.len)) {
+        if (amount) |amt| return guardLineCoversAmount(guard_ctx, var_name, amt);
         return true;
     }
     if (hasExitStatement(line) and hasEqualsZeroGuardForVar(line, var_name)) {
@@ -79276,6 +79544,370 @@ test "ZA901: multi-line arm guard judges the decrement amount (EPH-I0995)" {
             RULE_DECREMENT_WITHOUT_CHECK,
         ),
     );
+}
+
+test "ZA901: multi-line or-tail guard judges the decrement amount (EPH-I1000)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A condition that opens on the guard line but closes on the next
+    // line joins for the span parse: `m > 1 or m > 3` proves m >= 2
+    // (the or min-combine), so `m -= 5` fires while `m -= 1` and the
+    // and-tail twin stay silent. Pre-fix the unclosed condition kept
+    // the shape-only covered verdict and every amount stayed silent
+    // (FN) (EPH-I1000).
+    const content =
+        \\fn ort_multi_unsafe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1 or
+        \\        m > 3) {
+        \\        m -= 5;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn ort_multi_safe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1 or
+        \\        m > 3) {
+        \\        m -= 1;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn ort_multi_and(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1 and
+        \\        m > 5) {
+        \\        m -= 2;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_ortail_join.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za901_ortail_join.zig",
+            RULE_DECREMENT_WITHOUT_CHECK,
+        ),
+    );
+}
+
+test "ZA901: multi-line Allman or-tail guard judges the amount (EPH-I1000)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The Allman twin: the body open sits on its own line, so the
+    // walk's header judge joins the header's unclosed condition the
+    // same way — `m -= 5` fires, `m -= 1` stays silent (EPH-I1000).
+    const content =
+        \\fn allman_unsafe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1 or
+        \\        m > 3)
+        \\    {
+        \\        m -= 5;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn allman_safe(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1 or
+        \\        m > 3)
+        \\    {
+        \\        m -= 1;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_allman_join.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za901_allman_join.zig",
+            RULE_DECREMENT_WITHOUT_CHECK,
+        ),
+    );
+}
+
+test "ZA901: mid-line else-if multi-line own condition covers its arm (EPH-I1000)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A chain arm's multi-line own condition joins from the arm region
+    // after the `else` keyword — the negated antecedent (`n > 1`) must
+    // not hijack the join. `m > 3 or m > 5` proves m >= 4: `m -= 4`
+    // stays silent and `m -= 6` fires (EPH-I1000).
+    const content =
+        \\fn mid_ok(x: usize, n: usize) usize {
+        \\    var m = x;
+        \\    if (n > 1) { return 0; } else if (m > 3 or
+        \\        m > 5) {
+        \\        m -= 4;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+        \\fn mid_big(x: usize, n: usize) usize {
+        \\    var m = x;
+        \\    if (n > 1) { return 0; } else if (m > 3 or
+        \\        m > 5) {
+        \\        m -= 6;
+        \\        return m;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_region_join.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za901_region_join.zig",
+            RULE_DECREMENT_WITHOUT_CHECK,
+        ),
+    );
+}
+
+test "ZA901: identifier-RHS guard keeps the documented shape-only verdict (EPH-I1000)" {
+    // A comparison with an identifier RHS (`if (m > limit)`) cannot be
+    // amount-judged: the exact bound needs both literals, and a
+    // var-value analysis is beyond the line-granular model. The class
+    // keeps the shape-only verdict (covered for any amount) to avoid
+    // FP noise on genuinely-guarded corpus code (verified: 8 corpus
+    // sites; EPH-I1000 residual, documented at guardSpanCoversAmount).
+    // The end-to-end twin stays silent (probe .tmp/b46probes/p2_var_rhs).
+    try std.testing.expect(guardLineCoversAmount("if (m > limit) {", "m", 5));
+    try std.testing.expect(guardSpanCoversAmount(
+        "if (m > limit) {",
+        "m",
+        .{ .start = 4, .end = 13 },
+        5,
+    ));
+}
+
+test "joinGuardCondition joins clean multi-line conditions and bails on poison (EPH-I1000)" {
+    // The or-tail's two lines join into one condition text; the span
+    // and bound judges then parse it like a single-line condition. The
+    // region-offset join starts at the arm's own `if`, never at the
+    // negated antecedent. A comment, an unterminated string, or a
+    // condition past the byte cap cannot be joined — null keeps the
+    // caller's shape-only verdict (EPH-I1000).
+    const clean = [_][]const u8{
+        "fn f(x: usize) usize {",
+        "    var m = x;",
+        "    if (m > 1 or",
+        "        m > 3) {",
+        "        m -= 5;",
+        "    }",
+    };
+    var buf: [joined_guard_buf]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "if (m > 1 or m > 3)",
+        joinGuardCondition(&clean, 2, 0, &buf).?,
+    );
+
+    const mid = [_][]const u8{
+        "fn f(x: usize, n: usize) usize {",
+        "    var m = x;",
+        "    if (n > 1) { return 0; } else if (m > 3 or",
+        "        m > 5) {",
+        "        m -= 4;",
+        "    }",
+    };
+    const raw = mem.trim(u8, mid[2], " \t\r");
+    const region = guardSourceForLine(raw);
+    try std.testing.expectEqualStrings(
+        "if (m > 3 or m > 5)",
+        joinGuardCondition(&mid, 2, raw.len - region.len, &buf).?,
+    );
+
+    const comment = [_][]const u8{
+        "fn f(x: usize) usize {",
+        "    var m = x;",
+        "    if (m > 1 or // note",
+        "        m > 3) {",
+        "        m -= 5;",
+        "    }",
+    };
+    try std.testing.expect(joinGuardCondition(&comment, 2, 0, &buf) == null);
+
+    const strline = [_][]const u8{
+        "fn f(x: usize) usize {",
+        "    var m = x;",
+        "    if (m > 1 or",
+        "        m > \"3) {",
+        "        m -= 5;",
+        "    }",
+    };
+    try std.testing.expect(joinGuardCondition(&strline, 2, 0, &buf) == null);
+
+    var wide_buf: [600]u8 = undefined;
+    @memcpy(wide_buf[0..4], "if (");
+    const cond = "m > 1 or ";
+    var w: usize = 4;
+    while (w + cond.len < 580) : (w += cond.len) {
+        @memcpy(wide_buf[w..][0..cond.len], cond);
+    }
+    const wide_line = wide_buf[0..w];
+    const wide = [_][]const u8{
+        "fn f(x: usize) usize {",
+        "    var m = x;",
+        wide_line,
+        "        m > 3) {",
+        "        m -= 5;",
+        "    }",
+    };
+    try std.testing.expect(joinGuardCondition(&wide, 2, 0, &buf) == null);
+}
+
+test "ZA901: same-line closed-chain else-arm decrement fires (EPH-I1001)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A same-line closed chain's else arm runs under the NEGATED
+    // antecedent: `if (m > 1) { return 0; } else { m -= 1; }` decrements
+    // at m <= 1 and underflows at m == 0. The same-line judge must not
+    // credit the antecedent's bound — pre-fix the whole-line judge read
+    // the first condition's span (m >= 2) and the decrement stayed
+    // silent (FN, batch-42 review probe leak2.zig). The 3-arm chain's
+    // first candidate fires the same way; the foreign-var twin and the
+    // then-arm twin keep their verdicts (controls).
+    const content =
+        \\fn chain2(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) { return 0; } else { m -= 1; }
+        \\    return m;
+        \\}
+        \\fn chain3(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) { return 0; } else if (m > 3) { m -= 2; } else { m -= 1; }
+        \\    return m;
+        \\}
+        \\fn chain2_foreign(x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (q > 1) { return 0; } else { m -= 1; }
+        \\    return m;
+        \\}
+        \\fn then_ok(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 1) { m -= 1; } else { return 0; }
+        \\    return m;
+        \\}
+        \\fn zero_else(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 0) { return 0; } else { m -= 1; }
+        \\    return m;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_chain_else_fire.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countRuleIssues(
+            run.issues.items,
+            "test_za901_chain_else_fire.zig",
+            RULE_DECREMENT_WITHOUT_CHECK,
+        ),
+    );
+}
+
+test "ZA901: chain-arm own condition still covers a same-line candidate (EPH-I1001)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The region split mirrors the record path: a chain arm's OWN
+    // condition still covers its candidate (`m > 3` proves m >= 4, so
+    // `m -= 2` stays silent), while an amount past the bound fires
+    // (EPH-I1001, EPH-I0996).
+    const content =
+        \\fn chain_own_ok(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 1) { return 0; } else if (m > 3) { m -= 2; }
+        \\    return m;
+        \\}
+        \\fn chain_own_big(x: usize) usize {
+        \\    var m = x;
+        \\    if (m == 1) { return 0; } else if (m > 3) { m -= 5; }
+        \\    return m;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_chain_own.zig", content);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(
+            run.issues.items,
+            "test_za901_chain_own.zig",
+            RULE_DECREMENT_WITHOUT_CHECK,
+        ),
+    );
+}
+
+test "hasGuardOnLine splits the same-line chain's else-arm region (EPH-I1001)" {
+    // The same-line judge reads the arm's own region after the line's
+    // last `else` keyword when the candidate sits in an else arm; a
+    // then-arm candidate keeps the whole-line judge. The zero-exit
+    // branch keeps the full line: the `== 0` exit's negation proves the
+    // arm runs at m >= 1 (EPH-I1001).
+    try std.testing.expect(!hasGuardOnLine("if (m > 1) { return 0; } else { m -= 1; }", "m", 1));
+    try std.testing.expect(!hasGuardOnLine("if (m > 1) { return 0; } else { m -= 1; }", "m", null));
+    try std.testing.expect(!hasGuardOnLine(
+        "if (m > 1) { return 0; } else if (m > 3) { m -= 2; } else { m -= 1; }",
+        "m",
+        2,
+    ));
+    try std.testing.expect(!hasGuardOnLine("if (q > 1) { return 0; } else { m -= 1; }", "m", 1));
+    // Then-arm candidates keep the whole-line antecedent credit.
+    try std.testing.expect(hasGuardOnLine("if (m > 1) { m -= 1; } else { return 0; }", "m", 1));
+    try std.testing.expect(!hasGuardOnLine("if (m > 1) { m -= 5; } else { return 0; }", "m", 5));
+    // A chain arm's own condition covers its candidate in the region.
+    try std.testing.expect(hasGuardOnLine("if (m == 1) { return 0; } else if (m > 3) { m -= 2; }", "m", 2));
+    try std.testing.expect(!hasGuardOnLine("if (m == 1) { return 0; } else if (m > 3) { m -= 5; }", "m", 5));
+    // The zero-exit antecedent's negation covers amounts <= 1 only.
+    try std.testing.expect(hasGuardOnLine("if (m == 0) { return 0; } else { m -= 1; }", "m", 1));
+    try std.testing.expect(!hasGuardOnLine("if (m == 0) { return 0; } else { m -= 2; }", "m", 2));
+}
+
+test "elseKeywordBeforePos bounds the else scan at the candidate (EPH-I1001)" {
+    // The bounded twin keeps the same rules (brace-following,
+    // string/comment-aware) and stops at the first keyword past the
+    // candidate's column: a then-arm candidate before any else sees no
+    // arm, an else-arm candidate sees the last else before it.
+    const chain = "} else { const s = \"else\"; m -= 1; }";
+    // The qualifying else follows the leading `}` at position 2; the
+    // word inside the string is not code. A candidate at column 2 sees
+    // no arm; a candidate at column 3 sits inside the arm.
+    try std.testing.expect(elseKeywordBeforePos(chain, 2) == null);
+    try std.testing.expect(elseKeywordBeforePos(chain, 3) == 2);
+    const chain2 = "if (m > 1) { return 0; } else if (m > 3) { m -= 2; } else { m -= 1; }";
+    // The chain's first else sits at 25, the final else at 53: a
+    // candidate in the then-arm (column < 25) sees no arm, a candidate
+    // between the arms sees the first else, and a candidate in the
+    // final arm sees the final else.
+    try std.testing.expect(elseKeywordBeforePos(chain2, 25) == null);
+    try std.testing.expect(elseKeywordBeforePos(chain2, 26) == 25);
+    try std.testing.expect(elseKeywordBeforePos(chain2, 53) == 25);
+    try std.testing.expect(elseKeywordBeforePos(chain2, 54) == 53);
 }
 
 test "ZA903: mismatched-array .len guard does not suppress the candidate (EPH-I0496)" {

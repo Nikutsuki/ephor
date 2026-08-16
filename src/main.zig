@@ -340,36 +340,12 @@ const Thresholds = types.Thresholds;
 // Control Flow Graph (CFG) Infrastructure - Phase 4
 // ============================================================================
 
-/// State of an allocation through the CFG
-const AllocationState = enum {
-    unknown, // Initial state
-    allocated, // Memory allocated, not yet freed
-    freed, // Memory has been freed
-    will_free, // Covered by defer (will be freed on scope exit)
-    escaped, // Pointer returned or stored (ownership transferred)
-};
-
-/// Represents a variable/allocation being tracked
-const TrackedAllocation = struct {
-    name: []const u8, // Variable name holding the allocation
-    line: usize, // Line where allocated
-    col: usize, // Column where allocated
-    state: AllocationState,
-    is_create: bool, // true = create(), false = alloc()
-};
-
 /// A basic block in the CFG - straight-line code with no internal branches
 const BasicBlock = struct {
     id: usize,
     start_line: usize,
     end_line: usize,
-    allocations: std.ArrayListUnmanaged(TrackedAllocation),
-    has_defer_free: bool,
-    has_errdefer: bool,
     is_return: bool,
-    is_error_return: bool,
-    returns_value: bool,
-    is_catch_block: bool, // Block is in error recovery path (catch handler)
     // Ends with break/continue: control never falls through past this
     // block, so close wiring must not add edges from it (EPH-I0094)
     is_jump_terminal: bool,
@@ -379,19 +355,9 @@ const BasicBlock = struct {
             .id = 0,
             .start_line = 0,
             .end_line = 0,
-            .allocations = .empty,
-            .has_defer_free = false,
-            .has_errdefer = false,
             .is_return = false,
-            .is_error_return = false,
-            .returns_value = false,
-            .is_catch_block = false,
             .is_jump_terminal = false,
         };
-    }
-
-    fn deinit(self: *BasicBlock, allocator: Allocator) void {
-        self.allocations.deinit(allocator);
     }
 };
 
@@ -432,7 +398,13 @@ const BlockType = enum {
 const StackEntry = struct {
     block_type: BlockType,
     merge_block: usize, // Block to merge back to (or continuation for catch)
-    catch_origin_block: usize, // For catch: the block before catch started (0 if N/A)
+    // The construct's branch-origin block: for catch, the block before
+    // the catch started; for loops, the header (continue target); for
+    // switch, the header (arm source); for else-if, the condition-false
+    // block. Null only for plain if/else entries, which no reader
+    // consults — every reader gates on block_type first, so the null
+    // never dereferences (EPH-I0325, band-B01a F10).
+    catch_origin_block: ?usize,
     // Control `{` has not been seen yet (Allman style / multi-line condition);
     // the next `{` at paren-depth 0 on a non-opener line belongs to this entry.
     pending_brace: bool = false,
@@ -507,9 +479,6 @@ const ControlFlowGraph = struct {
     }
 
     fn deinit(self: *ControlFlowGraph) void {
-        for (self.blocks.items) |*block| {
-            block.deinit(self.allocator);
-        }
         self.blocks.deinit(self.allocator);
         self.edges.deinit(self.allocator);
         self.exit_blocks.deinit(self.allocator);
@@ -537,44 +506,11 @@ const ControlFlowGraph = struct {
             .kind = kind,
         });
     }
-
-    /// Get all predecessor blocks for a given block
-    fn getPredecessors(
-        self: *ControlFlowGraph,
-        block_id: usize,
-        result: *std.ArrayListUnmanaged(usize),
-    ) !void {
-        for (self.edges.items) |edge| {
-            if (edge.to == block_id) {
-                try result.append(self.allocator, edge.from);
-            }
-        }
-    }
-
-    /// Get all successor blocks for a given block
-    fn getSuccessors(
-        self: *ControlFlowGraph,
-        block_id: usize,
-        result: *std.ArrayListUnmanaged(usize),
-    ) !void {
-        for (self.edges.items) |edge| {
-            if (edge.from == block_id) {
-                try result.append(self.allocator, edge.to);
-            }
-        }
-    }
 };
 
 // ============================================================================
 // Data Flow Analysis Framework (Phase 2)
 // ============================================================================
-
-/// Variable state for definite assignment analysis
-const VarState = enum {
-    undefined, // Not yet assigned
-    defined, // Has been assigned
-    maybe_defined, // Assigned on some but not all paths
-};
 
 /// Allocation state for path-sensitive memory analysis
 const AllocState = enum {
@@ -593,46 +529,6 @@ const CFGAllocation = struct {
     state: AllocState,
     freed_line: usize = 0, // Line where freed (if freed)
     is_create: bool = false,
-};
-
-/// Definition info for reaching definitions
-const DefInfo = struct {
-    var_name: []const u8,
-    line: usize,
-    kind: DefKind,
-};
-
-const DefKind = enum {
-    allocation, // alloc() or create()
-    assignment, // = value
-    undefined_init, // = undefined
-};
-
-/// Block-level data flow state
-const BlockDataFlow = struct {
-    // Definite assignment: gen = vars defined in block, kill = vars read
-    def_gen: std.StringHashMap(usize), // var -> line where defined
-    def_kill: std.StringHashMap(void), // vars read before def
-    // Reaching definitions: allocations
-    alloc_gen: std.ArrayListUnmanaged(DefInfo),
-    // Output state after data flow
-    defined_vars: std.StringHashMap(VarState),
-
-    fn init(allocator: Allocator) BlockDataFlow {
-        return .{
-            .def_gen = std.StringHashMap(usize).init(allocator),
-            .def_kill = std.StringHashMap(void).init(allocator),
-            .alloc_gen = .empty,
-            .defined_vars = std.StringHashMap(VarState).init(allocator),
-        };
-    }
-
-    fn deinit(self: *BlockDataFlow, allocator: Allocator) void {
-        self.def_gen.deinit();
-        self.def_kill.deinit();
-        self.alloc_gen.deinit(allocator);
-        self.defined_vars.deinit();
-    }
 };
 
 /// Control flow pattern detected on a line
@@ -1138,7 +1034,6 @@ const CFGBuildCtx = struct {
     block_stack: *std.ArrayListUnmanaged(StackEntry),
     allocator: Allocator,
     current_block: usize,
-    func_line: usize,
     // Kind-tagged stack of unmatched braces; a `}` is a control-block end
     // iff it pops a `.control` brace. Owned by buildCFG (same pattern as
     // block_stack).
@@ -1465,10 +1360,10 @@ const CFGBuildCtx = struct {
         // that the body always covers before a break (EPH-I0110).
         if (bt != .while_block or !isWhileLiteralTrue(t))
             try self.cfg.addEdge(self.current_block, false_block, .branch_false);
-        const origin = if (bt == .while_block or bt == .for_block)
+        const origin: ?usize = if (bt == .while_block or bt == .for_block)
             self.current_block
         else
-            @as(usize, 0);
+            null;
         try self.block_stack.append(self.allocator, .{
             .block_type = bt,
             .merge_block = false_block,
@@ -1481,11 +1376,30 @@ const CFGBuildCtx = struct {
         self.setStartLine(line);
     }
 
+    /// Wire the loop-back edge from the current block to a loop entry's
+    /// header. Loop entries always carry the header (handleBranch sets
+    /// it), so the optional unwraps by construction (EPH-I0325).
+    fn wireLoopBack(self: *CFGBuildCtx, entry: StackEntry) !void {
+        const header = entry.catch_origin_block orelse return;
+        try self.cfg.addEdge(self.current_block, header, .loop_back);
+    }
+
     /// Mark the current block as a return exit; no fall-through edge
     /// leaves it.
     fn handleReturn(self: *CFGBuildCtx) !void {
         self.cfg.blocks.items[self.current_block].is_return = true;
-        try self.cfg.exit_blocks.append(self.allocator, self.current_block);
+        try self.addExitBlock(self.current_block);
+    }
+
+    /// Append a block to the exit list, skipping an id already present:
+    /// two return lines in one block would duplicate the entry, and
+    /// consumers read the list as a membership set (EPH-I0325, band-B01a
+    /// F9).
+    fn addExitBlock(self: *CFGBuildCtx, block: usize) !void {
+        for (self.cfg.exit_blocks.items) |exit_bid| {
+            if (exit_bid == block) return;
+        }
+        try self.cfg.exit_blocks.append(self.allocator, block);
     }
 
     /// Nearest enclosing loop entry on the block stack, skipping if/else,
@@ -1513,10 +1427,12 @@ const CFGBuildCtx = struct {
     fn handleJump(self: *CFGBuildCtx, kind: JumpKind) !void {
         if (kind == .none) return;
         const entry = self.nearestLoopEntry() orelse return;
+        // A loop entry always carries its header (handleBranch sets it),
+        // so the optional unwraps by construction (EPH-I0325).
         const target = if (kind == .loop_break)
             entry.merge_block
         else
-            entry.catch_origin_block;
+            entry.catch_origin_block orelse return;
         const edge_kind: EdgeKind = if (kind == .loop_break)
             .break_jump
         else
@@ -1558,33 +1474,48 @@ const CFGBuildCtx = struct {
             i -= 1;
             const entry = self.block_stack.items[i];
             if (entry.block_type != .switch_block) continue;
-            const switch_header = entry.catch_origin_block;
-            // A jump-terminal arm (break/continue) already wired its exit —
-            // it does not fall into the switch merge (EPH-I0094).
-            if (self.current_block != switch_header and
-                !self.cfg.blocks.items[self.current_block].is_return and
-                !self.cfg.blocks.items[self.current_block].is_jump_terminal)
-            {
-                try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
-            }
-            const arm_block = try self.cfg.addBlock();
-            try self.cfg.addEdge(switch_header, arm_block, .branch_true);
-            self.current_block = arm_block;
-            self.setStartLine(line);
-            // The previous block's end_line already covers this prong line
-            // (the per-line end update runs before the event walk), so
-            // whole-line attribution hands the arm's fills and reads to the
-            // header or the previous arm — an unconditional-exit block.
-            // A full-line column span claims the line for the arm instead
-            // (EPH-I0679, the EPH-I0111 same-line-arm mechanism).
-            try self.cfg.col_spans.append(self.allocator, .{
-                .line = line,
-                .start_col = 0,
-                .end_col = code.len,
-                .block = arm_block,
-            });
+            // A switch entry always carries its header (handleSwitchStart
+            // sets it), so the optional unwraps by construction (EPH-I0325).
+            const switch_header = entry.catch_origin_block orelse continue;
+            try self.openSwitchArm(entry, switch_header, code, line);
             return;
         }
+    }
+
+    /// Wire one switch arm off the header block and claim the prong line
+    /// for it (the arm-open body of handleSwitchArm, extracted to keep
+    /// the scan loop under the complexity limit).
+    fn openSwitchArm(
+        self: *CFGBuildCtx,
+        entry: StackEntry,
+        switch_header: usize,
+        code: []const u8,
+        line: usize,
+    ) !void {
+        // A jump-terminal arm (break/continue) already wired its exit —
+        // it does not fall into the switch merge (EPH-I0094).
+        if (self.current_block != switch_header and
+            !self.cfg.blocks.items[self.current_block].is_return and
+            !self.cfg.blocks.items[self.current_block].is_jump_terminal)
+        {
+            try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
+        }
+        const arm_block = try self.cfg.addBlock();
+        try self.cfg.addEdge(switch_header, arm_block, .branch_true);
+        self.current_block = arm_block;
+        self.setStartLine(line);
+        // The previous block's end_line already covers this prong line
+        // (the per-line end update runs before the event walk), so
+        // whole-line attribution hands the arm's fills and reads to the
+        // header or the previous arm — an unconditional-exit block.
+        // A full-line column span claims the line for the arm instead
+        // (EPH-I0679, the EPH-I0111 same-line-arm mechanism).
+        try self.cfg.col_spans.append(self.allocator, .{
+            .line = line,
+            .start_col = 0,
+            .end_col = code.len,
+            .block = arm_block,
+        });
     }
 
     /// Entry for handleElse: a deferred close (lone `}` on an earlier line)
@@ -1607,7 +1538,13 @@ const CFGBuildCtx = struct {
         // condition-false block in catch_origin_block; every other entry
         // reserves merge_block as the else body and gets a fresh merge.
         const chained = entry.block_type == .else_if_block;
-        const else_body = if (chained) entry.catch_origin_block else entry.merge_block;
+        // An else-if entry always carries its condition-false block
+        // (openElseIfBranch sets it), so the optional unwraps by
+        // construction (EPH-I0325).
+        const else_body = if (chained)
+            entry.catch_origin_block orelse return
+        else
+            entry.merge_block;
         const merge_block = if (chained) entry.merge_block else try self.cfg.addBlock();
         // A jump-terminal body (break/continue) already wired its exit, so
         // the close-time edge from it is skipped (EPH-I0094).
@@ -1620,8 +1557,7 @@ const CFGBuildCtx = struct {
             // (EPH-I0086). Breaks wired to the false exit before the else
             // arrived bypass the else arm and move to the post-else merge
             // (EPH-I0094).
-            if (!terminal)
-                try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
+            if (!terminal) try self.wireLoopBack(entry);
             self.rewireBreakJumps(else_body, merge_block);
         } else {
             if (!terminal)
@@ -1631,7 +1567,7 @@ const CFGBuildCtx = struct {
             self.cfg.blocks.items[else_body].start_line = line;
             self.cfg.blocks.items[else_body].end_line = line;
             self.cfg.blocks.items[else_body].is_return = true;
-            try self.cfg.exit_blocks.append(self.allocator, else_body);
+            try self.addExitBlock(else_body);
             self.current_block = merge_block;
             self.cfg.blocks.items[self.current_block].start_line = line + 1;
         } else if (elseChainsIntoIf(t)) {
@@ -1640,7 +1576,7 @@ const CFGBuildCtx = struct {
             try self.block_stack.append(self.allocator, .{
                 .block_type = .else_block,
                 .merge_block = merge_block,
-                .catch_origin_block = 0,
+                .catch_origin_block = null,
             });
             self.current_block = else_body;
             self.setStartLine(line);
@@ -1690,8 +1626,7 @@ const CFGBuildCtx = struct {
         // no fall-through edge leaves it (EPH-I0094).
         const terminal = self.cfg.blocks.items[self.current_block].is_jump_terminal;
         if (isLoopBlock(entry.block_type)) {
-            if (!terminal)
-                try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
+            if (!terminal) try self.wireLoopBack(entry);
         } else {
             // A return-terminal body exits too; only catch and switch
             // bodies can carry one here, because the inline-return else
@@ -1744,13 +1679,16 @@ const CFGBuildCtx = struct {
         self.pending_else = null;
         const terminal = self.cfg.blocks.items[self.current_block].is_jump_terminal;
         if (isLoopBlock(entry.block_type)) {
-            if (!terminal)
-                try self.cfg.addEdge(self.current_block, entry.catch_origin_block, .loop_back);
+            if (!terminal) try self.wireLoopBack(entry);
         } else {
             if (!terminal)
                 try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
+            // An else-if entry always carries its condition-false block
+            // (openElseIfBranch sets it), so the optional unwraps by
+            // construction (EPH-I0325).
             if (entry.block_type == .else_if_block) {
-                try self.cfg.addEdge(entry.catch_origin_block, entry.merge_block, .sequential);
+                const fallthrough = entry.catch_origin_block orelse return;
+                try self.cfg.addEdge(fallthrough, entry.merge_block, .sequential);
             }
         }
         self.current_block = entry.merge_block;
@@ -1828,7 +1766,6 @@ const CFGBuildCtx = struct {
         const origin_block = self.current_block;
         const continuation_block = try self.cfg.addBlock();
         const catch_block = try self.cfg.addBlock();
-        self.cfg.blocks.items[catch_block].is_catch_block = true;
         try self.cfg.addEdge(origin_block, continuation_block, .sequential);
         try self.cfg.addEdge(origin_block, catch_block, .error_path);
         try self.block_stack.append(self.allocator, .{
@@ -2163,7 +2100,6 @@ fn buildCFG(
         .block_stack = &block_stack,
         .allocator = allocator,
         .current_block = current_block,
-        .func_line = func_line,
         .brace_stack = &brace_stack,
         .event_scratch = &event_scratch,
         .paren_depth = 0,
@@ -2371,28 +2307,6 @@ fn isPrimitiveTypeName(c: u8, first_arg: []const u8) bool {
     if (c == 'f' and first_arg.len >= 2 and
         first_arg[1] >= '0' and first_arg[1] <= '9') return true;
 
-    return false;
-}
-
-/// Check if a variable name appears as a LOCAL variable (not a struct field)
-/// Returns true if the name appears NOT preceded by '.' (which would be field access)
-fn isLocalVarOccurrence(t: []const u8, name: []const u8) bool {
-    var search_start: usize = 0;
-    while (mem.indexOf(u8, t[search_start..], name)) |rel_pos| {
-        const var_pos = search_start + rel_pos;
-        search_start = var_pos + name.len;
-
-        // Verify it's a full word match (not part of longer identifier)
-        if (var_pos + name.len < t.len and isIdent(t[var_pos + name.len])) continue;
-        if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
-
-        // If preceded by '.', it's a struct field access (self.field, with
-        // any spacing around the dot — EPH-I0796) - skip
-        if (hasLeftDot(t, var_pos)) continue;
-
-        // Found a local variable occurrence
-        return true;
-    }
     return false;
 }
 
@@ -2794,7 +2708,16 @@ fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
     return false;
 }
 
-/// Compute which block a line belongs to
+/// The block owning a whole source line, or null when no block's range
+/// covers it (a trailing empty merge block keeps start > end, EPH-I0094).
+/// Block ranges overlap on construct-open/close lines; the scan takes
+/// the FIRST match — the oldest block, the condition side — which is
+/// load-bearing: a construct's condition and body share the open line,
+/// and the condition-side block's edges model the branch, so fills and
+/// reads on that line must attribute to it (band-B01a assumption A1,
+/// EPH-I0326). O(blocks) per lookup; per-line callers compose O(B x L),
+/// bounded by the 10 MB file cap — an interval index is only worth it
+/// if profiling shows one.
 fn findBlockForLine(cfg: *const ControlFlowGraph, line: usize) ?usize {
     for (cfg.blocks.items, 0..) |block, i| {
         if (line >= block.start_line and line <= block.end_line) return i;
@@ -2805,7 +2728,9 @@ fn findBlockForLine(cfg: *const ControlFlowGraph, line: usize) ?usize {
 /// Compute which block owns a column on a line. A recorded column span
 /// wins: a same-line if/else packs the branch, the arms, and the merge
 /// into one line, and whole-line ranges cannot separate them (EPH-I0111).
-/// Lines without spans fall back to the whole-line range.
+/// Lines without spans fall back to the whole-line range. O(spans) per
+/// lookup; spans cover only same-line constructs, so the scan is short
+/// in practice (band-B01a F12, EPH-I0326).
 fn findBlockForLineCol(cfg: *const ControlFlowGraph, line: usize, col: usize) ?usize {
     for (cfg.col_spans.items) |span| {
         if (span.line != line) continue;
@@ -2819,7 +2744,8 @@ fn findBlockForLineCol(cfg: *const ControlFlowGraph, line: usize, col: usize) ?u
 /// itself so a later blank line cannot detach the fill from its arm
 /// (EPH-I0111, EPH-I0846/49). A span without a block (a non-opener
 /// line's pending claim) returns null and the caller keeps the
-/// whole-line attribution.
+/// whole-line attribution. O(spans) per lookup — spans exist only for
+/// same-line arms, a bounded per-line count (band-B01a F12, EPH-I0326).
 fn onelineArmBlockAt(cfg: *const ControlFlowGraph, line: usize, col: usize) ?usize {
     for (cfg.oneline_arms.items) |span| {
         if (span.line == line and col >= span.start_col and col < span.end_col)
@@ -6702,7 +6628,7 @@ fn collectMemSafetyAllocs(
         const actual_line = func_line + idx;
         // Split decl RHS (`const x =\n try allocator.alloc(...)`) joins
         // first; the paren join covers wrapped args (EPH-I0675).
-        const t = joinSplitDeclRhs(lines, idx, &join_buf) orelse
+        const t = joinSplitDeclRhs(lines, idx, &join_buf, &all_alloc_names) orelse
             joinParenContinuation(lines, idx, &join_buf);
         // Type-based allocation detection: .alloc() or .create() on tracked allocators
         const alloc_call = findAllocCall(t, &all_alloc_names) orelse continue;
@@ -8489,7 +8415,7 @@ fn collectCFGAllocations(
         const actual_line = ctx.body.func_line + idx;
         // Split decl RHS (`const x =\n try allocator.alloc(...)`) joins
         // first; the paren join covers wrapped args (EPH-I0675).
-        const t = joinSplitDeclRhs(ctx.body.lines, idx, &join_buf) orelse
+        const t = joinSplitDeclRhs(ctx.body.lines, idx, &join_buf, &all_alloc_names) orelse
             joinParenContinuation(ctx.body.lines, idx, &join_buf);
 
         // Detect allocations using type-based detection for .create()
@@ -10767,7 +10693,12 @@ fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !
     // wrapped ARG (`allocator.alloc(u8, try f())`) is the alloc's
     // argument, not its own try, and must not mint a try-alloc record
     // (EPH-I0675).
-    const split_joined = joinSplitDeclRhs(ctx.lines, idx, ctx.join_buf);
+    const split_joined = joinSplitDeclRhs(
+        ctx.lines,
+        idx,
+        ctx.join_buf,
+        ctx.collect_ctx.alloc_names,
+    );
     const joined = split_joined orelse joinParenContinuation(ctx.lines, idx, ctx.join_buf);
     const skip_ctx: NoFreeAllocCtx = .{
         .joined = joined,
@@ -23680,13 +23611,17 @@ fn joinSplitDeclRhs(
     lines: []const []const u8,
     idx: usize,
     buf: []u8,
+    alloc_names: ?*const std.StringHashMapUnmanaged(void),
 ) ?[]const u8 {
     const t = mem.trim(u8, lines[idx], " \t\r");
     if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return null;
     if (t.len == 0 or t[t.len - 1] != '=') return null;
     if (idx + 1 >= lines.len) return null;
     const alloc = joinParenContinuation(lines, idx + 1, buf);
-    const info = findAllocCall(alloc, null) orelse return null;
+    // The create gate needs the tracked receiver set: the split form of
+    // `f(try allocator.create(W))` would otherwise miss a create on a
+    // tracked local allocator (EPH-I0989, symmetric to EPH-I0984).
+    const info = findAllocCall(alloc, alloc_names) orelse return null;
     // The alloc's own `try` must sit on the continuation before the alloc
     // column. A "try " earlier inside a string only widens the join, and
     // the joined line still passes the string-aware alloc pattern check.
@@ -23706,13 +23641,21 @@ fn joinSplitDeclRhs(
 /// For .create(), uses tracked allocator set to verify receiver is an allocator
 /// (common method name on non-allocator types). All other alloc methods are
 /// allocator-specific enough to detect without type-based verification.
+/// A match at/after the line's `//` comment start is comment prose, never
+/// an alloc record (EPH-I0990).
 fn findAllocCall(
     t: []const u8,
     alloc_names: ?*const std.StringHashMapUnmanaged(void),
 ) ?struct { col: usize, is_create: bool } {
+    // Lazy: only a candidate pattern match pays for the comment scan.
+    var comment_start: ?usize = null;
     for (compat.getAllocMethodPatterns()) |pattern| {
         const col = mem.indexOf(u8, t, pattern) orelse continue;
         if (isPatternInString(t, col)) continue;
+        if (comment_start == null) comment_start = findCommentStart(t);
+        if (comment_start) |cs| {
+            if (col >= cs) continue;
+        }
         if (isTypeAllocFactory(t, col)) continue;
 
         const is_create = mem.eql(u8, pattern, ".create(");
@@ -23734,6 +23677,10 @@ fn findAllocCall(
     for (compat.getQualifiedAllocFnPatterns()) |pattern| {
         const col = mem.indexOf(u8, t, pattern) orelse continue;
         if (isPatternInString(t, col)) continue;
+        if (comment_start == null) comment_start = findCommentStart(t);
+        if (comment_start) |cs| {
+            if (col >= cs) continue;
+        }
         return .{ .col = col, .is_create = false };
     }
 
@@ -39747,6 +39694,44 @@ test "ZA101: indexed write through the owner is not a transfer (EPH-I0825)" {
     ) == 1);
 }
 
+test "buildCFG: OOM mid-build unwinds the partial graph (EPH-I0319)" {
+    const allocator = std.testing.allocator;
+    const lines = [_][]const u8{
+        "fn f(a: bool) !void {",
+        "    if (a) {",
+        "        try g();",
+        "    } else {",
+        "        try h();",
+        "    }",
+        "}",
+    };
+
+    // Measure the cold-run allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run).
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var cfg = try buildCFG(probe.allocator(), "f", 1, &lines);
+        cfg.deinit();
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        if (buildCFG(failing.allocator(), "f", 1, &lines)) |graph| {
+            var cfg = graph;
+            cfg.deinit();
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Byte balance at every failure point is the leak proof: the
+        // errdefer frees every list the partial graph owns (band-B01a F4).
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 test "ZA101: same-line-if discard of the owner is not a transfer (EPH-I0825)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -44372,7 +44357,7 @@ test "joinSplitDeclRhs joins a split try-alloc RHS (EPH-I0675)" {
         "    _ = x;",
     };
     var buf: [max_join_bytes]u8 = undefined;
-    const joined = joinSplitDeclRhs(&lines, 0, &buf) orelse
+    const joined = joinSplitDeclRhs(&lines, 0, &buf, null) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(mem.eql(u8, joined, "const x = try allocator.alloc(u8, 100);"));
 }
@@ -44387,7 +44372,7 @@ test "joinSplitDeclRhs joins the wrapped-args split form (EPH-I0675)" {
         "    _ = x;",
     };
     var buf: [max_join_bytes]u8 = undefined;
-    const joined = joinSplitDeclRhs(&lines, 0, &buf) orelse
+    const joined = joinSplitDeclRhs(&lines, 0, &buf, null) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(mem.eql(
         u8,
@@ -44409,7 +44394,7 @@ test "joinSplitDeclRhs stays silent without the split try-alloc shape (EPH-I0675
     };
     for (cases) |c| {
         var buf: [max_join_bytes]u8 = undefined;
-        try std.testing.expect(joinSplitDeclRhs(c, 0, &buf) == null);
+        try std.testing.expect(joinSplitDeclRhs(c, 0, &buf, null) == null);
     }
 }
 
@@ -44747,7 +44732,7 @@ test "joinSplitDeclRhs joins a try-alloc nested in a call on the continuation li
         "    _ = x;",
     };
     var buf: [max_join_bytes]u8 = undefined;
-    const joined = joinSplitDeclRhs(&lines, 0, &buf) orelse
+    const joined = joinSplitDeclRhs(&lines, 0, &buf, null) orelse
         return error.TestUnexpectedResult;
     try std.testing.expect(mem.eql(u8, joined, "const x = f(try allocator.alloc(u8, 100));"));
 }
@@ -44778,6 +44763,155 @@ test "ZA103: split-RHS try-alloc nested in a call fires with the decl name (EPH-
         "test_nested_split_rhs.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 1);
+}
+
+test "ZA103: split-RHS create nested in a call on a tracked receiver fires (EPH-I0989)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const obj =\n f(try allocator.create(Widget));`: the split form of
+    // the I0984 nesting shape. joinSplitDeclRhs fed null into the .create()
+    // gate, so a tracked local receiver stayed invisible and the split form
+    // was silent while the single-line form fired (probe evidence).
+    const content =
+        \\fn nestedCreateRhs(allocator: std.mem.Allocator) !void {
+        \\    const obj =
+        \\        f(try allocator.create(Widget));
+        \\    _ = obj;
+        \\    try g();
+        \\}
+        \\fn f(x: *Widget) *Widget {
+        \\    return x;
+        \\}
+        \\const Widget = struct {};
+        \\fn g() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_split_create.zig", content);
+    defer run.deinit(allocator);
+
+    // The create fires the same two rules as its single-line form
+    // (EPH-I0981 probe: ZA102+ZA103 at 2:28).
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_nested_split_create.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_nested_split_create.zig",
+        RULE_CREATE_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA103: single-line create nested in a call keeps firing (EPH-I0989 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The single-line twin of the split form: the join change must not
+    // mute the shape that already fired.
+    const content =
+        \\fn nestedCreateOneLine(allocator: std.mem.Allocator) !void {
+        \\    const obj = f(try allocator.create(Widget));
+        \\    _ = obj;
+        \\    try g();
+        \\}
+        \\fn f(x: *Widget) *Widget {
+        \\    return x;
+        \\}
+        \\const Widget = struct {};
+        \\fn g() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_one_line_create.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_one_line_create.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_one_line_create.zig",
+        RULE_CREATE_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA103: alloc pattern in a trailing comment mints no phantom record (EPH-I0990)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // probe2 cmtTrailing shape from the batch-39 qa-gate sweep: the
+    // comment is prose, never an allocation. Pre-fix the phantom record
+    // fired ZA101 and ZA103 at the comment column (14:32).
+    const content =
+        \\fn cmtTrailing(allocator: std.mem.Allocator) !void {
+        \\    _ = allocator;
+        \\    const n = try g(); // allocator.alloc(u8, 64)
+        \\    try h();
+        \\    std.mem.doNotOptimizeAway(n);
+        \\}
+        \\fn g() !u32 {
+        \\    return 1;
+        \\}
+        \\fn h() !void {
+        \\    return error.Nope;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cmt_trailing.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        run.issues.items,
+        "test_cmt_trailing.zig",
+        RULE_ALLOC_NO_DEFER,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        run.issues.items,
+        "test_cmt_trailing.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ));
+}
+
+test "ZA103: comment-free control of the trailing-comment probe stays silent (EPH-I0990)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The same shape without the comment carries no alloc at all, so the
+    // silence is the baseline the comment gate must preserve.
+    const content =
+        \\fn cmtClean() !void {
+        \\    const n = try g();
+        \\    try h();
+        \\    std.mem.doNotOptimizeAway(n);
+        \\}
+        \\fn g() !u32 {
+        \\    return 1;
+        \\}
+        \\fn h() !void {
+        \\    return error.Nope;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cmt_clean.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        run.issues.items,
+        "test_cmt_clean.zig",
+        RULE_ALLOC_NO_DEFER,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), countRuleIssues(
+        run.issues.items,
+        "test_cmt_clean.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ));
 }
 
 test "ZA103: gap message names the trigger kind, try and error return (EPH-I0983)" {
@@ -54259,6 +54393,38 @@ test "buildCFG: brace-less break body equals the braced form" {
     try std.testing.expect(cfgEdgesMatch(&cfg_bare, &cfg_braced));
 }
 
+test "buildCFG: two returns in one block append one exit id (EPH-I0325)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Both return lines sit in the same if body; the exit list must hold
+    // the block id once (band-B01a F9). Consumers scan for membership,
+    // so the duplicate was tolerated — the dedup keeps the list honest
+    // for length-based consumers.
+    const lines = [_][]const u8{
+        "fn f(a: bool) !void {",
+        "    if (a) {",
+        "        return error.A;",
+        "        return error.B;",
+        "    }",
+        "    return;",
+        "}",
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    var count: usize = 0;
+    for (cfg.exit_blocks.items) |exit_bid| {
+        if (exit_bid == cfg.blocks.items.len - 2) count += 1;
+    }
+    // The if body is the second-to-last block: the last block is the
+    // if's false-block merge, which handleBranch creates at open time;
+    // buildCFG adds no block at fn close. Both returns live there.
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
 // ============================================================================
 // ZA607: Definite Assignment Tests
 // ============================================================================
@@ -57232,14 +57398,6 @@ test "isReturnTupleElement skips whitespace-spaced dot field elements (EPH-I0795
     const plain = ".{ buf, 0 }";
     const plain_region: TupleElementRegion = .{ .from = 0, .to = plain.len };
     try std.testing.expect(isReturnTupleElement(plain, "buf", plain_region));
-}
-
-test "isLocalVarOccurrence skips whitespace-spaced dot fields (EPH-I0796)" {
-    // `self . name` reads self's field through a spaced dot, never a local.
-    try std.testing.expect(!isLocalVarOccurrence("self . name", "name"));
-    try std.testing.expect(!isLocalVarOccurrence("self .\tname", "name"));
-    try std.testing.expect(!isLocalVarOccurrence("self.name", "name"));
-    try std.testing.expect(isLocalVarOccurrence("name = 1;", "name"));
 }
 
 test "isDirectFreeOfVar skips whitespace-spaced dot receivers (EPH-I0796)" {

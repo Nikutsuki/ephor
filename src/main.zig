@@ -2319,24 +2319,99 @@ fn isDirectFreeOfVar(t: []const u8, var_name: []const u8) bool {
     while (mem.indexOf(u8, t[search_start..], var_name)) |rel_pos| {
         const var_pos = search_start + rel_pos;
         search_start = var_pos + var_name.len;
-
-        // Word boundary checks
-        if (var_pos + var_name.len < t.len and isIdent(t[var_pos + var_name.len])) continue;
-        if (var_pos > 0 and isIdent(t[var_pos - 1])) continue;
-        // Struct field, with any spacing around the dot (EPH-I0796).
-        if (hasLeftDot(t, var_pos)) continue;
-
-        const after_var = var_pos + var_name.len;
-        // varname.field — intermediate access: never a direct free of varname,
-        // and pattern 2 must not see it either (allocator.free(buf.field) frees
-        // the field, not buf).
-        if (after_var < t.len and t[after_var] == '.') {
-            if (isFreeMethodCall(t, after_var)) return true;
-            continue;
-        }
-        if (isFreeFnArg(t, var_pos)) return true;
+        if (isFreeOccurrence(t, var_name, var_pos)) return true;
     }
     return false;
+}
+
+/// True when the occurrence of var_name at var_pos is a direct free target
+/// of the line. Word-boundary, field-access, and subscript gates all fail
+/// closed: an occurrence that is not the free's own argument never claims
+/// a free (EPH-I0361).
+fn isFreeOccurrence(t: []const u8, var_name: []const u8, var_pos: usize) bool {
+    if (hasIdentNeighbor(t, var_pos, var_name.len)) return false;
+    // Struct field, with any spacing around the dot (EPH-I0796).
+    if (hasLeftDot(t, var_pos)) return false;
+    const after_var = var_pos + var_name.len;
+    if (after_var >= t.len) return isFreeFnArg(t, var_pos);
+    // Element subscript: `free(buf[i])` releases the ELEMENT's memory,
+    // never the tracked var — only a slice VIEW (`free(buf[a..b])`)
+    // covers the tracked allocation (EPH-I0361, band-B02 F21). The
+    // element-attribution FN (an alloc stored at `slice[i]` and freed
+    // through the subscript) stays invisible: resolving it needs
+    // store-tracking data flow the line model does not carry.
+    if (t[after_var] == '[' and subscriptIsElementAccess(t, after_var)) return false;
+    // varname.field — intermediate access: never a direct free of varname,
+    // and the fn-arg pattern must not see it either
+    // (allocator.free(buf.field) frees the field, not buf).
+    if (t[after_var] == '.') return isFreeMethodCall(t, after_var);
+    return isFreeFnArg(t, var_pos);
+}
+
+/// True when an identifier char touches the occurrence on either side:
+/// the occurrence is a suffix/prefix of a longer identifier.
+fn hasIdentNeighbor(t: []const u8, pos: usize, len: usize) bool {
+    if (pos + len < t.len and isIdent(t[pos + len])) return true;
+    if (pos > 0 and isIdent(t[pos - 1])) return true;
+    return false;
+}
+
+/// True when the bracket group opened at `open` is an ELEMENT access
+/// (`buf[i]`, `buf[expr]`) rather than a slice view (`buf[a..b]`): no `..`
+/// range operator sits at the group's own depth, outside string and char
+/// literals and comment spans. A `..` inside `/* */` or a `//` tail is
+/// prose: reading it as a range would fabricate a view free of the
+/// tracked var (EPH-I1008, the F2 comment-spoofing class). Only a view
+/// free covers the tracked allocation; an element free releases a single
+/// element's memory (EPH-I0361). Nested brackets (`buf[f(i)]`,
+/// `buf[rows[0].idx]`) stay element accesses; a range nested deeper than
+/// the group's own depth (`buf[arr[a..b]]`) does not make the outer
+/// access a view. Unbalanced brackets fail toward element: an unknown
+/// subscript must not fabricate a free of the var.
+fn subscriptIsElementAccess(t: []const u8, open: usize) bool {
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    var i = open + 1;
+    while (i < t.len) : (i += 1) {
+        if (scanQuoteStep(&mode, t[i])) |skip| {
+            i += skip;
+            continue;
+        }
+        if (commentEndIndex(t, i)) |end| {
+            i = end - 1;
+            continue;
+        }
+        if (t[i] == ']' and depth == 1) return true;
+        if (t[i] == ']') {
+            depth -= 1;
+            continue;
+        }
+        if (t[i] == '[') {
+            depth += 1;
+            continue;
+        }
+        if (hasRangeAt(t, i, depth)) return false;
+    }
+    return true;
+}
+
+/// Index of the first code char after the comment span starting at `i`,
+/// or null when `i` does not start a comment. A `//` tail covers the rest
+/// of the line and returns an index past the line end; a `/* */` span
+/// covers to its closing `*/` (EPH-I1008). The caller stores `end - 1`
+/// before its loop increment, so the returned index is exact.
+fn commentEndIndex(t: []const u8, i: usize) ?usize {
+    if (i + 1 >= t.len) return null;
+    if (t[i] == '/' and t[i + 1] == '/') return t.len + 1;
+    if (t[i] == '/' and t[i + 1] == '*') return skipBlockComment(t, i) + 2;
+    return null;
+}
+
+/// True when a `..` range operator starts at `i` at the group's own
+/// depth: the bracket group holds a slice view, not an element access
+/// (EPH-I0361).
+fn hasRangeAt(t: []const u8, i: usize, depth: usize) bool {
+    return depth == 1 and t[i] == '.' and i + 1 < t.len and t[i + 1] == '.';
 }
 
 /// Pattern 1: varname.free( / varname.destroy( / varname.deinit(
@@ -6804,6 +6879,15 @@ fn analyzeCFGMemorySafety(
 }
 
 /// Extract the RHS of `const X = rhs;` when rhs is a plain identifier.
+/// Every other RHS shape is rejected by design: field chains
+/// (`const x = holder.items;`), pointer-to-var forms (`const self = &node;`),
+/// and slice views (`const tail = buf[0..];`) need type or field identity
+/// the line model does not carry. The consequence is an accepted FN class
+/// (EPH-I0359, band-B02 audit answer 1): a free through a field chain
+/// (`holder.items = buf; free(holder.items);`) or through such an alias is
+/// unattributed to the tracked allocation, so the UAF/double-free stays
+/// silent. Pinned by the EPH-I0359 tests: the field-chain shapes stay
+/// silent while plain-identifier aliases keep firing.
 fn extractSimpleIdentRhs(t: []const u8) ?[]const u8 {
     const eq_pos = mem.indexOf(u8, t, " = ") orelse return null;
     var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
@@ -6946,6 +7030,17 @@ fn initBlockFreeState(
     return s;
 }
 
+/// Collect the function's tracked allocations. The vocabulary covers
+/// allocator-method allocations (`.alloc`, `.create`, `.dupe`,
+/// `.toOwnedSlice`, and the qualified stdlib allocators — compat tables);
+/// container `.init(` forms are deliberately absent (EPH-I0360, band-B02
+/// F20 class): `ArrayList(T).init(allocator)` allocates no backing store
+/// at init — growth happens lazily on append — so a "leak" verdict would
+/// be conditional on container use the line model cannot see, and
+/// `.deinit(` is excluded from the free patterns as bulk cleanup. Container
+/// backing-store ownership is an accepted FN, pinned by the EPH-I0360
+/// tests: an init-without-deinit stays silent while an alloc-without-free
+/// fires.
 fn collectMemSafetyAllocs(
     allocator: Allocator,
     lines: []const []const u8,
@@ -7253,14 +7348,111 @@ fn computeCaptureShadowedLines(
 /// definite on that path and the merge meet combines the arms. A free
 /// inside an inline-switch arm region of a shared block is conditional:
 /// the def lattice must not claim it, or post-join uses grade err on the
-/// sibling-arm paths that never freed. A plain block free stays definite.
+/// sibling-arm paths that never freed. A free in an inline catch arm
+/// (EPH-I0362) is the same conditional shape: the arm runs on the error
+/// path only. A plain block free stays definite.
 fn freeOpForFree(scan: *const VarFreeCtx, block: BasicBlock, free_line: usize) BlockFreeOp {
     if (block.start_line > 0 and block.start_line <= block.end_line and
         isArmHeaderLine(mem.trim(u8, scan.lines[block.start_line - scan.func_line], " \t\r")))
         return .sets;
     if (freeArmRegion(scan.lines, scan.func_line, block.start_line, free_line) != null)
         return .cond_sets;
+    if (isInlineCatchArmFree(scan.lines, scan.func_line, free_line))
+        return .cond_sets;
     return .sets;
+}
+
+/// True when a line starts with a statement that never falls through to
+/// later lines: `return` (the family's classic exit) or a noreturn call
+/// (`@panic(`, `std.debug.panic(`, `@trap(`) or a bare `unreachable`. A
+/// noreturn call after a free proves the free never reaches the block's
+/// exit or any later line, so the exit vote is skipped exactly like a
+/// return (EPH-I0364, band-B02 F24). Mirrors the return check's line-start
+/// discipline: `if (c) @panic(...);` does not exit — the fall-through path
+/// really is freed, same as `if (c) return;`.
+fn isExitStatementLine(t: []const u8) bool {
+    if (mem.startsWith(u8, t, "return")) return true;
+    if (mem.startsWith(u8, t, "@panic(")) return true;
+    if (mem.startsWith(u8, t, "std.debug.panic(")) return true;
+    if (mem.startsWith(u8, t, "@trap(")) return true;
+    if (mem.startsWith(u8, t, "unreachable") and
+        (t.len == "unreachable".len or !isIdent(t["unreachable".len]))) return true;
+    return false;
+}
+
+/// True when the free at free_line sits in the arm of an inline catch
+/// whose construct shares the enclosing CFG block: the arm's `catch` sits
+/// at a code position before the free on the same line (`opt catch
+/// free(buf);`, `opt catch |err| free(buf);`, or the single-line braced
+/// form `opt catch { free(buf); };` whose braces balance) or ends the
+/// previous line (`opt catch` / `opt catch |err|` with the free on the
+/// continuation). The multi-line braced form gets its own catch block
+/// (catch_start) and never reaches this check. The arm runs on the error
+/// path only — the same conditional shape as an inline switch arm — so the
+/// def lattice must not read the free as definite (EPH-I0362, band-B02
+/// F22). Accepted residual: two statements on the free's own line
+/// (`use(buf); opt catch 0;`) mis-attribute the line's free to the arm —
+/// zig fmt keeps one statement per line.
+fn isInlineCatchArmFree(
+    lines: []const []const u8,
+    func_line: usize,
+    free_line: usize,
+) bool {
+    if (free_line < func_line) return false;
+    const f_idx = free_line - func_line;
+    if (f_idx >= lines.len) return false;
+    const free_t = mem.trim(u8, lines[f_idx], " \t\r");
+    const free_pos = firstFreePatternPos(free_t) orelse return false;
+    if (codeCatchBefore(free_t, free_pos)) return true;
+    if (f_idx == 0) return false;
+    const prev = mem.trim(u8, lines[f_idx - 1], " \t\r");
+    if (prev.len == 0) return false;
+    const code = prev[0..stripLineComment(prev).len];
+    const tail = mem.trimEnd(u8, code, " \t");
+    if (tail.len == 0) return false;
+    if (mem.endsWith(u8, tail, "catch")) {
+        const b = tail.len - "catch".len;
+        if (b == 0 or !isIdent(tail[b - 1])) return true;
+    }
+    // `opt catch |err|` ends on the capture pipe.
+    if (tail[tail.len - 1] == '|' and codeCatchBefore(tail, tail.len)) return true;
+    return false;
+}
+
+/// Position of the first code-position `.free(` or `.destroy(` on the
+/// line, or null. The free patterns this family counts (hasRealFreePattern
+/// excludes `.deinit(`), so the first cleanup call anchors the catch-arm
+/// test: a catch before it arms the whole statement.
+fn firstFreePatternPos(t: []const u8) ?usize {
+    var best: ?usize = null;
+    for ([_][]const u8{ ".free(", ".destroy(" }) |pat| {
+        var lit = types.LiteralState.forLine(t) orelse continue;
+        var i: usize = 0;
+        while (i < t.len) : (i += 1) {
+            const pos = lit.updateForChar(t, i) orelse continue;
+            if (!mem.startsWith(u8, t[pos..], pat)) continue;
+            if (best == null or pos < best.?) best = pos;
+            break;
+        }
+    }
+    return best;
+}
+
+/// True when `catch` appears at a code position before `before_pos` with
+/// identifier boundaries on both sides. String and comment occurrences
+/// never arm (LiteralState walk, mirroring hasCodeToken).
+fn codeCatchBefore(t: []const u8, before_pos: usize) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (pos + "catch".len > before_pos) return false;
+        if (!mem.startsWith(u8, t[pos..], "catch")) continue;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + "catch".len < t.len and isIdent(t[pos + "catch".len])) continue;
+        return true;
+    }
+    return false;
 }
 
 fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
@@ -7294,7 +7486,7 @@ fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResul
             // var points at new memory, not the freed allocation.
             r.op = .resets;
         }
-        if (r.free_seen and mem.startsWith(u8, t, "return"))
+        if (r.free_seen and isExitStatementLine(t))
             r.return_after = true;
     }
     return r;
@@ -7711,7 +7903,7 @@ fn checkSameBlockFree(
             rebound = true;
             freed = false;
         }
-        if (freed and mem.startsWith(u8, ct, "return")) ret = true;
+        if (freed and isExitStatementLine(ct)) ret = true;
     }
     return .{
         .freed = freed,
@@ -7760,7 +7952,7 @@ fn checkAliasBlockFree(
             freed = true;
             freed_line = cl;
         }
-        if (freed and mem.startsWith(u8, ct, "return")) ret = true;
+        if (freed and isExitStatementLine(ct)) ret = true;
     }
     return .{
         .freed = freed,
@@ -7911,13 +8103,21 @@ fn checkLineForUAF(ctx: *const FreeScanCtx, t: []const u8, actual_line: usize) !
 /// precedes the use when the block runs. It grades warning when the free is
 /// arm-conditional and the use runs after the arm's join — the sibling-arm
 /// paths never freed, so the free reaches the use on some paths only
-/// (EPH-I0356, mirror of the EPH-I0345 conditional grade).
+/// (EPH-I0356, mirror of the EPH-I0345 conditional grade). An inline catch
+/// arm grades the same way: a use on the free's own line shares the arm
+/// (err). A use past the construct runs on both paths — the catch arm
+/// frees on the error path, and the statement expression then continues
+/// to the use. The free reaches the use on the error path only, and the
+/// success path never freed, so the grade stays conditional (warning,
+/// EPH-I0362).
 fn sameBlockFreeSeverity(
     ctx: *const FreeScanCtx,
     sbf: SameBlockFreeResult,
     use_line: usize,
 ) Severity {
     if (sbf.freed_line == 0) return .err;
+    if (isInlineCatchArmFree(ctx.scan.lines, ctx.scan.func_line, sbf.freed_line))
+        return if (use_line == sbf.freed_line) .err else .warning;
     const bid = findBlockForLine(ctx.cfg, sbf.freed_line) orelse return .err;
     const block_start = ctx.cfg.blocks.items[bid].start_line;
     const region = freeArmRegion(
@@ -24147,6 +24347,16 @@ fn analyzeCFGFile(
 /// Process the just-finished function and reset the scan for the next one.
 fn finishCFGFunction(file: CFGFileCtx, scan: CFGScanCtx) !void {
     const state = scan.state;
+    // Test context mixes real block tracking (func_in_test — a function
+    // nested inside a tracked `test "..."` block, trackTestBlock) with the
+    // shared path-name classifier (isTestFilePath — `_test.zig` names and
+    // test/ dirs, EPH-I0422). The name arm is deliberate and shared with
+    // every test-context suppression in the tool: fixture helpers in test
+    // files are exempt from ZA103's errdefer gate regardless of block
+    // tracking (EPH-I0363). ZA101/ZA102/ZA105/ZA106 ignore this flag
+    // entirely — they run on every function — and test-block BODIES are
+    // never analyzed at all (test blocks are not fn-shaped, so the family
+    // never sees their lines; pinned by the EPH-I0363 tests).
     const in_test = state.func_in_test or isInTestContext(file.file_path, false);
     const func: CFGFuncCtx = .{
         .name = state.func_name,
@@ -32048,12 +32258,21 @@ const IgnoreCache = struct {
         file: []const u8,
         rule: []const u8,
     ) !*const RuleFacts {
-        const file_entry = try self.files.getOrPut(self.allocator, file);
-        if (!file_entry.found_existing) {
-            // WHY: getOrPut stored the caller's slice; remove unwinds the slot
-            // if dupe fails so deinit never frees borrowed memory.
-            errdefer _ = self.files.remove(file);
-            file_entry.key_ptr.* = try self.allocator.dupe(u8, file);
+        // Build-then-commit (EPH-I0061 class, EPH-I0365): the key dupe
+        // lands BEFORE getOrPut, so the slot always holds an owned key and
+        // unwinding never needs a map remove — a future caller may pass
+        // transient memory without re-opening the borrowed-key UAF class.
+        // A redundant dupe for an already-cached file is released here; the
+        // errdefer is disarmed first so a later failure cannot free the
+        // released key twice.
+        const owned_file = try self.allocator.dupe(u8, file);
+        var cache_owns_key = false;
+        errdefer if (!cache_owns_key) self.allocator.free(owned_file);
+        const file_entry = try self.files.getOrPut(self.allocator, owned_file);
+        cache_owns_key = true;
+        if (file_entry.found_existing) {
+            self.allocator.free(owned_file);
+        } else {
             file_entry.value_ptr.* = .empty;
         }
         if (file_entry.value_ptr.getPtr(rule)) |facts| return facts;
@@ -40543,6 +40762,81 @@ test "ZA101: indexed write through the owner is not a transfer (EPH-I0825)" {
     ) == 1);
 }
 
+test "ZA101/ZA103: container init without deinit stays silent (EPH-I0360 doc-arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented FN: `ArrayList(T).init(allocator)` allocates no backing
+    // store at init — growth is lazy on append — so the container's
+    // ownership is outside the alloc vocabulary (`.init(` is not an alloc
+    // method pattern and `.deinit(` is bulk cleanup, not a free pattern).
+    // The plain alloc in the same fixture fires, which discriminates the
+    // accepted FN from a detection hole.
+    const content =
+        \\fn container(allocator: std.mem.Allocator) !void {
+        \\    var list = std.ArrayList(u8).init(allocator);
+        \\    try list.append('x');
+        \\}
+        \\fn plain(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    try mayFail();
+        \\    _ = buf;
+        \\}
+        \\fn mayFail() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_container_init.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_container_init.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 1);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) == 1);
+    var fired_on_plain = false;
+    for (run.issues.items) |issue| {
+        if (issue.line == 6 and mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
+            fired_on_plain = true;
+    }
+    try std.testing.expect(fired_on_plain);
+}
+
+test "ZA103: test-path helper loses the errdefer gate while ZA101 fires (EPH-I0363 doc-arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented: the ZA103 tail gates on test context, and test context
+    // includes the shared path-name classifier (`_test.zig` in the name —
+    // EPH-I0422) — fixture helpers in test files lose the errdefer gate by
+    // name alone. ZA101 (r2) is not gated and keeps firing. The same
+    // content under a non-test path keeps ZA103, which discriminates the
+    // accepted FN from a detection hole.
+    const content =
+        \\fn helper(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    try mayFail();
+        \\    _ = buf;
+        \\}
+        \\fn mayFail() !void {}
+    ;
+    var run_test = try runCFGMemoryTest(&diag, allocator, "helper_test.zig", content);
+    defer run_test.deinit(allocator);
+    const file_test = "helper_test.zig";
+    const za103_test = countRuleIssues(run_test.issues.items, file_test, RULE_ALLOC_NO_ERRDEFER);
+    const za101_test = countRuleIssues(run_test.issues.items, file_test, RULE_ALLOC_NO_DEFER);
+    try std.testing.expect(za103_test == 0);
+    try std.testing.expect(za101_test == 1);
+
+    var run_norm = try runCFGMemoryTest(&diag, allocator, "helper.zig", content);
+    defer run_norm.deinit(allocator);
+    const file_norm = "helper.zig";
+    const za103_norm = countRuleIssues(run_norm.issues.items, file_norm, RULE_ALLOC_NO_ERRDEFER);
+    const za101_norm = countRuleIssues(run_norm.issues.items, file_norm, RULE_ALLOC_NO_DEFER);
+    try std.testing.expect(za103_norm == 1);
+    try std.testing.expect(za101_norm == 1);
+}
+
 test "buildCFG: OOM mid-build unwinds the partial graph (EPH-I0319)" {
     const allocator = std.testing.allocator;
     const lines = [_][]const u8{
@@ -41580,6 +41874,496 @@ test "ZA105: free then reassign then use stays silent" {
         "test_free_reassign.zig",
         RULE_USE_AFTER_FREE,
     ) == 0);
+}
+
+test "ZA105: element-subscript free does not free the slice var (EPH-I0361)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `free(buf[0])` releases the ELEMENT, never the tracked slice: the
+    // post-free use of the slice stays silent. Pre-fix this shape read as
+    // a definite free of buf and fired err (band-B02 F21).
+    const content =
+        \\fn element_free(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf[0]);
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_elem_free.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_elem_free.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: slice-view free still frees the tracked var (EPH-I0361)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `..` range inside the brackets marks a slice VIEW: the free
+    // covers the tracked allocation, so the use fires. Counter-case to
+    // the element-subscript pin.
+    const content =
+        \\fn view_free(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf[0..2]);
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_view_free.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_view_free.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 1);
+}
+
+test "ZA105: element alloc stored in a slice is unattributed (EPH-I0361 doc-arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented FN: freeing `slice[0]` releases the element alloc stored
+    // there, but attribution needs store-tracking data flow the line model
+    // does not carry — only the slice var is tracked, and the element free
+    // reads as an element access (stays silent). The plain free of the
+    // element in the same fixture still fires, which discriminates the
+    // accepted FN from a detection hole.
+    const content =
+        \\const Node = struct { v: u8 };
+        \\fn use(n: *Node) void { _ = n; }
+        \\fn stored(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.create(Node);
+        \\    var slice = try allocator.alloc(*Node, 4);
+        \\    slice[0] = item;
+        \\    allocator.free(slice[0]);
+        \\    use(item);
+        \\}
+        \\fn plain(allocator: std.mem.Allocator) !void {
+        \\    const item = try allocator.create(Node);
+        \\    allocator.free(item);
+        \\    use(item);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_elem_stored.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_elem_stored.zig";
+    // stored(): silent (accepted FN); plain(): fires.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var fired_on_plain = false;
+    for (run.issues.items) |issue| {
+        if (issue.line == 13 and mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            fired_on_plain = true;
+    }
+    try std.testing.expect(fired_on_plain);
+}
+
+test "ZA105: comment `..` in a subscript stays an element access (EPH-I1008)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A `..` inside `/* */` or a `//` tail is comment prose, never a range
+    // operator. Pre-fix the depth walk read it as a slice view and fired a
+    // fabricated free of the tracked var (the F2 comment-spoofing class).
+    // The comment-masked scan keeps the element verdict for both comment
+    // forms, so their post-free uses stay silent. The plain view free in
+    // the same fixture still fires, which proves the free-detection
+    // pipeline is live (a vacuous all-silent run would fail the control).
+    const content =
+        \\fn block_comment(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf[0 /* a..b */]);
+        \\    use(buf);
+        \\}
+        \\fn line_comment(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf[0 // a..b
+        \\    ]);
+        \\    use(buf);
+        \\}
+        \\fn plain_view(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf[0..2]);
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_sub.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_comment_sub.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var fired_on_plain_view = false;
+    for (run.issues.items) |issue| {
+        if (issue.line == 15 and mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            fired_on_plain_view = true;
+    }
+    try std.testing.expect(fired_on_plain_view);
+}
+
+test "ZA105: view free with a comment still fires (EPH-I1008)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Comment masking must never hide a real range: a view free whose
+    // `..` sits before the comment (range_before_comment) or after a
+    // closed `/* */` span (range_after_comment) still frees the tracked
+    // var. The second shape pins the close-skip offset — masking past the
+    // closing `*/` would swallow the range and silence the use.
+    const content =
+        \\fn range_before_comment(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf[0..2 /* c */]);
+        \\    use(buf);
+        \\}
+        \\fn range_after_comment(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf[0 /* c */ ..2]);
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_view_comment.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_view_comment.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 2);
+    var fired_on_before = false;
+    var fired_on_after = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        if (issue.line == 4) fired_on_before = true;
+        if (issue.line == 9) fired_on_after = true;
+    }
+    try std.testing.expect(fired_on_before);
+    try std.testing.expect(fired_on_after);
+}
+
+test "ZA105: inline catch-arm free grades conditional (EPH-I0362)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The inline catch arm runs on the error path only: the post-construct
+    // use is reachable on the success path, which never freed. Pre-fix the
+    // arm free shared the enclosing block and graded err.
+    const content =
+        \\fn inline_catch(allocator: std.mem.Allocator, opt: error{X}!void) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    opt catch allocator.free(buf);
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_inline_catch.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_inline_catch.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_warning = false;
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            graded_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(graded_warning);
+}
+
+test "ZA105: single-line braced catch-arm free grades conditional (EPH-I0362)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A balanced one-line `catch { ... }` is not classified catch_start
+    // (the opener test needs unbalanced braces), so the arm shares the
+    // enclosing block — the catch-arm test still grades it conditional.
+    const content =
+        \\fn oneline_braced(allocator: std.mem.Allocator, opt: error{X}!void) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    _ = opt catch { allocator.free(buf); };
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_oneline_catch.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_oneline_catch.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_warning = false;
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            graded_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(graded_warning);
+}
+
+test "ZA106: inline catch-arm free then post-join free grades conditional (EPH-I0362)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The second free double-frees on the error path only (the arm freed
+    // there); the success path runs it once. Conditional grade, mirror of
+    // the EPH-I0356 switch-arm double-free.
+    const content =
+        \\fn inline_catch_df(allocator: std.mem.Allocator, opt: error{X}!void) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    opt catch allocator.free(buf);
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_inline_catch_df.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_inline_catch_df.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    var graded_warning = false;
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_DOUBLE_FREE))
+            graded_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(graded_warning);
+}
+
+test "ZA105: noreturn call after free exits the block (EPH-I0364)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The panic exits the branch: the use is only reachable on the path
+    // where the free never ran. Pre-fix the exit was invisible and the
+    // use graded a conditional warning.
+    const content =
+        \\fn panic_exit(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\        @panic("boom");
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_panic_exit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_panic_exit.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: same-block use after noreturn-after-free stays silent (EPH-I0364)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The unreachable exits before the use line: dead code, not a UAF.
+    const content =
+        \\fn unreachable_exit(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\        unreachable;
+        \\        _ = buf[0];
+        \\    }
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_unreach_exit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_unreach_exit.zig",
+        RULE_USE_AFTER_FREE,
+    ) == 0);
+}
+
+test "ZA105: free without a noreturn exit still grades conditional (EPH-I0364)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Counter-case: without the noreturn exit the branch free reaches the
+    // use on one path, and the warning grade stays.
+    const content =
+        \\fn plain_exit(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_plain_exit.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_plain_exit.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var graded_warning = false;
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            graded_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(graded_warning);
+}
+
+test "ZA105: field-chain free unattributed stays silent (EPH-I0359 doc-arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Documented FN: freeing through a field chain (`free(holder.items)`
+    // after `holder.items = buf`) is unattributed — the alias model tracks
+    // plain-identifier chains only. The plain free in the same fixture
+    // fires, which discriminates the accepted FN from a detection hole.
+    const content =
+        \\const Holder = struct { items: []u8 };
+        \\fn use(d: []u8) void { _ = d; }
+        \\fn stored(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    var holder: Holder = undefined;
+        \\    holder.items = buf;
+        \\    allocator.free(holder.items);
+        \\    use(buf);
+        \\}
+        \\fn plain(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    use(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_field_chain.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_field_chain.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var fired_on_plain = false;
+    for (run.issues.items) |issue| {
+        if (issue.line == 13 and mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            fired_on_plain = true;
+    }
+    try std.testing.expect(fired_on_plain);
+}
+
+test "ZA105: field-chain alias stays silent while plain alias fires (EPH-I0359 doc-arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `const x = holder.items;` is a field-chain RHS — extractSimpleIdentRhs
+    // rejects it, so free(x) is unattributed to buf (documented FN). The
+    // plain-identifier alias `const a = buf;` still attributes, firing.
+    const content =
+        \\const Holder = struct { items: []u8 };
+        \\fn use(d: []u8) void { _ = d; }
+        \\fn stored(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    var holder: Holder = undefined;
+        \\    holder.items = buf;
+        \\    const x = holder.items;
+        \\    allocator.free(x);
+        \\    use(buf);
+        \\}
+        \\fn plain(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const a = buf;
+        \\    allocator.free(a);
+        \\    use(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_field_alias.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_field_alias.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var fired_on_plain = false;
+    for (run.issues.items) |issue| {
+        if (issue.line == 15 and mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            fired_on_plain = true;
+    }
+    try std.testing.expect(fired_on_plain);
+}
+
+test "ZA105: test-block bodies are not analyzed (EPH-I0363 doc-arm)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Test blocks are not fn-shaped, so the family never sees their lines:
+    // the free+use inside the test block stays silent (documented FN). The
+    // real function in the same fixture fires, which discriminates the
+    // accepted FN from a detection hole.
+    const content =
+        \\fn use(d: []u8) void { _ = d; }
+        \\test "free then use" {
+        \\    const buf = try std.testing.allocator.alloc(u8, 64);
+        \\    std.testing.allocator.free(buf);
+        \\    _ = buf[0];
+        \\}
+        \\fn real_fn(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    use(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_tblk_skip.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_tblk_skip.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    var fired_on_fn = false;
+    for (run.issues.items) |issue| {
+        if (issue.line == 10 and mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
+            fired_on_fn = true;
+    }
+    try std.testing.expect(fired_on_fn);
 }
 
 test "ZA105: free and use in different switch arms stay silent" {
@@ -51873,8 +52657,11 @@ test "IgnoreCache allocation-failure paths fall back without leaking" {
     // with zero allocations (covers grow/dupe/put failure points); a
     // line-level rule allocates in facts.lines.put — the only sweep that
     // reaches the build-failure unwind. Alloc sequence per iteration (zig
-    // 0.16.0): outer grow, file dupe, rule dupe, inner put (query A); file
-    // dupe, rule dupe, lines.put == fail_index 6 (query B), inner put.
+    // 0.16.0, build-then-commit key dupe — EPH-I0365): file dupe, outer
+    // grow, rule dupe, inner put (query A); file dupe, outer grow, rule
+    // dupe, lines.put (query B). The failing sweep covers every index up
+    // to the measured total, so the sequence comment is descriptive, not
+    // load-bearing.
     const file_level =
         \\const a = foo() catch {}; // ephor:ignore ZA201
         \\const b = bar() catch {};

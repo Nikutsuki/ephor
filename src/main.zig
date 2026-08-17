@@ -12479,12 +12479,13 @@ const ImportGraph = struct {
     /// Scan already-loaded content for b.path("...zig") and pathJoin refs, marking reachable.
     /// Refs are masked to code positions (EPH-I0227): a b.path("...") inside
     /// a string, comment, or `\\` multiline-string body is text and must not
-    /// mark its target reachable.
+    /// mark its target reachable. OOM from the pathJoin join propagates
+    /// (EPH-I0528): a failed alloc is not "no ref".
     fn scanContentBuildPathRefs(
         self: *ImportGraph,
         content: []const u8,
         build_root: []const u8,
-    ) void {
+    ) !void {
         const bp_tag = "b.path(\"";
         var lines = mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
@@ -12499,7 +12500,7 @@ const ImportGraph = struct {
             }
         }
         // Also scan for pathJoin(&.{ "dir", "file.zig" }) patterns
-        self.scanContentPathJoinRefs(content, build_root);
+        try self.scanContentPathJoinRefs(content, build_root);
     }
 
     /// Scan content for pathJoin(&.{ ... }) patterns and mark .zig results reachable.
@@ -12510,14 +12511,14 @@ const ImportGraph = struct {
         self: *ImportGraph,
         content: []const u8,
         build_root: []const u8,
-    ) void {
+    ) !void {
         const tag = "pathJoin(&.{";
         var lines = mem.splitScalar(u8, content, '\n');
         var offset: usize = 0;
         while (lines.next()) |line| : (offset += line.len + 1) {
             var from: usize = 0;
             while (findTagInCode(line, tag, from)) |idx| {
-                self.tryMarkPathJoinAt(content, offset + idx + tag.len - 1, build_root);
+                try self.tryMarkPathJoinAt(content, offset + idx + tag.len - 1, build_root);
                 from = idx + tag.len;
             }
         }
@@ -12530,8 +12531,8 @@ const ImportGraph = struct {
         content: []const u8,
         brace_pos: usize,
         build_root: []const u8,
-    ) void {
-        const joined = extractPathJoin(self.allocator, content, brace_pos) orelse return;
+    ) !void {
+        const joined = (try extractPathJoin(self.allocator, content, brace_pos)) orelse return;
         defer self.allocator.free(joined);
         self.tryMarkBuildPath(joined, build_root);
     }
@@ -12581,7 +12582,7 @@ const ImportGraph = struct {
                 max_source_file_bytes,
             ) catch continue;
             defer self.allocator.free(content);
-            self.scanContentBuildPathRefs(content, build_root);
+            try self.scanContentBuildPathRefs(content, build_root);
         }
 
         self.discoverNestedBuildFiles(cfg);
@@ -35626,6 +35627,11 @@ const ThresholdMatch = union(enum) {
 fn parseThreshold(arg: []const u8, prefix: []const u8) ThresholdMatch {
     if (!mem.startsWith(u8, arg, prefix)) return .no_match;
     const num = std.fmt.parseInt(usize, arg[prefix.len..], 10) catch return .invalid;
+    // EPH-I0522: 0 is not the "positive integer" the error text promises,
+    // and a zero threshold flags every function. Reject it like any other
+    // malformed value instead of clamping it to 1 (which would silently
+    // contradict the value the user typed).
+    if (num == 0) return .invalid;
     return .{ .value = num };
 }
 
@@ -35859,7 +35865,17 @@ fn detectFileTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
 /// operator's tree); the target-tree extraction family carries the
 /// containment gate.
 fn extractBuildZigEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
-    const content = Fs.cwd(diag.io).readFileAlloc(allocator, "build.zig", 1024 * 1024) catch return;
+    // EPH-I0526: OOM is not "no build.zig in the cwd" — it propagates.
+    // The catch stays for the genuine absent/unreadable probes: entry
+    // extraction is best-effort on the operator's own tree.
+    const content = Fs.cwd(diag.io).readFileAlloc(
+        allocator,
+        "build.zig",
+        1024 * 1024,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
     defer allocator.free(content);
 
     // Track already-added entries to avoid duplicates
@@ -35973,14 +35989,18 @@ fn parsePathJoinSegments(
 }
 
 /// Join path segments with '/' separator into an allocated string.
-/// Returns null if not a .zig path. Caller must free result.
+/// Returns null when the segments do not name a .zig path. Caller must
+/// free the result. An empty segment list returns null before touching
+/// the arithmetic (EPH-I0528), and OOM propagates — a failed alloc is
+/// not "not a path".
 fn joinPathSegments(
     allocator: Allocator,
     segments: []const []const u8,
     total_len: usize,
-) ?[]const u8 {
+) !?[]const u8 {
+    if (segments.len == 0) return null;
     const sep_count = segments.len - 1;
-    const joined = allocator.alloc(u8, total_len + sep_count) catch return null;
+    const joined = try allocator.alloc(u8, total_len + sep_count);
     var offset: usize = 0;
     for (segments, 0..) |seg, i| {
         @memcpy(joined[offset .. offset + seg.len], seg);
@@ -35999,8 +36019,8 @@ fn joinPathSegments(
 
 /// Extract a joined path from a pathJoin(&.{ "seg1", "seg2", ... }) pattern.
 /// Returns the joined path (e.g. "seg1/seg2/file.zig") or null.
-/// Caller must free the returned slice.
-fn extractPathJoin(allocator: Allocator, line: []const u8, start: usize) ?[]const u8 {
+/// Caller must free the returned slice. OOM propagates (EPH-I0528).
+fn extractPathJoin(allocator: Allocator, line: []const u8, start: usize) !?[]const u8 {
     const inner = findPathJoinInner(line, start) orelse return null;
     var segments: [16][]const u8 = undefined;
     const result = parsePathJoinSegments(inner, &segments);
@@ -36084,19 +36104,18 @@ fn extractPathJoinEntries(ctx: EntryScanCtx, line: []const u8) !void {
     var pos: usize = 0;
     while (findTagInCode(line, tag, pos)) |idx| {
         pos = idx + tag.len;
-        if (extractPathJoin(ctx.allocator, line, idx + tag.len - 1)) |joined| {
+        if (try extractPathJoin(ctx.allocator, line, idx + tag.len - 1)) |joined| {
             defer ctx.allocator.free(joined);
             try addEntryWithPrefix(ctx, joined);
         }
     }
 }
 
-/// Check if an import path is a valid zig file import (not std/builtin)
+/// True when an import path ends in .zig. The std/builtin import filter
+/// lives in extractQuotedPath; the equality checks that lived here were
+/// unreachable — the suffix gate rejects both names first (EPH-I0527).
 fn isValidZigImport(imp_path: []const u8) bool {
-    if (!mem.endsWith(u8, imp_path, ".zig")) return false;
-    if (mem.eql(u8, imp_path, "std")) return false;
-    if (mem.eql(u8, imp_path, "builtin")) return false;
-    return true;
+    return mem.endsWith(u8, imp_path, ".zig");
 }
 
 /// Follow @import entries in a build.zig line and recurse into nested modules.
@@ -36152,11 +36171,17 @@ fn extractBuildZigEntriesFromPath(ctx: EntryScanCtx) !void {
     if (ctx.depth > 4) return;
 
     const max_bytes = 1024 * 1024;
+    // EPH-I0526: OOM is not "no build.zig here" — it propagates. The
+    // catch stays for the genuine absent/unreadable probes: the scan is
+    // best-effort discovery, and a missing file is the normal case.
     const content = Fs.cwd(ctx.diag.io).readFileAlloc(
         ctx.allocator,
         ctx.build_path,
         max_bytes,
-    ) catch return;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return,
+    };
     defer ctx.allocator.free(content);
 
     var line_iter = mem.splitScalar(u8, content, '\n');
@@ -36214,8 +36239,11 @@ fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
     defer dir.close(ctx.diag.io);
     var iter = dir.iterate();
     while (try iter.next(ctx.diag.io)) |entry| {
+        // EPH-I0526: an addDirEntry OOM (allocPrint/append/put) must
+        // abort the scan like the sibling `try` calls do, not silently
+        // drop the entry while the rest of the binary keeps allocating.
         if (entry.kind == .file and isEntryPointFile(entry.name)) {
-            addDirEntry(ctx, dir_path, entry.name) catch continue;
+            try addDirEntry(ctx, dir_path, entry.name);
         }
         if (entry.kind != .directory) continue;
         const subdir = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ dir_path, entry.name });
@@ -36283,8 +36311,46 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
     }
 }
 
+/// Command scope of one command-scoped flag: the commands that honor it
+/// and their names for the usage error (EPH-I0525).
+const CommandScope = struct {
+    commands: []const Command,
+    names: []const u8,
+};
+
+const build_scope: CommandScope = .{ .commands = &.{.init}, .names = "init" };
+const yes_scope: CommandScope = .{ .commands = &.{.runtime}, .names = "runtime" };
+const force_scope: CommandScope = .{ .commands = &.{.upgrade}, .names = "upgrade" };
+const command_scope: CommandScope = .{ .commands = &.{.runtime}, .names = "runtime" };
+const version_scope: CommandScope = .{
+    .commands = &.{ .install, .upgrade, .init },
+    .names = "install, upgrade, or init",
+};
+
+/// Hard usage error when a command-scoped flag appears under a command
+/// that does not honor it (EPH-I0525). The flag used to parse and
+/// silently no-op — `ephor check --force` ran a scan and `ephor
+/// --version=1.2.3` left the default check command. Fail closed like an
+/// unknown flag (EPH-I0233/34).
+fn requireCommandScope(
+    diag: *DiagCtx,
+    cfg: *const Config,
+    flag_name: []const u8,
+    scope: CommandScope,
+) !void {
+    for (scope.commands) |cmd| {
+        if (cfg.command == cmd) return;
+    }
+    cliDiag(
+        diag,
+        "error: flag '{s}' is only valid with {s} (see ephor --help)\n",
+        .{ flag_name, scope.names },
+    );
+    return error.FlagWrongCommand;
+}
+
 /// Parse simple flags (returns true if handled)
-fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
+fn parseSimpleFlag(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
     if (mem.eql(u8, arg, "-V") or mem.eql(u8, arg, "--verbose")) {
         cfg.verbose = true;
         return true;
@@ -36302,10 +36368,12 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         return true;
     }
     if (mem.eql(u8, arg, "--build") or mem.eql(u8, arg, "-b")) {
+        try requireCommandScope(diag, cfg, arg, build_scope);
         cfg.init_build = true;
         return true;
     }
     if (mem.eql(u8, arg, "--yes") or mem.eql(u8, arg, "-y")) {
+        try requireCommandScope(diag, cfg, arg, yes_scope);
         cfg.auto_approve = true;
         return true;
     }
@@ -36322,6 +36390,7 @@ fn parseSimpleFlag(arg: []const u8, cfg: *Config) bool {
         return true;
     }
     if (mem.eql(u8, arg, "--force")) {
+        try requireCommandScope(diag, cfg, arg, force_scope);
         cfg.force_upgrade = true;
         return true;
     }
@@ -36434,6 +36503,7 @@ fn setOptionalPath(
 
 /// Handle --export=, --known-issues=, --command= (optional path arguments)
 fn handleOptionalPathArg(
+    diag: *DiagCtx,
     allocator: Allocator,
     arg: []const u8,
     cfg: *Config,
@@ -36442,10 +36512,14 @@ fn handleOptionalPathArg(
         return setOptionalPath(allocator, &cfg.export_path, arg[9..]);
     if (mem.startsWith(u8, arg, "--known-issues="))
         return setOptionalPath(allocator, &cfg.known_issues_path, arg[15..]);
-    if (mem.startsWith(u8, arg, "--command="))
+    if (mem.startsWith(u8, arg, "--command=")) {
+        try requireCommandScope(diag, cfg, "--command=", command_scope);
         return setOptionalPath(allocator, &cfg.runtime_command, arg[10..]);
-    if (mem.startsWith(u8, arg, "--version="))
+    }
+    if (mem.startsWith(u8, arg, "--version=")) {
+        try requireCommandScope(diag, cfg, "--version=", version_scope);
         return setOptionalPath(allocator, &cfg.install_version, arg[10..]);
+    }
     return false;
 }
 
@@ -36469,14 +36543,16 @@ fn parseFailOnArg(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
 /// Shared context for CLI argument parsing (EPH-I0771): the run
 /// diagnostics context, the config under construction, and the latches
 /// that record whether any --entry flag arrived (the first one clears the
-/// config-file entries) and whether a positional already set the scan
-/// path (a second one is a usage error, EPH-I0807).
+/// config-file entries), whether a positional already set the scan
+/// path (a second one is a usage error, EPH-I0807), and whether `--`
+/// ended flag parsing (EPH-I0523).
 const CliParseCtx = struct {
     diag: *DiagCtx,
     allocator: Allocator,
     cfg: *Config,
     cli_entries: *bool,
     cli_path: *bool,
+    no_more_flags: *bool,
 };
 
 /// Strip leading "./" components: "./x" and "x" name the same file, and
@@ -36511,20 +36587,30 @@ fn acceptPositionalPath(ctx: CliParseCtx, path: []const u8) !void {
 /// Parse one CLI argument. Fail closed on malformed input (EPH-I0233/34):
 /// an empty element is a hard usage error, never an index panic, and an
 /// unmatched -flag is a hard usage error, never a silently ignored typo
-/// (a dropped --strict would neuter a CI gate). Positional paths stay
-/// positional. Anything else starting with '-' must name a known flag.
+/// (a dropped --strict would neuter a CI gate). `--` ends flag parsing
+/// (EPH-I0523): every later argument is a scan path, even one starting
+/// with '-'. Positional paths stay positional. Anything else starting
+/// with '-' must name a known flag.
 fn parseCliArg(ctx: CliParseCtx, arg: []const u8) !void {
     if (arg.len == 0) {
         cliDiag(ctx.diag, "error: empty argument is not valid (see ephor --help)\n", .{});
         return error.EmptyArgument;
     }
+    if (ctx.no_more_flags.*) {
+        try acceptPositionalPath(ctx, arg);
+        return;
+    }
+    if (mem.eql(u8, arg, "--")) {
+        ctx.no_more_flags.* = true;
+        return;
+    }
     if (try parseFailOnArg(ctx.diag, arg, ctx.cfg)) return;
     if (mem.startsWith(u8, arg, "--entry="))
         return handleEntryArg(ctx.allocator, arg, ctx.cfg, ctx.cli_entries);
-    if (parseSimpleFlag(arg, ctx.cfg)) return;
+    if (try parseSimpleFlag(ctx.diag, arg, ctx.cfg)) return;
     if (try parseThresholdArg(ctx.diag, arg, ctx.cfg)) return;
     if (try handleListArg(ctx, arg)) return;
-    if (try handleOptionalPathArg(ctx.allocator, arg, ctx.cfg)) return;
+    if (try handleOptionalPathArg(ctx.diag, ctx.allocator, arg, ctx.cfg)) return;
     if (arg[0] != '-') {
         try acceptPositionalPath(ctx, arg);
         return;
@@ -36595,12 +36681,14 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     try loadConfigFile(diag, allocator, &cfg);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
@@ -36675,12 +36763,15 @@ fn printHelp() void {
         \\                       The findings print, and the suppression note
         \\                       counts what would have been hidden. Config
         \\                       disable/exclude still apply.
+        \\  --                  Stop flag parsing: the rest of the arguments
+        \\                      are scan paths (use for a path that starts
+        \\                      with '-')
         \\  -b, --build          With 'init': also show build.zig integration
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
         \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
         \\  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
-        \\  --version=<X.Y.Z>   For 'install'/'upgrade': pin a specific version
+         \\  --version=<X.Y.Z>   For 'install'/'upgrade'/'init': pin a specific version
         \\  --force             For 'upgrade': allow a downgrade below the
         \\                       binary's own version (refused by default)
         \\
@@ -36775,7 +36866,9 @@ fn printHelp() void {
         \\  the known-issues list when the path is trusted. The load
         \\  discloses itself with a note. Ephor refuses an untrusted file
         \\  with a skip note. Ephor always honors an explicit
-        \\  --known-issues=<file>.
+        \\  --known-issues=<file>. An explicit file that cannot be read is
+        \\  a hard usage error (EPH-I0521): a typo'd path never silently
+        \\  un-filters the known-issue list.
         \\
         \\RULE IDS:
         \\  ZA1xx  Memory     (ZA101: alloc-no-defer, ZA102: create-no-defer,
@@ -36847,13 +36940,51 @@ fn loadKnownIssues(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // second call from duplicating entries or the auto-load note.
     if (cfg.known_issues_loaded) return;
     defer cfg.known_issues_loaded = true;
+    try loadKnownIssuesOnce(diag, allocator, cfg);
+}
+
+/// Read the known-issues list bytes. OOM is never "no list": it
+/// propagates (EPH-I0521). An unreadable EXPLICIT --known-issues=<file>
+/// is a hard usage error naming the path — help and README promise the
+/// explicit path is always honored, and a typo'd path must not silently
+/// un-filter every known issue (fail-open on an operator-specified
+/// suppression control). Only the auto-detected probe returns null on
+/// absence. Caller owns the returned slice.
+fn readKnownIssuesContent(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    path: []const u8,
+    explicit: bool,
+) !?[]u8 {
+    const content = Fs.cwd(diag.io).readFileAlloc(
+        allocator,
+        path,
+        10 * 1024 * 1024,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (!explicit) return null;
+            cliDiag(
+                diag,
+                "error: cannot read known-issues file '{s}' (see ephor --help)\n",
+                .{path},
+            );
+            return error.KnownIssuesUnreadable;
+        },
+    };
+    return content;
+}
+
+/// One known-issues load: resolve the path, read it, and parse the
+/// file:line keys into cfg.known_issues (RED3-7 disclosure lives here).
+fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // RED3-7: the auto-detected .ephor-ignore discloses its load. An
     // explicit --known-issues path stays silent (the user asked for it).
     const explicit = cfg.known_issues_path != null;
     const path = cfg.known_issues_path orelse
         (try detectKnownIssuesPath(diag, allocator, cfg)) orelse return;
 
-    const content = Fs.cwd(diag.io).readFileAlloc(allocator, path, 10 * 1024 * 1024) catch return;
+    const content = (try readKnownIssuesContent(diag, allocator, path, explicit)) orelse return;
     defer allocator.free(content);
 
     // Track how many keys we've successfully added for cleanup on error
@@ -39332,12 +39463,14 @@ test "dot-slash CLI path keeps one graph key for a covered entry (EPH-I0812)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     // The parse layer sheds the leading ./ (acceptPositionalPath), so the
     // run sees the same spelling as the kept entry.
@@ -39821,7 +39954,7 @@ test "build-path scanners ignore refs inside strings (EPH-I0227)" {
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
-    graph.scanContentBuildPathRefs(content, root);
+    try graph.scanContentBuildPathRefs(content, root);
     try std.testing.expectEqual(@as(u32, 0), graph.reachable.count());
 }
 
@@ -39843,7 +39976,7 @@ test "build-path scanners still mark refs in real code (EPH-I0227)" {
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
-    graph.scanContentBuildPathRefs(content, root);
+    try graph.scanContentBuildPathRefs(content, root);
 
     const real_path = try tmpFilePath(allocator, &tmp, "src/r_p.zig");
     defer allocator.free(real_path);
@@ -39963,6 +40096,120 @@ test "build.zig entry extractors ignore refs in // comments (EPH-I0299)" {
     const want = try std.fmt.allocPrint(allocator, "{s}/real.zig", .{root});
     defer allocator.free(want);
     try std.testing.expectEqualStrings(want, cfg.entries.items[0]);
+}
+
+test "entry directory scan propagates OOM (EPH-I0526)" {
+    var diag = testDiagCtx();
+    // Regression: `addDirEntry(...) catch continue` swallowed the OOM
+    // from allocPrint/append/put and silently dropped the entry while
+    // the sibling `try` calls propagated. The scan must fail, not
+    // silently degrade the entry set.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "" });
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const ctx: EntryScanCtx = .{
+        .diag = &diag,
+        .allocator = failing.allocator(),
+        .cfg = &cfg,
+        .added = &added,
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        scanDirForEntries(ctx, dir_path),
+    );
+}
+
+test "build.zig extraction absence probe stays silent (EPH-I0526)" {
+    var diag = testDiagCtx();
+    // The catch is reserved for the genuine not-found probe: a missing
+    // build.zig is the normal case and must not fail the run.
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    const ctx: EntryScanCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .added = &added,
+        .build_path = "no-such-dir/build.zig",
+    };
+    try extractBuildZigEntriesFromPath(ctx);
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+}
+
+test "build.zig extraction propagates OOM, never absence (EPH-I0526)" {
+    var diag = testDiagCtx();
+    // The pre-fix `catch return` collapsed OutOfMemory into "no build.zig
+    // here", silently degrading entry discovery on OOM.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "// empty\n" });
+    const build_path = try tmpFilePath(allocator, &tmp, "build.zig");
+    defer allocator.free(build_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const ctx: EntryScanCtx = .{
+        .diag = &diag,
+        .allocator = failing.allocator(),
+        .cfg = &cfg,
+        .added = &added,
+        .build_path = build_path,
+    };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        extractBuildZigEntriesFromPath(ctx),
+    );
+}
+
+test "isValidZigImport keeps the .zig gate (EPH-I0527)" {
+    // The std/builtin equality checks were unreachable: the suffix gate
+    // already rejects both names, so the visible behavior is unchanged
+    // after their deletion (A/B: byte-identical corpus expected).
+    try std.testing.expect(isValidZigImport("src/main.zig"));
+    try std.testing.expect(!isValidZigImport("src/main.txt"));
+    try std.testing.expect(!isValidZigImport("std"));
+    try std.testing.expect(!isValidZigImport("builtin"));
+}
+
+test "joinPathSegments guards the empty slice and propagates OOM (EPH-I0528)" {
+    const allocator = std.testing.allocator;
+    // Empty segments: the pre-fix `segments.len - 1` underflowed (usize
+    // wraps to max) and only the caller-side count==0 guard saved it.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try joinPathSegments(allocator, &.{}, 0),
+    );
+    // A non-.zig join returns null, allocation freed.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try joinPathSegments(allocator, &.{"a.txt"}, 5),
+    );
+    // Happy path unchanged.
+    const joined = (try joinPathSegments(allocator, &.{ "src", "main.zig" }, 11)).?;
+    defer allocator.free(joined);
+    try std.testing.expectEqualStrings("src/main.zig", joined);
+    // OOM propagates as OutOfMemory, never "not a path".
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        joinPathSegments(failing.allocator(), &.{"a.zig"}, 5),
+    );
 }
 
 test "parseCommandIntoArgv parses tokens within the buffer" {
@@ -92253,12 +92500,14 @@ test "CLI --strict sets the warning gate" {
     var cfg = testConfig();
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--strict");
     try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
@@ -92270,12 +92519,14 @@ test "CLI --fail-on overrides config strict" {
     try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--fail-on=error");
     try std.testing.expectEqual(FailOn.err, cfg.fail_on);
@@ -92287,12 +92538,14 @@ test "CLI --fail-on=never can override config strict off" {
     try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--fail-on=never");
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
@@ -92305,12 +92558,14 @@ test "CLI invalid --fail-on value is a hard usage error" {
     var cfg = testConfig();
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try std.testing.expectError(
         error.InvalidFailOnValue,
@@ -92351,12 +92606,14 @@ test "second config load (target dir) cannot clobber the CLI" {
     try parseConfigJson(&diag, std.testing.allocator, "{\"strict\": true}", &cfg);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--fail-on=never");
     // Target-dir ephor.json loads AFTER CLI args in parseArgs
@@ -92387,12 +92644,14 @@ test "same source resolves last-wins" {
 
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = std.testing.allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--strict");
     try parseCliArg(cli_ctx, "--fail-on=error");
@@ -92664,6 +92923,7 @@ test "CLI --trust-target-config sets the trust flag" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     try std.testing.expect(!cfg.trust_target_config);
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
@@ -92671,6 +92931,7 @@ test "CLI --trust-target-config sets the trust flag" {
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--trust-target-config");
     try std.testing.expect(cfg.trust_target_config);
@@ -92681,8 +92942,11 @@ test "CLI --force sets force_upgrade" {
     const allocator = std.testing.allocator;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
+    // --force is upgrade-scoped (EPH-I0525).
+    cfg.command = .upgrade;
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     try std.testing.expect(!cfg.force_upgrade);
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
@@ -92690,6 +92954,7 @@ test "CLI --force sets force_upgrade" {
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--force");
     try std.testing.expect(cfg.force_upgrade);
@@ -93091,12 +93356,14 @@ test "CLI positional path sheds a leading ./ (EPH-I0801)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "./main.zig");
     try std.testing.expectEqualStrings("main.zig", cfg.path);
@@ -93549,12 +93816,14 @@ test "CLI threshold flags clamp at the documented maxima (RED3-6)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--max-lines=999999999");
     try std.testing.expectEqual(@as(usize, 100_000), cfg.thresholds.max_function_lines);
@@ -93571,12 +93840,14 @@ test "CLI threshold flags beat config-file thresholds (RED3-6)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--max-lines=50");
     try parseConfigJson(
@@ -93594,6 +93865,59 @@ test "CLI threshold flags beat config-file thresholds (RED3-6)" {
 // Fail-closed CLI and install/upgrade exit codes (EPH-I0233–I0237)
 // ============================================================================
 
+test "CLI -- ends flag parsing: the rest are scan paths (EPH-I0523)" {
+    var diag = testDiagCtx();
+    // Regression: `--` errored as an unknown flag, so a path starting
+    // with '-' could never be scanned. After `--`, every argument is a
+    // scan path, even one that looks like a flag.
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    var cli_path = false;
+    var no_more_flags = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    // Flags before `--` still parse.
+    try parseCliArg(cli_ctx, "--summary");
+    try std.testing.expect(cfg.show_summary);
+    try parseCliArg(cli_ctx, "--");
+    try parseCliArg(cli_ctx, "-dir");
+    try std.testing.expectEqualStrings("-dir", cfg.path);
+    // The one-path latch still applies after `--`: a second positional
+    // is a hard usage error and must not clobber the accepted path.
+    try std.testing.expectError(
+        error.ExtraScanPath,
+        parseCliArg(cli_ctx, "other.zig"),
+    );
+    try std.testing.expectEqualStrings("-dir", cfg.path);
+    // A flag after `--` is a path, not a flag: no threshold got set.
+    var cfg_after = testConfig();
+    defer cfg_after.deinit(allocator);
+    var cli_entries_after = false;
+    var cli_path_after = false;
+    var no_more_flags_after = false;
+    const cli_ctx_after: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg_after,
+        .cli_entries = &cli_entries_after,
+        .cli_path = &cli_path_after,
+        .no_more_flags = &no_more_flags_after,
+    };
+    try parseCliArg(cli_ctx_after, "--");
+    try parseCliArg(cli_ctx_after, "--max-lines=1");
+    try std.testing.expectEqualStrings("--max-lines=1", cfg_after.path);
+    try std.testing.expectEqual(@as(usize, 50), cfg_after.thresholds.max_function_lines);
+}
+
 test "CLI empty argument is a hard usage error (EPH-I0233)" {
     var diag = testDiagCtx();
     // Regression: an empty argv element panicked index-out-of-bounds at the
@@ -93604,12 +93928,14 @@ test "CLI empty argument is a hard usage error (EPH-I0233)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try std.testing.expectError(
         error.EmptyArgument,
@@ -93629,12 +93955,14 @@ test "CLI unknown flags are a hard usage error (EPH-I0234)" {
         defer cfg.deinit(allocator);
         var cli_entries = false;
         var cli_path = false;
+        var no_more_flags = false;
         const cli_ctx: CliParseCtx = .{
             .diag = &diag,
             .allocator = allocator,
             .cfg = &cfg,
             .cli_entries = &cli_entries,
             .cli_path = &cli_path,
+            .no_more_flags = &no_more_flags,
         };
         try std.testing.expectError(
             error.UnknownFlag,
@@ -93660,12 +93988,14 @@ test "CLI a second positional path is a hard usage error (EPH-I0807)" {
         defer cfg.deinit(allocator);
         var cli_entries = false;
         var cli_path = false;
+        var no_more_flags = false;
         const cli_ctx: CliParseCtx = .{
             .diag = &diag,
             .allocator = allocator,
             .cfg = &cfg,
             .cli_entries = &cli_entries,
             .cli_path = &cli_path,
+            .no_more_flags = &no_more_flags,
         };
         try parseCliArg(cli_ctx, order[0]);
         try std.testing.expectError(
@@ -93689,12 +94019,14 @@ test "CLI flags and config path_dir do not arm the one-path latch (EPH-I0807)" {
     try parseConfigJson(&diag, allocator, "{\"path_dir\": \"src\"}", &cfg);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "sub/foo.zig");
     try std.testing.expectEqualStrings("sub/foo.zig", cfg.path);
@@ -93713,26 +94045,39 @@ test "CLI every documented flag still parses (EPH-I0234)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
-    const documented = [_][]const u8{
-        "--entry=src/main.zig",  "--format=text",            "-f=json",
-        "--disable=ZA301",       "--enable=ZA305",           "--max-lines=60",
-        "--max-nesting=4",       "--max-params=5",           "--max-branches=10",
-        "--max-line-length=120", "--max-file-bytes=60000",   "-V",
-        "--verbose",             "-s",                       "--summary",
-        "--strict",              "--fail-on=error",          "--trust-target-config",
-        "--no-suppression",      "-b",                       "--build",
-        "--export=issues.md",    "--known-issues=known.txt", "--command=zig build test",
-        "-y",                    "--yes",                    "--version=9.9.9",
-        "--force",               "-f=text",
-    };
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    const documented = [_][]const u8{
+        "--entry=src/main.zig",  "--format=text",          "-f=json",
+        "--disable=ZA301",       "--enable=ZA305",         "--max-lines=60",
+        "--max-nesting=4",       "--max-params=5",         "--max-branches=10",
+        "--max-line-length=120", "--max-file-bytes=60000", "-V",
+        "--verbose",             "-s",                     "--summary",
+        "--strict",              "--fail-on=error",        "--trust-target-config",
+        "--no-suppression",      "--export=issues.md",     "--known-issues=known.txt",
+        "-f=text",
     };
     for (documented) |flag| try parseCliArg(cli_ctx, flag);
+    // Command-scoped flags parse under their own command (EPH-I0525).
+    cfg.command = .init;
+    try parseCliArg(cli_ctx, "-b");
+    try parseCliArg(cli_ctx, "--build");
+    cfg.command = .runtime;
+    try parseCliArg(cli_ctx, "--command=zig build test");
+    try parseCliArg(cli_ctx, "-y");
+    try parseCliArg(cli_ctx, "--yes");
+    cfg.command = .upgrade;
+    try parseCliArg(cli_ctx, "--force");
+    cfg.command = .install;
+    try parseCliArg(cli_ctx, "--version=9.9.9");
+    cfg.command = .check;
     try std.testing.expect(cfg.verbose);
     try std.testing.expect(cfg.show_summary);
     try std.testing.expectEqual(OutputFormat.text, cfg.format);
@@ -93757,6 +94102,54 @@ test "CLI every documented flag still parses (EPH-I0234)" {
     try std.testing.expectEqualStrings("9.9.9", cfg.install_version.?);
 }
 
+test "CLI command-scoped flags under the wrong command error (EPH-I0525)" {
+    var diag = testDiagCtx();
+    // Regression: every command-scoped flag parsed under any command and
+    // silently no-opped — `ephor check --force` ran a scan, and
+    // `ephor --version=1.2.3` (first arg) left command=.check and
+    // scanned. Fail closed like an unknown flag (EPH-I0233/34).
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { flag: []const u8, wrong: Command }{
+        .{ .flag = "--version=9.9.9", .wrong = .check },
+        .{ .flag = "--version=9.9.9", .wrong = .runtime },
+        .{ .flag = "--force", .wrong = .check },
+        .{ .flag = "--force", .wrong = .install },
+        .{ .flag = "--command=zig build test", .wrong = .check },
+        .{ .flag = "--command=zig build test", .wrong = .upgrade },
+        .{ .flag = "-b", .wrong = .check },
+        .{ .flag = "--build", .wrong = .install },
+        .{ .flag = "-y", .wrong = .check },
+        .{ .flag = "--yes", .wrong = .upgrade },
+    };
+    for (cases) |c| {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        cfg.command = c.wrong;
+        var cli_entries = false;
+        var cli_path = false;
+        var no_more_flags = false;
+        const cli_ctx: CliParseCtx = .{
+            .diag = &diag,
+            .allocator = allocator,
+            .cfg = &cfg,
+            .cli_entries = &cli_entries,
+            .cli_path = &cli_path,
+            .no_more_flags = &no_more_flags,
+        };
+        try std.testing.expectError(
+            error.FlagWrongCommand,
+            parseCliArg(cli_ctx, c.flag),
+        );
+        // Fail closed: the rejected flag changed nothing.
+        try std.testing.expect(!cfg.init_build);
+        try std.testing.expect(!cfg.auto_approve);
+        try std.testing.expect(!cfg.force_upgrade);
+        try std.testing.expect(cfg.runtime_command == null);
+        try std.testing.expect(cfg.install_version == null);
+    }
+}
+
 test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {
     var diag = testDiagCtx();
     // Regression: an empty --disable= value prefix-matched every rule and
@@ -93767,12 +94160,14 @@ test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try std.testing.expectError(
         error.EmptyRulePattern,
@@ -93817,12 +94212,14 @@ test "CLI malformed threshold value is a hard usage error (EPH-I0237)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try std.testing.expectError(
         error.InvalidThresholdValue,
@@ -93837,6 +94234,47 @@ test "CLI malformed threshold value is a hard usage error (EPH-I0237)" {
     try std.testing.expectEqual(@as(u8, 0), cfg.threshold_cli_mask);
 }
 
+test "CLI zero threshold value is a hard usage error (EPH-I0522)" {
+    var diag = testDiagCtx();
+    // Regression: --max-lines=0 parsed, CLI-locked the field, and flagged
+    // every function, while the error text promised "a positive integer".
+    // Only the max clamp existed; nothing rejected zero.
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    const zero_flags = [_][]const u8{
+        "--max-lines=0",    "--max-nesting=0",     "--max-params=0",
+        "--max-branches=0", "--max-line-length=0", "--max-file-bytes=0",
+    };
+    for (zero_flags) |flag| {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var cli_entries = false;
+        var cli_path = false;
+        var no_more_flags = false;
+        const cli_ctx: CliParseCtx = .{
+            .diag = &diag,
+            .allocator = allocator,
+            .cfg = &cfg,
+            .cli_entries = &cli_entries,
+            .cli_path = &cli_path,
+            .no_more_flags = &no_more_flags,
+        };
+        try std.testing.expectError(
+            error.InvalidThresholdValue,
+            parseCliArg(cli_ctx, flag),
+        );
+        // Fail closed: the rejected flag neither set any field nor locked
+        // any bit, so a config-file value still wins.
+        try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
+        try std.testing.expectEqual(@as(usize, 3), cfg.thresholds.max_nesting_depth);
+        try std.testing.expectEqual(@as(usize, 4), cfg.thresholds.max_params);
+        try std.testing.expectEqual(@as(usize, 12), cfg.thresholds.max_branches);
+        try std.testing.expectEqual(@as(usize, 100), cfg.thresholds.max_line_length);
+        try std.testing.expectEqual(@as(usize, 50000), cfg.thresholds.max_file_bytes);
+        try std.testing.expectEqual(@as(u8, 0), cfg.threshold_cli_mask);
+    }
+}
+
 test "CLI valid threshold value parses and locks (EPH-I0237)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -93844,12 +94282,14 @@ test "CLI valid threshold value parses and locks (EPH-I0237)" {
     defer cfg.deinit(allocator);
     var cli_entries = false;
     var cli_path = false;
+    var no_more_flags = false;
     const cli_ctx: CliParseCtx = .{
         .diag = &diag,
         .allocator = allocator,
         .cfg = &cfg,
         .cli_entries = &cli_entries,
         .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
     };
     try parseCliArg(cli_ctx, "--max-lines=80");
     try std.testing.expectEqual(@as(usize, 80), cfg.thresholds.max_function_lines);
@@ -94811,6 +95251,48 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
     try loadKnownIssues(&diag, allocator, &cfg_explicit);
     try std.testing.expectEqual(@as(usize, 0), diag.known_issues_autoload_count);
     try std.testing.expectEqual(@as(usize, 2), cfg_explicit.known_issues.items.len);
+}
+
+test "CLI explicit known-issues path must be readable (EPH-I0521)" {
+    var diag = testDiagCtx();
+    // Regression: a missing explicit --known-issues=<file> fell into the
+    // auto-load's silent `catch return`, so a typo'd path un-filtered
+    // every known issue despite help/README promising the explicit path
+    // is always honored (a fail-open suppression control).
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg.known_issues_path, "no-such-dir/known.txt");
+    try std.testing.expectError(
+        error.KnownIssuesUnreadable,
+        loadKnownIssues(&diag, allocator, &cfg),
+    );
+    // Fail closed: no entries were loaded from the missing file.
+    try std.testing.expectEqual(@as(usize, 0), cfg.known_issues.items.len);
+}
+
+test "known-issues load propagates OOM, never absence (EPH-I0521)" {
+    var diag = testDiagCtx();
+    // The pre-fix `catch return` collapsed OutOfMemory into "no list",
+    // identical to a missing auto-detected file. On OOM the run must
+    // fail, not silently run without its suppression list.
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "known.txt", .data = "src/a.zig:1\n" });
+    const ki_path = try tmpFilePath(allocator, &tmp, "known.txt");
+    defer allocator.free(ki_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg.known_issues_path, ki_path);
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        loadKnownIssues(&diag, failing.allocator(), &cfg),
+    );
 }
 
 test "suppression: untrusted .ephor-ignore auto-load is refused (EPH-I0222)" {

@@ -349,6 +349,13 @@ const BasicBlock = struct {
     // Ends with break/continue: control never falls through past this
     // block, so close wiring must not add edges from it (EPH-I0094)
     is_jump_terminal: bool,
+    // The block is the else body of an else-claimed if/loop entry:
+    // handleElse set its start line to the `} else {` arm-header line.
+    // A post-join merge — finishPendingElse or handleBlockEnd set the
+    // start line — never carries the mark, so the both-arms gate can
+    // tell a genuine arm from a merge whose first line is an enclosing
+    // construct's `} else {` close (EPH-I1032).
+    is_else_body: bool = false,
 
     fn init() BasicBlock {
         return .{
@@ -1567,6 +1574,11 @@ const CFGBuildCtx = struct {
             self.cfg.blocks.items[else_body].start_line = line;
             self.cfg.blocks.items[else_body].end_line = line;
             self.cfg.blocks.items[else_body].is_return = true;
+            // The else-claim mark: this block is a genuine else body, not
+            // a post-join merge (EPH-I1032). The chained branch
+            // (openElseIfBranch) sets no mark — the chain grades arm by
+            // arm and its condition block is not an arm body.
+            self.cfg.blocks.items[else_body].is_else_body = true;
             try self.addExitBlock(else_body);
             self.current_block = merge_block;
             self.cfg.blocks.items[self.current_block].start_line = line + 1;
@@ -1579,6 +1591,10 @@ const CFGBuildCtx = struct {
                 .catch_origin_block = null,
             });
             self.current_block = else_body;
+            // The else-claim mark: the same-line block distinction the
+            // both-arms gate requires — finishPendingElse sets no mark
+            // (EPH-I1032).
+            self.cfg.blocks.items[else_body].is_else_body = true;
             self.setStartLine(line);
         }
     }
@@ -7434,8 +7450,11 @@ fn freeOpForFree(scan: *const VarFreeCtx, block: BasicBlock, free_line: usize) B
         return .cond_sets;
     // A brace-less if-form free shares the block with the post-join use:
     // it runs on the condition's path only, the same conditional shape as
-    // the catch arm (EPH-I1005).
+    // the catch arm (EPH-I1005). The single-line braced twin is the same
+    // line-conditional shape (EPH-I1016).
     if (isBraceLessIfFormFree(scan.lines, scan.func_line, free_line))
+        return .cond_sets;
+    if (isInlineBracedIfFormFree(scan.lines, scan.func_line, free_line))
         return .cond_sets;
     return .sets;
 }
@@ -7643,6 +7662,167 @@ fn braceLessIfBodyFree(t: []const u8, free_pos: usize) bool {
 /// if statement (`;`) after the condition's close.
 fn endsBraceLessBody(t: []const u8, pos: usize) bool {
     return t[pos] == '{' or t[pos] == ';';
+}
+
+/// True when the free at free_line sits inside an arm brace group of a
+/// single-line braced `if`: `if (c) { allocator.free(buf); }` or an
+/// else-arm (`if (c) { use(buf); } else { allocator.free(buf); }`). The
+/// braced twin of the brace-less if-form (EPH-I1005): the free runs on
+/// the arm's path only, so the same-block verdict grades conditional —
+/// the mirror of the multi-line braced form, whose CFG arm split keeps
+/// the post-join use at the warning grade (EPH-I1016). Every brace group
+/// must close on the line: an unclosed body is a multi-line arm, which
+/// the CFG splits into its own block, and a use inside that arm shares
+/// the arm (definite). A brace group after the construct without an
+/// `else` is a bare block: the free inside runs on every path. A
+/// both-arms construct (`if (c) { free(buf); } else { free(buf); }`)
+/// frees on both arms and reads definite through the
+/// elsePrecedesSecondFree gate.
+fn isInlineBracedIfFormFree(
+    lines: []const []const u8,
+    func_line: usize,
+    free_line: usize,
+) bool {
+    if (free_line < func_line) return false;
+    const f_idx = free_line - func_line;
+    if (f_idx >= lines.len) return false;
+    const t = mem.trim(u8, lines[f_idx], " \t\r");
+    if (!mem.startsWith(u8, t, "if ")) return false;
+    const free_pos = firstFreePatternPos(t) orelse return false;
+    if (elsePrecedesSecondFree(t, free_pos)) return false;
+    return bracedIfBodyContainsFree(t, free_pos);
+}
+
+/// True when the free at free_pos sits inside an arm group of the
+/// single-line `if` on the line: the group containing it is the first
+/// group after the condition (the then-arm) or an `else` token precedes
+/// its open. The arm must close before the line ends: an unclosed arm is
+/// multi-line, which the CFG splits into its own block, and a use inside
+/// that arm then shares the arm (definite). A `;` before the first group
+/// closes the if statement with an empty body — any later group is a bare
+/// block, and a free inside it runs on every path.
+fn bracedIfBodyContainsFree(t: []const u8, free_pos: usize) bool {
+    const start = ifConditionClosePos(t) orelse return false;
+    var scan = BracedIfScan{ .prev_bound = start };
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = start;
+    while (i < free_pos) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '{') scan.onGroupOpen(t, pos);
+        if (t[pos] == '}') scan.onGroupClose(pos);
+        if (t[pos] == '(') scan.onParenOpen();
+        if (t[pos] == ')') scan.onParenClose();
+        if (t[pos] == ';') scan.onSemi();
+    }
+    if (!scan.arm_group or scan.brace_depth == 0) return false;
+    return bracedGroupsBalance(t, free_pos, scan.brace_depth);
+}
+
+/// One brace group of a single-line braced `if` line walk (EPH-I1016).
+/// The state machine answers one question: does the free sit inside an
+/// arm group of the `if`, not inside a later bare block?
+const BracedIfScan = struct {
+    /// Brace nesting of the construct's groups.
+    brace_depth: usize = 0,
+    /// Paren nesting: braces inside a condition or call argument
+    /// (`else if (x == .{ .a = 1 }) {`) never count as groups.
+    paren_depth: usize = 0,
+    /// Position after the previous depth-1 group's close, or the
+    /// condition's close: an `else` between it and the next open arms
+    /// the next group.
+    prev_bound: usize,
+    /// No depth-1 group opened yet: the next group is the then-arm.
+    first_group: bool = true,
+    /// The current depth-1 group is an arm of the `if`.
+    arm_group: bool = true,
+
+    fn onGroupOpen(self: *BracedIfScan, t: []const u8, pos: usize) void {
+        if (self.paren_depth > 0) return;
+        if (self.brace_depth == 0)
+            self.arm_group = self.first_group or elseTokenBetween(t, self.prev_bound, pos);
+        self.brace_depth += 1;
+    }
+
+    fn onGroupClose(self: *BracedIfScan, pos: usize) void {
+        if (self.paren_depth > 0) return;
+        if (self.brace_depth == 1) {
+            self.prev_bound = pos + 1;
+            self.first_group = false;
+            self.arm_group = false;
+        }
+        if (self.brace_depth > 0) self.brace_depth -= 1;
+    }
+
+    fn onParenOpen(self: *BracedIfScan) void {
+        self.paren_depth += 1;
+    }
+
+    fn onParenClose(self: *BracedIfScan) void {
+        if (self.paren_depth > 0) self.paren_depth -= 1;
+    }
+
+    /// A `;` at the construct level closes the if statement: the next
+    /// group is a bare block, never an arm.
+    fn onSemi(self: *BracedIfScan) void {
+        if (self.paren_depth == 0 and self.brace_depth == 0)
+            self.first_group = false;
+    }
+};
+
+/// True when the arm group containing the free closes before the line
+/// ends: the walk from the free position counts braces (paren content
+/// balances, so its braces never disturb the count) and returns at the
+/// first close back to the incoming depth level's arm close.
+fn bracedGroupsBalance(t: []const u8, from: usize, start_depth: usize) bool {
+    var depth = start_depth;
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = from;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '{') depth += 1;
+        if (t[pos] == '}') {
+            if (depth > 0) depth -= 1;
+            if (depth == 0) return true;
+        }
+    }
+    return false;
+}
+
+/// Position after the condition's closing paren of the `if` on the line,
+/// or null when the parens never balance or the condition has no group.
+fn ifConditionClosePos(t: []const u8) ?usize {
+    var depth: usize = 0;
+    var lit = types.LiteralState.forLine(t) orelse return null;
+    var i: usize = "if ".len;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] == '(') {
+            depth += 1;
+            continue;
+        }
+        if (t[pos] == ')') {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) return pos + 1;
+        }
+    }
+    return null;
+}
+
+/// True when a code-position `else` token lies between `from` and `to`
+/// (exclusive), with identifier boundaries on both sides. String and
+/// comment occurrences never count (LiteralState walk).
+fn elseTokenBetween(t: []const u8, from: usize, to: usize) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = from;
+    while (i < to) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (!mem.startsWith(u8, t[pos..], "else")) continue;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + "else".len < t.len and isIdent(t[pos + "else".len])) continue;
+        return true;
+    }
+    return false;
 }
 
 fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
@@ -8308,7 +8488,8 @@ fn sameBlockFreeSeverity(
 ) Severity {
     if (sbf.freed_line == 0) return .err;
     if (isInlineCatchArmFree(ctx.scan.lines, ctx.scan.func_line, sbf.freed_line) or
-        isBraceLessIfFormFree(ctx.scan.lines, ctx.scan.func_line, sbf.freed_line))
+        isBraceLessIfFormFree(ctx.scan.lines, ctx.scan.func_line, sbf.freed_line) or
+        isInlineBracedIfFormFree(ctx.scan.lines, ctx.scan.func_line, sbf.freed_line))
         return if (use_line == sbf.freed_line) .err else .warning;
     const bid = findBlockForLine(ctx.cfg, sbf.freed_line) orelse return .err;
     const block_start = ctx.cfg.blocks.items[bid].start_line;
@@ -9158,6 +9339,168 @@ fn loopCarriedFreeVote(ctx: *const FreeScanCtx, bid: usize, actual_line: usize) 
     return false;
 }
 
+/// Bounded walk state for blockOnEveryContinuingPath (EPH-I1017).
+const SkipWalk = struct {
+    allocator: Allocator,
+    cfg: *const ControlFlowGraph,
+    /// The block a path must avoid.
+    bid: usize,
+    /// The avoided block's last line: a visited block starting after it
+    /// proves a path that skips the block and continues past it.
+    end_line: usize,
+    visited: std.DynamicBitSetUnmanaged,
+    stack: std.ArrayListUnmanaged(usize),
+
+    /// Explore one edge out of the current block. True when the edge
+    /// starts a path that skips the avoided block and reaches code past
+    /// it.
+    fn exploreEdge(self: *SkipWalk, cur: usize, edge: CFGEdge) !bool {
+        if (edge.from != cur) return false;
+        if (edge.to == self.bid) return false;
+        if (edge.to >= self.cfg.blocks.items.len) return false;
+        if (self.visited.isSet(edge.to)) return false;
+        if (self.cfg.blocks.items[edge.to].start_line > self.end_line) return true;
+        self.visited.set(edge.to);
+        try self.stack.append(self.allocator, edge.to);
+        return false;
+    }
+};
+
+/// True when every path from the function entry to code past the block at
+/// bid passes through the block: no path reaches a block that starts after
+/// the block without first executing it. A path that skips the block and
+/// terminates before it (an early return) does not downgrade a second
+/// free inside the block — the free then runs on every path that reaches
+/// the code after the first free, the EPH-I0677 definite grade. A path
+/// that skips the block and continues past it runs the second free on
+/// some paths only, the conditional grade — the cross-block mirror of the
+/// same-block current-free op (EPH-I1011, EPH-I1017). The walk treats the
+/// block as a sink: it neither enters nor leaves it.
+fn blockOnEveryContinuingPath(
+    allocator: Allocator,
+    cfg: *const ControlFlowGraph,
+    bid: usize,
+) !bool {
+    if (bid == cfg.entry_block) return true;
+    var walk = SkipWalk{
+        .allocator = allocator,
+        .cfg = cfg,
+        .bid = bid,
+        .end_line = cfg.blocks.items[bid].end_line,
+        .visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, cfg.blocks.items.len),
+        .stack = .empty,
+    };
+    defer walk.visited.deinit(allocator);
+    defer walk.stack.deinit(allocator);
+    try walk.stack.append(allocator, cfg.entry_block);
+    walk.visited.set(cfg.entry_block);
+    while (walk.stack.pop()) |cur| {
+        for (cfg.edges.items) |edge| {
+            if (try walk.exploreEdge(cur, edge)) return false;
+        }
+    }
+    return true;
+}
+
+/// The branch_true in-edge pair of the block at bid: the sibling arm the
+/// construct header's branch_false edge leaves via, and the header block
+/// that sources the branch_true edge. Null when bid is not a branch_true
+/// arm or the header wires no false exit (a switch arm, a catch block, a
+/// `while (true)` body).
+fn branchSibling(cfg: *const ControlFlowGraph, bid: usize) ?SiblingArm {
+    for (cfg.edges.items) |edge| {
+        if (edge.to != bid or edge.kind != .branch_true) continue;
+        for (cfg.edges.items) |e2| {
+            if (e2.from == edge.from and e2.kind == .branch_false)
+                return .{ .sibling = e2.to, .header = edge.from };
+        }
+        return null;
+    }
+    return null;
+}
+
+/// The sibling-arm pair branchSibling resolves: the arm block reached
+/// via the construct header's branch_false edge, and the header block
+/// that sources the branch_true edge into bid.
+const SiblingArm = struct {
+    sibling: usize,
+    header: usize,
+};
+
+/// True when the skip path's sibling arm of the block at bid also frees
+/// the variable: the cross-block mirror of the same-line
+/// elsePrecedesSecondFree gate (EPH-I1017 F1). The branch_true edge into
+/// bid names the construct header; the header's branch_false target is
+/// the sibling (the else body of an if, the loop-else body of a
+/// while/for). The sibling counts only when it is a genuine arm: a
+/// multi-line else/loop-else body opens with its `} else {` arm-header
+/// line, and an inline single-line arm shares the construct header's
+/// start line. A post-join merge — the branch_false target of an
+/// else-less construct — starts on the line after the construct close
+/// (finishPendingElse or handleBlockEnd), so it normally matches neither
+/// test, even when its first line carries an unrelated else token (an
+/// if-expression, a single-line if-else, a switch else prong)
+/// (EPH-I1031). One merge shape passes the `}`-prefix test: a nested
+/// construct that is the last statement of an enclosing arm closes onto
+/// the enclosing `} else {` line, and finishPendingElse sets the inner
+/// merge's start there. The else-claim mark closes it: handleElse sets
+/// the mark on the claimed entry's else body, the close paths never do,
+/// so the gate rejects the enclosing-close merge (EPH-I1032). When the
+/// sibling arm also frees, every path through the construct runs a
+/// second free: the pair is definite, never conditional — the severity
+/// mirror of the same-line both-arms form, which the
+/// elsePrecedesSecondFree gate already reads as definite.
+/// Residuals, mirroring elsePrecedesSecondFree: the gate does not check
+/// that the sibling pattern targets the same variable, an else-if chain's
+/// final else body is not the direct sibling of the first arm (the chain
+/// grades arm-by-arm, and an intermediate arm's sibling is the next
+/// condition block, which carries no else-claim mark and spans only its
+/// condition line — an inline same-line else-if body free keeps the
+/// conditional grade, the safe direction), a free
+/// nested inside a construct within the sibling arm lies in a deeper
+/// block, outside the sibling's own span, a top-level single-line arm
+/// whose header block starts on an earlier line (the usual fn-body
+/// shape) does not share the header's start line and stays at the
+/// non-upgraded grade, and an Allman-style `else {` on its own line does
+/// not start with `}` and shares no header line, so its both-arms pair
+/// falls back to the conditional warning grade.
+fn siblingArmAlsoFrees(ctx: *const FreeScanCtx, bid: usize) bool {
+    const arm = branchSibling(ctx.cfg, bid) orelse return false;
+    const block = ctx.cfg.blocks.items[arm.sibling];
+    if (block.start_line == 0 or block.end_line < block.start_line or
+        block.start_line < ctx.scan.func_line) return false;
+    const lines = ctx.scan.lines;
+    const first_idx = block.start_line - ctx.scan.func_line;
+    if (first_idx >= lines.len) return false;
+    if (!elseTokenBetween(lines[first_idx], 0, lines[first_idx].len)) return false;
+    // The word-bounded else token alone does not prove an arm header: a
+    // merge's first line can carry an unrelated else (an if-expression, a
+    // single-line if-else, a switch else prong). The sibling must be a
+    // genuine arm — its first line starts with the arm-header `}` of a
+    // multi-line else/loop-else body, or it shares the construct header's
+    // start line as an inline single-line arm (EPH-I1031).
+    const first = mem.trim(u8, lines[first_idx], " \t\r");
+    const header_start = ctx.cfg.blocks.items[arm.header].start_line;
+    if (!mem.startsWith(u8, first, "}") and block.start_line != header_start) return false;
+    // The start-line tests do not close the class: a nested construct that
+    // is the last statement of an enclosing arm closes onto the enclosing
+    // `} else {` line, and finishPendingElse sets the inner merge's start
+    // there (processCFGLine runs it before the walk: the line's close
+    // event makes scanClaimsElse refuse the deferral). The enclosing `}`
+    // passes the prefix test and the else token is unrelated, so a free in
+    // the enclosing else body on that line would fire the gate. The
+    // else-claim mark closes the class: handleElse sets it on the claimed
+    // entry's else body, finishPendingElse and handleBlockEnd never do
+    // (EPH-I1032).
+    if (!block.is_else_body) return false;
+    const last_idx = @min(block.end_line - ctx.scan.func_line, lines.len - 1);
+    var idx = first_idx;
+    while (idx <= last_idx) : (idx += 1) {
+        if (freePatternAfter(lines[idx], 0)) return true;
+    }
+    return false;
+}
+
 fn detectCrossBlockDoubleFree(
     ctx: *const FreeScanCtx,
     t: []const u8,
@@ -9179,6 +9522,25 @@ fn detectCrossBlockDoubleFree(
     if (hasExclusiveBranchBetween(ctx.scan.lines, ref, actual_line, ctx.scan.func_line))
         return;
 
+    // The def-lattice grade names the second free's block entry: err
+    // requires the block on every path that continues past it. A
+    // conditionally-reached block (if arm, loop body, switch prong, catch
+    // block) runs the second free on some continuing paths only, so the
+    // pair is the conditional double-free — the cross-block mirror of the
+    // same-block current-free op (EPH-I1011, EPH-I1017). A path that
+    // skips the block and returns before it keeps the definite grade
+    // (EPH-I0677).
+    const definite_reach = pa.def_freed and
+        try blockOnEveryContinuingPath(ctx.allocator, ctx.cfg, bid);
+
+    // The both-arms grade: when the skip path's sibling arm also frees
+    // the variable, the second free runs on every path through the
+    // construct — definite even though the block itself is
+    // conditionally reached (EPH-I1017 F1, the cross-block mirror of the
+    // same-line elsePrecedesSecondFree gate).
+    const both_arms = pa.def_freed and !definite_reach and
+        siblingArmAlsoFrees(ctx, bid);
+
     try emitCrossBlockDoubleFree(ctx, .{
         .t = t,
         .line = actual_line,
@@ -9193,6 +9555,8 @@ fn detectCrossBlockDoubleFree(
             .any_freed = true,
             .freed_pred_line = pa.freed_pred_line,
         },
+        .definite_reach = definite_reach,
+        .both_arms = both_arms,
     });
 }
 
@@ -9204,6 +9568,14 @@ const CrossFreeCandidate = struct {
     line: usize,
     freed_line: usize,
     loop_carried: bool = false,
+    /// The second free's block runs on every path that continues past it
+    /// (EPH-I1017): the def-lattice err grade requires it.
+    definite_reach: bool = false,
+    /// The skip path's sibling arm also frees the variable (EPH-I1017
+    /// F1): every path through the construct runs a second free, so the
+    /// pair grades definite even when the block itself is conditionally
+    /// reached.
+    both_arms: bool = false,
     pa: PredFreeAnalysis,
 };
 
@@ -9214,12 +9586,13 @@ fn emitCrossBlockDoubleFree(ctx: *const FreeScanCtx, c: CrossFreeCandidate) !voi
         .file_path = ctx.file_path,
         .var_name = ctx.scan.var_name,
     };
+    const definite = c.pa.def_freed and (c.definite_reach or c.both_arms);
     const site: DoubleFreeSite = .{
         .t = c.t,
         .line = c.line,
         .freed_line = c.freed_line,
-        .severity = if (c.pa.def_freed) .err else .warning,
-        .help = if (c.pa.def_freed)
+        .severity = if (definite) .err else .warning,
+        .help = if (definite)
             "remove duplicate free"
         else if (c.loop_carried)
             "move free outside the loop"
@@ -43516,6 +43889,476 @@ test "ZA106: definite free then catch-arm free grades conditional (EPH-I1011)" {
     try std.testing.expect(definite_err);
 }
 
+test "ZA106: definite free then single-line braced if free grades conditional (EPH-I1017)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The single-line braced twin of the EPH-I1011 catch mirror: the
+    // second free runs on the condition's path only, so the pair is the
+    // conditional double-free. Pre-fix the same-block current-free op read
+    // the braced form as .sets and graded err, while the brace-less twin
+    // graded warning (EPH-I1016 detector fills the mirror gap). The
+    // plain-plain function in the same fixture stays err.
+    const content =
+        \\fn inline_braced(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) { allocator.free(buf); }
+        \\}
+        \\fn definite(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_inline_braced_second_df.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_inline_braced_second_df.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 2);
+    var inline_warning = false;
+    var definite_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 4) inline_warning = issue.severity == .warning;
+        if (issue.line == 9) definite_err = issue.severity == .err;
+    }
+    try std.testing.expect(inline_warning);
+    try std.testing.expect(definite_err);
+}
+
+test "ZA106: definite free then braced if-arm free grades conditional, join stays definite (EPH-I1017)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The multi-line braced arm splits into its own block: the cross-block
+    // def-lattice graded err although the second free runs on the
+    // condition's path only — the same-semantics catch-arm and brace-less
+    // twins grade warning via the current-free op (EPH-I1011). The
+    // block-on-every-continuing-path gate now grades the arm free
+    // conditional; the post-join free, reached on every path that
+    // continues, keeps the definite grade.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn braced(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+        \\fn join(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        use(buf);
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_braced_arm_second_df.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_braced_arm_second_df.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 2);
+    var arm_warning = false;
+    var join_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 8) arm_warning = issue.severity == .warning;
+        if (issue.line == 17) join_err = issue.severity == .err;
+    }
+    try std.testing.expect(arm_warning);
+    try std.testing.expect(join_err);
+}
+
+test "ZA106: loop, switch, and catch arm second frees grade conditional, return-arm join stays definite (EPH-I1017)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Every conditional-arm second free runs on some continuing paths
+    // only, so each pair grades the conditional warning: the loop body
+    // (c true), the switch prong (.buf), and the catch block (error). The
+    // return-arm join free is the EPH-I0677 control: the paths that skip
+    // it terminate at the return, so it keeps the definite err grade.
+    const content =
+        \\fn loop_df(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+        \\fn switch_df(allocator: std.mem.Allocator, p: union(enum) { buf: []u8, empty }) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    switch (p) {
+        \\        .buf => {
+        \\            allocator.free(buf);
+        \\        },
+        \\        .empty => {},
+        \\    }
+        \\}
+        \\fn catch_df(allocator: std.mem.Allocator, opt: error{X}!void) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    opt catch {
+        \\        allocator.free(buf);
+        \\    };
+        \\}
+        \\fn return_arm(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) {
+        \\        return;
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cond_arm_second_df.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_cond_arm_second_df.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 4);
+    var loop_warning = false;
+    var switch_warning = false;
+    var catch_warning = false;
+    var return_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 5) loop_warning = issue.severity == .warning;
+        if (issue.line == 13) switch_warning = issue.severity == .warning;
+        if (issue.line == 22) catch_warning = issue.severity == .warning;
+        if (issue.line == 32) return_err = issue.severity == .err;
+    }
+    try std.testing.expect(loop_warning);
+    try std.testing.expect(switch_warning);
+    try std.testing.expect(catch_warning);
+    try std.testing.expect(return_err);
+}
+
+test "ZA106: cross-block both-arms free grades err, single-arm twin grades warning (EPH-I1017 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The then-arm free pairs with the outer free: the skip path's
+    // sibling else arm also frees the variable, so every path through the
+    // construct runs a second free and the pair is the definite
+    // double-free (err) — the cross-block mirror of the same-line
+    // both-arms form, which elsePrecedesSecondFree already reads as
+    // definite. The single-arm control: the else arm holds a use, not a
+    // free, so the pair stays conditional (warning). The two functions
+    // differ in one line — the discriminating pin. Pre-fix both graded
+    // warning (the B48a conditional grade read the skip path as per-arm
+    // conditional); the err assertion fails pre-fix.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn both(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+        \\fn single(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        use(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_both_arms_cross_block.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_both_arms_cross_block.zig";
+    // The single-arm else-path use fires the ZA105 family, not ZA106.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 2);
+    var both_err = false;
+    var single_warning = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 8) both_err = issue.severity == .err;
+        if (issue.line == 17) single_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(both_err);
+    try std.testing.expect(single_warning);
+}
+
+test "ZA106: loop-else both-arms free grades err, plain loop twin stays conditional (EPH-I1017 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The word-bounded-else discriminator on the sibling's first line: a
+    // loop with an else arm whose body also frees reads as both-arms
+    // (err — every path runs a second free; for a loop the false exit IS
+    // the else body). The plain loop's sibling is the post-loop block,
+    // which carries no else token, so the pair stays conditional
+    // (warning). The two functions differ in the else arm only — the
+    // discriminating pin. Pre-fix both graded warning; the err assertion
+    // fails pre-fix.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn w_else(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+        \\fn w_plain(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    use(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_else_both_arms.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_loop_else_both_arms.zig";
+    // The plain-loop post-body use fires the ZA105 family, not ZA106.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 2);
+    var else_err = false;
+    var plain_warning = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 8) else_err = issue.severity == .err;
+        if (issue.line == 17) plain_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(else_err);
+    try std.testing.expect(plain_warning);
+}
+
+test "ZA106: merge siblings with unrelated else tokens stay conditional, genuine arms stay err (EPH-I1031 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The both-arms gate counts the skip path's sibling arm only when the
+    // sibling is a genuine arm: a multi-line else/loop-else body opens
+    // with its `} else {` header line, or an inline arm shares the
+    // construct header's start line. A post-join merge — the branch_false
+    // target of an else-less construct — starts on the line after the
+    // close, so its first line's unrelated else token (an if-expression,
+    // a single-line if-else, a switch else prong) no longer upgrades the
+    // pair to err (EPH-I1031). The three FP fns carry a free on the
+    // merge's first line and another free in the merge's span; each pair
+    // grades conditional (warning) — pre-fix all three graded err. The
+    // discriminating controls: the multi-line if/else and while-else
+    // both-arms pairs (genuine `} else {` siblings) stay err, and the
+    // switch-else-prong free's own pair stays err.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn fp_ifexpr(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    const other = try allocator.alloc(u8, 32);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    var n: usize = if (d) 1 else 2;
+        \\    _ = n;
+        \\    allocator.free(other);
+        \\}
+        \\fn fp_loop_join(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    if (d) { use(buf); } else { allocator.free(buf); }
+        \\    use(buf);
+        \\}
+        \\fn ctrl_switchelse(allocator: std.mem.Allocator, c: bool, x: u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    switch (x) { .a => use(buf), else => allocator.free(buf) }
+        \\    use(buf);
+        \\}
+        \\fn both(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+        \\fn w_else(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_merge_sibling_arms.zig", content);
+    defer run.deinit(allocator);
+
+    var ifexpr_warning = false;
+    var loop_join_warning = false;
+    var switchelse_warning = false;
+    var prong_err = false;
+    var both_err = false;
+    var w_else_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 9) ifexpr_warning = issue.severity == .warning;
+        if (issue.line == 19) loop_join_warning = issue.severity == .warning;
+        if (issue.line == 28) switchelse_warning = issue.severity == .warning;
+        if (issue.line == 30) prong_err = issue.severity == .err;
+        if (issue.line == 37) both_err = issue.severity == .err;
+        if (issue.line == 46) w_else_err = issue.severity == .err;
+    }
+    try std.testing.expect(ifexpr_warning);
+    try std.testing.expect(loop_join_warning);
+    try std.testing.expect(switchelse_warning);
+    try std.testing.expect(prong_err);
+    try std.testing.expect(both_err);
+    try std.testing.expect(w_else_err);
+}
+
+test "ZA106: enclosing-close merge siblings stay conditional, genuine arms stay err (EPH-I1032 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A nested construct that is the last statement of an enclosing arm
+    // closes onto the enclosing `} else {` line: finishPendingElse sets
+    // the inner merge's start there (processCFGLine runs it before the
+    // walk because the line's close event makes scanClaimsElse refuse the
+    // deferral), so the merge's first line starts with the enclosing `}`,
+    // carries an unrelated else token, and holds a free in the enclosing
+    // else body. Pre-fix the start-line tests accepted the sibling and
+    // the free in the merge span fired the gate: the three nested shapes
+    // (if/else, while-else, inner-loop) graded err. The discriminating
+    // controls: the stmt-before-else shape's merge starts on the statement
+    // line (no free in the span) and stays warning, and the multi-line
+    // if/else and while-else both-arms pairs (genuine `} else {` siblings)
+    // stay err. The three warning assertions fail pre-fix.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn ifElseNested(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (d) {
+        \\        if (c) {
+        \\            allocator.free(buf);
+        \\        }
+        \\    } else { allocator.free(buf); }
+        \\}
+        \\fn loopElseNested(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (d) {
+        \\        if (c) {
+        \\            allocator.free(buf);
+        \\        }
+        \\    } else { allocator.free(buf); }
+        \\}
+        \\fn innerLoopNested(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (d) {
+        \\        while (c) {
+        \\            allocator.free(buf);
+        \\        }
+        \\    } else { allocator.free(buf); }
+        \\}
+        \\fn stmtBeforeElse(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (d) {
+        \\        if (c) {
+        \\            allocator.free(buf);
+        \\        }
+        \\        use(buf);
+        \\    } else { allocator.free(buf); }
+        \\}
+        \\fn both(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+        \\fn w_else(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_enclosing_close_sibling.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_enclosing_close_sibling.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 6);
+    var if_else_nested_warning = false;
+    var loop_else_nested_warning = false;
+    var inner_loop_nested_warning = false;
+    var stmt_before_warning = false;
+    var both_err = false;
+    var w_else_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 9) if_else_nested_warning = issue.severity == .warning;
+        if (issue.line == 18) loop_else_nested_warning = issue.severity == .warning;
+        if (issue.line == 27) inner_loop_nested_warning = issue.severity == .warning;
+        if (issue.line == 36) stmt_before_warning = issue.severity == .warning;
+        if (issue.line == 45) both_err = issue.severity == .err;
+        if (issue.line == 54) w_else_err = issue.severity == .err;
+    }
+    try std.testing.expect(if_else_nested_warning);
+    try std.testing.expect(loop_else_nested_warning);
+    try std.testing.expect(inner_loop_nested_warning);
+    try std.testing.expect(stmt_before_warning);
+    try std.testing.expect(both_err);
+    try std.testing.expect(w_else_err);
+}
+
 test "ZA105: noreturn call after free exits the block (EPH-I0364)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -44713,6 +45556,100 @@ test "ZA105: brace-less if-form free grades conditional like the braced twin (EP
     try std.testing.expect(definite_err);
 }
 
+test "ZA105: single-line braced if-form free grades conditional like the multi-line twin (EPH-I1016)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The single-line braced free sat on the block header line, so the
+    // same-block verdict read it as a definite block statement and graded
+    // err, while the multi-line braced twin grades warning through the CFG
+    // arm split. The free runs on the arm's path only, so the same-block
+    // verdict now mirrors the brace-less twin's conditional grade
+    // (EPH-I1005). The both-arms line frees on every path and stays err,
+    // which proves the else-arm gate does not leak into definite frees.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn inline_braced(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) { allocator.free(buf); }
+        \\    use(buf);
+        \\}
+        \\fn inline_else(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) { use(buf); } else { allocator.free(buf); }
+        \\    use(buf);
+        \\}
+        \\fn both_arms(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) { allocator.free(buf); } else { allocator.free(buf); }
+        \\    use(buf);
+        \\}
+        \\fn definite(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    use(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_inline_braced_uaf.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_inline_braced_uaf.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 4);
+    var inline_warning = false;
+    var inline_else_warning = false;
+    var both_err = false;
+    var definite_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        if (issue.line == 7) inline_warning = issue.severity == .warning;
+        if (issue.line == 12) inline_else_warning = issue.severity == .warning;
+        if (issue.line == 17) both_err = issue.severity == .err;
+        if (issue.line == 22) definite_err = issue.severity == .err;
+    }
+    try std.testing.expect(inline_warning);
+    try std.testing.expect(inline_else_warning);
+    try std.testing.expect(both_err);
+    try std.testing.expect(definite_err);
+}
+
+test "ZA105: single-line braced if-form free keeps a cross-block use conditional (EPH-I1016)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The use sits in a later block: the free's block exit is the cond_sets
+    // op, so the use block's MUST meet stays false and the verdict stays at
+    // the conditional warning grade — the mirror of the brace-less
+    // cross-block pin (EPH-I1005). Pre-fix the single-line braced form read
+    // as a definite free (.sets) and the cross-block use graded err.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn cross(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (c) { allocator.free(buf); }
+        \\    if (d) {
+        \\        use(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_inline_braced_cross.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_inline_braced_cross.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
+}
+
 test "ZA105: brace-less if-form free keeps a cross-block use conditional (EPH-I1005)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -45093,8 +46030,11 @@ test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
     const allocator = gpa.allocator();
 
     // No capture rebinds the name: the prong body frees the tracked alloc
-    // itself. The free on 3 dominates the switch, so the free on 6 runs on a
-    // path that already freed item — a definite double-free (err).
+    // itself. The free on 3 dominates the switch, so the free on 6 runs on
+    // a path that already freed item — the pair fires. The prong runs on
+    // the .buf path only and the .empty path continues past it, so the
+    // second free is conditional: the verdict is the warning grade
+    // (EPH-I1017), the cross-block mirror of the I1011 current-free op.
     const content =
         \\fn handle(allocator: std.mem.Allocator, p: union(enum) { buf: []u8, empty }) !void {
         \\    const item = try allocator.alloc(u8, 32);
@@ -45114,7 +46054,7 @@ test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
     for (run.issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
-        try std.testing.expect(issue.severity == .err);
+        try std.testing.expect(issue.severity == .warning);
     }
 }
 

@@ -32107,6 +32107,29 @@ fn reportFmtTermFailure(
     });
 }
 
+/// Build the zig fmt child argv for one scan path (EPH-I1023). zig
+/// fmt's own parser (0.16 src/fmt.zig) treats every dash-leading
+/// argument as a flag and has no `--` separator: a dash-leading scan
+/// path dies on "unrecognized parameter". The "./" prefix keeps the
+/// argument positional and names the same path from the inherited
+/// cwd. A path too long for the scratch stays raw: the child's own
+/// rejection keeps the current ZR104 behavior for that shape.
+fn buildFmtArgv(
+    path: []const u8,
+    argv_buf: *[4][]const u8,
+    scratch: []u8,
+) []const []const u8 {
+    argv_buf[0] = tool_zig_path;
+    argv_buf[1] = "fmt";
+    argv_buf[2] = "--check";
+    if (path.len == 0 or path[0] != '-') {
+        argv_buf[3] = path;
+        return argv_buf[0..4];
+    }
+    argv_buf[3] = std.fmt.bufPrint(scratch, "./{s}", .{path}) catch path;
+    return argv_buf[0..4];
+}
+
 /// Run zig fmt --check on `path` and parse its output into ZA601
 /// findings. Different toolchains write the list to different
 /// streams. Both go through parseFmtOutput, which owns every name it
@@ -32116,10 +32139,12 @@ fn runFmtCheck(
     allocator: Allocator,
     path: []const u8,
 ) !std.ArrayListUnmanaged(Issue) {
+    var fmt_argv: [4][]const u8 = undefined;
+    var fmt_scratch: [Fs.max_path_bytes + 2]u8 = undefined;
     const result = runChildCapped(
         allocator,
         diag.io,
-        &.{ tool_zig_path, "fmt", "--check", path },
+        buildFmtArgv(path, &fmt_argv, &fmt_scratch),
         .inherit,
     ) catch |err| {
         std.debug.print("error: cannot run zig fmt: {}\n", .{err});
@@ -32135,9 +32160,15 @@ fn runFmtCheck(
     // Different toolchains write the needs-format list to different
     // streams, so parse both. The defers above free both buffers at
     // return: the parse must own every name it keeps (EPH-I0196).
-    var issues = try parseFmtOutput(diag, allocator, result.stdout, root_real);
+    var issues = try parseFmtOutput(diag, allocator, result.stdout, .{
+        .scan_path = path,
+        .root_real = root_real,
+    });
     errdefer deinitIssues(&issues, allocator);
-    var stderr_issues = try parseFmtOutput(diag, allocator, result.stderr, root_real);
+    var stderr_issues = try parseFmtOutput(diag, allocator, result.stderr, .{
+        .scan_path = path,
+        .root_real = root_real,
+    });
     errdefer deinitIssues(&stderr_issues, allocator);
     try issues.appendSlice(allocator, stderr_issues.items);
     // Item ownership moved with the append. Only the array frees here.
@@ -32178,17 +32209,26 @@ fn runFmtCheck(
     return issues;
 }
 
+/// Parse context for one zig fmt child output stream: the scan path as
+/// spawned (the strip decision reads its spelling, EPH-I1038) and the
+/// containment root for the EPH-I0197 gate (null fails closed).
+const FmtParseCtx = struct {
+    scan_path: []const u8,
+    root_real: ?[]const u8,
+};
+
 /// Parse `zig fmt --check` output into ZA601 findings. Kept names are
 /// duped and marked file_owned: the caller frees the child buffers after
 /// return, while findings print later (EPH-I0196). The bytes are
 /// untrusted filesystem metadata. Gates: printable ASCII only, a .zig
-/// suffix, resolution inside root_real (EPH-I0197). A null root_real
-/// fails closed. Each rejected hostile line prints one sanitized note.
+/// suffix, resolution inside ctx.root_real (EPH-I0197). A null
+/// ctx.root_real fails closed. Each rejected hostile line prints one
+/// sanitized note.
 fn parseFmtOutput(
     diag: *DiagCtx,
     allocator: Allocator,
     output_bytes: []const u8,
-    root_real: ?[]const u8,
+    ctx: FmtParseCtx,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer deinitIssues(&issues, allocator);
@@ -32197,18 +32237,31 @@ fn parseFmtOutput(
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
-        if (!isPrintableAscii(t)) {
-            try rejectFmtLine(diag, allocator, t, "control or non-ASCII bytes in the path");
+        // The child echoes the scan path as given. Only buildFmtArgv's
+        // dash-prefix form (EPH-I1023) adds a "./" the user never wrote:
+        // a dash-leading path reaches zig fmt as "./-dashdir2" and the
+        // list names come back with the "./" prefix. A dot-root scan
+        // path ("." or "./") also echoes "./name" — zig fmt joins the
+        // scan path with "/" — but there the prefix IS the scan path, so
+        // stripping it would silently lose the finding (EPH-I1038): the
+        // report-path gate compares the name textually against cfg.path,
+        // and "name" fails the ancestor test for ".".
+        const name = if (ctx.scan_path.len > 0 and ctx.scan_path[0] == '-')
+            stripDotSlashPrefix(t)
+        else
+            t;
+        if (!isPrintableAscii(name)) {
+            try rejectFmtLine(diag, allocator, name, "control or non-ASCII bytes in the path");
             continue;
         }
         // Not a bare file name (zig fmt parse errors, status lines). The
         // pre-gate filter, kept silent so a broken build stays quiet.
-        if (!mem.endsWith(u8, t, ".zig")) continue;
-        if (!resolvesInRoot(diag.io, t, root_real)) {
-            try rejectFmtLine(diag, allocator, t, "the path points outside the scan root");
+        if (!mem.endsWith(u8, name, ".zig")) continue;
+        if (!resolvesInRoot(diag.io, name, ctx.root_real)) {
+            try rejectFmtLine(diag, allocator, name, "the path points outside the scan root");
             continue;
         }
-        const owned = try allocator.dupe(u8, t);
+        const owned = try allocator.dupe(u8, name);
         errdefer allocator.free(owned);
         try issues.append(allocator, .{
             .file = owned,
@@ -34337,7 +34390,12 @@ fn isSuppressionGateKey(key: []const u8) bool {
 /// Apply a config "path_dir" value under the RED4-1 containment rule:
 /// resolve the value relative to the config file's directory, realpath the
 /// result, and require it inside that directory. Any failure warns and
-/// leaves cfg.path alone (fail closed: a moved root is never silent).
+/// leaves cfg.path alone (fail closed: a moved root is never silent). The
+/// stored value sheds a leading "./" like the CLI channel does
+/// (acceptPositionalPath, EPH-I0801): one spelling across channels keeps
+/// the fmt child's echo textually matchable by the report-path gate
+/// (EPH-I1038). A bare "./" stays for the trailing-slash trim, which turns
+/// it into the dot-root scan ".".
 fn applyConfigPathDir(ctx: ConfigParseCtx, value: []const u8) !void {
     const allocator = ctx.allocator;
     const joined = if (value.len > 0 and value[0] == '/')
@@ -34362,7 +34420,7 @@ fn applyConfigPathDir(ctx: ConfigParseCtx, value: []const u8) !void {
         warnPathDirRejected(ctx, value, "resolves outside config directory");
         return;
     }
-    try setOwnedPath(allocator, ctx.cfg, value);
+    try setOwnedPath(allocator, ctx.cfg, stripDotSlashPrefix(value));
 }
 
 /// Render the path_dir rejection warning into `out`. The value is
@@ -36607,7 +36665,15 @@ fn addEntryIfValid(ctx: EntryScanCtx, path: []const u8) !void {
     if (ctx.added.contains(path)) return;
     Fs.cwd(ctx.diag.io).access(path, .{}) catch return;
     const duped = try ctx.allocator.dupe(u8, path);
+    // EPH-I1024: the append is the first fallible op after the dupe.
+    // On append OOM the list never takes ownership and the slice must
+    // free. The flag disarms after the append: a failed map put keeps
+    // the list slot (the map references the list-owned slice, it never
+    // owns — Config.deinit frees the list items).
+    var entry_owned = true;
+    errdefer if (entry_owned) ctx.allocator.free(duped);
     try ctx.cfg.entries.append(ctx.allocator, duped);
+    entry_owned = false;
     try ctx.added.put(duped, {});
 }
 
@@ -36650,7 +36716,15 @@ fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
     }
     Fs.cwd(ctx.diag.io).access(full_path, .{}) catch return;
     const duped = try ctx.allocator.dupe(u8, full_path);
+    // EPH-I1024: the append is the first fallible op after the dupe.
+    // On append OOM the list never takes ownership and the slice must
+    // free. The flag disarms after the append: a failed map put keeps
+    // the list slot (the map references the list-owned slice, it never
+    // owns — Config.deinit frees the list items).
+    var entry_owned = true;
+    errdefer if (entry_owned) ctx.allocator.free(duped);
     try ctx.cfg.entries.append(ctx.allocator, duped);
+    entry_owned = false;
     try ctx.added.put(duped, {});
 }
 
@@ -36801,7 +36875,15 @@ fn addDirEntry(ctx: EntryScanCtx, dir_path: []const u8, name: []const u8) !void 
             return;
         };
     }
+    // EPH-I1024: the append is the first fallible op after the join.
+    // On append OOM the list never takes ownership and the slice must
+    // free. The flag disarms after the append: a failed map put keeps
+    // the list slot (the map references the list-owned slice, it never
+    // owns — Config.deinit frees the list items).
+    var entry_owned = true;
+    errdefer if (entry_owned) ctx.allocator.free(full);
     try ctx.cfg.entries.append(ctx.allocator, full);
+    entry_owned = false;
     try ctx.added.put(full, {});
 }
 
@@ -40718,6 +40800,173 @@ test "entry directory scan propagates OOM (EPH-I0526)" {
     );
 }
 
+test "addEntryIfValid frees the duped entry on append failure (EPH-I1024)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "valid.zig", .data = "pub fn f() void {}\n" });
+    const path = try tmpFilePath(allocator, &tmp, "valid.zig");
+    defer allocator.free(path);
+
+    // Probe the allocation count, then fail every index in turn: a
+    // leaked duped slice at the append-growth index fails the testing
+    // allocator at deinit (B45-1 sweep pattern).
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var added = std.StringHashMap(void).init(allocator);
+        defer added.deinit();
+        const ctx: EntryScanCtx = .{
+            .diag = &diag,
+            .allocator = probe.allocator(),
+            .cfg = &cfg,
+            .added = &added,
+        };
+        try addEntryIfValid(ctx, path);
+        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+        try std.testing.expect(added.contains(path));
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var added = std.StringHashMap(void).init(allocator);
+        defer added.deinit();
+        const ctx: EntryScanCtx = .{
+            .diag = &diag,
+            .allocator = failing.allocator(),
+            .cfg = &cfg,
+            .added = &added,
+        };
+        addEntryIfValid(ctx, path) catch {
+            // fail_index 1 = the append growth (allocation 0 is the
+            // dupe): the list must not hold the freed slice. A failed
+            // map put keeps the slot, the pre-fix behavior.
+            if (fail_index == 1)
+                try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    }
+}
+
+test "addEntryWithPrefix frees the duped entry on append failure (EPH-I1024)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "valid.zig", .data = "pub fn f() void {}\n" });
+    const root = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(root);
+    const want = try std.fmt.allocPrint(allocator, "{s}/valid.zig", .{root});
+    defer allocator.free(want);
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var added = std.StringHashMap(void).init(allocator);
+        defer added.deinit();
+        const ctx: EntryScanCtx = .{
+            .diag = &diag,
+            .allocator = probe.allocator(),
+            .cfg = &cfg,
+            .added = &added,
+            .prefix = root,
+        };
+        try addEntryWithPrefix(ctx, "valid.zig");
+        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+        try std.testing.expectEqualStrings(want, cfg.entries.items[0]);
+        try std.testing.expect(added.contains(want));
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var added = std.StringHashMap(void).init(allocator);
+        defer added.deinit();
+        const ctx: EntryScanCtx = .{
+            .diag = &diag,
+            .allocator = failing.allocator(),
+            .cfg = &cfg,
+            .added = &added,
+            .prefix = root,
+        };
+        addEntryWithPrefix(ctx, "valid.zig") catch {
+            // fail_index 2 = the append growth (0 = the prefix join,
+            // 1 = the dupe): the list must not hold the freed slice.
+            if (fail_index == 2)
+                try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    }
+}
+
+test "addDirEntry frees the joined entry on append failure (EPH-I1024)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "main.zig", .data = "" });
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const want = try std.fmt.allocPrint(allocator, "{s}/main.zig", .{dir_path});
+    defer allocator.free(want);
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var added = std.StringHashMap(void).init(allocator);
+        defer added.deinit();
+        const ctx: EntryScanCtx = .{
+            .diag = &diag,
+            .allocator = probe.allocator(),
+            .cfg = &cfg,
+            .added = &added,
+            .check_access = true,
+        };
+        try addDirEntry(ctx, dir_path, "main.zig");
+        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+        try std.testing.expectEqualStrings(want, cfg.entries.items[0]);
+        try std.testing.expect(added.contains(want));
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        var added = std.StringHashMap(void).init(allocator);
+        defer added.deinit();
+        const ctx: EntryScanCtx = .{
+            .diag = &diag,
+            .allocator = failing.allocator(),
+            .cfg = &cfg,
+            .added = &added,
+            .check_access = true,
+        };
+        addDirEntry(ctx, dir_path, "main.zig") catch {
+            // fail_index 1 = the append growth (0 = the join): the
+            // list must not hold the freed slice.
+            if (fail_index == 1)
+                try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+            continue;
+        };
+        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    }
+}
+
 test "build.zig extraction absence probe stays silent (EPH-I0526)" {
     var diag = testDiagCtx();
     // The catch is reserved for the genuine not-found probe: a missing
@@ -41637,6 +41886,149 @@ test "runFmtCheck reports ZR104 when the scanned path does not exist" {
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expectEqual(Severity.err, issues.items[0].severity);
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "FileNotFound") != null);
+}
+
+test "runFmtCheck accepts a dash-leading scan path (EPH-I1023)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var issues = try runFmtCheck(&diag, allocator, "-dashdir2");
+    defer deinitIssues(&issues, allocator);
+
+    // The dash-leading relative path must reach zig fmt as the
+    // positional "./-dashdir2". Pre-fix the child died on
+    // "unrecognized parameter: '-dashdir2'" (zig fmt 0.16 has no `--`
+    // separator; its parser treats any dash-leading argument as a
+    // flag) and every run on a dash-leading path was a spurious ZR104.
+    for (issues.items) |issue|
+        try std.testing.expect(mem.indexOf(u8, issue.message, "unrecognized parameter") == null);
+    // The honest failure for the absent path: zig fmt cannot find it.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "FileNotFound") != null);
+}
+
+test "buildFmtArgv prefixes a dash-leading scan path (EPH-I1023)" {
+    var argv_buf: [4][]const u8 = undefined;
+    var scratch: [Fs.max_path_bytes + 2]u8 = undefined;
+    const argv = buildFmtArgv("-dashdir2", &argv_buf, &scratch);
+    try std.testing.expectEqual(@as(usize, 4), argv.len);
+    try std.testing.expectEqualStrings(tool_zig_path, argv[0]);
+    try std.testing.expectEqualStrings("fmt", argv[1]);
+    try std.testing.expectEqualStrings("--check", argv[2]);
+    try std.testing.expectEqualStrings("./-dashdir2", argv[3]);
+    // A non-dash path passes through untouched.
+    const plain = buildFmtArgv("src", &argv_buf, &scratch);
+    try std.testing.expectEqualStrings("src", plain[3]);
+    // A dash-leading path that cannot fit the scratch stays raw: the
+    // child's rejection keeps the current ZR104 behavior.
+    var tiny: [3]u8 = undefined;
+    const long = buildFmtArgv("-dashdir2", &argv_buf, &tiny);
+    try std.testing.expectEqualStrings("-dashdir2", long[3]);
+}
+
+test "parseFmtOutput keeps the dot-root ./ echo (EPH-I1038)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root_real = Fs.cwd(std.testing.io).realpath(".", &root_buf) catch
+        return error.SkipZigTest;
+
+    // A dot-root scan path reaches the child as "." and zig fmt joins it
+    // with "/", so the echo "./src/main.zig" carries the scan path itself,
+    // not an argv artifact. The finding keeps the "./": the report-path
+    // gate compares the name textually against cfg.path, and "src/main.zig"
+    // fails the ancestor test for "." — pre-fix the unconditional strip
+    // dropped every ZA601 on a "." or "./" scan silently.
+    var issues = try parseFmtOutput(&diag, allocator, "./src/main.zig\n", .{
+        .scan_path = ".",
+        .root_real = root_real,
+    });
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("./src/main.zig", issues.items[0].file);
+    try std.testing.expect(issues.items[0].file_owned);
+    try std.testing.expectEqualStrings(RULE_NEEDS_FORMAT, issues.items[0].rule);
+    // The gate-equivalent: the kept name must survive classifyIssue's
+    // path_scope check (isPathAncestorOrEqual(out.cfg.path, issue.file)).
+    try std.testing.expect(isPathAncestorOrEqual(".", issues.items[0].file));
+}
+
+test "runFmtCheck fires ZA601 on a dash-leading scan path (EPH-I1023/I1038)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // A real dash-named directory in the test cwd: the child spawn is
+    // "./-dashdir-i1038" and the echoed list name carries the "./"
+    // prefix (the buildFmtArgv artifact, EPH-I1023). The finding must
+    // strip back to the bare form and pass the ancestor gate.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "-dashdir-i1038");
+    defer cwd.deleteTree(std.testing.io, "-dashdir-i1038") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "-dashdir-i1038/unfmt.zig",
+        .data = "fn main()void{}\n",
+    });
+
+    var issues = try runFmtCheck(&diag, allocator, "-dashdir-i1038");
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_NEEDS_FORMAT, issues.items[0].rule);
+    try std.testing.expectEqualStrings("-dashdir-i1038/unfmt.zig", issues.items[0].file);
+    try std.testing.expect(isPathAncestorOrEqual("-dashdir-i1038", issues.items[0].file));
+}
+
+test "config path_dir ./src spelling normalizes and ZA601 fires (EPH-I1038)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // The live-probe shape: a config whose path_dir carries the "./"
+    // spelling. The fixture lives in the test cwd so the containment
+    // check and the fmt child both resolve it.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "i1038fixture/src");
+    defer cwd.deleteTree(std.testing.io, "i1038fixture") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "i1038fixture/src/unfmt.zig",
+        .data = "fn main()void{}\n",
+    });
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"./i1038fixture/src\"}", &cfg);
+    // The intake normalization: cfg.path sheds the "./" like the CLI
+    // channel, so the fmt finding matches the scan path textually.
+    try std.testing.expectEqualStrings("i1038fixture/src", cfg.path);
+
+    var issues = try runFmtCheck(&diag, allocator, cfg.path);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_NEEDS_FORMAT, issues.items[0].rule);
+    try std.testing.expectEqualStrings("i1038fixture/src/unfmt.zig", issues.items[0].file);
+    try std.testing.expect(isPathAncestorOrEqual(cfg.path, issues.items[0].file));
+}
+
+test "config path_dir ./ and ./src normalize like the CLI channel (EPH-I1038)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"./src\"}", &cfg);
+    try std.testing.expectEqualStrings("src", cfg.path);
+    try std.testing.expect(cfg.path_owned);
+
+    // The "./" shape decision: the len-2 guard in stripDotSlashPrefix
+    // keeps "./" for the trailing-slash trim, which turns it into the
+    // dot-root scan ".". That scan is visible (parseFmtOutput keeps the
+    // dot-root echo, see the EPH-I1038 keep pin) — never a silent drop.
+    var dot_cfg = testConfig();
+    defer dot_cfg.deinit(allocator);
+    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"./\"}", &dot_cfg);
+    try stripTrailingSlashes(allocator, &dot_cfg);
+    try std.testing.expectEqualStrings(".", dot_cfg.path);
+    try std.testing.expect(isPathAncestorOrEqual(dot_cfg.path, "./src/unfmt.zig"));
 }
 
 test "runFmtCheck reports ZR104 for a non-zig input path" {
@@ -97317,7 +97709,10 @@ test "parseFmtOutput findings own their file bytes after the source frees" {
     const source = try std.fmt.allocPrint(allocator, "{s}\n{s}\n", .{ a_path, b_path });
     // No defer: the test frees the source before the reads, replicating
     // runFmtCheck's free-then-print order (EPH-I0196).
-    var issues = try parseFmtOutput(&diag, allocator, source, root);
+    var issues = try parseFmtOutput(&diag, allocator, source, .{
+        .scan_path = root,
+        .root_real = root,
+    });
     defer deinitIssues(&issues, allocator);
     allocator.free(source);
 
@@ -97353,7 +97748,10 @@ test "parseFmtOutput rejects control and non-ASCII bytes" {
     });
     defer allocator.free(source);
 
-    var issues = try parseFmtOutput(&diag, allocator, source, root);
+    var issues = try parseFmtOutput(&diag, allocator, source, .{
+        .scan_path = root,
+        .root_real = root,
+    });
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -97369,7 +97767,10 @@ test "parseFmtOutput silently skips zig fmt lines that are not file names" {
     // broken build stays quiet and the reject counter does not move.
     const source = "src/main.zig:3:1: error: expected ';', found '}'\n" ++
         "note: 1 file did not parse\n";
-    var issues = try parseFmtOutput(&diag, allocator, source, null);
+    var issues = try parseFmtOutput(&diag, allocator, source, .{
+        .scan_path = "src",
+        .root_real = null,
+    });
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
@@ -97398,7 +97799,10 @@ test "parseFmtOutput rejects paths that resolve outside the scan root" {
         escape, trav_out, trav_in,
     });
     defer allocator.free(source);
-    var issues = try parseFmtOutput(&diag, allocator, source, root);
+    var issues = try parseFmtOutput(&diag, allocator, source, .{
+        .scan_path = root,
+        .root_real = root,
+    });
     defer deinitIssues(&issues, allocator);
 
     // The absolute outside path and the escaping traversal are rejected.
@@ -97409,7 +97813,10 @@ test "parseFmtOutput rejects paths that resolve outside the scan root" {
     try std.testing.expectEqual(@as(usize, 2), diag.fmt_reject_count);
 
     // A null root fails closed, even for a plain in-root-looking name.
-    var closed = try parseFmtOutput(&diag, allocator, "src/ok.zig\n", null);
+    var closed = try parseFmtOutput(&diag, allocator, "src/ok.zig\n", .{
+        .scan_path = "src",
+        .root_real = null,
+    });
     defer deinitIssues(&closed, allocator);
     try std.testing.expectEqual(@as(usize, 0), closed.items.len);
     try std.testing.expectEqual(@as(usize, 3), diag.fmt_reject_count);

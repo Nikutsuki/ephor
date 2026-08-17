@@ -11823,6 +11823,17 @@ fn analyzeCFGErrdeferCoverage(
     defer state.deinit(allocator);
 
     if (state.try_allocs.items.len == 0) return issues;
+    // Allocation-count cap: the per-allocation transfer walk rescans the
+    // body for each try-alloc (O(M x N)), so an over-cap function keeps
+    // the band-B02 F11 hang class alive through the ZA103 tail (EPH-I1006).
+    if (try overErrdeferCapEmitsNote(.{
+        .a = allocator,
+        .out = &issues,
+        .file_path = body.file_path,
+        .func_line = body.func_line,
+        .rule = RULE_ALLOC_NO_ERRDEFER,
+        .cap_noun = mem_alloc_cap_noun,
+    }, state.try_allocs.items.len)) return issues;
     for (state.try_allocs.items) |*alloc| {
         checkErrdeferOwnershipTransfer(alloc, body.lines, body.func_line);
     }
@@ -12954,6 +12965,10 @@ fn collectNoFreeAllocatorNames(
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.StringHashMapUnmanaged(void) {
     var names = std.StringHashMapUnmanaged(void){};
+    // The map has no self-owning defer: a put failure after earlier
+    // successful puts would drop the storage of the entries already
+    // inserted (OOM-path leak, EPH-I0895 class; EPH-I1007).
+    errdefer names.deinit(a);
 
     // Scan function signature for arena-named Allocator parameters.
     // Check first ~10 lines for parameter declarations like `arena: Allocator`
@@ -13134,6 +13149,10 @@ fn collectNoFreeFieldNames(
     lines: []const []const u8,
 ) !std.StringHashMapUnmanaged(void) {
     var names = std.StringHashMapUnmanaged(void){};
+    // The map has no self-owning defer: a put failure after earlier
+    // successful puts would drop the storage of the entries already
+    // inserted (OOM-path leak, EPH-I0895 class; EPH-I1007).
+    errdefer names.deinit(a);
     const field_type_patterns = compat.getNoFreeFieldTypePatterns();
 
     for (lines) |line| {
@@ -13278,6 +13297,10 @@ fn collectAllAllocatorNames(
     lines: []const []const u8,
 ) !std.StringHashMapUnmanaged(void) {
     var names = std.StringHashMapUnmanaged(void){};
+    // The map has no self-owning defer: a put failure after earlier
+    // successful puts would drop the storage of the entries already
+    // inserted (OOM-path leak, EPH-I0895 class; EPH-I1007).
+    errdefer names.deinit(a);
 
     // All allocator type init patterns from stdlib vocabulary (compat layer)
     const alloc_inits = compat.getAllInitPatterns();
@@ -24019,19 +24042,21 @@ fn deinitIssuePayloads(items: []Issue, a: Allocator) void {
     for (items) |*issue| issue.deinit(a);
 }
 
-/// Per-function analysis caps for the ZA105/106 and ZA101/102 families
-/// (band-B02 F11, EPH-I0350). The family rescans the function body once
-/// per allocation: the per-line detectors walk every line and the
-/// same-block scans walk the block again per candidate line, so one
-/// function costs O(M x N^2) with M allocations and N lines, plus the
-/// per-alloc alias and defer-pairing passes. The 10 MiB source cap
-/// (EPH-I0150) bounds the input file, not the blowup: a single
-/// attacker-controlled function of hundreds of thousands of lines is a
-/// hang class. These caps bound the family's input; a function past either
-/// cap skips the family with a note. Measured 2026-08-16: an adversarial
-/// single-alloc function costs ~2.5 s at the 2048-line cap, and the
-/// four-project corpus runs at 0.91-4.34 s per project (zls 0.91, ghostty
-/// 4.34, sig 3.87, tigerbeetle 3.24).
+/// Per-function analysis caps for the ZA105/106, ZA101/102, and ZA103
+/// families (band-B02 F11, EPH-I0350, EPH-I1006). The families rescan the
+/// function body once per allocation: the per-line detectors walk every
+/// line and the same-block scans walk the block again per candidate line,
+/// so one function costs O(M x N^2) with M allocations and N lines, plus
+/// the per-alloc alias and defer-pairing passes. The ZA103 tail's
+/// per-allocation transfer walk is the same class: O(M x N) with the
+/// try-alloc count as M (EPH-I1006). The 10 MiB source cap (EPH-I0150)
+/// bounds the input file, not the blowup: a single attacker-controlled
+/// function of hundreds of thousands of lines is a hang class. These caps
+/// bound the families' input; a function past either cap skips the family
+/// with a note. Measured 2026-08-16: an adversarial single-alloc function
+/// costs ~2.5 s at the 2048-line cap, and the four-project corpus runs at
+/// 0.91-4.34 s per project (zls 0.91, ghostty 4.34, sig 3.87, tigerbeetle
+/// 3.24).
 const max_mem_family_lines = 2048;
 const max_mem_family_allocs = 128;
 
@@ -24057,8 +24082,8 @@ const MemCapNoteCtx = struct {
 };
 
 /// Emit the skip note for a memory-family cap: the function exceeds the
-/// named cap, so ZA101/ZA102/ZA105/ZA106 skip it. A note never fails a
-/// gate; it keeps the skip visible in the report (EPH-I0350).
+/// named cap, so the family skips it. A note never fails a gate; it keeps
+/// the skip visible in the report (EPH-I0350).
 fn appendMemFamilyCapNote(ctx: MemCapNoteCtx) !void {
     const msg = try std.fmt.allocPrint(
         ctx.a,
@@ -24066,6 +24091,14 @@ fn appendMemFamilyCapNote(ctx: MemCapNoteCtx) !void {
         .{ctx.cap_noun},
     );
     errdefer ctx.a.free(msg);
+    try appendCapNote(ctx, msg);
+}
+
+/// Shared skip-note emission: append the caller's owned message as a
+/// memory-family cap note. The caller keeps its errdefer next to the
+/// allocation, so the free mirrors the alloc in the same scope; the note
+/// owns the message after a successful append (message_owned).
+fn appendCapNote(ctx: MemCapNoteCtx, msg: []const u8) !void {
     try ctx.out.append(ctx.a, .{
         .file = ctx.file_path,
         .line = ctx.func_line,
@@ -24076,6 +24109,20 @@ fn appendMemFamilyCapNote(ctx: MemCapNoteCtx) !void {
         .message_owned = true,
         .help = "split the function into smaller units so ephor can analyze it",
     });
+}
+
+/// Emit the skip note for a memory-family cap from the ZA103 tail: the
+/// tail's per-allocation errdefer walk rescans the body for each try-alloc
+/// (O(M x N)), so the I0350 caps bound it too (EPH-I1006).
+fn appendErrdeferTailCapNote(ctx: MemCapNoteCtx) !void {
+    const msg = try std.fmt.allocPrint(
+        ctx.a,
+        "function exceeds {s}; ZA103 skips it: the per-allocation " ++
+            "errdefer walk rescans the body for each try-alloc",
+        .{ctx.cap_noun},
+    );
+    errdefer ctx.a.free(msg);
+    try appendCapNote(ctx, msg);
 }
 
 /// True when the allocation count exceeds the family cap; the skip note is
@@ -24096,9 +24143,28 @@ fn overAllocCapEmitsNote(
     return true;
 }
 
-/// The memory-family tail that runs regardless of the caps: ZA103 errdefer
-/// coverage and the must-return-ref check (EPH-I0350 — the caps bound
-/// ZA101/ZA102/ZA105/ZA106 only).
+/// True when the try-alloc count exceeds the family cap; the ZA103 tail
+/// emits its own note then, and the caller returns without analyzing
+/// (EPH-I1006).
+fn overErrdeferCapEmitsNote(
+    p: MemCapNoteCtx,
+    try_alloc_count: usize,
+) !bool {
+    if (try_alloc_count <= max_mem_family_allocs) return false;
+    try appendErrdeferTailCapNote(.{
+        .a = p.a,
+        .out = p.out,
+        .file_path = p.file_path,
+        .func_line = p.func_line,
+        .rule = p.rule,
+        .cap_noun = mem_alloc_cap_noun,
+    });
+    return true;
+}
+
+/// The memory-family tail: ZA103 errdefer coverage and the must-return-ref
+/// check. The line cap bounds the tail's ZA103 walk too (EPH-I1006); ZA110
+/// stays uncapped — checkMustReturnRef is a single linear pass.
 fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
@@ -24107,6 +24173,31 @@ fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
         .func_line = run.func.start,
         .file_path = run.file.file_path,
     };
+    // ZA110 runs before the line cap: checkMustReturnRef is a single
+    // linear pass with no per-alloc rescan, so an over-cap function keeps
+    // its ZA110 coverage (review r1 F1).
+    try checkMustReturnRef(.{
+        .a = a,
+        .out = out,
+        .fl = run.func.lines,
+        .fstart = run.func.start,
+        .fp = run.file.file_path,
+    });
+    // The line cap bounds the ZA103 tail too: its per-allocation transfer
+    // walk rescans the body for each try-alloc (O(M x N)), so an over-cap
+    // function keeps the band-B02 F11 hang class alive through the tail
+    // (EPH-I1006).
+    if (run.func.lines.len > max_mem_family_lines) {
+        try appendErrdeferTailCapNote(.{
+            .a = a,
+            .out = out,
+            .file_path = run.file.file_path,
+            .func_line = run.func.start,
+            .rule = RULE_ALLOC_NO_ERRDEFER,
+            .cap_noun = mem_line_cap_noun,
+        });
+        return;
+    }
     var r3 = if (run.func.in_test or is_no_free_recipient)
         std.ArrayListUnmanaged(Issue).empty
     else
@@ -24117,14 +24208,16 @@ fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
             run.func.no_free_fields,
         );
     defer r3.deinit(a);
+    // r3's list can carry the alloc-cap skip note's owned payload (the
+    // ZA103 tail joins the alloc cap, EPH-I1006): the appendSlice transfer
+    // needs the same guard as r1/r2 — on an OOM the array defer frees only
+    // the backing array, so the errdefer frees the payloads without the
+    // array; after a successful transfer the payloads belong to out
+    // (EPH-I0895).
+    var r3_owns_payloads = true;
+    errdefer if (r3_owns_payloads) deinitIssuePayloads(r3.items, a);
     try out.appendSlice(a, r3.items);
-    try checkMustReturnRef(.{
-        .a = a,
-        .out = out,
-        .fl = run.func.lines,
-        .fstart = run.func.start,
-        .fp = run.file.file_path,
-    });
+    r3_owns_payloads = false;
 }
 
 /// Run memory-related CFG analyses
@@ -41165,6 +41258,108 @@ test "ZA105: runCFGMemoryAnalyses frees r2 payloads when appendSlice OOMs (EPH-I
     }
 }
 
+test "ZA1xx: no-free collectors stay byte-balanced on put failure (EPH-I1007)" {
+    const allocator = std.testing.allocator;
+    const path = "sweep_collectors.zig";
+    // The fixture drives >= 2 puts into each no-free collector map: the
+    // arena-typed struct fields (collectNoFreeFieldNames, file-level scan),
+    // the arena-named Allocator params (collectNoFreeAllocatorNames
+    // signature scan), and the init + alias chain (collectAllAllocatorNames).
+    // A map whose put fails after earlier puts held storage dropped that
+    // storage pre-fix; byte balance at every fail index is the leak proof
+    // (EPH-I1007).
+    const content =
+        \\const S = struct {
+        \\    arena0: std.heap.ArenaAllocator,
+        \\    arena1: std.heap.ArenaAllocator,
+        \\    arena2: std.heap.ArenaAllocator,
+        \\    arena3: std.heap.ArenaAllocator,
+        \\    arena4: std.heap.ArenaAllocator,
+        \\    arena5: std.heap.ArenaAllocator,
+        \\    arena6: std.heap.ArenaAllocator,
+        \\    arena7: std.heap.ArenaAllocator,
+        \\    arena8: std.heap.ArenaAllocator,
+        \\    arena9: std.heap.ArenaAllocator,
+        \\    arena10: std.heap.ArenaAllocator,
+        \\    arena11: std.heap.ArenaAllocator,
+        \\};
+        \\
+        \\fn sweep(arena0: std.mem.Allocator, arena1: std.mem.Allocator, arena2: std.mem.Allocator, arena3: std.mem.Allocator, arena4: std.mem.Allocator, arena5: std.mem.Allocator, arena6: std.mem.Allocator, arena7: std.mem.Allocator, arena8: std.mem.Allocator, arena9: std.mem.Allocator, arena10: std.mem.Allocator, arena11: std.mem.Allocator) !void {
+        \\    const a = std.heap.ArenaAllocator.init(arena0);
+        \\    const b1 = arena0.allocator();
+        \\    const b2 = b1.allocator();
+        \\    const b3 = b2.allocator();
+        \\    const b4 = b3.allocator();
+        \\    const b5 = b4.allocator();
+        \\    const b6 = b5.allocator();
+        \\    const b7 = b6.allocator();
+        \\    const b8 = b7.allocator();
+        \\    const b9 = b8.allocator();
+        \\    const b10 = b9.allocator();
+        \\    const b11 = b10.allocator();
+        \\    const buf = try arena0.alloc(u8, 64);
+        \\    arena0.free(buf);
+        \\    _ = a;
+        \\    _ = b11;
+        \\}
+    ;
+
+    // Fixture shape pin: each collector's map reaches >= 2 puts on this
+    // input, so the sweep below covers a leakable point (a put failure
+    // after the map holds storage) for every collector (EPH-I1007). The
+    // call shapes mirror the pipeline: the field collector scans the whole
+    // file, the name collectors scan the function's lines with the
+    // signature first, like collectMemSafetyAllocs and prescanErrdeferSets.
+    var lines = std.ArrayListUnmanaged([]const u8).empty;
+    defer lines.deinit(allocator);
+    var line_iter = mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| try lines.append(allocator, line);
+
+    var fn_start: usize = 0;
+    while (fn_start < lines.items.len and
+        !mem.startsWith(u8, mem.trim(u8, lines.items[fn_start], " \t\r"), "fn ")) fn_start += 1;
+    try std.testing.expect(fn_start < lines.items.len);
+    const fn_lines = lines.items[fn_start..];
+
+    var no_free_fields = try collectNoFreeFieldNames(allocator, lines.items);
+    defer no_free_fields.deinit(allocator);
+    try std.testing.expect(no_free_fields.count() >= 2);
+
+    var no_free_names = try collectNoFreeAllocatorNames(
+        allocator,
+        fn_lines,
+        &no_free_fields,
+    );
+    defer no_free_names.deinit(allocator);
+    try std.testing.expect(no_free_names.count() >= 2);
+
+    var all_names = try collectAllAllocatorNames(allocator, fn_lines);
+    defer all_names.deinit(allocator);
+    try std.testing.expect(all_names.count() >= 2);
+
+    // Measure the cold-run allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run).
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    try sweepCFGMemoryOnce(&probe, path, content);
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        if (sweepCFGMemoryOnce(&failing, path, content)) |_| {
+            // Success iteration: the pipeline ran clean under the budget.
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Byte balance at every failure point is the leak proof. Pre-fix
+        // the three no-free collector maps drop their storage when a put
+        // fails after earlier successful puts (EPH-I1007).
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 /// Count issues for a rule within one file (test assertion helper).
 fn countRuleIssues(
     issues: []const Issue,
@@ -41266,6 +41461,99 @@ test "ZA105/ZA106/ZA101: over-alloc-cap function skips memory analysis with a no
             noted = true;
     }
     try std.testing.expect(findings == 0);
+    try std.testing.expect(noted);
+}
+
+test "ZA103: over-line-cap function skips errdefer coverage with a note (EPH-I1006)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The ZA103 tail's per-allocation transfer walk rescans the body for
+    // each try-alloc (O(M x N)), so the I0350 line cap bounds it too: an
+    // over-cap function emits the note and zero ZA103 findings. The
+    // trailing error return would fire a ZA103 gap under-cap, so the
+    // zero-findings assert discriminates the skip from a vacuous pass
+    // (EPH-I1006).
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator,
+        \\fn big(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\
+    );
+    for (0..max_mem_family_lines + 16) |_| {
+        try content.appendSlice(allocator, "    _ = buf;\n");
+    }
+    try content.appendSlice(allocator, "    return error.OutOfMemory;\n");
+    try content.appendSlice(allocator, "}\n");
+
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_line_cap.zig", content.items);
+    defer run.deinit(allocator);
+
+    const file = "test_errdefer_line_cap.zig";
+    var z103_findings: usize = 0;
+    var noted = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, file)) continue;
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and issue.severity != .note)
+            z103_findings += 1;
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
+            issue.severity == .note and
+            mem.indexOf(u8, issue.message, "analysis cap") != null)
+            noted = true;
+    }
+    try std.testing.expect(z103_findings == 0);
+    try std.testing.expect(noted);
+}
+
+test "ZA103: over-alloc-cap function skips errdefer coverage with a note (EPH-I1006)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The allocation-count cap bounds the M factor of the tail's O(M x N)
+    // per-allocation transfer walks: an over-cap function emits the note
+    // and zero ZA103 findings. Under-cap, every try-alloc without an
+    // errdefer before the next try fires a gap, so the zero-findings
+    // assert discriminates the skip (EPH-I1006).
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "fn many(allocator: std.mem.Allocator) !void {\n");
+    for (0..max_mem_family_allocs + 8) |i| {
+        const line = try std.fmt.allocPrint(
+            allocator,
+            "    const b{d} = try allocator.alloc(u8, 64);\n",
+            .{i},
+        );
+        defer allocator.free(line);
+        try content.appendSlice(allocator, line);
+    }
+    for (0..max_mem_family_allocs + 8) |i| {
+        const line = try std.fmt.allocPrint(allocator, "    _ = b{d};\n", .{i});
+        defer allocator.free(line);
+        try content.appendSlice(allocator, line);
+    }
+    try content.appendSlice(allocator, "}\n");
+
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_alloc_cap.zig", content.items);
+    defer run.deinit(allocator);
+
+    const file = "test_errdefer_alloc_cap.zig";
+    var z103_findings: usize = 0;
+    var noted = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, file)) continue;
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and issue.severity != .note)
+            z103_findings += 1;
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
+            issue.severity == .note and
+            mem.indexOf(u8, issue.message, "analysis cap") != null)
+            noted = true;
+    }
+    try std.testing.expect(z103_findings == 0);
     try std.testing.expect(noted);
 }
 

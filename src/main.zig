@@ -14003,6 +14003,11 @@ const MethodCall = struct { receiver: []const u8, method: []const u8 };
 
 /// Extract receiver.method from a line containing a method call.
 /// Scans for "identifier.identifier(" patterns. Returns the last such match.
+/// Residual (band-B04 F12, EPH-I0398): multiple calls on one line resolve
+/// the LAST one only — the earlier calls are invisible to the resolution.
+/// Position-resolved extraction would need the call site's offset, which
+/// the memory analyses do not carry; zig-fmt keeps one statement per line,
+/// so the shape is rare. Pinned by the EPH-I0398 multi-call test.
 fn extractMethodCall(t: []const u8) ?MethodCall {
     var result: ?MethodCall = null;
     var i: usize = 0;
@@ -14478,6 +14483,24 @@ fn registerMethod(
     try gop.value_ptr.put(rctx.a, fn_name, rk);
 }
 
+/// True when `t` is a var/const declaration with a fn-pointer TYPE
+/// annotation (`const f: fn (u8) void = g;`): the line starts with
+/// `var `/`const `, and the first code-position `fn` token sits after a
+/// code-position `:` and before any `=`. The fn-paren guard matches such
+/// lines too, but they are declarations, not signatures: consuming them
+/// skips registerVarDecl and the vars stay absent from var_types
+/// (band-B04 F10, EPH-I0395). A fn token after the `=` (an inline
+/// struct or labeled-block body) is not this shape and keeps the
+/// pre-existing behavior.
+fn isFnPointerTypedDecl(t: []const u8) bool {
+    if (!mem.startsWith(u8, t, "var ") and !mem.startsWith(u8, t, "const ")) return false;
+    const fn_pos = realTokenPos(t, "fn") orelse return false;
+    const colon = findTagInCode(t, ":", 0) orelse return false;
+    if (colon >= fn_pos) return false;
+    const eq = findTagInCode(t, "=", 0) orelse return true;
+    return eq > fn_pos;
+}
+
 /// Parse a function/method signature line into ctx returns tables.
 /// Returns true when the line was consumed (matches the fn guard).
 /// Wrapped signatures join forward, so their return kinds and self types
@@ -14492,6 +14515,10 @@ fn registerFnSignature(
     // `my_fn (x)` are not function signatures (EPH-I0949 residual class,
     // EPH-I0975).
     if (!isFuncBoundary(t)) return false;
+    // Fn-pointer-typed declarations match the guard but are var
+    // declarations: fall through to registerVarDecl (band-B04 F10,
+    // EPH-I0395).
+    if (isFnPointerTypedDecl(t)) return false;
     const sig = scanFnSignatureRet(t, sctx.lines, sctx.idx) orelse return true;
     const rk = classifyReturnType(sig.ret);
     const fn_name = extractFnName(t) orelse return true;
@@ -14770,6 +14797,13 @@ fn structFieldStorePos(t: []const u8, alloc_name: []const u8) ?usize {
 /// NOT matched (no transfer / ownership unclear): `return name != null;`
 /// (comparison), `return foo(name);` (call), `return name.field;` (read),
 /// and name occurrences inside string literals.
+/// Scope caveat (band-B04 F9, EPH-I0397): matching is name-based across
+/// the whole fn, never scope-tracked. A `return buf;` in a later scope
+/// covers an EARLIER `buf` allocation even when the later `buf` shadows
+/// the first — the return may hand out the shadow, not the original
+/// allocation, so the suppression is a disclosed FN under shadowing. The
+/// line model cannot see scopes; scope-tracking the names would need the
+/// CFG and is not planned (pinned by the EPH-I0397 integration test).
 fn isReturnTransfer(t: []const u8, name: []const u8) bool {
     if (name.len == 0) return false;
     const expr = afterReturnKeyword(t) orelse return false;
@@ -14861,8 +14895,14 @@ fn hasElementFollower(t: []const u8, end0: usize) bool {
 
 /// Paren nesting depth at `pos`, counting t[from..pos] on top of `base`
 /// (the depth carried from previous lines) and ignoring parens inside
-/// string literals. The per-char queries ascend, so one classifier walks
-/// the span once instead of rescanning per char (EPH-I0153).
+/// string literals. Within ONE call the queries ascend, so that call's
+/// single classifier walks its span once instead of rescanning per char
+/// (EPH-I0153). Per-line cost (band-B04 F14, EPH-I0400):
+/// isReturnTupleElement re-enters this per name candidate, so a line
+/// with k candidates runs k independent walks — bounded by the candidate
+/// count per line and the 40-line tuple window. The classifier cannot
+/// carry across calls without threading line state; the doc's
+/// "one walk per line" phrasing was the overstatement, now corrected.
 fn parenDepthAt(t: []const u8, from: usize, pos: usize, base: usize) usize {
     var cls = LineClassifier.init(t);
     var depth = base;
@@ -48844,6 +48884,42 @@ test "ZA103: alloc never returned or stored still fires (TP lock)" {
     ) == 1);
 }
 
+test "ZA103: shadowed alloc name returned in a later scope stays covered (EPH-I0397)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B04 F9: ownership matching is name-based across scopes. The
+    // inner `return buf;` hands out the SHADOW, but the name match also
+    // covers the outer buf, whose error path then leaks (no errdefer, no
+    // free, and the fall-through `return error` is never reached by the
+    // scan). The shadow's own decl carries no `try`, so no uncovered
+    // exit stops the walk first, and a bare `{` block is not a control
+    // brace (EPH-I0368), so the shadow's return dominates at the same
+    // depth. Disclosed residual: the verdict stays silent; a
+    // scope-tracked rewrite must update this pin and the isReturnTransfer
+    // doc.
+    const content =
+        \\fn shadow_return(allocator: std.mem.Allocator, cond: bool) ![]u8 {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    {
+        \\        const buf: []u8 = undefined;
+        \\        return buf;
+        \\    }
+        \\    return error.Invalid;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_shadow_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_shadow_return.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
 test "ZA103: return of a call result does not transfer (TP lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -69897,6 +69973,71 @@ test "registerFnSignature resolves zig-fmt-wrapped signatures (EPH-I0388)" {
     try std.testing.expectEqual(ReturnKind.error_union, ctx.function_returns.get("edits").?);
 }
 
+test "registerFnSignature falls through on fn-pointer-typed decls (EPH-I0395)" {
+    var ctx = TypeContext.init();
+    defer ctx.deinit(std.testing.allocator);
+    const sctx = FnSigCtx{ .a = std.testing.allocator, .lines = &.{}, .idx = 0 };
+    // band-B04 F10: the fn-paren guard matches a fn-pointer TYPE
+    // annotation too; such lines are var declarations and must not be
+    // consumed as signatures (registerVarDecl then registers the var).
+    try std.testing.expect(!try registerFnSignature(sctx, "const f: fn (u8) void = g;", null, &ctx));
+    try std.testing.expect(!try registerFnSignature(sctx, "var f: *const fn (u8) void = &g;", null, &ctx));
+    try std.testing.expect(!try registerFnSignature(sctx, "const f: ?fn (u8) void = null;", null, &ctx));
+    // A real signature still registers.
+    try std.testing.expect(try registerFnSignature(sctx, "fn g() void {", null, &ctx));
+    try std.testing.expect(ctx.function_returns.count() == 1);
+}
+
+test "parseFileTypeContext registers fn-pointer-typed vars (EPH-I0395)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\const f: fn (u8) void = g;
+        \\fn g(x: u8) void { _ = x; }
+        \\
+    ;
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    // The fall-through observable: the fn-pointer var registers under
+    // its declaration (extractVarTypeName yields "fn" for the
+    // annotation), and the line never reaches the signature tables.
+    try std.testing.expect(ctx.var_types.get("f") != null);
+    try std.testing.expectEqual(ReturnKind.void_type, ctx.function_returns.get("g").?);
+    try std.testing.expect(ctx.function_returns.get("f") == null);
+}
+
+test "parseFileTypeContext skips signatures embedded in string literals (EPH-I0396)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    // band-B04 F11: a string literal carrying a full `fn name(...) T`
+    // signature on a CODE line must not register a bogus entry. The
+    // EPH-I0975 code-position masking covers the fn-paren guard; this
+    // pin locks the full-signature shape end-to-end through the context
+    // builder (top-level and struct-field strings alike).
+    const content =
+        \\const pat = "fn foo() void";
+        \\const Wrapper = struct {
+        \\    const doc = "fn bar(x: u8) u32;";
+        \\    fn real(self: *Wrapper) u32 { return 0; }
+        \\};
+        \\
+    ;
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    try std.testing.expect(ctx.function_returns.get("foo") == null);
+    try std.testing.expect(ctx.function_returns.get("bar") == null);
+    const methods = ctx.struct_methods.get("Wrapper");
+    try std.testing.expect(methods != null);
+    try std.testing.expect(methods.?.get("bar") == null);
+    try std.testing.expectEqual(ReturnKind.value, methods.?.get("real").?);
+}
+
 test "parseFileTypeContext registers wrapped method signatures (EPH-I0388)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -70087,6 +70228,16 @@ test "extractMethodCall extracts receiver and method" {
 test "extractMethodCall returns null for non-method calls" {
     try std.testing.expect(extractMethodCall("_ = someFunction()") == null);
     try std.testing.expect(extractMethodCall("const x = 42;") == null);
+}
+
+test "extractMethodCall returns the last call on a multi-call line (EPH-I0398)" {
+    // band-B04 F12: the scan resolves the LAST receiver.method( match.
+    // The pin locks the disclosed last-match behavior so a
+    // position-resolved rewrite must update the test and the doc.
+    const r = extractMethodCall("_ = a.reset(); _ = b.clear()");
+    try std.testing.expect(r != null);
+    try std.testing.expectEqualStrings("b", r.?.receiver);
+    try std.testing.expectEqualStrings("clear", r.?.method);
 }
 
 // ============================================================================

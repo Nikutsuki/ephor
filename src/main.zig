@@ -13327,12 +13327,10 @@ const ImportGraph = struct {
 // Memory Analysis Helpers
 // ============================================================================
 
-/// Build a set of variable names that hold no-free allocators by tracking
-/// type-based initialization patterns in the function body.
-/// Build set of variable names holding no-free allocators by tracking
-/// TYPE-BASED initialization patterns (Zig stdlib types only).
-/// Tracks: FixedBufferAllocator, ArenaAllocator, StackFallbackAllocator
-/// Also tracks .allocator() aliases and struct field aliases.
+/// Build a set of variable names holding no-free allocators by tracking
+/// TYPE-BASED initialization patterns (Zig stdlib types only): the
+/// FixedBufferAllocator/ArenaAllocator/StackFallbackAllocator family,
+/// plus .allocator() aliases and struct field aliases.
 fn collectNoFreeAllocatorNames(
     a: Allocator,
     lines: []const []const u8,
@@ -13382,8 +13380,12 @@ fn collectNoFreeAllocatorNames(
         var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
         if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
 
+        // Arena-named locals are no-free by convention (ADR-0007): the
+        // name arm matches "arena" exactly, so counter names like
+        // arena_count stay need-free (EPH-I0387).
         if (!names.contains(name) and isArenaName(name)) try names.put(a, name, {});
-        if (!names.contains(name) and isArenaName(name)) continue;
+        // Alias tracking for an arena-named var is a no-op (the put above
+        // already covers it): the former skip-continue here was dead.
 
         const alias_ctx: NoFreeAliasCtx = .{
             .names = &names,
@@ -13561,7 +13563,7 @@ fn collectNoFreeFieldNames(
         }
         if (matched) try names.put(a, field_name, {});
 
-        // Name-based heuristic: fields named "arena" (or containing "arena")
+        // Name-based heuristic: fields named exactly "arena" (ADR-0007)
         // with type Allocator/std.mem.Allocator/mem.Allocator are treated as no-free.
         // In the Zig ecosystem, arena-named Allocator fields are always backed by
         // ArenaAllocator — naming a GPA-backed allocator "arena" would be a severe
@@ -13574,12 +13576,14 @@ fn collectNoFreeFieldNames(
     return names;
 }
 
-/// Check if a field/param name indicates an arena allocator.
-/// Matches "arena" exactly or names containing "arena" (e.g. "child_arena").
+/// True when a name marks an arena allocator by convention. Exact match
+/// on "arena" only (ADR-0007): a need-free var or field whose name merely
+/// CONTAINS "arena" (arena_count, arenas, notarena, child_arena) keeps
+/// its free requirement. The substring form over-suppressed and hid real
+/// leaks (band-B04 F1, EPH-I0387); the exact form's FN budget (genuine
+/// arena allocators with non-exact names) is documented in ADR-0007.
 fn isArenaName(name: []const u8) bool {
-    if (mem.eql(u8, name, "arena")) return true;
-    if (mem.indexOf(u8, name, "arena") != null) return true;
-    return false;
+    return mem.eql(u8, name, "arena");
 }
 
 /// Check if a type string is an Allocator type (not ArenaAllocator/FixedBufferAllocator).
@@ -13655,7 +13659,8 @@ fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnm
         // Type-based: field declared as no-free allocator type
         if (segment.len > 0 and no_free_fields.count() > 0 and
             no_free_fields.contains(segment)) return true;
-        // Name-based: field named "arena" — cross-file heuristic.
+        // Name-based: segment named exactly "arena" — cross-file heuristic
+        // (ADR-0007).
         if (segment.len > 0 and isArenaName(segment)) return true;
         iter_start += dot_pos + 1;
     }
@@ -13743,9 +13748,10 @@ fn trackAllocatorParams(
             if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
             continue;
         };
-        // Extract parameter name (word before the colon)
+        // Extract parameter name (word before the colon); isIdent covers
+        // underscores, so no separate '_' arm is needed (EPH-I0392).
         var start = colon_pos;
-        while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '_')) start -= 1;
+        while (start > 0 and isIdent(t[start - 1])) start -= 1;
         if (start < colon_pos) try names.put(a, t[start..colon_pos], {});
         // Stop at function body
         if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
@@ -13811,24 +13817,56 @@ fn trackNoFreeAllocAlias(
 }
 
 /// Step 2: content-based scan for calls whose args reference a no-free var.
-/// Handles multi-line function calls (common in Zig code).
+/// Handles multi-line function calls (common in Zig code). The scan runs
+/// on comment/string-masked content: a call-shaped comment or string
+/// (`// doStuff(alloc, 42)`) must not register the callee as no-free-
+/// receiving, and a `)` inside a string arg must not close the call early
+/// (band-B04 F5, EPH-I0391). Call names and args still read from the
+/// original content at the (position-identical) masked offsets.
 fn scanNoFreeCallArgs(
     a: Allocator,
     content: []const u8,
     no_free_vars: *const std.StringHashMapUnmanaged(void),
     result: *std.StringHashMapUnmanaged(void),
 ) !void {
+    const masked = try maskContentLines(a, content);
+    defer a.free(masked);
     var cpos: usize = 0;
-    while (cpos < content.len) {
-        const paren_pos = mem.indexOfScalarPos(u8, content, cpos, '(') orelse break;
+    while (cpos < masked.len) {
+        const paren_pos = mem.indexOfScalarPos(u8, masked, cpos, '(') orelse break;
         cpos = paren_pos + 1;
 
         const call = extractCallName(content, paren_pos) orelse continue;
         if (!isPlainCallName(content, call.start, call.name)) continue;
-        const close = findMatchingCloseParen(content, paren_pos) orelse continue;
+        const close = findMatchingCloseParen(masked, paren_pos) orelse continue;
         if (!argsReferenceNoFreeVar(content[paren_pos + 1 .. close], no_free_vars)) continue;
         try result.put(a, call.name, {});
     }
+}
+
+/// Copy of `content` with comment tails and string/char literal contents
+/// blanked to spaces, byte positions preserved. A `(` or `)` inside prose
+/// can neither start nor close a call scan, and the paren-depth walk of
+/// the args region stays honest (EPH-I0391). Per-line masking writes
+/// into an exact-sized destination, so every line masks fully; the 16 KiB
+/// literal-blanker bound applies at the multi-line signature scans, not
+/// here.
+fn maskContentLines(a: Allocator, content: []const u8) ![]u8 {
+    const masked = try a.alloc(u8, content.len);
+    errdefer a.free(masked);
+    var start: usize = 0;
+    while (start < content.len) {
+        const end = mem.indexOfScalarPos(u8, content, start, '\n') orelse content.len;
+        const line = content[start..end];
+        const code_end = findCommentStart(line) orelse line.len;
+        // Comment tail (and trailing \r): prose, never call structure.
+        @memset(masked[start + code_end .. end], ' ');
+        // Literal contents within the code part; blankLiteralContents
+        // writes the masked bytes into its destination buffer directly.
+        _ = blankLiteralContents(line[0..code_end], masked[start .. start + code_end]);
+        start = end + 1;
+    }
+    return masked;
 }
 
 /// Call-site candidate: identifier immediately before a `(`.
@@ -14048,6 +14086,26 @@ fn extractFnReturnType(t: []const u8) ?[]const u8 {
     return ret_text;
 }
 
+/// The self-parameter type name in `type_text` (the text after `self:`):
+/// pointer markers stripped, then the leading identifier.
+fn extractSelfTypeFromText(type_text_in: []const u8) ?[]const u8 {
+    const type_text = mem.trim(u8, type_text_in, " \t");
+    // Strip pointer markers: *Type, *const Type
+    var name_start: usize = 0;
+    if (type_text.len > 0 and type_text[0] == '*') {
+        name_start = 1;
+        const remaining = type_text[1..];
+        if (mem.startsWith(u8, remaining, "const ")) {
+            name_start = 7; // past "*const "
+        }
+    }
+    // Extract the type name (identifier chars until comma, paren, or space)
+    var name_end = name_start;
+    while (name_end < type_text.len and isIdent(type_text[name_end])) name_end += 1;
+    if (name_end <= name_start) return null;
+    return type_text[name_start..name_end];
+}
+
 /// Extract the self-parameter type name from a method signature.
 /// For "fn foo(self: *MyStruct, ...)" returns "MyStruct".
 /// For "fn foo(self: *const MyStruct)" returns "MyStruct".
@@ -14064,21 +14122,7 @@ fn extractSelfTypeName(t: []const u8) ?[]const u8 {
     if (trimmed[4] != ':' and trimmed[4] != ' ') return null;
     // Find the colon after self
     const colon_pos = mem.indexOfScalar(u8, trimmed, ':') orelse return null;
-    const type_text = mem.trim(u8, trimmed[colon_pos + 1 ..], " \t");
-    // Strip pointer markers: *Type, *const Type
-    var name_start: usize = 0;
-    if (type_text.len > 0 and type_text[0] == '*') {
-        name_start = 1;
-        const remaining = type_text[1..];
-        if (mem.startsWith(u8, remaining, "const ")) {
-            name_start = 7; // past "*const "
-        }
-    }
-    // Extract the type name (identifier chars until comma, paren, or space)
-    var name_end = name_start;
-    while (name_end < type_text.len and isIdent(type_text[name_end])) name_end += 1;
-    if (name_end <= name_start) return null;
-    return type_text[name_start..name_end];
+    return extractSelfTypeFromText(trimmed[colon_pos + 1 ..]);
 }
 
 /// Extract the function name from a fn declaration line.
@@ -14240,10 +14284,206 @@ fn detectTypeScope(
     type_brace_depth.* = brace_depth;
 }
 
+/// Window for the multi-line signature lookahead: continuation lines of a
+/// zig-fmt-wrapped signature carry the closing `)` and (for methods) the
+/// self param. Matches joinFnSignature's window (EPH-I0388).
+const max_sig_lookahead: usize = 16;
+
+/// Return-type text following a closing `)` on the same line, bounded by
+/// the body opener `{` or a bodiless `;`. Error-set literal braces
+/// (`error{OutOfMemory}`) are balanced, not boundaries: a wrapped
+/// error-set return must resolve as .error_union, never .value (EPH-I0388).
+/// A `{` at depth zero that is not an error-set opener is the body brace
+/// (isErrorSetOpen, EPH-I0470/I0885 locks). Bound (pre-existing): an
+/// anonymous `struct {...}` return type ends at its `{`.
+fn returnTypeAfter(rest: []const u8) ?[]const u8 {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const c = rest[i];
+        if (c == '{') {
+            if (!isErrorSetOpen(rest, i) and depth == 0) break;
+            depth += 1;
+            continue;
+        }
+        if (c == '}') {
+            if (depth > 0) depth -= 1;
+            continue;
+        }
+        if (c == ';') break;
+    }
+    const ret_text = mem.trim(u8, rest[0..i], " \t\r");
+    if (ret_text.len == 0) return null;
+    return ret_text;
+}
+
+/// Result of the signature return-type scan: the return-type text plus
+/// the index of the line carrying the closing `)` of the parameter list
+/// (the fn's own line for a single-line signature). close_idx bounds the
+/// self-param scan to the signature, never the body (EPH-I0388).
+const FnSigScan = struct {
+    ret: []const u8,
+    close_idx: usize,
+};
+
+/// Walk one continuation line for the paren that closes the signature's
+/// parameter list (depth carries across lines). Returns its offset or
+/// null when the line does not close it.
+fn closerInLine(masked: []const u8, depth: *usize) ?usize {
+    for (masked, 0..) |c, offset| {
+        if (c == '(') {
+            depth.* += 1;
+            continue;
+        }
+        if (c != ')') continue;
+        depth.* -= 1;
+        if (depth.* == 0) return offset;
+    }
+    return null;
+}
+
+/// Return-type text for an Allman-style closer line (`)` alone): the
+/// first following line up to its `{`. Hand-formatted code only; zig fmt
+/// always emits `) T {` on one line (EPH-I0388).
+fn allmanReturnType(
+    lines: []const []const u8,
+    from: usize,
+    stop: usize,
+    buf: []u8,
+) ?[]const u8 {
+    var j = from;
+    while (j < stop) : (j += 1) {
+        const raw2 = lines[j];
+        const ce2 = findCommentStart(raw2) orelse raw2.len;
+        const masked2 = blankLiteralContents(raw2[0..ce2], buf);
+        const brace = mem.indexOfScalar(u8, masked2, '{') orelse continue;
+        const ret_text = mem.trim(u8, raw2[0..brace], " \t\r");
+        if (ret_text.len == 0) return null;
+        return ret_text;
+    }
+    return null;
+}
+
+/// Bundle for registerFnSignature (keeps the param count legal): the
+/// allocator plus the line array and index for the multi-line signature
+/// lookahead (EPH-I0388).
+const FnSigCtx = struct {
+    a: Allocator,
+    lines: []const []const u8,
+    idx: usize,
+};
+
+/// Extract the return-type text of the signature on lines[idx], following
+/// continuation lines when zig fmt wrapped the signature (the closing `)`
+/// and the return type then live on a later line).
+fn scanFnSignatureRet(
+    t: []const u8,
+    lines: []const []const u8,
+    idx: usize,
+) ?FnSigScan {
+    const fn_pos = realTokenPos(t, "fn") orelse return null;
+    const open_paren = findTagInCode(t, "(", fn_pos) orelse return null;
+    var depth: usize = 0;
+    for (t[open_paren..], 0..) |c, offset| {
+        if (c == '(') {
+            depth += 1;
+            continue;
+        }
+        if (c != ')') continue;
+        depth -= 1;
+        if (depth == 0) {
+            const ret = returnTypeAfter(t[open_paren + offset + 1 ..]) orelse return null;
+            return .{ .ret = ret, .close_idx = idx };
+        }
+    }
+    // Multi-line: the closer sits on a continuation line.
+    return scanContinuationRet(lines, idx, &depth);
+}
+
+/// Continuation phase of the signature scan: lines after the fn line
+/// carry the closer when zig fmt wrapped the signature. Comment and
+/// string contents never count parens; a `;` before the closer aborts
+/// (the text is not a wrapped-signature continuation, so the line class
+/// keeps its no-registration behavior). Returns null when the window is
+/// exhausted without a closer.
+fn scanContinuationRet(
+    lines: []const []const u8,
+    idx: usize,
+    depth: *usize,
+) ?FnSigScan {
+    var blank_buf: [16 * 1024]u8 = undefined;
+    const stop = @min(lines.len, idx + 1 + max_sig_lookahead);
+    var li = idx + 1;
+    while (li < stop) : (li += 1) {
+        const raw = lines[li];
+        const code_end = findCommentStart(raw) orelse raw.len;
+        const masked = blankLiteralContents(raw[0..code_end], &blank_buf);
+        if (closerInLine(masked, depth)) |offset| {
+            // The closer line may carry the return type (`) !void {`) or
+            // stand alone (Allman style: the type is on a later line).
+            const rest = mem.trimStart(u8, raw[offset + 1 ..], " \t\r");
+            const ret = if (rest.len == 0)
+                allmanReturnType(lines, li + 1, stop, &blank_buf)
+            else
+                returnTypeAfter(rest);
+            const rr = ret orelse return null;
+            return .{ .ret = rr, .close_idx = li };
+        }
+        if (mem.indexOfScalar(u8, masked, ';') != null) return null;
+    }
+    return null;
+}
+
+/// Self-parameter type name for a multi-line signature whose `self:`
+/// param sits on a continuation line at or before the closer (zig fmt
+/// wraps the param list). The returned slice points into `lines` and
+/// dies with the content; the call site uses only its nullity (EPH-I0388).
+fn selfTypeInContinuation(
+    lines: []const []const u8,
+    idx: usize,
+    close_idx: usize,
+) ?[]const u8 {
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var li = idx + 1;
+    while (li <= close_idx and li < lines.len) : (li += 1) {
+        const raw = lines[li];
+        const code_end = findCommentStart(raw) orelse raw.len;
+        const masked = blankLiteralContents(raw[0..code_end], &blank_buf);
+        var pos: usize = 0;
+        while (pos < masked.len and (masked[pos] == ' ' or masked[pos] == '\t')) pos += 1;
+        if (pos + 4 > masked.len) continue;
+        if (!mem.eql(u8, masked[pos .. pos + 4], "self")) continue;
+        if (pos + 4 < masked.len and masked[pos + 4] != ':' and masked[pos + 4] != ' ') continue;
+        const colon = mem.indexOfScalarPos(u8, masked, pos + 4, ':') orelse continue;
+        if (extractSelfTypeFromText(mem.trim(u8, raw[colon + 1 ..], " \t"))) |st| return st;
+    }
+    return null;
+}
+
+/// Bundle for registerMethod (keeps the param count legal).
+const RegisterMethodCtx = struct {
+    a: Allocator,
+    ctx: *TypeContext,
+};
+
+/// Register one signature as a method of `type_name` (self param seen).
+fn registerMethod(
+    rctx: RegisterMethodCtx,
+    type_name: []const u8,
+    fn_name: []const u8,
+    rk: ReturnKind,
+) !void {
+    const gop = try rctx.ctx.struct_methods.getOrPut(rctx.a, type_name);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.put(rctx.a, fn_name, rk);
+}
+
 /// Parse a function/method signature line into ctx returns tables.
 /// Returns true when the line was consumed (matches the fn guard).
+/// Wrapped signatures join forward, so their return kinds and self types
+/// register (band-B04 F2, EPH-I0388).
 fn registerFnSignature(
-    a: Allocator,
+    sctx: FnSigCtx,
     t: []const u8,
     current_type: ?[]const u8,
     ctx: *TypeContext,
@@ -14252,20 +14492,20 @@ fn registerFnSignature(
     // `my_fn (x)` are not function signatures (EPH-I0949 residual class,
     // EPH-I0975).
     if (!isFuncBoundary(t)) return false;
-    const ret_text = extractFnReturnType(t) orelse return true;
-    const rk = classifyReturnType(ret_text);
+    const sig = scanFnSignatureRet(t, sctx.lines, sctx.idx) orelse return true;
+    const rk = classifyReturnType(sig.ret);
     const fn_name = extractFnName(t) orelse return true;
     if (current_type) |type_name| {
-        if (extractSelfTypeName(t) != null) {
-            // Register as type method
-            const gop = try ctx.struct_methods.getOrPut(a, type_name);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.put(a, fn_name, rk);
+        if (extractSelfTypeName(t) != null or
+            selfTypeInContinuation(sctx.lines, sctx.idx, sig.close_idx) != null)
+        {
+            const rctx: RegisterMethodCtx = .{ .a = sctx.a, .ctx = ctx };
+            try registerMethod(rctx, type_name, fn_name, rk);
             return true;
         }
     }
     // Top-level function
-    try ctx.function_returns.put(a, fn_name, rk);
+    try ctx.function_returns.put(sctx.a, fn_name, rk);
     return true;
 }
 
@@ -14298,6 +14538,10 @@ fn registerVarDecl(
 
 fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
     var ctx = TypeContext.init();
+    // The map set has no self-owning defer: a put failure after earlier
+    // successful puts would drop the entries' storage (OOM-path leak,
+    // band-B04 F7, EPH-I0393).
+    errdefer ctx.deinit(a);
 
     const pats: InitPatterns = .{
         .container_inits = compat.getStdlibContainerInitPatterns(),
@@ -14311,8 +14555,16 @@ fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
     var type_brace_depth: usize = 0;
     var brace_depth: usize = 0;
 
-    var lines = mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
+    // Collect lines once: registerFnSignature's multi-line lookahead
+    // needs indexed access to the continuation lines (EPH-I0388).
+    var all_lines = std.ArrayListUnmanaged([]const u8).empty;
+    defer all_lines.deinit(a);
+    var line_iter = mem.splitScalar(u8, content, '\n');
+    while (line_iter.next()) |line| {
+        try all_lines.append(a, line);
+    }
+
+    for (all_lines.items, 0..) |line, i| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
 
@@ -14323,24 +14575,8 @@ fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
         // Exit type scope when braces close
         if (current_type != null and brace_depth < type_brace_depth) current_type = null;
 
-        if (try registerFnSignature(a, t, current_type, &ctx)) continue;
-        try registerVarDecl(a, t, pats, &ctx);
-    }
-    return ctx;
-}
-
-/// Line-based variant for function-scoped analysis (memory path).
-fn parseFileTypeContextFromLines(a: Allocator, lines: []const []const u8) !TypeContext {
-    var ctx = TypeContext.init();
-
-    const pats: InitPatterns = .{
-        .container_inits = compat.getStdlibContainerInitPatterns(),
-        .allocator_inits = compat.getAllInitPatterns(),
-    };
-
-    for (lines) |line| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
+        const sig_ctx: FnSigCtx = .{ .a = a, .lines = all_lines.items, .idx = i };
+        if (try registerFnSignature(sig_ctx, t, current_type, &ctx)) continue;
         try registerVarDecl(a, t, pats, &ctx);
     }
     return ctx;
@@ -14389,15 +14625,6 @@ fn isMethodOnStdlibVar(
         if (vars.contains(target)) return true;
     }
     return false;
-}
-
-/// Check if line uses .allocator().{alloc_method}() chain from a tracked no-free source.
-/// Detects patterns like: fba_var.allocator().alloc(...), arena_var.allocator().create(...)
-fn isNoFreeCallChain(
-    t: []const u8,
-    no_free_names: *const std.StringHashMapUnmanaged(void),
-) bool {
-    return isNoFreeCallChainFull(t, no_free_names, null);
 }
 
 /// Check if allocation is through a no-free allocator call chain:
@@ -14457,9 +14684,8 @@ fn noFreeChainAt(
             if (fields.contains(source)) return true;
         }
 
-        // Name-based heuristic: if the immediate source before the
-        // accessor is named "arena" (or contains "arena"), treat as
-        // no-free (cross-file support).
+        // Name-based heuristic: the immediate source before the accessor
+        // is named exactly "arena" (ADR-0007) — cross-file support.
         if (isArenaName(source)) return true;
     }
 
@@ -14924,10 +15150,6 @@ fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize
 
 // ============================================================================
 // Analysis Functions
-// ============================================================================
-
-// ============================================================================
-// Memory Analysis Helpers
 // ============================================================================
 
 /// Detect if allocation is returned (factory pattern)
@@ -42613,8 +42835,10 @@ test "ZA1xx: no-free collectors stay byte-balanced on put failure (EPH-I1007)" {
     const path = "sweep_collectors.zig";
     // The fixture drives >= 2 puts into each no-free collector map: the
     // arena-typed struct fields (collectNoFreeFieldNames, file-level scan),
-    // the arena-named Allocator params (collectNoFreeAllocatorNames
-    // signature scan), and the init + alias chain (collectAllAllocatorNames).
+    // the type-init and alias chain (collectNoFreeAllocatorNames — two
+    // stdlib inits; the arena0-named params no longer drive the signature
+    // arm since the arena name matches exactly, ADR-0007/EPH-I0387), and
+    // the init + Allocator-param chain (collectAllAllocatorNames).
     // A map whose put fails after earlier puts held storage dropped that
     // storage pre-fix; byte balance at every fail index is the leak proof
     // (EPH-I1007).
@@ -42636,6 +42860,7 @@ test "ZA1xx: no-free collectors stay byte-balanced on put failure (EPH-I1007)" {
         \\
         \\fn sweep(arena0: std.mem.Allocator, arena1: std.mem.Allocator, arena2: std.mem.Allocator, arena3: std.mem.Allocator, arena4: std.mem.Allocator, arena5: std.mem.Allocator, arena6: std.mem.Allocator, arena7: std.mem.Allocator, arena8: std.mem.Allocator, arena9: std.mem.Allocator, arena10: std.mem.Allocator, arena11: std.mem.Allocator) !void {
         \\    const a = std.heap.ArenaAllocator.init(arena0);
+        \\    const a2 = std.heap.FixedBufferAllocator.init(arena1);
         \\    const b1 = arena0.allocator();
         \\    const b2 = b1.allocator();
         \\    const b3 = b2.allocator();
@@ -42650,6 +42875,7 @@ test "ZA1xx: no-free collectors stay byte-balanced on put failure (EPH-I1007)" {
         \\    const buf = try arena0.alloc(u8, 64);
         \\    arena0.free(buf);
         \\    _ = a;
+        \\    _ = a2;
         \\    _ = b11;
         \\}
     ;
@@ -50419,6 +50645,61 @@ test "ZA103: real store after a string mention still transfers (EPH-I0369 lock)"
         "test_real_after_string.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
+}
+
+test "ZA103: comment mentioning .ptr does not transfer (EPH-I0389)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B04 F3: `.ptr` inside comment prose faked an ownership
+    // transfer for the raw scan; the try after it is a real gap, so the
+    // warning must fire.
+    const content =
+        \\fn comment_ptr(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    // move buf.ptr into result
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_comment_ptr.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_comment_ptr.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA101: arena_count-style name is not arena-suppressed (EPH-I0387)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // ADR-0007 lock: the arena name arm matches "arena" exactly. The
+    // substring form put arena_count into the no-free set, so the alloc
+    // through it drew no warning.
+    const content =
+        \\fn count_it(allocator: std.mem.Allocator) !void {
+        \\    const arena_count = allocator;
+        \\    const p = try arena_count.alloc(u8, 16);
+        \\    _ = p;
+        \\    try ping();
+        \\}
+        \\fn ping() !void {}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arena_count.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_arena_count.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
 }
 
 test "ZA101: guard-style embedded return transfers ownership (EPH-I0273)" {
@@ -69558,11 +69839,145 @@ test "extractFnReturnType masks fn ( inside strings (EPH-I0975)" {
 test "registerFnSignature guard masks fn ( in strings (EPH-I0975)" {
     var ctx = TypeContext.init();
     defer ctx.deinit(std.testing.allocator);
+    const sctx = FnSigCtx{ .a = std.testing.allocator, .lines = &.{}, .idx = 0 };
     // A string carrying `fn (` is not a signature: the guard rejects it
     // before any registration.
-    try std.testing.expect(!try registerFnSignature(std.testing.allocator, "const pat = \"fn (\";", null, &ctx));
+    const pat_line = "const pat = \"fn (\";";
+    try std.testing.expect(!try registerFnSignature(sctx, pat_line, null, &ctx));
     // The real signature still registers.
-    try std.testing.expect(try registerFnSignature(std.testing.allocator, "fn g() void {", null, &ctx));
+    try std.testing.expect(try registerFnSignature(sctx, "fn g() void {", null, &ctx));
+}
+
+test "registerFnSignature resolves zig-fmt-wrapped signatures (EPH-I0388)" {
+    var ctx = TypeContext.init();
+    defer ctx.deinit(std.testing.allocator);
+
+    // band-B04 F2: the return type sat on a continuation line, so the
+    // wrapped method registered nothing and its ReturnKind stayed
+    // unknown. The continuation scan must register the method under the
+    // enclosing type (self on line 2) with the closer's return kind.
+    const lines = [_][]const u8{
+        "pub fn processSomething(",
+        "    self: *Foo,",
+        "    allocator: std.mem.Allocator,",
+        "    input: []const u8,",
+        ") !void {",
+        "    _ = input;",
+    };
+    const sctx = FnSigCtx{ .a = std.testing.allocator, .lines = &lines, .idx = 0 };
+    try std.testing.expect(try registerFnSignature(sctx, lines[0], "Foo", &ctx));
+    const methods = ctx.struct_methods.get("Foo");
+    try std.testing.expect(methods != null);
+    try std.testing.expectEqual(ReturnKind.error_union, methods.?.get("processSomething").?);
+
+    // Wrapped top-level fn with a fn-pointer param: nested parens on a
+    // continuation line must not close the scan early.
+    const lines2 = [_][]const u8{
+        "fn scan(",
+        "    comptime T: type,",
+        "    cb: fn(u8) void = null,",
+        ") void {",
+    };
+    const sctx2 = FnSigCtx{ .a = std.testing.allocator, .lines = &lines2, .idx = 0 };
+    try std.testing.expect(try registerFnSignature(sctx2, lines2[0], null, &ctx));
+    try std.testing.expectEqual(ReturnKind.void_type, ctx.function_returns.get("scan").?);
+
+    // Wrapped error-set return: `error{OutOfMemory}!T {` on the closer
+    // line must resolve as an error union, not .value (the error-set
+    // braces are balanced, never a body boundary).
+    const lines3 = [_][]const u8{
+        "fn edits(",
+        "    allocator: std.mem.Allocator,",
+        "    encoding: u32,",
+        ") error{OutOfMemory}!std.ArrayList(u8) {",
+        "    _ = encoding;",
+    };
+    const sctx3 = FnSigCtx{ .a = std.testing.allocator, .lines = &lines3, .idx = 0 };
+    try std.testing.expect(try registerFnSignature(sctx3, lines3[0], null, &ctx));
+    try std.testing.expectEqual(ReturnKind.error_union, ctx.function_returns.get("edits").?);
+}
+
+test "parseFileTypeContext registers wrapped method signatures (EPH-I0388)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\const Wrapped = struct {
+        \\    pub fn format(
+        \\        self: *Wrapped,
+        \\        buf: []u8,
+        \\    ) !void {
+        \\        _ = buf;
+        \\    }
+        \\};
+        \\fn helper(
+        \\    n: usize,
+        \\    s: []const u8,
+        \\    a: std.mem.Allocator,
+        \\    b: std.mem.Allocator,
+        \\    c: std.mem.Allocator,
+        \\    d: std.mem.Allocator,
+        \\    e: std.mem.Allocator,
+        \\    f: std.mem.Allocator,
+        \\    g: std.mem.Allocator,
+        \\    h: std.mem.Allocator,
+        \\) bool {
+        \\    _ = n;
+        \\    _ = s;
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = c;
+        \\    _ = d;
+        \\    _ = e;
+        \\    _ = f;
+        \\    _ = g;
+        \\    _ = h;
+        \\}
+    ;
+
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    const methods = ctx.struct_methods.get("Wrapped");
+    try std.testing.expect(methods != null);
+    try std.testing.expectEqual(ReturnKind.error_union, methods.?.get("format").?);
+    try std.testing.expectEqual(ReturnKind.value, ctx.function_returns.get("helper").?);
+}
+
+test "extractMethodTarget stops at the previous dot (EPH-I0394 pin)" {
+    // band-B04 F8: `self.list.clear(` resolves the receiver `list` —
+    // name-identity, not object-identity (disclosed residual). The pin
+    // locks the documented behavior so a field-aware change is deliberate.
+    const line = "self.list.clear(x);";
+    const dot = mem.indexOf(u8, line, ".clear(").?;
+    try std.testing.expectEqualStrings("list", extractMethodTarget(line, dot).?);
+    // A plain receiver resolves the same way.
+    const line2 = "list.clear(x);";
+    const dot2 = mem.indexOf(u8, line2, ".clear(").?;
+    try std.testing.expectEqualStrings("list", extractMethodTarget(line2, dot2).?);
+}
+
+test "isMethodOnStdlibVar matches receivers by name identity (EPH-I0394 pin)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var vars = std.StringHashMapUnmanaged(void){};
+    defer vars.deinit(a);
+    try vars.put(a, "list", {});
+
+    // A field receiver borrows the local's tracking: `list` in
+    // stdlib_vars covers `self.list.clear(` and `list.clear(` alike
+    // (name-identity, the disclosed F8 behavior).
+    const patterns = [_][]const u8{".clear("};
+    try std.testing.expect(isMethodOnStdlibVar("self.list.clear();", &vars, &patterns));
+    try std.testing.expect(isMethodOnStdlibVar("list.clear();", &vars, &patterns));
+    // No tracked receiver: the dot-pattern must not match.
+    try std.testing.expect(!isMethodOnStdlibVar("other.clear();", &vars, &patterns));
+    // Universal patterns (no leading dot) always apply.
+    const universal = [_][]const u8{"debug.print"};
+    try std.testing.expect(isMethodOnStdlibVar("debug.print(\"x\");", &vars, &universal));
 }
 
 test "extractFnName accepts quoted names (EPH-I0922)" {
@@ -70792,6 +71207,41 @@ test "buildNoFreeParamFunctions skips function definitions" {
 
     // "doStuff" should NOT be detected — it's a definition, not a call
     try std.testing.expect(!result.contains("doStuff"));
+}
+
+test "isArenaName is exact-match only (EPH-I0387, ADR-0007)" {
+    // The substring form matched arena_count/arenas/notarena and hid real
+    // leaks; ADR-0007 documents the exact-match scope and its FN budget.
+    try std.testing.expect(isArenaName("arena"));
+    try std.testing.expect(!isArenaName("arena_count"));
+    try std.testing.expect(!isArenaName("arenas"));
+    try std.testing.expect(!isArenaName("notarena"));
+    try std.testing.expect(!isArenaName("child_arena"));
+    try std.testing.expect(!isArenaName("arena_alloc"));
+}
+
+test "buildNoFreeParamFunctions ignores call-shaped comments and strings (EPH-I0391)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    const content =
+        \\var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        \\const alloc = arena.allocator();
+        \\// doStuff(alloc, 42);
+        \\const help = "maybe doStuff(alloc, 42);";
+        \\_ = help;
+        \\try realCall("a)", alloc);
+    ;
+    var result = try buildNoFreeParamFunctions(a, content);
+    defer result.deinit(a);
+
+    // Call-shaped prose registers nothing (band-B04 F5): the comment and
+    // string parens are masked before the scan.
+    try std.testing.expect(!result.contains("doStuff"));
+    // A real call whose string arg holds a paren still registers: the
+    // masked close-paren walk ends at the true `)`.
+    try std.testing.expect(result.contains("realCall"));
 }
 
 // ============================================================================

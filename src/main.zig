@@ -35940,17 +35940,15 @@ fn extractQuotedPath(line: []const u8, start: usize) ?[]const u8 {
     if (start >= line.len) return null;
     const end_quote = mem.indexOf(u8, line[start..], "\"") orelse return null;
     const path = line[start .. start + end_quote];
-    // Only return .zig files
+    // Only return .zig files. The stdlib import names are the bare
+    // "std"/"builtin" packages, which the suffix gate rejects. Any path
+    // that reaches here is a project file, whatever its name: the old
+    // startsWith("std")/"builtin" filters refused real entries named
+    // std.zig, stdext.zig, or builtin_extra.zig (B14-9).
     if (!mem.endsWith(u8, path, ".zig")) return null;
-    // Skip standard library imports
-    if (mem.startsWith(u8, path, "std")) return null;
-    if (mem.startsWith(u8, path, "builtin")) return null;
     return path;
 }
 
-/// Extract a joined path from a pathJoin(&.{ "seg1", "seg2", ... }) pattern.
-/// Returns the joined path (e.g. "seg1/seg2/file.zig") or null.
-/// Caller must free the returned slice.
 /// Find the brace-delimited inner content of a pathJoin(&.{ ... }) call.
 fn findPathJoinInner(line: []const u8, start: usize) ?[]const u8 {
     if (start >= line.len) return null;
@@ -35962,17 +35960,35 @@ fn findPathJoinInner(line: []const u8, start: usize) ?[]const u8 {
     return line[after_brace .. after_brace + close_brace];
 }
 
-const PathJoinResult = struct { count: usize, total_len: usize };
+/// Upper bound on pathJoin segments. Measured corpus ground truth
+/// (span-based count of pathJoin(&.{ in build.zig files across the
+/// community corpus): max 6 segments, zero calls above 6 — the
+/// 16-segment cap keeps a 2.67x margin. A join longer than this is
+/// pathological input, not a real build.zig (B14-13).
+const max_pathjoin_segments = 16;
+
+const PathJoinResult = struct {
+    count: usize,
+    total_len: usize,
+    /// True when the segment cap stopped the parse with quotes left.
+    /// The caller must not join a truncated path: the wrong path either
+    /// fails access() and the entry vanishes, or names a different
+    /// existing file and adds a wrong entry. The verbose channel exists
+    /// (cfg.verbose, used by recurseNestedBuildModule) but truncation
+    /// stays fail-closed null: a note does not stop the wrong entry,
+    /// the null does.
+    truncated: bool,
+};
 
 /// Parse quoted string segments from pathJoin inner content.
 fn parsePathJoinSegments(
     inner: []const u8,
-    segments: *[16][]const u8,
+    segments: *[max_pathjoin_segments][]const u8,
 ) PathJoinResult {
     var count: usize = 0;
     var total_len: usize = 0;
     var pos: usize = 0;
-    while (pos < inner.len and count < 16) {
+    while (pos < inner.len and count < max_pathjoin_segments) {
         const q1 = mem.indexOf(u8, inner[pos..], "\"") orelse break;
         const str_start = pos + q1 + 1;
         if (str_start >= inner.len) break;
@@ -35985,7 +36001,12 @@ fn parsePathJoinSegments(
         }
         pos = str_start + q2 + 1;
     }
-    return .{ .count = count, .total_len = total_len };
+    // Truncated only when the cap stopped the parse with a segment
+    // still ahead. A trailing comma after a complete parse leaves no
+    // quote in the remainder and is not truncation.
+    const truncated = count == max_pathjoin_segments and
+        mem.indexOfScalar(u8, inner[pos..], '"') != null;
+    return .{ .count = count, .total_len = total_len, .truncated = truncated };
 }
 
 /// Join path segments with '/' separator into an allocated string.
@@ -36019,12 +36040,15 @@ fn joinPathSegments(
 
 /// Extract a joined path from a pathJoin(&.{ "seg1", "seg2", ... }) pattern.
 /// Returns the joined path (e.g. "seg1/seg2/file.zig") or null.
-/// Caller must free the returned slice. OOM propagates (EPH-I0528).
+/// Caller must free the returned slice. OOM propagates (EPH-I0528). A
+/// pathJoin beyond max_pathjoin_segments yields null — fail-closed, the
+/// truncated join would name a wrong path (B14-13).
 fn extractPathJoin(allocator: Allocator, line: []const u8, start: usize) !?[]const u8 {
     const inner = findPathJoinInner(line, start) orelse return null;
-    var segments: [16][]const u8 = undefined;
+    var segments: [max_pathjoin_segments][]const u8 = undefined;
     const result = parsePathJoinSegments(inner, &segments);
     if (result.count == 0) return null;
+    if (result.truncated) return null;
     return joinPathSegments(allocator, segments[0..result.count], result.total_len);
 }
 
@@ -36111,9 +36135,10 @@ fn extractPathJoinEntries(ctx: EntryScanCtx, line: []const u8) !void {
     }
 }
 
-/// True when an import path ends in .zig. The std/builtin import filter
-/// lives in extractQuotedPath; the equality checks that lived here were
-/// unreachable — the suffix gate rejects both names first (EPH-I0527).
+/// True when an import path ends in .zig. The stdlib import names are
+/// the bare "std"/"builtin" packages, which this suffix gate rejects.
+/// No other filter exists: a project file named std.zig or
+/// builtin_extra.zig is a valid entry (EPH-I0527, B14-9).
 fn isValidZigImport(imp_path: []const u8) bool {
     return mem.endsWith(u8, imp_path, ".zig");
 }
@@ -36408,6 +36433,18 @@ const cli_threshold_flags = [_]CliThresholdFlag{
     .{ .prefix = "--max-line-length=", .field = .max_line_length, .key = "max_line_length" },
     .{ .prefix = "--max-file-bytes=", .field = .max_file_bytes, .key = "max_file_bytes" },
 };
+
+// B14-14: reportInvalidThreshold strips the trailing '=' with
+// prefix[0 .. prefix.len - 1]. A table entry with an empty or '='-less
+// prefix would underflow at runtime; a table mistake is a compile
+// error, never a panic.
+comptime {
+    for (cli_threshold_flags) |flag| {
+        if (flag.prefix.len == 0 or flag.prefix[flag.prefix.len - 1] != '=') {
+            @compileError("cli_threshold_flags prefix must end with '=': " ++ flag.prefix);
+        }
+    }
+}
 
 /// Parse threshold arguments (returns true if handled). Each matched flag
 /// locks its field in cfg.threshold_cli_mask so a later config-file load
@@ -36771,7 +36808,7 @@ fn printHelp() void {
         \\  --known-issues=<file> Filter out known true positives (file:line format)
         \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
         \\  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
-         \\  --version=<X.Y.Z>   For 'install'/'upgrade'/'init': pin a specific version
+        \\  --version=<X.Y.Z>   For 'install'/'upgrade'/'init': pin a specific version
         \\  --force             For 'upgrade': allow a downgrade below the
         \\                       binary's own version (refused by default)
         \\
@@ -37050,17 +37087,20 @@ fn detectKnownIssuesPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !?[
     return cfg.known_issues_path.?;
 }
 
-/// Check if an issue is in the known issues list
+/// True when the issue's file:line matches a loaded known-issue key.
+/// Keys are "file:line" lines; the line number is the last
+/// colon-separated field, so a file path containing ':' still parses
+/// (the line part must be a number). No fixed-size key buffer: a file
+/// path longer than 512 bytes used to fail bufPrint and silently never
+/// matched (B14-12). The linear scan is O(issues x keys); acceptable at
+/// current list sizes.
 fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
     if (cfg.known_issues.items.len == 0) return false;
 
-    // Build key in format "file:line"
-    var buf: [512]u8 = undefined;
-    const key = std.fmt.bufPrint(&buf, "{s}:{d}", .{ issue.file, issue.line }) catch return false;
-
-    // Linear search through known issues
     for (cfg.known_issues.items) |known| {
-        if (mem.eql(u8, known, key)) return true;
+        const sep = mem.lastIndexOfScalar(u8, known, ':') orelse continue;
+        const known_line = std.fmt.parseInt(usize, known[sep + 1 ..], 10) catch continue;
+        if (known_line == issue.line and mem.eql(u8, known[0..sep], issue.file)) return true;
     }
     return false;
 }
@@ -40175,6 +40215,127 @@ test "build.zig extraction propagates OOM, never absence (EPH-I0526)" {
         error.OutOfMemory,
         extractBuildZigEntriesFromPath(ctx),
     );
+}
+
+test "extractQuotedPath accepts stdlib-named project files (EPH-I0529)" {
+    // "std.zig" and "builtin_extra.zig" are relative file imports, not
+    // stdlib names (verified against the 0.16.0 compiler: @import("std")
+    // and @import("builtin") are the only package forms, and the .zig
+    // suffix gate rejects both). Pre-fix, startsWith("std")/"builtin"
+    // refused these entries; zls carries a real @import("std.zig").
+    try std.testing.expectEqualStrings(
+        "stdfoo.zig",
+        extractQuotedPath("@import(\"stdfoo.zig\")", 9).?,
+    );
+    try std.testing.expectEqualStrings(
+        "std.zig",
+        extractQuotedPath("b.path(\"std.zig\")", 8).?,
+    );
+    try std.testing.expectEqualStrings(
+        "builtin_extra.zig",
+        extractQuotedPath("b.path(\"builtin_extra.zig\")", 8).?,
+    );
+    // The bare stdlib package names stay rejected by the suffix gate.
+    try std.testing.expectEqual(@as(?[]const u8, null), extractQuotedPath("@import(\"std\")", 9));
+    try std.testing.expectEqual(@as(?[]const u8, null), extractQuotedPath("@import(\"builtin\")", 9));
+}
+
+test "pathJoin beyond the segment cap fails closed (EPH-I0533)" {
+    const allocator = std.testing.allocator;
+    // 17 segments: the parse stops at 16 ("p.zig") with "q" still
+    // ahead, so the join is truncated. The .zig suffix is deliberate:
+    // pre-fix, the 16 segments joined to ".../o/p.zig", which passes
+    // the join's .zig gate and returns a wrong path — either a silent
+    // miss or a wrong existing file. Fail-closed: null. The old a..q
+    // fixture never reached the join and passed on the broken code
+    // (OPS-I0198 masked-fixture class).
+    const line =
+        "pathJoin(&.{ \"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\"," ++
+        " \"i\", \"j\", \"k\", \"l\", \"m\", \"n\", \"o\", \"p.zig\", \"q\" })";
+    const start = mem.indexOfScalar(u8, line, '{').?;
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        try extractPathJoin(allocator, line, start),
+    );
+}
+
+test "pathJoin at the segment cap with a trailing comma is not truncated (EPH-I0533)" {
+    const allocator = std.testing.allocator;
+    const line =
+        "pathJoin(&.{ \"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\"," ++
+        " \"i\", \"j\", \"k\", \"l\", \"m\", \"n\", \"o\", \"p.zig\", })";
+    const start = mem.indexOfScalar(u8, line, '{').?;
+    const joined = (try extractPathJoin(allocator, line, start)).?;
+    defer allocator.free(joined);
+    // A trailing comma after a complete 16-segment parse leaves no quote
+    // in the remainder: not truncation, the join is complete.
+    try std.testing.expectEqualStrings("a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p.zig", joined);
+}
+
+test "isKnownIssue matches file paths beyond 512 bytes (EPH-I0532)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    // A path longer than the old 512-byte key buffer: bufPrint failed
+    // and isKnownIssue returned false — the finding always printed, the
+    // suppression never matched. The no-format compare has no key size.
+    const long_file = try allocator.alloc(u8, 600);
+    defer allocator.free(long_file);
+    @memset(long_file, 'a');
+    try cfg.known_issues.append(
+        allocator,
+        try std.fmt.allocPrint(allocator, "{s}:{d}", .{ long_file, 42 }),
+    );
+    const issue = Issue{
+        .file = long_file,
+        .line = 42,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA101",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(isKnownIssue(issue, &cfg));
+    const other_line = Issue{
+        .file = long_file,
+        .line = 43,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA101",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(!isKnownIssue(other_line, &cfg));
+    // A file path containing ':' still matches: the line number is the
+    // last colon-separated field.
+    const colon_file = "dir:part/main.zig";
+    try cfg.known_issues.append(
+        allocator,
+        try std.fmt.allocPrint(allocator, "{s}:{d}", .{ colon_file, 7 }),
+    );
+    const colon_issue = Issue{
+        .file = colon_file,
+        .line = 7,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA101",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(isKnownIssue(colon_issue, &cfg));
+    // A three-field entry ("file:line:rule") never matches — the line
+    // part does not parse as a number (EPH-I0158 behavior preserved).
+    try cfg.known_issues.append(allocator, try allocator.dupe(u8, "plain.zig:3:ZA101"));
+    const rule_issue = Issue{
+        .file = "plain.zig",
+        .line = 3,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA101",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(!isKnownIssue(rule_issue, &cfg));
 }
 
 test "isValidZigImport keeps the .zig gate (EPH-I0527)" {

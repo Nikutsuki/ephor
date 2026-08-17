@@ -16987,6 +16987,11 @@ const ErrRetFnScan = struct {
     /// The fn finishes only after its body brace opened — a multi-line
     /// signature sits at depth 0 for lines before the `{`.
     body_started: bool = false,
+    /// Paren depth while the signature is still open: the body brace is
+    /// the first `{` at depth 0. An inline `enum { a, b }` param balances
+    /// to net 0 braces and must not open (or finish) the body early
+    /// (EPH-I0479: the fixed signature join now reaches such fns).
+    sig_parens: usize = 0,
     has_error_path: bool = false,
     payload_count: usize = 0,
     payloads: [max_err_ret_payloads][]const u8 = undefined,
@@ -17208,6 +17213,7 @@ fn startErrRetFn(lines: []const []const u8, line_num: usize, scan: *ErrRetFnScan
     scan.fn_name = extractFnName(t) orelse "";
     scan.brace_depth = 0;
     scan.body_started = false;
+    scan.sig_parens = 0;
     scan.has_error_path = false;
     scan.payload_count = 0;
     scan.call_ident_count = 0;
@@ -17321,6 +17327,20 @@ fn isInterfaceShim(scan: *const ErrRetFnScan) bool {
         scan.non_discard_stmts <= max_shim_body_stmts;
 }
 
+/// Scan one literal-blanked signature line for the body brace: the first
+/// `{` at paren depth 0. An inline `enum { a, b }` param is balanced
+/// signature text — counting its braces without the paren gate opens the
+/// body early, and the net-0 line then finishes the fn mid-signature
+/// (EPH-I0479 exposed the shape via the fixed signature join).
+fn sigLineBodyStart(blanked: []const u8, sig_parens: *usize) bool {
+    for (blanked) |c| {
+        if (c == '(') sig_parens.* += 1;
+        if (c == ')' and sig_parens.* > 0) sig_parens.* -= 1;
+        if (c == '{' and sig_parens.* == 0) return true;
+    }
+    return false;
+}
+
 /// Emit ZA209 when the finished fn never exhibited an error path.
 fn finishErrRetFn(
     a: Allocator,
@@ -17350,6 +17370,16 @@ fn finishErrRetFn(
         .help = "drop the '!' so callers stop writing try/catch " ++
             "for an impossible error",
     });
+}
+
+/// Apply one literal-blanked chunk to the ZA209 fn-scan state: shim
+/// evidence, the paren-aware body brace, and the brace depth.
+fn scanBlankedChunk(scan: *ErrRetFnScan, blanked: []const u8) void {
+    if (!scan.has_error_path) feedShimLine(scan, blanked);
+    if (!scan.body_started) {
+        scan.body_started = sigLineBodyStart(blanked, &scan.sig_parens);
+    }
+    scan.brace_depth = braceDelta(scan.brace_depth, blanked);
 }
 
 /// Walk a file's lines and flag error-union fns with no error path.
@@ -17385,11 +17415,7 @@ fn checkUselessErrorReturns(
         // blankLiteralContents fails open past 512 bytes, so a literal
         // brace on a long generated line would corrupt the fn-depth scan.
         var blank_iter = BlankChunkIter.init(line[0..code_end], &blank_buf);
-        while (blank_iter.next()) |blanked| {
-            if (!scan.has_error_path) feedShimLine(&scan, blanked);
-            if (mem.indexOfScalar(u8, blanked, '{') != null) scan.body_started = true;
-            scan.brace_depth = braceDelta(scan.brace_depth, blanked);
-        }
+        while (blank_iter.next()) |blanked| scanBlankedChunk(&scan, blanked);
         if (scan.body_started and scan.brace_depth == 0) {
             try finishErrRetFn(a, issues, path, &scan);
         }
@@ -24939,15 +24965,40 @@ const max_sig_join_lines = 16;
 const max_sig_bytes = 1024;
 const max_tracked_locals = 64;
 const max_defer_paths = 8;
+/// Copy-alias cap; overflow is FN-only — the extra alias never matches a
+/// defer path (same direction as the locals and defer-path caps).
+const max_alias_copies = 16;
+
+/// Scan one joined signature line for the body brace (true), the bodiless
+/// terminator (false), or neither (null). Paren depth carries across
+/// lines, so `.{}` defaults and fn-pointer params stay balanced.
+fn sigLineTerminates(t: []const u8, depth: *usize) ?bool {
+    var cls = LineClassifier.init(t);
+    for (0..t.len) |i| {
+        if (cls.isInsideString(i)) continue;
+        const c = t[i];
+        if (c == '{' and depth.* == 0) return true;
+        if (isDeferOpener(c)) depth.* += 1;
+        if (isDeferCloser(c) and depth.* > 0) depth.* -= 1;
+        if (c == ';' and depth.* == 0) return false;
+    }
+    return null;
+}
 
 /// Join a (possibly multi-line) fn signature from fl[0] until the body `{`.
 /// Returns null for bodiless declarations (`fn f() void;`) and over-long
-/// signatures — both have no body to analyze.
+/// signatures — both have no body to analyze. The body brace is the one at
+/// paren depth 0: a `.{}` param default and a `";"` string literal are
+/// parameter data, never the body or the terminator, so the join must not
+/// stop on them (EPH-I0479). Comment text is data too: `// {` on a
+/// signature line must not end the join early.
 fn joinFnSignature(fl: []const []const u8, buf: []u8) ?[]const u8 {
     var len: usize = 0;
     var idx: usize = 0;
+    var depth: usize = 0;
     while (idx < fl.len and idx < max_sig_join_lines) : (idx += 1) {
-        const t = mem.trim(u8, fl[idx], " \t\r");
+        const code_end = findCommentStart(fl[idx]) orelse fl[idx].len;
+        const t = mem.trim(u8, fl[idx][0..code_end], " \t\r");
         if (len + 1 + t.len > buf.len) return null;
         if (len > 0) {
             buf[len] = ' ';
@@ -24955,8 +25006,9 @@ fn joinFnSignature(fl: []const []const u8, buf: []u8) ?[]const u8 {
         }
         @memcpy(buf[len..][0..t.len], t);
         len += t.len;
-        if (mem.indexOfScalar(u8, t, '{') != null) return buf[0..len];
-        if (mem.indexOfScalar(u8, t, ';') != null) return null;
+        const terminates = sigLineTerminates(t, &depth) orelse continue;
+        if (terminates) return buf[0..len];
+        return null;
     }
     return null;
 }
@@ -24993,11 +25045,11 @@ fn managedContainerPayload(ret: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The path of a bare `return ident;` / `return ident.field;`, or null for
-/// any compound expression (call, init, literal, block).
-fn returnedLocalPath(t: []const u8) ?[]const u8 {
-    if (!mem.startsWith(u8, t, "return ")) return null;
-    var expr = mem.trim(u8, t["return ".len..], " \t\r");
+/// Parse `t[expr_from..]` as a bare return expression (`ident` or
+/// `ident.field`), or null for compound shapes (call, init, literal). The
+/// expression ends at the first `;` or whitespace.
+fn returnExprPath(t: []const u8, expr_from: usize) ?[]const u8 {
+    var expr = mem.trim(u8, t[expr_from..], " \t\r");
     if (expr.len == 0 or expr[0] == '.') return null;
     var stop: usize = 0;
     while (stop < expr.len and expr[stop] != ';' and
@@ -25013,6 +25065,26 @@ fn returnedLocalPath(t: []const u8) ?[]const u8 {
         var fend = end + 1;
         while (fend < expr.len and isIdent(expr[fend])) fend += 1;
         return expr[0..fend];
+    }
+    return null;
+}
+
+/// The path of a bare `return ident;` / `return ident.field;` inside `t`,
+/// or null for any compound expression (call, init, literal, block) and
+/// for lines with no return statement. Every `return ` token at a code
+/// position is a candidate: braceless one-liners (`if (c) return list;`)
+/// and same-line statements after a `;` are real returns, so the scan
+/// iterates all occurrences instead of requiring a line-leading return
+/// (EPH-I0478). String and comment text is data (the caller strips
+/// comments; literals are masked here).
+fn returnedLocalPath(t: []const u8) ?[]const u8 {
+    var cls = LineClassifier.init(t);
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, "return ")) |pos| {
+        from = pos + "return ".len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (returnExprPath(t, from)) |path| return path;
     }
     return null;
 }
@@ -25040,53 +25112,319 @@ fn trackLocalDecl(
     count.* += 1;
 }
 
-/// Receiver path (`ident` or `ident.field`) of a deferred `.deinit(` call,
-/// or null. errdefer is excluded: it runs only on the error path, never
-/// behind a successful value return. fn-wide collection deliberately
-/// over-approximates "armed": a defer on a path mutually exclusive with
-/// the return still fires — dual-lifetime code is suspicious either way.
-/// True when `t` contains a real `defer ` keyword. A match immediately
-/// preceded by `err` at a word boundary is `errdefer` — which never runs
-/// on the success path and must not arm ("errdefer " contains "defer "
-/// at offset 3, so a plain substring search misclassifies it).
+/// Carry state for a defer statement that spans lines (EPH-I0477): a
+/// `defer {` block body or a wrapped expression continues on the next
+/// line, and its `.deinit(` calls are still armed there.
+const DeferScanState = struct {
+    /// True when a defer statement from a previous line continues here.
+    active: bool = false,
+    /// Paren/brace/bracket depth of the continuing statement at line start.
+    depth: usize = 0,
+};
+
+/// Position of the next real `defer` keyword in `t` at or after `from`, or
+/// null. Real = code position with identifier boundaries on both sides:
+/// `errdefer` (offset-3 substring) and `mydefer` never arm — errdefer does
+/// not run on the success path, and `deferred` is a different word. The
+/// string mask rejects `"defer "` literal text (EPH-I0475).
+fn nextRealDeferPos(t: []const u8, cls: *LineClassifier, from: usize) ?usize {
+    var s: usize = from;
+    while (mem.indexOf(u8, t[s..], "defer")) |rel| {
+        const pos = s + rel;
+        s = pos + "defer".len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + "defer".len < t.len and isIdent(t[pos + "defer".len])) continue;
+        if (cls.isInsideString(pos)) continue;
+        return pos;
+    }
+    return null;
+}
+
+/// True when `t` contains a real `defer ` keyword (see nextRealDeferPos).
+/// errdefer never runs on the success path and must not arm.
 fn hasRealDeferKeyword(t: []const u8) bool {
+    var cls = LineClassifier.init(t);
+    return nextRealDeferPos(t, &cls, 0) != null;
+}
+
+/// Append one `.deinit(` receiver path (ident chain) to `paths`. Same
+/// leading/trailing-dot and `..` guards as v1; duplicate paths are skipped
+/// so a repeated deinit cannot starve the cap.
+fn collectDeinitPath(
+    t: []const u8,
+    call: usize,
+    paths: *[max_defer_paths][]const u8,
+    count: *usize,
+) void {
+    var start = call;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) start -= 1;
+    if (start == call) return;
+    const path = t[start..call];
+    if (path[0] == '.' or path[path.len - 1] == '.') return;
+    if (mem.indexOf(u8, path, "..") != null) return;
+    for (paths[0..count.*]) |p| {
+        if (mem.eql(u8, p, path)) return;
+    }
+    if (count.* >= max_defer_paths) return;
+    paths[count.*] = path;
+    count.* += 1;
+}
+
+/// Position right after a word-boundary `else` at or after `from` (skipping
+/// whitespace), or null. A defer if-block's `} else {` branch is still part
+/// of the defer statement, so the region scan continues past the close
+/// brace when an else follows (EPH-I0477).
+fn elseKeywordAfter(t: []const u8, from: usize) ?usize {
+    var i = from;
+    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+    if (i + 4 > t.len) return null;
+    if (!mem.eql(u8, t[i .. i + 4], "else")) return null;
+    if (i + 4 < t.len and isIdent(t[i + 4])) return null;
+    return i + 4;
+}
+
+/// True for a brace/bracket/paren opener byte.
+fn isDeferOpener(c: u8) bool {
+    return c == '(' or c == '[' or c == '{';
+}
+
+/// True for a brace/bracket/paren closer byte.
+fn isDeferCloser(c: u8) bool {
+    return c == ')' or c == ']' or c == '}';
+}
+
+/// True when a `.deinit(` call starts at `i` (code position).
+fn isDeinitCallAt(t: []const u8, i: usize) bool {
+    return i + 8 <= t.len and mem.eql(u8, t[i..][0..8], ".deinit(");
+}
+
+/// Apply a `}` byte to the defer-region state: returns the next scan
+/// position (past the close brace, or past a continuing `else` branch),
+/// or null when the defer statement ended at this byte.
+fn blockCloseStep(t: []const u8, i: usize, depth: *usize) ?usize {
+    if (depth.* == 0) return null;
+    depth.* -= 1;
+    if (depth.* > 0) return i + 1;
+    return elseKeywordAfter(t, i + 1);
+}
+
+/// Apply one code byte to the defer-region scan: returns the next scan
+/// position, or null when the defer statement terminated at this byte
+/// (the caller resumes after it). `.deinit(` receivers collect here.
+fn deferRegionStep(
+    t: []const u8,
+    i: usize,
+    depth: *usize,
+    s: *DeferRegionScan,
+) ?usize {
+    if (s.cls.isInsideString(i)) return i + 1;
+    const c = t[i];
+    if (isDeferOpener(c)) {
+        depth.* += 1;
+        return i + 1;
+    }
+    // `}` must precede the generic closer: it closes the region's block
+    // (blockCloseStep), while `)`/`]` only decrement depth.
+    if (c == '}') return blockCloseStep(t, i, depth);
+    if (isDeferCloser(c)) {
+        if (depth.* > 0) depth.* -= 1;
+        return i + 1;
+    }
+    if (c == ';' and depth.* == 0) return null;
+    if (c == '.' and isDeinitCallAt(t, i)) {
+        // The call's own `(` and `)` are scanned as ordinary bytes, so
+        // they balance each other: skipping the opener would drop the
+        // block depth at the close and end the region prematurely.
+        collectDeinitPath(t, i, s.paths, s.count);
+    }
+    return i + 1;
+}
+
+/// Line-scan state shared by the defer-region scanner.
+const DeferRegionScan = struct {
+    cls: LineClassifier,
+    paths: *[max_defer_paths][]const u8,
+    count: *usize,
+};
+
+/// Scan `t[from..]` as one defer statement's expression: collect every
+/// `.deinit(` receiver path, tracking paren/brace/bracket depth. The
+/// statement ends at a `;` at depth 0 (a later same-line statement is
+/// inline code, not deferred) or at the `}` that closes the block it
+/// opened (an `else` branch continues the statement). Returns the position
+/// after the terminator, or null when the statement runs past the line
+/// end — the caller then carries `depth` into the next line (EPH-I0477).
+fn scanDeferRegion(
+    t: []const u8,
+    from: usize,
+    depth: *usize,
+    s: *DeferRegionScan,
+) ?usize {
+    var i = from;
+    while (i < t.len) {
+        const next = deferRegionStep(t, i, depth, s) orelse return i + 1;
+        i = next;
+    }
+    return null;
+}
+
+/// Collect every defer-deinit receiver path on `t` into `paths`. Each
+/// `.deinit(` is collected only inside the defer statement that contains
+/// it: the scan starts at the defer keyword (never before it, so
+/// `a.deinit(); defer mu.unlock();` arms nothing) and iterates every
+/// occurrence on the line (`defer a.deinit(); defer b.deinit();` arms
+/// both — EPH-I0476). Statements that run past the line end stay armed
+/// through `state` (EPH-I0477).
+fn collectDeferDeinitPaths(
+    t: []const u8,
+    state: *DeferScanState,
+    paths: *[max_defer_paths][]const u8,
+    count: *usize,
+) void {
+    if (!state.active and !hasRealDeferKeyword(t)) return;
+    var s = DeferRegionScan{ .cls = LineClassifier.init(t), .paths = paths, .count = count };
+    var depth: usize = 0;
     var from: usize = 0;
-    while (mem.indexOfPos(u8, t, from, "defer ")) |pos| {
-        const is_errdefer = pos >= 3 and
-            mem.eql(u8, t[pos - 3 .. pos], "err") and
-            (pos == 3 or !isIdent(t[pos - 4]));
-        if (!is_errdefer) return true;
-        from = pos + 1;
+    if (state.active) {
+        // The statement began on an earlier line: the code prefix is its
+        // continuation until it terminates; new defer statements may
+        // follow on the same line after that.
+        state.active = false;
+        depth = state.depth;
+        const end = scanDeferRegion(t, 0, &depth, &s) orelse {
+            state.active = true;
+            state.depth = depth;
+            return;
+        };
+        from = end;
+    }
+    while (nextRealDeferPos(t, &s.cls, from)) |dpos| {
+        depth = 0;
+        const end = scanDeferRegion(t, dpos + "defer".len, &depth, &s) orelse {
+            state.active = true;
+            state.depth = depth;
+            return;
+        };
+        from = end;
+    }
+}
+
+/// A single-copy alias: `const out = list;` binds `out` to `list`'s defer
+/// paths, so `return out;` dangles when `defer list.deinit();` is armed
+/// (EPH-I0480). `decl_line` anchors the var-rebind sweep; const aliases
+/// cannot rebind.
+const LocalAlias = struct {
+    name: []const u8,
+    rhs: []const u8,
+    decl_line: usize = 0,
+    is_var: bool = false,
+};
+
+/// Record `const/var NAME = ident;` as a copy alias (bounded; overflow
+/// only narrows the alias set — never a false positive).
+fn collectCopyAlias(t: []const u8, line_idx: usize, scan: *MustReturnRefScan) void {
+    if (scan.alias_count >= max_alias_copies) return;
+    if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return;
+    const name = extractVarDeclName(t) orelse return;
+    const rhs = extractSimpleIdentRhs(t) orelse return;
+    if (mem.eql(u8, name, rhs)) return;
+    scan.aliases[scan.alias_count] = .{
+        .name = name,
+        .rhs = rhs,
+        .decl_line = line_idx,
+        .is_var = mem.startsWith(u8, t, "var "),
+    };
+    scan.alias_count += 1;
+}
+
+/// True when `name` is an assignment target somewhere in `t`: the word
+/// `name` followed by optional whitespace and a single `=` (not `==`,
+/// `<=`, `>=`, `!=`). String data never assigns; the caller strips
+/// comments. (The position-specific variant is isAssignmentTarget.)
+fn isRebindAssignment(t: []const u8, name: []const u8) bool {
+    var cls = LineClassifier.init(t);
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, t, from, name)) |pos| {
+        from = pos + name.len;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (from < t.len and isIdent(t[from])) continue;
+        if (cls.isInsideString(pos)) continue;
+        var j = from;
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+        if (j >= t.len or t[j] != '=') continue;
+        if (j + 1 < t.len and t[j + 1] == '=') continue;
+        return true;
     }
     return false;
 }
 
-fn deferDeinitPath(t: []const u8) ?[]const u8 {
-    if (!hasRealDeferKeyword(t)) return null;
-    const call = mem.indexOf(u8, t, ".deinit(") orelse return null;
-    if (isInsideString(t, call)) return null;
-    var start = call;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) start -= 1;
-    if (start == call) return null;
-    const path = t[start..call];
-    if (path[0] == '.' or path[path.len - 1] == '.') return null;
-    if (mem.indexOf(u8, path, "..") != null) return null;
-    return path;
+/// True when a `var` copy alias is reassigned after its declaration. const
+/// aliases cannot rebind (EPH-I0480).
+fn aliasRebound(fl: []const []const u8, al: LocalAlias) bool {
+    if (!al.is_var) return false;
+    for (fl[al.decl_line + 1 ..]) |line| {
+        const code_end = findCommentStart(line) orelse line.len;
+        if (isRebindAssignment(line[0..code_end], al.name)) return true;
+    }
+    return false;
+}
+
+/// Drop `var` copy aliases that are reassigned after their declaration: a
+/// rebound copy no longer aliases its original RHS, and matching it would
+/// fire on safe code. const aliases cannot rebind (EPH-I0480).
+fn dropReboundVarAliases(fl: []const []const u8, scan: *MustReturnRefScan) void {
+    var i: usize = 0;
+    while (i < scan.alias_count) {
+        if (aliasRebound(fl, scan.aliases[i])) {
+            scan.aliases[i] = scan.aliases[scan.alias_count - 1];
+            scan.alias_count -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The alias RHS for `name`, or null when `name` is not an alias.
+fn aliasRhsFor(name: []const u8, aliases: []const LocalAlias) ?[]const u8 {
+    for (aliases) |al| {
+        if (mem.eql(u8, al.name, name)) return al.rhs;
+    }
+    return null;
+}
+
+/// Resolve `head` through the copy-alias map to its root name. The walk
+/// is bounded by the map size; valid alias chains are acyclic (EPH-I0480).
+fn resolveAliasHead(head: []const u8, aliases: []const LocalAlias) []const u8 {
+    var cur = head;
+    var hops: usize = 0;
+    while (hops < aliases.len) : (hops += 1) {
+        const next = aliasRhsFor(cur, aliases) orelse break;
+        cur = next;
+    }
+    return cur;
 }
 
 /// True when some armed defer-deinit path matches the returned path: an
 /// exact path match, or a whole-owner return (`return w;`) while one of
 /// its fields (`w.list`) is armed — both copies alias the freed backing.
+/// Copy-alias heads resolve on both sides before the comparison, so
+/// `const out = list; ...; return out;` matches an armed `defer
+/// list.deinit();` (EPH-I0480).
 fn deferPathArmsReturn(
     paths: []const []const u8,
     ret_path: []const u8,
     head: []const u8,
+    aliases: []const LocalAlias,
 ) bool {
+    const ret_tail = ret_path[head.len..];
+    const ret_root = resolveAliasHead(head, aliases);
     for (paths) |p| {
-        if (mem.eql(u8, p, ret_path)) return true;
-        const whole_owner = mem.eql(u8, ret_path, head) and
-            mem.startsWith(u8, p, head) and p.len > head.len and p[head.len] == '.';
-        if (whole_owner) return true;
+        const p_head = mem.sliceTo(p, '.');
+        const p_root = resolveAliasHead(p_head, aliases);
+        const p_tail = p[p_head.len..];
+        if (mem.eql(u8, ret_root, p_root) and mem.eql(u8, ret_tail, p_tail)) return true;
+        if (ret_tail.len == 0 and p_tail.len > 0 and p_tail[0] == '.' and
+            mem.eql(u8, ret_root, p_root)) return true;
     }
     return false;
 }
@@ -25118,17 +25456,22 @@ fn emitMustReturnRef(
     });
 }
 
-/// Bounded fn-scan sets for ZA110 (locals + armed defer paths).
+/// Bounded fn-scan sets for ZA110 (locals, armed defer paths, aliases).
 const MustReturnRefScan = struct {
     locals: [max_tracked_locals][]const u8 = undefined,
     local_count: usize = 0,
     defer_paths: [max_defer_paths][]const u8 = undefined,
     defer_count: usize = 0,
+    aliases: [max_alias_copies]LocalAlias = undefined,
+    alias_count: usize = 0,
 };
 
-/// First pass: collect local declarations and armed defer-deinit paths.
+/// First pass: collect local declarations, copy aliases, and armed
+/// defer-deinit paths. Defer statements can span lines (defer blocks), so
+/// the scan carries statement state between lines (EPH-I0477).
 fn collectLocalsAndDefers(fl: []const []const u8, scan: *MustReturnRefScan) void {
-    for (fl) |line| {
+    var defer_state = DeferScanState{};
+    for (fl, 0..) |line, i| {
         // Analyze code only: trailing-comment text must never arm a defer
         // (`x(); // was: defer list.deinit();`) or declare a local — the
         // same findCommentStart discipline as ZA209's brace tracking.
@@ -25136,11 +25479,9 @@ fn collectLocalsAndDefers(fl: []const []const u8, scan: *MustReturnRefScan) void
         const t = mem.trim(u8, line[0..code_end], " \t\r");
         if (t.len == 0 or isCommentOrMultilineString(t)) continue;
         trackLocalDecl(t, &scan.locals, &scan.local_count);
+        collectCopyAlias(t, i, scan);
         if (scan.defer_count >= max_defer_paths) continue;
-        if (deferDeinitPath(t)) |p| {
-            scan.defer_paths[scan.defer_count] = p;
-            scan.defer_count += 1;
-        }
+        collectDeferDeinitPaths(t, &defer_state, &scan.defer_paths, &scan.defer_count);
     }
 }
 
@@ -25158,14 +25499,23 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
     var scan = MustReturnRefScan{};
     collectLocalsAndDefers(ctx.fl, &scan);
     if (scan.defer_count == 0) return;
+    dropReboundVarAliases(ctx.fl, &scan);
 
     for (ctx.fl, 0..) |line, i| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
+        // Same comment discipline as the collect pass: comment text must
+        // never read as a return statement (EPH-I0478).
+        const code_end = findCommentStart(line) orelse line.len;
+        const t = mem.trim(u8, line[0..code_end], " \t\r");
+        if (t.len == 0 or isCommentOrMultilineString(t)) continue;
         const path = returnedLocalPath(t) orelse continue;
         const head = mem.sliceTo(path, '.');
         if (!containsName(scan.locals[0..scan.local_count], head)) continue;
-        if (!deferPathArmsReturn(scan.defer_paths[0..scan.defer_count], path, head)) continue;
+        if (!deferPathArmsReturn(
+            scan.defer_paths[0..scan.defer_count],
+            path,
+            head,
+            scan.aliases[0..scan.alias_count],
+        )) continue;
         try emitMustReturnRef(ctx, line, i, path);
     }
 }
@@ -93548,6 +93898,382 @@ test "ZA110: multi-line signature with armed defer fires" {
     );
 }
 
+test "ZA110: hasRealDeferKeyword masks defer inside strings (EPH-I0475)" {
+    // A string literal containing `defer ` is text, never an armed defer —
+    // the F1 phantom-defer FP class (a string + a real `.deinit(` on the
+    // same line used to arm a defer that does not exist).
+    try std.testing.expect(!hasRealDeferKeyword("log.warn(\"defer missing\", .{});"));
+    try std.testing.expect(!hasRealDeferKeyword("const s = \"defer \";"));
+    try std.testing.expect(!hasRealDeferKeyword("errdefer list.deinit();"));
+    try std.testing.expect(!hasRealDeferKeyword("deferred.x();"));
+    try std.testing.expect(hasRealDeferKeyword("defer list.deinit();"));
+    try std.testing.expect(hasRealDeferKeyword("x(); defer list.deinit();"));
+}
+
+test "ZA110: defer scan takes every deinit after the keyword (EPH-I0476)" {
+    var paths: [max_defer_paths][]const u8 = undefined;
+    var count: usize = 0;
+    var state = DeferScanState{};
+    collectDeferDeinitPaths("defer a.deinit(); defer b.deinit();", &state, &paths, &count);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("a", paths[0]);
+    try std.testing.expectEqualStrings("b", paths[1]);
+}
+
+test "ZA110: deinit before the defer keyword never arms (EPH-I0476)" {
+    var paths: [max_defer_paths][]const u8 = undefined;
+    var count: usize = 0;
+    var state = DeferScanState{};
+    collectDeferDeinitPaths("a.deinit(); defer mu.unlock();", &state, &paths, &count);
+    try std.testing.expectEqual(@as(usize, 0), count);
+    collectDeferDeinitPaths("defer mu.unlock(); a.deinit();", &state, &paths, &count);
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "ZA110: deinit after the defer statement is inline, not armed (EPH-I0476)" {
+    var paths: [max_defer_paths][]const u8 = undefined;
+    var count: usize = 0;
+    var state = DeferScanState{};
+    collectDeferDeinitPaths("defer a.deinit(); b.deinit();", &state, &paths, &count);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqualStrings("a", paths[0]);
+}
+
+test "ZA110: multi-line defer blocks arm their body deinits (EPH-I0477)" {
+    var paths: [max_defer_paths][]const u8 = undefined;
+    var count: usize = 0;
+    var state = DeferScanState{};
+    collectDeferDeinitPaths("defer {", &state, &paths, &count);
+    try std.testing.expect(state.active);
+    try std.testing.expectEqual(@as(usize, 0), count);
+    collectDeferDeinitPaths("    list.deinit();", &state, &paths, &count);
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqualStrings("list", paths[0]);
+    collectDeferDeinitPaths("}", &state, &paths, &count);
+    try std.testing.expect(!state.active);
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "ZA110: defer if-block else branch is still the defer statement (EPH-I0477)" {
+    var paths: [max_defer_paths][]const u8 = undefined;
+    var count: usize = 0;
+    var state = DeferScanState{};
+    collectDeferDeinitPaths(
+        "defer if (c) { a.deinit(); } else { b.deinit(); }",
+        &state,
+        &paths,
+        &count,
+    );
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "ZA110: returnedLocalPath scans mid-line returns (EPH-I0478)" {
+    try std.testing.expectEqualStrings("list", returnedLocalPath("if (c) return list;").?);
+    try std.testing.expectEqualStrings("list", returnedLocalPath("else return list;").?);
+    try std.testing.expectEqualStrings("list", returnedLocalPath("x(); return list;").?);
+    try std.testing.expectEqualStrings(
+        "list",
+        returnedLocalPath("if (c) return make(a); return list;").?,
+    );
+    try std.testing.expect(returnedLocalPath("const s = \"if (c) return list;\";") == null);
+    try std.testing.expect(returnedLocalPath("return make(a);") == null);
+}
+
+test "ZA110: joinFnSignature skips braces in param defaults (EPH-I0479)" {
+    var buf: [max_sig_bytes]u8 = undefined;
+    const fl = [_][]const u8{
+        "fn makeList(a: std.mem.Allocator, opts: Opts = .{}) std.ArrayList(u8) {",
+    };
+    const sig = joinFnSignature(&fl, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("std.ArrayList(u8)", extractFnReturnType(sig).?);
+}
+
+test "ZA110: joinFnSignature masks semicolons in string defaults (EPH-I0479)" {
+    var buf: [max_sig_bytes]u8 = undefined;
+    const fl = [_][]const u8{
+        "fn makeList(s: []const u8 = \";\") std.ArrayList(u8) {",
+    };
+    const sig = joinFnSignature(&fl, &buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("std.ArrayList(u8)", extractFnReturnType(sig).?);
+}
+
+test "ZA110: deferPathArmsReturn resolves copy aliases (EPH-I0480)" {
+    const aliases = [_]LocalAlias{
+        .{ .name = "out", .rhs = "list" },
+        .{ .name = "b", .rhs = "out" },
+    };
+    try std.testing.expect(deferPathArmsReturn(&.{"list"}, "out", "out", &aliases));
+    try std.testing.expect(deferPathArmsReturn(&.{"out"}, "b", "b", &aliases));
+    try std.testing.expect(deferPathArmsReturn(&.{"out"}, "list", "list", &aliases));
+    try std.testing.expect(deferPathArmsReturn(&.{"out.list"}, "out", "out", &aliases));
+    try std.testing.expect(!deferPathArmsReturn(&.{"other"}, "out", "out", &aliases));
+}
+
+test "ZA110: string-literal defer text never arms a phantom defer (EPH-I0475)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `"defer missing"` is a string; `old.deinit()` is an inline call, not
+    // a defer. The old raw substring search armed `old` and fired on this
+    // safe code (the worst-class FP — F1).
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var old = std.ArrayList(u8).init(a);
+        \\    log.warn("defer missing", .{}); old.deinit();
+        \\    return old;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_strdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_strdefer.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: pre-keyword deinit does not arm the return (EPH-I0476)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `old.deinit()` runs inline before the unrelated defer; `old` is not
+    // armed, so the return is the safe ownership-transfer idiom.
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var old = std.ArrayList(u8).init(a);
+        \\    var mu = std.Thread.Mutex{};
+        \\    old.deinit(); defer mu.unlock();
+        \\    return old;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_predeinit.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_predeinit.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: every defer-deinit on a line arms (EPH-I0476)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The second same-line defer used to be lost (first-`.deinit(`-only).
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var one = std.ArrayList(u8).init(a);
+        \\    var two = std.ArrayList(u8).init(a);
+        \\    defer one.deinit(); defer two.deinit();
+        \\    return two;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_twodefers.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_twodefers.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: multi-line defer block arms (EPH-I0477)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The standard zig-fmt defer-block shape: `defer {` opens, the body
+    // line carries the deinit, `}` closes. Neither line alone co-fires
+    // the old defer-keyword + deinit predicates.
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer {
+        \\        list.clearRetainingCapacity();
+        \\        list.deinit();
+        \\    }
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_blockdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_blockdefer.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: braceless one-line returns fire (EPH-I0478)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `if (c) return list;` never starts with `return `, so the old
+    // line-leading scan missed both one-liners.
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator, c: bool) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    if (c) return list;
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_oneliner.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "za110_oneliner.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: comment return text never fires (EPH-I0478)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A mid-line return scan must keep the comment discipline: the
+    // comment text `return list;` is not a return statement.
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    list.clearRetainingCapacity(); // if (c) return list;
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_commentreturn.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_commentreturn.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: struct-default params keep the signature join (EPH-I0479)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The `.{}` default truncated the join inside the parens, so
+    // extractFnReturnType found no close paren and skipped the whole fn.
+    const content =
+        \\const std = @import("std");
+        \\const Opts = struct { cap: usize = 64 };
+        \\fn makeList(a: std.mem.Allocator, opts: Opts = .{}) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_optdefault.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_optdefault.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: const copy alias with armed original fires (EPH-I0480)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `out` copies the list header, so the returned copy shares the
+    // backing the armed defer frees at scope exit.
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    const out = list;
+        \\    defer list.deinit();
+        \\    return out;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_constalias.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_constalias.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: armed copy alias with bare original return fires (EPH-I0480)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The reverse shape: `c` copies `list`, the defer arms the copy, and
+    // the bare original is returned — the copy's deinit still frees the
+    // shared backing.
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    var c = list;
+        \\    defer c.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_varalias.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_varalias.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: rebound copy alias never fires (EPH-I0480)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `c = other;` breaks the single-copy link: the defer on `c` frees
+    // `other`'s backing, not `list`'s — firing here would be an FP.
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    var other = std.ArrayList(u8).init(a);
+        \\    var c = list;
+        \\    c = other;
+        \\    defer c.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_rebound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_rebound.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
 // ============================================================================
 // ZA209 Tests — useless-error-return (!T fn that never fails)
 // ============================================================================
@@ -93612,6 +94338,69 @@ test "ZA209: body with try is silent (real error path)" {
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "za209_try.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: inline-enum param keeps the try body in the fn scan (EPH-I0479)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The fixed signature join reaches fns with a brace inside the param
+    // list (an inline `enum { a, b }` type). The old body-start detection
+    // counted that balanced brace as the body, finished the fn at the
+    // enum line, and emitted a false never-fails note on a body full of
+    // trys. The body brace is the `{` at paren depth 0.
+    const content =
+        \\const std = @import("std");
+        \\fn renderOptField(
+        \\    p: *PrintAst,
+        \\    style: enum { always_render, hide_if_none },
+        \\) !void {
+        \\    try p.w.print("x", .{});
+        \\    try p.w.writeByte(',');
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_enumsig_try.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_enumsig_try.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: inline-enum param fn that never fails fires (EPH-I0479)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same signature shape, genuinely infallible body (non-shim: six
+    // computed statements): the note is the intended F5 consequence — the
+    // fn was skipped entirely before the join fix.
+    const content =
+        \\fn renderOptField(
+        \\    p: *PrintAst,
+        \\    style: enum { always_render, hide_if_none },
+        \\) !void {
+        \\    const a: u32 = p.len + 1;
+        \\    const b: u32 = a + 2;
+        \\    const c: u32 = b * 3;
+        \\    const d: u32 = c - 4;
+        \\    const e: u32 = d / 5;
+        \\    const f: u32 = e % 6;
+        \\    _ = f;
+        \\    _ = style;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_enumsig_note.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_enumsig_note.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

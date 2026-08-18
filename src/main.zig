@@ -14178,6 +14178,14 @@ fn classifyReturnType(ret: []const u8) ReturnKind {
     if (t.len == 0) return .unknown;
     if (mem.eql(u8, t, "void")) return .void_type;
     if (mem.eql(u8, t, "noreturn")) return .noreturn_type;
+    // A fn-pointer return (`fn () !void`): the `!` belongs to the
+    // pointee's return type, never to the outer fn. An error-union
+    // classification reports the never-fails note on the outer line (a
+    // fn pointer cannot fail) and swallows the inner fn's own note — the
+    // wrong-victim class (sig sync/once_cell.zig:194, EPH-I1042 join
+    // r1). The outer fn returns a value; the pointee's error union
+    // registers when the inner fn's own signature is scanned.
+    if (mem.startsWith(u8, t, "fn ") or mem.startsWith(u8, t, "fn(")) return .value;
     // Error union: starts with '!' or contains '!' before the type
     if (t[0] == '!') return .error_union;
     // "ErrorSet!T" or "anyerror!T" patterns
@@ -14277,7 +14285,9 @@ fn resolveStandaloneReturn(ctx: *const TypeContext, t: []const u8) ReturnKind {
 
 /// Extract return type text from a function signature line.
 /// Given a line like "pub fn foo(self: *T, x: u32) !void {", returns "!void".
-/// Returns null if no valid return type can be extracted.
+/// Returns null if no valid return type can be extracted. The end boundary
+/// is returnTypeAfter: error-set literal braces in the return type are
+/// balanced, never the boundary (EPH-I1042).
 fn extractFnReturnType(t: []const u8) ?[]const u8 {
     // Find the fn keyword to ensure we're looking at a function. The
     // probe is code-position-masked: a string like `const pat = "fn (";`
@@ -14303,13 +14313,13 @@ fn extractFnReturnType(t: []const u8) ?[]const u8 {
         }
     }
     const cp = close_paren orelse return null;
-    // Text between close paren and opening brace is the return type
-    const after_close = t[cp + 1 ..];
-    // Find the opening brace (or end of line for declarations without body)
-    const brace = mem.indexOfScalar(u8, after_close, '{') orelse after_close.len;
-    const ret_text = mem.trim(u8, after_close[0..brace], " \t\r");
-    if (ret_text.len == 0) return null;
-    return ret_text;
+    // Text between close paren and the body brace is the return type.
+    // Error-set literal braces (`error{OutOfMemory}`) are balanced, not a
+    // boundary: a first-`{` end would resolve a `error{...}!T {` joined
+    // signature as "error" (.value) and skip the fn. returnTypeAfter
+    // carries the error-set-aware walk shared with the register path
+    // (EPH-I0388, EPH-I1042).
+    return returnTypeAfter(t[cp + 1 ..]);
 }
 
 /// The self-parameter type name in `type_text` (the text after `self:`):
@@ -14459,14 +14469,29 @@ fn rhsInferTypeName(t: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The decl-keyword prefix length of a var/const declaration line:
+/// "var " = 4, "const " = 6, "pub var " = 8, "pub const " = 10, 0 for
+/// any other line. The F10 gate and the var_types registration share
+/// this accepted-form list: a pub-prefixed fn-pointer decl must fall
+/// through like the plain form (EPH-I1044).
+fn varDeclPrefixLen(t: []const u8) usize {
+    if (mem.startsWith(u8, t, "pub ")) {
+        if (mem.startsWith(u8, t[4..], "var ")) return 8;
+        if (mem.startsWith(u8, t[4..], "const ")) return 10;
+        return 0;
+    }
+    if (mem.startsWith(u8, t, "var ")) return 4;
+    if (mem.startsWith(u8, t, "const ")) return 6;
+    return 0;
+}
+
 /// Extract the type name from a variable declaration's right-hand side.
 /// Handles: `var x: TypeName = ...`, `var x = TypeName.init(...)`, `var x = TypeName{...}`
+/// The pub-prefixed decl forms register identically (EPH-I1044).
 fn extractVarTypeName(t: []const u8) ?[]const u8 {
-    const is_var = mem.startsWith(u8, t, "var ");
-    const is_const = mem.startsWith(u8, t, "const ");
-    if (!is_var and !is_const) return null;
+    const prefix_len = varDeclPrefixLen(t);
+    if (prefix_len == 0) return null;
 
-    const prefix_len: usize = if (is_var) 4 else 6;
     var name_end = prefix_len;
     while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
     if (name_end <= prefix_len) return null;
@@ -14705,16 +14730,19 @@ fn registerMethod(
 }
 
 /// True when `t` is a var/const declaration with a fn-pointer TYPE
-/// annotation (`const f: fn (u8) void = g;`): the line starts with
-/// `var `/`const `, and the first code-position `fn` token sits after a
+/// annotation (`const f: fn (u8) void = g;`): the line starts with a
+/// var/const decl keyword (`var `, `const `, `pub var `, `pub const `,
+/// varDeclPrefixLen), and the first code-position `fn` token sits after a
 /// code-position `:` and before any `=`. The fn-paren guard matches such
 /// lines too, but they are declarations, not signatures: consuming them
 /// skips registerVarDecl and the vars stay absent from var_types
 /// (band-B04 F10, EPH-I0395). A fn token after the `=` (an inline
 /// struct or labeled-block body) is not this shape and keeps the
-/// pre-existing behavior.
+/// pre-existing behavior. The pub-prefixed forms were missing from the
+/// decl gate, so `pub const f: fn (u8) void = g;` was consumed as a
+/// signature (EPH-I1044).
 fn isFnPointerTypedDecl(t: []const u8) bool {
-    if (!mem.startsWith(u8, t, "var ") and !mem.startsWith(u8, t, "const ")) return false;
+    if (varDeclPrefixLen(t) == 0) return false;
     const fn_pos = realTokenPos(t, "fn") orelse return false;
     const colon = findTagInCode(t, ":", 0) orelse return false;
     if (colon >= fn_pos) return false;
@@ -14757,17 +14785,44 @@ fn registerFnSignature(
     return true;
 }
 
+/// The declared name of a var/const decl line, starting at its decl
+/// keyword end (varDeclPrefixLen), or null when no identifier follows.
+/// Pub-prefixed decls need this pub-aware extraction: the shared
+/// extractVarDeclName keeps its var/const-only contract (EPH-I1044).
+fn extractVarDeclNameAfter(t: []const u8, prefix_len: usize) ?[]const u8 {
+    var name_end = prefix_len;
+    while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
+    if (name_end == prefix_len) return null;
+    return t[prefix_len..name_end];
+}
+
+/// True when the extracted type may write the var_types entry: the inert
+/// "fn" annotation must not erase an existing real type — a later
+/// fn-pointer-typed shadow degrades the method-call resolution of the
+/// real type to .unknown — while first-time registrations and real types
+/// always write (EPH-I1043).
+fn mayWriteVarType(type_name: []const u8, var_name: []const u8, ctx: *const TypeContext) bool {
+    if (!mem.eql(u8, type_name, "fn")) return true;
+    return !ctx.var_types.contains(var_name);
+}
+
 /// Parse a var/const declaration into ctx type tables (shared by the
-/// content-based and line-based TypeContext builders).
+/// content-based and line-based TypeContext builders). Pub-prefixed
+/// decls register identically (EPH-I1044).
 fn registerVarDecl(
     a: Allocator,
     t: []const u8,
     pats: InitPatterns,
     ctx: *TypeContext,
 ) !void {
-    if (!mem.startsWith(u8, t, "var ") and !mem.startsWith(u8, t, "const ")) return;
-    const var_name = extractVarDeclName(t) orelse return;
-    if (extractVarTypeName(t)) |type_name| try ctx.var_types.put(a, var_name, type_name);
+    const prefix_len = varDeclPrefixLen(t);
+    if (prefix_len == 0) return;
+    const var_name = extractVarDeclNameAfter(t, prefix_len) orelse return;
+    if (extractVarTypeName(t)) |type_name| {
+        if (mayWriteVarType(type_name, var_name, ctx)) {
+            try ctx.var_types.put(a, var_name, type_name);
+        }
+    }
     var matched = false;
     for (pats.container_inits) |init_pat| {
         if (mem.indexOf(u8, t, init_pat) == null) continue;
@@ -17529,10 +17584,18 @@ fn scanShimEvidence(blanked: []const u8, scan: *ErrRetFnScan) void {
 
 /// Feed one literal-blanked line into the shim scan. Signature lines only
 /// contribute text after the body's opening `{`; lines inside the body
-/// contribute in full.
+/// contribute in full. The body brace is paren-aware: an inline
+/// `enum { a, b }` param's brace is signature text, and feeding its member
+/// text into the shim buffer would merge it with the first body statement
+/// (EPH-I1047). The brace scan runs on a LOCAL paren-depth snapshot: the
+/// carried sig_parens advances only in sigLineBodyStart, so the depth
+/// counts each paren exactly once per line (EPH-I1047 r1 — a second
+/// advance skews signatures whose closer line ends in a net-zero paren
+/// segment, and the body brace is then never found).
 fn feedShimLine(scan: *ErrRetFnScan, blanked: []const u8) void {
     if (scan.body_started) return scanShimEvidence(blanked, scan);
-    const open = mem.indexOfScalar(u8, blanked, '{') orelse return;
+    var parens = scan.sig_parens;
+    const open = sigBodyBraceAt(blanked, &parens) orelse return;
     scanShimEvidence(blanked[open + 1 ..], scan);
 }
 
@@ -17548,18 +17611,26 @@ fn isInterfaceShim(scan: *const ErrRetFnScan) bool {
         scan.non_discard_stmts <= max_shim_body_stmts;
 }
 
-/// Scan one literal-blanked signature line for the body brace: the first
-/// `{` at paren depth 0. An inline `enum { a, b }` param is balanced
-/// signature text — counting its braces without the paren gate opens the
-/// body early, and the net-0 line then finishes the fn mid-signature
-/// (EPH-I0479 exposed the shape via the fixed signature join).
-fn sigLineBodyStart(blanked: []const u8, sig_parens: *usize) bool {
-    for (blanked) |c| {
+/// The body-opening brace index of a literal-blanked signature line: the
+/// first `{` at paren depth 0, or null. An inline `enum { a, b }` param is
+/// balanced signature text — counting its braces without the paren gate
+/// opens the body early, and the net-0 line then finishes the fn
+/// mid-signature (EPH-I0479 exposed the shape via the fixed signature
+/// join). The shared helper keeps feedShimLine and the body-start flag on
+/// the same brace (EPH-I1047).
+fn sigBodyBraceAt(blanked: []const u8, sig_parens: *usize) ?usize {
+    for (blanked, 0..) |c, i| {
         if (c == '(') sig_parens.* += 1;
         if (c == ')' and sig_parens.* > 0) sig_parens.* -= 1;
-        if (c == '{' and sig_parens.* == 0) return true;
+        if (c == '{' and sig_parens.* == 0) return i;
     }
-    return false;
+    return null;
+}
+
+/// Scan one literal-blanked signature line for the body brace: the first
+/// `{` at paren depth 0 (sigBodyBraceAt).
+fn sigLineBodyStart(blanked: []const u8, sig_parens: *usize) bool {
+    return sigBodyBraceAt(blanked, sig_parens) != null;
 }
 
 /// Emit ZA209 when the finished fn never exhibited an error path.
@@ -25184,7 +25255,13 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 // defer on the exact path: the `take()` idiom needs a visible field reset
 // to adjudicate (EPH-I0038, v2). The exact-path armed-defer subset is not
 // dual-owner: the defer frees the backing the by-value copy hands out, so
-// it fires (EPH-I0482).
+// it fires (EPH-I0482). The armed-whole/field-return reverse (`defer
+// w.deinit(); return w.list;`) stays silent: whether the whole-owner
+// deinit frees the returned field's backing is owner-dependent, the same
+// uncertainty that scopes the dual-owner direction (EPH-I1046). Copy
+// aliases drop when the alias or its RHS reassigns after the declaration;
+// the sweep is conservative — a conditional rebind also drops, FN-only
+// (EPH-I1048).
 
 const max_sig_join_lines = 16;
 const max_sig_bytes = 1024;
@@ -25198,13 +25275,17 @@ const max_alias_copies = 16;
 
 /// Scan one joined signature line for the body brace (true), the bodiless
 /// terminator (false), or neither (null). Paren depth carries across
-/// lines, so `.{}` defaults and fn-pointer params stay balanced.
+/// lines, so `.{}` defaults and fn-pointer params stay balanced. An
+/// error-set literal in the return type (`error{OutOfMemory}!T`) is
+/// balanced signature text, never the body opener — the same
+/// error-set-aware boundary the register path uses (EPH-I0388,
+/// EPH-I1042).
 fn sigLineTerminates(t: []const u8, depth: *usize) ?bool {
     var cls = LineClassifier.init(t);
     for (0..t.len) |i| {
         if (cls.isInsideString(i)) continue;
         const c = t[i];
-        if (c == '{' and depth.* == 0) return true;
+        if (c == '{' and depth.* == 0 and !isErrorSetOpen(t, i)) return true;
         if (isDeferOpener(c)) depth.* += 1;
         if (isDeferCloser(c) and depth.* > 0) depth.* -= 1;
         if (c == ';' and depth.* == 0) return false;
@@ -25598,20 +25679,28 @@ fn isRebindAssignment(t: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// True when a `var` copy alias is reassigned after its declaration. const
-/// aliases cannot rebind (EPH-I0480).
+/// True when a copy alias stops sharing its RHS backing: the alias name
+/// is reassigned after its declaration (var aliases only — const cannot
+/// rebind, EPH-I0480), or the RHS is reassigned after the declaration. An
+/// RHS rebind (`const out = list; list = other;`) breaks the single-copy
+/// link the same way: the armed defer then frees the new backing, not the
+/// alias's (EPH-I1048). The sweep is conservative: ANY later assignment
+/// (conditional rebinds, inner-scope shadows) drops the alias, an FN-only
+/// direction consistent with the EPH-I0836 precedent.
 fn aliasRebound(fl: []const []const u8, al: LocalAlias) bool {
-    if (!al.is_var) return false;
     for (fl[al.decl_line + 1 ..]) |line| {
         const code_end = findCommentStart(line) orelse line.len;
-        if (isRebindAssignment(line[0..code_end], al.name)) return true;
+        const code = line[0..code_end];
+        if (al.is_var and isRebindAssignment(code, al.name)) return true;
+        if (isRebindAssignment(code, al.rhs)) return true;
     }
     return false;
 }
 
-/// Drop `var` copy aliases that are reassigned after their declaration: a
-/// rebound copy no longer aliases its original RHS, and matching it would
-/// fire on safe code. const aliases cannot rebind (EPH-I0480).
+/// Drop copy aliases that stop aliasing their original RHS after their
+/// declaration (the alias or its RHS rebind), or matching them would
+/// fire on safe code. const aliases cannot rebind; the RHS-rebind sweep
+/// covers both forms (EPH-I1048).
 fn dropReboundVarAliases(fl: []const []const u8, scan: *MustReturnRefScan) void {
     var i: usize = 0;
     while (i < scan.alias_count) {
@@ -25649,7 +25738,10 @@ fn resolveAliasHead(head: []const u8, aliases: []const LocalAlias) []const u8 {
 /// its fields (`w.list`) is armed — both copies alias the freed backing.
 /// Copy-alias heads resolve on both sides before the comparison, so
 /// `const out = list; ...; return out;` matches an armed `defer
-/// list.deinit();` (EPH-I0480).
+/// list.deinit();` (EPH-I0480). The reverse — an armed whole owner with a
+/// field return (`defer w.deinit(); return w.list;`) — stays silent:
+/// whether the whole-owner deinit frees the field's backing is
+/// owner-dependent (EPH-I1046).
 fn deferPathArmsReturn(
     paths: []const []const u8,
     ret_path: []const u8,
@@ -72201,6 +72293,10 @@ test "classifyReturnType identifies values" {
     try std.testing.expectEqual(ReturnKind.value, classifyReturnType("u32"));
     try std.testing.expectEqual(ReturnKind.value, classifyReturnType("Response"));
     try std.testing.expectEqual(ReturnKind.value, classifyReturnType("bool"));
+    // A fn-pointer return: the `!` belongs to the pointee, so the outer
+    // fn is a value return, never an error union (EPH-I1042 r1
+    // wrong-victim class).
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("fn () error{}!u64"));
 }
 
 test "classifyReturnType returns unknown for empty" {
@@ -72354,6 +72450,57 @@ test "parseFileTypeContext registers fn-pointer-typed vars (EPH-I0395)" {
     // annotation), and the line never reaches the signature tables.
     try std.testing.expect(ctx.var_types.get("f") != null);
     try std.testing.expectEqual(ReturnKind.void_type, ctx.function_returns.get("g").?);
+    try std.testing.expect(ctx.function_returns.get("f") == null);
+}
+
+test "parseFileTypeContext: fn-pointer shadow does not erase a real var type (EPH-I1043)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    // A later fn-pointer-typed shadow (`const w: fn (u8) void = ...`)
+    // used to overwrite the earlier real type with the inert "fn": the
+    // method-call resolution for the real type degraded to .unknown. The
+    // shadow must not erase an existing var_types entry (EPH-I1043).
+    const content =
+        \\const W = struct {
+        \\    fn call(self: *W) void {}
+        \\};
+        \\const w = W{};
+        \\fn f() void {
+        \\    const w: fn (u8) void = W.call;
+        \\    _ = w.call();
+        \\}
+        \\
+    ;
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    try std.testing.expectEqualStrings("W", ctx.var_types.get("w").?);
+    try std.testing.expectEqual(
+        ReturnKind.void_type,
+        resolveReturnKind(&ctx, "_ = w.call()"),
+    );
+}
+
+test "parseFileTypeContext registers pub-prefixed fn-pointer vars (EPH-I1044)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    // `pub const f: fn (u8) void = g;` did not match the var/const-only
+    // decl guards: the F10 gate never fired, the line was consumed as a
+    // signature, and the var stayed absent from var_types. The
+    // pub-prefixed form must fall through like the plain form (EPH-I1044).
+    const content =
+        \\pub const f: fn (u8) void = g;
+        \\fn g(x: u8) void { _ = x; }
+        \\
+    ;
+    var ctx = try parseFileTypeContext(a, content);
+    defer ctx.deinit(a);
+
+    try std.testing.expect(ctx.var_types.get("f") != null);
     try std.testing.expect(ctx.function_returns.get("f") == null);
 }
 
@@ -95906,6 +96053,36 @@ test "ZA110: self whole-owner return under an armed field stays silent (EPH-I048
     );
 }
 
+test "ZA110: armed whole-owner defer with field return stays silent (EPH-I1046)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B11 F7: deferPathArmsReturn fires the whole-owner branch only
+    // for the return-whole/armed-field direction. The reverse — an armed
+    // whole owner with a field return — stays silent: whether w.deinit()
+    // frees the returned field's backing is owner-dependent, the same
+    // uncertainty that scopes the dual-owner direction (EPH-I0038). Pins
+    // the silence so a scope change must update this test and the header.
+    const content =
+        \\const std = @import("std");
+        \\const W = struct { list: std.ArrayList(u8) };
+        \\fn take(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var w: W = .{ .list = std.ArrayList(u8).init(a) };
+        \\    defer w.deinit();
+        \\    return w.list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_armedwhole.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_armedwhole.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
 test "ZA110: slice pointee return with armed defer stays silent (EPH-I0485)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -96294,6 +96471,35 @@ test "ZA110: struct-default params keep the signature join (EPH-I0479)" {
     );
 }
 
+test "ZA110: joined error-set return with armed defer fires (EPH-I1042)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A wrapped error-set return type (`error{OutOfMemory}!T`) used to
+    // end the signature join at the error-set brace, and the first-`{`
+    // end resolved the remainder as ".value" — the managed-container
+    // gate never fired (the EPH-I0388 class on the ZA110 join path).
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(
+        \\    a: std.mem.Allocator,
+        \\) error{OutOfMemory}!std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_errset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_errset.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
 test "ZA110: const copy alias with armed original fires (EPH-I0480)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -96372,6 +96578,37 @@ test "ZA110: rebound copy alias never fires (EPH-I0480)" {
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "za110_rebound.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: RHS-rebound copy alias never fires (EPH-I1048)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `list = other;` rebinds the alias RHS after the declaration: the
+    // armed defer on `list` frees `other`'s backing at scope exit, not
+    // the original backing `out` still holds — firing here is an FP. The
+    // rebind sweep drops the alias; a conditional rebind also drops,
+    // FN-only (EPH-I0836 precedent).
+    const content =
+        \\const std = @import("std");
+        \\fn makeList(a: std.mem.Allocator) std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    var other = std.ArrayList(u8).init(a);
+        \\    const out = list;
+        \\    list = other;
+        \\    defer list.deinit();
+        \\    return out;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_rhsrebound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_rhsrebound.zig", RULE_MUST_RETURN_REF),
     );
 }
 
@@ -96503,6 +96740,113 @@ test "ZA209: inline-enum param fn that never fails fires (EPH-I0479)" {
         @as(usize, 1),
         countRuleIssues(run.issues.items, "za209_enumsig_note.zig", RULE_USELESS_ERROR_RETURN),
     );
+}
+
+test "ZA209: joined error-set return fn that never fails fires (EPH-I1042)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Same join class as the ZA110 pin: the error-set brace used to end
+    // the signature join, and the first-`{` end resolved the ret text as
+    // ".value" — the fn never entered the never-fails scan.
+    const content =
+        \\fn f(
+        \\    x: u32,
+        \\) error{OutOfMemory}!void {
+        \\    const a: u32 = x + 1;
+        \\    const b: u32 = a * 2;
+        \\    const c: u32 = b + 3;
+        \\    const d: u32 = c * 4;
+        \\    const e: u32 = d + 5;
+        \\    _ = e;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_errset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_errset.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: multi-line error-set return fn that never fails fires (EPH-I1042)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The zig-fmt-wrapped error set spans lines: the join must carry the
+    // balanced braces across them (the same shape the register path
+    // handles via returnTypeAfter).
+    const content =
+        \\fn f(
+        \\    x: u32,
+        \\) error{
+        \\    OutOfMemory,
+        \\}!void {
+        \\    const a: u32 = x + 1;
+        \\    const b: u32 = a * 2;
+        \\    const c: u32 = b + 3;
+        \\    const d: u32 = c * 4;
+        \\    const e: u32 = d + 5;
+        \\    _ = e;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_errset_ml.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_errset_ml.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: fn-pointer ret leaves the outer fn silent, inner noted (EPH-I1042 r1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Wrong-victim pin (sig sync/once_cell.zig:194 class): the outer fn
+    // returns a fn POINTER whose pointee returns error{}!u64. The `!`
+    // belongs to the pointee, so the outer return is a value: the outer
+    // fn must stay out of the never-fails scan. Classifying it as
+    // error_union reports the note on the outer line (a fn pointer
+    // cannot fail) and swallows the inner `get` note.
+    const content =
+        \\fn returnNotErr(comptime x: u64) fn () error{}!u64 {
+        \\    return struct {
+        \\        fn get() !u64 {
+        \\            return x;
+        \\        }
+        \\    }.get;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_fnptr_ret.zig", content);
+    defer run.deinit(allocator);
+
+    // Exactly one ZA209 note, on the inner fn (`get`), never the outer.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_fnptr_ret.zig", RULE_USELESS_ERROR_RETURN),
+    );
+    var victim_on_get = false;
+    var victim_on_outer = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_USELESS_ERROR_RETURN)) continue;
+        if (!mem.eql(u8, issue.file, "za209_fnptr_ret.zig")) continue;
+        if (mem.indexOf(u8, issue.message, "get") != null and issue.line == 3) {
+            victim_on_get = true;
+        }
+        if (mem.indexOf(u8, issue.message, "returnNotErr") != null) {
+            victim_on_outer = true;
+        }
+    }
+    try std.testing.expect(victim_on_get);
+    try std.testing.expect(!victim_on_outer);
 }
 
 test "ZA209: body with return error is silent" {
@@ -96791,6 +97135,69 @@ test "ZA209: single-line interface shim is silent" {
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "za209_shim1.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: inline-enum param shim stays silent (EPH-I1047)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // feedShimLine used the FIRST `{` on the line (paren-blind): an
+    // inline enum param fed its member text into the shim buffer, which
+    // merged with the first body statement and pushed the genuine
+    // interface shim past the carve-out — a false never-fails note. The
+    // body brace is the `{` at paren depth 0 (EPH-I1047).
+    const content =
+        \\const T = struct { text: []const u8 = "" };
+        \\fn translate(x: enum { a, b }) !T {
+        \\    _ = x;
+        \\    return .{};
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_shim_enumsig.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_shim_enumsig.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: switch-in-return-type signature body starts (EPH-I1047 r1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // A parenthesized switch in the return type makes the closer line
+    // paren-net-zero (`) !(switch (x) {`). The shim brace scan must not
+    // advance the carried paren depth twice per line: the body brace on
+    // the following `}) {` line would then sit at odd depth, never start
+    // the body, and the fn scan would swallow the rest of the file
+    // (EPH-I1047 r1, sig rpc/server/server.zig:554 class).
+    const content =
+        \\fn pick(
+        \\    x: u32,
+        \\) !(switch (x) {
+        \\    .a => void,
+        \\    else => u32,
+        \\}) {
+        \\    const a: u32 = x + 1;
+        \\    const b: u32 = a * 2;
+        \\    const c: u32 = b + 3;
+        \\    const d: u32 = c * 4;
+        \\    const e: u32 = d + 5;
+        \\    _ = e;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_switchret.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_switchret.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

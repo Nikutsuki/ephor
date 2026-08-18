@@ -7654,6 +7654,110 @@ fn isBraceLessIfFormFree(
     return braceLessIfBodyFree(t, free_pos);
 }
 
+/// True when the line carries a single-line both-arms construct of the
+/// tracked variable: a plain `} else {` arm separator (never `} else if`)
+/// whose then arm (the depth-1 group closing at the marker) and else arm
+/// (the text after the marker) each hold a free pattern at code
+/// positions. Every path through the construct runs a second free, so
+/// the pair a dominating first free forms with this line is the definite
+/// double-free — the else-marker suppression (EPH-I0806) must not hide
+/// it (EPH-I1030). An `} else if` marker opens the next chain condition:
+/// the chain grades arm by arm and stays conditional (EPH-I1017).
+/// Residuals mirroring siblingArmAlsoFrees: the arm frees are var-blind
+/// (a free of another variable in the sibling arm still counts), and a
+/// free nested inside a deeper construct on the line counts as an arm
+/// free.
+fn isSameLineBothArmsFree(t: []const u8) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var scan = BothArmsScan{};
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (scan.step(t, pos)) return true;
+    }
+    return false;
+}
+
+/// Brace-group walk state for isSameLineBothArmsFree (EPH-I1030): the
+/// depth-1 group's free evidence and the paren/brace nesting the group
+/// walk needs.
+const BothArmsScan = struct {
+    paren_depth: usize = 0,
+    brace_depth: usize = 0,
+    group_free: bool = false,
+
+    /// Advance over one code char. True when the char closes a depth-1
+    /// group with a free pattern, a plain `} else` marker follows, and
+    /// the text after the marker holds another free pattern.
+    fn step(self: *BothArmsScan, t: []const u8, pos: usize) bool {
+        const c = t[pos];
+        if (c == '(' or c == ')') {
+            self.onParen(c);
+            return false;
+        }
+        if (self.paren_depth > 0) return false;
+        if (c == '{') {
+            self.onGroupOpen();
+            return false;
+        }
+        if (c == '}') {
+            self.onGroupClose();
+            if (self.brace_depth != 0) return false;
+            const tail = plainElseTail(t, pos + 1) orelse return false;
+            return self.bothArmsFree(t, tail);
+        }
+        self.markFreeIfPattern(t, pos);
+        return false;
+    }
+
+    fn onParen(self: *BothArmsScan, c: u8) void {
+        if (c == '(') {
+            self.paren_depth += 1;
+        } else if (self.paren_depth > 0) {
+            self.paren_depth -= 1;
+        }
+    }
+
+    fn onGroupOpen(self: *BothArmsScan) void {
+        if (self.brace_depth == 0) self.group_free = false;
+        self.brace_depth += 1;
+    }
+
+    fn onGroupClose(self: *BothArmsScan) void {
+        if (self.brace_depth > 0) self.brace_depth -= 1;
+    }
+
+    fn markFreeIfPattern(self: *BothArmsScan, t: []const u8, pos: usize) void {
+        if (isFreePatternAt(t, pos)) self.group_free = true;
+    }
+
+    fn bothArmsFree(self: *const BothArmsScan, t: []const u8, tail: usize) bool {
+        return self.group_free and freePatternAfter(t, tail);
+    }
+};
+
+/// Position after the `else` keyword of the plain arm separator starting
+/// right after the `}` at `from - 1`, or null when the text there is not
+/// a plain `} else` (a word-boundary miss, `elsewhere`, or the chain's
+/// `} else if`).
+fn plainElseTail(t: []const u8, from: usize) ?usize {
+    var k = from;
+    while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
+    if (k + 4 > t.len or !mem.eql(u8, t[k .. k + 4], "else")) return null;
+    if (k + 4 < t.len and isIdent(t[k + 4])) return null;
+    var j = k + 4;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j + 2 <= t.len and mem.eql(u8, t[j .. j + 2], "if")) return null;
+    return j;
+}
+
+/// True when a code-position `.free(` or `.destroy(` pattern starts at
+/// `pos`.
+fn isFreePatternAt(t: []const u8, pos: usize) bool {
+    return mem.startsWith(u8, t[pos..], ".free(") or
+        mem.startsWith(u8, t[pos..], ".destroy(");
+}
+
 /// True when a code-position `else` after the first cleanup call precedes
 /// a second cleanup call on the same line: the if-else frees on both
 /// arms, so the free is definite, never line-conditional (EPH-I1005 F1).
@@ -8092,7 +8196,12 @@ fn hasElseOrOrelseMarker(t: []const u8) bool {
 /// paths (EPH-I0791: the indent-blind `=>` clause suppressed an outer free
 /// paired with a prong-body free of the same var. EPH-I0806: the
 /// indent-blind else/orelse clause suppressed a dominating free paired
-/// with a later free across a nested `} else {` or `} orelse {`). The
+/// with a later free across a nested `} else {` or `} orelse {`). A
+/// separator on the SECOND free's own line is the construct's arm
+/// divider, not a path separator: the both-arms caller escape
+/// (isSameLineBothArmsFree, EPH-I1030) re-reads the line when the gate
+/// fires there, so a single-line both-arms construct under a dominating
+/// pre-free grades definite instead of going silent. The
 /// `=>` clause counts arm-header lines whose arm contains the second free
 /// (armHeaderSeparates): an inline switch expression between the frees
 /// carries real arrows, but its arms are expression data and cannot
@@ -8849,7 +8958,21 @@ fn checkSameBlockDoubleFree(
     // same-block verdicts.
     const freed = sbf.freed_line;
     const lines = ctx.scan.lines;
-    if (!hasExclusiveBranchBetween(lines, freed, actual_line, ctx.scan.func_line)) {
+    const exclusive = hasExclusiveBranchBetween(lines, freed, actual_line, ctx.scan.func_line);
+    // The own-line both-arms escape (EPH-I1030): an else separator on the
+    // second free's own line is the construct's arm divider, not a path
+    // separator — when both arms free the tracked var, every path through
+    // the construct runs a second free and the pair is definite (the
+    // pre-fix shape was silent). The separator must sit at the pair's
+    // indent or shallower (the gate's own min-indent discipline): a
+    // deeper both-arms construct nested inside an arm of the separating
+    // construct stays suppressed (the pair is conditional). Twin of the
+    // detectCrossBlockDoubleFree escape.
+    const both_arms_line = exclusive and
+        countIndent(lines[actual_line - ctx.scan.func_line]) <=
+            countIndent(lines[freed - ctx.scan.func_line]) and
+        isSameLineBothArmsFree(t);
+    if (!exclusive or both_arms_line) {
         // The second free's own conditionality grades the pair: a
         // conditional second free (catch arm, inline-switch arm,
         // brace-less if body) double-frees on some paths only, so the
@@ -8857,6 +8980,11 @@ fn checkSameBlockDoubleFree(
         // first free is a plain block statement (EPH-I1011, mirror of the
         // first-free conditional grade). sameBlockFreeSeverity keys on
         // the FIRST free line; the current-free op fills the mirror gap.
+        // The own-line both-arms shape reads definite through
+        // sameBlockFreeSeverity's first-free grade: a dominating plain
+        // first free grades err, a conditional first free keeps the
+        // warning (every path through the construct runs a second free,
+        // but only the paths that ran the first free double-free).
         const cur_bid = findBlockForLine(ctx.cfg, actual_line);
         const cur_op: BlockFreeOp = if (cur_bid) |bid|
             freeOpForFree(&ctx.scan, ctx.cfg.blocks.items[bid], actual_line)
@@ -8871,7 +8999,9 @@ fn checkSameBlockDoubleFree(
             .t = t,
             .line = actual_line,
             .freed_line = freed,
-            .severity = if (cur_op == .cond_sets)
+            .severity = if (both_arms_line)
+                sameBlockFreeSeverity(ctx, sbf, actual_line)
+            else if (cur_op == .cond_sets)
                 .warning
             else
                 sameBlockFreeSeverity(ctx, sbf, actual_line),
@@ -9527,7 +9657,10 @@ const SiblingArm = struct {
 /// block, outside the sibling's own span, a top-level single-line arm
 /// whose header block starts on an earlier line (the usual fn-body
 /// shape) does not share the header's start line and stays at the
-/// non-upgraded grade, and an Allman-style `else {` on its own line does
+/// non-upgraded grade — the single-line both-arms shape with a
+/// dominating pre-free reads definite through the own-line escape
+/// (isSameLineBothArmsFree, EPH-I1030) instead, and an Allman-style
+/// `else {` on its own line does
 /// not start with `}` and shares no header line, so its both-arms pair
 /// falls back to the conditional warning grade.
 fn siblingArmAlsoFrees(ctx: *const FreeScanCtx, bid: usize) bool {
@@ -9585,8 +9718,25 @@ fn detectCrossBlockDoubleFree(
         pa.freed_pred_line
     else
         ctx.scan.alloc_info.freed_line;
-    if (hasExclusiveBranchBetween(ctx.scan.lines, ref, actual_line, ctx.scan.func_line))
-        return;
+    const exclusive = hasExclusiveBranchBetween(
+        ctx.scan.lines,
+        ref,
+        actual_line,
+        ctx.scan.func_line,
+    );
+    // The own-line both-arms escape (EPH-I1030): an else separator on the
+    // second free's own line is the construct's arm divider, not a path
+    // separator — when both arms free the tracked var, every path through
+    // the construct runs a second free and the pair is definite. The
+    // separator must sit at the pair's indent or shallower (the gate's own
+    // min-indent discipline): a deeper both-arms construct nested inside
+    // an arm of the separating construct stays suppressed (the pair is
+    // conditional). Twin of the checkSameBlockDoubleFree escape.
+    const own_line_both_arms = exclusive and
+        countIndent(ctx.scan.lines[actual_line - ctx.scan.func_line]) <=
+            countIndent(ctx.scan.lines[ref - ctx.scan.func_line]) and
+        isSameLineBothArmsFree(t);
+    if (exclusive and !own_line_both_arms) return;
 
     // The def-lattice grade names the second free's block entry: err
     // requires the block on every path that continues past it. A
@@ -9603,9 +9753,11 @@ fn detectCrossBlockDoubleFree(
     // the variable, the second free runs on every path through the
     // construct — definite even though the block itself is
     // conditionally reached (EPH-I1017 F1, the cross-block mirror of the
-    // same-line elsePrecedesSecondFree gate).
-    const both_arms = pa.def_freed and !definite_reach and
-        siblingArmAlsoFrees(ctx, bid);
+    // same-line elsePrecedesSecondFree gate). The own-line escape
+    // (EPH-I1030) reads the both-arms shape directly off the second
+    // free's line.
+    const both_arms = (pa.def_freed and !definite_reach and
+        siblingArmAlsoFrees(ctx, bid)) or own_line_both_arms;
 
     try emitCrossBlockDoubleFree(ctx, .{
         .t = t,
@@ -28376,6 +28528,13 @@ fn guardCoversDecrement(
     var_name: []const u8,
     amount: ?usize,
 ) bool {
+    // A conditional body that closes on its own line holds only on that
+    // line: the closed arm's bound never covers the lines below (the
+    // I1034 crossClosedBlock discipline applied to the CFG layers —
+    // EPH-I1036). The in-arm candidate on the guard's own line stays
+    // covered. Assert guards are statements, not conditional bodies:
+    // they hold wherever they executed.
+    if (ctx.idx > guard_idx and guardLineClosesBodyOnLine(ctx.lines, guard_idx)) return false;
     if (amount == null) return true;
     const raw = mem.trim(u8, ctx.lines[guard_idx], " \t\r");
     const guard_line = guardSourceForLine(raw);
@@ -28394,6 +28553,65 @@ fn guardCoversDecrement(
         var_name,
         amount.?,
     );
+}
+
+/// True when the conditional body the guard line opens also closes on
+/// the line: the guard holds only there and covers nothing below
+/// (EPH-I1036, the CFG-layers mirror of the crossClosedBlock discipline,
+/// EPH-I1034). A multi-line condition, an open braced body, or an Allman
+/// header (body on the next line) keeps covering the arm lines below. A
+/// brace-less statement body (`if (m > 3) m -= 1;`) closes with the
+/// line. The check reads the guard's own region (guardSourceForLine), so
+/// an else-if arm's condition judges the arm's text, never the negated
+/// antecedent (EPH-I0996).
+fn guardLineClosesBodyOnLine(lines: []const []const u8, guard_idx: usize) bool {
+    const raw = mem.trim(u8, lines[guard_idx], " \t\r");
+    const t = guardSourceForLine(raw);
+    if (parenBalance(t) != 0) return false; // condition continues below
+    if (countCurlyBalance(t) != 0) return false; // body continues below
+    if (lineCarriesOpenBrace(t)) return true; // braced body closed on the line
+    // No brace group: the guard holds past the line only when the body
+    // opens on the next line (Allman). A brace-less statement body on
+    // the line closes with the statement; a bare header (Allman `if (m
+    // > 3)` with nothing after the condition) opens no body on the line
+    // and must keep covering the body lines below (EPH-I0951, I0976).
+    return braceLessBodyOnLine(t);
+}
+
+/// True when the guard line carries a brace-less statement body after
+/// the condition: `if (m > 3) m -= 1;`. A bare Allman header (nothing
+/// after the condition, or only a trailing comment) opens its body on
+/// the next line and returns false.
+fn braceLessBodyOnLine(t: []const u8) bool {
+    var from: usize = 0;
+    while (nextGuardKeywordPos(t, from)) |kw| {
+        from = kw + 2;
+        const close = guardConditionClose(t, kw) orelse continue;
+        if (bodyTextAfterCondition(t, close)) return true;
+    }
+    return false;
+}
+
+/// The matching close of the guard keyword's paren group at `kw` on the
+/// line, or null when the keyword carries no paren group or the group
+/// stays open. Mirrors the guardConditionSpan keyword walk.
+fn guardConditionClose(t: []const u8, kw: usize) ?usize {
+    const kw_len: usize = if (t[kw] == 'w') 5 else 2;
+    var j = kw + kw_len;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j >= t.len or t[j] != '(') return null;
+    return matchingCloseParenOnLine(t, j);
+}
+
+/// True when code follows the condition's close on the line: a
+/// brace-less statement body (`if (m > 3) m -= 1;`). A bare Allman
+/// header (nothing after the condition, or only a trailing comment)
+/// opens its body on the next line.
+fn bodyTextAfterCondition(t: []const u8, close: usize) bool {
+    var k = close + 1;
+    while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
+    if (k >= t.len or t[k] == '/') return false;
+    return true;
 }
 
 /// True when the guard line's condition proves `var_name >= amount`.
@@ -46744,6 +46962,232 @@ test "ZA106: enclosing-close merge siblings stay conditional, genuine arms stay 
     try std.testing.expect(stmt_before_warning);
     try std.testing.expect(both_err);
     try std.testing.expect(w_else_err);
+}
+
+test "ZA106: single-line both-arms free with a dominating pre-free grades err, single-arm twins stay silent (EPH-I1030)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The else marker on the second free's own line is the construct's
+    // arm divider, not a path separator: when both arms free the tracked
+    // var, every path through the construct runs a second free and the
+    // pair is definite. Pre-fix the else-marker suppression (EPH-I0806)
+    // hid the pair and the line stayed silent (probe V). The single-arm
+    // twins (a use in one arm) stay silent — their pair is conditional
+    // and the text gate keeps suppressing. The nested control: the
+    // both-arms construct sits inside the outer else arm at a deeper
+    // indent, so the outer separator's suppression stands (the pair is
+    // conditional there — the gate's min-indent discipline).
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn both(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) { allocator.free(buf); } else { allocator.free(buf); }
+        \\}
+        \\fn else_only(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) { use(buf); } else { allocator.free(buf); }
+        \\}
+        \\fn then_only(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) { allocator.free(buf); } else { use(buf); }
+        \\}
+        \\fn nested(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        use(buf);
+        \\    } else {
+        \\        if (d) { allocator.free(buf); } else { allocator.free(buf); }
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_single_line_both_arms.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_single_line_both_arms.zig";
+    // Only the both fn fires ZA106: the single-arm twins and the nested
+    // shape stay silent. The err assertion fails pre-fix (the line was
+    // silent).
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    var both_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        both_err = issue.line == 7 and issue.severity == .err;
+    }
+    try std.testing.expect(both_err);
+}
+
+test "ZA106: else-if chain corner grades — inline arm and final else stay conditional, all-arms chain reads definite (EPH-I1033)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The chain grades arm by arm: an intermediate arm's sibling is the
+    // next condition block, never an arm body, so an inline same-line
+    // else-if body free keeps the conditional grade, and the final else
+    // body is not the first arm's direct sibling either (EPH-I1017, the
+    // B48a N2 note's committed pin). The all-arms control: every arm
+    // frees on one line, so every path runs a second free and the line
+    // reads definite through the same-line both-arms gate (EPH-I1030).
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn chainInline(allocator: std.mem.Allocator, a: bool, b: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (a) {
+        \\        allocator.free(buf);
+        \\    } else if (b) { allocator.free(buf); }
+        \\    use(buf);
+        \\}
+        \\fn chainFinalElse(allocator: std.mem.Allocator, a: bool, b: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (a) {
+        \\        allocator.free(buf);
+        \\    } else if (b) {
+        \\        use(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+        \\fn chainAllArms(allocator: std.mem.Allocator, a: bool, b: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (a) { allocator.free(buf); } else if (b) { allocator.free(buf); } else { allocator.free(buf); }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_chain_corner_grades.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_chain_corner_grades.zig";
+    // One ZA106 per chain fn: the first-arm free of the inline and
+    // final-else chains grades conditional; the all-arms chain's line
+    // grades err.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 3);
+    var inline_warning = false;
+    var final_warning = false;
+    var all_arms_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 8) inline_warning = issue.severity == .warning;
+        if (issue.line == 16) final_warning = issue.severity == .warning;
+        if (issue.line == 26) all_arms_err = issue.severity == .err;
+    }
+    try std.testing.expect(inline_warning);
+    try std.testing.expect(final_warning);
+    try std.testing.expect(all_arms_err);
+}
+
+test "ZA901/ZA903: closed same-line else-if arm does not cover a separate bare block below (EPH-I1036)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The chain arm's own condition (`else if (m > 3)`) holds only
+    // inside the arm, which closes on the same line: the closed arm's
+    // bound must not cover the bare block below (pre-fix silent on both
+    // rules — the I1036 FN). The discriminating controls: the plain
+    // closed if and the closed while twins fire the same way; a
+    // multi-line chain arm's in-arm candidate stays silent (its body is
+    // the guard's span); an Allman if header keeps covering its body
+    // below; and an amount past the credited bound fires.
+    const content =
+        \\fn use(v: usize) usize {
+        \\    _ = v;
+        \\    return v;
+        \\}
+        \\fn chain_dec(x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (q > 1) { return 0; }
+        \\    else if (m > 3) { m -= 1; }
+        \\    {
+        \\        m -= 2;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn chain_idx(x: usize, q: usize, arr: []u8) usize {
+        \\    var m = x;
+        \\    if (q > 1) { return 0; }
+        \\    else if (m > 3) { m -= 1; }
+        \\    {
+        \\        return arr[m - 2];
+        \\    }
+        \\    return m;
+        \\}
+        \\fn if_twin(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 3) { m -= 1; }
+        \\    {
+        \\        m -= 2;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn while_twin(x: usize) usize {
+        \\    var m = x;
+        \\    while (m > 3) { m -= 1; }
+        \\    {
+        \\        m -= 2;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn big_amount(x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (q > 1) { return 0; }
+        \\    else if (m > 3) { m -= 1; }
+        \\    {
+        \\        m -= 5;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn ml_arm(x: usize, q: usize) usize {
+        \\    var m = x;
+        \\    if (q > 1) { return 0; }
+        \\    else if (m > 3) {
+        \\        use(m);
+        \\        m -= 1;
+        \\    }
+        \\    return m;
+        \\}
+        \\fn allman(x: usize) usize {
+        \\    var m = x;
+        \\    if (m > 3)
+        \\    {
+        \\        m -= 1;
+        \\    }
+        \\    return m;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_closed_elseif_bare.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_closed_elseif_bare.zig";
+    // Four decrement findings: the closed chain arm's bare block
+    // (chain_dec), the if twin, the while twin, and the amount past the
+    // credited bound (big_amount). The multi-line arm and the Allman
+    // body stay silent (the in-arm candidate is the guard's span), and
+    // the closed chain arm's bare range end fires ZA903.
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        file,
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 4);
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        file,
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
 }
 
 test "ZA105: noreturn call after free exits the block (EPH-I0364)" {

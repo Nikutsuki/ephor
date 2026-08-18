@@ -196,16 +196,31 @@ fn initToolPaths(diag: *const DiagCtx, environ_map: *const std.process.Environ.M
 /// and threads it. Tests construct a fresh instance per test and assert on
 /// the fields directly. No restore-at-exit and no canary: a per-instance
 /// value cannot leak across tests by construction.
+///
+/// cliDiag's output sink (EPH-I1051): the formatted message goes through
+/// writeFn when a DiagCtx carries a sink. The default (null sink) writes
+/// via std.debug.print to raw stderr — byte-identical with pre-sink
+/// output, because the sink path's fixed-buffer format only runs when a
+/// sink is installed. Tests install a per-test capture sink and assert on
+/// the diagnostics in-process (the EPH-I0314 warning-absence seam).
+const DiagSink = struct {
+    /// Sink state (a test capture struct; null-context fns ignore it).
+    ctx: *anyopaque,
+    /// Writes one formatted diagnostic message.
+    writeFn: *const fn (ctx: *anyopaque, msg: []const u8) void,
+};
+
 const DiagCtx = struct {
     /// I/O handle for child-process and file operations.
     io: std.Io,
     /// Mutes cliDiag when false. The mute does not change the test-runner
     /// verdict: the verdict derives from TestResults counts only (fail,
     /// crash, timeout, leak, log_err). cliDiag writes via std.debug.print
-    /// to raw stderr, which the runner echoes into the gate log on success
-    /// (build_runner "no matter the result") but never counts against the
-    /// step. Error-path tests mute parse diagnostics and assert on the
-    /// resulting state; the mute keeps that echoed stderr quiet.
+    /// to raw stderr (or through diag_sink when one is installed), which
+    /// the runner echoes into the gate log on success (build_runner "no
+    /// matter the result") but never counts against the step. Error-path
+    /// tests mute parse diagnostics and assert on the resulting state;
+    /// the mute keeps that echoed stderr quiet.
     cli_diagnostics_enabled: bool = true,
     /// JSON output mode (--format=json): the shared stderr stream carries
     /// the machine JSON contract, so human diagnostics must not reach it
@@ -214,6 +229,13 @@ const DiagCtx = struct {
     /// latch stays on for the whole run, even when a later --format=text
     /// switches the output format back.
     json_stream: bool = false,
+    /// Injectable diagnostic sink (EPH-I1051): cliDiag routes the
+    /// formatted message here when set. Null keeps the default
+    /// std.debug.print stderr path byte-identical (the fixed-buffer
+    /// format runs only when a sink is installed). The json_stream and
+    /// cli_diagnostics_enabled latches gate the sink exactly like the
+    /// default path, so the JSON machine contract stays pure.
+    diag_sink: ?DiagSink = null,
     /// Errno-style detail for error.InvalidFailOnValue /
     /// error.InvalidStrictValue out of config parsing: the parse layer
     /// cannot know which ephor.json it is reading, so it stashes the
@@ -300,11 +322,103 @@ const max_source_file_bytes = 10 * 1024 * 1024;
 /// malformed token worth naming in the diagnostic.
 const bad_gate_value_buf_bytes = 64;
 
+/// Cap on one formatted cliDiag message for the sink path (EPH-I1051).
+/// The default stderr path never formats (std.debug.print direct), so
+/// the cap bounds only sink-bearing runs, which tests install. The
+/// largest production messages are a path (<= Fs.max_path_bytes) plus
+/// under 1 KiB of static text; 8 KiB covers every production class. An
+/// over-cap message keeps its head — the diagnostic prefix — by the
+/// same truncation policy as the stashBadGateValue clamp (B13-17).
+const diag_msg_buf_bytes = 8192;
+
 /// Print a CLI/config diagnostic unless the run has muted the channel or
-/// the output stream is the JSON machine contract (EPH-I0213).
+/// the output stream is the JSON machine contract (EPH-I0213). With a
+/// sink installed (EPH-I1051) the message formats once into a fixed
+/// buffer and goes through the sink; without one the call passes
+/// straight to std.debug.print, so production output is byte-identical
+/// with the pre-sink code.
 fn cliDiag(diag: *const DiagCtx, comptime fmt: []const u8, args: anytype) void {
     if (!diag.cli_diagnostics_enabled or diag.json_stream) return;
-    std.debug.print(fmt, args);
+    const sink = diag.diag_sink orelse {
+        std.debug.print(fmt, args);
+        return;
+    };
+    var buf: [diag_msg_buf_bytes]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print(fmt, args) catch |err| switch (err) {
+        // Over-cap truncation keeps the head: the diagnostic prefix
+        // survives (the stashBadGateValue clamp is the same policy).
+        error.WriteFailed => {},
+    };
+    sink.writeFn(sink.ctx, w.buffered());
+}
+
+/// Test capture sink for cliDiag (EPH-I1051): install on a DiagCtx, run
+/// the code under test, assert on the captured bytes in-process. The
+/// buffer is sized for the diagnostics the pins emit; an over-cap write
+/// keeps the truncated head and sets `truncated`, so the test's content
+/// assertions still fail loudly on the missing tail.
+const CaptureSink = struct {
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    /// Set when a diagnostic did not fit the capture (a future test's
+    /// message outgrew the buffer).
+    truncated: bool = false,
+
+    fn sink(self: *CaptureSink) DiagSink {
+        return .{ .ctx = self, .writeFn = CaptureSink.write };
+    }
+
+    fn slice(self: *const CaptureSink) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn write(ctx: *anyopaque, msg: []const u8) void {
+        const self: *CaptureSink = @ptrCast(@alignCast(ctx));
+        const n = @min(msg.len, self.buf.len - self.len);
+        if (n < msg.len) self.truncated = true;
+        @memcpy(self.buf[self.len .. self.len + n], msg[0..n]);
+        self.len += n;
+    }
+};
+
+test "cliDiag routes through the sink; the latches still gate it (EPH-I1051)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    cliDiag(&diag, "note: {s} {d}\n", .{ "alpha", 3 });
+    try std.testing.expectEqualStrings("note: alpha 3\n", capture.slice());
+    // json_stream: the machine contract stays pure — the latch gates the
+    // sink exactly like the default stderr path (B56 gate contract).
+    diag.json_stream = true;
+    cliDiag(&diag, "machine\n", .{});
+    try std.testing.expectEqual(@as(usize, 14), capture.len);
+    // The mute gates the sink too.
+    diag.json_stream = false;
+    diag.cli_diagnostics_enabled = false;
+    cliDiag(&diag, "muted\n", .{});
+    try std.testing.expectEqual(@as(usize, 14), capture.len);
+}
+
+test "cliDiag over-cap format keeps the head and sets the sink truncated latch (EPH-I1051)" {
+    // The >8192-byte format output trips the cliDiag fixed buffer's
+    // WriteFailed, the head-preserving truncation at the catch site
+    // (the policy the previous tests never pinned); the 8192-byte head
+    // then overflows the 512-byte capture, which keeps its own truncated
+    // head and sets the latch. Both truncations preserve the diagnostic
+    // prefix, so the assertion pins the delivered head byte-for-byte:
+    // "note: " plus the first 506 argument bytes (512 minus the prefix).
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const long_arg = "x" ** (diag_msg_buf_bytes + 808);
+    cliDiag(&diag, "note: {s}\n", .{long_arg});
+    try std.testing.expect(capture.truncated);
+    try std.testing.expectEqual(@as(usize, 512), capture.len);
+    try std.testing.expectEqualStrings(
+        "note: " ++ long_arg[0 .. 512 - "note: ".len],
+        capture.slice(),
+    );
 }
 
 // Version compatibility layer
@@ -35553,6 +35667,16 @@ const JsonCodeScanner = struct {
 /// first string opener, newline, comment opener, or EOF: a separator
 /// never sits inside the next string, and the lenient grammar is
 /// line-oriented, so a colon on a later line cannot bind.
+///
+/// The designed skip class (EPH-I1049): a pair whose separator colon
+/// sits on a later line or after a `//` comment (for example
+/// {"path_dir"\n: "src"} or {"path_dir" // note\n: "src"}) is silently
+/// skipped — the key keeps its default and no warning fires. The
+/// line-oriented grammar accepts that a hand-edited multi-line pair
+/// falls back to the default, and no generated config produces the
+/// shape (writeDefaultConfig and the install writer emit one pair per
+/// line). Pinned by the EPH-I1049 tests so a future cross-line scan
+/// cannot silently change the grammar contract.
 /// Returns the colon position, or the stop-byte position (content.len
 /// at EOF) when the separator is missing.
 fn findKeySeparator(content: []const u8, start: usize) usize {
@@ -38506,7 +38630,12 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
     for (entries) |e| {
         Fs.cwd(diag.io).access(e, .{}) catch continue;
         const duped = try allocator.dupe(u8, e);
-        try cfg.entries.append(allocator, duped);
+        // EPH-I1037: appendOwnedEntry is the first fallible op after the
+        // dupe — on append OOM the list never takes ownership and the
+        // helper frees the slice. A failed map put keeps the list slot
+        // (the map references the list-owned slice, it never owns —
+        // Config.deinit frees the list items).
+        try appendOwnedEntry(&cfg.entries, allocator, duped);
         try added.put(duped, {});
     }
 
@@ -38549,7 +38678,12 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
             allocator.free(path);
             continue;
         }
-        try cfg.entries.append(allocator, path);
+        // EPH-I1037: appendOwnedEntry is the first fallible op after the
+        // join — on append OOM the list never takes ownership and the
+        // helper frees the slice. A failed map put keeps the list slot
+        // (the map references the list-owned slice, it never owns —
+        // Config.deinit frees the list items).
+        try appendOwnedEntry(&cfg.entries, allocator, path);
         try added.put(path, {});
     }
 }
@@ -38918,13 +39052,30 @@ fn stripTrailingSlashes(allocator: Allocator, cfg: *Config) !void {
 
 /// Auto-detect path from build.zig when neither config nor CLI set one
 /// (only for commands that analyze code, not install/upgrade/help/version).
-fn autoDetectPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) void {
+fn autoDetectPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     const needs_path = switch (cfg.command) {
         .install, .upgrade, .help, .version => false,
         else => true,
     };
     if (!needs_path or cfg.path_owned) return;
-    cfg.path = detectPathDirFromBuildZig(diag, allocator);
+    const detected = detectPathDirFromBuildZig(diag, allocator);
+    // EPH-I1041: the re-dupe below can fail; `detected` is cfg-tracked
+    // only in the no-strip branch, so an OOM there must free it here.
+    // The manual free after the dupe precedes the normal return, so the
+    // errdefer does not double-free the success path.
+    errdefer allocator.free(detected);
+    // EPH-I1041: normalize the detected spelling like the config and CLI
+    // channels (EPH-I1038): a ./-spelled root_source_file would otherwise
+    // yield a ./-spelled cfg.path while every other channel strips it.
+    // Re-dupe when the strip shortens — cfg.path must stay the allocation
+    // base for Config.deinit's free.
+    const stripped = stripDotSlashPrefix(detected);
+    if (stripped.len == detected.len) {
+        cfg.path = detected;
+    } else {
+        cfg.path = try allocator.dupe(u8, stripped);
+        allocator.free(detected);
+    }
     cfg.path_owned = true;
 }
 
@@ -39000,7 +39151,7 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     // either flag order lands on the same outcome (EPH-I0213).
     silenceVerboseInJson(&cfg);
     try stripTrailingSlashes(allocator, &cfg);
-    autoDetectPath(diag, allocator, &cfg);
+    try autoDetectPath(diag, allocator, &cfg);
     if (cfg.path_owned and !mem.eql(u8, cfg.path, "src"))
         try detectTargetEntries(diag, allocator, &cfg);
     if (cfg.entries.items.len == 0) try detectStandardEntries(diag, allocator, &cfg);
@@ -42812,7 +42963,10 @@ test "addEntryIfValid frees the duped entry on append failure (EPH-I1024)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "valid.zig", .data = "pub fn f() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "valid.zig",
+        .data = "pub fn f() void {}\n",
+    });
     const path = try tmpFilePath(allocator, &tmp, "valid.zig");
     defer allocator.free(path);
 
@@ -42867,7 +43021,10 @@ test "addEntryWithPrefix frees the duped entry on append failure (EPH-I1024)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "valid.zig", .data = "pub fn f() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "valid.zig",
+        .data = "pub fn f() void {}\n",
+    });
     const root = try tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
     const want = try std.fmt.allocPrint(allocator, "{s}/valid.zig", .{root});
@@ -42971,6 +43128,118 @@ test "addDirEntry frees the joined entry on append failure (EPH-I1024)" {
             continue;
         };
         try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    }
+}
+
+/// Sort comparator for the EPH-I1037 fixture's set-membership assertion.
+const SlicesLessThan = struct {
+    fn lt(_: void, a: []const u8, b: []const u8) bool {
+        return std.mem.order(u8, a, b) == .lt;
+    }
+};
+
+test "detectStandardEntries frees both duped entries on append failure (EPH-I1037)" {
+    // The fixture reaches both leakable append sites and forces a growth
+    // allocation at the walk site too. The standard entries loop appends
+    // src/main.zig, src/lib.zig, src/root.zig (3 appends; the first grows
+    // the list 0 -> 9). The src/ test-file walk appends seven _test.zig
+    // files; the 7th walk append is the 10th append overall and exceeds
+    // the 9-slot first-growth capacity, so it triggers a growth
+    // allocation the fail_index sweep covers — order-robust, because the
+    // growth lands on the walk's last append in any readdir order.
+    // std growCapacity(1) = 1 + cache_line / @sizeOf([]const u8): 9 on
+    // both aarch64 and x86_64 (cache_line 128 for both in the pinned
+    // 0.16.0 stdlib; some pre-0.16 stdlibs map x86_64 to 64 — the count
+    // is sized so the walk exceeds the capacity either way). No
+    // build.zig means extractBuildZigEntries no-ops and the
+    // multi-entry dir walk finds nothing, so the allocation sequence
+    // is dupe/append/put per standard entry plus allocPrint/append/put
+    // per walk entry, plus the two append-growth allocations.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/lib.zig",
+        .data = "pub fn g() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/root.zig",
+        .data = "pub fn h() void {}\n",
+    });
+    const test_files = [_][]const u8{
+        "foo_test.zig",  "bar_test.zig",   "baz_test.zig",    "qux_test.zig",
+        "quux_test.zig", "corge_test.zig", "grault_test.zig",
+    };
+    for (test_files) |name| {
+        const sub_path = try std.fmt.allocPrint(allocator, "src/{s}", .{name});
+        defer allocator.free(sub_path);
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = sub_path,
+            .data = "test \"t\" {}\n",
+        });
+    }
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    // The detection reads cwd (Fs.cwd): chdir into the fixture and
+    // restore before the test ends, so the sweep sees a controlled tree.
+    // The restore is the ZT104-sanctioned defer-cleanup form: it cannot
+    // fail in practice (old_cwd was realpath'd moments ago and exists),
+    // and a failed restore would only poison the tests that follow.
+    var old_buf: [Fs.max_path_bytes]u8 = undefined;
+    const old_cwd = try Fs.cwd(std.testing.io).realpath(".", &old_buf);
+    try std.Io.Threaded.chdir(dir_path);
+    defer std.Io.Threaded.chdir(old_cwd) catch {};
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        try detectStandardEntries(&diag, probe.allocator(), &cfg);
+        try std.testing.expectEqual(@as(usize, 10), cfg.entries.items.len);
+        // The standard entries append in the fixed array order.
+        try std.testing.expectEqualStrings("src/main.zig", cfg.entries.items[0]);
+        try std.testing.expectEqualStrings("src/lib.zig", cfg.entries.items[1]);
+        try std.testing.expectEqualStrings("src/root.zig", cfg.entries.items[2]);
+        // The walk appends in filesystem order: assert by set
+        // membership. Strip the constant "src/" prefix the walk prepends
+        // so both sides compare bare file names.
+        var got: [7][]const u8 = undefined;
+        for (cfg.entries.items[3..], 0..) |item, i| got[i] = item["src/".len..];
+        std.mem.sort([]const u8, &got, {}, SlicesLessThan.lt);
+        var want = test_files;
+        std.mem.sort([]const u8, &want, {}, SlicesLessThan.lt);
+        for (got, 0..) |item, i| {
+            try std.testing.expectEqualStrings(want[i], item);
+        }
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        detectStandardEntries(&diag, failing.allocator(), &cfg) catch {
+            // fail_index 1 = the standard-loop append growth (0 = the
+            // dupe): the list must not hold the freed slice. The walk
+            // append growth (the 10th append, i.e. the 7th walk append)
+            // is swept too: a leaked slice there fails the testing
+            // allocator at deinit (the discriminator for both sites).
+            if (fail_index == 1)
+                try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+            continue;
+        };
+        // Unreachable: every fail_index below total_allocs fails exactly
+        // one allocation deterministically. Kept as documentation — the
+        // full-success post-condition the probe block asserts above.
+        try std.testing.expectEqual(@as(usize, 10), cfg.entries.items.len);
+        try std.testing.expectEqualStrings("src/main.zig", cfg.entries.items[0]);
     }
 }
 
@@ -70522,26 +70791,36 @@ test "resolveToolFromEnv accepts an absolute override that resolves (EPH-I0154)"
 
 test "resolveToolFromEnv warns and falls back on a relative override (EPH-I0154)" {
     var diag = testDiagCtx();
-    diag.cli_diagnostics_enabled = false;
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
     try std.testing.expectEqualStrings(
         "zig",
         resolveToolFromEnv(&diag, .zig, "tools/zig"),
+    );
+    // The warning reaches the capture in-process (EPH-I1051): the sink
+    // replaced the mute-and-state-only assertion shape, and this positive
+    // control proves the capture catches the diagnostic the I0314 test
+    // asserts absent.
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "not an absolute path") != null,
     );
 }
 
 test "resolveToolFromEnv empty override falls back to the bare name (EPH-I0314, value-level pin)" {
     // Value-level fallback-semantics pin: an empty override is not an
     // override, so it resolves to the bare name like an unset var. The
-    // warning-absence half of the regression (pre-fix: "not an absolute
-    // path" on "") cannot be asserted here: no capturable diagnostic sink
-    // exists (blocking mechanism), and the step verdict derives from
-    // TestResults counts only, never from raw stderr. The gate-level
-    // full-suite stderr grep ("not an absolute path" = 0) enforces that
-    // half, because the runner echoes captured stderr into the gate log
-    // on success.
+    // warning-absence half is asserted in-process via the capture sink
+    // (EPH-I1051): pre-fix, the empty value tripped the "not an absolute
+    // path" warning, which the gate-level full-suite stderr grep used to
+    // enforce. The sink makes the absence assertable without the grep
+    // (the relative-override test is the positive control proving the
+    // capture catches that warning).
     var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
     try std.testing.expectEqualStrings("zig", resolveToolFromEnv(&diag, .zig, ""));
     try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, ""));
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
 }
 
 test "resolveToolFromEnv warns and falls back on a directory override (EPH-I0312)" {
@@ -98865,6 +99144,45 @@ test "thresholds parse recovers after a missing colon inside the object (EPH-I05
     try std.testing.expectEqual(@as(usize, 7), cfg.thresholds.max_branches);
 }
 
+test "config pair with a cross-line colon keeps its default (EPH-I1049)" {
+    // B13-6 line-oriented grammar pin: findKeySeparator stops at the
+    // first newline, so a separator colon on a later line cannot bind.
+    // The pair is skipped — the key keeps its default, no warning — and
+    // a clean pair that parsed before it stays intact. Pinned so a
+    // future cross-line scan cannot silently change the grammar contract.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"thresholds\": {\"max_lines\": 42}, \"path_dir\"\n: \"lib\"}",
+        &cfg,
+    );
+    // "lib" never bound: the skipped path_dir leaves the default "src".
+    try std.testing.expectEqualStrings("src", cfg.path);
+    try std.testing.expectEqual(@as(usize, 42), cfg.thresholds.max_function_lines);
+}
+
+test "config pair with a comment-spanning colon keeps its default (EPH-I1049)" {
+    // Same skip class as the cross-line colon: the separator scan stops
+    // at the `//` opener, so a colon after a comment cannot bind. The
+    // pair is skipped and the default stays (no warning fires).
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"thresholds\": {\"max_lines\": 42}, \"path_dir\" // note\n: \"lib\"}",
+        &cfg,
+    );
+    try std.testing.expectEqualStrings("src", cfg.path);
+    try std.testing.expectEqual(@as(usize, 42), cfg.thresholds.max_function_lines);
+}
+
 test "config strings scan escaped quotes span-correctly (RED1-9)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -99036,6 +99354,73 @@ test "detectPathDirFromBuildZig reads the project build.zig through diag" {
     defer allocator.free(dir);
     // The repo's own build.zig declares root_source_file = "src/main.zig".
     try std.testing.expectEqualStrings("src", dir);
+}
+
+test "autoDetectPath normalizes a ./-spelled root_source_file (EPH-I1041)" {
+    // A ./-spelled root_source_file yields a ./-spelled dir from the
+    // build.zig extraction; autoDetectPath must strip it like the config
+    // and CLI channels do (EPH-I1038), so every channel spells cfg.path
+    // the same way.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/main.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void {\n" ++
+            "    b.addExecutable(.{ .root_source_file = b.path(\"./src/main.zig\") });\n" ++
+            "}\n",
+    });
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    // The detection reads cwd (Fs.cwd): chdir into the fixture and
+    // restore before the test ends. The restore is the ZT104-sanctioned
+    // defer-cleanup form: it cannot fail in practice (old_cwd was
+    // realpath'd moments ago and exists), and a failed restore would
+    // only poison the tests that follow.
+    var old_buf: [Fs.max_path_bytes]u8 = undefined;
+    const old_cwd = try Fs.cwd(std.testing.io).realpath(".", &old_buf);
+    try std.Io.Threaded.chdir(dir_path);
+    defer std.Io.Threaded.chdir(old_cwd) catch {};
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        try autoDetectPath(&diag, probe.allocator(), &cfg);
+        try std.testing.expect(cfg.path_owned);
+        // The bare spelling, not "./src": the normalized value also keeps
+        // the known-issues text matching aligned with the other channels.
+        try std.testing.expectEqualStrings("src", cfg.path);
+    }
+    const total_allocs = probe.allocations;
+
+    // EPH-I1041 sweep: at the re-dupe allocation (the last one — the
+    // errdefer must free `detected`). A leaked `detected` fails the
+    // testing allocator at teardown, the discriminator. Earlier indices
+    // fail inside the detection, which falls back to "." or "" and still
+    // returns success with an owned path, so the success branch only
+    // asserts the ownership contract, never a spelling. The read-failure
+    // indices echo the "no build.zig found" diagnostic through cliDiag:
+    // muted per the error-path test convention.
+    diag.cli_diagnostics_enabled = false;
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        autoDetectPath(&diag, failing.allocator(), &cfg) catch {
+            // On failure nothing was transferred into cfg.
+            try std.testing.expect(!cfg.path_owned);
+            continue;
+        };
+        try std.testing.expect(cfg.path_owned);
+    }
 }
 
 test "config trust: cwd and ancestors trusted, descendants untrusted" {

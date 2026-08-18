@@ -175,15 +175,23 @@ const DiagCtx = struct {
     /// mute parse diagnostics and assert on the resulting state instead of
     /// on the printed text.
     cli_diagnostics_enabled: bool = true,
-    /// Errno-style detail for error.InvalidFailOnValue out of config
-    /// parsing: the parse layer cannot know which ephor.json it is reading,
-    /// so it stashes the offending value here and the catch-site (which
-    /// knows the path) prints. Slice into the config content — valid until
-    /// that caller frees it.
-    last_bad_fail_on: ?[]const u8 = null,
+    /// Errno-style detail for error.InvalidFailOnValue /
+    /// error.InvalidStrictValue out of config parsing: the parse layer
+    /// cannot know which ephor.json it is reading, so it stashes the
+    /// offending value here and the catch-site (which knows the path)
+    /// prints. Owned copy in a fixed buffer (B13-17): the config content
+    /// buffer the value aliases is freed right after the catch, so a
+    /// borrowed slice would dangle one refactor later. Truncation at the
+    /// buffer bound is fine for a diagnostic.
+    last_bad_gate_value: [bad_gate_value_buf_bytes]u8 = undefined,
+    last_bad_gate_value_len: usize = 0,
     /// "ignoring suppression/gate keys from untrusted" notes printed. One
     /// per offending config file.
     untrusted_config_note_count: usize = 0,
+    /// Config read failures that are not a missing file (B13-9, EPH-I0517):
+    /// an unreadable or oversized config must never silently read as "no
+    /// config here".
+    unreadable_config_warn_count: usize = 0,
     /// Rejected config path_dir values.
     path_dir_reject_count: usize = 0,
     /// Entries dropped by the EPH-I0195 containment gates (untrusted config
@@ -197,6 +205,10 @@ const DiagCtx = struct {
     fmt_reject_count: usize = 0,
     /// Threshold values clamped at the documented maxima.
     threshold_clamp_count: usize = 0,
+    /// Config threshold values that do not parse as a positive integer
+    /// (B13-11, EPH-I0518): a typo'd huge value reverting to the default
+    /// silently was the pre-fix behavior.
+    threshold_invalid_count: usize = 0,
     /// Suppression-accounting notes printed.
     suppression_note_count: usize = 0,
     /// ".ephor-ignore auto-load" notes. The explicit --known-issues path
@@ -243,6 +255,11 @@ fn testDiagCtx() DiagCtx {
 /// processes, not source reads. Build-path ref scans share this cap
 /// (band-B03 F21, EPH-I0376).
 const max_source_file_bytes = 10 * 1024 * 1024;
+
+/// Cap on the stashed invalid CI-gate value (B13-17). The longest valid
+/// fail_on value is 7 bytes ("warning"); 64 bytes leaves room for a
+/// malformed token worth naming in the diagnostic.
+const bad_gate_value_buf_bytes = 64;
 
 /// Print a CLI/config diagnostic unless the run has muted the channel.
 fn cliDiag(diag: *const DiagCtx, comptime fmt: []const u8, args: anytype) void {
@@ -32932,9 +32949,11 @@ fn parseFmtOutput(
 /// line failed a safety gate, so its bytes are hostile by definition and
 /// pass through sanitizeTerminal before they reach the terminal.
 fn rejectFmtLine(diag: *DiagCtx, allocator: Allocator, line: []const u8, cause: []const u8) !void {
-    diag.fmt_reject_count += 1;
     var safe = try types.sanitizeTerminal(allocator, line);
     defer safe.deinit(allocator);
+    // B13-21 (EPH-I0520): count only after the fallible sanitize
+    // succeeded — an OOM before the note prints must not count it.
+    diag.fmt_reject_count += 1;
     cliDiag(diag, "note: ignoring zig fmt output line {s}: {s}\n", .{ safe.slice, cause });
 }
 
@@ -33793,7 +33812,12 @@ fn matchesOrphanDirPattern(path: []const u8) bool {
     return false;
 }
 
-/// Check if file path should be excluded from orphan detection
+/// Check if file path should be excluded from orphan detection.
+/// A non-empty config "orphan_exclude" list REPLACES the built-in
+/// defaults (build.zig, _test.zig, and the directory patterns below) —
+/// it does not extend them (B13-15, EPH-I0519). To keep a built-in, list
+/// it in the config; the default config template lists the _test.zig and
+/// directory-pattern defaults (build.zig is an entry, never an orphan).
 fn isOrphanExcluded(path: []const u8, cfg: *const Config) bool {
     if (cfg.orphan_exclude.items.len > 0) {
         for (cfg.orphan_exclude.items) |pattern| {
@@ -33859,12 +33883,17 @@ const Directive = struct {
 
 /// Parse an ephor directive anchored at the start of a comment. `comment`
 /// must begin at the comment's first `/` (see findCommentStart). Doc comments
-/// (`///`) never carry directives, and neither do comments whose first token
-/// is prose — the keyword must be the comment's first token.
+/// (`///` and `//!`) never carry directives, and neither do comments whose
+/// first token is prose — the keyword must be the comment's first token.
 fn parseDirective(comment: []const u8) Directive {
     const none: Directive = .{ .kind = .none, .rest = "" };
     if (!mem.startsWith(u8, comment, "//")) return none;
-    if (mem.startsWith(u8, comment, "///")) return none;
+    // B13-13 (EPH-I0519): `//!` module doc comments are excluded like
+    // `///` doc comments. The `!` token already fails the keyword match,
+    // but the exclusion must be explicit: the doc rule "doc comments
+    // never carry directives" is a promise, not an accident of the token
+    // shape.
+    if (mem.startsWith(u8, comment, "///") or mem.startsWith(u8, comment, "//!")) return none;
     const body = mem.trimStart(u8, comment[2..], " \t\r");
     const tok_end = mem.indexOfAny(u8, body, " \t\r") orelse body.len;
     const rest = mem.trimStart(u8, body[tok_end..], " \t\r");
@@ -33896,6 +33925,12 @@ fn isRuleToken(tok: []const u8) bool {
 /// True when `rule` appears among the leading rule-id tokens of `rest`.
 /// The rule list ends at the first token that is not rule-shaped, so a rule
 /// id buried in trailing prose does not count.
+/// B13-14 (EPH-I0519): directives match rule ids EXACTLY — `ZA3` does not
+/// suppress ZA301. The config disable/enable lists additionally accept
+/// category prefixes (`"disable": ["ZA3"]` kills the whole category); the
+/// asymmetry is documented in printHelp; the README coverage is pending
+/// EPH-I1050 (README lag). A directive is a surgical, in-code decision; a
+/// config list is run-wide policy.
 fn ruleListMatches(rest: []const u8, rule: []const u8) bool {
     var tokens = mem.tokenizeAny(u8, rest, " \t\r");
     while (tokens.next()) |tok| {
@@ -34389,8 +34424,8 @@ fn reportConfigParseError(
     var safe_path = types.sanitizeTerminal(allocator, path) catch {
         // OOM must not flip the fail posture: propagate the gated errors,
         // warn-and-continue the rest, exactly as the sanitized path does.
-        if (err == error.InvalidFailOnValue or err == error.EmptyExcludePattern or
-            err == error.EmptyRulePattern)
+        if (err == error.InvalidFailOnValue or err == error.InvalidStrictValue or
+            err == error.EmptyExcludePattern or err == error.EmptyRulePattern)
             return err;
         std.debug.print("warning: failed to parse config: {}\n", .{err});
         return;
@@ -34398,6 +34433,7 @@ fn reportConfigParseError(
     defer safe_path.deinit(allocator);
     switch (err) {
         error.InvalidFailOnValue => reportBadFailOn(diag, allocator, safe_path.slice),
+        error.InvalidStrictValue => reportBadStrictValue(diag, allocator, safe_path.slice),
         error.EmptyExcludePattern => cliDiag(
             diag,
             "error: {s}: invalid exclude pattern '' — an empty pattern matches every path. " ++
@@ -34420,11 +34456,28 @@ fn reportConfigParseError(
     return err;
 }
 
+/// The stashed invalid CI-gate value, or "?" when none was stashed (the
+/// report fallback for a value that never reached the stash).
+fn badGateValueSlice(diag: *const DiagCtx) []const u8 {
+    if (diag.last_bad_gate_value_len == 0) return "?";
+    return diag.last_bad_gate_value[0..diag.last_bad_gate_value_len];
+}
+
+/// Copy an offending CI-gate value into the fixed stash (B13-17,
+/// EPH-I0520). The value aliases the config content buffer, which the
+/// caller frees right after the parse error is reported; the copy keeps
+/// the catch-site's report read valid past that free.
+fn stashBadGateValue(diag: *DiagCtx, value: []const u8) void {
+    const n = @min(value.len, diag.last_bad_gate_value.len);
+    @memcpy(diag.last_bad_gate_value[0..n], value[0..n]);
+    diag.last_bad_gate_value_len = n;
+}
+
 /// The InvalidFailOnValue diagnostic. The offending value is config file
 /// content, so it crosses the terminal sanitizer like the path does
 /// (EPH-I0147).
 fn reportBadFailOn(diag: *DiagCtx, allocator: Allocator, safe_path: []const u8) void {
-    var safe = types.sanitizeTerminal(allocator, diag.last_bad_fail_on orelse "?") catch {
+    var safe = types.sanitizeTerminal(allocator, badGateValueSlice(diag)) catch {
         cliDiag(
             diag,
             "error: {s}: invalid fail_on value (expected: error, warning, note, never)\n",
@@ -34440,13 +34493,58 @@ fn reportBadFailOn(diag: *DiagCtx, allocator: Allocator, safe_path: []const u8) 
     );
 }
 
+/// The InvalidStrictValue diagnostic (B13-7, EPH-I0515). The offending
+/// value is config file content, so it crosses the terminal sanitizer
+/// like the fail_on value does (EPH-I0147).
+fn reportBadStrictValue(diag: *DiagCtx, allocator: Allocator, safe_path: []const u8) void {
+    var safe = types.sanitizeTerminal(allocator, badGateValueSlice(diag)) catch {
+        cliDiag(
+            diag,
+            "error: {s}: invalid strict value (expected: true or false)\n",
+            .{safe_path},
+        );
+        return;
+    };
+    defer safe.deinit(allocator);
+    cliDiag(
+        diag,
+        "error: {s}: invalid strict value '{s}' (expected: true or false)\n",
+        .{ safe_path, safe.slice },
+    );
+}
+
+/// B13-9 (EPH-I0517): warn on a config read failure that is not a missing
+/// file. The pre-fix catch treated every failure as "no config here",
+/// which silently dropped the user's gate and suppression keys on an
+/// unreadable or oversized file. The path can carry scanned-tree bytes,
+/// so it crosses the terminal sanitizer (EPH-I0147).
+fn warnUnreadableConfig(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    config_path: []const u8,
+    err: anyerror,
+) void {
+    var safe_path = types.sanitizeTerminal(allocator, config_path) catch {
+        cliDiag(
+            diag,
+            "warning: could not read config file ({}). Fix the file or remove it.\n",
+            .{err},
+        );
+        diag.unreadable_config_warn_count += 1;
+        return;
+    };
+    defer safe_path.deinit(allocator);
+    cliDiag(
+        diag,
+        "warning: could not read {s} ({}). Fix the file or remove it.\n",
+        .{ safe_path.slice, err },
+    );
+    diag.unreadable_config_warn_count += 1;
+}
+
 fn loadConfigFile(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // Try to load ephor.json config file from current directory
-    const content = Fs.cwd(diag.io).readFileAlloc(
-        allocator,
-        CONFIG_FILENAME,
-        64 * 1024,
-    ) catch return;
+    const content = readConfigFile(diag, allocator, CONFIG_FILENAME) orelse return;
     defer allocator.free(content);
 
     // Simple JSON parsing for config format
@@ -34529,6 +34627,24 @@ fn rollbackConfigLists(cfg: *Config, allocator: Allocator, snap: ConfigListSnaps
     rollbackConfigList(&cfg.enabled_rules, allocator, snap.enabled_rules);
 }
 
+/// Read one config file, warning on any failure that is not a missing
+/// file (B13-9, EPH-I0517). A missing config is the normal parent-fallback
+/// case; an unreadable or oversized file must never silently read as "no
+/// config here" — the pre-fix behavior silently dropped the user's gate
+/// and suppression keys. Returns null when the file cannot be read (the
+/// function never errors: the catch warns and converts to null).
+fn readConfigFile(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    config_path: []const u8,
+) ?[]u8 {
+    const content = Fs.cwd(diag.io).readFileAlloc(allocator, config_path, 64 * 1024) catch |err| {
+        if (err != error.FileNotFound) warnUnreadableConfig(diag, allocator, config_path, err);
+        return null;
+    };
+    return content;
+}
+
 /// Try to load ephor.json config from a directory, returning true if found
 fn tryLoadConfigFromDir(
     lctx: ConfigLoadCtx,
@@ -34549,11 +34665,7 @@ fn tryLoadConfigFromDir(
     const dir_copy = try allocator.dupe(u8, dir);
     defer allocator.free(dir_copy);
 
-    const content = Fs.cwd(lctx.diag.io).readFileAlloc(
-        allocator,
-        config_path,
-        64 * 1024,
-    ) catch return false;
+    const content = readConfigFile(lctx.diag, allocator, config_path) orelse return false;
     defer allocator.free(content);
 
     // RED3-x trust boundary: only configs from the auditor's own tree (cwd
@@ -34601,9 +34713,11 @@ fn tryLoadConfigFromDir(
 /// untrusted config (RED3-x). The path bytes come from the scanned tree,
 /// so they cross the terminal sanitizer.
 fn noteSuppressionKeysIgnored(diag: *DiagCtx, allocator: Allocator, config_path: []const u8) !void {
-    diag.untrusted_config_note_count += 1;
     var safe_config = try types.sanitizeTerminal(allocator, config_path);
     defer safe_config.deinit(allocator);
+    // B13-21 (EPH-I0520): count only after the fallible sanitize
+    // succeeded — an OOM before the note prints must not count it.
+    diag.untrusted_config_note_count += 1;
     cliDiag(
         diag,
         "note: ignoring suppression/gate keys from untrusted {s} " ++
@@ -34628,9 +34742,11 @@ fn noteEntriesRejected(
     comptime fmt: []const u8,
     note: EntriesRejectNote,
 ) !void {
-    diag.entries_reject_note_count += 1;
     var safe_path = try types.sanitizeTerminal(allocator, note.path);
     defer safe_path.deinit(allocator);
+    // B13-21 (EPH-I0520): count only after the fallible sanitize
+    // succeeded — an OOM before the note prints must not count it.
+    diag.entries_reject_note_count += 1;
     cliDiag(diag, fmt, .{ note.dropped, safe_path.slice });
 }
 
@@ -34765,6 +34881,12 @@ fn entryPassesTrust(io: std.Io, trusted: bool, root_real: ?[]const u8, abs: []co
 
 /// EPH-I0195 containment core: realpath the candidate and require it under
 /// the realpath'd root. Fails closed when the candidate does not resolve.
+/// B13-16 (EPH-I0520): every containment gate realpaths to decide, then
+/// the caller opens the ORIGINAL textual path — a check/use gap. A tree
+/// mutated DURING the scan could swap a symlink between gate and open
+/// (TOCTOU). The no-active-adversary-during-scan assumption is the
+/// accepted posture for a batch scanner; the README trust-model section
+/// (B83) lacks the statement — see EPH-I1050 (README lag).
 fn realpathContained(io: std.Io, root_real: []const u8, candidate: []const u8) bool {
     var cand_buf: [Fs.max_path_bytes]u8 = undefined;
     const cand_real = Fs.cwd(io).realpath(candidate, &cand_buf) catch return false;
@@ -34802,6 +34924,10 @@ fn skipJsonStringSpan(content: []const u8, start: usize) usize {
 /// span (escapes are not decoded — only span scanning needs them). On an
 /// unterminated string, val runs to content.len and end == content.len, so
 /// downstream indexes stay inside the buffer (RED1-1).
+/// B13-10 (EPH-I0518): the raw span is the CONSUMER contract, not a scan
+/// detail. A value used as a pattern or path carries its escape bytes
+/// verbatim: `"a\/b"` yields the seven bytes `a\/b` and never matches the
+/// path `a/b`. Write values without escape sequences.
 fn parseJsonString(content: []const u8, start: usize) struct { val: []const u8, end: usize } {
     var i = start + 1;
     while (i < content.len) {
@@ -34926,6 +35052,47 @@ fn clampThreshold(diag: *DiagCtx, source: []const u8, spec: ThresholdClamp, num:
         .{ spec.key, num, spec.cap, source },
     );
     return spec.cap;
+}
+
+/// Render the invalid-threshold warning into `out` (B13-11, EPH-I0518).
+/// The key and value are undecoded config content and the path comes from
+/// the loader, so all three cross the terminal sanitizer (EPH-I0147).
+fn formatBadThresholdValue(
+    out: *types.OutBuf,
+    config_path: []const u8,
+    key: []const u8,
+    raw: []const u8,
+) !void {
+    var safe_path = try types.sanitizeTerminal(out.allocator, config_path);
+    defer safe_path.deinit(out.allocator);
+    var safe_key = try types.sanitizeTerminal(out.allocator, key);
+    defer safe_key.deinit(out.allocator);
+    var safe_raw = try types.sanitizeTerminal(out.allocator, raw);
+    defer safe_raw.deinit(out.allocator);
+    try out.buf.print(
+        out.allocator,
+        "warning: {s}: invalid threshold value '{s}' for '{s}' (expected a positive integer)\n",
+        .{ safe_path.slice, safe_raw.slice, safe_key.slice },
+    );
+}
+
+/// B13-11 (EPH-I0518): warn on a config threshold value that does not
+/// parse as a positive integer. Mirrors warnPathDirRejected's shape: the
+/// fallback keeps the warning but drops the untrusted values on OOM.
+fn warnBadThresholdValue(ctx: ConfigParseCtx, key: []const u8, raw: []const u8) void {
+    var out = types.OutBuf{ .allocator = ctx.allocator };
+    defer out.deinit();
+    formatBadThresholdValue(&out, ctx.source.path, key, raw) catch {
+        cliDiag(
+            ctx.diag,
+            "warning: ignoring invalid threshold value (expected a positive integer)\n",
+            .{},
+        );
+        ctx.diag.threshold_invalid_count += 1;
+        return;
+    };
+    cliDiag(ctx.diag, "{s}", .{out.buf.items});
+    ctx.diag.threshold_invalid_count += 1;
 }
 
 fn applyThresholdField(th: *Thresholds, id: ThresholdFieldId, num: usize) void {
@@ -35107,7 +35274,14 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
     const num_start = i;
     while (i < content.len and content[i] >= '0' and content[i] <= '9') i += 1;
-    const raw = std.fmt.parseInt(usize, content[num_start..i], 10) catch return i;
+    const raw = std.fmt.parseInt(usize, content[num_start..i], 10) catch {
+        // B13-11 (EPH-I0518): a digit run that overflows usize (or an
+        // empty run) is skipped with a warning — the pre-fix code skipped
+        // it silently, so a typo'd huge threshold reverted to the default
+        // without a signal, inconsistent with the clampThreshold policy.
+        warnBadThresholdValue(ctx, key_result.val, content[num_start..i]);
+        return i;
+    };
     const cap = thresholdCapFor(key_result.val) orelse return i;
     // A CLI-locked field discards this value; clamping it would warn falsely.
     if (thresholdCliLocked(ctx.cfg.threshold_cli_mask, key_result.val)) return i;
@@ -35279,10 +35453,10 @@ fn formatPathDirRejected(
     value: []const u8,
     reason: []const u8,
 ) !void {
-    var safe_value = try types.sanitizeTerminal(out.allocator, value);
-    defer safe_value.deinit(out.allocator);
     var safe_path = try types.sanitizeTerminal(out.allocator, config_path);
     defer safe_path.deinit(out.allocator);
+    var safe_value = try types.sanitizeTerminal(out.allocator, value);
+    defer safe_value.deinit(out.allocator);
     try out.buf.print(
         out.allocator,
         "warning: ignoring path_dir '{s}' in {s}: {s}. Fix the value or remove the key.\n",
@@ -35323,6 +35497,9 @@ fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
         ctx.source.ignored_any.* = true;
         return skipJsonValue(content, start);
     }
+    // path_dir aliases (B13-10): "code", "src", and "root" are accepted
+    // spellings of the same key, documented in printHelp and README. All
+    // route through applyConfigPathDir with the same containment rule.
     const is_path_dir_key = mem.eql(u8, key, "path_dir") or
         mem.eql(u8, key, "code") or mem.eql(u8, key, "src") or mem.eql(u8, key, "root");
     if (is_path_dir_key and content[start] == '"') {
@@ -35341,6 +35518,28 @@ fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
     return skipJsonValue(content, start);
 }
 
+/// Render the unknown-error_naming warning into `out` (B13-10,
+/// EPH-I0147). The value is undecoded config content, so it crosses the
+/// terminal sanitizer like the fail_on value does. Mirrors
+/// formatBadThresholdValue's shape: tests call the formatter directly to
+/// pin the rendered bytes.
+fn formatBadErrorNaming(
+    out: *types.OutBuf,
+    config_path: []const u8,
+    value: []const u8,
+) !void {
+    var safe_path = try types.sanitizeTerminal(out.allocator, config_path);
+    defer safe_path.deinit(out.allocator);
+    var safe_value = try types.sanitizeTerminal(out.allocator, value);
+    defer safe_value.deinit(out.allocator);
+    try out.buf.print(
+        out.allocator,
+        "warning: {s}: unknown error_naming '{s}' " ++
+            "(expected: TitleCase, PascalCase, snake_case) — using TitleCase\n",
+        .{ safe_path.slice, safe_value.slice },
+    );
+}
+
 /// Handle the "error_naming" config key (null if not that key). Unlike
 /// fail_on, an unknown value is warn-and-default, not a hard error: a
 /// misspelled style preference must not abort the run (same policy as
@@ -35350,12 +35549,20 @@ fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8)
     if (!mem.eql(u8, key, "error_naming") or content[start] != '"') return null;
     const result = parseJsonString(content, start);
     const mode = ErrorNaming.fromString(result.val) orelse {
-        cliDiag(
-            ctx.diag,
-            "warning: {s}: unknown error_naming '{s}' " ++
-                "(expected: TitleCase, PascalCase, snake_case) — using TitleCase\n",
-            .{ CONFIG_FILENAME, result.val },
-        );
+        // The value is config content, so it crosses the terminal
+        // sanitizer like the fail_on value does (B13-10, EPH-I0147).
+        var out = types.OutBuf{ .allocator = ctx.allocator };
+        defer out.deinit();
+        formatBadErrorNaming(&out, CONFIG_FILENAME, result.val) catch {
+            cliDiag(
+                ctx.diag,
+                "warning: {s}: unknown error_naming " ++
+                    "(expected: TitleCase, PascalCase, snake_case) — using TitleCase\n",
+                .{CONFIG_FILENAME},
+            );
+            return result.end;
+        };
+        cliDiag(ctx.diag, "{s}", .{out.buf.items});
         return result.end;
     };
     ctx.cfg.error_naming = mode;
@@ -35368,9 +35575,25 @@ fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8)
 fn parseFailOnConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?usize {
     const content = ctx.content;
     const cfg = ctx.cfg;
-    if (mem.eql(u8, key, "strict") and mem.startsWith(u8, content[start..], "true")) {
-        setFailOn(cfg, .warning, .strict_key);
-        return start + 4;
+    if (mem.eql(u8, key, "strict")) {
+        if (!mem.startsWith(u8, content[start..], "true")) return null;
+        const after = start + 4;
+        // B13-7 (EPH-I0515): "trueXYZ" is not the JSON boolean true. The
+        // byte after "true" must be a token boundary — `,`, `}`, whitespace,
+        // newline, a `//` comment opener, or EOF — or the pair is malformed
+        // and the CI gate refuses to arm. The pre-fix prefix match gated
+        // the run on garbage. A `//` opener is a boundary because the
+        // lenient grammar accepts a comment after every other value: the
+        // main loop's skipWhitespaceAndComments consumes it (B54 F5).
+        if (after >= content.len or
+            isStrictValueBoundary(content[after]) or
+            isStrictCommentBoundary(content, after))
+        {
+            setFailOn(cfg, .warning, .strict_key);
+            return after;
+        }
+        stashBadGateValue(ctx.diag, content[start..bareTokenEnd(content, start)]);
+        return error.InvalidStrictValue;
     }
     if (!mem.eql(u8, key, "fail_on") or content[start] != '"') return null;
     const result = parseJsonString(content, start);
@@ -35378,11 +35601,36 @@ fn parseFailOnConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?us
         // Hard error, not warn-and-continue like other config keys: an
         // unparseable CI gate must never fail open (same policy as a bad
         // --fail-on CLI value). The catch-site prints path + value.
-        ctx.diag.last_bad_fail_on = result.val;
+        stashBadGateValue(ctx.diag, result.val);
         return error.InvalidFailOnValue;
     };
     setFailOn(cfg, level, .fail_on_key);
     return result.end;
+}
+
+/// B13-7: true when `c` can follow the "true" token of a strict value.
+/// The boundary set is `,`, `}`, whitespace, and newline; EOF is checked
+/// by the caller.
+fn isStrictValueBoundary(c: u8) bool {
+    return c == ',' or c == '}' or c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+/// B13-7 (B54 F5): true when `at` starts a `//` line comment in `content`.
+/// The lenient config grammar accepts a comment after the strict value
+/// like it does after every other value, so the opener counts as a token
+/// boundary. The two-byte peek with the bounds guard keeps "trueXYZ"
+/// rejected while "true//comment" arms the gate.
+fn isStrictCommentBoundary(content: []const u8, at: usize) bool {
+    return at + 1 < content.len and content[at] == '/' and content[at + 1] == '/';
+}
+
+/// End of a bare (unquoted) config token: the first boundary byte at or
+/// after `start`, or content.len at EOF. Bounds a malformed strict value
+/// for the stash (B13-7).
+fn bareTokenEnd(content: []const u8, start: usize) usize {
+    var i = start;
+    while (i < content.len and !isStrictValueBoundary(content[i])) : (i += 1) {}
+    return i;
 }
 
 /// Skip a // line comment, returning the index after the newline (or content.len)
@@ -35497,6 +35745,11 @@ fn parseConfigJson(diag: *DiagCtx, allocator: Allocator, content: []const u8, cf
     });
 }
 
+/// Keys parse in file order. A repeated scalar key resolves last-wins
+/// (setOwnedPath, setFailOn, error_naming overwrite); a repeated list key
+/// accumulates (each value appends) (B13-12, EPH-I0518). The duplicate
+/// semantics are documented in printHelp; the README coverage is pending
+/// EPH-I1050 (README lag). There is no duplicate detection.
 fn parseConfigJsonSource(ctx: ConfigParseCtx) !void {
     const content = ctx.content;
     var i: usize = 0;
@@ -35632,6 +35885,15 @@ fn writeDefaultConfig(io: std.Io) !void {
     std.debug.print("Created {s}\n", .{CONFIG_FILENAME});
 }
 
+/// Owned dupe with an OOM fallback the caller can always free (B13-17,
+/// EPH-I0520). The fallback is a static zero-length slice: free of a
+/// zero-length slice is a no-op per the Allocator contract, so the
+/// callers' unconditional frees are legal. The pre-fix `catch "."`
+/// returned a non-empty static literal callers later freed — a crash.
+fn dupeOrEmpty(allocator: Allocator, value: []const u8) []const u8 {
+    return allocator.dupe(u8, value) catch &.{};
+}
+
 /// Detect the path_dir from build.zig by finding root_source_file patterns.
 /// Returns an allocator-owned string. Caller must free. The detected
 /// directory must realpath inside the cwd (RED4-2 backstop: a symlinked
@@ -35648,7 +35910,7 @@ fn detectPathDirFromBuildZig(io: std.Io, allocator: Allocator) []const u8 {
                 "  hint: run from project root, or: ephor check <dir>\n",
             .{err},
         );
-        return allocator.dupe(u8, ".") catch ".";
+        return dupeOrEmpty(allocator, ".");
     };
 
     defer allocator.free(content);
@@ -35660,9 +35922,9 @@ fn detectPathDirFromBuildZig(io: std.Io, allocator: Allocator) []const u8 {
                 "project. Using \".\" as the scan root.\n",
             .{result},
         );
-        return allocator.dupe(u8, ".") catch ".";
+        return dupeOrEmpty(allocator, ".");
     }
-    return allocator.dupe(u8, result) catch ".";
+    return dupeOrEmpty(allocator, result);
 }
 
 /// Containment backstop for the build.zig detection result (RED4-2): the
@@ -35729,6 +35991,23 @@ fn findPathDirInContent(content: []const u8) []const u8 {
     return ".";
 }
 
+/// Append an owned slice to a string list, freeing it when the append
+/// OOMs (B13-18, EPH-I0520). The slice is in no list until the append,
+/// so only this catch can free it on failure; after the append the
+/// caller's list-level errdefer owns the free. The pre-fix callers
+/// map-inserted first, leaking the slice when the append failed between
+/// the two.
+fn appendOwnedEntry(
+    entries: *std.ArrayListUnmanaged([]const u8),
+    allocator: Allocator,
+    owned: []const u8,
+) !void {
+    entries.append(allocator, owned) catch |err| {
+        allocator.free(owned);
+        return err;
+    };
+}
+
 /// Collect entry points from build.zig for the install config.
 /// Returns entries as a list of strings (caller frees with allocator).
 fn collectInstallEntries(
@@ -35757,8 +36036,8 @@ fn collectInstallEntries(
     };
 
     if (main_exists) {
+        try appendOwnedEntry(&entries, allocator, main_path);
         try added.put(main_path, {});
-        try entries.append(allocator, main_path);
     } else {
         allocator.free(main_path);
     }
@@ -35766,8 +36045,8 @@ fn collectInstallEntries(
     // Always add build.zig as entry
     const build_zig = try allocator.dupe(u8, "build.zig");
     if (!added.contains(build_zig)) {
+        try appendOwnedEntry(&entries, allocator, build_zig);
         try added.put(build_zig, {});
-        try entries.append(allocator, build_zig);
     } else {
         allocator.free(build_zig);
     }
@@ -36305,7 +36584,9 @@ fn runUpgradeCommand(
     const ver = install_version orelse (fetched_ver orelse EPHOR_VERSION);
 
     // Floor: a downgrade needs --force. Applies to an explicit --version
-    // too (EPH-I0193). Refuse before any fetch or write.
+    // too (EPH-I0193). Refuse before any write; the implicit-version
+    // fetch above already ran — it must, to resolve the upgrade target
+    // the floor compares (B13-20).
     if (!upgradeFloorAllows(EPHOR_VERSION, ver, opts.force)) {
         cliDiag(
             diag,
@@ -36911,10 +37192,12 @@ fn resolveLatestVersion(
     return latest;
 }
 
-/// Byte cap on a version-fetch curl stdout (EPH-I0156). The tags API page
-/// (limit=10) is a few KiB and the zon page is smaller. 64 KiB is
-/// generous. A larger body fails the fetch with StreamTooLong, which the
-/// existing catch routes into the fallback chain.
+/// Byte cap on a version-fetch curl stdout and stderr (EPH-I0156,
+/// B13-19). The tags API page (limit=10) is a few KiB and the zon page is
+/// smaller. 64 KiB is generous. A larger body fails the fetch with
+/// StreamTooLong, which the existing catch routes into the fallback
+/// chain. Both streams are capped: the pre-fix spawns capped stdout only,
+/// leaving a hostile network free to grow stderr unbounded (B13-19).
 const version_fetch_stdout_limit_bytes = 64 * 1024;
 
 /// Build the argv both version-fetch curl spawns share (EPH-I0156). One
@@ -36945,6 +37228,7 @@ fn fetchLatestVersion(io: std.Io, allocator: Allocator) ?[]const u8 {
     const api_result = std.process.run(allocator, io, .{
         .argv = &api_argv,
         .stdout_limit = .limited(version_fetch_stdout_limit_bytes),
+        .stderr_limit = .limited(version_fetch_stdout_limit_bytes),
     }) catch return fetchVersionFromZon(io, allocator);
     defer allocator.free(api_result.stdout);
     defer allocator.free(api_result.stderr);
@@ -36963,6 +37247,7 @@ fn fetchVersionFromZon(io: std.Io, allocator: Allocator) ?[]const u8 {
     const result = std.process.run(allocator, io, .{
         .argv = &zon_argv,
         .stdout_limit = .limited(version_fetch_stdout_limit_bytes),
+        .stderr_limit = .limited(version_fetch_stdout_limit_bytes),
     }) catch return null;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -38413,6 +38698,17 @@ fn printHelp() void {
         \\    }
         \\  }
         \\
+        \\  Keys parse in file order. A repeated scalar key (path_dir,
+        \\  strict, fail_on, error_naming) resolves last-wins. A repeated
+        \\  list key (entries, exclude, orphan_exclude, disable, enable)
+        \\  accumulates (B13-12). String values are used raw: JSON escape
+        \\  sequences are not decoded, so "a\/b" stays the literal bytes
+        \\  a\/b and never matches the path a/b (B13-10). path_dir also
+        \\  accepts code, src, and root as aliases. A non-empty
+        \\  orphan_exclude REPLACES the built-in defaults (build.zig,
+        \\  _test.zig, and the directory patterns), it does not extend
+        \\  them — list a built-in you still want (B13-15).
+        \\
         \\CONFIG TRUST MODEL:
         \\  A config file is trusted when its directory is the working
         \\  directory or an ancestor of it (realpath compare).
@@ -38435,6 +38731,9 @@ fn printHelp() void {
         \\  // ephor:ignore ZA201       (above fn/block: suppresses entire scope)
         \\  // ephor:ignore-file ZA201  (suppresses rule for entire file)
         \\  // ephor:ignore             (omit rule to suppress all)
+        \\  Rule ids match exactly: ZA3 does not suppress ZA301. Config
+        \\  disable/enable accept category prefixes. Directives do not.
+        \\  Doc comments (/// and //!) never carry directives (B13-13/14).
         \\
         \\SUPPRESSION ACCOUNTING:
         \\  Suppression is never silent. When an inline directive, the
@@ -38595,10 +38894,12 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
     }
 
     if (!explicit) {
-        diag.known_issues_autoload_count += 1;
         // path_dir can steer cfg.path into an attacker-named directory.
         var safe_path = try types.sanitizeTerminal(allocator, path);
         defer safe_path.deinit(allocator);
+        // B13-21 (EPH-I0520): count only after the fallible sanitize
+        // succeeded — an OOM before the note prints must not count it.
+        diag.known_issues_autoload_count += 1;
         cliDiag(diag, "note: loaded {d} known-issue {s} from {s}\n", .{
             keys_added,
             if (keys_added == 1) @as([]const u8, "entry") else "entries",
@@ -38618,10 +38919,12 @@ fn detectKnownIssuesPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !?[
     Fs.cwd(diag.io).access(ignore_path, .{}) catch return null; // No known issues file
     const trusted = cfg.trust_target_config or isConfigDirTrusted(diag.io, cfg.path);
     if (!trusted) {
-        diag.untrusted_ignore_skip_count += 1;
         // The scanned tree supplies the path bytes here: sanitize them.
         var safe_path = try types.sanitizeTerminal(allocator, ignore_path);
         defer safe_path.deinit(allocator);
+        // B13-21 (EPH-I0520): count only after the fallible sanitize
+        // succeeded — an OOM before the note prints must not count it.
+        diag.untrusted_ignore_skip_count += 1;
         cliDiag(
             diag,
             "note: ignoring untrusted .ephor-ignore at {s} " ++
@@ -40009,9 +40312,11 @@ fn noteEntriesWidenScan(
 ) !void {
     const widened = countOutOfRootEntries(diag.io, scan_path, entries);
     if (widened == 0) return;
-    diag.entries_widen_note_count += 1;
     var safe_path = try types.sanitizeTerminal(allocator, scan_path);
     defer safe_path.deinit(allocator);
+    // B13-21 (EPH-I0520): count only after the fallible sanitize
+    // succeeded — an OOM before the note prints must not count it.
+    diag.entries_widen_note_count += 1;
     cliDiag(
         diag,
         "note: scan includes {d} entry point{s} outside {s} " ++
@@ -40614,6 +40919,68 @@ test "analyzeFile releases the analysis when the graph insert fails (EPH-I0375)"
         var graph = ImportGraph.init(failing.allocator(), &diag);
         defer graph.deinit();
         graph.analyzeFile(file_path) catch continue;
+    }
+}
+
+test "dupeOrEmpty always returns a freeable slice (B13-17)" {
+    // The OOM fallback must survive the callers' unconditional frees:
+    // the pre-fix `catch "."` returned a non-empty static literal that
+    // callers freed — a crash. The empty fallback is safe because free
+    // of a zero-length slice is a no-op per the Allocator contract.
+    const allocator = std.testing.allocator;
+
+    // Normal path: the value is duped and freeable.
+    const owned = dupeOrEmpty(allocator, "src");
+    try std.testing.expectEqualStrings("src", owned);
+    allocator.free(owned);
+
+    // OOM at the first dupe: the empty fallback is returned and freeable.
+    var failing = std.testing.FailingAllocator.init(allocator, .{
+        .fail_index = 0,
+    });
+    const fallback = dupeOrEmpty(failing.allocator(), "src");
+    try std.testing.expectEqual(@as(usize, 0), fallback.len);
+    failing.allocator().free(fallback);
+}
+
+test "collectInstallEntries leaks nothing under allocation failure (B13-18)" {
+    // OOM sweep over collectInstallEntries' allocations. Pre-fix, a
+    // put-then-append OOM between the two leaked one path slice: the map
+    // held it, the list the errdefer frees never did. A real main.zig in
+    // a tmp dir sweeps the main arm too: with the project root as the
+    // root dir the main file is absent and the main arm's append/put
+    // allocations never run (B54 F4).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(root_dir);
+    const main_path = try std.fmt.allocPrint(allocator, "{s}/main.zig", .{root_dir});
+    defer allocator.free(main_path);
+    try Fs.cwd(std.testing.io).writeFile(main_path, "pub fn main() void {}\n", .{});
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var entries = try collectInstallEntries(std.testing.io, probe.allocator(), root_dir);
+        defer {
+            for (entries.items) |e| probe.allocator().free(e);
+            entries.deinit(probe.allocator());
+        }
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var entries = collectInstallEntries(
+            std.testing.io,
+            failing.allocator(),
+            root_dir,
+        ) catch continue;
+        for (entries.items) |e| failing.allocator().free(e);
+        entries.deinit(failing.allocator());
     }
 }
 
@@ -56632,6 +56999,45 @@ test "ignore-file in doc comment does not suppress file-wide (EPH-I0051)" {
     ;
     try std.testing.expect(!isInlineDisabled(content, 2, "ZA201"));
     try std.testing.expect(!isInlineDisabled(content, 4, "ZA201"));
+}
+
+test "module doc comment //! does not suppress (B13-13)" {
+    // `//!` is a doc comment too: the exclusion is explicit in
+    // parseDirective, not an accident of the `!` token shape.
+    const same_line =
+        \\//! ephor:ignore ZA201
+        \\const x = foo() catch {};
+    ;
+    try expectSuppression(same_line, 2, false);
+    const file_level =
+        \\//! ephor:ignore-file ZA201
+        \\const a = foo() catch {};
+        \\fn f() void {
+        \\    bar() catch {};
+        \\}
+    ;
+    try std.testing.expect(!isInlineDisabled(file_level, 2, "ZA201"));
+    try std.testing.expect(!isInlineDisabled(file_level, 4, "ZA201"));
+}
+
+test "directive rule ids are exact, config disable prefixes are not (B13-14)" {
+    // A directive matches the rule id exactly: `ZA3` suppresses nothing.
+    // The config disable list matches prefixes: "ZA3" kills the category.
+    // The asymmetry is documented in printHelp (README lag EPH-I1050).
+    const content =
+        \\// ephor:ignore ZA3
+        \\const x = foo() catch {};
+    ;
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA301"));
+    try std.testing.expect(!isInlineDisabled(content, 2, "ZA305"));
+
+    // The config channel's prefix match is the documented contrast.
+    var diag = testDiagCtx();
+    var cfg = testConfig();
+    const allocator = std.testing.allocator;
+    defer cfg.deinit(allocator);
+    try parseConfigJson(&diag, allocator, "{\"disable\": [\"ZA3\"]}", &cfg);
+    try std.testing.expect(!cfg.isRuleEnabled("ZA301"));
 }
 
 test "ephor:ignore with multiple rules suppresses each listed rule" {
@@ -96507,6 +96913,41 @@ test "config strict:false leaves findings informational" {
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
 }
 
+test "config strict:trueXYZ is refused, never gated (EPH-I0515)" {
+    // B13-7: "true" must sit at a token boundary — `,`, `}`, whitespace,
+    // or EOF. A prefix match on "trueXYZ" armed the gate on garbage.
+    var diag = testDiagCtx();
+    var cfg = testConfig();
+    try std.testing.expectError(
+        error.InvalidStrictValue,
+        parseConfigJson(&diag, std.testing.allocator, "{\"strict\": trueXYZ}", &cfg),
+    );
+    // fail closed: the malformed CI gate must not leave a gate
+    // half-configured, and the stash names the offending token.
+    try std.testing.expectEqual(FailOn.never, cfg.fail_on);
+    const stashed = diag.last_bad_gate_value[0..diag.last_bad_gate_value_len];
+    try std.testing.expectEqualStrings("trueXYZ", stashed);
+}
+
+test "config strict:true accepts every token boundary (EPH-I0515)" {
+    const forms = [_][]const u8{
+        "{\"strict\": true}", // closing brace
+        "{\"strict\": true,}", // comma
+        "{\"strict\": true }", // trailing space
+        "{\"strict\": true\n}", // newline
+        "{\"strict\": true\t}", // tab
+        "{\"strict\": true\r}", // carriage return
+        "{\"strict\": true", // EOF
+        "{\"strict\": true// comment\n}", // line comment (B54 F5)
+    };
+    for (forms) |form| {
+        var diag = testDiagCtx();
+        var cfg = testConfig();
+        try parseConfigJson(&diag, std.testing.allocator, form, &cfg);
+        try std.testing.expectEqual(FailOn.warning, cfg.fail_on);
+    }
+}
+
 test "config fail_on parses the level" {
     var diag = testDiagCtx();
     var cfg = testConfig();
@@ -96577,7 +97018,34 @@ test "config invalid fail_on is a hard usage error" {
     // fail closed: the rejected key must not leave a gate half-configured
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
     // error detail stashed so the catch-site can name path + value
-    try std.testing.expectEqualStrings("warn", diag.last_bad_fail_on.?);
+    // (B13-17: owned copy in the fixed buffer, not a dangling slice into
+    // the freed config content)
+    const stashed = diag.last_bad_gate_value[0..diag.last_bad_gate_value_len];
+    try std.testing.expectEqualStrings("warn", stashed);
+}
+
+test "config error_naming hostile value warns through the sanitizer (B13-10)" {
+    // The unknown-value warning routes the config value through
+    // sanitizeTerminal (EPH-I0147): a control byte in the value must not
+    // reach the terminal raw. The parse survives and keeps the default.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    var cfg = testConfig();
+    try parseConfigJson(
+        &diag,
+        std.testing.allocator,
+        "{\"error_naming\": \"kebab\x1bcase\"}",
+        &cfg,
+    );
+    try std.testing.expectEqual(ErrorNaming.title_case, cfg.error_naming);
+
+    // The rendered warning contains none of the raw bytes — the
+    // discriminator: the default-sticks assertion alone held pre-fix.
+    var out = types.OutBuf{ .allocator = std.testing.allocator };
+    defer out.deinit();
+    try formatBadErrorNaming(&out, "ephor.json", "kebab\x1bcase");
+    try std.testing.expect(mem.indexOfScalar(u8, out.buf.items, 0x1B) == null);
+    try std.testing.expect(mem.indexOf(u8, out.buf.items, "kebab?case") != null);
 }
 
 test "CLI --strict sets the warning gate" {
@@ -96741,6 +97209,38 @@ test "same source resolves last-wins" {
     try parseCliArg(cli_ctx, "--strict");
     try parseCliArg(cli_ctx, "--fail-on=error");
     try std.testing.expectEqual(FailOn.err, cfg.fail_on);
+}
+
+test "duplicate list keys accumulate, duplicate scalars last-win (B13-12)" {
+    // Documented semantics (printHelp; README lag EPH-I1050): a repeated
+    // list key appends every value; a repeated scalar key resolves
+    // last-wins.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"exclude\": [\"a\"], \"exclude\": [\"b\", \"c\"]}",
+        &cfg,
+    );
+    try std.testing.expectEqual(@as(usize, 3), cfg.exclude.items.len);
+    try std.testing.expectEqualStrings("a", cfg.exclude.items[0]);
+    try std.testing.expectEqualStrings("b", cfg.exclude.items[1]);
+    try std.testing.expectEqualStrings("c", cfg.exclude.items[2]);
+}
+
+test "config values are used raw, escapes are not decoded (B13-10)" {
+    // The raw span is the consumer contract: `a\/b` stays the seven
+    // bytes a\/b and never matches the path a/b.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(&diag, allocator, "{\"exclude\": [\"a\\/b\"]}", &cfg);
+    try std.testing.expectEqual(@as(usize, 1), cfg.exclude.items.len);
+    try std.testing.expectEqualStrings("a\\/b", cfg.exclude.items[0]);
 }
 
 // ============================================================================
@@ -97007,6 +97507,73 @@ test "untrusted target config keeps suppression and gate keys off (RED3-1/2/6/8)
     // ...while analysis keys stay honored (entries made absolute).
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expect(mem.startsWith(u8, cfg.entries.items[0], dir_path));
+}
+
+test "oversized target config warns instead of vanishing (EPH-I0517)" {
+    // B13-9: the pre-fix `catch return false` treated a >64 KiB config
+    // (readFileAlloc StreamTooLong) as absent — the run silently lost the
+    // user's gate and suppression keys. Now it warns and continues.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    diag.cli_diagnostics_enabled = false;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+
+    var big: [70 * 1024]u8 = undefined;
+    @memset(&big, 'x');
+    try writeTestConfig(dir_path, &big);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, dir_path);
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
+    try std.testing.expectEqual(@as(usize, 1), diag.unreadable_config_warn_count);
+    // The unreadable file contributed nothing (same as absent), but the
+    // warning proves the failure was not silent.
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+}
+
+test "missing target config stays silent (EPH-I0517)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, dir_path);
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
+    // FileNotFound is the normal fall-through: no warning, no counter.
+    try std.testing.expectEqual(@as(usize, 0), diag.unreadable_config_warn_count);
+}
+
+test "orphan_exclude config list replaces the built-in defaults (B13-15)" {
+    // Documented semantics: a non-empty config orphan_exclude REPLACES
+    // the built-in defaults (build.zig, _test.zig, directory patterns);
+    // it does not extend them. A custom pattern alone re-enables the
+    // built-in classes' reports.
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try cfg.orphan_exclude.append(allocator, try allocator.dupe(u8, "/custom/"));
+
+    // The built-in shapes are no longer excluded...
+    try std.testing.expect(!isOrphanExcluded("build.zig", &cfg));
+    try std.testing.expect(!isOrphanExcluded("src/main_test.zig", &cfg));
+    try std.testing.expect(!isOrphanExcluded("src/vendor/x.zig", &cfg));
+    // ...while the configured pattern still matches.
+    try std.testing.expect(isOrphanExcluded("src/custom/util.zig", &cfg));
+
+    // With an empty config list, the built-in defaults apply again.
+    var plain = testConfig();
+    defer plain.deinit(allocator);
+    try std.testing.expect(isOrphanExcluded("build.zig", &plain));
+    try std.testing.expect(isOrphanExcluded("src/main_test.zig", &plain));
+    try std.testing.expect(isOrphanExcluded("src/vendor/x.zig", &plain));
 }
 
 test "trusted config keeps full control of suppression and gates" {
@@ -97970,6 +98537,44 @@ test "config path_dir outside the config directory is rejected (RED4-1)" {
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(cfg.path_owned);
     try std.testing.expectEqual(@as(usize, 2), diag.path_dir_reject_count);
+}
+
+test "config path_dir aliases code, src, root all route to the same key (B13-10)" {
+    // The aliases are documented in printHelp and README; each one must
+    // behave exactly like "path_dir" (containment-checked, stored).
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    diag.cli_diagnostics_enabled = false;
+    const aliases = [_][]const u8{ "code", "src", "root" };
+    for (aliases) |alias| {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        const content = try std.fmt.allocPrint(allocator, "{{\"{s}\": \"src\"}}", .{alias});
+        defer allocator.free(content);
+        try parseConfigJson(&diag, allocator, content, &cfg);
+        try std.testing.expectEqualStrings("src", cfg.path);
+        try std.testing.expect(cfg.path_owned);
+        try std.testing.expectEqual(@as(usize, 0), diag.path_dir_reject_count);
+    }
+}
+
+test "config thresholds overflow warns and keeps the default (B13-11)" {
+    // A digit run overflowing usize is unparseable: the pre-fix code
+    // skipped it silently, so a typo'd huge value reverted to the default
+    // with no signal. Now it warns (EPH-I0518).
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    diag.cli_diagnostics_enabled = false;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"thresholds\": {\"max_function_lines\": 999999999999999999999999999}}",
+        &cfg,
+    );
+    try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(@as(usize, 1), diag.threshold_invalid_count);
 }
 
 test "config path_dir rejection warning sanitizes hostile value bytes" {

@@ -4865,6 +4865,13 @@ const DefFlowSets = struct {
     def_entry: []bool,
     def_exit: []bool,
     num_blocks: usize,
+    /// Included-edge count (succ_flat.len): the worklist's drain bound
+    /// is B + 2E + 1, not 2B + 1 — each block's entry and exit each
+    /// flip at most once, and each flip re-enqueues the block's
+    /// successors (EPH-I1058). The former 2B+1 cap is safe only when
+    /// 2E <= B + 1, which a chain of two-arm conditionals breaches (bun
+    /// cli/Arguments.zig parse: B=518, E=759, 1038 enqueues).
+    num_edges: usize,
 };
 
 /// Per-read scan context: the analysis inputs plus the flow results the
@@ -4940,21 +4947,26 @@ fn checkVarDefiniteAssignment(
     defer er_memo.deinit(ctx.allocator);
 
     // The queue worklist visits each block at most twice per variable
-    // (worklist_visit_cap_mult); the queue and the in-queue marks are
-    // per-variable scratch (EPH-I0335).
-    const queue = try ctx.allocator.alloc(usize, ctx.num_blocks *| 2 +| 1);
+    // (once per def-state flip; see DefFlowSets.num_edges for the drain
+    // bound); the queue and the in-queue marks are per-variable scratch
+    // (EPH-I0335). Sized to B + 2E + 1 — the provable drain bound
+    // (EPH-I1058); the former 2B+1 cap overflowed on two-arm
+    // conditional chains (bun cli/Arguments.zig).
+    const queue_capacity = ctx.num_blocks +| 2 *| ctx.neighbors.succ_flat.len +| 1;
+    const queue = try ctx.allocator.alloc(usize, queue_capacity);
     defer ctx.allocator.free(queue);
     const in_queue = try ctx.allocator.alloc(bool, ctx.num_blocks);
     defer ctx.allocator.free(in_queue);
     @memset(in_queue, false);
 
-    // The visit-count return pins the 2B+1 drain bound in a test
+    // The visit-count return pins the drain bound in a test
     // (EPH-I0335); the production caller needs only the fixpoint.
     _ = runDefiniteAssignmentWorklist(ctx.neighbors, .{
         .gen = gen_sets.gen,
         .def_entry = def_entry,
         .def_exit = def_exit,
         .num_blocks = ctx.num_blocks,
+        .num_edges = ctx.neighbors.succ_flat.len,
     }, queue, in_queue);
 
     const sc: ReadScanCtx = .{
@@ -6673,31 +6685,33 @@ fn parenBalanceOutsideQuotes(t: []const u8) i32 {
     return balance;
 }
 
-/// Worklist visit cap: 2 * blocks + 1. The def-state equations are
-/// monotone (entry and exit flip false->true at most once per block),
-/// so the queue-driven fixpoint visits each block at most twice — the
-/// initial visit plus one re-visit per state flip (EPH-I0335, band-B01b
-/// F-09). The sweep form this replaces iterated up to the same
-/// 2 * blocks + 1 FULL PASSES over every edge — O(passes * B * E) per
-/// variable; the queue form is O(B + E) per variable. The cap is
-/// defensive: the monotone bound terminates the loop first. On a cap
-/// hit the loop stops with the under-approximate state — a read may
-/// report where a longer run would prove coverage, never the reverse
-/// (band-B01b F-13).
-const worklist_visit_cap_mult = 2;
-
+/// Worklist visit cap: B + 2E + 1 (blocks + twice the included-edge
+/// count). The def-state equations are monotone: each block's entry and
+/// exit flip false->true at most once, and each state flip re-enqueues
+/// the block's successors. Total enqueues therefore stay below
+/// B + 2E (the initial fill plus at most two re-enqueues per included
+/// edge) — EPH-I1058. The former 2B+1 cap is safe only when
+/// 2E <= B + 1, which a chain of two-arm conditionals breaches (bun
+/// cli/Arguments.zig parse: B=518, E=759, 1038 enqueues; the 2B+1 cap
+/// overflowed with a deterministic abort — the release-blocking corpus
+/// crash). The queue
+/// form replaces the former sweep's O(passes * B * E) with O(B + E) per
+/// variable. The cap is defensive: the monotone bound terminates the
+/// loop first. On a cap hit the loop stops with the under-approximate
+/// state — a read may report where a longer run would prove coverage,
+/// never the reverse (band-B01b F-13).
 /// Drive the def-state fixpoint with a queue (EPH-I0335, band-B01b
 /// F-09): a block is revisited only when a predecessor's exit changed,
 /// instead of re-sweeping every block and edge per pass. Returns the
-/// visit count — the 2B+1 drain pin (a test asserts the queue drained
-/// below the cap, EPH-I1003).
+/// visit count — the B + 2E + 1 drain pin (a test asserts the queue
+/// drained below the cap, EPH-I1003, EPH-I1058).
 fn runDefiniteAssignmentWorklist(
     nb: *const BlockNeighbors,
     flow: DefFlowSets,
     queue: []usize,
     in_queue: []bool,
 ) usize {
-    const max_visits = flow.num_blocks *| worklist_visit_cap_mult +| 1;
+    const max_visits = flow.num_blocks +| 2 *| flow.num_edges +| 1;
     var head: usize = 0;
     var tail: usize = 0;
     for (0..flow.num_blocks) |bid| {
@@ -6717,14 +6731,10 @@ fn runDefiniteAssignmentWorklist(
         flow.def_exit[bid] = new_out;
         for (nb.succ_flat[nb.succ_offsets[bid]..nb.succ_offsets[bid + 1]]) |s| {
             if (in_queue[s]) continue;
-            // The queue holds max_visits entries — the same 2B+1 bound
-            // the loop caps visits at. The sizing rests on the
-            // monotone def-state argument (EPH-I0335): a block's entry
-            // and exit flip false->true at most once, so total
-            // enqueues stay below the cap on the shapes the CFG
-            // builder produces. A breach is a builder-shape violation,
-            // not a fixpoint case: fail loudly here instead of writing
-            // past the queue (EPH-I1003).
+            // The queue holds max_visits entries — the B + 2E + 1 drain
+            // bound (EPH-I1058). The bound holds for every shape, so a
+            // breach here is an internal analysis bug: fail loudly
+            // instead of writing past the queue (EPH-I1003).
             std.debug.assert(tail < max_visits);
             queue[tail] = s;
             tail += 1;
@@ -58072,7 +58082,130 @@ test "integration: undefined variable read" {
     try std.testing.expect(def_issues.count() > 0);
 }
 
-test "definite-assignment worklist drains within the 2B+1 cap (EPH-I0335, EPH-I1003)" {
+test "definite-assignment worklist drains beyond the 2B+1 cap (EPH-I1058)" {
+    // The bun cli/Arguments.zig parse crash (the release-blocking corpus
+    // abort): a long chain of payload-ifs and nested-return ifs with the
+    // var's assignment if/else near the start. The CFG builder
+    // pre-creates each if's false-continuation block, so the inner
+    // merges flow back to lower block ids; the flip wave then
+    // re-enqueues nearly every downstream block. This shape has
+    // B = 64 blocks and E = 94 included edges; the worklist enqueues
+    // 130 entries — one past the former 2B+1 cap, which asserted and
+    // aborted the whole scan (exit 134). The queue bound is
+    // B + 2E + 1: each block's entry and exit flip false->true at most
+    // once, and each flip re-enqueues the block's successors, so total
+    // enqueues stay below B + 2E.
+    const allocator = std.testing.allocator;
+    const lines = [_][]const u8{
+        "fn f(a: bool) void {",
+        "    var v: u32 = undefined;",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        v = 2;",
+        "    } else {",
+        "        v = 3;",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    if (opt) |p| {",
+        "        if (p > 0) { return; }",
+        "    }",
+        "    if (a) {",
+        "        if (a) { return; }",
+        "    }",
+        "    _ = v;",
+        "}",
+    };
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+    var nb = try buildBlockNeighbors(allocator, &cfg);
+    defer nb.deinit(allocator);
+    const num_blocks = cfg.blocks.items.len;
+    const num_edges = nb.succ_flat.len;
+    // The analysis must complete: pre-fix, the 2B+1 queue overflowed on
+    // this shape and the fail-loud assert aborted the run.
+    var def_issues = try analyzeDefiniteAssignment(allocator, &cfg, &lines, 1);
+    defer def_issues.deinit();
+    // The drain pin: the worklist stays inside the B + 2E + 1 bound and
+    // lands BEYOND the former 2B+1 cap (130 visits for 64 blocks), so
+    // the fixture really exercises the overflow region. The gen set is
+    // the production attribution for the var's assignments (the same
+    // computeGenSetForVar the analysis path runs).
+    var gs = try computeGenSetForVar(&.{
+        .allocator = allocator,
+        .cfg = &cfg,
+        .lines = &lines,
+        .func_line = 1,
+        .num_blocks = num_blocks,
+        .neighbors = &nb,
+    }, "v");
+    defer gs.deinit(allocator);
+    const gen = gs.gen;
+    const def_entry = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(def_entry);
+    const def_exit = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(def_exit);
+    @memset(def_entry, false);
+    @memset(def_exit, false);
+    const queue = try allocator.alloc(usize, num_blocks +| 2 *| num_edges +| 1);
+    defer allocator.free(queue);
+    const in_queue = try allocator.alloc(bool, num_blocks);
+    defer allocator.free(in_queue);
+    @memset(in_queue, false);
+    const visits = runDefiniteAssignmentWorklist(&nb, .{
+        .gen = gen,
+        .def_entry = def_entry,
+        .def_exit = def_exit,
+        .num_blocks = num_blocks,
+        .num_edges = num_edges,
+    }, queue, in_queue);
+    try std.testing.expect(visits > num_blocks *| 2 +| 1);
+    try std.testing.expect(visits < num_blocks +| 2 *| num_edges +| 1);
+}
+
+test "definite-assignment worklist drains within the B+2E+1 bound (EPH-I0335, EPH-I1003, EPH-I1058)" {
     const allocator = std.testing.allocator;
     // A small branchy function. The queue-driven fixpoint must visit
     // each block at most twice (initial plus one re-visit per state
@@ -58080,14 +58213,16 @@ test "definite-assignment worklist drains within the 2B+1 cap (EPH-I0335, EPH-I1
     // over every edge. Pre-fix, a chain-shaped CFG of B blocks paid
     // O(B^2) visits; the drain is the hermetic pin.
     //
-    // The loop condition caps visits at 2B+1, so a <= assertion can
-    // never fail (EPH-I1003): the cap exits only with visits == 2B+1
-    // and returns that exact value. The strict form discriminates the
-    // two exits. It holds only when the queue drained, and fails only
-    // when the cap truncated the run — the F-13 under-approximation,
-    // where a read may report where a longer run would prove coverage.
-    // The monotone bound says the drain always comes first on the
-    // shapes the CFG builder produces (loop-back preds are excluded).
+    // The loop condition caps visits at B + 2E + 1 (blocks plus twice
+    // the included edges), so a <= assertion can never fail
+    // (EPH-I1003, EPH-I1058): the cap exits only with visits ==
+    // B + 2E + 1 and returns that exact value. The strict form
+    // discriminates the two exits. It holds only when the queue
+    // drained, and fails only when the cap truncated the run — the
+    // F-13 under-approximation, where a read may report where a longer
+    // run would prove coverage. The monotone bound says the drain
+    // always comes first on the shapes the CFG builder produces
+    // (loop-back preds are excluded).
     const lines = [_][]const u8{
         "fn f(a: bool) !void {",
         "    if (a) {",
@@ -58110,7 +58245,7 @@ test "definite-assignment worklist drains within the 2B+1 cap (EPH-I0335, EPH-I1
     defer allocator.free(def_exit);
     @memset(def_entry, false);
     @memset(def_exit, false);
-    const queue = try allocator.alloc(usize, num_blocks *| 2 +| 1);
+    const queue = try allocator.alloc(usize, num_blocks +| 2 *| nb.succ_flat.len +| 1);
     defer allocator.free(queue);
     const in_queue = try allocator.alloc(bool, num_blocks);
     defer allocator.free(in_queue);
@@ -58120,8 +58255,9 @@ test "definite-assignment worklist drains within the 2B+1 cap (EPH-I0335, EPH-I1
         .def_entry = def_entry,
         .def_exit = def_exit,
         .num_blocks = num_blocks,
+        .num_edges = nb.succ_flat.len,
     }, queue, in_queue);
-    try std.testing.expect(visits < num_blocks *| 2 +| 1);
+    try std.testing.expect(visits < num_blocks +| 2 *| nb.succ_flat.len +| 1);
 }
 
 test "definite-assignment converges on a 10k-line adversarial function (EPH-I0335)" {

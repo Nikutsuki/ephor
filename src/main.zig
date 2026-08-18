@@ -34481,6 +34481,54 @@ fn parseCandidateConfig(
     return true;
 }
 
+/// Length snapshot of every config list a candidate load can append to
+/// (EPH-I0513). A parse that fails partway leaves the values parsed
+/// before the failure in the config; on the false path those partial
+/// values must unwind, or a later successful parent-config load would
+/// absolutize and gate them against the wrong base.
+const ConfigListSnapshot = struct {
+    entries: usize,
+    exclude: usize,
+    orphan_exclude: usize,
+    disabled_rules: usize,
+    enabled_rules: usize,
+};
+
+fn snapshotConfigLists(cfg: *const Config) ConfigListSnapshot {
+    return .{
+        .entries = cfg.entries.items.len,
+        .exclude = cfg.exclude.items.len,
+        .orphan_exclude = cfg.orphan_exclude.items.len,
+        .disabled_rules = cfg.disabled_rules.items.len,
+        .enabled_rules = cfg.enabled_rules.items.len,
+    };
+}
+
+/// Free and drop every element appended past `keep` (EPH-I0513). The
+/// elements before the snapshot stay owned by the config.
+fn rollbackConfigList(
+    list: *std.ArrayListUnmanaged([]const u8),
+    allocator: Allocator,
+    keep: usize,
+) void {
+    while (list.items.len > keep) {
+        allocator.free(list.pop().?);
+    }
+}
+
+/// Unwind every list to its pre-parse length (EPH-I0513, B13-5). Runs on
+/// the parse-failed path of tryLoadConfigFromDir: the partially parsed
+/// entries must not reach makeEntriesAbsolute, which the parent fallback
+/// would run against the parent base — an untrusted partial parse would
+/// leak past the realpath gate.
+fn rollbackConfigLists(cfg: *Config, allocator: Allocator, snap: ConfigListSnapshot) void {
+    rollbackConfigList(&cfg.entries, allocator, snap.entries);
+    rollbackConfigList(&cfg.exclude, allocator, snap.exclude);
+    rollbackConfigList(&cfg.orphan_exclude, allocator, snap.orphan_exclude);
+    rollbackConfigList(&cfg.disabled_rules, allocator, snap.disabled_rules);
+    rollbackConfigList(&cfg.enabled_rules, allocator, snap.enabled_rules);
+}
+
 /// Try to load ephor.json config from a directory, returning true if found
 fn tryLoadConfigFromDir(
     lctx: ConfigLoadCtx,
@@ -34521,7 +34569,16 @@ fn tryLoadConfigFromDir(
         .dir = dir_copy,
         .ignored_any = &ignored_any,
     };
-    if (!try parseCandidateConfig(lctx, content, source)) return false;
+    const list_snapshot = snapshotConfigLists(cfg);
+    if (!try parseCandidateConfig(lctx, content, source)) {
+        // A failed parse leaves the entries it appended in cfg; those
+        // partial entries would then be absolutized and trusted by a
+        // later successful parent-config load against the wrong base
+        // (EPH-I0513, B13-5). Roll them back before the caller falls
+        // back to the parent config.
+        rollbackConfigLists(cfg, allocator, list_snapshot);
+        return false;
+    }
 
     // Commit saved_path only AFTER its fallible consumers: until then the
     // caller's errdefer owns it, so a mid-load OOM frees it once (EPH-I0689).
@@ -34896,6 +34953,142 @@ fn setThresholdValue(th: *Thresholds, cli_mask: u8, k: []const u8, num: usize) v
     }
 }
 
+/// Code-position state for the JSON-with-comments config machinery
+/// (EPH-I0511, EPH-I0514). The lenient config grammar accepts `//`
+/// comments to end of line and string spans that cross newlines, so a
+/// position query walks the content from the start and carries both
+/// states: a byte is code when it is neither string data nor comment
+/// text. Queries must not move backwards.
+const JsonCodeScanner = struct {
+    content: []const u8,
+    pos: usize = 0,
+    in_string: bool = false,
+    in_comment: bool = false,
+
+    /// Advance the scanner state past one byte. Returns true when the
+    /// byte is code. Escaped bytes inside a string are consumed in
+    /// pairs (the extra step here), so the walk can overshoot a queried
+    /// target by one byte — the same constraint LineClassifier
+    /// documents; the escaped byte and the tail of its string share the
+    /// in-string verdict, so no caller-visible verdict changes.
+    fn step(self: *JsonCodeScanner, c: u8) bool {
+        if (self.in_comment) {
+            if (c == '\n') self.in_comment = false;
+            return false;
+        }
+        if (self.in_string) {
+            if (c == '\\') self.pos += 1;
+            if (c == '"') self.in_string = false;
+            return false;
+        }
+        if (c == '"') {
+            self.in_string = true;
+            return false;
+        }
+        if (c == '/' and self.pos + 1 < self.content.len and
+            self.content[self.pos + 1] == '/')
+        {
+            self.in_comment = true;
+            self.pos += 1;
+            return false;
+        }
+        return true;
+    }
+
+    /// True when position `target` is code: the byte is neither string
+    /// data nor comment text. Queries must not move backwards.
+    pub fn isCodeAt(self: *JsonCodeScanner, target: usize) bool {
+        std.debug.assert(target >= self.pos);
+        while (self.pos < target and self.pos < self.content.len) : (self.pos += 1) {
+            _ = self.step(self.content[self.pos]);
+        }
+        return !self.in_string and !self.in_comment;
+    }
+};
+
+/// Scan for the `:` separator of a just-parsed key (EPH-I0514, B13-6).
+/// The pre-fix scan took the first colon anywhere, so a missing
+/// separator bound the key to a `:` inside a later string literal or a
+/// comment, shifting every following pair. The scan now stops at the
+/// first string opener, newline, comment opener, or EOF: a separator
+/// never sits inside the next string, and the lenient grammar is
+/// line-oriented, so a colon on a later line cannot bind.
+/// Returns the colon position, or the stop-byte position (content.len
+/// at EOF) when the separator is missing.
+fn findKeySeparator(content: []const u8, start: usize) usize {
+    var i = start;
+    while (i < content.len) : (i += 1) {
+        const c = content[i];
+        if (c == ':') return i;
+        if (c == '"' or c == '\n' or c == '\r') return i;
+        if (c == '/' and i + 1 < content.len and content[i + 1] == '/') return i;
+    }
+    return i;
+}
+
+/// Skip the stray value of a key whose separator is missing. The
+/// separator scan stopped at the first string opener, newline, comment
+/// opener, or EOF; a string opener means the stray value is a string,
+/// so its span is consumed and the following pairs stay aligned
+/// (EPH-I0514).
+fn skipSeparatorlessPairValue(content: []const u8, stop: usize) usize {
+    if (stop < content.len and content[stop] == '"') return skipJsonStringSpan(content, stop);
+    return stop;
+}
+
+/// First code-position occurrence of `key` that sits in key position:
+/// the match is a JSON key whose separator colon follows in code
+/// (EPH-I0511). A value whose text equals the key (for example
+/// "note": "thresholds") matches the raw needle but is followed by a
+/// comma or a newline, not a colon, so the key-shape check rejects it.
+fn findConfigKey(content: []const u8, key: []const u8) ?usize {
+    var scanner = JsonCodeScanner{ .content = content };
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, content, from, key)) |pos| {
+        if (!scanner.isCodeAt(pos)) {
+            from = pos + 1;
+            continue;
+        }
+        const sep = findKeySeparator(content, pos + key.len);
+        if (sep < content.len and content[sep] == ':') return pos;
+        from = pos + 1;
+    }
+    return null;
+}
+
+/// Position of the next `{` at or after `start` that sits in code
+/// (EPH-I0511). The pre-fix scans took the first `{` anywhere: a leading
+/// comment or a string value holding `{` retargeted the splice.
+fn findConfigObjectBrace(content: []const u8, start: usize) ?usize {
+    var scanner = JsonCodeScanner{ .content = content };
+    var i = start;
+    while (i < content.len) : (i += 1) {
+        if (content[i] == '{' and scanner.isCodeAt(i)) return i;
+    }
+    return null;
+}
+
+/// Position of the `}` that closes the object opened at `brace_start`,
+/// counting only code braces (EPH-I0511). A `}` inside a string value of
+/// the object cannot close it early, and a nested object inside it
+/// cannot confuse the depth.
+fn findConfigObjectEnd(content: []const u8, brace_start: usize) ?usize {
+    var scanner = JsonCodeScanner{ .content = content };
+    var depth: usize = 1;
+    var i = brace_start + 1;
+    while (i < content.len) : (i += 1) {
+        if (!scanner.isCodeAt(i)) continue;
+        if (content[i] == '{') {
+            depth += 1;
+            continue;
+        }
+        if (content[i] != '}') continue;
+        depth -= 1;
+        if (depth == 0) return i;
+    }
+    return null;
+}
+
 /// Parse threshold key-value pair
 fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     const content = ctx.content;
@@ -34903,11 +35096,14 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     if (i >= content.len) return i;
     if (content[i] != '"') return i + 1;
     const key_result = parseJsonString(content, i);
-    i = key_result.end;
-    while (i < content.len and content[i] != ':') i += 1;
-    // RED1-1: a truncated pair ends here — never index past the buffer end.
-    if (i >= content.len) return i;
-    i += 1;
+    const sep_stop = findKeySeparator(content, key_result.end);
+    if (sep_stop >= content.len or content[sep_stop] != ':') {
+        // Missing separator: end the pair after the stray value so the
+        // remaining pairs stay aligned (EPH-I0514). A `:` inside a later
+        // string must not bind this key.
+        return skipSeparatorlessPairValue(content, sep_stop);
+    }
+    i = sep_stop + 1;
     while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
     const num_start = i;
     while (i < content.len and content[i] >= '0' and content[i] <= '9') i += 1;
@@ -35315,10 +35511,17 @@ fn parseConfigJsonSource(ctx: ConfigParseCtx) !void {
             continue;
         }
         const key_result = parseJsonString(content, i);
-        i = key_result.end;
-        while (i < content.len and content[i] != ':') i += 1;
-        i = skipWhitespace(content, i + 1, false);
-        i = try handleConfigKey(ctx, i, key_result.val);
+        const sep_stop = findKeySeparator(content, key_result.end);
+        if (sep_stop < content.len and content[sep_stop] == ':') {
+            i = skipWhitespace(content, sep_stop + 1, false);
+            i = try handleConfigKey(ctx, i, key_result.val);
+            continue;
+        }
+        // Missing separator: the pair is malformed. Skip the stray value
+        // so the following pairs stay aligned (EPH-I0514): the pre-fix
+        // scan bound the key to the first colon anywhere, which a later
+        // string's `:` satisfied, shifting every pair after it.
+        i = skipSeparatorlessPairValue(content, sep_stop);
     }
 }
 
@@ -35805,30 +36008,60 @@ const BuildFnScan = struct {
     in_build_fn: bool = false,
 };
 
+/// Column of the `fn build(` marker on the line when it sits in code,
+/// null otherwise (EPH-I0512). The pre-fix raw substring opened the scan
+/// on a mention inside a comment or a string, so the brace walk started
+/// at the wrong line.
+fn findBuildFnMarker(line: []const u8) ?usize {
+    const markers = [_][]const u8{ "pub fn build(", "fn build(" };
+    for (markers) |marker| {
+        if (mem.indexOf(u8, line, marker)) |col| {
+            if (isCodeMatchInLine(line, col)) return col;
+        }
+    }
+    return null;
+}
+
+/// True when the line carries a code-position `installArtifact(` call
+/// (EPH-I0512). The raw substring matched the call name inside a comment
+/// or a string; the insertion anchor must be a real call.
+fn findInstallArtifactMarker(line: []const u8) bool {
+    if (mem.indexOf(u8, line, "installArtifact(")) |col| {
+        return isCodeMatchInLine(line, col);
+    }
+    return false;
+}
+
 /// Scan build.zig lines for insertion point
 fn findBuildZigInsertionPoint(line_items: []const []const u8) ?usize {
     var scan = BuildFnScan{};
     for (line_items, 0..) |line, idx| {
-        const trimmed = mem.trim(u8, line, " \t");
         if (!scan.in_build_fn) {
-            const is_build_fn = mem.indexOf(u8, trimmed, "pub fn build(") != null or
-                mem.indexOf(u8, trimmed, "fn build(") != null;
-            if (is_build_fn) scan.in_build_fn = true;
+            if (findBuildFnMarker(line) != null) scan.in_build_fn = true;
         }
         if (!scan.in_build_fn) continue;
 
-        updateBuildFnScanBraces(&scan, trimmed, idx);
-        if (mem.indexOf(u8, line, "installArtifact(") != null) scan.last_install_artifact = idx;
+        updateBuildFnScanBraces(&scan, line, idx);
+        if (findInstallArtifactMarker(line)) scan.last_install_artifact = idx;
     }
     if (scan.last_install_artifact) |idx| return idx;
     if (scan.build_fn_end) |idx| return if (idx > 0) idx - 1 else 0;
     return null;
 }
 
-/// Track brace depth and detect build function end
-fn updateBuildFnScanBraces(scan: *BuildFnScan, trimmed: []const u8, idx: usize) void {
-    for (trimmed) |c| {
-        if (c == '{') scan.brace_depth += 1;
+/// Track brace depth and detect build function end. Only code braces
+/// move the depth (EPH-I0512): braces inside strings, char literals,
+/// `\\` multiline tails, and comments are data — a format string with an
+/// unbalanced `{` or `}` must not open or close the build function
+/// early.
+fn updateBuildFnScanBraces(scan: *BuildFnScan, line: []const u8, idx: usize) void {
+    var state = types.LiteralState.forLine(line) orelse return;
+    for (line, 0..) |c, i| {
+        if (state.updateForChar(line, i) == null) continue;
+        if (c == '{') {
+            scan.brace_depth += 1;
+            continue;
+        }
         if (c != '}') continue;
         scan.brace_depth -= 1;
         if (scan.brace_depth != 0) continue;
@@ -35873,6 +36106,21 @@ fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) 
         if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK);
     }
 
+    // The composed file must parse before it replaces the live one
+    // (EPH-I0512, mirroring the upgrade path's EPH-I0168 gate): a splice
+    // that landed mid-expression would leave the project unbuildable, so
+    // a parse failure keeps the original file and fails the install with
+    // the manual block.
+    if (!zigContentParses(diag.io, allocator, project_dir, new_content.items)) {
+        cliDiag(
+            diag,
+            "error: composed build.zig failed zig ast-check. " ++
+                "Keeping the current file; add the ephor step manually.\n",
+            .{},
+        );
+        return error.BuildZigSpliceRejected;
+    }
+
     try writeFileAtomic(diag.io, project_dir, "build.zig", new_content.items);
     return insert_after + 2;
 }
@@ -35889,6 +36137,18 @@ fn projectHasEphorDependency(io: std.Io, allocator: Allocator, project_dir: std.
     return mem.indexOf(u8, content, ".ephor") != null;
 }
 
+/// True when column `col` of `line` sits in code: not on a `\\`
+/// multiline-body line, not at or past the `//` comment opener, and not
+/// inside a string literal. Shared by the content-based isCodeMatch and
+/// the per-line build.zig scan (EPH-I0512).
+fn isCodeMatchInLine(line: []const u8, col: usize) bool {
+    if (mem.startsWith(u8, mem.trimStart(u8, line, " \t"), "\\\\")) return false;
+    if (findCommentStart(line)) |comment_col| {
+        if (col >= comment_col) return false;
+    }
+    return !isInsideString(line, col);
+}
+
 /// True when the marker match at `pos` sits in code. Returns false when
 /// the line is a `\\` multiline string line (the whole line is string
 /// data), when the match follows a `//` comment opener on its line, or
@@ -35901,13 +36161,7 @@ fn isCodeMatch(content: []const u8, pos: usize) bool {
     const before = content[0..pos];
     const line_start = if (mem.lastIndexOfScalar(u8, before, '\n')) |nl| nl + 1 else 0;
     const line_end = mem.indexOfScalarPos(u8, content, pos, '\n') orelse content.len;
-    const line = content[line_start..line_end];
-    const col = pos - line_start;
-    if (mem.startsWith(u8, mem.trimStart(u8, line, " \t"), "\\\\")) return false;
-    if (findCommentStart(line)) |comment_col| {
-        if (col >= comment_col) return false;
-    }
-    return !isInsideString(line, col);
+    return isCodeMatchInLine(content[line_start..line_end], pos - line_start);
 }
 
 /// First occurrence of `needle` at or after `start` that isCodeMatch
@@ -36111,20 +36365,15 @@ const ThresholdsSpan = struct {
     brace_end: usize,
 };
 
-/// Locate the flat "thresholds" object's braces; null when absent or malformed.
+/// Locate the "thresholds" object's braces; null when absent or malformed
+/// (EPH-I0511). The key and both braces are located in code position: a
+/// comment or a string value mentioning "thresholds" cannot retarget the
+/// splice, and a `}` inside a string value of the object cannot close the
+/// span early.
 fn findThresholdsSpan(content: []const u8) ?ThresholdsSpan {
-    const thresholds_key = "\"thresholds\"";
-    const key_pos = mem.indexOf(u8, content, thresholds_key) orelse return null;
-
-    var brace_start = key_pos + thresholds_key.len;
-    while (brace_start < content.len and content[brace_start] != '{') brace_start += 1;
-    if (brace_start >= content.len) return null;
-
-    // Flat object, so the next '}' is the matching close
-    var brace_end = brace_start + 1;
-    while (brace_end < content.len and content[brace_end] != '}') brace_end += 1;
-    if (brace_end >= content.len) return null;
-
+    const key_pos = findConfigKey(content, "\"thresholds\"") orelse return null;
+    const brace_start = findConfigObjectBrace(content, key_pos) orelse return null;
+    const brace_end = findConfigObjectEnd(content, brace_start) orelse return null;
     return .{ .brace_start = brace_start, .brace_end = brace_end };
 }
 
@@ -36193,8 +36442,11 @@ fn migrateThresholds(allocator: Allocator, content: []const u8) ?[]const u8 {
     const span = findThresholdsSpan(content) orelse return null;
     const body = content[span.brace_start + 1 .. span.brace_end];
 
-    const has_cyclo = mem.indexOf(u8, body, "\"max_cyclomatic\"") != null;
-    const has_cog = mem.indexOf(u8, body, "\"max_cognitive\"") != null;
+    // A mention inside a comment or a string value is not a present key:
+    // the key-shape check rejects it, so the migration still adds the
+    // missing entries (EPH-I0511).
+    const has_cyclo = findConfigKey(body, "\"max_cyclomatic\"") != null;
+    const has_cog = findConfigKey(body, "\"max_cognitive\"") != null;
     if (has_cyclo and has_cog) return null;
 
     const pad = bracePadding(content, span);
@@ -36247,33 +36499,42 @@ fn updateConfigVersion(io: std.Io, allocator: Allocator, ver: []const u8) void {
 
 /// Build config content with the version field replaced or inserted.
 /// Returns allocated string on success, null if content cannot be processed.
+/// The key must sit in code in key position: a "version" mention inside
+/// a comment or a string value must not move the rewrite (EPH-I0511).
 fn buildVersionUpdatedConfig(
     allocator: Allocator,
     content: []const u8,
     ver: []const u8,
 ) ?[]const u8 {
     const key = "\"version\"";
-    if (mem.indexOf(u8, content, key)) |key_pos| {
+    if (findConfigKey(content, key)) |key_pos| {
         return replaceVersionValue(allocator, content, key_pos + key.len, ver);
     }
     return insertVersionField(allocator, content, ver);
 }
 
 /// Replace the value of an existing "version" key at the given offset.
+/// The canonical shape is `"version": "..."` with the colon and the
+/// value string in code position; any other shape returns null so the
+/// best-effort update no-ops instead of splicing into a comment, a later
+/// key, or a stray string (EPH-I0511). The closing quote is escape-aware:
+/// a `\"` inside the value stays value data.
 fn replaceVersionValue(
     allocator: Allocator,
     content: []const u8,
     after_key: usize,
     ver: []const u8,
 ) ?[]const u8 {
-    // Find opening quote of value
-    var i = after_key;
-    while (i < content.len and content[i] != '"') i += 1;
-    if (i >= content.len) return null;
+    const sep_stop = findKeySeparator(content, after_key);
+    if (sep_stop >= content.len or content[sep_stop] != ':') return null;
+    var i = sep_stop + 1;
+    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
+    if (i >= content.len or content[i] != '"') return null;
     const val_start = i + 1;
-    // Find closing quote
     var j = val_start;
-    while (j < content.len and content[j] != '"') j += 1;
+    while (j < content.len and content[j] != '"') : (j += 1) {
+        if (content[j] == '\\') j += 1;
+    }
     if (j >= content.len) return null;
 
     return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
@@ -36284,12 +36545,15 @@ fn replaceVersionValue(
 }
 
 /// Insert a "version" field after the opening brace when none exists.
+/// The opener must sit in code: a leading comment containing `{` (or a
+/// string value holding one) must not receive the insertion, which would
+/// comment it out and silently no-op the update (EPH-I0511).
 fn insertVersionField(
     allocator: Allocator,
     content: []const u8,
     ver: []const u8,
 ) ?[]const u8 {
-    const brace_pos = mem.indexOf(u8, content, "{") orelse return null;
+    const brace_pos = findConfigObjectBrace(content, 0) orelse return null;
     return std.fmt.allocPrint(allocator, "{s}\n  \"version\": \"{s}\",{s}", .{
         content[0 .. brace_pos + 1],
         ver,
@@ -69055,6 +69319,58 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\}
         ,
     },
+    .{
+        // EPH-I0511: a string VALUE mentioning "thresholds" must not
+        // anchor the splice; the real key after it must. Pre-fix the
+        // value's quote was the first raw match and the "x" object
+        // received the migration (corruption).
+        .name = "value mention before the real key does not retarget the splice",
+        .input =
+        \\{
+        \\  "note": "thresholds",
+        \\  "x": { },
+        \\  "thresholds": {
+        \\    "max_function_lines": 50
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "note": "thresholds",
+        \\  "x": { },
+        \\  "thresholds": {
+        \\    "max_function_lines": 50,
+        \\    "max_cyclomatic": 10,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
+    .{
+        // EPH-I0511: a COMMENT mentioning "thresholds" with braces must
+        // not anchor the splice. Pre-fix the comment's quote was the
+        // first raw match and the comment's `{`/`}` pair became the
+        // "object": the migration inserted keys into comment text.
+        .name = "comment mention does not anchor the splice",
+        .input =
+        \\{
+        \\  // "thresholds" { } keys live here
+        \\  "thresholds": {
+        \\    "max_function_lines": 50
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  // "thresholds" { } keys live here
+        \\  "thresholds": {
+        \\    "max_function_lines": 50,
+        \\    "max_cyclomatic": 10,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
 };
 
 const migrate_null_cases = [_]MigrateNullCase{
@@ -69080,6 +69396,21 @@ const migrate_null_cases = [_]MigrateNullCase{
     .{
         .name = "thresholds is not an object",
         .input = "{\"thresholds\": 5}",
+    },
+    .{
+        // EPH-I0511: a string VALUE mentioning "thresholds" with no real
+        // thresholds key must not anchor the splice into the next object.
+        // Pre-fix the migration inserted threshold keys into the
+        // "something" object (corruption); now it no-ops.
+        .name = "value mention with no thresholds object is not an anchor",
+        .input =
+        \\{
+        \\  "note": "thresholds",
+        \\  "something": {
+        \\    "deep": 1
+        \\  }
+        \\}
+        ,
     },
     .{
         .name = "empty content",
@@ -69160,6 +69491,101 @@ test "buildMissingKeysJson serializes missing entries in order" {
         const actual = try buildMissingKeysJson(std.testing.allocator, case.mig);
         defer std.testing.allocator.free(actual);
         std.testing.expectEqualStrings(case.expected, actual) catch {
+            std.debug.print("case '{s}' failed\n", .{case.name});
+            try std.testing.expect(false);
+        };
+    }
+}
+
+const VersionRewriteCase = struct {
+    name: []const u8,
+    input: []const u8,
+    /// Expected rewrite output; null expects a no-op (null return).
+    expected: ?[]const u8,
+};
+
+/// EPH-I0511 rewrite pins: the "version" anchor must sit in code in key
+/// position, and the splice must fail closed on any other shape. Pre-fix
+/// the raw substring matches hit comments, string values, and stray
+/// braces, splicing the version into the user's config at arbitrary
+/// quote pairs.
+const version_rewrite_cases = [_]VersionRewriteCase{
+    .{
+        .name = "comment version anchor stays inert; field inserted",
+        .input =
+        \\// "version": "0.9.9" (schema note)
+        \\{
+        \\  "path_dir": "src"
+        \\}
+        ,
+        .expected =
+        \\// "version": "0.9.9" (schema note)
+        \\{
+        \\  "version": "0.14.3",
+        \\  "path_dir": "src"
+        \\}
+        ,
+    },
+    .{
+        .name = "real key replaced byte-exactly",
+        .input = "{\"version\": \"0.9.9\", \"path_dir\": \"src\"}",
+        .expected = "{\"version\": \"0.14.3\", \"path_dir\": \"src\"}",
+    },
+    .{
+        .name = "leading comment brace does not receive the insertion",
+        .input =
+        \\// the { is a placeholder
+        \\{
+        \\  "path_dir": "src"
+        \\}
+        ,
+        .expected =
+        \\// the { is a placeholder
+        \\{
+        \\  "version": "0.14.3",
+        \\  "path_dir": "src"
+        \\}
+        ,
+    },
+    .{
+        .name = "version VALUE does not anchor the replace",
+        .input = "{\"path_dir\": \"version\", \"disable\": [\"ZA305\"]}",
+        .expected = "{\n  \"version\": \"0.14.3\",\"path_dir\": \"version\", \"disable\": [\"ZA305\"]}",
+    },
+    .{
+        .name = "number value no-ops instead of splicing",
+        .input = "{\"version\": 5, \"path_dir\": \"src\"}",
+        .expected = null,
+    },
+    .{
+        .name = "missing colon no-ops the replace and inserts a field",
+        .input = "{\"version\" \"0.9.9\"}",
+        .expected = "{\n  \"version\": \"0.14.3\",\"version\" \"0.9.9\"}",
+    },
+};
+
+test "buildVersionUpdatedConfig ignores version anchors in comments and strings (EPH-I0511)" {
+    for (&version_rewrite_cases) |*case| {
+        const maybe_actual = buildVersionUpdatedConfig(
+            std.testing.allocator,
+            case.input,
+            "0.14.3",
+        );
+        if (case.expected == null) {
+            if (maybe_actual) |actual| {
+                std.debug.print("case '{s}': expected null, got:\n{s}\n", .{ case.name, actual });
+                std.testing.allocator.free(actual);
+                try std.testing.expect(false);
+            }
+            continue;
+        }
+        if (maybe_actual == null) {
+            std.debug.print("case '{s}': expected rewrite, got null\n", .{case.name});
+            try std.testing.expect(false);
+            continue;
+        }
+        defer std.testing.allocator.free(maybe_actual.?);
+        std.testing.expectEqualStrings(case.expected.?, maybe_actual.?) catch {
             std.debug.print("case '{s}' failed\n", .{case.name});
             try std.testing.expect(false);
         };
@@ -96369,6 +96795,45 @@ test "truncated disable array keeps its partial entries" {
     try std.testing.expectEqualStrings("ZA", cfg.disabled_rules.items[0]);
 }
 
+test "config parse recovers after a missing colon (EPH-I0514)" {
+    // "fail_on" has no separator: the pre-fix colon scan ran to the
+    // first `:` ANYWHERE, which belonged to "thresholds" — the whole
+    // thresholds object then parsed as fail_on's value and was skipped.
+    // The scan now stops at the next string opener, so the malformed
+    // pair is skipped and the thresholds object parses in place.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"fail_on\" \"never\", \"thresholds\": {\"max_lines\": 9}}",
+        &cfg,
+    );
+    try std.testing.expectEqual(@as(usize, 9), cfg.thresholds.max_function_lines);
+}
+
+test "thresholds parse recovers after a missing colon inside the object (EPH-I0514)" {
+    // "max_cognitive" has no separator: the pre-fix scan bound it to
+    // the colon after "max_branches", so max_cognitive took 7 and
+    // max_branches kept its default. The scan now stops at the stray
+    // string, the pair is skipped, and max_branches parses in place.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"thresholds\": {\"max_lines\": 9, \"max_cognitive\" \"15\", \"max_branches\": 7}}",
+        &cfg,
+    );
+    try std.testing.expectEqual(@as(usize, 9), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(@as(usize, 15), cfg.thresholds.max_cognitive);
+    try std.testing.expectEqual(@as(usize, 7), cfg.thresholds.max_branches);
+}
+
 test "config strings scan escaped quotes span-correctly (RED1-9)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -97306,6 +97771,158 @@ test "loadConfigFromTargetPath without a config frees saved_path once (EPH-I0689
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
+/// Test allocator that fails exactly ONE allocation: the fail_at-th.
+/// std.testing.FailingAllocator latches — once its index is hit, every
+/// later allocation fails too — so it cannot drive the EPH-I0513
+/// scenario, where the parent fallback must allocate AFTER the induced
+/// parse failure. All allocations and frees pass through to the parent
+/// (std.testing.allocator), whose leak detector is the ownership proof.
+/// The vtable entries take the allocator as their leading `self`
+/// receiver (the Allocator interface mandates the 5-parameter entry
+/// signatures; ZA303 excludes the receiver like it does for methods).
+const SingleFailureAllocator = struct {
+    parent: Allocator,
+    fail_at: usize = std.math.maxInt(usize),
+    alloc_count: usize = 0,
+    has_failed: bool = false,
+
+    fn allocator(self: *SingleFailureAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(
+        self: *anyopaque,
+        len: usize,
+        alignment: mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const s: *SingleFailureAllocator = @ptrCast(@alignCast(self));
+        if (!s.has_failed and s.alloc_count == s.fail_at) {
+            s.has_failed = true;
+            return null;
+        }
+        s.alloc_count += 1;
+        return s.parent.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(
+        self: *anyopaque,
+        buf: []u8,
+        alignment: mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const s: *SingleFailureAllocator = @ptrCast(@alignCast(self));
+        return s.parent.rawResize(buf, alignment, new_len, return_address);
+    }
+
+    fn remap(
+        self: *anyopaque,
+        memory: []u8,
+        alignment: mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const s: *SingleFailureAllocator = @ptrCast(@alignCast(self));
+        return s.parent.rawRemap(memory, alignment, new_len, return_address);
+    }
+
+    fn free(
+        self: *anyopaque,
+        buf: []u8,
+        alignment: mem.Alignment,
+        return_address: usize,
+    ) void {
+        const s: *SingleFailureAllocator = @ptrCast(@alignCast(self));
+        s.parent.rawFree(buf, alignment, return_address);
+    }
+};
+
+test "partial target-config parse rolls back its entries before the parent fallback (EPH-I0513)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    // Layout: <tmp>/root carries the target config whose parse the sweep
+    // fails AFTER appending entries; <tmp> carries a valid parent config.
+    // The parent load absolutizes whatever survives against the PARENT
+    // base and, with --trust-target-config, lets it through ungated — a
+    // partial target parse would steer the analysis from leaked entries.
+    // The sweep proves no induced failure leaves a mixed entry set.
+    const parent = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    const tmp_path = try tmpDirPath(parent, &tmp);
+    defer parent.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(parent, "{s}/root", .{tmp_path});
+    defer parent.free(root_path);
+    try writeTestConfig(root_path, "{\"entries\": [\"a.zig\", \"b.zig\"], \"exclude\": [\"x\"]}");
+    try writeTestConfig(tmp_path, "{\"entries\": [\"p.zig\"]}");
+
+    // Measure the load's allocation count so the sweep covers every
+    // induced failure point plus one no-failure run. The single-shot
+    // allocator doubles as the counter: a successful probe run counts
+    // every allocation of the whole load.
+    var probe = SingleFailureAllocator{ .parent = parent };
+    var probe_cfg = testConfig();
+    probe_cfg.trust_target_config = true;
+    try setOwnedPath(probe.allocator(), &probe_cfg, root_path);
+    try loadConfigFromTargetPath(&diag, probe.allocator(), &probe_cfg, root_path);
+    probe_cfg.deinit(probe.allocator());
+    // The probe never fails, so alloc_count is the whole load's count.
+    const total_allocs = probe.alloc_count;
+
+    const want_parent_entry = try std.fmt.allocPrint(parent, "{s}/p.zig", .{tmp_path});
+    defer parent.free(want_parent_entry);
+    const want_root_a = try std.fmt.allocPrint(parent, "{s}/a.zig", .{root_path});
+    defer parent.free(want_root_a);
+    const want_root_b = try std.fmt.allocPrint(parent, "{s}/b.zig", .{root_path});
+    defer parent.free(want_root_b);
+    const leaked_a = try std.fmt.allocPrint(parent, "{s}/a.zig", .{tmp_path});
+    defer parent.free(leaked_a);
+
+    var fail_at: usize = 0;
+    while (fail_at <= total_allocs) : (fail_at += 1) {
+        var failing = SingleFailureAllocator{ .parent = parent };
+        var cfg = testConfig();
+        cfg.trust_target_config = true;
+        try setOwnedPath(failing.allocator(), &cfg, root_path);
+        // Arm the failure after setOwnedPath: the sweep covers the
+        // load's allocations only.
+        failing.fail_at = failing.alloc_count + fail_at;
+        if (loadConfigFromTargetPath(&diag, failing.allocator(), &cfg, root_path)) |_| {
+            // A completed load shows one legitimate state: the target
+            // config won (root-based), the parent fallback won
+            // (parent-based), or both failed (empty). The pre-fix leak
+            // absolutized the partial target entries against the PARENT
+            // base, producing the third-state mix below.
+            const is_leaked = cfg.entries.items.len == 3 and
+                mem.eql(u8, cfg.entries.items[1], leaked_a);
+            try std.testing.expect(!is_leaked);
+            const is_parent_state = cfg.entries.items.len == 1 and
+                mem.eql(u8, cfg.entries.items[0], want_parent_entry);
+            const is_target_state = cfg.entries.items.len == 2 and
+                mem.eql(u8, cfg.entries.items[0], want_root_a) and
+                mem.eql(u8, cfg.entries.items[1], want_root_b);
+            try std.testing.expect(
+                is_parent_state or is_target_state or cfg.entries.items.len == 0,
+            );
+        } else |err| {
+            // A mid-load OOM may leave partial content; the parent
+            // allocator's leak detector is the ownership proof.
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        cfg.deinit(failing.allocator());
+    }
+}
+
 test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -98010,6 +98627,127 @@ test "install patch failure maps to InstallFailed (EPH-I0235)" {
         error.InstallFailed,
         patchBuildZigOrFail(&diag, allocator, tmp.dir),
     );
+}
+
+test "findBuildZigInsertionPoint ignores fn build in comments and strings (EPH-I0512)" {
+    // A comment inside the build fn must not move the brace depth:
+    // pre-fix the raw scan counted the comment's `}`, closed the depth
+    // at the comment line, and skipped the real closing brace, so the
+    // insertion landed at line 0. Post-fix the block lands at line 2.
+    const comment_trap =
+        \\pub fn build(b: *std.Build) void {
+        \\    // fn build( } {
+        \\    _ = b;
+        \\}
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var comment_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer comment_lines.deinit(allocator);
+    var comment_iter = mem.splitScalar(u8, comment_trap, '\n');
+    while (comment_iter.next()) |line| try comment_lines.append(allocator, line);
+    try std.testing.expectEqual(
+        @as(?usize, 2),
+        findBuildZigInsertionPoint(comment_lines.items),
+    );
+
+    // A format string with unbalanced braces must not move the depth:
+    // the function closes only at its real `}` (pre-fix: the string's
+    // `}` closed it at the string line and the block landed mid-function).
+    const string_trap =
+        \\pub fn build(b: *std.Build) void {
+        \\    const s = "fn build( } {";
+        \\    _ = b;
+        \\}
+        \\
+    ;
+    var string_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer string_lines.deinit(allocator);
+    var string_iter = mem.splitScalar(u8, string_trap, '\n');
+    while (string_iter.next()) |line| try string_lines.append(allocator, line);
+    try std.testing.expectEqual(
+        @as(?usize, 2),
+        findBuildZigInsertionPoint(string_lines.items),
+    );
+}
+
+test "patchBuildZig inserts the ephor block at the anchored point (EPH-I0512)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The canonical build fn signature: `zig ast-check` resolves names,
+    // so the composed file must keep `target` in scope for the block.
+    const original =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+        \\    const exe = b.addExecutable(.{ .name = "x", .root_source_file = b.path("src/main.zig") });
+        \\    _ = exe;
+        \\    _ = optimize;
+        \\}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = original,
+    });
+    // No installArtifact call: the block lands before the function's
+    // closing brace (line 4, 0-based), reported as line 6.
+    const inserted = try patchBuildZig(&diag, allocator, tmp.dir);
+    try std.testing.expectEqual(@as(?usize, 6), inserted);
+    const after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(after);
+    const block_pos = mem.indexOf(u8, after, EPHOR_BUILD_BLOCK) orelse
+        return error.TestUnexpectedResult;
+    // The block lands after the last build-fn statement, before the close.
+    try std.testing.expect(block_pos > mem.indexOf(u8, after, "_ = optimize;").?);
+    try std.testing.expect(mem.endsWith(u8, after, "}\n"));
+}
+
+test "patchBuildZig rejects a mid-expression splice and keeps the file (EPH-I0512)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The installArtifact call spans three lines: the anchor lands on the
+    // opening line, so the block would splice mid-call. The ast-check
+    // gate must reject the composition (pre-fix: written atomically as a
+    // silently broken build) and leave the live file untouched.
+    const original =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    b.addInstallArtifact(
+        \\        exe,
+        \\        .{ .dest_dir = .{ .override = .{ .custom = "bin" } } },
+        \\    );
+        \\    _ = b;
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = original,
+    });
+    try std.testing.expectError(
+        error.BuildZigSpliceRejected,
+        patchBuildZig(&diag, allocator, tmp.dir),
+    );
+    const after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(original, after);
 }
 
 test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {

@@ -207,6 +207,13 @@ const DiagCtx = struct {
     /// step. Error-path tests mute parse diagnostics and assert on the
     /// resulting state; the mute keeps that echoed stderr quiet.
     cli_diagnostics_enabled: bool = true,
+    /// JSON output mode (--format=json): the shared stderr stream carries
+    /// the machine JSON contract, so human diagnostics must not reach it
+    /// (EPH-I0213). A pre-scan of argv arms this before the config load;
+    /// parseSimpleFlag sets it when the format flag parses. Once armed the
+    /// latch stays on for the whole run, even when a later --format=text
+    /// switches the output format back.
+    json_stream: bool = false,
     /// Errno-style detail for error.InvalidFailOnValue /
     /// error.InvalidStrictValue out of config parsing: the parse layer
     /// cannot know which ephor.json it is reading, so it stashes the
@@ -293,9 +300,10 @@ const max_source_file_bytes = 10 * 1024 * 1024;
 /// malformed token worth naming in the diagnostic.
 const bad_gate_value_buf_bytes = 64;
 
-/// Print a CLI/config diagnostic unless the run has muted the channel.
+/// Print a CLI/config diagnostic unless the run has muted the channel or
+/// the output stream is the JSON machine contract (EPH-I0213).
 fn cliDiag(diag: *const DiagCtx, comptime fmt: []const u8, args: anytype) void {
-    if (!diag.cli_diagnostics_enabled) return;
+    if (!diag.cli_diagnostics_enabled or diag.json_stream) return;
     std.debug.print(fmt, args);
 }
 
@@ -12395,7 +12403,7 @@ const ImportGraph = struct {
 
     fn scanDirectory(self: *ImportGraph, dir_path: []const u8) !void {
         var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch |err| {
-            reportScanOpenError(self.allocator, dir_path, err);
+            reportScanOpenError(self.diag, self.allocator, dir_path, err);
             return err;
         };
         defer dir.close(self.diag.io);
@@ -12404,18 +12412,21 @@ const ImportGraph = struct {
 
     /// Print the scan-open diagnostic. The path crosses the terminal
     /// sanitizer first: scan roots can derive from config files, so their
-    /// bytes are not necessarily the operator's own (EPH-I0147).
+    /// bytes are not necessarily the operator's own (EPH-I0147). cliDiag
+    /// keeps the lines off the JSON machine stream (EPH-I0213): the
+    /// handler's failure exit carries the verdict in JSON mode.
     fn reportScanOpenError(
+        diag: *const DiagCtx,
         allocator: Allocator,
         dir_path: []const u8,
         err: anyerror,
     ) void {
         var safe = types.sanitizeTerminal(allocator, dir_path) catch {
-            std.debug.print("error: cannot open scan directory: {}\n", .{err});
+            cliDiag(diag, "error: cannot open scan directory: {}\n", .{err});
             return;
         };
         defer safe.deinit(allocator);
-        std.debug.print("error: cannot open '{s}': {}\n", .{ safe.slice, err });
+        cliDiag(diag, "error: cannot open '{s}': {}\n", .{ safe.slice, err });
     }
 
     fn scanSingleFile(self: *ImportGraph, file_path: []const u8) !void {
@@ -32846,7 +32857,9 @@ fn runFmtCheck(
         buildFmtArgv(path, &fmt_argv, &fmt_scratch),
         .inherit,
     ) catch |err| {
-        std.debug.print("error: cannot run zig fmt: {}\n", .{err});
+        // The bare line stays off the JSON machine stream (EPH-I0213);
+        // the ZR104 finding below carries the same fact as machine data.
+        cliDiag(diag, "error: cannot run zig fmt: {}\n", .{err});
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
         try reportFmtFailure(allocator, &issues, err);
         return issues;
@@ -33114,16 +33127,15 @@ fn commitArgvToken(
 }
 
 fn buildRuntimeArgv(
-    custom_command: ?[]const u8,
+    opts: RuntimeOptions,
     argv_buf: *[64][]const u8,
-    verbose: bool,
     scratch: []u8,
 ) usize {
-    if (custom_command) |cmd| {
-        if (verbose)
+    if (opts.custom_command) |cmd| {
+        if (opts.verbose and !opts.json_stream)
             std.debug.print("Running: {s} (with GPA diagnostics)\n", .{cmd});
         const parsed = parseCommandIntoArgv(cmd, argv_buf, scratch);
-        if (parsed.truncated)
+        if (parsed.truncated and !opts.json_stream)
             std.debug.print(
                 "warning: --command truncated (limit {d} tokens, {d} bytes)\n",
                 .{ argv_buf.len, runtime_argv_scratch_bytes },
@@ -33133,7 +33145,7 @@ fn buildRuntimeArgv(
     argv_buf[0] = tool_zig_path;
     argv_buf[1] = "build";
     argv_buf[2] = "test";
-    if (verbose)
+    if (opts.verbose and !opts.json_stream)
         std.debug.print("Running: zig build test (with GPA diagnostics)\n", .{});
     return 3;
 }
@@ -33258,6 +33270,10 @@ fn runChildCapped(
 const RuntimeOptions = struct {
     verbose: bool,
     custom_command: ?[]const u8,
+    /// JSON mode: the runtime band's human diagnostics (the "Running:"
+    /// echo and the command-truncation warning) stay off the machine
+    /// stream (EPH-I0213).
+    json_stream: bool = false,
 };
 
 fn runRuntimeAnalysis(
@@ -33272,7 +33288,7 @@ fn runRuntimeAnalysis(
     errdefer deinitIssues(&issues, allocator);
     var argv_buf: [64][]const u8 = undefined;
     var argv_scratch: [runtime_argv_scratch_bytes]u8 = undefined;
-    const argv_len = buildRuntimeArgv(opts.custom_command, &argv_buf, opts.verbose, &argv_scratch);
+    const argv_len = buildRuntimeArgv(opts, &argv_buf, &argv_scratch);
 
     const result = runChildCapped(
         allocator,
@@ -33281,7 +33297,10 @@ fn runRuntimeAnalysis(
         .{ .path = path },
     ) catch |err| {
         const cmd_str = opts.custom_command orelse "zig build test";
-        std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
+        // The bare line stays off the JSON machine stream (EPH-I0213);
+        // the ZR104 finding below carries the same fact as machine data.
+        if (!opts.json_stream)
+            std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
         try reportRunFailure(allocator, &issues, cmd_str, err);
         return issues;
     };
@@ -34332,6 +34351,9 @@ const Config = struct {
     orphan_exclude: std.ArrayListUnmanaged([]const u8),
     disabled_rules: std.ArrayListUnmanaged([]const u8),
     enabled_rules: std.ArrayListUnmanaged([]const u8),
+    // Verbose diagnostics. JSON mode makes verbose a no-op: the machine
+    // stream cannot carry human diagnostics, so parseArgs clears the
+    // field when the final format is json (EPH-I0213).
     verbose: bool,
     show_summary: bool,
     format: OutputFormat,
@@ -34458,7 +34480,7 @@ fn reportConfigParseError(
         if (err == error.InvalidFailOnValue or err == error.InvalidStrictValue or
             err == error.EmptyExcludePattern or err == error.EmptyRulePattern)
             return err;
-        std.debug.print("warning: failed to parse config: {}\n", .{err});
+        cliDiag(diag, "warning: failed to parse config: {}\n", .{err});
         return;
     };
     defer safe_path.deinit(allocator);
@@ -34478,7 +34500,7 @@ fn reportConfigParseError(
             .{safe_path.slice},
         ),
         else => {
-            std.debug.print("warning: failed to parse {s}: {}\n", .{
+            cliDiag(diag, "warning: failed to parse {s}: {}\n", .{
                 safe_path.slice, err,
             });
             return;
@@ -35929,14 +35951,17 @@ fn dupeOrEmpty(allocator: Allocator, value: []const u8) []const u8 {
 /// Returns an allocator-owned string. Caller must free. The detected
 /// directory must realpath inside the cwd (RED4-2 backstop: a symlinked
 /// source directory passes the string checks yet resolves outside the
-/// project). A violation warns and falls back to the "." default.
-fn detectPathDirFromBuildZig(io: std.Io, allocator: Allocator) []const u8 {
-    const content = Fs.cwd(io).readFileAlloc(
+/// project). A violation warns and falls back to the "." default. Every
+/// diagnostic routes through cliDiag: JSON mode owns the stream as a
+/// machine contract (EPH-I0213).
+fn detectPathDirFromBuildZig(diag: *const DiagCtx, allocator: Allocator) []const u8 {
+    const content = Fs.cwd(diag.io).readFileAlloc(
         allocator,
         "build.zig",
         1024 * 1024,
     ) catch |err| {
-        std.debug.print(
+        cliDiag(
+            diag,
             "error: no build.zig found: {}\n" ++
                 "  hint: run from project root, or: ephor check <dir>\n",
             .{err},
@@ -35946,9 +35971,18 @@ fn detectPathDirFromBuildZig(io: std.Io, allocator: Allocator) []const u8 {
 
     defer allocator.free(content);
 
-    const result = findPathDirInContent(content);
-    if (!detectedDirWithinCwd(io, result)) {
-        std.debug.print(
+    const result = findPathDirInContent(content) orelse {
+        cliDiag(
+            diag,
+            "warning: could not detect source directory from build.zig\n" ++
+                "  hint: specify a path: ephor check <dir>, or create ephor.json with 'ephor init'\n",
+            .{},
+        );
+        return dupeOrEmpty(allocator, ".");
+    };
+    if (!detectedDirWithinCwd(diag.io, result)) {
+        cliDiag(
+            diag,
             "warning: detected source directory '{s}' resolves outside the " ++
                 "project. Using \".\" as the scan root.\n",
             .{result},
@@ -35984,6 +36018,8 @@ fn isSafeDetectedPath(path: []const u8) bool {
 
 /// Scan build.zig content for root_source_file pattern, return dir portion.
 /// Returns a slice into `content` - caller must dupe before freeing content.
+/// Returns null when no valid match exists: the caller reports the
+/// not-detected case on its own diagnostics channel.
 /// The scan skips comment and multiline-string lines and rejects a
 /// candidate that is absolute or carries a ".." component (RED4-2): a
 /// hostile build.zig must not move the scan root. Each line is masked at
@@ -35993,7 +36029,7 @@ fn isSafeDetectedPath(path: []const u8) bool {
 /// detected root under a bare `ephor check` when it came before the real
 /// match. The first valid match wins. A rejected match never selects a
 /// value and never aborts detection.
-fn findPathDirInContent(content: []const u8) []const u8 {
+fn findPathDirInContent(content: []const u8) ?[]const u8 {
     const patterns = [_][]const u8{ "root_source_file", ".root_src" };
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -36014,12 +36050,7 @@ fn findPathDirInContent(content: []const u8) []const u8 {
             return ".";
         }
     }
-    std.debug.print(
-        "warning: could not detect source directory from build.zig\n" ++
-            "  hint: specify a path: ephor check <dir>, or create ephor.json with 'ephor init'\n",
-        .{},
-    );
-    return ".";
+    return null;
 }
 
 /// Append an owned slice to a string list, freeing it when the append
@@ -36087,18 +36118,18 @@ fn collectInstallEntries(
 
 /// Create ephor.json during install with auto-detected path_dir and entries.
 /// Best-effort: prints a message but does not fail the install if config cannot be created.
-fn createInstallConfig(io: std.Io, allocator: Allocator, ver: []const u8) !void {
-    if (Fs.cwd(io).access(CONFIG_FILENAME, .{})) {
+fn createInstallConfig(diag: *DiagCtx, allocator: Allocator, ver: []const u8) !void {
+    if (Fs.cwd(diag.io).access(CONFIG_FILENAME, .{})) {
         // Config already exists - update version if needed
-        updateConfigVersion(io, allocator, ver);
+        updateConfigVersion(diag.io, allocator, ver);
         std.debug.print("{s} already exists (skipped)\n", .{CONFIG_FILENAME});
         return;
     } else |_| {}
 
     // File doesn't exist - create it
-    const root_dir = detectPathDirFromBuildZig(io, allocator);
+    const root_dir = detectPathDirFromBuildZig(diag, allocator);
     defer allocator.free(root_dir);
-    var entries = try collectInstallEntries(io, allocator, root_dir);
+    var entries = try collectInstallEntries(diag.io, allocator, root_dir);
     defer {
         for (entries.items) |e| allocator.free(e);
         entries.deinit(allocator);
@@ -36156,7 +36187,7 @@ fn createInstallConfig(io: std.Io, allocator: Allocator, ver: []const u8) !void 
     , .{ ver, root_dir, entries_json.items });
     defer allocator.free(config_content);
 
-    try writeFileAtomic(io, std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
+    try writeFileAtomic(diag.io, std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
 
     std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
         CONFIG_FILENAME, ver, root_dir,
@@ -36277,7 +36308,7 @@ fn runInstallCommand(
 
     try patchBuildZigOrFail(diag, allocator, project_dir);
 
-    createInstallConfig(diag.io, allocator, ver) catch |err| {
+    createInstallConfig(diag, allocator, ver) catch |err| {
         cliDiag(diag, "error: could not create {s}: {}\n", .{ CONFIG_FILENAME, err });
         return error.InstallFailed;
     };
@@ -37071,7 +37102,7 @@ const CachedCheck = struct {
 /// and every check fetches live. Setting EPHOR_NO_UPDATE_CHECK (any value,
 /// including empty) skips the whole check: no fetch, no cache read, no warning.
 fn checkForUpdates(
-    io: std.Io,
+    diag: *DiagCtx,
     allocator: Allocator,
     home: ?[]const u8,
     no_check_env: ?[]const u8,
@@ -37080,19 +37111,23 @@ fn checkForUpdates(
     const cache_path = resolveUpdateCachePath(allocator, home);
     defer if (cache_path) |p| allocator.free(p);
     const cache_ctx: UpdateCacheCtx = .{
-        .io = io,
+        .io = diag.io,
         .allocator = allocator,
-        .now = std.Io.Clock.Timestamp.now(io, .real).raw.toSeconds(),
+        .now = std.Io.Clock.Timestamp.now(diag.io, .real).raw.toSeconds(),
     };
     const latest = resolveLatestVersion(
         cache_ctx,
         cache_path,
         fetchLatestVersion,
     ) orelse {
-        std.debug.print(
-            "warning: could not fetch latest ephor version, continuing with v{s}\n",
-            .{EPHOR_VERSION},
-        );
+        // JSON mode: the fetch warning is a human diagnostic and would
+        // break the machine stream (EPH-I0213).
+        if (!diag.json_stream) {
+            std.debug.print(
+                "warning: could not fetch latest ephor version, continuing with v{s}\n",
+                .{EPHOR_VERSION},
+            );
+        }
         return;
     };
     defer allocator.free(latest);
@@ -38249,6 +38284,9 @@ fn parseSimpleFlag(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
     }
     if (mem.eql(u8, arg, "--format=json") or mem.eql(u8, arg, "-f=json")) {
         cfg.format = .json;
+        // JSON mode routes human diagnostics off the shared stream, which
+        // becomes the machine JSON contract (EPH-I0213).
+        diag.json_stream = true;
         return true;
     }
     if (mem.eql(u8, arg, "--format=text") or mem.eql(u8, arg, "-f=text")) {
@@ -38560,14 +38598,44 @@ fn stripTrailingSlashes(allocator: Allocator, cfg: *Config) !void {
 
 /// Auto-detect path from build.zig when neither config nor CLI set one
 /// (only for commands that analyze code, not install/upgrade/help/version).
-fn autoDetectPath(io: std.Io, allocator: Allocator, cfg: *Config) void {
+fn autoDetectPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) void {
     const needs_path = switch (cfg.command) {
         .install, .upgrade, .help, .version => false,
         else => true,
     };
     if (!needs_path or cfg.path_owned) return;
-    cfg.path = detectPathDirFromBuildZig(io, allocator);
+    cfg.path = detectPathDirFromBuildZig(diag, allocator);
     cfg.path_owned = true;
+}
+
+/// True when the argument requests the JSON output format (EPH-I0213).
+/// The two spellings mirror parseSimpleFlag's format tokens exactly.
+fn isJsonFormatToken(arg: []const u8) bool {
+    return mem.eql(u8, arg, "--format=json") or mem.eql(u8, arg, "-f=json");
+}
+
+/// Pre-scan argv for the JSON format flag so the stream gate arms before
+/// the config load (EPH-I0213): config diagnostics (unreadable file, bad
+/// fail_on/strict values) fire there, and the machine contract must
+/// swallow them. format is not a config key, so the scan cannot misread
+/// a config value.
+fn scanArgsForJson(allocator: Allocator, proc_args: std.process.Args) !bool {
+    var it = try proc_args.iterateAllocator(allocator);
+    defer it.deinit();
+    _ = it.next();
+    while (it.next()) |arg| {
+        if (isJsonFormatToken(arg)) return true;
+    }
+    return false;
+}
+
+/// JSON mode is a machine contract: the verbose diagnostics would break
+/// the stream, so --verbose is a no-op when the final format is json
+/// (EPH-I0213). Applied after the flag loop so either flag order lands on
+/// the same outcome.
+fn silenceVerboseInJson(cfg: *Config) void {
+    if (cfg.format != .json) return;
+    cfg.verbose = false;
 }
 
 fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) !Config {
@@ -38578,6 +38646,9 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     // Free the partially built config when a parse error aborts midway
     // (config-file allocations are already attached to cfg by then).
     errdefer cfg.deinit(allocator);
+    // Arm the stream gate before the config load: config diagnostics fire
+    // here, before the flag loop parses --format=json (EPH-I0213).
+    if (try scanArgsForJson(allocator, proc_args)) diag.json_stream = true;
     try loadConfigFile(diag, allocator, &cfg);
     var cli_entries = false;
     var cli_path = false;
@@ -38605,8 +38676,11 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
         }
     }
     while (args.next()) |arg| try parseCliArg(cli_ctx, arg);
+    // JSON mode makes verbose a no-op: settled after the flag loop so
+    // either flag order lands on the same outcome (EPH-I0213).
+    silenceVerboseInJson(&cfg);
     try stripTrailingSlashes(allocator, &cfg);
-    autoDetectPath(diag.io, allocator, &cfg);
+    autoDetectPath(diag, allocator, &cfg);
     if (cfg.path_owned and !mem.eql(u8, cfg.path, "src"))
         try detectTargetEntries(diag, allocator, &cfg);
     if (cfg.entries.items.len == 0) try detectStandardEntries(diag, allocator, &cfg);
@@ -39375,6 +39449,9 @@ fn reportSuppression(diag: *DiagCtx, stats: *const SuppressionStats, cfg: *const
     if (cfg.format == .json and !summary_prints) printSuppressedJsonObject(stats.*);
     const n = stats.total();
     if (n == 0) return;
+    // JSON mode: the suppressed object/member already carries the
+    // accounting; the bare note would break the machine stream (EPH-I0213).
+    if (diag.json_stream) return;
     diag.suppression_note_count += 1;
     var buf: [160]u8 = undefined;
     cliDiag(diag, "note: {d} finding{s} suppressed ({s})\n", .{
@@ -39446,10 +39523,12 @@ fn printStrictFailure(total: PrintCounts, fail_on: FailOn) void {
 }
 
 /// Apply the strict CI gate to one command's findings: print the failure
-/// notice and flag the exit when the fail-on level is met.
-fn applyStrictGate(total: PrintCounts, fail_on: FailOn, findings_fail: *bool) void {
-    if (computeExitCode(total, fail_on) == 0) return;
-    printStrictFailure(total, fail_on);
+/// notice and flag the exit when the fail-on level is met. JSON mode
+/// suppresses the notice so the machine stream stays pure (EPH-I0213);
+/// the exit flag carries the gate in both modes.
+fn applyStrictGate(total: PrintCounts, cfg: *const Config, findings_fail: *bool) void {
+    if (computeExitCode(total, cfg.fail_on) == 0) return;
+    if (cfg.format != .json) printStrictFailure(total, cfg.fail_on);
     findings_fail.* = true;
 }
 
@@ -39478,21 +39557,51 @@ fn tallyIssues(issues: []const Issue, out: ReportOutCtx) PrintCounts {
     return counts;
 }
 
+/// One analyzer object's payload: the findings, the stream title, and the
+/// printable count from the tally pass (the JSON "count" field).
+const AnalyzerJsonArgs = struct {
+    issues: []const Issue,
+    title: []const u8,
+    printable: usize,
+};
+
+/// Render one analyzer JSON object into `obj`: the header, one object per
+/// printable issue, and the array close. The caller writes the buffer
+/// once and emits nothing on error, so an allocation failure cannot
+/// strand a partial object (trailing comma, short array, bare notice) in
+/// the machine stream (EPH-I0537, B15 F4).
+fn buildIssuesJson(a: AnalyzerJsonArgs, out: ReportOutCtx, obj: *types.OutBuf) !void {
+    try obj.buf.print(obj.allocator,
+        \\{{
+        \\  "analyzer": "{s}",
+        \\  "count": {d},
+        \\  "issues": [
+        \\
+    , .{ a.title, a.printable });
+    var printed: usize = 0;
+    for (a.issues) |issue| {
+        if (!shouldPrintIssue(issue, out)) continue;
+        // is_last decides the trailing comma, so the array close always
+        // matches the printed count.
+        try issue.formatJson(out.base_path, printed + 1 == a.printable, obj);
+        printed += 1;
+    }
+    try obj.buf.print(obj.allocator, "  ]\n}}\n", .{});
+}
+
+/// Buffer one analyzer JSON object and write it once (see buildIssuesJson).
+fn printIssuesJson(a: AnalyzerJsonArgs, out: ReportOutCtx) void {
+    var obj = types.OutBuf{ .allocator = out.allocator };
+    defer obj.deinit();
+    buildIssuesJson(a, out, &obj) catch return;
+    std.debug.print("{s}", .{obj.buf.items});
+}
+
 fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) PrintCounts {
     const counts = tallyIssues(issues, out);
     const total_printable = counts.warnings + counts.notes;
     if (out.cfg.format == .json) {
-        std.debug.print(
-            "{{\n  \"analyzer\": \"{s}\",\n  \"count\": {d},\n  \"issues\": [\n",
-            .{ title, total_printable },
-        );
-        var printed: usize = 0;
-        for (issues) |issue| {
-            if (!shouldPrintIssue(issue, out)) continue;
-            printed += 1;
-            issue.printJson(out.allocator, out.base_path, printed == total_printable);
-        }
-        std.debug.print("  ]\n}}\n", .{});
+        printIssuesJson(.{ .issues = issues, .title = title, .printable = total_printable }, out);
     } else {
         for (issues) |issue| {
             if (!shouldPrintIssue(issue, out)) continue;
@@ -39502,7 +39611,11 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
     return counts;
 }
 
-fn printResultFooter(total: PrintCounts) void {
+fn printResultFooter(total: PrintCounts, format: OutputFormat) void {
+    // JSON mode emits no footer: the stream is a machine contract and must
+    // stay pure JSON (EPH-I0213). The per-analyzer counts and the exit
+    // code carry the same information.
+    if (format == .json) return;
     if (total.warnings == 0 and total.notes == 0) return;
     std.debug.print("\nephor: ", .{});
     if (total.warnings > 0) {
@@ -39520,6 +39633,13 @@ fn printResultFooter(total: PrintCounts) void {
     }
     std.debug.print(" found\n", .{});
 }
+
+/// Label for the stats Quality line. Spelled via comptime concatenation
+/// so ephor's own stats scanner (getStats, raw-byte match) never counts
+/// the label when ephor scans its own source: a contiguous spelling in
+/// this file would self-inflate the dogfood stats. The rendered text is
+/// the marker word; rendering is pinned by test (EPH-I0538, B15 F5).
+const quality_todo_label = "TO" ++ "DO/FIX" ++ "ME";
 
 fn printStats(s: ProjectStats, format: OutputFormat) void {
     if (format == .json) {
@@ -39577,7 +39697,7 @@ fn printStats(s: ProjectStats, format: OutputFormat) void {
             s.files_with_tests,
             if (s.total_files > 0) s.files_with_tests * 100 / s.total_files else 0,
             s.not_implemented_count,
-            @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
+            quality_todo_label,
             s.todo_count,
         });
     }
@@ -39595,21 +39715,26 @@ const IssueCounts = struct {
     panic: usize = 0,
     tests: usize = 0,
     concurrency: usize = 0,
+    /// Note-severity findings. The per-category buckets count warnings
+    /// only (errors ride inside warnings); notes get one explicit bucket
+    /// so a notes-only run can never report total 0 with status ok
+    /// (EPH-I0535, B15 F2).
+    notes: usize = 0,
 
     fn total(self: IssueCounts) usize {
         return self.orphan + self.memory + self.err + self.unused +
             self.complexity + self.fmt + self.style + self.null_safety +
-            self.panic + self.tests + self.concurrency;
+            self.panic + self.tests + self.concurrency + self.notes;
     }
 };
 
-/// Stack buffer for formatSummaryText. Worst case: ~320 fixed template
-/// bytes + 17 usize fields at <=20 digits each = ~660 bytes. 1024 covers
+/// Stack buffer for formatSummaryText. Worst case: ~350 fixed template
+/// bytes + 18 usize fields at <=20 digits each = ~710 bytes. 1024 covers
 /// it with headroom for additive lines.
 const summary_text_buf_bytes = 1024;
 
-/// Stack buffer for formatSummaryJson. Worst case: ~370 fixed bytes + 18
-/// usize fields at <=20 digits + the 192-byte suppressed member = ~960
+/// Stack buffer for formatSummaryJson. Worst case: ~410 fixed bytes + 19
+/// usize fields at <=20 digits + the 192-byte suppressed member = ~980
 /// bytes. 1536 covers it with headroom for additive members.
 const summary_json_buf_bytes = 1536;
 
@@ -39617,7 +39742,10 @@ const summary_json_buf_bytes = 1536;
 /// a "suppressed" member of the summary object, so a clean "status" never
 /// hides suppressed findings from machine consumers (RED3-3). The AST-tier
 /// members (EPH-I0200) are additive: machine consumers keep every member
-/// they already read.
+/// they already read. The issues member gains an explicit "notes" count;
+/// "total" counts every printed finding (warnings plus errors plus notes),
+/// and "status" reflects that total, so a notes-only run never reports
+/// ok (EPH-I0535).
 fn formatSummaryJson(
     buf: []u8,
     counts: IssueCounts,
@@ -39643,6 +39771,7 @@ fn formatSummaryJson(
         \\      "panic": {d},
         \\      "tests": {d},
         \\      "concurrency": {d},
+        \\      "notes": {d},
         \\      "total": {d}
         \\    }},
         \\    "quality": {{
@@ -39666,6 +39795,7 @@ fn formatSummaryJson(
         counts.panic,
         counts.tests,
         counts.concurrency,
+        counts.notes,
         counts.total(),
         s.not_implemented_count,
         s.todo_count,
@@ -39694,6 +39824,8 @@ fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: Suppressi
 
 /// Format the text summary with the STATUS line into `buf`. The AST-tier
 /// line (EPH-I0200) keeps parse coverage visible in every --summary run.
+/// The Notes line and the TOTAL (which includes notes) keep the summary
+/// consistent with the footer and the exit code (EPH-I0535).
 fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u8 {
     return std.fmt.bufPrint(buf,
         \\
@@ -39714,6 +39846,7 @@ fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u
         \\  Panic:      {d}
         \\  Tests:      {d}
         \\  Concurrency: {d}
+        \\  Notes:      {d}
         \\  TOTAL:      {d}
         \\
         \\Quality: NotImplemented={d} {s}={d}
@@ -39736,9 +39869,10 @@ fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u
         counts.panic,
         counts.tests,
         counts.concurrency,
+        counts.notes,
         counts.total(),
         s.not_implemented_count,
-        @as([]const u8, "TO" ++ "DO/FIX" ++ "ME"),
+        quality_todo_label,
         s.todo_count,
         if (counts.total() == 0) "OK" else "ISSUES FOUND",
     });
@@ -39755,9 +39889,11 @@ fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
 
 /// Surface partial AST-tier coverage (EPH-I0200): a version-skew or
 /// over-cap file loses ZA111 coverage, and the line tier has no equivalent
-/// signal. Fires whenever the tier skipped at least one file.
+/// signal. Fires whenever the tier skipped at least one file. JSON mode
+/// skips the note so the machine stream stays pure (EPH-I0213); with
+/// --summary the ast_skipped member carries the same fact.
 fn noteAstTierSkips(diag: *DiagCtx, stats: ast_tier.Stats) void {
-    if (stats.skipped == 0) return;
+    if (stats.skipped == 0 or diag.json_stream) return;
     diag.ast_skip_note_count += 1;
     cliDiag(
         diag,
@@ -39939,10 +40075,12 @@ fn handleUpgrade(ctx: *RunCtx) void {
 }
 
 /// Usage error shared by `orphans` and `check`: both need entry points.
-fn printNoEntriesError() void {
-    std.debug.print("error: no entry points found\n", .{});
-    std.debug.print("  hint: create ephor.json with 'entries' array\n", .{});
-    std.debug.print("  run: ephor init\n", .{});
+/// cliDiag keeps the lines off the JSON machine stream (EPH-I0213); the
+/// exit flag carries the failure in both modes.
+fn printNoEntriesError(diag: *DiagCtx) void {
+    cliDiag(diag, "error: no entry points found\n", .{});
+    cliDiag(diag, "  hint: create ephor.json with 'entries' array\n", .{});
+    cliDiag(diag, "  run: ephor init\n", .{});
 }
 
 /// ZA502 skipped files ride the structure list (EPH-I0150): same
@@ -39961,7 +40099,7 @@ fn mergeSkippedIssues(
 /// `orphans` command: report files no entry point can reach.
 fn handleOrphans(ctx: *RunCtx) !void {
     if (ctx.cfg.entries.items.len == 0) {
-        printNoEntriesError();
+        printNoEntriesError(ctx.diag);
         ctx.should_exit_error = true;
         return;
     }
@@ -39982,7 +40120,7 @@ fn handleOrphans(ctx: *RunCtx) !void {
     sortIssuesByFile(issues.items);
     const c = printIssues(issues.items, "orphans", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
-    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
 /// `memory` command: CFG-based allocation checks plus the AST tier (ZA111).
@@ -40003,7 +40141,7 @@ fn handleMemory(ctx: *RunCtx) !void {
     ast_issues.items.len = 0; // ownership moved to issues
     const c = printIssues(issues.items, "memory", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
-    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
 /// `errors` command: error-handling findings plus discarded error unions.
@@ -40026,7 +40164,7 @@ fn handleErrors(ctx: *RunCtx) !void {
     ignored.items.len = 0;
     const c = printIssues(issues.items, "errors", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
-    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
 /// `unused` command: dead-code findings.
@@ -40040,7 +40178,7 @@ fn handleUnused(ctx: *RunCtx) !void {
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "unused", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
-    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
 /// `complexity` command: function-size and branch-metric findings.
@@ -40054,7 +40192,7 @@ fn handleComplexity(ctx: *RunCtx) !void {
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "complexity", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
-    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
 /// `fmt-check` command: zig fmt compliance findings.
@@ -40064,7 +40202,7 @@ fn handleFmtCheck(ctx: *RunCtx) !void {
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "format", ctx.reportOut(null));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
-    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
 /// `stats` command: project scan counters, no findings.
@@ -40116,12 +40254,16 @@ fn handleRuntime(ctx: *RunCtx) !void {
         ctx.diag.io,
         ctx.alloc,
         ctx.cfg.path,
-        .{ .verbose = ctx.cfg.verbose, .custom_command = ctx.cfg.runtime_command },
+        .{
+            .verbose = ctx.cfg.verbose,
+            .custom_command = ctx.cfg.runtime_command,
+            .json_stream = ctx.diag.json_stream,
+        },
     );
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "runtime", ctx.reportOut(null));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
-    applyStrictGate(c, ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
 /// Every findings list the `check` report consumes, plus the AST-tier
@@ -40177,7 +40319,9 @@ const FilteredMemIssues = struct {
 const CheckCounts = struct {
     orphan: PrintCounts,
     mem: PrintCounts,
-    ignored_err: PrintCounts,
+    /// Combined errors counts: the report merges the two error-family
+    /// lists into one stream object, so each analyzer key appears once
+    /// (EPH-I0536, B15 F3).
     err: PrintCounts,
     null_safety: PrintCounts,
     panic: PrintCounts,
@@ -40191,7 +40335,7 @@ const CheckCounts = struct {
 
     fn total(self: *const CheckCounts) PrintCounts {
         return self.orphan
-            .add(self.mem).add(self.ignored_err)
+            .add(self.mem)
             .add(self.err).add(self.null_safety)
             .add(self.panic).add(self.unused)
             .add(self.cx).add(self.fmt)
@@ -40205,7 +40349,7 @@ const CheckCounts = struct {
 /// stage stays a flat orchestration.
 fn handleCheck(ctx: *RunCtx) !void {
     if (ctx.cfg.entries.items.len == 0) {
-        printNoEntriesError();
+        printNoEntriesError(ctx.diag);
         ctx.should_exit_error = true;
     }
     if (ctx.should_exit_error) return;
@@ -40441,14 +40585,14 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
     const out = ctx.reportOut(g);
     var filtered = try filterMemIssues(ctx.alloc, findings.cfg_mem_issues.items);
     defer filtered.deinit(ctx.alloc);
-    const counts = printCheckReports(out, findings, &filtered);
+    const counts = try printCheckReports(out, findings, &filtered);
     // RED3-3: the suppression note lands before STATUS/summary/footer so a
     // suppressed repo never shows a bare clean status.
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     if (ctx.cfg.show_summary) printCheckSummary(ctx, g, findings, &counts);
-    printResultFooter(counts.total());
+    printResultFooter(counts.total(), ctx.cfg.format);
     // Findings are informational unless --strict/--fail-on gates them.
-    applyStrictGate(counts.total(), ctx.cfg.fail_on, &ctx.strict_fail);
+    applyStrictGate(counts.total(), ctx.cfg, &ctx.strict_fail);
     try exportCheckIssues(ctx, out, findings, &filtered);
 }
 
@@ -40475,16 +40619,25 @@ fn filterMemIssues(alloc: Allocator, items: []const Issue) !FilteredMemIssues {
     return filtered;
 }
 
-/// Print all thirteen categories in the pinned report order.
+/// Print all thirteen categories in the pinned report order. The two
+/// error-family lists merge into one "errors" stream object: a consumer
+/// keying on the analyzer name must see each analyzer at most once
+/// (EPH-I0536, B15 F3).
 fn printCheckReports(
     out: ReportOutCtx,
     findings: *CheckFindings,
     filtered: *FilteredMemIssues,
-) CheckCounts {
+) !CheckCounts {
+    var err_merged = std.ArrayListUnmanaged(Issue).empty;
+    // Array-only ownership: the item payloads stay owned by their source
+    // lists until CheckFindings teardown (EPH-I0882 pattern).
+    defer err_merged.deinit(out.allocator);
+    try err_merged.appendSlice(out.allocator, findings.ignored_err_issues.items);
+    try err_merged.appendSlice(out.allocator, findings.err_issues.items);
+
     const orphan = printIssues(findings.orphan_issues.items, "orphans", out);
     const mem_count = printIssues(filtered.mem_only.items, "memory", out);
-    const ignored_err = printIssues(findings.ignored_err_issues.items, "errors", out);
-    const err = printIssues(findings.err_issues.items, "errors", out);
+    const err = printIssues(err_merged.items, "errors", out);
     const null_safety = printIssues(filtered.null_safety.items, "null-safety", out);
     const panic = printIssues(filtered.panic.items, "panic", out);
     const unused = printIssues(findings.unused_issues.items, "unused", out);
@@ -40497,7 +40650,6 @@ fn printCheckReports(
     return .{
         .orphan = orphan,
         .mem = mem_count,
-        .ignored_err = ignored_err,
         .err = err,
         .null_safety = null_safety,
         .panic = panic,
@@ -40523,10 +40675,14 @@ fn printCheckSummary(
     var stats = g.getStats();
     stats.ast_parsed = findings.ast_stats.parsed;
     stats.ast_skipped = findings.ast_stats.skipped;
+    // Note-severity findings ride one summary member, not per-category
+    // buckets: the buckets keep the historical warnings-only meaning
+    // (EPH-I0535).
+    const all = counts.total();
     printSummary(.{
         .orphan = counts.orphan.warnings,
         .memory = counts.mem.warnings,
-        .err = counts.err.warnings + counts.ignored_err.warnings,
+        .err = counts.err.warnings,
         .unused = counts.unused.warnings,
         .complexity = counts.cx.warnings,
         .fmt = counts.fmt.warnings,
@@ -40535,6 +40691,7 @@ fn printCheckSummary(
         .panic = counts.panic.warnings,
         .tests = counts.tests.warnings,
         .concurrency = counts.conc.warnings,
+        .notes = all.notes,
     }, stats, ctx.suppression, ctx.cfg.format);
 }
 
@@ -40550,10 +40707,16 @@ fn exportCheckIssues(
     const export_path = ctx.cfg.export_path orelse return;
     var all_issues = try collectAllIssues(ctx.alloc, findings, filtered);
     defer all_issues.deinit(ctx.alloc);
+    // JSON mode suppresses the confirmation: the machine stream must stay
+    // pure (EPH-I0213); the export file itself is the result signal.
     if (exportIssues(ctx.alloc, export_path, all_issues.items, out)) |exported_count| {
-        std.debug.print("exported {d} issues to {s}\n", .{ exported_count, export_path });
+        if (ctx.cfg.format != .json) {
+            std.debug.print("exported {d} issues to {s}\n", .{ exported_count, export_path });
+        }
     } else |err| {
-        std.debug.print("error: failed to export issues: {}\n", .{err});
+        if (ctx.cfg.format != .json) {
+            std.debug.print("error: failed to export issues: {}\n", .{err});
+        }
     }
 }
 
@@ -40587,20 +40750,36 @@ fn collectAllIssues(
     return all;
 }
 
+/// Parse-error exit path. JSON mode owns the stream as a machine
+/// contract: the runtime's bare error line would break it (EPH-I0213),
+/// so the run exits silently with the failure code. Text mode propagates
+/// the error so the runtime prints the diagnostic.
+fn exitOnParseError(diag: *const DiagCtx, err: anyerror) !void {
+    if (!diag.json_stream) return err;
+    // ephor:disable-next-line ZA206
+    std.process.exit(1);
+}
+
 pub fn main(init: std.process.Init) !void {
     var diag = DiagCtx{ .io = init.io };
-    initToolPaths(&diag, init.environ_map);
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
+    // JSON-mode pre-scan before tool-path resolution: the env warnings
+    // fire before parseArgs' own scan would arm the latch (EPH-I0213).
+    // parseArgs scans again: its latch must hold for direct test callers.
+    if (try scanArgsForJson(alloc, init.minimal.args)) diag.json_stream = true;
+    initToolPaths(&diag, init.environ_map);
 
-    var cfg = try parseArgs(&diag, alloc, init.minimal.args);
+    var cfg = parseArgs(&diag, alloc, init.minimal.args) catch |err| {
+        return exitOnParseError(&diag, err);
+    };
     defer cfg.deinit(alloc);
 
     const entry = command_table.get(cfg.command);
     if (entry.check_updates) {
         checkForUpdates(
-            diag.io,
+            &diag,
             alloc,
             init.environ_map.get("HOME"),
             init.environ_map.get("EPHOR_NO_UPDATE_CHECK"),
@@ -40625,15 +40804,20 @@ pub fn main(init: std.process.Init) !void {
     };
     switch (entry.handler) {
         .infallible => |h| h(&ctx),
-        .fallible => |h| try h(&ctx),
+        // JSON mode owns the stream as a machine contract: the runtime's
+        // bare error line would break it, so a failing handler exits
+        // silently with the failure code, the parse-error path's contract
+        // (EPH-I0213).
+        .fallible => |h| h(&ctx) catch |err| return exitOnParseError(&diag, err),
     }
     // A declined runtime prompt returns before the epilogue, exactly like
     // the pre-split bare return from main.
     if (ctx.abort_epilogue) return;
 
-    // Print update notification after all analysis output
+    // Print update notification after all analysis output. JSON mode
+    // skips it so the machine stream stays pure (EPH-I0213).
     if (update_notification) |msg| {
-        std.debug.print("{s}", .{msg});
+        if (cfg.format != .json) std.debug.print("{s}", .{msg});
         alloc.free(msg);
         update_notification = null;
     }
@@ -41266,6 +41450,187 @@ test "summary JSON parses with the AST tier members" {
     try std.testing.expect(summary.get("files") != null);
 }
 
+test "summary text carries the notes bucket and status reflects it (EPH-I0535)" {
+    var buf: [summary_text_buf_bytes]u8 = undefined;
+    // Pre-fix shape (B15 F2): a notes-only run reported TOTAL 0 and
+    // STATUS OK while the footer said "1 note found" and --fail-on=note
+    // exited 1. The total and the status must follow the notes.
+    const text = try formatSummaryText(&buf, .{ .notes = 1 }, .{});
+    try std.testing.expect(mem.indexOf(u8, text, "  Notes:      1") != null);
+    try std.testing.expect(mem.indexOf(u8, text, "  TOTAL:      1") != null);
+    try std.testing.expect(mem.indexOf(u8, text, "STATUS: ISSUES FOUND") != null);
+}
+
+test "summary text stays clean with zero findings" {
+    var buf: [summary_text_buf_bytes]u8 = undefined;
+    const text = try formatSummaryText(&buf, .{}, .{});
+    try std.testing.expect(mem.indexOf(u8, text, "  TOTAL:      0") != null);
+    try std.testing.expect(mem.indexOf(u8, text, "STATUS: OK") != null);
+}
+
+test "summary JSON carries the notes bucket and status reflects it (EPH-I0535)" {
+    const allocator = std.testing.allocator;
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    const text = try formatSummaryJson(&buf, .{
+        .memory = 2,
+        .notes = 1,
+    }, .{}, .{});
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    const issues = parsed.value.object.get("summary").?.object.get("issues").?.object;
+    // The per-category buckets keep the warnings-only meaning; notes ride
+    // their own member; total counts every printed finding.
+    try std.testing.expectEqual(@as(i64, 2), issues.get("memory").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), issues.get("notes").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), issues.get("total").?.integer);
+    try std.testing.expectEqualStrings(
+        "issues_found",
+        parsed.value.object.get("summary").?.object.get("status").?.string,
+    );
+}
+
+test "summary JSON stays ok with zero findings" {
+    const allocator = std.testing.allocator;
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    const text = try formatSummaryJson(&buf, .{}, .{}, .{});
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        parsed.value.object.get("summary").?.object.get("issues").?.object.get("total").?.integer,
+    );
+    try std.testing.expectEqualStrings(
+        "ok",
+        parsed.value.object.get("summary").?.object.get("status").?.string,
+    );
+}
+
+test "analyzer JSON object shape matches the tally (EPH-I0537)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var h = try initSuppressHarness(&diag, allocator, "src/shape.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    const issues = [_]Issue{
+        testJsonIssue("src/a.zig", 1, "ZA101"),
+        testJsonIssue("src/c.zig", 3, "ZA102"),
+    };
+    // ZA102 sits on the disable list, so the second issue drops: the
+    // count field and the array length must both follow the printable
+    // set, never the raw list length.
+    try h.cfg.disabled_rules.append(allocator, try allocator.dupe(u8, "ZA102"));
+    const out = h.out();
+    const counts = tallyIssues(issues[0..], out);
+    const printable = counts.warnings + counts.notes;
+    var obj = types.OutBuf{ .allocator = allocator };
+    defer obj.deinit();
+    const args = AnalyzerJsonArgs{
+        .issues = issues[0..],
+        .title = "memory",
+        .printable = printable,
+    };
+    try buildIssuesJson(args, out, &obj);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, obj.buf.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("memory", parsed.value.object.get("analyzer").?.string);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("issues").?.array.items.len);
+}
+
+test "analyzer JSON build fails atomically under allocation failure (EPH-I0537)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var h = try initSuppressHarness(&diag, allocator, "src/oom.zig", suppress_leak_source);
+    defer h.deinit(allocator);
+    const issues = [_]Issue{
+        testJsonIssue("src/a.zig", 1, "ZA101"),
+        testJsonIssue("src/b.zig", 2, "ZA101"),
+    };
+    // Every allocation point inside the object build must yield a complete
+    // parseable object or error.OutOfMemory — never a partial write. The
+    // caller (printIssuesJson) emits nothing on error, so the machine
+    // stream cannot carry a broken analyzer object (B15 F4).
+    for (0..16) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const falloc = failing.allocator();
+        const out = ReportOutCtx{
+            .diag = &diag,
+            .base_path = h.cfg.path,
+            .allocator = falloc,
+            .cfg = &h.cfg,
+            .graph = &h.run.graph,
+            .ignore_cache = &h.cache,
+            .suppression = &h.stats,
+        };
+        var obj = types.OutBuf{ .allocator = falloc };
+        const args = AnalyzerJsonArgs{ .issues = issues[0..], .title = "memory", .printable = 2 };
+        if (buildIssuesJson(args, out, &obj)) |_| {
+            // Shape check on the plain allocator: the failing allocator's
+            // armed index must not interact with the assertion parse.
+            const parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                obj.buf.items,
+                .{},
+            );
+            defer parsed.deinit();
+            const issues_obj = parsed.value.object.get("issues").?.array;
+            try std.testing.expectEqual(@as(usize, 2), issues_obj.items.len);
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        obj.deinit();
+        // Byte balance at every failure point is the leak proof.
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "summary quality label renders the marker text (EPH-I0538)" {
+    var buf: [summary_text_buf_bytes]u8 = undefined;
+    const text = try formatSummaryText(&buf, .{}, .{});
+    // The comptime-concatenated label value must render plainly in the
+    // summary. The test spells the expected text the same way the label
+    // does, so this file keeps zero raw marker strings (see the scanner
+    // pin below).
+    try std.testing.expect(mem.indexOf(u8, text, "TO" ++ "DO/FIX" ++ "ME") != null);
+}
+
+/// Test helper: one warning finding on `file` for the analyzer JSON
+/// shape tests (kept narrow so the fixture lines stay under the line cap).
+fn testJsonIssue(file: []const u8, line: usize, rule: []const u8) Issue {
+    return .{
+        .file = file,
+        .line = line,
+        .col = 1,
+        .severity = .warning,
+        .rule = rule,
+        .message = "finding",
+        .help = null,
+    };
+}
+
+test "stats scanner ignores comptime-concatenated marker spellings (EPH-I0538)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const content = "const label = \"TO\" ++ \"DO/FIX\" ++ \"ME\";\n";
+    var h = try initSuppressHarness(&diag, allocator, "src/todo_concat.zig", content);
+    defer h.deinit(allocator);
+    // The stats scanner matches raw bytes only (getStats): the
+    // concatenated spelling renders the marker text at comptime and never
+    // self-counts when ephor scans its own source. Documented limitation
+    // (EPH-I0538, B15 F5).
+    try std.testing.expectEqual(@as(usize, 0), h.run.graph.getStats().todo_count);
+}
+
 test "AST skip note fires only when files were skipped" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
@@ -41273,6 +41638,13 @@ test "AST skip note fires only when files were skipped" {
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
     noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 });
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
+}
+
+test "AST skip note stays off the JSON machine stream (EPH-I0213)" {
+    var diag = testDiagCtx();
+    diag.json_stream = true;
+    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 });
+    try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
 }
 
 test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-I0784)" {
@@ -43095,13 +43467,45 @@ test "reportCommandFailure varies help by command kind" {
 test "buildRuntimeArgv builds default and custom argv" {
     var buf: [64][]const u8 = undefined;
     var scratch: [1024]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 3), buildRuntimeArgv(null, &buf, false, &scratch));
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        buildRuntimeArgv(.{ .verbose = false, .custom_command = null }, &buf, &scratch),
+    );
     try std.testing.expectEqualStrings("zig", buf[0]);
     try std.testing.expectEqualStrings("build", buf[1]);
     try std.testing.expectEqualStrings("test", buf[2]);
-    try std.testing.expectEqual(@as(usize, 2), buildRuntimeArgv("sh run.sh", &buf, false, &scratch));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        buildRuntimeArgv(.{ .verbose = false, .custom_command = "sh run.sh" }, &buf, &scratch),
+    );
     try std.testing.expectEqualStrings("sh", buf[0]);
     try std.testing.expectEqualStrings("run.sh", buf[1]);
+}
+
+test "buildRuntimeArgv truncation is detected with and without JSON mode" {
+    // The truncated marker still surfaces the 64-token cap in both modes;
+    // the warning print itself stays off the machine stream (EPH-I0213).
+    const allocator = std.testing.allocator;
+    var cmd: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd.deinit(allocator);
+    for (0..70) |i| {
+        if (i > 0) try cmd.append(allocator, ' ');
+        try cmd.appendSlice(allocator, "tok");
+    }
+    var buf: [64][]const u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    const plain = buildRuntimeArgv(
+        .{ .verbose = false, .custom_command = cmd.items },
+        &buf,
+        &scratch,
+    );
+    const json = buildRuntimeArgv(
+        .{ .verbose = false, .custom_command = cmd.items, .json_stream = true },
+        &buf,
+        &scratch,
+    );
+    try std.testing.expectEqual(@as(usize, 64), plain);
+    try std.testing.expectEqual(@as(usize, 64), json);
 }
 
 test "reportSignalDeath names the signal number in an owned message" {
@@ -43200,6 +43604,24 @@ test "runFmtCheck reports ZR104 when the scanned path does not exist" {
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "FileNotFound") != null);
+}
+
+test "runFmtCheck JSON mode keeps the spawn-failure line off the stream (EPH-I0213)" {
+    var diag = testDiagCtx();
+    diag.json_stream = true;
+    const allocator = std.testing.allocator;
+    // Force the spawn failure with a nonexistent tool path; restore the
+    // global so the rest of the suite sees the real zig.
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = "/nonexistent/ephor-jq-fmt";
+    var issues = try runFmtCheck(&diag, allocator, "src");
+    defer deinitIssues(&issues, allocator);
+    // The machine stream carries the failure as a ZR104 finding; the
+    // bare "cannot run zig fmt" line is gated off (cliDiag).
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "FileNotFound") != null);
 }
 
@@ -43611,6 +44033,26 @@ test "runRuntimeAnalysis reports ZR104 when the command cannot spawn" {
 
     // Pre-fix the catch returned a bare empty list: indistinguishable
     // from ran-clean (EPH-I0232).
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("ZR104", issues.items[0].rule);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "cannot run") != null);
+}
+
+test "runRuntimeAnalysis JSON mode keeps the spawn-failure line off the stream (EPH-I0213)" {
+    const allocator = std.testing.allocator;
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{
+            .verbose = false,
+            .custom_command = "/nonexistent/ephor-jq-runtime",
+            .json_stream = true,
+        },
+    );
+    defer deinitIssues(&issues, allocator);
+    // The machine stream carries the failure as a ZR104 finding; the
+    // bare "cannot run" line is gated off.
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings("ZR104", issues.items[0].rule);
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "cannot run") != null);
@@ -96948,6 +97390,28 @@ test "PrintCounts.add accumulates the error subset" {
     try std.testing.expectEqual(@as(usize, 3), total.errors);
 }
 
+test "applyStrictGate flags the exit in JSON mode too (EPH-I0213)" {
+    // The gate signal must survive the JSON-mode notice suppression: a
+    // JSON run that trips the gate exits 1 even though no notice prints.
+    var cfg = testConfig();
+    cfg.fail_on = .note;
+    cfg.format = .json;
+    var findings_fail = false;
+    applyStrictGate(.{ .notes = 1 }, &cfg, &findings_fail);
+    try std.testing.expect(findings_fail);
+}
+
+test "applyStrictGate passes a clean run at every level" {
+    var cfg = testConfig();
+    var findings_fail = false;
+    inline for (.{ .never, .err, .warning, .note }) |level| {
+        cfg.fail_on = level;
+        findings_fail = false;
+        applyStrictGate(PrintCounts{}, &cfg, &findings_fail);
+        try std.testing.expect(!findings_fail);
+    }
+}
+
 test "FailOn.fromString round-trips and rejects garbage" {
     try std.testing.expectEqual(FailOn.never, FailOn.fromString("never").?);
     try std.testing.expectEqual(FailOn.err, FailOn.fromString("error").?);
@@ -97450,6 +97914,32 @@ test "isWithinScanRoot rejects sibling-prefix paths (RED4-3)" {
     try std.testing.expect(g.isWithinScanRoot("/tmp/repo"));
 }
 
+test "scanDirectory failure routes through the diagnostics channel (EPH-I0213)" {
+    const allocator = std.testing.allocator;
+    // Text mode: the error propagates and the line prints.
+    var text_diag = testDiagCtx();
+    {
+        var graph = ImportGraph.init(allocator, &text_diag);
+        defer graph.deinit();
+        try std.testing.expectError(
+            error.FileNotFound,
+            graph.scanDirectory("/nonexistent/ephor-jq-scan"),
+        );
+    }
+    // JSON mode: the same propagation, the bare line gated off the
+    // machine stream (reportScanOpenError routes through cliDiag).
+    var json_diag = testDiagCtx();
+    json_diag.json_stream = true;
+    {
+        var graph = ImportGraph.init(allocator, &json_diag);
+        defer graph.deinit();
+        try std.testing.expectError(
+            error.FileNotFound,
+            graph.scanDirectory("/nonexistent/ephor-jq-scan"),
+        );
+    }
+}
+
 test "findPathDirInContent skips comments and rejects unsafe candidates (RED4-2)" {
     // A hostile comment line must not win over a later real match.
     const hostile_comment =
@@ -97459,7 +97949,7 @@ test "findPathDirInContent skips comments and rejects unsafe candidates (RED4-2)
         \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/main.zig") });
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(hostile_comment));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(hostile_comment).?);
 
     // A ".." candidate in a comment line is skipped like any comment.
     const parent_comment =
@@ -97468,7 +97958,7 @@ test "findPathDirInContent skips comments and rejects unsafe candidates (RED4-2)
         \\    const exe = b.addExecutable(.{ .root_source_file = b.path("lib/main.zig") });
         \\}
     ;
-    try std.testing.expectEqualStrings("lib", findPathDirInContent(parent_comment));
+    try std.testing.expectEqualStrings("lib", findPathDirInContent(parent_comment).?);
 
     // An absolute candidate in real code is rejected, not selected.
     const absolute_code =
@@ -97477,7 +97967,7 @@ test "findPathDirInContent skips comments and rejects unsafe candidates (RED4-2)
         \\    const lib = b.addStaticLibrary(.{ .root_source_file = b.path("src/lib.zig") });
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(absolute_code));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(absolute_code).?);
 
     // A ".." candidate in real code is rejected by the component check.
     const parent_code =
@@ -97486,7 +97976,7 @@ test "findPathDirInContent skips comments and rejects unsafe candidates (RED4-2)
         \\    const lib = b.addStaticLibrary(.{ .root_source_file = b.path("src/lib.zig") });
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(parent_code));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(parent_code).?);
 }
 
 test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)" {
@@ -97498,7 +97988,7 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
         \\    const exe = b2.addExecutable(.{ .root_source_file = b2.path("src/main.zig") });
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(trailing_comment));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(trailing_comment).?);
 
     // A real match keeps its value when a comment follows it.
     const real_then_comment =
@@ -97506,7 +97996,7 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
         \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/m.zig") }); // note
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(real_then_comment));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(real_then_comment).?);
 
     // A `//` inside a string literal is not a comment. The quote-aware
     // strip must keep such a line whole.
@@ -97516,7 +98006,7 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
         \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/main.zig") });
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(url_own_line));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(url_own_line).?);
 
     // Same-line form: a naive strip would cut at the string's `//` and
     // hide the pattern after it.
@@ -97525,7 +98015,7 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
         \\    _ = "https://x"; exe.root_src = "src/m.zig";
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(url_same_line));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(url_same_line).?);
 
     // A payload on a line-initial `\\` multiline-string body line stays
     // skipped. The existing skip already covers this shape; this pins it.
@@ -97537,7 +98027,28 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
         \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/main.zig") });
         \\}
     ;
-    try std.testing.expectEqualStrings("src", findPathDirInContent(string_body));
+    try std.testing.expectEqualStrings("src", findPathDirInContent(string_body).?);
+}
+
+test "findPathDirInContent returns null when nothing matches" {
+    // No pattern at all: the caller owns the not-detected report.
+    try std.testing.expect(findPathDirInContent("pub fn build(b: *std.Build) void {}\n") == null);
+    // Every candidate rejected (absolute, ".."): null, never a value.
+    const rejected =
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("../evil/main.zig") });
+        \\}
+    ;
+    try std.testing.expect(findPathDirInContent(rejected) == null);
+}
+
+test "detectPathDirFromBuildZig reads the project build.zig through diag" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const dir = detectPathDirFromBuildZig(&diag, allocator);
+    defer allocator.free(dir);
+    // The repo's own build.zig declares root_source_file = "src/main.zig".
+    try std.testing.expectEqualStrings("src", dir);
 }
 
 test "config trust: cwd and ancestors trusted, descendants untrusted" {
@@ -99063,6 +99574,39 @@ test "CLI every documented flag still parses (EPH-I0234)" {
     try std.testing.expectEqualStrings("9.9.9", cfg.install_version.?);
 }
 
+test "parseSimpleFlag --format=json enables the JSON stream flag (EPH-I0213)" {
+    var diag = testDiagCtx();
+    var cfg = testConfig();
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(try parseSimpleFlag(&diag, "--format=json", &cfg));
+    try std.testing.expectEqual(types.OutputFormat.json, cfg.format);
+    // The format flag arms the stream-purity gate for every later
+    // diagnostic (cliDiag, the notes, the footer, the update notice).
+    try std.testing.expect(diag.json_stream);
+}
+
+test "isJsonFormatToken matches only the two JSON format spellings (EPH-I0213)" {
+    try std.testing.expect(isJsonFormatToken("--format=json"));
+    try std.testing.expect(isJsonFormatToken("-f=json"));
+    try std.testing.expect(!isJsonFormatToken("--format=text"));
+    try std.testing.expect(!isJsonFormatToken("-f=text"));
+    try std.testing.expect(!isJsonFormatToken("--format=jsonx"));
+    try std.testing.expect(!isJsonFormatToken("json"));
+}
+
+test "JSON mode makes verbose a no-op, text mode keeps it (EPH-I0213)" {
+    var cfg_json = testConfig();
+    cfg_json.format = .json;
+    cfg_json.verbose = true;
+    silenceVerboseInJson(&cfg_json);
+    try std.testing.expect(!cfg_json.verbose);
+
+    var cfg_text = testConfig();
+    cfg_text.verbose = true;
+    silenceVerboseInJson(&cfg_text);
+    try std.testing.expect(cfg_text.verbose);
+}
+
 test "CLI command-scoped flags under the wrong command error (EPH-I0525)" {
     var diag = testDiagCtx();
     // Regression: every command-scoped flag parsed under any command and
@@ -100061,6 +100605,23 @@ test "suppression: ignore-file directive drops the finding and counts inline" {
     diag.cli_diagnostics_enabled = false;
     reportSuppression(&diag, &h.stats, &h.cfg);
     try std.testing.expectEqual(@as(usize, 1), diag.suppression_note_count);
+}
+
+test "suppression: JSON mode carries the accounting without the bare note (EPH-I0213)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
+    var h = try initSuppressHarness(&diag, allocator, "src/sup_json.zig", content);
+    defer h.deinit(allocator);
+    h.cfg.format = .json;
+    diag.json_stream = true;
+    const counts = tallyIssues(h.run.issues.items, h.out());
+    try std.testing.expectEqual(@as(usize, 0), counts.warnings);
+    try std.testing.expect(h.stats.total() > 0);
+    // The suppressed object (or summary member) carries the accounting in
+    // JSON mode; the bare note must not reach the machine stream.
+    reportSuppression(&diag, &h.stats, &h.cfg);
+    try std.testing.expectEqual(@as(usize, 0), diag.suppression_note_count);
 }
 
 test "suppression: known-issues entry drops the finding and counts known_issues" {

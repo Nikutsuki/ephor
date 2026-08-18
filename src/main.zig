@@ -24957,13 +24957,19 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 // AFTER the copy — the returned value's backing is freed before the caller
 // can use it (certain use-after-free; a double-free once the caller deinits).
 // errdefer does NOT fire on the success path, so it is correctly silent.
-// Accepted FNs (v1): labeled-block returns (`break :blk list`), and
-// `return self.field` dual-owner forms (the `take()` idiom needs a visible
-// field reset to adjudicate — v2).
+// Accepted FNs (v1): labeled-block returns (`break :blk list`) — tracked
+// for ZA110 under EPH-I0481 (EPH-I0046 covers the labeled-block shape for
+// ZA111 only) — and `return self.field` dual-owner forms with no armed
+// defer on the exact path: the `take()` idiom needs a visible field reset
+// to adjudicate (EPH-I0038, v2). The exact-path armed-defer subset is not
+// dual-owner: the defer frees the backing the by-value copy hands out, so
+// it fires (EPH-I0482).
 
 const max_sig_join_lines = 16;
 const max_sig_bytes = 1024;
 const max_tracked_locals = 64;
+/// Armed-defer-path cap; overflow is FN-only — the extra defer never arms
+/// a return (same direction as the locals and alias caps, EPH-I0485).
 const max_defer_paths = 8;
 /// Copy-alias cap; overflow is FN-only — the extra alias never matches a
 /// defer path (same direction as the locals and defer-path caps).
@@ -25014,11 +25020,18 @@ fn joinFnSignature(fl: []const []const u8, buf: []u8) ?[]const u8 {
 }
 
 /// Word-boundary substring match: `std.ArrayList(` matches `ArrayList(`,
-/// `MyBufMap` does not match `BufMap`.
+/// `MyBufMap` does not match `BufMap`. Patterns without a trailing `(`
+/// (the non-generic `BufMap`/`BufSet`) also need a non-identifier right
+/// boundary: `BufMaps` must not match `BufMap` (EPH-I0485, band-B11 F12).
 fn containsTypePattern(haystack: []const u8, pat: []const u8) bool {
+    const self_bound_right = pat.len > 0 and pat[pat.len - 1] == '(';
     var from: usize = 0;
     while (mem.indexOfPos(u8, haystack, from, pat)) |pos| {
-        if (pos == 0 or !isIdent(haystack[pos - 1])) return true;
+        if (pos == 0 or !isIdent(haystack[pos - 1])) {
+            if (self_bound_right) return true;
+            const end = pos + pat.len;
+            if (end == haystack.len or !isIdent(haystack[end])) return true;
+        }
         from = pos + 1;
     }
     return false;
@@ -25027,6 +25040,12 @@ fn containsTypePattern(haystack: []const u8, pat: []const u8) bool {
 /// The managed-container payload of a return type, or null when the return
 /// cannot alias a backing allocation: pointer (`*T`, `?*T`) and slice (`[]T`)
 /// returns copy no header, and non-managed types own no heap backing.
+/// The slice gate is header-only (band-B11 F9, EPH-I0485): `return
+/// list.items;` under an armed `defer list.deinit();` frees the backing
+/// the caller's slice reads, but no ephor rule analyzes the caller-side
+/// read — ZA110's help names the slice return as the fix for the header
+/// copy, and the pointee dangle stays an accepted FN, pinned by the
+/// EPH-I0485 slice test.
 fn managedContainerPayload(ret: []const u8) ?[]const u8 {
     var payload = mem.trim(u8, ret, " \t\r");
     // Error union: the single '!' separates error set from payload type.
@@ -25509,7 +25528,18 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
         if (t.len == 0 or isCommentOrMultilineString(t)) continue;
         const path = returnedLocalPath(t) orelse continue;
         const head = mem.sliceTo(path, '.');
-        if (!containsName(scan.locals[0..scan.local_count], head)) continue;
+        // The locals gate silences non-local heads (`self.field`): the
+        // receiver is not a tracked local, and a bare `return self.list;`
+        // is the dual-owner take()-idiom shape (EPH-I0038, v2). The
+        // exact-path armed-defer subset is the one exception (band-B11
+        // F8, EPH-I0482): a defer armed on the exact returned field path
+        // frees that backing at scope exit regardless of dual-owner
+        // semantics, so it fires even when the head is not a local. The
+        // whole-owner non-local form (`return self;` under an armed
+        // `self.list.deinit()`) stays silent — the same uncertainty that
+        // scopes the F7 direction applies there.
+        const head_is_local = containsName(scan.locals[0..scan.local_count], head);
+        if (!head_is_local and path.len == head.len) continue;
         if (!deferPathArmsReturn(
             scan.defer_paths[0..scan.defer_count],
             path,
@@ -25520,7 +25550,13 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
     }
 }
 
-/// Run safety and error CFG analyses
+/// Run safety and error CFG analyses. The r1/r2/r3 appendSlice transfers
+/// carry no payload guard by design (band-B11 F13, EPH-I0483): the
+/// null-safety, panic-pattern, and error families emit static message
+/// strings only, so an OOM at a transfer leaks nothing — the array defer
+/// frees the whole list. A future allocPrint'd message in one of these
+/// families must add the B45-1 owns-payloads guard (runCFGMemoryAnalyses
+/// shows the pattern). Pinned by the EPH-I0483 test.
 fn runCFGSafetyAnalyses(run: CFGRunCtx) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
@@ -25576,7 +25612,10 @@ fn buildCFGFilePrescan(allocator: Allocator, content: []const u8) !CFGFilePresca
     return .{ .no_free_fns = no_free_fns, .no_free_fields = no_free_fields };
 }
 
-/// Analyze a single file for CFG memory issues
+/// Analyze a single file for CFG memory issues. 49 physical lines; 44
+/// code lines under ephor's own ZA301 counting (blank and comment lines
+/// excluded, EPH-I0788) — under the 50-line ceiling, and ZA301 is not in
+/// the gate's enabled set (band-B11 F13-adjacent, EPH-I0484).
 fn analyzeCFGFile(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
@@ -43218,6 +43257,53 @@ test "ZA105: runCFGMemoryAnalyses frees r2 payloads when appendSlice OOMs (EPH-I
         // when out.appendSlice OOMs (EPH-I0895, B45-1).
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "safety lists carry no owned payloads (EPH-I0483)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B11 F13: runCFGSafetyAnalyses transfers r1/r2/r3 into out
+    // with a bare appendSlice — an owned message in those lists would
+    // leak on an OOM at the transfer (the array defer frees only the
+    // backing; the B45-1 guards exist exactly for that class). The
+    // null-safety, panic-pattern, and error families emit static message
+    // strings only, so no guard is needed. This pin fails when a future
+    // emission allocates a message into one of the safety lists without
+    // adding the owns-payloads guard (see runCFGSafetyAnalyses doc).
+    const content =
+        \\fn helper() u8 { return 1; }
+        \\fn probe(a: std.mem.Allocator, p: ?*u8, i: usize) u8 {
+        \\    var q: ?*u8 = p;
+        \\    _ = q.*;
+        \\    const buf = try a.alloc(u8, 64);
+        \\    defer a.free(buf);
+        \\    _ = buf[i - 1];
+        \\    const x = helper() catch unreachable;
+        \\    _ = x;
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "sweep_safety.zig", content);
+    defer run.deinit(allocator);
+
+    var saw_safety = false;
+    for (run.issues.items) |issue| {
+        const is_safety = mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE) or
+            mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE) or
+            mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED) or
+            mem.eql(u8, issue.rule, RULE_OPTIONAL_UNWRAP_UNSAFE) or
+            mem.eql(u8, issue.rule, RULE_ORELSE_QUESTION_UNSAFE) or
+            mem.eql(u8, issue.rule, RULE_DECREMENT_WITHOUT_CHECK) or
+            mem.eql(u8, issue.rule, RULE_INDEX_ARITHMETIC);
+        if (is_safety) saw_safety = true;
+        try std.testing.expect(!is_safety or !issue.message_owned);
+    }
+    // The fixture must actually reach the safety families: a silent run
+    // would make the no-owned-payload assertion vacuous.
+    try std.testing.expect(saw_safety);
 }
 
 test "ZA1xx: no-free collectors stay byte-balanced on put failure (EPH-I1007)" {
@@ -93846,6 +93932,109 @@ test "ZA110: self field return is silent (receiver owned by caller)" {
         @as(usize, 0),
         countRuleIssues(run.issues.items, "za110_selffield.zig", RULE_MUST_RETURN_REF),
     );
+}
+
+test "ZA110: self field return with exact-path armed defer fires (EPH-I0482)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B11 F8: the locals gate (self is not a tracked local) must
+    // not silence the certain-dangle subset — an armed defer on the
+    // EXACT returned field path frees the backing the by-value copy
+    // hands out, with no take()-reset adjudication needed (EPH-I0038
+    // covers the no-defer dual-owner form; za110_selffield pins that
+    // silence).
+    const content =
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    list: std.ArrayList(u8),
+        \\    fn take(self: *Store) std.ArrayList(u8) {
+        \\        defer self.list.deinit();
+        \\        return self.list;
+        \\    }
+        \\};
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_selffield_armed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_selffield_armed.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: self whole-owner return under an armed field stays silent (EPH-I0482)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The F8 fix fires only the exact-path shape: `return self;` while
+    // `self.list` is armed keeps the armed-whole/field-return uncertainty
+    // that scopes the F7 direction — whether the field's deinit frees the
+    // returned whole's backing is owner-dependent, so it stays silent.
+    const content =
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    list: std.ArrayList(u8),
+        \\    fn take(self: *Store) std.ArrayList(u8) {
+        \\        defer self.list.deinit();
+        \\        return self;
+        \\    }
+        \\};
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_selfwhole.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_selfwhole.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "ZA110: slice pointee return with armed defer stays silent (EPH-I0485)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // band-B11 F9: the `[` return-type gate excludes slice returns — the
+    // slice header copies no allocation. The pointee dangle (the armed
+    // defer frees the backing the caller's slice reads) is an accepted
+    // FN: no ephor rule analyzes the caller-side read. Pins the silence
+    // so a scope change must update this test and the
+    // managedContainerPayload doc.
+    const content =
+        \\const std = @import("std");
+        \\fn takeItems(a: std.mem.Allocator) []u8 {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    return list.items;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_slicepointee.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_slicepointee.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
+test "containsTypePattern: non-generic patterns need a right boundary (EPH-I0485)" {
+    // band-B11 F12: patterns without a trailing `(` (BufMap/BufSet) are
+    // not self-bound on the right — `BufMaps` and `BufSettings` must not
+    // match. Generic patterns self-bind through their trailing paren.
+    try std.testing.expect(containsTypePattern("BufMap", "BufMap"));
+    try std.testing.expect(containsTypePattern("std.BufMap", "BufMap"));
+    try std.testing.expect(!containsTypePattern("BufMaps", "BufMap"));
+    try std.testing.expect(!containsTypePattern("MyBufMap", "BufMap"));
+    try std.testing.expect(!containsTypePattern("BufSettings", "BufSet"));
+    try std.testing.expect(containsTypePattern("std.AutoHashMap(", "AutoHashMap("));
+    try std.testing.expect(containsTypePattern("std.AutoHashMap(u32, u32)", "AutoHashMap("));
+    try std.testing.expect(!containsTypePattern("MyAutoHashMap(", "AutoHashMap("));
 }
 
 test "ZA110: inline-storage container (EnumSet) by value is silent" {

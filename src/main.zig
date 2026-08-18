@@ -17,6 +17,12 @@
 //! - fmt-check:  Files needing zig fmt (wrapper)
 //! - stats:      Project metrics
 //! - check:      Run all checks
+//! - runtime:    Run tests with memory diagnostics
+//! - init:       Create an ephor.json config file
+//! - install:    Add ephor to a project's build.zig
+//! - upgrade:    Update ephor to the latest version (alias: update)
+//! - help:       Print help (-h, --help)
+//! - version:    Print the version (--version, -v)
 
 const std = @import("std");
 const mem = std.mem;
@@ -25,9 +31,7 @@ const Allocator = mem.Allocator;
 /// Compatibility layer for std.fs APIs removed in Zig 0.16.0.
 /// The I/O handle arrives through cwd(): no file-scope global (EPH-I0771).
 const Fs = struct {
-    pub const path = std.Io.Dir.path;
     pub const max_path_bytes = std.Io.Dir.max_path_bytes;
-    pub const Dir = CompatDir;
 
     pub fn cwd(io: std.Io) CompatDir {
         return .{ .io = io };
@@ -83,9 +87,6 @@ const Fs = struct {
         pub fn realpathAlloc(self: CompatDir, allocator: Allocator, sub_path: []const u8) ![:0]u8 {
             return std.Io.Dir.cwd().realPathFileAlloc(self.io, sub_path, allocator);
         }
-        pub fn iterate(_: CompatDir) std.Io.Dir.Iterator {
-            return std.Io.Dir.cwd().iterate();
-        }
         pub fn writeFile(
             self: CompatDir,
             sub_path: []const u8,
@@ -131,12 +132,26 @@ const ToolKind = enum {
 };
 
 /// Resolve the spawn path of an external tool (EPH-I0154). An absolute env
-/// override that resolves wins. Anything else falls back to the bare name
-/// and PATH. The fallback is fail-open with a warning, not a hard error:
-/// the threat is a hostile environment, which the operator controls, and a
+/// override that exists and is not a directory wins. An empty value counts
+/// as unset (EPH-I0314). Anything else falls back to the bare name and
+/// PATH with a warning. The fallback is fail-open, not a hard error: the
+/// threat is a hostile environment, which the operator controls, and a
 /// path typo must not brick the run.
+///
+/// The check is a fast-fail convenience, not a security gate (EPH-I0312):
+/// it validates existence and not-a-directory only. Executability is not
+/// checked — Windows ignores the access() options entirely (std Io
+/// Threaded.zig dirAccessWindows), so an X_OK gate would be a silent no-op
+/// there, and the exec at spawn time is the authoritative gate. The gap
+/// between this check and the late spawn is a TOCTOU window (std documents
+/// the same race for access()); it is accepted because the environment is
+/// operator-controlled and a swapped path fails at spawn with a clear
+/// error.
 fn resolveToolFromEnv(diag: *const DiagCtx, tool: ToolKind, env_val: ?[]const u8) []const u8 {
     const val = env_val orelse return tool.bareName();
+    // An empty override is not an override: treat it as unset, silently
+    // (EPH-I0314). The pre-fix warning called it "not an absolute path".
+    if (val.len == 0) return tool.bareName();
     if (!std.fs.path.isAbsolute(val)) {
         cliDiag(
             diag,
@@ -145,7 +160,10 @@ fn resolveToolFromEnv(diag: *const DiagCtx, tool: ToolKind, env_val: ?[]const u8
         );
         return tool.bareName();
     }
-    std.Io.Dir.cwd().access(diag.io, val, .{}) catch {
+    // statFile subsumes the existence check: it resolves the path and
+    // reports the kind in one call. A directory would fail confusingly at
+    // the late spawn, so reject it here (EPH-I0312).
+    const st = std.Io.Dir.cwd().statFile(diag.io, val, .{}) catch {
         cliDiag(
             diag,
             "warning: {s} path '{s}' does not resolve. Using PATH.\n",
@@ -153,6 +171,14 @@ fn resolveToolFromEnv(diag: *const DiagCtx, tool: ToolKind, env_val: ?[]const u8
         );
         return tool.bareName();
     };
+    if (st.kind == .directory) {
+        cliDiag(
+            diag,
+            "warning: {s} path '{s}' is a directory. Using PATH.\n",
+            .{ tool.envVar(), val },
+        );
+        return tool.bareName();
+    }
     return val;
 }
 
@@ -163,17 +189,23 @@ fn initToolPaths(diag: *const DiagCtx, environ_map: *const std.process.Environ.M
 }
 
 /// Diagnostics and I/O context for one ephor run (EPH-I0771). Replaces the
-/// file-scope test-hook globals: production main constructs one instance at
-/// startup and threads it. Tests construct a fresh instance per test and
-/// assert on the fields directly. No restore-at-exit and no canary: a
-/// per-instance value cannot leak across tests by construction.
+/// file-scope test-hook globals, including the pre-refactor global_io.?
+/// unwrap convention (band-B00 F4, EPH-I0313): io is a required field, so
+/// a context without an I/O handle cannot exist and no set-before-use
+/// ordering can panic. Production main constructs one instance at startup
+/// and threads it. Tests construct a fresh instance per test and assert on
+/// the fields directly. No restore-at-exit and no canary: a per-instance
+/// value cannot leak across tests by construction.
 const DiagCtx = struct {
     /// I/O handle for child-process and file operations.
     io: std.Io,
-    /// Mutes cliDiag when false. zig build test's runner surfaces any
-    /// stderr output as a step failure, so tests that exercise error paths
-    /// mute parse diagnostics and assert on the resulting state instead of
-    /// on the printed text.
+    /// Mutes cliDiag when false. The mute does not change the test-runner
+    /// verdict: the verdict derives from TestResults counts only (fail,
+    /// crash, timeout, leak, log_err). cliDiag writes via std.debug.print
+    /// to raw stderr, which the runner echoes into the gate log on success
+    /// (build_runner "no matter the result") but never counts against the
+    /// step. Error-path tests mute parse diagnostics and assert on the
+    /// resulting state; the mute keeps that echoed stderr quiet.
     cli_diagnostics_enabled: bool = true,
     /// Errno-style detail for error.InvalidFailOnValue /
     /// error.InvalidStrictValue out of config parsing: the parse layer
@@ -334,7 +366,6 @@ const Severity = types.Severity;
 const FailOn = types.FailOn;
 const ErrorNaming = types.ErrorNaming;
 
-// Output format (not in types.zig - specific to CLI)
 const OutputFormat = types.OutputFormat;
 
 // Import shared types from types.zig
@@ -38650,9 +38681,11 @@ fn printHelp() void {
         \\                          no cache read, no warning. Without it, the latest
         \\                          version is cached for 24h at ~/.ephor_update_check.
         \\  EPHOR_ZIG_PATH        Absolute path of the zig binary ephor spawns.
-        \\                          Overrides the PATH lookup. A value that is not
-        \\                          absolute or does not resolve warns and falls back
-        \\                          to PATH (EPH-I0154).
+        \\                          Overrides the PATH lookup. An empty value is
+        \\                          treated as unset (no warning). A value that is
+        \\                          not an absolute path to an existing file
+        \\                          (directories are rejected) warns and falls
+        \\                          back to PATH (EPH-I0154).
         \\  EPHOR_CURL_PATH       Same override for the curl binary the update check
         \\                          spawns. Ephor executes the zig and curl found via
         \\                          PATH. A poisoned PATH is code execution, so pin
@@ -69380,8 +69413,33 @@ test "resolveToolFromEnv warns and falls back on a relative override (EPH-I0154)
         "zig",
         resolveToolFromEnv(&diag, .zig, "tools/zig"),
     );
-    // An empty value is not absolute either.
+}
+
+test "resolveToolFromEnv empty override falls back to the bare name (EPH-I0314, value-level pin)" {
+    // Value-level fallback-semantics pin: an empty override is not an
+    // override, so it resolves to the bare name like an unset var. The
+    // warning-absence half of the regression (pre-fix: "not an absolute
+    // path" on "") cannot be asserted here: no capturable diagnostic sink
+    // exists (blocking mechanism), and the step verdict derives from
+    // TestResults counts only, never from raw stderr. The gate-level
+    // full-suite stderr grep ("not an absolute path" = 0) enforces that
+    // half, because the runner echoes captured stderr into the gate log
+    // on success.
+    var diag = testDiagCtx();
+    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(&diag, .zig, ""));
     try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, ""));
+}
+
+test "resolveToolFromEnv warns and falls back on a directory override (EPH-I0312)" {
+    var diag = testDiagCtx();
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    diag.cli_diagnostics_enabled = false;
+    // A directory passes the pre-fix existence-only access() check and
+    // fails confusingly at the late spawn; the not-dir gate catches it here.
+    try std.testing.expectEqualStrings(
+        "zig",
+        resolveToolFromEnv(&diag, .zig, "/bin"),
+    );
 }
 
 test "resolveToolFromEnv warns and falls back on an unresolvable override (EPH-I0154)" {
@@ -91252,10 +91310,10 @@ test "ZT105 EPH-I0909: struct-literal field names are not value references" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Fs.cwd / CompatDir.iterate class: `.cwd = .{...}` and
-    // `.iterate = true` literal LHS names are field names, never fn value
-    // references. Pre-fix they aliased `cwd` and `iterate`, silently
-    // suppressing the same-named pub fns. fs_ctrl is the control.
+    // Fs.cwd class: `.cwd = .{...}` and `.iterate = true` literal LHS
+    // names are field names, never fn value references. Pre-fix they
+    // aliased `cwd` and `iterate`, silently suppressing the same-named
+    // pub fns. fs_ctrl is the control.
     const files = [_]TestQualityFile{
         .{
             .path = "zt105_fs.zig",
@@ -96980,7 +97038,8 @@ test "config error_naming parses TitleCase and the PascalCase alias" {
 
 test "config error_naming unknown value warns and keeps the default" {
     var diag = testDiagCtx();
-    // Mute the warning print: zig's test runner surfaces stderr as failure.
+    // Mute the warning print: the runner echoes stderr into the gate log
+    // on success, never into the verdict. The value-level assertion is the pin.
     diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"kebab-case\"}", &cfg);
@@ -97022,6 +97081,26 @@ test "config invalid fail_on is a hard usage error" {
     // the freed config content)
     const stashed = diag.last_bad_gate_value[0..diag.last_bad_gate_value_len];
     try std.testing.expectEqualStrings("warn", stashed);
+}
+
+test "stashed gate value survives config content reuse (EPH-I0316)" {
+    // B13-17 (EPH-I0515..I0520) replaced the borrowed-slice stash with an
+    // owned copy in the fixed buffer. The literal-content pins above pass
+    // on a borrowed-slice regression too (the literal never frees), so this
+    // probe overwrites the source buffer after the parse and asserts the
+    // stash still holds the value: a borrow reads the overwritten bytes.
+    var diag = testDiagCtx();
+    var cfg = testConfig();
+    const content = "{\"fail_on\": \"bogus\"}";
+    var content_buf: [content.len]u8 = undefined;
+    @memcpy(content_buf[0..], content[0..content.len]);
+    try std.testing.expectError(
+        error.InvalidFailOnValue,
+        parseConfigJson(&diag, std.testing.allocator, &content_buf, &cfg),
+    );
+    @memset(content_buf[0..], 'X');
+    const stashed = diag.last_bad_gate_value[0..diag.last_bad_gate_value_len];
+    try std.testing.expectEqualStrings("bogus", stashed);
 }
 
 test "config error_naming hostile value warns through the sanitizer (B13-10)" {
@@ -97106,7 +97185,8 @@ test "CLI --fail-on=never can override config strict off" {
 
 test "CLI invalid --fail-on value is a hard usage error" {
     var diag = testDiagCtx();
-    // Mute the error print: zig's test runner surfaces child stderr as failure
+    // Mute the error print: the runner echoes stderr into the gate log
+    // on success, never into the verdict. The error-return assertion is the pin.
     diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     var cli_entries = false;

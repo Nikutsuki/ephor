@@ -147,7 +147,7 @@ const ToolKind = enum {
 /// the same race for access()); it is accepted because the environment is
 /// operator-controlled and a swapped path fails at spawn with a clear
 /// error.
-fn resolveToolFromEnv(diag: *const DiagCtx, tool: ToolKind, env_val: ?[]const u8) []const u8 {
+fn resolveToolFromEnv(diag: *DiagCtx, tool: ToolKind, env_val: ?[]const u8) []const u8 {
     const val = env_val orelse return tool.bareName();
     // An empty override is not an override: treat it as unset, silently
     // (EPH-I0314). The pre-fix warning called it "not an absolute path".
@@ -183,7 +183,7 @@ fn resolveToolFromEnv(diag: *const DiagCtx, tool: ToolKind, env_val: ?[]const u8
 }
 
 /// Resolve every tool spawn path once from the process environment.
-fn initToolPaths(diag: *const DiagCtx, environ_map: *const std.process.Environ.Map) void {
+fn initToolPaths(diag: *DiagCtx, environ_map: *const std.process.Environ.Map) void {
     tool_zig_path = resolveToolFromEnv(diag, .zig, environ_map.get("EPHOR_ZIG_PATH"));
     tool_curl_path = resolveToolFromEnv(diag, .curl, environ_map.get("EPHOR_CURL_PATH"));
 }
@@ -246,6 +246,15 @@ const DiagCtx = struct {
     /// buffer bound is fine for a diagnostic.
     last_bad_gate_value: [bad_gate_value_buf_bytes]u8 = undefined,
     last_bad_gate_value_len: usize = 0,
+    /// Last diagnostic muted by the machine latch (EPH-I1067): when
+    /// json_stream is armed, cliDiag never prints, so the abort path
+    /// renders the last stashed message inside the machine error object
+    /// instead of losing it. Owned copy in a fixed buffer (the
+    /// last_bad_gate_value policy): the message may alias a buffer that
+    /// frees right after the call. Truncation at the buffer bound is
+    /// fine for a diagnostic.
+    last_muted_diag: [diag_msg_buf_bytes]u8 = undefined,
+    last_muted_diag_len: usize = 0,
     /// "ignoring suppression/gate keys from untrusted" notes printed. One
     /// per offending config file.
     untrusted_config_note_count: usize = 0,
@@ -337,8 +346,23 @@ const diag_msg_buf_bytes = 8192;
 /// buffer and goes through the sink; without one the call passes
 /// straight to std.debug.print, so production output is byte-identical
 /// with the pre-sink code.
-fn cliDiag(diag: *const DiagCtx, comptime fmt: []const u8, args: anytype) void {
-    if (!diag.cli_diagnostics_enabled or diag.json_stream) return;
+fn cliDiag(diag: *DiagCtx, comptime fmt: []const u8, args: anytype) void {
+    if (!diag.cli_diagnostics_enabled) return;
+    if (diag.json_stream) {
+        // The machine latch mutes the message, but the abort path must
+        // still carry it: stash the formatted text (EPH-I1067). The
+        // fixed buffer keeps the head on over-cap, the sink path's
+        // truncation policy.
+        var stash_buf: [diag_msg_buf_bytes]u8 = undefined;
+        var stash_writer: std.Io.Writer = .fixed(&stash_buf);
+        stash_writer.print(fmt, args) catch |err| switch (err) {
+            error.WriteFailed => {},
+        };
+        const stash_msg = stash_writer.buffered();
+        @memcpy(diag.last_muted_diag[0..stash_msg.len], stash_msg);
+        diag.last_muted_diag_len = stash_msg.len;
+        return;
+    }
     const sink = diag.diag_sink orelse {
         std.debug.print(fmt, args);
         return;
@@ -12692,7 +12716,7 @@ const ImportGraph = struct {
     /// keeps the lines off the JSON machine stream (EPH-I0213): the
     /// handler's failure exit carries the verdict in JSON mode.
     fn reportScanOpenError(
-        diag: *const DiagCtx,
+        diag: *DiagCtx,
         allocator: Allocator,
         dir_path: []const u8,
         err: anyerror,
@@ -36407,7 +36431,7 @@ fn dupeOrEmpty(allocator: Allocator, value: []const u8) []const u8 {
 /// project). A violation warns and falls back to the "." default. Every
 /// diagnostic routes through cliDiag: JSON mode owns the stream as a
 /// machine contract (EPH-I0213).
-fn detectPathDirFromBuildZig(diag: *const DiagCtx, allocator: Allocator) []const u8 {
+fn detectPathDirFromBuildZig(diag: *DiagCtx, allocator: Allocator) []const u8 {
     const content = Fs.cwd(diag.io).readFileAlloc(
         allocator,
         "build.zig",
@@ -39101,7 +39125,10 @@ fn isJsonFormatToken(arg: []const u8) bool {
 /// a config value. Infallible by construction (EPH-I1056): the raw argv
 /// vector is scanned without an allocated iterator copy, so an OOM can
 /// never fire before the latch arms and let the runtime print its error
-/// line onto the machine stream. The WASI branch returns false on
+/// line onto the machine stream. The scan honors `--` exactly like
+/// parseCliArg's no_more_flags (EPH-I1057): every token after the marker
+/// is a positional path, so a later --format=json must not arm the
+/// latch. The WASI branch returns false on
 /// purpose: ephor does not ship for WASI, so the flag loop's own parse
 /// arms the latch there. WASI-with-libc does expose a raw argv vector.
 fn scanArgsForJson(proc_args: std.process.Args) bool {
@@ -39111,34 +39138,76 @@ fn scanArgsForJson(proc_args: std.process.Args) bool {
     defer it.deinit();
     _ = it.next();
     while (it.next()) |arg| {
+        if (mem.eql(u8, arg, "--")) return false;
         if (isJsonFormatToken(arg)) return true;
     }
     return false;
 }
 
 /// Scan a WTF-16 argv vector (Windows) for the JSON format tokens.
-/// Word-based: tokens split on space/tab, then matched while ignoring
-/// every '"' code unit in the word. The Windows CRT strips unescaped
-/// quotes from anywhere inside an argv word, so `--format="json"`
-/// reaches the flag loop as `--format=json` (EPH-I1056). A verbatim
-/// substring scan would false-arm the latch on a larger token that
-/// merely contains the flag. Infallible: no allocation, no error path.
+/// Word-based: words split on space/tab outside quotes, so a quoted
+/// phrase joins into one word and a token inside it never arms the
+/// latch alone (EPH-I1057 fold-in). The scan honors the CRT quote
+/// rules: a quote toggles the in-quotes state, and a quote behind an
+/// odd backslash run is a literal quote, so `\"` does not toggle. The
+/// Windows CRT strips unescaped quotes from anywhere inside an argv
+/// word, so `--format="json"` reaches the flag loop as `--format=json`
+/// (EPH-I1056). A verbatim substring scan would false-arm the latch on
+/// a larger token that merely contains the flag. A word equal to `--`
+/// ends the scan: every later word is positional, exactly like
+/// parseCliArg's no_more_flags (EPH-I1057). Infallible: no allocation,
+/// no error path.
 fn scanWtf16ArgsForJson(vector: []const u16) bool {
     const token_long = comptime utf16Literal("--format=json");
     const token_short = comptime utf16Literal("-f=json");
+    const end_marker = comptime utf16Literal("--");
     const tokens = [_][]const u16{ &token_long, &token_short };
     var i: usize = 0;
     while (i < vector.len) {
-        while (i < vector.len and (vector[i] == ' ' or vector[i] == '\t')) i += 1;
-        if (i == vector.len) return false;
-        const start = i;
-        while (i < vector.len and vector[i] != ' ' and vector[i] != '\t') i += 1;
-        const word = vector[start..i];
+        const end = wtf16WordEnd(vector, i);
+        if (end == i) {
+            // Whitespace outside quotes: advance one code unit.
+            i += 1;
+            continue;
+        }
+        const word = vector[i..end];
+        i = end;
+        if (matchesWtf16Token(word, &end_marker)) return false;
         for (tokens) |token| {
             if (matchesWtf16Token(word, token)) return true;
         }
     }
     return false;
+}
+
+/// Find the end of the WTF-16 argv word that starts at `start`. A quote
+/// toggles the in-quotes state; a quote behind an odd backslash run is
+/// a literal quote (the Windows CRT rule), so it does not toggle. The
+/// word ends at the first space/tab outside quotes or at the vector
+/// end. Infallible: a bounded index walk over a caller-owned slice.
+fn wtf16WordEnd(vector: []const u16, start: usize) usize {
+    var i = start;
+    var in_quotes = false;
+    var backslashes: usize = 0;
+    while (i < vector.len and (in_quotes or (vector[i] != ' ' and vector[i] != '\t'))) : (i += 1) {
+        switch (vector[i]) {
+            '\\' => backslashes += 1,
+            else => {
+                if (isUnescapedWtf16Quote(vector[i], backslashes)) in_quotes = !in_quotes;
+                backslashes = 0;
+            },
+        }
+    }
+    return i;
+}
+
+/// True when the code unit is a quote that toggles the in-quotes state:
+/// a `"` behind an even backslash run. A quote behind an odd run is a
+/// literal quote (the Windows CRT rule). `backslashes` is the count of
+/// consecutive backslashes directly before the unit; the caller resets
+/// it after every non-backslash unit. Infallible.
+fn isUnescapedWtf16Quote(c: u16, backslashes: usize) bool {
+    return c == '"' and backslashes % 2 == 0;
 }
 
 /// Compare one WTF-16 argv word with one token, ignoring every '"' code
@@ -41274,7 +41343,7 @@ fn printCheckSummary(
 /// the raw bytes. cliDiag keeps the notice off the JSON machine stream
 /// (EPH-I0213) and lets tests capture it through the sink (EPH-I1051).
 fn printExportNotice(
-    diag: *const DiagCtx,
+    diag: *DiagCtx,
     allocator: Allocator,
     exported_count: usize,
     export_path: []const u8,
@@ -41340,14 +41409,55 @@ fn collectAllIssues(
     return all;
 }
 
-/// Parse-error exit path. JSON mode owns the stream as a machine
-/// contract: the runtime's bare error line would break it (EPH-I0213),
-/// so the run exits silently with the failure code. Text mode propagates
-/// the error so the runtime prints the diagnostic.
-fn exitOnParseError(diag: *const DiagCtx, err: anyerror) !void {
+/// Error exit path. JSON mode owns the stream as a machine contract:
+/// the runtime's bare error line would break it (EPH-I0213), so the
+/// run emits one machine-readable error object and exits with the
+/// failure code (EPH-I1067). `msg` rides as the message member — the
+/// stashed diagnostic for a parse abort, empty for a mid-run handler
+/// failure, where no diagnostic belongs to the abort. Text mode
+/// propagates the error so the runtime prints the diagnostic.
+fn exitOnError(diag: *DiagCtx, allocator: Allocator, err: anyerror, msg: []const u8) !void {
     if (!diag.json_stream) return err;
+    printAbortJson(allocator, err, msg);
     // ephor:disable-next-line ZA206
     std.process.exit(1);
+}
+
+/// Print the JSON-mode abort object once (EPH-I1067): the error name and
+/// the message render into one buffer, so a render failure cannot strand
+/// a partial object in the machine stream (the buildIssuesJson
+/// contract). On failure the run degrades to the allocation-free object
+/// of the same shape with an empty message: the machine stream must
+/// still carry a valid document.
+fn printAbortJson(allocator: Allocator, err: anyerror, msg: []const u8) void {
+    var obj = types.OutBuf{ .allocator = allocator };
+    defer obj.deinit();
+    buildAbortJson(&obj, allocator, err, msg) catch {
+        std.debug.print("{{\n  \"error\": \"{s}\",\n  \"message\": \"\"\n}}\n", .{@errorName(err)});
+        return;
+    };
+    std.debug.print("{s}", .{obj.buf.items});
+}
+
+/// Render the JSON-mode abort object into `obj` (EPH-I1067): the error
+/// name and the diagnostic message. The message crosses escapeJson like
+/// every repo-derived field (EPH-I0146); the error name is a Zig
+/// identifier, so it never needs escaping.
+fn buildAbortJson(
+    obj: *types.OutBuf,
+    allocator: Allocator,
+    err: anyerror,
+    msg: []const u8,
+) !void {
+    var escaped = try types.escapeJson(allocator, msg);
+    defer escaped.deinit(allocator);
+    try obj.buf.print(allocator,
+        \\{{
+        \\  "error": "{s}",
+        \\  "message": "{s}"
+        \\}}
+        \\
+    , .{ @errorName(err), escaped.slice });
 }
 
 /// Print the pending unknown-version fallback warning through the
@@ -41373,7 +41483,10 @@ pub fn main(init: std.process.Init) !void {
     initToolPaths(&diag, init.environ_map);
 
     var cfg = parseArgs(&diag, alloc, init.minimal.args) catch |err| {
-        return exitOnParseError(&diag, err);
+        // The parse abort must still carry a machine-readable object on
+        // the JSON stream: the stashed diagnostic rides as the message
+        // (EPH-I1067).
+        return exitOnError(&diag, alloc, err, diag.last_muted_diag[0..diag.last_muted_diag_len]);
     };
     defer cfg.deinit(alloc);
 
@@ -41406,10 +41519,11 @@ pub fn main(init: std.process.Init) !void {
     switch (entry.handler) {
         .infallible => |h| h(&ctx),
         // JSON mode owns the stream as a machine contract: the runtime's
-        // bare error line would break it, so a failing handler exits
-        // silently with the failure code, the parse-error path's contract
-        // (EPH-I0213).
-        .fallible => |h| h(&ctx) catch |err| return exitOnParseError(&diag, err),
+        // bare error line would break it, so a failing handler emits the
+        // machine error object with no diagnostic message (a mid-run
+        // message does not belong to the abort) and exits with the
+        // failure code (EPH-I0213, EPH-I1067).
+        .fallible => |h| h(&ctx) catch |err| return exitOnError(&diag, alloc, err, ""),
     }
     // A declined runtime prompt returns before the epilogue, exactly like
     // the pre-split bare return from main.
@@ -101019,6 +101133,96 @@ test "CLI a second positional path is a hard usage error (EPH-I0807)" {
     }
 }
 
+test "JSON parse abort stashes the diagnostic and renders the error object (EPH-I1067)" {
+    var diag = testDiagCtx();
+    // The flag-first shape: --format=json arms the machine latch before
+    // the flag loop, so the ExtraScanPath diagnostic mutes on the stream
+    // and stashes for the abort object instead.
+    diag.json_stream = true;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    var cli_path = false;
+    var no_more_flags = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    try parseCliArg(cli_ctx, "check");
+    try std.testing.expectError(error.ExtraScanPath, parseCliArg(cli_ctx, "src/"));
+    const stashed = diag.last_muted_diag[0..diag.last_muted_diag_len];
+    try std.testing.expectEqualStrings(
+        "error: unexpected extra scan path 'src/': one path per run (see ephor --help)\n",
+        stashed,
+    );
+    var obj = types.OutBuf{ .allocator = allocator };
+    defer obj.deinit();
+    try buildAbortJson(&obj, allocator, error.ExtraScanPath, stashed);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, obj.buf.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "ExtraScanPath",
+        parsed.value.object.get("error").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "error: unexpected extra scan path 'src/': one path per run (see ephor --help)\n",
+        parsed.value.object.get("message").?.string,
+    );
+}
+
+test "JSON abort object renders name-only when no diagnostic is stashed (EPH-I1067)" {
+    // A mid-run handler failure has no stashed diagnostic: the object
+    // still carries the error name, so no non-zero exit stays silent.
+    const allocator = std.testing.allocator;
+    var obj = types.OutBuf{ .allocator = allocator };
+    defer obj.deinit();
+    try buildAbortJson(&obj, allocator, error.OutOfMemory, "");
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, obj.buf.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "OutOfMemory",
+        parsed.value.object.get("error").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "",
+        parsed.value.object.get("message").?.string,
+    );
+}
+
+test "text-mode ExtraScanPath diagnostic still reaches the sink (EPH-I1067)" {
+    // The text-mode flag-first shape prints the human usage error: the
+    // latch stays clear, so the diagnostic routes through the sink.
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    var cli_path = false;
+    var no_more_flags = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    try parseCliArg(cli_ctx, "check");
+    try std.testing.expectError(error.ExtraScanPath, parseCliArg(cli_ctx, "src/"));
+    try std.testing.expectEqualStrings(
+        "error: unexpected extra scan path 'src/': one path per run (see ephor --help)\n",
+        capture.slice(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), diag.last_muted_diag_len);
+}
+
 test "CLI flags and config path_dir do not arm the one-path latch (EPH-I0807)" {
     var diag = testDiagCtx();
     // Guard against over-reach: a config-file path_dir must not arm the
@@ -101159,6 +101363,29 @@ test "pre-scan scans the raw POSIX argv vector infallibly (EPH-I1056)" {
     try std.testing.expect(!scanArgsForJson(args_text));
 }
 
+test "pre-scan honors the -- end-of-flags marker (EPH-I1057)" {
+    // `--` ends flag parsing in the real parser, so a --format=json
+    // behind it is a positional path and must not arm the latch. Both
+    // directions: the marker before the flag stays clear, and a flag
+    // already consumed before the marker still arms it.
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi)
+        return error.SkipZigTest;
+    const marker_before = std.process.Args{ .vector = &.{
+        @as([*:0]const u8, "ephor"),
+        @as([*:0]const u8, "check"),
+        @as([*:0]const u8, "--"),
+        @as([*:0]const u8, "--format=json"),
+    } };
+    try std.testing.expect(!scanArgsForJson(marker_before));
+    const marker_after = std.process.Args{ .vector = &.{
+        @as([*:0]const u8, "ephor"),
+        @as([*:0]const u8, "--format=json"),
+        @as([*:0]const u8, "--"),
+        @as([*:0]const u8, "src/"),
+    } };
+    try std.testing.expect(scanArgsForJson(marker_after));
+}
+
 test "WTF-16 pre-scan finds the JSON tokens in a raw command line (EPH-I1056)" {
     // Windows argv is one WTF-16 command-line string: quoted tokens and
     // repeated spaces included. The logic is pure u16, so the darwin
@@ -101185,6 +101412,25 @@ test "WTF-16 pre-scan finds the JSON tokens in a raw command line (EPH-I1056)" {
     // flag must not false-arm the latch.
     const embedded = comptime utf16Literal("ephor x--format=json");
     try std.testing.expect(!scanWtf16ArgsForJson(&embedded));
+}
+
+test "WTF-16 pre-scan honors -- and quote grouping (EPH-I1057)" {
+    // `--` before the flag: the token is a positional path, no arm.
+    const marker_before = comptime utf16Literal("ephor check -- --format=json");
+    try std.testing.expect(!scanWtf16ArgsForJson(&marker_before));
+    // `--` after the flag: the flag already armed the latch.
+    const marker_after = comptime utf16Literal("ephor --format=json -- src");
+    try std.testing.expect(scanWtf16ArgsForJson(&marker_after));
+    // Fold-in: the quoted phrase is one CRT argv word, so the token
+    // inside it never arms the latch alone (the real parser sees the
+    // whole phrase as one positional path).
+    const quoted_phrase = comptime utf16Literal("ephor check \"docs --format=json dir\"");
+    try std.testing.expect(!scanWtf16ArgsForJson(&quoted_phrase));
+    // A backslash-escaped quote is a literal quote (the CRT rule): it
+    // does not toggle the quote state, and the token stays inside one
+    // quoted word.
+    const escaped_quote = comptime utf16Literal("ephor \"a\\\"b --format=json\"");
+    try std.testing.expect(!scanWtf16ArgsForJson(&escaped_quote));
 }
 
 test "unknown-version warning routes through the sink and off the JSON stream (EPH-I1054)" {

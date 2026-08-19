@@ -44,12 +44,7 @@ pub const VersionInfo = struct {
     patch: u16,
     dev: bool,
 
-    pub fn format(
-        self: VersionInfo,
-        comptime _: []const u8,
-        _: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
+    pub fn format(self: VersionInfo, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("{d}.{d}.{d}", .{
             self.major,
             self.minor,
@@ -240,40 +235,82 @@ fn fallbackTablesFor(version: VersionInfo) Tables {
 }
 
 /// Resolved tables for the running compiler. The resolve runs once per
-/// process: the first call also emits the unknown-version warning when the
-/// fallback applies. The analyzer is single-threaded, so a plain global is
+/// process: the first call also records the unknown-version fallback when
+/// it applies. The analyzer is single-threaded, so a plain global is
 /// race-free here.
 var cached_tables: ?Tables = null;
 
-/// Tables for the running compiler, resolved once. The unknown-version
-/// warning fires inside this resolve, not in the pure resolveVersion.
-fn currentTables() Tables {
-    if (cached_tables) |tables| return tables;
-    const version = getCurrentVersion();
-    const resolution = resolveVersion(version);
-    if (resolution.used_fallback) {
-        warnUnknownVersion(version, resolution.tables.version_label);
-    }
-    cached_tables = resolution.tables;
-    return resolution.tables;
+/// Pending unknown-version fallback state (EPH-I1054): currentTables
+/// sets the flag when the running compiler needs fallback tables; main
+/// consumes it once per run through takeUnknownVersionWarning() and
+/// prints the message on the CLI diagnostics channel, whose json_stream
+/// latch keeps it off the JSON machine stream. compat cannot reach
+/// main's diagnostics helpers without a circular import, so the flag
+/// defers the print instead of writing to raw stderr here.
+var pending_unknown_version_warning: bool = false;
+
+/// Record that the running compiler needed fallback tables (EPH-I1054).
+/// The message itself is printed by main's epilogue, never here.
+pub fn markUnknownVersionFallback() void {
+    pending_unknown_version_warning = true;
 }
 
-/// Print the unknown-version warning to stderr. std.debug.print is the
-/// error channel in this codebase: compat cannot call the CLI diagnostic
-/// helpers in main.zig without a circular import.
-fn warnUnknownVersion(version: VersionInfo, fallback_label: []const u8) void {
-    std.debug.print(
-        "WARNING: ephor does not have pattern tables for Zig {}. " ++
-            "ephor uses the Zig {s} tables, so results can be inaccurate. " ++
-            "Run ephor with a supported Zig version: {s}.\n",
-        .{ version, fallback_label, getSupportedVersionsString() },
-    );
+/// Consume the pending fallback warning (EPH-I1054). main calls this
+/// once per run; a consumed flag never fires again.
+pub fn takeUnknownVersionWarning() bool {
+    const pending = pending_unknown_version_warning;
+    pending_unknown_version_warning = false;
+    return pending;
 }
 
 /// Human-readable list of the supported Zig versions.
 /// Feeds the unknown-version warning.
 pub fn getSupportedVersionsString() []const u8 {
     return "0.15.x, 0.16.x";
+}
+
+/// Build the fallback warning text. Parameterized so tests can pin the
+/// wording for any version; the production text is the comptime call in
+/// unknown_version_warning_text.
+pub fn formatUnknownVersionWarning(
+    comptime version: VersionInfo,
+    comptime fallback_label: []const u8,
+) []const u8 {
+    const supported_versions = comptime getSupportedVersionsString();
+    return std.fmt.comptimePrint(
+        "WARNING: ephor does not have pattern tables for Zig {f}. " ++
+            "ephor uses the Zig {s} tables, so results can be inaccurate. " ++
+            "Run ephor with a supported Zig version: {s}.\n",
+        .{ version, fallback_label, supported_versions },
+    );
+}
+
+/// Resolution of the running compiler, evaluated once at comptime: the
+/// version is a comptime constant, so the fallback decision and its
+/// warning text cost nothing at runtime.
+const running_resolution = resolveVersion(getCurrentVersion());
+
+/// Warning text for a fallback-tables build (EPH-I1054). Comptime-built
+/// from the running version and the fallback label; empty on a supported
+/// build, where the warning can never fire. main prints it through
+/// cliDiag when takeUnknownVersionWarning() returns true.
+pub const unknown_version_warning_text: []const u8 = if (running_resolution.used_fallback)
+    formatUnknownVersionWarning(getCurrentVersion(), running_resolution.tables.version_label)
+else
+    "";
+
+/// Tables for the running compiler, resolved once. The unknown-version
+/// fallback record happens inside this resolve, not in the pure
+/// resolveVersion.
+fn currentTables() Tables {
+    if (cached_tables) |tables| return tables;
+    const version = getCurrentVersion();
+    const resolution = resolveVersion(version);
+    if (resolution.used_fallback) {
+        markUnknownVersionFallback();
+    }
+    cached_tables = resolution.tables;
+    return resolution.tables;
 }
 
 // ============================================================================
@@ -607,6 +644,26 @@ test "getSupportedVersionsString names the supported minor versions" {
     const s = getSupportedVersionsString();
     try std.testing.expect(std.mem.indexOf(u8, s, "0.15") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "0.16") != null);
+}
+
+test "unknown-version warning is pending until taken once (EPH-I1054)" {
+    // The flag is file-global: consume any residue a fallback build's
+    // earlier currentTables() call left behind.
+    _ = takeUnknownVersionWarning();
+    try std.testing.expect(!takeUnknownVersionWarning());
+    markUnknownVersionFallback();
+    try std.testing.expect(takeUnknownVersionWarning());
+    try std.testing.expect(!takeUnknownVersionWarning());
+}
+
+test "fallback warning text names the fallback label and the supported versions (EPH-I1054)" {
+    const text = formatUnknownVersionWarning(
+        .{ .major = 0, .minor = 17, .patch = 0, .dev = false },
+        "0.16",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, text, "Zig 0.17.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Zig 0.16 tables") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "0.15.x, 0.16.x") != null);
 }
 
 test "resolveVersion maps 0.15.x to the 0.15 tables without fallback" {

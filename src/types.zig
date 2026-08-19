@@ -312,24 +312,6 @@ pub const Issue = struct {
         };
         std.debug.print("{s}", .{out.buf.items});
     }
-
-    /// Print the JSON object form to stderr (see printText).
-    pub fn printJson(
-        self: Issue,
-        allocator: Allocator,
-        base_path: []const u8,
-        is_last: bool,
-    ) void {
-        var out = OutBuf{ .allocator = allocator };
-        defer out.deinit();
-        self.formatJson(base_path, is_last, &out) catch {
-            std.debug.print("ephor: out of memory printing {s} finding\n", .{
-                self.rule,
-            });
-            return;
-        };
-        std.debug.print("{s}", .{out.buf.items});
-    }
 };
 
 // ============================================================================
@@ -1445,22 +1427,4 @@ test "printText writes a sanitized line to stderr" {
     defer out.deinit();
     try issue.formatText("/repo", &out);
     try std.testing.expect(std.mem.indexOfScalar(u8, out.buf.items, 0x1B) == null);
-}
-
-test "printJson writes an escaped object to stderr" {
-    const issue = Issue{
-        .file = "q\".zig",
-        .line = 1,
-        .col = 1,
-        .severity = .note,
-        .rule = "ZA501",
-        .message = "m",
-        .help = null,
-    };
-    issue.printJson(std.testing.allocator, "/repo", true);
-    var out = OutBuf{ .allocator = std.testing.allocator };
-    defer out.deinit();
-    try issue.formatJson("/repo", true, &out);
-    try std.testing.expect(mem.indexOf(u8, out.buf.items, "q\".zig") == null);
-    try std.testing.expect(mem.indexOf(u8, out.buf.items, "q\\\".zig") != null);
 }

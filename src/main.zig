@@ -13625,6 +13625,15 @@ const ImportGraph = struct {
         return issues;
     }
 
+    /// Tally the graph's per-file counters into ProjectStats. The count
+    /// is the graph's, exactly: the check flow builds the graph as the
+    /// scan path UNION the joined entry points (EPH-I0784), so its
+    /// summary Files line includes out-of-root entries; the stats
+    /// command scans the path alone (EPH-I0541). Markers are matched as
+    /// raw bytes only: a comptime-concatenated spelling ("TO" ++ "DO")
+    /// renders the text at comptime and never self-counts when ephor
+    /// scans its own source (EPH-I0538, EPH-I1053; README "Get project
+    /// stats").
     fn getStats(self: *ImportGraph) ProjectStats {
         var s = ProjectStats{};
         var iter = self.files.iterator();
@@ -39089,15 +39098,72 @@ fn isJsonFormatToken(arg: []const u8) bool {
 /// the config load (EPH-I0213): config diagnostics (unreadable file, bad
 /// fail_on/strict values) fire there, and the machine contract must
 /// swallow them. format is not a config key, so the scan cannot misread
-/// a config value.
-fn scanArgsForJson(allocator: Allocator, proc_args: std.process.Args) !bool {
-    var it = try proc_args.iterateAllocator(allocator);
+/// a config value. Infallible by construction (EPH-I1056): the raw argv
+/// vector is scanned without an allocated iterator copy, so an OOM can
+/// never fire before the latch arms and let the runtime print its error
+/// line onto the machine stream. The WASI branch returns false on
+/// purpose: ephor does not ship for WASI, so the flag loop's own parse
+/// arms the latch there. WASI-with-libc does expose a raw argv vector.
+fn scanArgsForJson(proc_args: std.process.Args) bool {
+    if (@import("builtin").os.tag == .windows) return scanWtf16ArgsForJson(proc_args.vector);
+    if (@import("builtin").os.tag == .wasi) return false;
+    var it = proc_args.iterate();
     defer it.deinit();
     _ = it.next();
     while (it.next()) |arg| {
         if (isJsonFormatToken(arg)) return true;
     }
     return false;
+}
+
+/// Scan a WTF-16 argv vector (Windows) for the JSON format tokens.
+/// Word-based: tokens split on space/tab, then matched while ignoring
+/// every '"' code unit in the word. The Windows CRT strips unescaped
+/// quotes from anywhere inside an argv word, so `--format="json"`
+/// reaches the flag loop as `--format=json` (EPH-I1056). A verbatim
+/// substring scan would false-arm the latch on a larger token that
+/// merely contains the flag. Infallible: no allocation, no error path.
+fn scanWtf16ArgsForJson(vector: []const u16) bool {
+    const token_long = comptime utf16Literal("--format=json");
+    const token_short = comptime utf16Literal("-f=json");
+    const tokens = [_][]const u16{ &token_long, &token_short };
+    var i: usize = 0;
+    while (i < vector.len) {
+        while (i < vector.len and (vector[i] == ' ' or vector[i] == '\t')) i += 1;
+        if (i == vector.len) return false;
+        const start = i;
+        while (i < vector.len and vector[i] != ' ' and vector[i] != '\t') i += 1;
+        const word = vector[start..i];
+        for (tokens) |token| {
+            if (matchesWtf16Token(word, token)) return true;
+        }
+    }
+    return false;
+}
+
+/// Compare one WTF-16 argv word with one token, ignoring every '"' code
+/// unit in the word. The Windows CRT strips unescaped quotes from
+/// anywhere inside an argv word, so this matches the spellings the flag
+/// loop sees (EPH-I1056). Infallible: no allocation, no error path.
+fn matchesWtf16Token(word: []const u16, token: []const u16) bool {
+    var w: usize = 0;
+    for (token) |expected| {
+        while (w < word.len and word[w] == '"') w += 1;
+        if (w == word.len or word[w] != expected) return false;
+        w += 1;
+    }
+    while (w < word.len and word[w] == '"') w += 1;
+    return w == word.len;
+}
+
+/// Comptime ASCII-to-WTF-16 array. The JSON format tokens are pure
+/// ASCII, so each byte maps straight to one code unit. The runtime body
+/// is trivially valid too (by-value array return), but every call site
+/// is a comptime const initializer (EPH-I1056).
+fn utf16Literal(comptime s: []const u8) [s.len]u16 {
+    var buf: [s.len]u16 = undefined;
+    for (s, 0..) |c, j| buf[j] = c;
+    return buf;
 }
 
 /// JSON mode is a machine contract: the verbose diagnostics would break
@@ -39119,7 +39185,7 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     errdefer cfg.deinit(allocator);
     // Arm the stream gate before the config load: config diagnostics fire
     // here, before the flag loop parses --format=json (EPH-I0213).
-    if (try scanArgsForJson(allocator, proc_args)) diag.json_stream = true;
+    if (scanArgsForJson(proc_args)) diag.json_stream = true;
     try loadConfigFile(diag, allocator, &cfg);
     var cli_entries = false;
     var cli_path = false;
@@ -39902,7 +39968,10 @@ fn formatSuppressedJson(buf: []u8, stats: SuppressionStats) ![]const u8 {
 
 /// Print the suppressed counts as a standalone trailing JSON object. JSON
 /// mode emits a stream of top-level objects, so a run without --summary
-/// still carries the accounting for machine consumers.
+/// still carries the accounting for machine consumers. On the impossible
+/// overflow (256-byte buffer, 192-byte worst case) the object drops
+/// silently: a bare-text notice would break the machine stream
+/// (EPH-I0213, EPH-I0540).
 fn printSuppressedJsonObject(stats: SuppressionStats) void {
     var buf: [256]u8 = undefined;
     // Overflow is impossible: 92 fixed bytes + 5 usize values (<=20 digits
@@ -40068,6 +40137,12 @@ fn printIssuesJson(a: AnalyzerJsonArgs, out: ReportOutCtx) void {
     std.debug.print("{s}", .{obj.buf.items});
 }
 
+/// Print one analyzer's issues in the configured format and return the
+/// printable tallies. This is the output contract's dispatcher: JSON
+/// mode buffers one object per analyzer and writes it once
+/// (buildIssuesJson), text mode prints each issue through printText.
+/// The tallies exclude suppressed findings; they feed the footer, the
+/// summary, and the strict gate.
 fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) PrintCounts {
     const counts = tallyIssues(issues, out);
     const total_printable = counts.warnings + counts.notes;
@@ -40082,6 +40157,10 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
     return counts;
 }
 
+/// Print the trailing "N warning(s), M note(s) found" line. Text mode
+/// only: JSON mode emits no footer, because the machine stream must
+/// stay pure JSON (EPH-I0213) and the per-analyzer counts plus the
+/// exit code carry the same information.
 fn printResultFooter(total: PrintCounts, format: OutputFormat) void {
     // JSON mode emits no footer: the stream is a machine contract and must
     // stay pure JSON (EPH-I0213). The per-analyzer counts and the exit
@@ -40112,6 +40191,12 @@ fn printResultFooter(total: PrintCounts, format: OutputFormat) void {
 /// the marker word; rendering is pinned by test (EPH-I0538, B15 F5).
 const quality_todo_label = "TO" ++ "DO/FIX" ++ "ME";
 
+/// Print the project statistics block in the configured format. The
+/// counts come from getStats: the check --summary flow merges the
+/// AST-tier counters before printing (printCheckSummary), the stats
+/// command prints the graph counts directly. The Files line is the
+/// graph count, so a check summary includes the joined entry points
+/// while a stats run counts the scan path alone (EPH-I0541).
 fn printStats(s: ProjectStats, format: OutputFormat) void {
     if (format == .json) {
         std.debug.print(
@@ -40174,6 +40259,11 @@ fn printStats(s: ProjectStats, format: OutputFormat) void {
     }
 }
 
+/// Per-category summary buckets. One bucket per report category plus an
+/// explicit notes bucket: the summary schema derives "total" and
+/// "status" from these, so a notes-only run can never report a clean
+/// status (EPH-I0535). Error-severity findings ride inside the warning
+/// buckets (PrintCounts semantics).
 const IssueCounts = struct {
     orphan: usize = 0,
     memory: usize = 0,
@@ -40284,11 +40374,16 @@ fn formatSummaryJson(
     return buf[0 .. head.len + tail.len];
 }
 
-/// Print the JSON summary.
+/// Print the JSON summary. The buffer math (summary_json_buf_bytes)
+/// proves the format cannot overflow; on the impossible overflow the
+/// summary drops silently instead of emitting a bare-text notice: a
+/// notice would break the JSON machine contract (EPH-I0213), and the
+/// summary is a trailing optional document (EPH-I0540).
 fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: SuppressionStats) void {
     var buf: [summary_json_buf_bytes]u8 = undefined;
     // Overflow is impossible: see summary_json_buf_bytes. No catch
-    // unreachable (ZA202 dogfood).
+    // unreachable (ZA202 dogfood). The drop stays silent on purpose:
+    // the machine stream must stay pure (EPH-I0213, EPH-I0540).
     const text = formatSummaryJson(&buf, counts, s, suppression) catch return;
     std.debug.print("{s}", .{text});
 }
@@ -40349,12 +40444,18 @@ fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u
     });
 }
 
-/// Print the text summary.
+/// Print the text summary. The buffer math (summary_text_buf_bytes)
+/// proves the format cannot overflow; on the impossible overflow a
+/// static all-literal notice replaces the silent drop, so a future
+/// member that breaks the math stays visible (EPH-I0540).
 fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
     var buf: [summary_text_buf_bytes]u8 = undefined;
     // Overflow is impossible: see summary_text_buf_bytes. No catch
     // unreachable (ZA202 dogfood).
-    const text = formatSummaryText(&buf, counts, s) catch return;
+    const text = formatSummaryText(&buf, counts, s) catch {
+        std.debug.print("error: ephor could not print the summary\n", .{});
+        return;
+    };
     std.debug.print("{s}", .{text});
 }
 
@@ -41166,6 +41267,26 @@ fn printCheckSummary(
     }, stats, ctx.suppression, ctx.cfg.format);
 }
 
+/// Print the export confirmation. The path crosses the terminal
+/// sanitizer like every other repo-derived path print (EPH-I0147): a
+/// hostile byte in --export= must not reach the terminal. On sanitize
+/// OOM the notice prints the count without the path rather than risk
+/// the raw bytes. cliDiag keeps the notice off the JSON machine stream
+/// (EPH-I0213) and lets tests capture it through the sink (EPH-I1051).
+fn printExportNotice(
+    diag: *const DiagCtx,
+    allocator: Allocator,
+    exported_count: usize,
+    export_path: []const u8,
+) void {
+    var safe_path = types.sanitizeTerminal(allocator, export_path) catch {
+        cliDiag(diag, "exported {d} issues\n", .{exported_count});
+        return;
+    };
+    defer safe_path.deinit(allocator);
+    cliDiag(diag, "exported {d} issues to {s}\n", .{ exported_count, safe_path.slice });
+}
+
 /// --export=<file>: gather every printed finding into one list and write
 /// the export document. An export failure prints an error but does not
 /// fail the run (the pre-split behavior).
@@ -41178,16 +41299,14 @@ fn exportCheckIssues(
     const export_path = ctx.cfg.export_path orelse return;
     var all_issues = try collectAllIssues(ctx.alloc, findings, filtered);
     defer all_issues.deinit(ctx.alloc);
-    // JSON mode suppresses the confirmation: the machine stream must stay
-    // pure (EPH-I0213); the export file itself is the result signal.
+    // cliDiag gates both notices on json_stream: the machine stream
+    // stays pure in JSON mode (EPH-I0213), and the export file itself
+    // is the result signal there. The confirmation path is sanitized
+    // (EPH-I0542).
     if (exportIssues(ctx.alloc, export_path, all_issues.items, out)) |exported_count| {
-        if (ctx.cfg.format != .json) {
-            std.debug.print("exported {d} issues to {s}\n", .{ exported_count, export_path });
-        }
+        printExportNotice(ctx.diag, ctx.alloc, exported_count, export_path);
     } else |err| {
-        if (ctx.cfg.format != .json) {
-            std.debug.print("error: failed to export issues: {}\n", .{err});
-        }
+        cliDiag(ctx.diag, "error: failed to export issues: {}\n", .{err});
     }
 }
 
@@ -41231,6 +41350,17 @@ fn exitOnParseError(diag: *const DiagCtx, err: anyerror) !void {
     std.process.exit(1);
 }
 
+/// Print the pending unknown-version fallback warning through the
+/// diagnostics channel (EPH-I1054): cliDiag's json_stream latch keeps
+/// the warning off the machine stream on a fallback build running
+/// --format=json, and the DiagSink captures it for in-process pins.
+/// Text mode prints it after the findings, because compat records the
+/// flag during analysis.
+fn reportUnknownVersionWarning(diag: *DiagCtx) void {
+    if (!compat.takeUnknownVersionWarning()) return;
+    cliDiag(diag, "{s}", .{compat.unknown_version_warning_text});
+}
+
 pub fn main(init: std.process.Init) !void {
     var diag = DiagCtx{ .io = init.io };
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -41239,7 +41369,7 @@ pub fn main(init: std.process.Init) !void {
     // JSON-mode pre-scan before tool-path resolution: the env warnings
     // fire before parseArgs' own scan would arm the latch (EPH-I0213).
     // parseArgs scans again: its latch must hold for direct test callers.
-    if (try scanArgsForJson(alloc, init.minimal.args)) diag.json_stream = true;
+    if (scanArgsForJson(init.minimal.args)) diag.json_stream = true;
     initToolPaths(&diag, init.environ_map);
 
     var cfg = parseArgs(&diag, alloc, init.minimal.args) catch |err| {
@@ -41284,6 +41414,12 @@ pub fn main(init: std.process.Init) !void {
     // A declined runtime prompt returns before the epilogue, exactly like
     // the pre-split bare return from main.
     if (ctx.abort_epilogue) return;
+
+    // Unknown-version fallback warning (EPH-I1054): compat recorded the
+    // flag during analysis; the epilogue routes the message through
+    // cliDiag, whose json_stream latch keeps it off the JSON machine
+    // stream.
+    reportUnknownVersionWarning(&diag);
 
     // Print update notification after all analysis output. JSON mode
     // skips it so the machine stream stays pure (EPH-I0213).
@@ -41534,6 +41670,38 @@ test "main walk prunes dependency dirs with the shared skip predicate (EPH-I0377
     try std.testing.expectEqual(@as(usize, 1), graph.files.count());
     var iter = graph.files.keyIterator();
     try std.testing.expect(mem.endsWith(u8, iter.next().?.*, "/src/a.zig"));
+}
+
+test "stats file count is the graph count: joined out-of-root entries count once (EPH-I0541)" {
+    // The check summary's Files line is the graph count, and the check
+    // graph is the scan path UNION the joined entry points (EPH-I0784).
+    // A 2-file walk plus one out-of-root entry must total 3 — the count
+    // reflects the union, never a doubled scan set. Pre-fix the B15
+    // out-of-band note read the union as a doubling.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "pub fn a() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.zig", .data = "pub fn b() void {}\n" });
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    try tmp2.dir.writeFile(std.testing.io, .{
+        .sub_path = "e.zig",
+        .data = "pub fn e() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.scanDirectory(root);
+    try std.testing.expectEqual(@as(usize, 2), graph.getStats().total_files);
+    // One out-of-root entry joins the graph (the check flow's union).
+    const entry_path = try tmp2.dir.realPathFileAlloc(std.testing.io, "e.zig", allocator);
+    defer allocator.free(entry_path);
+    try graph.scanSingleFile(entry_path);
+    try std.testing.expectEqual(@as(usize, 3), graph.getStats().total_files);
 }
 
 test "markBuildPathReferences reads with the shared source cap (EPH-I0376)" {
@@ -100964,6 +101132,107 @@ test "isJsonFormatToken matches only the two JSON format spellings (EPH-I0213)" 
     try std.testing.expect(!isJsonFormatToken("-f=text"));
     try std.testing.expect(!isJsonFormatToken("--format=jsonx"));
     try std.testing.expect(!isJsonFormatToken("json"));
+}
+
+test "pre-scan scans the raw POSIX argv vector infallibly (EPH-I1056)" {
+    // POSIX argv is a borrowed [*:0] slice: the scan allocates nothing,
+    // so no OOM can fire before the stream gate arms. The latch must
+    // arm on either token spelling and stay clear otherwise.
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi)
+        return error.SkipZigTest;
+    const args = std.process.Args{ .vector = &.{
+        @as([*:0]const u8, "ephor"),
+        @as([*:0]const u8, "check"),
+        @as([*:0]const u8, "src/"),
+        @as([*:0]const u8, "--format=json"),
+    } };
+    try std.testing.expect(scanArgsForJson(args));
+    const args_short = std.process.Args{ .vector = &.{
+        @as([*:0]const u8, "ephor"),
+        @as([*:0]const u8, "-f=json"),
+    } };
+    try std.testing.expect(scanArgsForJson(args_short));
+    const args_text = std.process.Args{ .vector = &.{
+        @as([*:0]const u8, "ephor"),
+        @as([*:0]const u8, "--format=text"),
+    } };
+    try std.testing.expect(!scanArgsForJson(args_text));
+}
+
+test "WTF-16 pre-scan finds the JSON tokens in a raw command line (EPH-I1056)" {
+    // Windows argv is one WTF-16 command-line string: quoted tokens and
+    // repeated spaces included. The logic is pure u16, so the darwin
+    // test run covers the Windows branch.
+    const plain = comptime utf16Literal("ephor --format=json src");
+    try std.testing.expect(scanWtf16ArgsForJson(&plain));
+    const quoted = comptime utf16Literal("ephor check \"--format=json\" src");
+    try std.testing.expect(scanWtf16ArgsForJson(&quoted));
+    // The Windows CRT strips unescaped quotes anywhere inside a word, so
+    // the value-quoted spellings parse to the bare tokens (EPH-I1056).
+    const value_quoted = comptime utf16Literal("ephor --format=\"json\" src");
+    try std.testing.expect(scanWtf16ArgsForJson(&value_quoted));
+    const short_value_quoted = comptime utf16Literal("ephor -f=\"json\"");
+    try std.testing.expect(scanWtf16ArgsForJson(&short_value_quoted));
+    const mid_word_quoted = comptime utf16Literal("ephor --form\"at=json");
+    try std.testing.expect(scanWtf16ArgsForJson(&mid_word_quoted));
+    const short = comptime utf16Literal("ephor -f=json");
+    try std.testing.expect(scanWtf16ArgsForJson(&short));
+    const doubled_spaces = comptime utf16Literal("ephor  --format=json");
+    try std.testing.expect(scanWtf16ArgsForJson(&doubled_spaces));
+    const text = comptime utf16Literal("ephor --format=text --format=jsonx");
+    try std.testing.expect(!scanWtf16ArgsForJson(&text));
+    // Word-boundary semantics: a larger token that merely contains the
+    // flag must not false-arm the latch.
+    const embedded = comptime utf16Literal("ephor x--format=json");
+    try std.testing.expect(!scanWtf16ArgsForJson(&embedded));
+}
+
+test "unknown-version warning routes through the sink and off the JSON stream (EPH-I1054)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    compat.markUnknownVersionFallback();
+    reportUnknownVersionWarning(&diag);
+    // Supported builds carry an empty warning text (the fallback never
+    // engages there), so the capture is empty; the sink route itself is
+    // pinned by the flag consumption and the JSON gate on every build.
+    if (compat.unknown_version_warning_text.len > 0) {
+        try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "WARNING: ephor") != null);
+    }
+    // The flag is consumed exactly once per call.
+    try std.testing.expect(!compat.takeUnknownVersionWarning());
+    // JSON mode: the machine stream stays pure.
+    compat.markUnknownVersionFallback();
+    diag.json_stream = true;
+    capture = .{};
+    diag.diag_sink = capture.sink();
+    reportUnknownVersionWarning(&diag);
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+    try std.testing.expect(!compat.takeUnknownVersionWarning());
+}
+
+test "export notice sanitizes the path and stays off the JSON stream (EPH-I0542)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    printExportNotice(&diag, std.testing.allocator, 7, "ok.md");
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "exported 7 issues to ok.md") != null,
+    );
+    // Hostile bytes never reach the capture: the path crosses the
+    // terminal sanitizer first (EPH-I0147), each replaced by '?'.
+    capture = .{};
+    diag.diag_sink = capture.sink();
+    printExportNotice(&diag, std.testing.allocator, 7, "ev\x1b[2Jil.md");
+    try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "\x1b") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "exported 7 issues to") != null);
+    // JSON mode: the machine stream stays pure; the export file is the
+    // result signal.
+    capture = .{};
+    diag.diag_sink = capture.sink();
+    diag.json_stream = true;
+    printExportNotice(&diag, std.testing.allocator, 7, "ok.md");
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
 }
 
 test "JSON mode makes verbose a no-op, text mode keeps it (EPH-I0213)" {

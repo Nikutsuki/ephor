@@ -914,6 +914,12 @@ NotImplemented: 497
 TODO/FIXME:     268
 ```
 
+The stats scanner matches TODO and FIXME markers as raw bytes. A marker
+spelled through comptime string concatenation (`"TO" ++ "DO"`) renders
+at compile time and does not count (EPH-I0538, EPH-I1053). `ephor check
+--summary` counts the scan path plus the joined entry points
+(EPH-I0784, EPH-I0541); `ephor stats` counts the scan path alone.
+
 ### Run dynamic analysis
 
 ```bash

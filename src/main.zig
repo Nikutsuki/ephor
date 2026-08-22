@@ -39074,18 +39074,23 @@ fn scanWtf16ArgsForJson(vector: []const u16) bool {
     const token_short = comptime utf16Literal("-f=json");
     const end_marker = comptime utf16Literal("--");
     const tokens = [_][]const u16{ &token_long, &token_short };
-    // An empty vector or a leading NUL completes the std iterator
-    // immediately (Args.zig): no argv[0] exists, so nothing can arm.
-    if (vector.len == 0 or vector[0] == 0) return false;
-    var i = skipWtf16ExeName(vector);
-    while (i < vector.len) {
-        const end = wtf16WordEnd(vector, i);
+    // The std iterator reads a 0 code unit as the end of the command
+    // line (Args.zig: the exe-name branch yields argv[0] at the first
+    // NUL and the next call completes), so no word after an embedded
+    // NUL is ever parsed. Truncate at the first NUL to mirror that, or
+    // the scan would arm on a tail the flag loop never sees. A leading
+    // NUL makes the slice empty, the same immediate-complete shape the
+    // iterator takes on an empty command line.
+    const line = vector[0..(std.mem.indexOfScalar(u16, vector, 0) orelse vector.len)];
+    var i = skipWtf16ExeName(line);
+    while (i < line.len) {
+        const end = wtf16WordEnd(line, i);
         if (end == i) {
             // Whitespace outside quotes: advance one code unit.
             i += 1;
             continue;
         }
-        const word = vector[i..end];
+        const word = line[i..end];
         i = end;
         if (matchesWtf16Token(word, &end_marker)) return false;
         for (tokens) |token| {
@@ -39241,8 +39246,11 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     // progress lines would leak raw text onto the machine stream, and
     // routing them through cliDiag would leave the stream empty. The
     // stashed diagnostic rides the abort object, and the run exits 1.
-    // This runs after the flag loop, so either argument order lands on
-    // the same outcome.
+    // The rejection fires only when the command word parses as an
+    // interactive command, and argv[1] is the only command position in
+    // ephor's grammar. A flag-first spelling leaves that word to the
+    // path latch, so the run takes the check path instead; its failure
+    // shape is covered by the epilogue abort.
     if (jsonRejectedCommandName(&cfg)) |name| {
         cliDiag(
             diag,
@@ -41437,6 +41445,25 @@ fn reportUnknownVersionWarning(diag: *DiagCtx) void {
     cliDiag(diag, "{s}", .{compat.unknown_version_warning_text});
 }
 
+/// Exit a failed run (EPH-I1070 follow-up). Text mode keeps the silent
+/// exit(1). JSON mode must leave a readable document on the armed
+/// stream, so the abort object rides the exit: the stashed diagnostic
+/// (possibly empty) rides as the message, exactly like the parse abort.
+/// One branch covers the flag-first, no-entries, and strict-fail
+/// shapes. A clean run returns and main's defers hold.
+fn exitFailedRun(diag: *DiagCtx, allocator: Allocator, ctx: *const RunCtx) void {
+    if (!(ctx.should_exit_error or ctx.strict_fail)) return;
+    if (diag.json_stream) {
+        printAbortJson(
+            allocator,
+            error.RunFailed,
+            diag.last_muted_diag[0..diag.last_muted_diag_len],
+        );
+    }
+    // ephor:disable-next-line ZA206
+    std.process.exit(1);
+}
+
 pub fn main(init: std.process.Init) !void {
     var diag = DiagCtx{ .io = init.io };
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -41510,8 +41537,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Exit with error code AFTER all defers have run (cfg.deinit, gpa.deinit)
-    // ephor:disable-next-line ZA206
-    if (ctx.should_exit_error or ctx.strict_fail) std.process.exit(1);
+    // A failed run exits here: text mode exits 1 silently, JSON mode
+    // emits the abort object first so the armed stream never ends
+    // without a document (EPH-I1070 follow-up). EPH-I0543 tracks the
+    // flag-first grammar gap itself; this call only keeps the stream
+    // contract.
+    exitFailedRun(&diag, alloc, &ctx);
 }
 
 // ============================================================================
@@ -101838,6 +101869,11 @@ test "Windows argv pre-scan skips argv[0] under the std exe-name rules (EPH-I106
     // would read that quote as a literal and find a flag word instead.
     const exe_name_backslash = comptime utf16Literal("ephor\\\" --format=json");
     try std.testing.expect(!scanWtf16ArgsForJson(&exe_name_backslash));
+    // An embedded NUL ends the command line the way the std iterator
+    // reads it (Args.zig): no word after it is ever parsed, so the
+    // flag-looking tail must not arm the latch.
+    const embedded_nul = comptime utf16Literal("exe\x00 --format=json");
+    try std.testing.expect(!scanWtf16ArgsForJson(&embedded_nul));
 }
 
 test "unknown-version warning routes through the sink and off the JSON stream (EPH-I1054)" {

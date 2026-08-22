@@ -37601,8 +37601,14 @@ fn writeUpdateCache(ctx: UpdateCacheCtx, path: []const u8, version: []const u8) 
     var atomic = dir.createFileAtomic(ctx.io, base, .{ .replace = true }) catch return;
     defer atomic.deinit(ctx.io);
     atomic.file.writeStreamingAll(ctx.io, content) catch return;
-    // POSIX-only: the Windows permissions model has no mode_t.
-    if (comptime std.posix.mode_t != u0) {
+    // POSIX-only: the Windows permissions model has no mode_t, and the
+    // File.Permissions enum there is a DWORD with no fromMode member.
+    // The mode_t != u0 probe alone is not enough (EPH-I1068): Windows
+    // forces the libc shim, where posix.mode_t is u32, so the branch
+    // would compile and then fail on the missing member. Exclude the
+    // Windows target explicitly; the user-profile ACLs already scope the
+    // cache file to the user there.
+    if (comptime @import("builtin").os.tag != .windows and std.posix.mode_t != u0) {
         atomic.file.setPermissions(
             ctx.io,
             std.Io.File.Permissions.fromMode(update_cache_file_mode),
@@ -39047,13 +39053,17 @@ fn scanArgsForJson(proc_args: std.process.Args) bool {
 }
 
 /// Scan a WTF-16 argv vector (Windows) for the JSON format tokens.
-/// Word-based: words split on space/tab outside quotes, so a quoted
-/// phrase joins into one word and a token inside it never arms the
-/// latch alone (EPH-I1057 fold-in). The scan honors the CRT quote
-/// rules: a quote toggles the in-quotes state, and a quote behind an
-/// odd backslash run is a literal quote, so `\"` does not toggle. The
-/// Windows CRT strips unescaped quotes from anywhere inside an argv
-/// word, so `--format="json"` reaches the flag loop as `--format=json`
+/// The first word is argv[0] (the executable name): the flag loop never
+/// parses it as a flag, so the scan skips it under the std parser's
+/// exe-name rules (EPH-I1069) — a command line whose exe-name word
+/// spells a JSON token must not arm the latch. The remaining words
+/// split on space/tab outside quotes, so a quoted phrase joins into one
+/// word and a token inside it never arms the latch alone (EPH-I1057
+/// fold-in). The scan honors the CRT quote rules: a quote toggles the
+/// in-quotes state, and a quote behind an odd backslash run is a
+/// literal quote, so `\"` does not toggle. The Windows CRT strips
+/// unescaped quotes from anywhere inside an argv word, so
+/// `--format="json"` reaches the flag loop as `--format=json`
 /// (EPH-I1056). A verbatim substring scan would false-arm the latch on
 /// a larger token that merely contains the flag. A word equal to `--`
 /// ends the scan: every later word is positional, exactly like
@@ -39064,7 +39074,10 @@ fn scanWtf16ArgsForJson(vector: []const u16) bool {
     const token_short = comptime utf16Literal("-f=json");
     const end_marker = comptime utf16Literal("--");
     const tokens = [_][]const u16{ &token_long, &token_short };
-    var i: usize = 0;
+    // An empty vector or a leading NUL completes the std iterator
+    // immediately (Args.zig): no argv[0] exists, so nothing can arm.
+    if (vector.len == 0 or vector[0] == 0) return false;
+    var i = skipWtf16ExeName(vector);
     while (i < vector.len) {
         const end = wtf16WordEnd(vector, i);
         if (end == i) {
@@ -39080,6 +39093,25 @@ fn scanWtf16ArgsForJson(vector: []const u16) bool {
         }
     }
     return false;
+}
+
+/// Skip the first command-line word the way std.process.Args.Windows
+/// parses argv[0] (Args.zig, the executable-name rules): a quote toggles
+/// the in-quotes state and is never emitted, backslashes carry no special
+/// meaning, and whitespace inside quotes stays part of the name. Returns
+/// the index just past the word, or the vector end when the name reaches
+/// it. Infallible: a bounded index walk over a caller-owned slice.
+fn skipWtf16ExeName(vector: []const u16) usize {
+    var i: usize = 0;
+    var in_quotes = false;
+    while (i < vector.len) : (i += 1) {
+        switch (vector[i]) {
+            '"' => in_quotes = !in_quotes,
+            ' ', '\t' => if (!in_quotes) return i + 1,
+            else => {},
+        }
+    }
+    return i;
 }
 
 /// Find the end of the WTF-16 argv word that starts at `start`. A quote
@@ -39146,6 +39178,24 @@ fn silenceVerboseInJson(cfg: *Config) void {
     cfg.verbose = false;
 }
 
+/// Name of the command that must reject JSON output (EPH-I1070), or null
+/// when the command may run under --format=json. init, install, and
+/// upgrade emit human progress text and carry no machine result, so a
+/// JSON run has nothing honest to emit: routing their lines through
+/// cliDiag would leave the machine stream empty on success, an
+/// unreadable result for a consumer. They reject --format=json instead,
+/// and the abort object carries the stashed diagnostic. The "update"
+/// alias parses to .upgrade, so one arm covers both spellings.
+fn jsonRejectedCommandName(cfg: *const Config) ?[]const u8 {
+    if (cfg.format != .json) return null;
+    return switch (cfg.command) {
+        .init => "init",
+        .install => "install",
+        .upgrade => "upgrade",
+        else => null,
+    };
+}
+
 fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) !Config {
     var args = try proc_args.iterateAllocator(allocator);
     defer args.deinit();
@@ -39187,6 +39237,20 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     // JSON mode makes verbose a no-op: settled after the flag loop so
     // either flag order lands on the same outcome (EPH-I0213).
     silenceVerboseInJson(&cfg);
+    // The interactive commands reject --format=json (EPH-I1070): their
+    // progress lines would leak raw text onto the machine stream, and
+    // routing them through cliDiag would leave the stream empty. The
+    // stashed diagnostic rides the abort object, and the run exits 1.
+    // This runs after the flag loop, so either argument order lands on
+    // the same outcome.
+    if (jsonRejectedCommandName(&cfg)) |name| {
+        cliDiag(
+            diag,
+            "error: the {s} command has no machine-readable output. Run it without --format=json\n",
+            .{name},
+        );
+        return error.JsonCommandUnsupported;
+    }
     try stripTrailingSlashes(allocator, &cfg);
     try autoDetectPath(diag, allocator, &cfg);
     if (cfg.path_owned and !mem.eql(u8, cfg.path, "src"))
@@ -70542,7 +70606,9 @@ test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
     try std.testing.expectEqual(now, cached.epoch);
 
     // Owner-only mode on the published file (POSIX permissions only).
-    if (comptime std.posix.mode_t != u0) {
+    // Windows exclusion mirrors writeUpdateCache: toMode exists only on
+    // the POSIX File.Permissions enum (EPH-I1068).
+    if (comptime @import("builtin").os.tag != .windows and std.posix.mode_t != u0) {
         try std.testing.expectEqual(
             @as(std.posix.mode_t, update_cache_file_mode),
             stat.permissions.toMode() & 0o777,
@@ -101628,6 +101694,30 @@ test "isJsonFormatToken matches only the two JSON format spellings (EPH-I0213)" 
     try std.testing.expect(!isJsonFormatToken("json"));
 }
 
+test "jsonRejectedCommandName rejects only the interactive commands in JSON mode (EPH-I1070)" {
+    var cfg = testConfig();
+    defer cfg.deinit(std.testing.allocator);
+    cfg.format = .json;
+    cfg.command = .upgrade;
+    try std.testing.expectEqualStrings("upgrade", jsonRejectedCommandName(&cfg).?);
+    cfg.command = .install;
+    try std.testing.expectEqualStrings("install", jsonRejectedCommandName(&cfg).?);
+    cfg.command = .init;
+    try std.testing.expectEqualStrings("init", jsonRejectedCommandName(&cfg).?);
+    // Analysis commands keep their machine output.
+    cfg.command = .check;
+    try std.testing.expect(jsonRejectedCommandName(&cfg) == null);
+    cfg.command = .stats;
+    try std.testing.expect(jsonRejectedCommandName(&cfg) == null);
+    cfg.command = .runtime;
+    try std.testing.expect(jsonRejectedCommandName(&cfg) == null);
+    // Text mode never rejects: the interactive commands keep their
+    // human progress output.
+    cfg.format = .text;
+    cfg.command = .upgrade;
+    try std.testing.expect(jsonRejectedCommandName(&cfg) == null);
+}
+
 test "pre-scan scans the raw POSIX argv vector infallibly (EPH-I1056)" {
     // POSIX argv is a borrowed [*:0] slice: the scan allocates nothing,
     // so no OOM can fire before the stream gate arms. The latch must
@@ -101721,6 +101811,33 @@ test "WTF-16 pre-scan honors -- and quote grouping (EPH-I1057)" {
     // quoted word.
     const escaped_quote = comptime utf16Literal("ephor \"a\\\"b --format=json\"");
     try std.testing.expect(!scanWtf16ArgsForJson(&escaped_quote));
+}
+
+test "Windows argv pre-scan skips argv[0] under the std exe-name rules (EPH-I1069)" {
+    // The flag loop never parses the first word as a flag: parseArgs
+    // skips argv[0], and std.process.Args.Windows yields it under its
+    // exe-name rules. The pre-scan must match, or a command line whose
+    // exe-name word spells a JSON token arms the latch on a run where
+    // the flag loop reads no such flag. The logic is pure u16, so the
+    // darwin test run covers the Windows branch.
+    const bare_flag = comptime utf16Literal("--format=json");
+    try std.testing.expect(!scanWtf16ArgsForJson(&bare_flag));
+    const bare_short = comptime utf16Literal("-f=json src");
+    try std.testing.expect(!scanWtf16ArgsForJson(&bare_short));
+    // A `--` exe name is skipped, not honored as the end marker: the
+    // flag loop skips argv[0] outright, so the later flag still arms.
+    const marker_exe_name = comptime utf16Literal("-- --format=json");
+    try std.testing.expect(scanWtf16ArgsForJson(&marker_exe_name));
+    // Quoted exe name: the whitespace inside the quotes stays part of
+    // argv[0], and the scan continues after the closing quote.
+    const quoted_exe_name = comptime utf16Literal("\"my ephor.exe\" --format=json");
+    try std.testing.expect(scanWtf16ArgsForJson(&quoted_exe_name));
+    // The exe-name rules carry no backslash processing: the quote
+    // behind `\` still toggles, so the whole rest of the vector stays
+    // inside argv[0] and nothing arms. The CRT rules for later words
+    // would read that quote as a literal and find a flag word instead.
+    const exe_name_backslash = comptime utf16Literal("ephor\\\" --format=json");
+    try std.testing.expect(!scanWtf16ArgsForJson(&exe_name_backslash));
 }
 
 test "unknown-version warning routes through the sink and off the JSON stream (EPH-I1054)" {

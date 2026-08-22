@@ -23120,8 +23120,9 @@ fn paramListEnd(sig: []const u8) ?usize {
 }
 
 /// True when a code-position callconv(.c) or callconv(.C) token appears in
-/// `t`. Both spell the C calling convention; the ident-boundary filter keeps
-/// `callconv(.cc)` and `callconv(.Cdecl)` out (EPH-I1059).
+/// `t`. Both spell the C calling convention. The closing `)` in the needle
+/// keeps `callconv(.cc)` and `callconv(.Cdecl)` out; the ident-boundary
+/// filter guards the left edge of the needle (EPH-I1059).
 fn hasCCallconv(t: []const u8) bool {
     inline for (.{ "callconv(.c)", "callconv(.C)" }) |mark| {
         if (realTokenPos(t, mark) != null) return true;
@@ -23841,15 +23842,6 @@ fn skipStringLiteral(t: []const u8, start: usize) usize {
         i += 1;
     }
     return if (i < t.len) i + 1 else i;
-}
-
-/// Index where a `//` line comment begins (outside string literals and `\\`
-/// multiline tails), or t.len when the line has none. `error.` text at or
-/// past it is prose, not a reference — same data-not-syntax rule as string
-/// literals. Routes through findCommentStart so the masking rule lives in
-/// one place (EPH-I0671).
-fn lineCommentStart(t: []const u8) usize {
-    return findCommentStart(t) orelse t.len;
 }
 
 /// A naming violation to report (bundled to keep param counts legal).
@@ -58533,21 +58525,16 @@ test "findCommentStart ignores comment text in a multiline opener tail (EPH-I067
     try std.testing.expect(findCommentStart(line) == null);
     // A comment before the opener still wins.
     try std.testing.expectEqual(@as(?usize, 5), findCommentStart("x(); // real \\\\"));
-}
-
-test "lineCommentStart ignores comment text in a multiline opener tail (EPH-I0671)" {
-    const line = "const s = \\\\ // not a comment";
-    try std.testing.expectEqual(line.len, lineCommentStart(line));
     // A comment after a closed char literal with an escape run still counts.
-    try std.testing.expectEqual(@as(usize, 16), lineCommentStart("const c = '\\\\'; // r"));
+    try std.testing.expectEqual(@as(?usize, 16), findCommentStart("const c = '\\\\'; // r"));
 }
 
-test "lineCommentStart finds a real comment after a char literal with a quote (EPH-I0464)" {
+test "findCommentStart finds a real comment after a char literal with a quote (EPH-I0464)" {
     // The `"` inside `'"'` is character data, not a string opener: the
     // trailing `//` is a real comment, not string content.
     try std.testing.expectEqual(
-        @as(usize, 15),
-        lineCommentStart("const q = '\"'; // error.badName"),
+        @as(?usize, 15),
+        findCommentStart("const q = '\"'; // error.badName"),
     );
 }
 

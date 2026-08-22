@@ -44202,6 +44202,27 @@ test "classifyGPALine routes every gpa_classifications pattern to its rule" {
     }
 }
 
+test "classifyGPALine pins hard-coded rules for two table rows (band-T01 F8, EPH-I0555)" {
+    // The routing test reads the rule and message from the same table
+    // row, so a row mapped to the wrong rule stays green. These literals
+    // pin the table content independently of the table.
+    const allocator = std.testing.allocator;
+    {
+        var issues = try runClassifyGPALine(allocator, "err: double free in /t.zig:7");
+        defer deinitIssues(&issues, allocator);
+        try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+        try std.testing.expectEqualStrings("ZR102", issues.items[0].rule);
+        try std.testing.expectEqualStrings("double free detected at runtime", issues.items[0].message);
+    }
+    {
+        var issues = try runClassifyGPALine(allocator, "err: Segmentation fault at address 0x0");
+        defer deinitIssues(&issues, allocator);
+        try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+        try std.testing.expectEqualStrings("ZR105", issues.items[0].rule);
+        try std.testing.expectEqualStrings("segmentation fault - invalid memory access", issues.items[0].message);
+    }
+}
+
 test "classifyGPALine honors the located flag of each classification" {
     const allocator = std.testing.allocator;
     const Case = struct {
@@ -44788,13 +44809,23 @@ test "reportFmtFailure names the capture cap for StreamTooLong (EPH-I0501)" {
 test "runChildCapped trips StreamTooLong on unbounded child output (EPH-I0501)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    // `yes` writes unbounded output and trips the 10 MB cap fast. The
-    // fmt band's spawn shares this helper, so a hostile zig on PATH
-    // cannot grow ephor's heap without bound (F21).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // An unbounded echo loop replaces coreutils `yes` (band-T01 F6,
+    // EPH-I0554): sh already backs the other runtime-family children.
+    // The loop trips the 10 MB cap fast. The fmt band's spawn shares
+    // this helper, so a hostile zig on PATH cannot grow ephor's heap
+    // without bound (F21).
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "endless.sh",
+        .data = "while :; do echo y; done\n",
+    });
+    const script = try tmpFilePath(allocator, &tmp, "endless.sh");
+    defer allocator.free(script);
     try std.testing.expectError(error.StreamTooLong, runChildCapped(
         allocator,
         std.testing.io,
-        &.{"yes"},
+        &.{ "sh", script },
         .inherit,
     ));
 }
@@ -45303,12 +45334,23 @@ test "runRuntimeAnalysis JSON mode keeps the spawn-failure line off the stream (
 test "runRuntimeAnalysis reports ZR104 when output exceeds the capture limit" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    // `yes` writes unbounded output and trips the 10 MB cap fast.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // An unbounded echo loop replaces coreutils `yes` (band-T01 F6,
+    // EPH-I0554) and trips the 10 MB cap fast.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "endless.sh",
+        .data = "while :; do echo y; done\n",
+    });
+    const script = try tmpFilePath(allocator, &tmp, "endless.sh");
+    defer allocator.free(script);
+    const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
+    defer allocator.free(cmd);
     var issues = try runRuntimeAnalysis(
         std.testing.io,
         allocator,
         ".",
-        .{ .verbose = false, .custom_command = "yes" },
+        .{ .verbose = false, .custom_command = cmd },
     );
     defer deinitIssues(&issues, allocator);
 
@@ -45375,6 +45417,43 @@ test "runRuntimeAnalysis reports ZR105 for a stderr panic (EPH-I0489)" {
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
     try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
     try std.testing.expectEqual(@as(usize, 42), issues.items[0].line);
+}
+
+test "runRuntimeAnalysis reports a located ZR101 for child GPA leak text (band-T01 F6)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // band-T01 F6 (EPH-I0554): the GPA diagnostics parse path had no
+    // subprocess-level pin — family C unit tests covered the parser, but
+    // nothing wired child stderr through runRuntimeAnalysis to a ZR101
+    // finding. The 0.16 leak shape: the header names the leak and the
+    // next line carries the stack-frame location the parser borrows.
+    const script_body =
+        \\echo 'error(gpa): memory address 0x104000000 leaked:' >&2
+        \\echo '/x/proj/src/main.zig:7:9: 0x104000123 in leaky (test)' >&2
+        \\exit 1
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leak.sh", .data = script_body });
+    const script = try tmpFilePath(allocator, &tmp, "leak.sh");
+    defer allocator.free(script);
+    const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
+    defer allocator.free(cmd);
+
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = cmd },
+    );
+    defer deinitIssues(&issues, allocator);
+
+    // The leak header plus its location line yield exactly one located
+    // leak finding; the nonzero exit must not add a bare ZR104.
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
+    try std.testing.expectEqualStrings("memory leak at /x/proj/src/main.zig:7", issues.items[0].message);
+    try std.testing.expect(issues.items[0].message_owned);
 }
 
 test "runRuntimeAnalysis frees the partial findings list on a mid-parse failure" {
@@ -45611,7 +45690,7 @@ test "ZA105: runCFGMemoryAnalyses frees r2 payloads when appendSlice OOMs (EPH-I
 test "safety lists carry no owned payloads (EPH-I0483)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B11 F13: runCFGSafetyAnalyses transfers r1/r2/r3 into out
@@ -45777,7 +45856,7 @@ fn countRuleIssues(
 test "ZA105/ZA106/ZA101: over-line-cap function skips memory analysis with a note (EPH-I0350)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The family rescans the body per allocation (O(M x N^2) worst), so an
@@ -45819,7 +45898,7 @@ test "ZA105/ZA106/ZA101: over-line-cap function skips memory analysis with a not
 test "ZA105/ZA106/ZA101: over-alloc-cap function skips memory analysis with a note (EPH-I0350)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The allocation-count cap bounds the M factor of O(M x N^2). A
@@ -45868,7 +45947,7 @@ test "ZA105/ZA106/ZA101: over-alloc-cap function skips memory analysis with a no
 test "ZA103: over-line-cap function skips errdefer coverage with a note (EPH-I1006)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The ZA103 tail's per-allocation transfer walk rescans the body for
@@ -45912,7 +45991,7 @@ test "ZA103: over-line-cap function skips errdefer coverage with a note (EPH-I10
 test "ZA103: over-alloc-cap function skips errdefer coverage with a note (EPH-I1006)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The allocation-count cap bounds the M factor of the tail's O(M x N)
@@ -45961,7 +46040,7 @@ test "ZA103: over-alloc-cap function skips errdefer coverage with a note (EPH-I1
 test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zig-fmt canonical wrap: first line ends after `(` — the type first-arg
@@ -45981,15 +46060,20 @@ test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
     defer run.deinit(allocator);
 
     const file = "test_wrapped_alloc.zig";
-    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) >= 1);
-    // Second try with no errdefer on either alloc => errdefer gap tracked
-    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) >= 1);
+    // band-T01 F3 (EPH-I0551): the fixture holds exactly two unprotected
+    // allocs, so each rule must pin the exact count. A regression from
+    // two findings to one, or a duplicate emission, fails here.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 2);
+    // One errdefer gap, not two: `buf` is followed by the fallible
+    // `more` alloc with no errdefer (gap), while `more` has no later
+    // fallible op, so nothing covers it and nothing demands coverage.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) == 1);
 }
 
 test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -46006,12 +46090,20 @@ test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
         "test_prepend.zig",
         RULE_ALLOC_NO_DEFER,
     ) == 0);
+    // band-T01 F1 (EPH-I0549): the snippet allocates with create, so the
+    // prepend-transfer pin must also hold on the create-violation rule.
+    // A prepend-transfer regression on create would fire ZA102 here.
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_prepend.zig",
+        RULE_CREATE_NO_DEFER,
+    ) == 0);
 }
 
 test "ZA101: indexed write through the owner is not a transfer (EPH-I0825)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // isFieldOrGlobalStore's fallthrough read the indexed LHS `buf[0]` as
@@ -46036,7 +46128,7 @@ test "ZA101: indexed write through the owner is not a transfer (EPH-I0825)" {
 test "ZA101/ZA103: container init without deinit stays silent (EPH-I0360 doc-arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented FN: `ArrayList(T).init(allocator)` allocates no backing
@@ -46074,7 +46166,7 @@ test "ZA101/ZA103: container init without deinit stays silent (EPH-I0360 doc-arm
 test "ZA103: test-path helper loses the errdefer gate while ZA101 fires (EPH-I0363 doc-arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented: the ZA103 tail gates on test context, and test context
@@ -46149,7 +46241,7 @@ test "buildCFG: OOM mid-build unwinds the partial graph (EPH-I0319)" {
 test "ZA101: same-line-if discard of the owner is not a transfer (EPH-I0825)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `_`-discard guard sliced the LHS as `if (a) { _` on the
@@ -46174,7 +46266,7 @@ test "ZA101: same-line-if discard of the owner is not a transfer (EPH-I0825)" {
 test "ZA102: create plus pointee field init without destroy warns (EPH-I0346)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B02 F7: `node.data = v` on a create()-allocated node is
@@ -46203,7 +46295,7 @@ test "ZA102: create plus pointee field init without destroy warns (EPH-I0346)" {
 test "ZA101: store into another object's field still transfers (EPH-I0346 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `self.buf = buf` — the LHS root is `self`, a different object that
@@ -46232,7 +46324,7 @@ test "ZA101: store into another object's field still transfers (EPH-I0346 lock)"
 test "ZA101: module-level store of the owner still transfers (EPH-I0346 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The plain-identifier LHS with the owner on the RHS is the
@@ -46258,7 +46350,7 @@ test "ZA101: module-level store of the owner still transfers (EPH-I0346 lock)" {
 test "ZA101: array-element store of the owner still transfers (EPH-I0346 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `roots[0] = buf` stores the owner into another object's array: the
@@ -46284,7 +46376,7 @@ test "ZA101: array-element store of the owner still transfers (EPH-I0346 lock)" 
 test "ZA101: owner rebind is not a transfer (EPH-I0346)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf = other` rebinds the local: the original allocation is
@@ -46310,7 +46402,7 @@ test "ZA101: owner rebind is not a transfer (EPH-I0346)" {
 test "ZA101: early return before the defer still warns (EPH-I0348)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `if (c) { return; }` path exits before the defer registration:
@@ -46341,7 +46433,7 @@ test "ZA101: early return before the defer still warns (EPH-I0348)" {
 test "ZA101: far early return still warns, loop with post-loop defer stays silent (EPH-I0348 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The far early-return shape (defer beyond the immediate window)
@@ -46387,7 +46479,7 @@ test "ZA101: far early return still warns, loop with post-loop defer stays silen
 test "ZA101: defer after the only return stays silent (EPH-I0348 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer registers before the return, so it runs on every exit:
@@ -46415,7 +46507,7 @@ test "ZA101: defer after the only return stays silent (EPH-I0348 lock)" {
 test "ZA101: errdefer-only cleanup warns on the success path (EPH-I0349)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // An errdefer frees only on error exits. The success path keeps the
@@ -46446,7 +46538,7 @@ test "ZA101: errdefer-only cleanup warns on the success path (EPH-I0349)" {
 test "ZA101: errdefer plus transfer or defer stays silent (EPH-I0349 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The error/success cleanup split: an errdefer plus a visible
@@ -46479,7 +46571,7 @@ test "ZA101: errdefer plus transfer or defer stays silent (EPH-I0349 lock)" {
 test "ZA101: errdefer plus multi-line return literal stays silent (EPH-I0349 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The allocate-assemble-return idiom (tigerbeetle clock shape): the
@@ -46509,7 +46601,7 @@ test "ZA101: errdefer plus multi-line return literal stays silent (EPH-I0349 loc
 test "ZA101: buffer_size struct field does not bind the buf owner (EPH-I0840)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The literal field `buffer_size` contains the owner name `buf` as a
@@ -46539,7 +46631,7 @@ test "ZA101: buffer_size struct field does not bind the buf owner (EPH-I0840)" {
 test "ZA101: buffer_size deref store does not bind the buf owner (EPH-I0840)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The deref gate reads the owner appearance before the deref
@@ -46566,7 +46658,7 @@ test "ZA101: buffer_size deref store does not bind the buf owner (EPH-I0840)" {
 test "ZA101: single-line .alloc( detection unchanged by line joining" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -46588,7 +46680,7 @@ test "ZA101: single-line .alloc( detection unchanged by line joining" {
 test "ZA101: wrapped alloc with proper defer stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -46618,7 +46710,7 @@ test "ZA101: wrapped alloc with proper defer stays silent" {
 test "ZA101: multi-line enum param does not truncate body" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0012 issue shape: the `},` closing the enum container returns
@@ -46648,7 +46740,7 @@ test "ZA101: multi-line enum param does not truncate body" {
 test "ZA101: multi-line struct param does not truncate body" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -46676,7 +46768,7 @@ test "ZA101: multi-line struct param does not truncate body" {
 test "ZA101: error-set return on own line does not truncate body" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Edge of the error-set exclusion: `error{...}` at paren depth 0 is a
@@ -46704,7 +46796,7 @@ test "ZA101: error-set return on own line does not truncate body" {
 test "ZA101: default-param container on own line does not truncate body" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0012 shape: the `.{}` default value closes on its own signature
@@ -46733,7 +46825,7 @@ test "ZA101: default-param container on own line does not truncate body" {
 test "ZA101: single-line container signature detection unchanged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Parity lock: end-of-line evaluation already saved this shape; the
@@ -46757,7 +46849,7 @@ test "ZA101: single-line container signature detection unchanged" {
 test "ZA101: nested fn-type param does not break body extraction" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Parity lock: the `fn () void` param contributes parens but no braces;
@@ -46793,7 +46885,7 @@ test "ZA101: nested fn-type param does not break body extraction" {
 test "ZA103: multi-line signature with error return on own line is checked" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0072 issue shape: `) !void` on its own line — invisible to the
@@ -46821,7 +46913,7 @@ test "ZA103: multi-line signature with error return on own line is checked" {
 test "ZA103: single-line error-return signature check unchanged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Parity lock: the detect-line check already enabled ZA103 here; the
@@ -46845,7 +46937,7 @@ test "ZA103: single-line error-return signature check unchanged" {
 test "ZA103: multi-line plain-void signature stays unchecked" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Negative lock: no signature line carries an error-return marker, so
@@ -46872,7 +46964,7 @@ test "ZA103: multi-line plain-void signature stays unchecked" {
 test "ZA103: negation default on signature line does not fake error return" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Trap boundary lock: `!flag_default` is value-position negation and
@@ -46901,7 +46993,7 @@ test "ZA103: negation default on signature line does not fake error return" {
 test "ZA103: !bool negation on signature line trips the substring trap (pinned)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ACCEPTED TRAP (EPH-I0072, parity with the pre-existing detect-line
@@ -46932,7 +47024,7 @@ test "ZA103: !bool negation on signature line trips the substring trap (pinned)"
 test "ZA101: multi-line noreturn signature pins current no-gate behavior" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // PIN, not endorsement: fn_is_noreturn is vestigial (write-only — probed
@@ -46990,7 +47082,7 @@ test "signature return-marker helpers: own-line shapes pin each marker" {
 test "ZA105: free through alias then use root" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Freeing an alias releases the root allocation: use of buf is UAF.
@@ -47018,7 +47110,7 @@ test "ZA105: free through alias then use root" {
 test "ZA106: free through alias then free root" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -47042,7 +47134,7 @@ test "ZA106: free through alias then free root" {
 test "ZA105: free root then use alias (existing direction)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -47074,7 +47166,7 @@ test "ZA105: free root then use alias (existing direction)" {
 test "ZA105: use inside new declaration after free (subscript)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -47098,7 +47190,7 @@ test "ZA105: use inside new declaration after free (subscript)" {
 test "ZA105: use inside new declaration after free (field access)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -47123,7 +47215,7 @@ test "ZA105: use inside new declaration after free (field access)" {
 test "ZA105: free then reassign then use stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -47150,7 +47242,7 @@ test "ZA105: free then reassign then use stays silent" {
 test "ZA105: element-subscript free does not free the slice var (EPH-I0361)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `free(buf[0])` releases the ELEMENT, never the tracked slice: the
@@ -47179,7 +47271,7 @@ test "ZA105: element-subscript free does not free the slice var (EPH-I0361)" {
 test "ZA105: slice-view free still frees the tracked var (EPH-I0361)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `..` range inside the brackets marks a slice VIEW: the free
@@ -47208,7 +47300,7 @@ test "ZA105: slice-view free still frees the tracked var (EPH-I0361)" {
 test "ZA105: sibling-subscript chain free does not free the slice var (EPH-I1010)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `free(buf[1..][0])` reads element 0 of the VIEW: the free releases
@@ -47248,7 +47340,7 @@ test "ZA105: sibling-subscript chain free does not free the slice var (EPH-I1010
 test "ZA105: element alloc stored in a slice is unattributed (EPH-I0361 doc-arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented FN: freeing `slice[0]` releases the element alloc stored
@@ -47290,7 +47382,7 @@ test "ZA105: element alloc stored in a slice is unattributed (EPH-I0361 doc-arm)
 test "ZA105: comment `..` in a subscript stays an element access (EPH-I1008)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A `..` inside `/* */` or a `//` tail is comment prose, never a range
@@ -47337,7 +47429,7 @@ test "ZA105: comment `..` in a subscript stays an element access (EPH-I1008)" {
 test "ZA105: view free with a comment still fires (EPH-I1008)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Comment masking must never hide a real range: a view free whose
@@ -47379,7 +47471,7 @@ test "ZA105: view free with a comment still fires (EPH-I1008)" {
 test "ZA105: inline catch-arm free grades conditional (EPH-I0362)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The inline catch arm runs on the error path only: the post-construct
@@ -47411,7 +47503,7 @@ test "ZA105: inline catch-arm free grades conditional (EPH-I0362)" {
 test "ZA105: single-line braced catch-arm free grades conditional (EPH-I0362)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A balanced one-line `catch { ... }` is not classified catch_start
@@ -47443,7 +47535,7 @@ test "ZA105: single-line braced catch-arm free grades conditional (EPH-I0362)" {
 test "ZA106: inline catch-arm free then post-join free grades conditional (EPH-I0362)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second free double-frees on the error path only (the arm freed
@@ -47472,7 +47564,7 @@ test "ZA106: inline catch-arm free then post-join free grades conditional (EPH-I
 test "ZA106: definite free then catch-arm free grades conditional (EPH-I1011)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second free runs on the error path only, so the pair is the
@@ -47512,7 +47604,7 @@ test "ZA106: definite free then catch-arm free grades conditional (EPH-I1011)" {
 test "ZA106: definite free then single-line braced if free grades conditional (EPH-I1017)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The single-line braced twin of the EPH-I1011 catch mirror: the
@@ -47552,7 +47644,7 @@ test "ZA106: definite free then single-line braced if free grades conditional (E
 test "ZA106: definite free then braced if-arm free grades conditional, join stays definite (EPH-I1017)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The multi-line braced arm splits into its own block: the cross-block
@@ -47601,7 +47693,7 @@ test "ZA106: definite free then braced if-arm free grades conditional, join stay
 test "ZA106: loop, switch, and catch arm second frees grade conditional, return-arm join stays definite (EPH-I1017)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every conditional-arm second free runs on some continuing paths
@@ -47669,7 +47761,7 @@ test "ZA106: loop, switch, and catch arm second frees grade conditional, return-
 test "ZA106: cross-block both-arms free grades err, single-arm twin grades warning (EPH-I1017 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The then-arm free pairs with the outer free: the skip path's
@@ -47725,7 +47817,7 @@ test "ZA106: cross-block both-arms free grades err, single-arm twin grades warni
 test "ZA106: loop-else both-arms free grades err, plain loop twin stays conditional (EPH-I1017 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The word-bounded-else discriminator on the sibling's first line: a
@@ -47778,7 +47870,7 @@ test "ZA106: loop-else both-arms free grades err, plain loop twin stays conditio
 test "ZA106: merge siblings with unrelated else tokens stay conditional, genuine arms stay err (EPH-I1031 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The both-arms gate counts the skip path's sibling arm only when the
@@ -47875,7 +47967,7 @@ test "ZA106: merge siblings with unrelated else tokens stay conditional, genuine
 test "ZA106: enclosing-close merge siblings stay conditional, genuine arms stay err (EPH-I1032 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A nested construct that is the last statement of an enclosing arm
@@ -47982,7 +48074,7 @@ test "ZA106: enclosing-close merge siblings stay conditional, genuine arms stay 
 test "ZA106: single-line both-arms free with a dominating pre-free grades err, single-arm twins stay silent (EPH-I1030)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else marker on the second free's own line is the construct's
@@ -48043,7 +48135,7 @@ test "ZA106: single-line both-arms free with a dominating pre-free grades err, s
 test "ZA106: else-if chain corner grades — inline arm and final else stay conditional, all-arms chain reads definite (EPH-I1033)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The chain grades arm by arm: an intermediate arm's sibling is the
@@ -48107,7 +48199,7 @@ test "ZA106: else-if chain corner grades — inline arm and final else stay cond
 test "ZA106: line-start else claims the deferred entry — both-arms err, same-line-arm shapes split (EPH-I1063)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The line-start else (own-line `else`) claims the deferred close,
@@ -48192,7 +48284,7 @@ test "ZA106: line-start else claims the deferred entry — both-arms err, same-l
 test "ZA106: same-line both-arms escape matches the tracked var — other-var and nested arm frees cap at warning (EPH-I1064)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The both-arms arm-free evidence must target the tracked var:
@@ -48257,7 +48349,7 @@ test "ZA106: same-line both-arms escape matches the tracked var — other-var an
 test "ZA106: same-line both-arms escape verifies every chain arm — free-less prefix arm caps at warning (EPH-I1065)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The escape's firing marker is the final `} else {`: the marker-
@@ -48301,7 +48393,7 @@ test "ZA106: same-line both-arms escape verifies every chain arm — free-less p
 test "ZA901/ZA903: closed same-line else-if arm does not cover a separate bare block below (EPH-I1036)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The chain arm's own condition (`else if (m > 3)`) holds only
@@ -48402,7 +48494,7 @@ test "ZA901/ZA903: closed same-line else-if arm does not cover a separate bare b
 test "ZA105: noreturn call after free exits the block (EPH-I0364)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The panic exits the branch: the use is only reachable on the path
@@ -48434,7 +48526,7 @@ test "ZA105: noreturn call after free exits the block (EPH-I0364)" {
 test "ZA105: identifier-prefixed return line does not exit after a free (EPH-I1009)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `returned = 1;` starts with the bytes of `return` but is an
@@ -48479,7 +48571,7 @@ test "ZA105: identifier-prefixed return line does not exit after a free (EPH-I10
 test "ZA105: same-block use after noreturn-after-free stays silent (EPH-I0364)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The unreachable exits before the use line: dead code, not a UAF.
@@ -48507,7 +48599,7 @@ test "ZA105: same-block use after noreturn-after-free stays silent (EPH-I0364)" 
 test "ZA105: free without a noreturn exit still grades conditional (EPH-I0364)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Counter-case: without the noreturn exit the branch free reaches the
@@ -48540,7 +48632,7 @@ test "ZA105: free without a noreturn exit still grades conditional (EPH-I0364)" 
 test "ZA105: field-chain free unattributed stays silent (EPH-I0359 doc-arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented FN: freeing through a field chain (`free(holder.items)`
@@ -48579,7 +48671,7 @@ test "ZA105: field-chain free unattributed stays silent (EPH-I0359 doc-arm)" {
 test "ZA105: field-chain alias stays silent while plain alias fires (EPH-I0359 doc-arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const x = holder.items;` is a field-chain RHS — extractSimpleIdentRhs
@@ -48619,7 +48711,7 @@ test "ZA105: field-chain alias stays silent while plain alias fires (EPH-I0359 d
 test "ZA105: test-block bodies are not analyzed (EPH-I0363 doc-arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Test blocks are not fn-shaped, so the family never sees their lines:
@@ -48655,7 +48747,7 @@ test "ZA105: test-block bodies are not analyzed (EPH-I0363 doc-arm)" {
 test "ZA105: free and use in different switch arms stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Sibling switch arms are mutually exclusive: on the .b path the free
@@ -48685,7 +48777,7 @@ test "ZA105: free and use in different switch arms stay silent" {
 test "ZA105: free and use in different braced switch arms stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -48714,7 +48806,7 @@ test "ZA105: free and use in different braced switch arms stay silent" {
 test "ZA105: use after free in the same switch arm fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Free and use inside one arm: genuinely reachable, must stay loud.
@@ -48743,7 +48835,7 @@ test "ZA105: use after free in the same switch arm fires" {
 test "ZA105: free then use in a later sequential block fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Unconditional free dominates the use: no exclusive branch between
@@ -48770,7 +48862,7 @@ test "ZA105: free then use in a later sequential block fires" {
 test "ZA105: free root in one switch arm then use alias in sibling arm stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Alias path has the same FP class: the alias use sits in an arm
@@ -48801,7 +48893,7 @@ test "ZA105: free root in one switch arm then use alias in sibling arm stays sil
 test "ZA105: cross-block UAF cites the first free, not a later same-block scan (EPH-I0344)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // checkSameBlockFree used to overwrite alloc_info.freed_line on every
@@ -48848,7 +48940,7 @@ test "ZA105: cross-block UAF cites the first free, not a later same-block scan (
 test "ZA105: same-block UAF after rebind cites the reaching refree (EPH-I0344 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // P7: the free on 3 released the dead pre-rebind binding; the rebind on
@@ -48883,7 +48975,7 @@ test "ZA105: same-block UAF after rebind cites the reaching refree (EPH-I0344 r1
 test "ZA105: free on one path then use is a conditional use-after-free (EPH-I0345)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free inside `if (c)` reaches the join on one path only: the use
@@ -48915,7 +49007,7 @@ test "ZA105: free on one path then use is a conditional use-after-free (EPH-I034
 test "ZA105: alias rebound after the root free then used stays silent (EPH-I0347)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // reportAliasUAF never checked the alias's own rebind: `a = other`
@@ -48946,7 +49038,7 @@ test "ZA105: alias rebound after the root free then used stays silent (EPH-I0347
 test "ZA105: alias still dangling after the root free fires (EPH-I0347)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The rebind guard must not silence the genuine dangling shape: without
@@ -48975,7 +49067,7 @@ test "ZA105: alias still dangling after the root free fires (EPH-I0347)" {
 test "ZA105: alias use after a conditional root free grades warning (EPH-I0835)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // reportAliasUAF graded .err unconditionally: the conditional free on 5
@@ -49012,7 +49104,7 @@ test "ZA105: alias use after a conditional root free grades warning (EPH-I0835)"
 test "ZA105: alias use after a free on an early-return arm stays silent (EPH-I0835)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free on 5 sits on the return path: the use on 7 runs only when
@@ -49045,7 +49137,7 @@ test "ZA105: alias use after a free on an early-return arm stays silent (EPH-I08
 test "ZA105: root rebind after the free does not resurrect the alias (EPH-I0835)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf = other` hands the ROOT to live memory; the alias `a` still
@@ -49080,7 +49172,7 @@ test "ZA105: root rebind after the free does not resurrect the alias (EPH-I0835)
 test "ZA105: conditional root free plus root rebind grades warning (EPH-I0838)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free on 5 reaches the use on 8 on the c-true path only, and the
@@ -49119,7 +49211,7 @@ test "ZA105: conditional root free plus root rebind grades warning (EPH-I0838)" 
 test "ZA105: straight-line root free plus root rebind past a block boundary grades err (EPH-I0838)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The def arm of the rebind anchor: the free on 4 fires on every path,
@@ -49158,7 +49250,7 @@ test "ZA105: straight-line root free plus root rebind past a block boundary grad
 test "ZA105: conditional alias rebind after the free stays silent (EPH-I0836)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // p5c probe shape. hasReassignmentBetween is arm-blind (band-B02 F25
@@ -49192,7 +49284,7 @@ test "ZA105: conditional alias rebind after the free stays silent (EPH-I0836)" {
 test "ZA105: rebind then conditional refree after the join stays silent (EPH-I0836)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // p8 probe shape. The rebind-alloc on 4 is not collected as its own
@@ -49222,7 +49314,7 @@ test "ZA105: rebind then conditional refree after the join stays silent (EPH-I08
 test "ZA105: switch expression between free and use still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A switch EXPRESSION creates no branch exclusivity: its `=>` tokens sit
@@ -49253,7 +49345,7 @@ test "ZA105: switch expression between free and use still fires" {
 test "ZA105: alias use after a switch that frees on one arm still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free runs on the .a path only; the alias use sits AFTER the switch
@@ -49285,7 +49377,7 @@ test "ZA105: alias use after a switch that frees on one arm still fires" {
 test "ZA105: sibling-arm alias suppression does not end the scan (EPH-I0837)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The use on 6 sits in an arm exclusive with the free's arm: suppressed
@@ -49326,7 +49418,7 @@ test "ZA105: sibling-arm alias suppression does not end the scan (EPH-I0837)" {
 test "ZA105: free on both if and else arms then use still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every path frees, so the post-join use is UAF: `} else` is not an arm
@@ -49355,7 +49447,7 @@ test "ZA105: free on both if and else arms then use still fires" {
 test "ZA105: return arm without free does not mask the else-arm free (EPH-I0677)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The return arm wires a phantom sequential edge into the merge, so the
@@ -49385,7 +49477,7 @@ test "ZA105: return arm without free does not mask the else-arm free (EPH-I0677)
 test "ZA106: return arm without free upgrades cross-block double-free (EPH-I0677)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same phantom predecessor as the ZA105 case: with the return block
@@ -49418,7 +49510,7 @@ test "ZA106: return arm without free upgrades cross-block double-free (EPH-I0677
 test "ZA105: use two blocks past a dominating free fires (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free dominates the use but sits two block hops back: the if-body
@@ -49449,7 +49541,7 @@ test "ZA105: use two blocks past a dominating free fires (EPH-I0676)" {
 test "ZA106: loop-body free double-frees on the next iteration (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The loop back-edge carries the body's freed state into the header, so
@@ -49482,7 +49574,7 @@ test "ZA106: loop-body free double-frees on the next iteration (EPH-I0676)" {
 test "ZA106: free two blocks past a dominating free is a definite double-free (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same distance-2 shape as the ZA105 probe: every reachable path into
@@ -49513,7 +49605,7 @@ test "ZA106: free two blocks past a dominating free is a definite double-free (E
 test "ZA105: one-branch conditional free past the join grades a warning (EPH-I0345)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The false edge reaches the join without freeing, so the MUST verdict
@@ -49546,7 +49638,7 @@ test "ZA105: one-branch conditional free past the join grades a warning (EPH-I03
 test "ZA105: brace-less if-form free grades conditional like the braced twin (EPH-I1005)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace-less `if (c) free(buf);` shares the CFG block with the
@@ -49599,7 +49691,7 @@ test "ZA105: brace-less if-form free grades conditional like the braced twin (EP
 test "ZA105: single-line braced if-form free grades conditional like the multi-line twin (EPH-I1016)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The single-line braced free sat on the block header line, so the
@@ -49659,7 +49751,7 @@ test "ZA105: single-line braced if-form free grades conditional like the multi-l
 test "ZA105: single-line braced if-form free keeps a cross-block use conditional (EPH-I1016)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The use sits in a later block: the free's block exit is the cond_sets
@@ -49693,7 +49785,7 @@ test "ZA105: single-line braced if-form free keeps a cross-block use conditional
 test "ZA105: brace-less if-form free keeps a cross-block use conditional (EPH-I1005)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The use sits in a later block: the free's block exit is the
@@ -49727,7 +49819,7 @@ test "ZA105: brace-less if-form free keeps a cross-block use conditional (EPH-I1
 test "ZA105: both-arms brace-less if-else free grades definite, single-arm else stays conditional (EPH-I1005 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The both-arms line frees on every path, so the post-join use is a
@@ -49779,7 +49871,7 @@ test "ZA105: both-arms brace-less if-else free grades definite, single-arm else 
 test "ZA106: definite free then both-arms brace-less if-else free grades definite (EPH-I1005 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second free runs on both arms, so the pair is a definite double
@@ -49818,7 +49910,7 @@ test "ZA106: definite free then both-arms brace-less if-else free grades definit
 test "ZA105: reassignment on one arm keeps the post-join use silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The if-arm rebinds buf, so its exit state is live and the join's MUST
@@ -49846,7 +49938,7 @@ test "ZA105: reassignment on one arm keeps the post-join use silent (EPH-I0676)"
 test "ZA105: free before a loop with a use in the body keeps firing (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // No-regression pin: the pre-loop free dominates the loop header, so the
@@ -49873,7 +49965,7 @@ test "ZA105: free before a loop with a use in the body keeps firing (EPH-I0676)"
 test "ZA106: per-iteration alloc and free in a loop stays silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // FP guard for the new back-edge state: each iteration rebinds buf from
@@ -49899,7 +49991,7 @@ test "ZA106: per-iteration alloc and free in a loop stays silent (EPH-I0676)" {
 test "ZA106: freeing a loop capture each iteration stays silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // FP guard for the new back-edge state: the capture |item| rebinds the
@@ -49930,7 +50022,7 @@ test "ZA106: freeing a loop capture each iteration stays silent (EPH-I0676)" {
 test "ZA106: free before a capture loop does not pair with the capture free (EPH-I0748)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The capture |item| rebinds the name to a fresh element on every
@@ -49958,7 +50050,7 @@ test "ZA106: free before a capture loop does not pair with the capture free (EPH
 test "ZA106: real double free fires despite a later capture loop (EPH-I0748)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The same-name capture loop must not mask a genuine double free of the
@@ -49986,7 +50078,7 @@ test "ZA106: real double free fires despite a later capture loop (EPH-I0748)" {
 test "ZA106: free before an if-capture scope does not pair with the capture free (EPH-I0780)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The if-capture |item| rebinds the name for the body scope, so the body
@@ -50012,7 +50104,7 @@ test "ZA106: free before an if-capture scope does not pair with the capture free
 test "ZA106: real double free fires despite a later if-capture scope (EPH-I0780)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The same-name if-capture must not mask a genuine double free of the
@@ -50038,7 +50130,7 @@ test "ZA106: real double free fires despite a later if-capture scope (EPH-I0780)
 test "ZA106: free before a switch-prong capture scope stays silent (EPH-I0780)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The prong capture |item| binds the union payload for the prong body:
@@ -50066,7 +50158,7 @@ test "ZA106: free before a switch-prong capture scope stays silent (EPH-I0780)" 
 test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // No capture rebinds the name: the prong body frees the tracked alloc
@@ -50101,7 +50193,7 @@ test "ZA106: free before a switch pairs with a prong-body free (EPH-I0791)" {
 test "ZA106: prong-body free does not pair with a sibling-scope free (EPH-I0791)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free on 4 runs only when c holds: it does not dominate the switch.
@@ -50133,7 +50225,7 @@ test "ZA106: prong-body free does not pair with a sibling-scope free (EPH-I0791)
 test "ZA106: frees in different switch arms stay silent (EPH-I0791)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The arms are mutually exclusive: the .empty arm's only CFG predecessor
@@ -50163,7 +50255,7 @@ test "ZA106: frees in different switch arms stay silent (EPH-I0791)" {
 test "ZA106: arm free then post-switch free is a conditional double-free (EPH-I0791)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The .buf path frees item twice (arm body, then the post-switch line),
@@ -50195,7 +50287,7 @@ test "ZA106: arm free then post-switch free is a conditional double-free (EPH-I0
 test "ZA106: nested else between dominating frees does not separate them (EPH-I0806)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `} else {` on 7 heads an arm of the if nested in the bare block:
@@ -50229,7 +50321,7 @@ test "ZA106: nested else between dominating frees does not separate them (EPH-I0
 test "ZA106: nested else between defer and direct free does not separate them (EPH-I0806)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `} else {` on 7 heads an arm of the if nested in the bare block:
@@ -50265,7 +50357,7 @@ test "ZA106: nested else between defer and direct free does not separate them (E
 test "ZA106: nested orelse between dominating frees does not separate them (EPH-I0806)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `} orelse {` on 7 sits inside the bare block: nested deeper than
@@ -50300,7 +50392,7 @@ test "ZA106: nested orelse between dominating frees does not separate them (EPH-
 test "ZA106: frees in if and else arms stay silent (EPH-I0806)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else marker at indent 4 sits no deeper than both frees (indent
@@ -50328,7 +50420,7 @@ test "ZA106: frees in if and else arms stay silent (EPH-I0806)" {
 test "ZA106: shallow else between dominating frees still separates (EPH-I0806)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else marker sits at the same indent as both frees, so the
@@ -50359,7 +50451,7 @@ test "ZA106: shallow else between dominating frees still separates (EPH-I0806)" 
 test "ZA105: inline-switch arm free then statement-level post-join use grades warning (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The const-prefixed inline switch arms share the enclosing CFG block,
@@ -50395,7 +50487,7 @@ test "ZA105: inline-switch arm free then statement-level post-join use grades wa
 test "ZA105: inline-switch arm free then nested post-join use fires (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The post-join use sits inside a following if at the ARM indent. The
@@ -50430,7 +50522,7 @@ test "ZA105: inline-switch arm free then nested post-join use fires (EPH-I0356)"
 test "ZA105: same-arm free and use inside a braced inline-switch arm stays err (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free and the use share the .a arm region: the free definitely
@@ -50465,7 +50557,7 @@ test "ZA105: same-arm free and use inside a braced inline-switch arm stays err (
 test "ZA106: inline-switch arm free then post-join free grades warning (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second free runs after the switch join: on the .a path it
@@ -50496,7 +50588,7 @@ test "ZA106: inline-switch arm free then post-join free grades warning (EPH-I035
 test "ZA106: statement-form all-arms-free switch keeps the post-join err grade (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every statement-form arm frees, so the post-join use is definite:
@@ -50527,7 +50619,7 @@ test "ZA106: statement-form all-arms-free switch keeps the post-join err grade (
 test "ZA106: frees in const-prefixed inline sibling arms stay silent (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second free sits on its own arm-header line: the arm region
@@ -50554,7 +50646,7 @@ test "ZA106: frees in const-prefixed inline sibling arms stay silent (EPH-I0356)
 test "ZA105: use on another switch's arm header line stays suppressed (EPH-I0356 residual)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The use sits on the arm-header line of a LATER switch: the
@@ -50591,7 +50683,7 @@ test "ZA105: use on another switch's arm header line stays suppressed (EPH-I0356
 test "ZA106: comment `=>` line between frees does not separate them (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `// =>` line is comment text, not a switch arm: the second free
@@ -50614,7 +50706,7 @@ test "ZA106: comment `=>` line between frees does not separate them (EPH-I0342)"
 test "ZA106: trailing `=>` comment on the second free does not separate (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // hasExclusiveBranchBetween scans to_line inclusive, so the second
@@ -50637,7 +50729,7 @@ test "ZA106: trailing `=>` comment on the second free does not separate (EPH-I03
 test "ZA106: string `} else {` between frees does not separate them (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `"} else {"` line is string data, not a branch separator (F2
@@ -50661,7 +50753,7 @@ test "ZA106: string `} else {` between frees does not separate them (EPH-I0342)"
 test "ZA106: multiline-string body `=>` between frees does not separate (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `\\` body line is string data (LiteralState.forLine returns
@@ -50684,7 +50776,7 @@ test "ZA106: multiline-string body `=>` between frees does not separate (EPH-I03
 test "ZA105: string `=>` between free and use does not suppress (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `"=>"` line is string data: the same-block use stays a genuine
@@ -50708,7 +50800,7 @@ test "ZA105: string `=>` between free and use does not suppress (EPH-I0342)" {
 test "ZA106: comment `} else {` between frees does not separate them (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `// } else {` line is comment text, not a branch separator (F2
@@ -50731,7 +50823,7 @@ test "ZA106: comment `} else {` between frees does not separate them (EPH-I0342)
 test "ZA106: string `} orelse return` between frees does not separate (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `"} orelse return"` line is string data, not a separator (F2
@@ -50755,7 +50847,7 @@ test "ZA106: string `} orelse return` between frees does not separate (EPH-I0342
 test "ZA105: comment `} else {` between free and use still fires (EPH-I0342)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Else markers never suppress the UAF path (hasExclusiveArmBetween
@@ -50779,7 +50871,7 @@ test "ZA105: comment `} else {` between free and use still fires (EPH-I0342)" {
 test "ZA105: inline-arm free does not self-match its own arm header (EPH-I0343)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free sits in the LAST arm, so the only `=>` in the free..use
@@ -50812,7 +50904,7 @@ test "ZA105: inline-arm free does not self-match its own arm header (EPH-I0343)"
 test "ZA105: inline-arm free then direct post-join use fires (EPH-I0343)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The audit's literal F3 regression shape: the free's own arm header
@@ -50840,7 +50932,7 @@ test "ZA105: inline-arm free then direct post-join use fires (EPH-I0343)" {
 test "ZA106: inline-arm direct free pairs with a post-join defer (EPH-I0343)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The direct free sits in the LAST arm, so its own `=>` used to
@@ -50869,7 +50961,7 @@ test "ZA106: inline-arm direct free pairs with a post-join defer (EPH-I0343)" {
 test "ZA106: switch expression between frees does not separate them (EPH-I0062)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The inline switch expression carries real `=>` tokens, but they are
@@ -50895,7 +50987,7 @@ test "ZA106: switch expression between frees does not separate them (EPH-I0062)"
 test "ZA105: single-line switch expression between free and use fires (EPH-I0062)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The shallow single-line switch expression at statement indent used
@@ -50920,7 +51012,7 @@ test "ZA105: single-line switch expression between free and use fires (EPH-I0062
 test "ZA105: arm header of a switch whose join precedes the use does not separate (EPH-I0356)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The free sits in a NON-last arm, so the `.b => {}` header on the
@@ -50958,7 +51050,7 @@ test "ZA105: arm header of a switch whose join precedes the use does not separat
 test "ZA106: frees in inline sibling arms stay silent (EPH-I0062 probe18)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `.b =>` marker on the second free's own line stays in the span
@@ -50983,7 +51075,7 @@ test "ZA106: frees in inline sibling arms stay silent (EPH-I0062 probe18)" {
 test "ZA106: switch-expression case item hides the outer prong header (EPH-I0834)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The outer prong pattern is a single-line switch expression: the
@@ -51012,7 +51104,7 @@ test "ZA106: switch-expression case item hides the outer prong header (EPH-I0834
 test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The catch capture |item| rebinds the name for the handler block, so a
@@ -51038,7 +51130,7 @@ test "ZA106: free before a catch capture scope stays silent (EPH-I0780)" {
 test "ZA106: an alias-named capture loop does not free the tracked root (EPH-I0781)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The loop captures the alias name tmp, not the tracked root: inside the
@@ -51067,7 +51159,7 @@ test "ZA106: an alias-named capture loop does not free the tracked root (EPH-I07
 test "ZA106: real double free via alias fires despite a later alias-capture loop (EPH-I0781)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The alias-capture loop must not mask a genuine double free: freeing the
@@ -51096,7 +51188,7 @@ test "ZA106: real double free via alias fires despite a later alias-capture loop
 test "ZA106: brace in a string inside an if-capture body does not extend the mask (EPH-I0792)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The "{" on 4 is string data, not a brace. A close scan that counts
@@ -51123,7 +51215,7 @@ test "ZA106: brace in a string inside an if-capture body does not extend the mas
 test "ZA106: brace in a string inside a loop-capture body does not extend the mask (EPH-I0792)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The loop-capture form of the same pin (I0748 non-regression). The
@@ -51152,7 +51244,7 @@ test "ZA106: brace in a string inside a loop-capture body does not extend the ma
 test "ZA106: close brace in a string inside an if-capture body does not truncate the mask (EPH-I0792)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The "}" on 4 is string data, not a brace. Counting it closes the
@@ -51179,7 +51271,7 @@ test "ZA106: close brace in a string inside an if-capture body does not truncate
 test "ZA106: a // inside a string before a catch capture does not defeat the binding (EPH-I0793)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The "//" on 4 sits inside a string literal, so it opens no comment.
@@ -51205,7 +51297,7 @@ test "ZA106: a // inside a string before a catch capture does not defeat the bin
 test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Severity-boundary pin: the iteration-2 use-after-free is MAY-only
@@ -51233,7 +51325,7 @@ test "ZA105: use before free in a loop body stays silent (EPH-I0676)" {
 test "ZA106: free after a brace-less for body stays silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The ghostty coretext shape (reviewer F1): the CFG merges the statement
@@ -51262,7 +51354,7 @@ test "ZA106: free after a brace-less for body stays silent (EPH-I0676)" {
 test "ZA106: free after a brace-less while body stays silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Reviewer F1 fp4: the loop never touches buf, and the only free sits
@@ -51288,7 +51380,7 @@ test "ZA106: free after a brace-less while body stays silent (EPH-I0676)" {
 test "ZA106: free of a var the loop never references stays silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Reviewer F1 fp5: the loop iterates a different slice and never names
@@ -51316,7 +51408,7 @@ test "ZA106: free of a var the loop never references stays silent (EPH-I0676)" {
 test "ZA106: free after a braced loop body stays silent (EPH-I0676)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The braced form of the reviewer F1 shapes: the free sits below the
@@ -51344,7 +51436,7 @@ test "ZA106: free after a braced loop body stays silent (EPH-I0676)" {
 test "ZA106: defer free plus direct free is a double-free" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer runs at scope exit and frees buf a second time.
@@ -51369,7 +51461,7 @@ test "ZA106: defer free plus direct free is a double-free" {
 test "ZA106: direct free plus later defer free is a double-free" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Mirror order: the defer frees the already-freed pointer at scope exit.
@@ -51393,7 +51485,7 @@ test "ZA106: direct free plus later defer free is a double-free" {
 test "ZA106: defer free with reassignment after direct free stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // defer evaluates buf at scope exit — after reassignment it frees the NEW
@@ -51420,7 +51512,7 @@ test "ZA106: defer free with reassignment after direct free stays silent" {
 test "ZA106: errdefer free plus defer free stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Canonical error/success split: errdefer frees on error paths, defer on
@@ -51446,7 +51538,7 @@ test "ZA106: errdefer free plus defer free stays silent" {
 test "ZA105: zig-fmt wrapped free is seen (EPH-I0351)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A free wrapped past 100 columns puts the freed var on a
@@ -51475,7 +51567,7 @@ test "ZA105: zig-fmt wrapped free is seen (EPH-I0351)" {
 test "ZA106: wrapped free double-free and wrapped defer pairing are seen (EPH-I0351)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The wrapped second free double-frees, and a wrapped defer-registered
@@ -51509,7 +51601,7 @@ test "ZA106: wrapped free double-free and wrapped defer pairing are seen (EPH-I0
 test "ZA101: wrapped defer free covers the alloc (EPH-I0351 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A wrapped `defer allocator.free(\n x,\n);` must cover the alloc in
@@ -51537,7 +51629,7 @@ test "ZA101: wrapped defer free covers the alloc (EPH-I0351 lock)" {
 test "ZA101: nearby defer freeing a prefix-colliding name does not cover the alloc (EPH-I0357)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer frees `buffer`, not `buf`: the raw substring match used to
@@ -51564,7 +51656,7 @@ test "ZA101: nearby defer freeing a prefix-colliding name does not cover the all
 test "ZA101: outer-scope defer freeing a prefix-colliding name does not cover (EPH-I0357)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same collision through hasOuterScopeDefer: the defer textually
@@ -51592,7 +51684,7 @@ test "ZA101: outer-scope defer freeing a prefix-colliding name does not cover (E
 test "ZA101: nearby defer freeing the exact name still covers (EPH-I0357 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The discriminating counter-case: the word-bounded match must not
@@ -51618,7 +51710,7 @@ test "ZA101: nearby defer freeing the exact name still covers (EPH-I0357 lock)" 
 test "ZA103: same-line try-transfer is an uncovered exit (EPH-I0068)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `state.field = try allocator.dupe(u8, buf)` carries both a field
@@ -51646,7 +51738,7 @@ test "ZA103: same-line try-transfer is an uncovered exit (EPH-I0068)" {
 test "ZA103: errdefer covers the same-line try-store (EPH-I0068 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A real errdefer between the alloc and the try-store covers the
@@ -51672,7 +51764,7 @@ test "ZA103: errdefer covers the same-line try-store (EPH-I0068 lock)" {
 test "ZA103: try wrapping the transfer itself still credits (EPH-I0068 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `try list.append(x)` wraps the transfer in the try: there is no
@@ -51698,7 +51790,7 @@ test "ZA103: try wrapping the transfer itself still credits (EPH-I0068 lock)" {
 test "ZA105: use after free in tail of single-line errdefer (EPH-I0680)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The direct free dominates the use. The single-line errdefer must mark
@@ -51724,7 +51816,7 @@ test "ZA105: use after free in tail of single-line errdefer (EPH-I0680)" {
 test "ZA105: use after free in tail of multi-line errdefer block (EPH-I0680)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The close brace of a braced errdefer block must return the depth to
@@ -51752,7 +51844,7 @@ test "ZA105: use after free in tail of multi-line errdefer block (EPH-I0680)" {
 test "ZA106: double free in tail of single-line errdefer (EPH-I0680)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // errdefer runs only on error paths, so the two direct frees on the
@@ -51778,7 +51870,7 @@ test "ZA106: double free in tail of single-line errdefer (EPH-I0680)" {
 test "ZA106: conditional defer plus direct free is a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -51802,7 +51894,7 @@ test "ZA106: conditional defer plus direct free is a warning" {
 test "ZA106: defer free and direct free in different switch arms stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Arms are mutually exclusive: the defer's arm and the direct free's arm
@@ -51835,7 +51927,7 @@ test "ZA106: defer free and direct free in different switch arms stay silent" {
 test "ZA106: defer outside switch plus direct free inside an arm fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer is shallower than the arm header and runs on every path —
@@ -51864,7 +51956,7 @@ test "ZA106: defer outside switch plus direct free inside an arm fires" {
 test "ZA106: defer in if-arm plus direct free in else-if arm stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `} else if` arms are mutually exclusive with the if-arm — the two
@@ -51892,7 +51984,7 @@ test "ZA106: defer in if-arm plus direct free in else-if arm stays silent" {
 test "ZA103: try inside a string literal is not a gap trigger" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // @panic("Retry transaction not found in pool") contains "try " inside a
@@ -51925,7 +52017,7 @@ test "ZA103: try inside a string literal is not a gap trigger" {
 test "ZA103: struct field storage with colliding name transfers ownership" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // self.buf = buf — the first "buf" occurrence is the LHS field; the
@@ -51954,7 +52046,7 @@ test "ZA103: struct field storage with colliding name transfers ownership" {
 test "ZA103: plain return of the alloc transfers ownership" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle multiversion.zig shape: alloc + plain return inside a
@@ -51983,7 +52075,7 @@ test "ZA103: plain return of the alloc transfers ownership" {
 test "ZA103: single-line tuple return transfers ownership" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle transaction_pool shape: `return .{ buf, 0 };`
@@ -52010,7 +52102,7 @@ test "ZA103: single-line tuple return transfers ownership" {
 test "ZA103: multi-line tuple return transfers ownership" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -52039,7 +52131,7 @@ test "ZA103: multi-line tuple return transfers ownership" {
 test "ZA103: named-field anon-struct return transfers ownership" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -52066,7 +52158,7 @@ test "ZA103: named-field anon-struct return transfers ownership" {
 test "ZA103: alloc never returned or stored still fires (TP lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Manual free on the success path only — the error path through the
@@ -52092,7 +52184,7 @@ test "ZA103: alloc never returned or stored still fires (TP lock)" {
 test "ZA103: shadowed alloc name returned in a later scope stays covered (EPH-I0397)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B04 F9: ownership matching is name-based across scopes. The
@@ -52128,7 +52220,7 @@ test "ZA103: shadowed alloc name returned in a later scope stays covered (EPH-I0
 test "ZA103: return of a call result does not transfer (TP lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `return wrap(buf);` — ownership passed through a call is unclear; the
@@ -52159,7 +52251,7 @@ test "ZA103: return of a call result does not transfer (TP lock)" {
 test "ZA103: comparison return does not transfer (TP lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `return buf != null;` — first token is the name but followed by an
@@ -52187,7 +52279,7 @@ test "ZA103: comparison return does not transfer (TP lock)" {
 test "ZA103: field access on another object inside tuple does not transfer (TP lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `return .{ x.buf, 0 };` — `x.buf` is a field of another object; the
@@ -52218,7 +52310,7 @@ test "ZA103: field access on another object inside tuple does not transfer (TP l
 test "ZA103: enum literal inside tuple does not transfer (TP lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `return .{ .buf, 0 };` — `.buf` is an enum literal, not the local buf;
@@ -52248,7 +52340,7 @@ test "ZA103: enum literal inside tuple does not transfer (TP lock)" {
 test "ZA103: string mention inside tuple does not transfer (TP lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `return .{ "buf", 0 };` — the alloc name appears only inside a string
@@ -52277,7 +52369,7 @@ test "ZA103: string mention inside tuple does not transfer (TP lock)" {
 test "ZA101/ZA103: orelse-return try-alloc escapes to caller (EPH-I0009)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zls analysis.zig trimCommonIndentation shape: the dupe result is
@@ -52311,7 +52403,7 @@ test "ZA101/ZA103: orelse-return try-alloc escapes to caller (EPH-I0009)" {
 test "ZA101/ZA103: orelse-return try-alloc skips zig-fmt wrapped call" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same escape shape with the call args wrapped by zig-fmt: the orelse
@@ -52347,7 +52439,7 @@ test "ZA101/ZA103: orelse-return try-alloc skips zig-fmt wrapped call" {
 test "ZA101/ZA103: plain try-alloc still fires (orelse positional lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // No orelse before the alloc: x holds the dupe result, cleanup due.
@@ -52377,7 +52469,7 @@ test "ZA101/ZA103: plain try-alloc still fires (orelse positional lock)" {
 test "ZA102: try-create still fires (orelse positional lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -52401,7 +52493,7 @@ test "ZA102: try-create still fires (orelse positional lock)" {
 test "ZA101/ZA103: orelse-return inside string literal does not skip" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `orelse return` text appears only inside a string literal BEFORE
@@ -52433,7 +52525,7 @@ test "ZA101/ZA103: orelse-return inside string literal does not skip" {
 test "ZA106: plain defer with no direct free stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -52456,7 +52548,7 @@ test "ZA106: plain defer with no direct free stays silent" {
 test "ZA103: return error after alloc without errdefer is a gap" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // No later try: the error-returning exit IS the leak trigger.
@@ -52483,7 +52575,7 @@ test "ZA103: return error after alloc without errdefer is a gap" {
 test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zignal png.zig shape: the field store transfers ownership on the
@@ -52510,7 +52602,7 @@ test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {
 test "ZA103: try before return-transfer is a gap (EPH-I0005)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `try validate` error path runs before `return buf` transfers
@@ -52538,7 +52630,7 @@ test "ZA103: try before return-transfer is a gap (EPH-I0005)" {
 test "ZA103: immediate return-transfer stays silent (EPH-I0005 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // No error exit between alloc and transfer — I0004 behavior intact.
@@ -52561,7 +52653,7 @@ test "ZA103: immediate return-transfer stays silent (EPH-I0005 lock)" {
 test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A real errdefer between the alloc and the try covers the error path;
@@ -52591,7 +52683,7 @@ test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)"
 test "ZA103: conditional alloc-return passes the transfer scan (EPH-I0063)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (cond) return buf;` is a conditional transfer: the field store
@@ -52621,7 +52713,7 @@ test "ZA103: conditional alloc-return passes the transfer scan (EPH-I0063)" {
 test "ZA103: conditional return of another name stays a gap (EPH-I0063 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The if-return returns `err`, not buf: buf stays untransferred on
@@ -52664,7 +52756,7 @@ test "isUncoveredErrorExit ignores mid-line comment exits (EPH-I0070)" {
 test "ZA103: comment mentioning return between alloc and transfer stays silent (EPH-I0070)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `// return err;` prose between the alloc and the field-store
@@ -52694,7 +52786,7 @@ test "ZA103: comment mentioning return between alloc and transfer stays silent (
 test "ZA103: comment before a real try gap still fires (EPH-I0070 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `// try this` comment must not hide the real try gap: the try
@@ -52723,7 +52815,7 @@ test "ZA103: comment before a real try gap still fires (EPH-I0070 lock)" {
 test "ZA103: transfer before later try stays silent (EPH-I0005 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The field store comes first: ownership moved before the try, so the
@@ -52752,7 +52844,7 @@ test "ZA103: transfer before later try stays silent (EPH-I0005 lock)" {
 test "ZA103: try inside a string literal is not an exit (EPH-I0005)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The string line must not stop the ownership scan: the real transfer
@@ -52782,7 +52874,7 @@ test "ZA103: try inside a string literal is not an exit (EPH-I0005)" {
 test "ZA103: bare error return before field-store transfer is a gap (EPH-I0005)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (isFatal(err)) return err;` is an uncovered error exit. Ordering is
@@ -52821,7 +52913,7 @@ test "ZA103: bare error return before field-store transfer is a gap (EPH-I0005)"
 test "ZA103: bare error return without a trigger stays silent (EPH-I0005 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same shape minus the `try validate` line: the bare `return err;` stops
@@ -52954,7 +53046,7 @@ test "joinSplitDeclRhs stays silent without the split try-alloc shape (EPH-I0675
 test "ZA103: split-RHS try-alloc fires with the decl name (EPH-I0675)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The decl and its alloc sit on different physical lines (`const buf =`
@@ -52985,7 +53077,7 @@ test "ZA103: split-RHS try-alloc fires with the decl name (EPH-I0675)" {
 test "ZA103: split-RHS try-alloc with errdefer stays silent (EPH-I0675)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -53010,7 +53102,7 @@ test "ZA103: split-RHS try-alloc with errdefer stays silent (EPH-I0675)" {
 test "ZA103: split-RHS own try is not a self-trigger (EPH-I0675)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The alloc's own try lives on the continuation line inside the
@@ -53037,7 +53129,7 @@ test "ZA103: split-RHS own try is not a self-trigger (EPH-I0675)" {
 test "ZA103: transfer after a split-RHS alloc still covers (EPH-I0675)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The transfer walk starts past the alloc's own statement: a field
@@ -53067,7 +53159,7 @@ test "ZA103: transfer after a split-RHS alloc still covers (EPH-I0675)" {
 test "ZA103: split-RHS statement end ignores a paren inside a string (EPH-I0675 c2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The statement-end scan runs on masked code: the unbalanced `(` inside
@@ -53094,7 +53186,7 @@ test "ZA103: split-RHS statement end ignores a paren inside a string (EPH-I0675 
 test "ZA103: split-RHS statement end does not swallow a later try (EPH-I0675 c2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The real statement ends at the alloc's own `;`. The raw scan let a
@@ -53123,7 +53215,7 @@ test "ZA103: split-RHS statement end does not swallow a later try (EPH-I0675 c2)
 test "ZA103: errdefer naming the alloc only in a string does not cover (EPH-I0380 F19)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // findMatchingErrdefer's name test runs on masked content: a mention
@@ -53150,7 +53242,7 @@ test "ZA103: errdefer naming the alloc only in a string does not cover (EPH-I038
 test "ZA103: errdefer with a comment mentioning the alloc still covers (EPH-I0380 F19)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Masking strips the comment tail only: the real free on the same
@@ -53177,7 +53269,7 @@ test "ZA103: errdefer with a comment mentioning the alloc still covers (EPH-I038
 test "ZA103: lone `{` in a string keeps a multi-line errdefer block open (EPH-I0987)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The block collector's depth scan runs on masked code: the lone `{`
@@ -53214,7 +53306,7 @@ test "ZA103: lone `{` in a string keeps a multi-line errdefer block open (EPH-I0
 test "ZA103: lone `}` in a string does not close a multi-line errdefer block early (EPH-I0987)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The raw scan closed the block at the string's `}`: the record
@@ -53248,7 +53340,7 @@ test "ZA103: lone `}` in a string does not close a multi-line errdefer block ear
 test "ZA103: create on a tracked local allocator fires (EPH-I0981)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The .create() receiver gate ran on the compat global names only:
@@ -53293,7 +53385,7 @@ test "joinSplitDeclRhs joins a try-alloc nested in a call on the continuation li
 test "ZA103: split-RHS try-alloc nested in a call fires with the decl name (EPH-I0984)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -53321,7 +53413,7 @@ test "ZA103: split-RHS try-alloc nested in a call fires with the decl name (EPH-
 test "ZA103: split-RHS create nested in a call on a tracked receiver fires (EPH-I0989)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const obj =\n f(try allocator.create(Widget));`: the split form of
@@ -53361,7 +53453,7 @@ test "ZA103: split-RHS create nested in a call on a tracked receiver fires (EPH-
 test "ZA103: single-line create nested in a call keeps firing (EPH-I0989 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The single-line twin of the split form: the join change must not
@@ -53396,7 +53488,7 @@ test "ZA103: single-line create nested in a call keeps firing (EPH-I0989 lock)" 
 test "ZA103: alloc pattern in a trailing comment mints no phantom record (EPH-I0990)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // probe2 cmtTrailing shape from the batch-39 qa-gate sweep: the
@@ -53434,7 +53526,7 @@ test "ZA103: alloc pattern in a trailing comment mints no phantom record (EPH-I0
 test "ZA103: comment-free control of the trailing-comment probe stays silent (EPH-I0990)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The same shape without the comment carries no alloc at all, so the
@@ -53470,7 +53562,7 @@ test "ZA103: comment-free control of the trailing-comment probe stays silent (EP
 test "ZA103: gap message names the trigger kind, try and error return (EPH-I0983)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The error-return trigger class used to claim "before next try" even
@@ -53518,7 +53610,7 @@ test "ZA103: gap message names the trigger kind, try and error return (EPH-I0983
 test "ZA103/ZA101: issue col stays inside the physical line on split-RHS and wrapped shapes (EPH-I0986)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The alloc col is computed on the JOINED line, which exceeds the
@@ -53576,7 +53668,7 @@ fn expectColInLine(issues: []const Issue, file: []const u8, content: []const u8)
 test "ZA103: multi-line errdefer block with a string-only name mention does not cover (EPH-I0380 F19)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The per-line masking in the block collector blanks the string
@@ -53604,7 +53696,7 @@ test "ZA103: multi-line errdefer block with a string-only name mention does not 
 test "ZA103: errdefer before the alloc does not cover it" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Textually-early errdefer mentioning the same name must not silence the
@@ -53633,7 +53725,7 @@ test "ZA103: errdefer before the alloc does not cover it" {
 test "ZA103: errdefer after alloc with later try stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -53659,7 +53751,7 @@ test "ZA103: errdefer after alloc with later try stays silent" {
 test "ZA103: plain defer covers error returns (ZA101's domain)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // defer frees on ALL exits including error returns — no ZA103. (Defer
@@ -53685,7 +53777,7 @@ test "ZA103: plain defer covers error returns (ZA101's domain)" {
 test "ZA103: braced return in a non-dominating branch is a gap (EPH-I0368)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B03 F4: the multi-line `return buf;` sits inside an if that
@@ -53713,7 +53805,7 @@ test "ZA103: braced return in a non-dominating branch is a gap (EPH-I0368)" {
 test "ZA103: braced field store in a non-dominating branch is a gap (EPH-I0368)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The multi-line field store inside the if covers only its branch
@@ -53742,7 +53834,7 @@ test "ZA103: braced field store in a non-dominating branch is a gap (EPH-I0368)"
 test "ZA103: same-line braced field store is a gap (EPH-I0368)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The one-line `if (c) { state.f = buf; }` form: the transfer fires
@@ -53770,7 +53862,7 @@ test "ZA103: same-line braced field store is a gap (EPH-I0368)" {
 test "ZA103: single-line if-return stays loud (EPH-I0368 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace-free twin is caught by hasBareIdentReturn as an exit —
@@ -53796,7 +53888,7 @@ test "ZA103: single-line if-return stays loud (EPH-I0368 lock)" {
 test "ZA103: transfer inside the alloc's own block stays silent (EPH-I0368 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle shape: the alloc and the transfer share the if-block.
@@ -53825,7 +53917,7 @@ test "ZA103: transfer inside the alloc's own block stays silent (EPH-I0368 lock)
 test "ZA103: comment field-store does not transfer (EPH-I0369)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B03 F5: prose in a comment faked coverage for the field-store
@@ -53852,7 +53944,7 @@ test "ZA103: comment field-store does not transfer (EPH-I0369)" {
 test "ZA103: string field-store does not transfer (EPH-I0369)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A string literal carrying the store shape must not fake coverage.
@@ -53878,7 +53970,7 @@ test "ZA103: string field-store does not transfer (EPH-I0369)" {
 test "ZA103: comment break-label does not transfer (EPH-I0369)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The raw `break :` indexOf matched comment text.
@@ -53903,7 +53995,7 @@ test "ZA103: comment break-label does not transfer (EPH-I0369)" {
 test "ZA103: real store after a string mention still transfers (EPH-I0369 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Masking must not kill the genuine credit: the real field store
@@ -53931,7 +54023,7 @@ test "ZA103: real store after a string mention still transfers (EPH-I0369 lock)"
 test "ZA103: comment mentioning .ptr does not transfer (EPH-I0389)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B04 F3: `.ptr` inside comment prose faked an ownership
@@ -53958,7 +54050,7 @@ test "ZA103: comment mentioning .ptr does not transfer (EPH-I0389)" {
 test "ZA101: arena_count-style name is not arena-suppressed (EPH-I0387)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ADR-0007 lock: the arena name arm matches "arena" exactly. The
@@ -53986,7 +54078,7 @@ test "ZA101: arena_count-style name is not arena-suppressed (EPH-I0387)" {
 test "ZA101: guard-style embedded return transfers ownership (EPH-I0273)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // messenger process_path shape: `if (cond) return ptr;` one-liner
@@ -54013,7 +54105,7 @@ test "ZA101: guard-style embedded return transfers ownership (EPH-I0273)" {
 test "ZA101: embedded return in string or comment does not transfer (EPH-I0273 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Prose fakes no coverage: the guard shape inside a string literal and
@@ -54071,7 +54163,7 @@ test "hasManagedFreeReceiver rejects dotted receivers (review Q1)" {
 test "ZA101: managed-pointer handoff into a container method transfers (EPH-I0066)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ghostty PageList shape: the dupe result is stored into
@@ -54133,7 +54225,7 @@ test "ZA101: managed-pointer handoff into a container method transfers (EPH-I006
 test "ZA101: wrapped container-call handoff still transfers (EPH-I0066 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The zig-fmt wrapped form of the ghostty shape: the argument sits on
@@ -54197,7 +54289,7 @@ test "ZA101: wrapped container-call handoff still transfers (EPH-I0066 lock)" {
 test "ZA101: handoff without the managed-receiver signal still warns (EPH-I0066 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The lock side of the EPH-I0066 boundary: the same container call
@@ -54252,7 +54344,7 @@ test "ZA101: handoff without the managed-receiver signal still warns (EPH-I0066 
 test "ZA103: realloc-with-try is not a transfer (EPH-I0366)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B03 F2: `.realloc(` marked `buf = try allocator.realloc(buf, n);`
@@ -54276,7 +54368,7 @@ test "ZA103: realloc-with-try is not a transfer (EPH-I0366)" {
 test "ZA103: realloc with errdefer stays silent (EPH-I0366 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The realloc line itself stays a try-exit for ZA103; a same-scope
@@ -54299,7 +54391,7 @@ test "ZA103: realloc with errdefer stays silent (EPH-I0366 lock)" {
 test "ZA103: nested-scope errdefer does not cover a later trigger (EPH-I0367)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B03 F3: the errdefer inside the if-block cancels at the block's
@@ -54329,7 +54421,7 @@ test "ZA103: nested-scope errdefer does not cover a later trigger (EPH-I0367)" {
 test "ZA103: same-scope errdefer covers (EPH-I0367 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The lock side: the errdefer at the alloc's own scope runs at the
@@ -54355,7 +54447,7 @@ test "ZA103: same-scope errdefer covers (EPH-I0367 lock)" {
 test "ZA103: nested defer still covers (EPH-I0367 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A nested DEFER runs at its block's close and frees there — unlike a
@@ -54390,7 +54482,7 @@ test "ZA103: nested defer still covers (EPH-I0367 lock)" {
 test "ZA103: nested errdefer covers in-block triggers (EPH-I0830)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review probe P16b: the switch-arm errdefer IS registered before the
@@ -54425,7 +54517,7 @@ test "ZA103: nested errdefer covers in-block triggers (EPH-I0830)" {
 test "ZA103: errdefer in an if-block does not cover a chained else trigger (EPH-I0832)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review S1: the errdefer cancels at the if-block's close, and the
@@ -54458,7 +54550,7 @@ test "ZA103: errdefer in an if-block does not cover a chained else trigger (EPH-
 test "ZA103: errdefer in an if-arm does not cover a later else-if trigger (EPH-I0832)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review S2: the same mis-span through the `} else if (` chain.
@@ -54489,7 +54581,7 @@ test "ZA103: errdefer in an if-arm does not cover a later else-if trigger (EPH-I
 test "ZA103: errdefer in a labeled block does not cover a later trigger (EPH-I0832)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review S5: `blk: {` is a value brace under isControlBrace, but it
@@ -54523,7 +54615,7 @@ test "ZA103: errdefer in a labeled block does not cover a later trigger (EPH-I08
 test "ZA103: errdefer covers a trigger in a nested block inside its span (EPH-I0832 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review S3 lock: the nested if inside the errdefer's block must not
@@ -54555,7 +54647,7 @@ test "ZA103: errdefer covers a trigger in a nested block inside its span (EPH-I0
 test "ZA103: nested block inside the errdefer's span does not close it early (EPH-I0833)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review S8: the errdefer's block contains a nested multi-line block
@@ -54591,7 +54683,7 @@ test "ZA103: nested block inside the errdefer's span does not close it early (EP
 test "ZA103: while-loop inside the errdefer's span does not close it early (EPH-I0833)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review S9: the while-loop variant of the S8 drain shape.
@@ -54623,7 +54715,7 @@ test "ZA103: while-loop inside the errdefer's span does not close it early (EPH-
 test "ZA103: trigger after the alloc's own block close is not a gap (EPH-I0830 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The alloc is scoped to the if-block with its errdefer; a later
@@ -54654,7 +54746,7 @@ test "ZA103: trigger after the alloc's own block close is not a gap (EPH-I0830 l
 test "ZA103: mixed no-free and real allocators both analyzed (EPH-I0370)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B03 F6: the function-level bail exempted every alloc in a
@@ -54689,7 +54781,7 @@ test "ZA103: mixed no-free and real allocators both analyzed (EPH-I0370)" {
 test "ZA103: string containing a no-free pattern does not bail (EPH-I0370)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The old bail matched the raw pattern inside a string literal and
@@ -54719,7 +54811,7 @@ test "ZA103: string containing a no-free pattern does not bail (EPH-I0370)" {
 test "ZA103: no-free pointer-typed param suppresses per call site (EPH-I0370 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The type-anchored param replacement for the deleted bail: a
@@ -54744,7 +54836,7 @@ test "ZA103: no-free pointer-typed param suppresses per call site (EPH-I0370 loc
 test "ZA103: StackFallbackAllocator .get() chains stay no-free (EPH-I0831)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The deleted bail silenced every stackFallback shape; the per-call
@@ -54786,7 +54878,7 @@ test "ZA103: StackFallbackAllocator .get() chains stay no-free (EPH-I0831)" {
 test "ZA103: catch-free-return idiom stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Manual free on the error path covers the error return — no errdefer
@@ -54817,7 +54909,7 @@ test "ZA103: catch-free-return idiom stays silent" {
 test "ZA103: zig-fmt wrapped catch-free-return credits the gap (EPH-I0839)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The manual free on the error path is wrapped past 100 columns: the
@@ -54852,7 +54944,7 @@ test "ZA103: zig-fmt wrapped catch-free-return credits the gap (EPH-I0839)" {
 test "ZA103: alloc's own multi-line catch is not a gap trigger" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The error return belongs to the failing allocation expression itself —
@@ -54879,7 +54971,7 @@ test "ZA103: alloc's own multi-line catch is not a gap trigger" {
 test "ZA103: no-space errdefer block covers a later try (EPH-I0372)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `errdefer{` is a valid block form. Collection must not require
@@ -54912,7 +55004,7 @@ test "ZA103: no-space errdefer block covers a later try (EPH-I0372)" {
 test "ZA103: create without errdefer names the create in the message (EPH-I0373)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The message must name the allocation verb: is_create was written
@@ -54947,7 +55039,7 @@ test "ZA103: create without errdefer names the create in the message (EPH-I0373)
 test "ZA103: multi-decl line records the first name, so the free of the second misses (EPH-I0378)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented line-granularity bound (band-B03 F11): the record
@@ -54986,7 +55078,7 @@ test "ZA103: multi-decl line records the first name, so the free of the second m
 test "ZA103: a second try on the alloc's own line is not a trigger (EPH-I0378)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented line-granularity bound (band-B03 F11): the trigger
@@ -55053,7 +55145,7 @@ test "tryAppendCleanupInfo releases the dupe when the append fails (EPH-I0375)" 
 test "analyzeCFGMemory detects use-after-free (ZA105)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Create graph with a file containing use-after-free pattern
@@ -55089,7 +55181,7 @@ test "analyzeCFGMemory detects use-after-free (ZA105)" {
 test "analyzeCFGMemory: free text in a multiline opener tail is not a free (EPH-I0671)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The tail's `allocator.free(buf);` is string data. Counting it would
@@ -55113,7 +55205,7 @@ test "analyzeCFGMemory: free text in a multiline opener tail is not a free (EPH-
 test "analyzeCFGMemory: brace tail does not hide a real double-free (EPH-I0671)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The opener-line tail braces are string data: the CFG must stay intact
@@ -55144,7 +55236,7 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
     // KEY TEST: This was the original false positive that motivated CFG-based analysis
     // Pattern: catch { free(x); return; } - free only on error path, data still valid after
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -55192,7 +55284,7 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
 test "analyzeCFGMemory detects double-free (ZA106)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -55227,7 +55319,7 @@ test "analyzeCFGMemory detects double-free (ZA106)" {
 test "analyzeCFGMemory no false positive for proper defer" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -55262,7 +55354,7 @@ test "analyzeCFGMemory no false positive for proper defer" {
 test "analyzeCFGMemory no false positive for switch arm frees (ZA106)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -55306,7 +55398,7 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
     //                                        orelse { cleanup(); return null_err; };
 
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -55353,7 +55445,7 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
 test "analyzeCFGMemory ZA802 fires on nullable pointer decl deref (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // FN flip: `p` has no maybe_/opt_ prefix, so the pre-fix name gate
@@ -55372,13 +55464,13 @@ test "analyzeCFGMemory ZA802 fires on nullable pointer decl deref (EPH-I0219)" {
         run.issues.items,
         "test_za802_decl.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
-    ) > 0);
+    ) == 1); // One deref in the fixture pins the exact count (band-T01 F3).
 }
 
 test "analyzeCFGMemory ZA802 silent on plain pointer with maybe_ name (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // FP flip: `maybe_p` is a non-nullable *u8, but the pre-fix name gate
@@ -55403,7 +55495,7 @@ test "analyzeCFGMemory ZA802 silent on plain pointer with maybe_ name (EPH-I0219
 test "analyzeCFGMemory ZA802 fires on nullable pointer param deref (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Param annotations live on the fn line; `p` carries no name prefix.
@@ -55420,13 +55512,13 @@ test "analyzeCFGMemory ZA802 fires on nullable pointer param deref (EPH-I0219)" 
         run.issues.items,
         "test_za802_param.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
-    ) > 0);
+    ) == 1); // One deref in the fixture pins the exact count (band-T01 F3).
 }
 
 test "analyzeCFGMemory ZA802 silent after null-equality guard (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The checked-set suppression channel must survive the re-gate.
@@ -55451,7 +55543,7 @@ test "analyzeCFGMemory ZA802 silent after null-equality guard (EPH-I0219)" {
 test "analyzeCFGMemory ZA802 silent past the two-line null-guard shape (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { return; }` exits before the deref, so `p.*` on the
@@ -55480,7 +55572,7 @@ test "analyzeCFGMemory ZA802 silent past the two-line null-guard shape (EPH-I048
 test "analyzeCFGMemory ZA802 fires past a nested-braced conditional exit in the guard block (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The braced `if (q) { return null; }` inside the guard block is a
@@ -55512,7 +55604,7 @@ test "analyzeCFGMemory ZA802 fires past a nested-braced conditional exit in the 
 test "analyzeCFGMemory ZA802 silent past a both-branches exit in the guard block (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Both arms of the nested conditional exit: q true returns, q false
@@ -55544,7 +55636,7 @@ test "analyzeCFGMemory ZA802 silent past a both-branches exit in the guard block
 test "analyzeCFGMemory ZA802 fires past a nested conditional exit in the guard block (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (q) return null;` inside the guard block is a conditional exit:
@@ -55573,7 +55665,7 @@ test "analyzeCFGMemory ZA802 fires past a nested conditional exit in the guard b
 test "analyzeCFGMemory ZA802 fires past a same-line nested conditional exit in a braced guard (EPH-I0859)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { if (q) return null; }` on one line: the same-line
@@ -55603,7 +55695,7 @@ test "analyzeCFGMemory ZA802 fires past a same-line nested conditional exit in a
 test "analyzeCFGMemory ZA802 silent past a same-line braced guard exit (EPH-I0859)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { return null; }` on one line: the braced body's
@@ -55630,7 +55722,7 @@ test "analyzeCFGMemory ZA802 silent past a same-line braced guard exit (EPH-I085
 test "analyzeCFGMemory ZA802 silent past a plain same-line guard exit (EPH-I0859)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) return null;` — the unbraced same-line exit at the
@@ -55656,7 +55748,7 @@ test "analyzeCFGMemory ZA802 silent past a plain same-line guard exit (EPH-I0859
 test "analyzeCFGMemory ZA802 silent past a same-line nested both-arms guard exit (EPH-I0861)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { if (q) { return null; } else { return null; } }`
@@ -55687,7 +55779,7 @@ test "analyzeCFGMemory ZA802 silent past a same-line nested both-arms guard exit
 test "analyzeCFGMemory ZA802 silent past a same-line braced-with-else guard (EPH-I0863)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { return null; } else { sink(); }` + deref: the
@@ -55716,7 +55808,7 @@ test "analyzeCFGMemory ZA802 silent past a same-line braced-with-else guard (EPH
 test "analyzeCFGMemory ZA802 silent past a same-line both-arms guard with else (EPH-I0863)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { return null; } else { return null; }` + deref:
@@ -55743,7 +55835,7 @@ test "analyzeCFGMemory ZA802 silent past a same-line both-arms guard with else (
 test "analyzeCFGMemory ZA802 silent past split and full one-line else guards (EPH-I0863)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The split-else layout (`{ return null; } else {` newline body) and
@@ -55780,7 +55872,7 @@ test "analyzeCFGMemory ZA802 silent past split and full one-line else guards (EP
 test "analyzeCFGMemory ZA802 silent past a guarded deref with a later inline construct (EPH-I0863)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The guard's fall-through fact must survive a later same-line
@@ -55810,7 +55902,7 @@ test "analyzeCFGMemory ZA802 silent past a guarded deref with a later inline con
 test "analyzeCFGMemory ZA802 silent on the deref-in-else contrast shapes (EPH-I0863)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The contrast probes: a deref inside the else arm (v5/v6) runs on
@@ -55853,7 +55945,7 @@ test "analyzeCFGMemory ZA802 silent on the deref-in-else contrast shapes (EPH-I0
 test "analyzeCFGMemory ZA802 still fires past a true-edge guard with a falling-through else (EPH-I0863)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p != null) { return null; } else { sink(); }` + deref: the
@@ -55881,7 +55973,7 @@ test "analyzeCFGMemory ZA802 still fires past a true-edge guard with a falling-t
 test "analyzeCFGMemory ZA802 still fires on a deref after a non-exit inline arm (EPH-I0863)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (r != null) { sink(); }` + deref: the inline then arm does
@@ -55909,7 +56001,7 @@ test "analyzeCFGMemory ZA802 still fires on a deref after a non-exit inline arm 
 test "analyzeCFGMemory ZA802 guard walk survives a comment brace on the guard line (EPH-I0866)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace-less guard line carries a `{` inside its trailing
@@ -55939,7 +56031,7 @@ test "analyzeCFGMemory ZA802 guard walk survives a comment brace on the guard li
 test "analyzeCFGMemory ZA802 silent past a both-arms guard with a same-line trailing statement (EPH-I0867)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { if (q) { return null; } else { return null; } }
@@ -55968,7 +56060,7 @@ test "analyzeCFGMemory ZA802 silent past a both-arms guard with a same-line trai
 test "analyzeCFGMemory ZA802 silent past a both-arms guard with a trailing statement below (EPH-I0867)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The multi-line twin: the guard body holds a one-line nested
@@ -55999,7 +56091,7 @@ test "analyzeCFGMemory ZA802 silent past a both-arms guard with a trailing state
 test "analyzeCFGMemory ZA802 silent past a one-line nested both-arms inside a multi-line guard (EPH-I0868)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) {` + `if (q) { return null; } else { return
@@ -56029,7 +56121,7 @@ test "analyzeCFGMemory ZA802 silent past a one-line nested both-arms inside a mu
 test "analyzeCFGMemory ZA802 silent past a same-line unbraced-then both-arms guard (EPH-I0861)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The unbraced-then twin of the depth-2 rule: `if (q) return null
@@ -56058,7 +56150,7 @@ test "analyzeCFGMemory ZA802 silent past a same-line unbraced-then both-arms gua
 test "analyzeCFGMemory ZA802 fires past the multi-line twin of an unbraced-then guard (EPH-I0861)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The walk's residual gap: the multi-line twin of the same-line
@@ -56090,7 +56182,7 @@ test "analyzeCFGMemory ZA802 fires past the multi-line twin of an unbraced-then 
 test "analyzeCFGMemory ZA802 fires past a switch-arm exit in the guard block (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `true => return null,` is a partial switch arm: when q is false the
@@ -56122,7 +56214,7 @@ test "analyzeCFGMemory ZA802 fires past a switch-arm exit in the guard block (EP
 test "analyzeCFGMemory ZA802 fires on a deref before the null-arm guard (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The deref runs before the guard line, where p can still be null. The
@@ -56149,7 +56241,7 @@ test "analyzeCFGMemory ZA802 fires on a deref before the null-arm guard (EPH-I04
 test "analyzeCFGMemory ZA802 fires on a deref inside the null arm (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Inside `if (p == null)`, p IS null: the then block must not inherit
@@ -56175,7 +56267,7 @@ test "analyzeCFGMemory ZA802 fires on a deref inside the null arm (EPH-I0488)" {
 test "analyzeCFGMemory ZA802 fires on a deref inside a while null-check body (EPH-I0488)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The while body runs only while p == null. The false-edge fact holds
@@ -56202,7 +56294,7 @@ test "analyzeCFGMemory ZA802 fires on a deref inside a while null-check body (EP
 test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pins classifyNullCheck's `if (p) |v|` form through the re-gate.
@@ -56228,7 +56320,7 @@ test "analyzeCFGMemory ZA802 silent inside payload capture (EPH-I0219)" {
 test "analyzeCFGMemory ZA802 fires on C pointer deref (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // [*c] pointers carry no null guarantee: deref without a check is UB.
@@ -56246,13 +56338,13 @@ test "analyzeCFGMemory ZA802 fires on C pointer deref (EPH-I0219)" {
         run.issues.items,
         "test_za802_cptr.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
-    ) > 0);
+    ) == 1); // One deref in the fixture pins the exact count (band-T01 F3).
 }
 
 test "analyzeCFGMemory ZA802 fires on allowzero pointer deref (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // *allowzero permits address zero: deref without a check is UB.
@@ -56270,13 +56362,13 @@ test "analyzeCFGMemory ZA802 fires on allowzero pointer deref (EPH-I0219)" {
         run.issues.items,
         "test_za802_allowzero.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
-    ) > 0);
+    ) == 1); // One deref in the fixture pins the exact count (band-T01 F3).
 }
 
 test "analyzeCFGMemory ZA802 silent on string literal lookalike decl (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `ptr: ?*u8` inside the string literal is not a decl: `ptr`
@@ -56303,7 +56395,7 @@ test "analyzeCFGMemory ZA802 silent on string literal lookalike decl (EPH-I0219)
 test "analyzeCFGMemory ZA802 silent on trailing-comment lookalike decl (EPH-I0219)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `ptr: ?*u8` in the trailing comment is not a decl: `ptr` must
@@ -56330,7 +56422,7 @@ test "analyzeCFGMemory ZA802 silent on trailing-comment lookalike decl (EPH-I021
 test "analyzeCFGMemory ZA801 fires on unguarded optional unwrap (EPH-I0220)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // No guard on any path: a .? with usage after it is an unsafe unwrap.
@@ -56352,7 +56444,7 @@ test "analyzeCFGMemory ZA801 fires on unguarded optional unwrap (EPH-I0220)" {
 test "analyzeCFGMemory ZA801 silent on orelse unwrap (EPH-I0220)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The orelse path unwraps without .?, so ZA801 must stay silent.
@@ -56375,7 +56467,7 @@ test "analyzeCFGMemory ZA801 silent on orelse unwrap (EPH-I0220)" {
 test "analyzeCFGMemory ZA801 silent inside null-equality guard (EPH-I0220)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The if (opt != null) guard puts opt in the block's checked set, and
@@ -56401,7 +56493,7 @@ test "analyzeCFGMemory ZA801 silent inside null-equality guard (EPH-I0220)" {
 test "analyzeCFGMemory ZA801 silent after early-return null guard (EPH-I0220)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // if (opt == null) return 0 enters the checked set and also matches
@@ -56425,7 +56517,7 @@ test "analyzeCFGMemory ZA801 silent after early-return null guard (EPH-I0220)" {
 test "analyzeCFGMemory ZA801 same-line exits judged at the guard's depth (EPH-I0865)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The hasEarlyReturnNullGuard same-line exit is judged at the
@@ -56463,7 +56555,7 @@ test "analyzeCFGMemory ZA801 same-line exits judged at the guard's depth (EPH-I0
 test "analyzeCFGMemory ZA801 silent inside payload-capture guard (EPH-I0220)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The if (opt) |_| capture form marks opt checked inside the then-block.
@@ -56488,7 +56580,7 @@ test "analyzeCFGMemory ZA801 silent inside payload-capture guard (EPH-I0220)" {
 test "analyzeCFGMemory ZA801 silent on bare unwrap statement (EPH-I0220)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // isUnsafeUnwrapUsage: a bare `opt.?;` statement (semicolon after the
@@ -56512,7 +56604,7 @@ test "analyzeCFGMemory ZA801 silent on bare unwrap statement (EPH-I0220)" {
 test "analyzeCFGMemory ZA801 fires on a second unwrap site after a bare first (EPH-I0508 F24)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A bare `opt.?;` statement suppresses only its own site; the second
@@ -56536,7 +56628,7 @@ test "analyzeCFGMemory ZA801 fires on a second unwrap site after a bare first (E
 test "analyzeCFGMemory ZA802 fires on a second deref site after a checked first (EPH-I0508 F24)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The checked set suppresses p's deref; the second deref of q on the
@@ -56562,7 +56654,7 @@ test "analyzeCFGMemory ZA802 fires on a second deref site after a checked first 
 test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // An unrelated statement before the unwrap must not suppress the
@@ -56586,7 +56678,7 @@ test "analyzeCFGMemory ZA801 fires on unguarded unwrap mid-block (EPH-I0220)" {
 test "analyzeCFGMemory ZA801 fires past unexpected_ identifier (EPH-I0224)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the "expect" substring check suppressed on `unexpected_`.
@@ -56609,7 +56701,7 @@ test "analyzeCFGMemory ZA801 fires past unexpected_ identifier (EPH-I0224)" {
 test "analyzeCFGMemory ZA801 fires past attestation_ identifier (EPH-I0224)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `attestation_` trips neither old substring, so this fired pre-fix
@@ -56633,7 +56725,7 @@ test "analyzeCFGMemory ZA801 fires past attestation_ identifier (EPH-I0224)" {
 test "analyzeCFGMemory ZA801 fires past testing.-substring identifier (EPH-I0224)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the "testing." substring check suppressed on `protesting.`.
@@ -56657,7 +56749,7 @@ test "analyzeCFGMemory ZA801 fires past testing.-substring identifier (EPH-I0224
 test "analyzeCFGMemory ZA801 silent on real std.testing call (EPH-I0224)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A genuine std.testing call site keeps the testing-context suppression.
@@ -56680,7 +56772,7 @@ test "analyzeCFGMemory ZA801 silent on real std.testing call (EPH-I0224)" {
 test "analyzeCFGMemory ZA801 fires past expect in trailing comment (EPH-I0224)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Comment text never establishes a testing context: the suppression
@@ -56704,7 +56796,7 @@ test "analyzeCFGMemory ZA801 fires past expect in trailing comment (EPH-I0224)" 
 test "analyzeCFGMemory ZA801 fires past orelse in string literal (EPH-I0224)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the " orelse " substring check suppressed on string data.
@@ -56727,7 +56819,7 @@ test "analyzeCFGMemory ZA801 fires past orelse in string literal (EPH-I0224)" {
 test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the "expect" substring check suppressed the deref side too.
@@ -56751,7 +56843,7 @@ test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {
 test "analyzeCFGMemory ZA801 fires on unwrap past a true-only null check join (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the `opt != null` fact leaks down the branch_false edge into
@@ -56777,7 +56869,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap past a true-only null check join (E
 test "analyzeCFGMemory ZA801 fires on unwrap on the else path (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else block's only pred is the condition via branch_false: the
@@ -56804,7 +56896,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap on the else path (EPH-I0678)" {
 test "analyzeCFGMemory ZA801 fires on unwrap past a while null check exit (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The loop exit's only pred is the header via branch_false: `p != null`
@@ -56830,7 +56922,7 @@ test "analyzeCFGMemory ZA801 fires on unwrap past a while null check exit (EPH-I
 test "analyzeCFGMemory ZA801 silent on unwrap on the true path (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Polarity filtering must keep the true-edge fact on the true edge.
@@ -56854,7 +56946,7 @@ test "analyzeCFGMemory ZA801 silent on unwrap on the true path (EPH-I0678)" {
 test "analyzeCFGMemory ZA801 silent past an early-return null guard (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `== null` + return holds on the fall-through edge: the fact must
@@ -56878,7 +56970,7 @@ test "analyzeCFGMemory ZA801 silent past an early-return null guard (EPH-I0678)"
 test "analyzeCFGMemory ZA802 silent past an early-return null guard (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The ZA802 polarity hazard: no textual backstop exists (EPH-I0488), so
@@ -56902,7 +56994,7 @@ test "analyzeCFGMemory ZA802 silent past an early-return null guard (EPH-I0678)"
 test "analyzeCFGMemory ZA801 silent on unwrap inside a while null check body (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The body sits on the true edge of `p != null`: the fact must flow in.
@@ -56927,7 +57019,7 @@ test "analyzeCFGMemory ZA801 silent on unwrap inside a while null check body (EP
 test "analyzeCFGMemory ZA802 silent past the braced early-return null guard (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0488 landed: classifyNullCheck now accepts the braced
@@ -56956,7 +57048,7 @@ test "analyzeCFGMemory ZA802 silent past the braced early-return null guard (EPH
 test "analyzeCFGMemory ZA801 fires past a true-only check whose then-path returns (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Converse shape: `opt != null` holds on the true edge, which returns.
@@ -56980,7 +57072,7 @@ test "analyzeCFGMemory ZA801 fires past a true-only check whose then-path return
 test "analyzeCFGMemory ZA801 silent on an outer-check var past a nested if join (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Only the var a block tests is polarity-gated: the outer `a != null`
@@ -57009,7 +57101,7 @@ test "analyzeCFGMemory ZA801 silent on an outer-check var past a nested if join 
 test "analyzeCFGMemory ZA801 fires past a multi-line condition join (EPH-I0678)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The origin block spans the whole multi-line condition. Ownership must
@@ -57037,7 +57129,7 @@ test "analyzeCFGMemory ZA801 fires past a multi-line condition join (EPH-I0678)"
 test "analyzeCFGMemory ZA802 silent past a nested else-guard with a return arm (EPH-I0747)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `if (a)` return arm wires a phantom sequential edge into the
@@ -57067,7 +57159,7 @@ test "analyzeCFGMemory ZA802 silent past a nested else-guard with a return arm (
 test "analyzeCFGMemory ZA801 silent on the nested else-guard shape (EPH-I0747)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The issue's shape: every real path to the unwrap guarded x, so the
@@ -57099,7 +57191,7 @@ test "analyzeCFGMemory ZA801 silent on the nested else-guard shape (EPH-I0747)" 
 test "analyzeCFGMemory ZA802 still fires when the guard covers one branch only (EPH-I0747)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The a-false path reaches the deref with no p check, so the meet must
@@ -57126,7 +57218,7 @@ test "analyzeCFGMemory ZA802 still fires when the guard covers one branch only (
 test "analyzeCFGMemory ZA901 silent past a nested else-guard with a return arm (EPH-I0779)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `if (a)` return arm wires a phantom sequential edge into the
@@ -57166,7 +57258,7 @@ test "analyzeCFGMemory ZA901 silent past a nested else-guard with a return arm (
 test "analyzeCFGMemory ZA903 silent past a nested else-guard with a return arm (EPH-I0779)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same phantom predecessor as the ZA901 case, pinned through the
@@ -57204,7 +57296,7 @@ test "analyzeCFGMemory ZA903 silent past a nested else-guard with a return arm (
 test "analyzeCFGMemory ZA901 still fires when the guard covers one branch only (EPH-I0779)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The a-false path reaches the decrement with no m guard, so the
@@ -57268,7 +57360,7 @@ test "isInSafeContext masks trailing comment text (EPH-I0224)" {
 test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57306,7 +57398,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer (ZA103)" {
 test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57345,7 +57437,7 @@ test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" 
 test "analyzeIgnoredErrors detects discarded error union (ZA205)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57381,7 +57473,7 @@ test "analyzeIgnoredErrors detects discarded error union (ZA205)" {
 test "analyzeIgnoredErrors: string brace in a defer line does not arm a phantom defer block (EPH-I0894)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57420,7 +57512,7 @@ test "analyzeIgnoredErrors: string brace in a defer line does not arm a phantom 
 test "analyzeIgnoredErrors: string close brace in a defer block does not drop the mask early (EPH-I0894)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57462,7 +57554,7 @@ test "analyzeIgnoredErrors: string close brace in a defer block does not drop th
 test "analyzeIgnoredErrors no false positive for try" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57495,7 +57587,7 @@ test "analyzeIgnoredErrors no false positive for try" {
 test "analyzeIgnoredErrors no false positive for catch" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57535,7 +57627,7 @@ test "analyzeIgnoredErrors no false positive for catch" {
 test "ZA205 type-aware: user-defined void method NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57573,7 +57665,7 @@ test "ZA205 type-aware: user-defined void method NOT flagged" {
 test "ZA205 type-aware: user-defined error method IS flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57613,7 +57705,7 @@ test "ZA205 type-aware: user-defined error method IS flagged" {
 test "ZA205 type-aware: standalone void function NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57644,7 +57736,7 @@ test "ZA205 type-aware: standalone void function NOT flagged" {
 test "ZA205 type-aware: standalone error function IS flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57679,7 +57771,7 @@ test "ZA205 type-aware: standalone error function IS flagged" {
 test "ZA205 type-aware: value-returning method NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57716,7 +57808,7 @@ test "ZA205 type-aware: value-returning method NOT flagged" {
 test "ZA205 type-aware: optional-returning method NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57754,7 +57846,7 @@ test "ZA205 type-aware: optional-returning method NOT flagged" {
 test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57786,7 +57878,7 @@ test "ZA205 type-aware: stdlib ArrayList method NOT flagged" {
 test "ZA205 type-aware: mixed struct void and error methods" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57839,7 +57931,7 @@ test "ZA205 type-aware: user .clear() returning !void IS flagged (overrides voca
     // this because .clear( matches safe_method_patterns vocab. The new code MUST
     // flag it because TypeContext resolves .clear() to error_union for this struct.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57881,7 +57973,7 @@ test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
     var diag = testDiagCtx();
     // Verify that stdlib containers' .clear() is still suppressed via vocab
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57913,7 +58005,7 @@ test "ZA205 type-aware: stdlib .clear() still NOT flagged (vocab fallback)" {
 test "ZA205 type-aware: unknown receiver falls through to legacy" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57946,7 +58038,7 @@ test "ZA205 type-aware: unknown receiver falls through to legacy" {
 test "ZA205 type-aware: enum void method NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -57984,7 +58076,7 @@ test "ZA205 type-aware: enum void method NOT flagged" {
 test "ZA205 type-aware: enum error method IS flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58025,7 +58117,7 @@ test "ZA205 type-aware: enum error method IS flagged" {
 test "ZA205 type-aware: union void method NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58063,7 +58155,7 @@ test "ZA205 type-aware: union void method NOT flagged" {
 test "ZA205 type-aware: union error method IS flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58107,7 +58199,7 @@ test "ZA205 type-aware: enum value method NOT flagged" {
     var diag = testDiagCtx();
     // Enum method that returns a value (not error union) — safe to discard
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58151,7 +58243,7 @@ test "ZA205 type-aware: packed struct method works" {
     var diag = testDiagCtx();
     // Packed structs are used in real code (hardware registers, protocol headers)
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58192,7 +58284,7 @@ test "ZA205 type-aware: extern struct method works" {
     var diag = testDiagCtx();
     // Extern structs used for C FFI
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58238,7 +58330,7 @@ test "ZA205 type-aware: extern struct method works" {
 test "ZA205 type-aware: noreturn function NOT flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58277,7 +58369,7 @@ test "ZA205 type-aware: multiple user types in same file resolved independently"
     var diag = testDiagCtx();
     // Real Zig files define multiple types. Each type's methods must resolve independently.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -58498,7 +58590,7 @@ test "ZA205: builtin discard stays silent (EPH-I0408)" {
 
 test "Config.isRuleEnabled respects explicit enable" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var cfg = Config{
@@ -58533,7 +58625,7 @@ test "Config.isRuleEnabled respects explicit enable" {
 
 test "Config.isRuleEnabled respects disable prefix" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var cfg = Config{
@@ -58579,7 +58671,7 @@ test "Config.isRuleEnabled respects disable prefix" {
 
 test "Config.isRuleEnabled enable overrides disable" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var cfg = Config{
@@ -59018,7 +59110,7 @@ test "blankLiteralContents blanks a mid-line multiline opener tail (EPH-I0671)" 
 test "analyzeNaming: error{ in comments and strings does not open an error block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -59443,7 +59535,7 @@ test "checkSilentCatch mid-line defer suppression is string- and comment-aware (
 test "analyzeErrors detects silent catch (ZA201)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -59477,7 +59569,7 @@ test "analyzeErrors detects silent catch (ZA201)" {
 
 test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Test content: defer only in if-true branch
@@ -59528,7 +59620,7 @@ test "analyzeCFGDeferCoverage detects defer only in conditional branch" {
 
 test "analyzeCFGDeferCoverage no false positive for proper defer" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Test content: defer at proper scope
@@ -59573,7 +59665,7 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
 
 test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Test content: allocation with no defer, no free, no ownership transfer
@@ -59627,7 +59719,7 @@ test "analyzeCFGDeferCoverage detects alloc with no defer at all" {
 test "integration: use-after-free patterns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -59673,7 +59765,7 @@ test "integration: use-after-free patterns" {
 test "integration: double-free patterns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -59709,7 +59801,7 @@ test "integration: double-free patterns" {
 
 test "integration: undefined variable read" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Code that compiles but reads undefined value
@@ -59910,7 +60002,7 @@ test "definite-assignment worklist drains within the B+2E+1 bound (EPH-I0335, EP
 
 test "definite-assignment converges on a 10k-line adversarial function (EPH-I0335)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // 1000 undefined vars, each read inside four nested same-condition
@@ -60025,7 +60117,7 @@ fn cfgHasEdge(cfg: *const ControlFlowGraph, from: usize, to: usize, kind: EdgeKi
 
 test "buildCFG: struct literal close does not pop if block" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60051,7 +60143,7 @@ test "buildCFG: struct literal close does not pop if block" {
 
 test "buildCFG: call-arg close does not pop if block" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60078,7 +60170,7 @@ test "buildCFG: call-arg close does not pop if block" {
 
 test "buildCFG: switch arm block close does not pop switch entry" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60108,7 +60200,7 @@ test "buildCFG: switch arm block close does not pop switch entry" {
 
 test "buildCFG: int, range, discard, and string prongs open arm blocks (EPH-I0679)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60157,7 +60249,7 @@ test "buildCFG: int, range, discard, and string prongs open arm blocks (EPH-I067
 
 test "buildCFG: arrow text in a body string opens no phantom arm (EPH-I0679)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60188,7 +60280,7 @@ test "buildCFG: arrow text in a body string opens no phantom arm (EPH-I0679)" {
 
 test "buildCFG: quoted braces do not corrupt depth; comment close counts" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60217,7 +60309,7 @@ test "buildCFG: quoted braces do not corrupt depth; comment close counts" {
 
 test "buildCFG: multiline opener tail braces do not corrupt depth (EPH-I0671)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60524,7 +60616,7 @@ test "char-literal contents are not references or try-calls (EPH-I0432)" {
 
 test "buildCFG: Allman if brace on next line pops correctly" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60642,7 +60734,7 @@ test "detectCFGFuncStart: a string containing // does not hide fn (EPH-I0471)" {
 
 test "buildCFG: multi-line condition brace claims pending opener" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60667,7 +60759,7 @@ test "buildCFG: multi-line condition brace claims pending opener" {
 
 test "buildCFG: error-set return type does not corrupt body brace tracking" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60692,7 +60784,7 @@ test "buildCFG: error-set return type does not corrupt body brace tracking" {
 
 test "buildCFG: control block nested in switch arm pops on its own close" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60721,7 +60813,7 @@ test "buildCFG: control block nested in switch arm pops on its own close" {
 
 test "buildCFG: switch nested in switch arm keeps both switches on the stack" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60766,7 +60858,7 @@ test "buildCFG: switch nested in switch arm keeps both switches on the stack" {
 
 test "buildCFG: nested int prongs branch from the inner switch header (EPH-I0318)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60823,7 +60915,7 @@ fn cfgSucc(cfg: *const ControlFlowGraph, from: usize, kind: EdgeKind) ?usize {
 
 test "buildCFG: same-line balanced if opens and pops on one line" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60848,7 +60940,7 @@ test "buildCFG: same-line balanced if opens and pops on one line" {
 
 test "buildCFG: same-line if/else wires true, else, and merge blocks" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60879,7 +60971,7 @@ test "buildCFG: same-line if/else wires true, else, and merge blocks" {
 
 test "buildCFG: same-line if with struct literal pops on one line" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60904,7 +60996,7 @@ test "buildCFG: same-line if with struct literal pops on one line" {
 
 test "buildCFG: nested same-line if — literal close pops only the inner if" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60935,7 +61027,7 @@ test "buildCFG: nested same-line if — literal close pops only the inner if" {
 
 test "buildCFG: next-line else still pops the if and wires the else block" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -60964,7 +61056,7 @@ test "buildCFG: next-line else still pops the if and wires the else block" {
 
 test "buildCFG: next-line else pairs with the if across the close" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61001,7 +61093,7 @@ test "buildCFG: next-line else pairs with the if across the close" {
 
 test "buildCFG: comment line between close and else keeps the pairing" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61036,7 +61128,7 @@ test "buildCFG: comment line between close and else keeps the pairing" {
 
 test "buildCFG: deferred if-close finishes as no-else on a plain statement" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61068,7 +61160,7 @@ test "buildCFG: deferred if-close finishes as no-else on a plain statement" {
 
 test "buildCFG: lone close then next-line else wires four blocks" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61107,7 +61199,7 @@ test "buildCFG: lone close then next-line else wires four blocks" {
 
 test "buildCFG: multi-line else-if chain pairs each close with its else" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61158,7 +61250,7 @@ test "buildCFG: multi-line else-if chain pairs each close with its else" {
 
 test "buildCFG: bare Allman else-if line opens the chain (EPH-I0323)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61197,7 +61289,7 @@ test "buildCFG: bare Allman else-if line opens the chain (EPH-I0323)" {
 
 test "buildCFG: two closes on one line preserve the inner merge wiring (EPH-I0091)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61232,7 +61324,7 @@ test "buildCFG: two closes on one line preserve the inner merge wiring (EPH-I009
 
 test "buildCFG: text between two same-line closes keeps the inner fall-through (EPH-I0317)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61269,7 +61361,7 @@ test "buildCFG: text between two same-line closes keeps the inner fall-through (
 
 test "buildCFG: else after two same-line closes pairs with the outer entry (EPH-I0317)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61314,7 +61406,7 @@ test "buildCFG: else after two same-line closes pairs with the outer entry (EPH-
 
 test "buildCFG: Allman else brace after same-line if is a control open (EPH-I0089)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61351,7 +61443,7 @@ test "buildCFG: Allman else brace after same-line if is a control open (EPH-I008
 
 test "buildCFG: blank line between close and else keeps the pairing" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61384,7 +61476,7 @@ test "buildCFG: blank line between close and else keeps the pairing" {
 
 test "buildCFG: same-line while-else wires loop-back and claims the loop entry" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0086: the close on `} else {` is skipped for the else, so the
@@ -61424,7 +61516,7 @@ test "buildCFG: same-line while-else wires loop-back and claims the loop entry" 
 
 test "buildCFG: multi-line while-else defers the loop close for its else" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0086: a lone `}` closing a loop defers like the if form, so a
@@ -61466,7 +61558,7 @@ test "buildCFG: multi-line while-else defers the loop close for its else" {
 
 test "buildCFG: same-line for-else claims the loop entry like while-else" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0086: for-else shares the while-else wiring.
@@ -61498,7 +61590,7 @@ test "buildCFG: same-line for-else claims the loop entry like while-else" {
 
 test "buildCFG: while without else keeps the immediate loop close wiring" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard: the deferred loop close with no else claiming it finishes
@@ -61526,7 +61618,7 @@ test "buildCFG: while without else keeps the immediate loop close wiring" {
 
 test "buildCFG: bare else-identifier line wires as a virtual else body" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -61559,7 +61651,7 @@ test "buildCFG: bare else-identifier line wires as a virtual else body" {
 
 test "buildCFG: braced if-break edges to the loop merge and ends the block" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: break exits to the nearest loop's merge; the break block
@@ -61595,7 +61687,7 @@ test "buildCFG: braced if-break edges to the loop merge and ends the block" {
 
 test "buildCFG: brace-less next-line break wires like the braced form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: `if (d)\n    break;` must produce the braced form's edges.
@@ -61632,7 +61724,7 @@ test "buildCFG: brace-less next-line break wires like the braced form" {
 
 test "buildCFG: same-line break body wires like the braced form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: `if (d) break;` must produce the braced form's edges.
@@ -61668,7 +61760,7 @@ test "buildCFG: same-line break body wires like the braced form" {
 
 test "buildCFG: same-line braced if-break wires like the multi-line form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: `if (d) { break; }` on one line wires the same jump.
@@ -61704,7 +61796,7 @@ test "buildCFG: same-line braced if-break wires like the multi-line form" {
 
 test "buildCFG: bare break at loop-body top level skips the loop-back" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: a body ending in break never falls off its end, so no
@@ -61735,7 +61827,7 @@ test "buildCFG: bare break at loop-body top level skips the loop-back" {
 
 test "buildCFG: braced continue edges to the loop header" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: continue jumps to the loop header (a loop_back edge, so
@@ -61768,7 +61860,7 @@ test "buildCFG: braced continue edges to the loop header" {
 
 test "buildCFG: same-line continue body wires like the braced form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: `if (d) continue;` must produce the braced form's edges.
@@ -61804,7 +61896,7 @@ test "buildCFG: same-line continue body wires like the braced form" {
 
 test "buildCFG: break in a nested loop targets the inner merge" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: the stack walk binds break to the nearest enclosing LOOP.
@@ -61838,7 +61930,7 @@ test "buildCFG: break in a nested loop targets the inner merge" {
 
 test "buildCFG: while-else break wires to the post-else merge" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094 while-else split: a break bypasses the else arm, so its
@@ -61879,7 +61971,7 @@ test "buildCFG: while-else break wires to the post-else merge" {
 
 test "buildCFG: Allman while-else break wires to the post-else merge" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: the deferred-close else claims the loop entry through
@@ -61920,7 +62012,7 @@ test "buildCFG: Allman while-else break wires to the post-else merge" {
 
 test "buildCFG: break in a switch prong inside a loop targets the loop merge" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: a switch is not a loop — the prong body's break binds to
@@ -61961,7 +62053,7 @@ test "buildCFG: break in a switch prong inside a loop targets the loop merge" {
 
 test "buildCFG: labeled block break is not wired as loop control" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: `break :blk` exits the labeled BLOCK, not a loop — no
@@ -61990,7 +62082,7 @@ test "buildCFG: labeled block break is not wired as loop control" {
 
 test "buildCFG: continue in a while-continue-expression loop edges to the header" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094: the header block carries the `: (i += 1)` continuation,
@@ -62024,7 +62116,7 @@ test "buildCFG: continue in a while-continue-expression loop edges to the header
 test "ZA607: break before fill in while-else body is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094 class (b): break bypasses the else arm, so the break path
@@ -62059,7 +62151,7 @@ test "ZA607: break before fill in while-else body is detected" {
 test "ZA607: fill before break in while-else stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (EPH-I0094): every path to the read fills x. The body fill
@@ -62098,7 +62190,7 @@ test "ZA607: fill before break in while-else stays silent" {
 test "ZA607: continue before fill still flags the post-loop read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (EPH-I0094): the continue edge must not silence the genuine
@@ -62131,7 +62223,7 @@ test "ZA607: continue before fill still flags the post-loop read" {
 test "ZA607: while-body fill alone does not cover the zero-trip path" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0110: the loop may run zero times, so the body fill is
@@ -62163,7 +62255,7 @@ test "ZA607: while-body fill alone does not cover the zero-trip path" {
 test "ZA607: no-space while header keeps the body fill conditional (EPH-I0320)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // isLoopStart must see the no-space `while(` form, or the fill-before-
@@ -62195,7 +62287,7 @@ test "ZA607: no-space while header keeps the body fill conditional (EPH-I0320)" 
 test "ZA607: while-else with fills on both arms stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0110 regression lock: the else arm covers the zero-trip path
@@ -62231,7 +62323,7 @@ test "ZA607: while-else with fills on both arms stays silent" {
 test "ZA607: for-body fill alone does not cover the zero-trip path" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0110: a for over a slice runs zero times on an empty slice,
@@ -62260,7 +62352,7 @@ test "ZA607: for-body fill alone does not cover the zero-trip path" {
 test "ZA607: while(true) fill dominating the break stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0110: a literal-true condition has no zero-trip path. The only
@@ -62289,7 +62381,7 @@ test "ZA607: while(true) fill dominating the break stays silent" {
 
 test "buildCFG: while(true) wires no false exit" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0110: a literal-true condition never goes false, so the header
@@ -62316,7 +62408,7 @@ test "buildCFG: while(true) wires no false exit" {
 test "ZA607: switch-arm break does not poison the switch merge" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094 class (c): the break arm exits to the loop merge, not the
@@ -62362,7 +62454,7 @@ test "ZA607: switch-arm break does not poison the switch merge" {
 test "ZA101: break path skipping the loop-body free is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0094 class (a): the break edge removes the fall-through that
@@ -62392,7 +62484,7 @@ test "ZA101: break path skipping the loop-body free is detected" {
 test "ZA101: defer free in loop body covers the break path" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (EPH-I0094): defer runs on scope exit including via break, so
@@ -62421,7 +62513,7 @@ test "ZA101: defer free in loop body covers the break path" {
 test "ZA101: loop then post-loop defer stays silent (F6 probe)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0682 F6a: the backward coverage AND over the loop cycle
@@ -62450,7 +62542,7 @@ test "ZA101: loop then post-loop defer stays silent (F6 probe)" {
 test "ZA101: return inside loop with post-loop direct free still warns (F6 divergence pin)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The cycle deadlock is deliberate: a return inside the body bypasses
@@ -62479,7 +62571,7 @@ test "ZA101: return inside loop with post-loop direct free still warns (F6 diver
 test "ZA101: string-only brace defer does not arm a phantom defer block (EPH-I0894)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer line carries only a string brace: it must not arm a
@@ -62509,7 +62601,7 @@ test "ZA101: string-only brace defer does not arm a phantom defer block (EPH-I08
 test "ZA101: string close brace in a real defer block does not drop the depth early (EPH-I0894)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The F6a loop shape reaches the linear fallback; the string `}`
@@ -62545,7 +62637,7 @@ test "ZA101: string close brace in a real defer block does not drop the depth ea
 test "ZA105: string close brace in a defer block keeps the UAF defer marker (EPH-I0894)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The UAF marker walk (markDeferAndErrdeferBlocks) must keep the
@@ -62578,7 +62670,7 @@ test "ZA105: string close brace in a defer block keeps the UAF defer marker (EPH
 test "ZA101: errdefer handoff survives a string brace in a return literal (EPH-I0894)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The errdefer covers the error paths; the return literal mentions
@@ -62742,7 +62834,7 @@ test "isReturnTransfer masks a closer inside string content (EPH-I0900)" {
 test "ZA101: same-indent conditional defer still warns (F6 probe)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0682 F6b: `if (a) defer free(buf);` runs the defer only on the
@@ -62770,7 +62862,7 @@ test "ZA101: same-indent conditional defer still warns (F6 probe)" {
 test "ZA101: trailing comment mentioning defer keeps the direct free (r1 pin)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review r1 fix 1: the keyword scan runs on the comment-stripped line,
@@ -62795,7 +62887,7 @@ test "ZA101: trailing comment mentioning defer keeps the direct free (r1 pin)" {
 test "ZA101: trailing comment mentioning errdefer keeps the direct free (r1 pin)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review r1 fix 1, errdefer needle: same mechanism as the defer
@@ -62819,7 +62911,7 @@ test "ZA101: trailing comment mentioning errdefer keeps the direct free (r1 pin)
 test "ZA101: block-close then defer on one line keeps the structural warning (r1 pin)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Review r1 fix 2, documented bound: `} defer free(buf);` holds no
@@ -62860,7 +62952,7 @@ fn cfgEdgesMatch(a: *const ControlFlowGraph, b: *const ControlFlowGraph) bool {
 
 test "buildCFG: brace-less same-line if body closes at end of line" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -62885,7 +62977,7 @@ test "buildCFG: brace-less same-line if body closes at end of line" {
 
 test "buildCFG: brace-less body CFG equals the braced form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const bare = [_][]const u8{
@@ -62912,7 +63004,7 @@ test "buildCFG: brace-less body CFG equals the braced form" {
 
 test "buildCFG: brace-less if with same-line else pairs correctly" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -62946,7 +63038,7 @@ test "buildCFG: brace-less if with same-line else pairs correctly" {
 
 test "buildCFG: next-line statement is the pending opener's virtual body" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -62974,7 +63066,7 @@ test "buildCFG: next-line statement is the pending opener's virtual body" {
 
 test "buildCFG: next-line body pairs with a virtual else" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -63006,7 +63098,7 @@ test "buildCFG: next-line body pairs with a virtual else" {
 
 test "buildCFG: multi-line condition takes a next-line virtual body" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -63032,7 +63124,7 @@ test "buildCFG: multi-line condition takes a next-line virtual body" {
 
 test "buildCFG: multi-line condition carries its body on the end line" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -63055,7 +63147,7 @@ test "buildCFG: multi-line condition carries its body on the end line" {
 
 test "buildCFG: one-liner with both bodies virtual" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -63083,7 +63175,7 @@ test "buildCFG: one-liner with both bodies virtual" {
 
 test "buildCFG: virtual else pairs after a braced if" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -63110,7 +63202,7 @@ test "buildCFG: virtual else pairs after a braced if" {
 
 test "buildCFG: nested same-line if is one plain virtual body" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented approximation (B2.4): the outer body is the whole line
@@ -63134,7 +63226,7 @@ test "buildCFG: nested same-line if is one plain virtual body" {
 
 test "buildCFG: brace-less while body degrades exactly as before" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Brace-less while/for are out of B2 scope: the pending entry lingers
@@ -63187,7 +63279,7 @@ fn cfgTrueBlockReturns(cfg: *const ControlFlowGraph) bool {
 
 test "buildCFG: brace-less return body equals the multi-line braced form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const bare = [_][]const u8{
@@ -63229,7 +63321,7 @@ test "buildCFG: brace-less return body equals the multi-line braced form" {
 
 test "buildCFG: next-line return body equals the multi-line braced form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The next-line virtual body dispatches return_stmt on the body line,
@@ -63265,7 +63357,7 @@ test "buildCFG: next-line return body equals the multi-line braced form" {
 
 test "buildCFG: virtual else return marks the else block" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -63289,7 +63381,7 @@ test "buildCFG: virtual else return marks the else block" {
 
 test "buildCFG: brace-less break body equals the braced form" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // break/continue are not CFG-modeled in either form (dispatchPattern
@@ -63322,7 +63414,7 @@ test "buildCFG: brace-less break body equals the braced form" {
 
 test "buildCFG: two returns in one block append one exit id (EPH-I0325)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Both return lines sit in the same if body; the exit list must hold
@@ -63359,7 +63451,7 @@ test "buildCFG: two returns in one block append one exit id (EPH-I0325)" {
 test "ZA607: never-assigned undefined var is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -63380,7 +63472,7 @@ test "ZA607: never-assigned undefined var is detected" {
 test "ZA607: single-branch if assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The skip path through `if (cond)` never assigns x, so the read on
@@ -63411,7 +63503,7 @@ test "ZA607: single-branch if assignment is detected" {
 test "ZA607: nested single-branch if assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -63437,7 +63529,7 @@ test "ZA607: nested single-branch if assignment is detected" {
 test "ZA607: both-branches if/else is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -63463,7 +63555,7 @@ test "ZA607: both-branches if/else is silent" {
 test "ZA607: else-arm-only assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The cond-true path never assigns x, so the read on line 7 is a
@@ -63495,7 +63587,7 @@ test "ZA607: else-arm-only assignment is detected" {
 test "ZA607: parenthesized chain amp keeps the fill credit (EPH-I0816)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `use(&(opts.buf))` groups the chain operand: the call still fills
@@ -63545,7 +63637,7 @@ test "ZA607: parenthesized chain amp keeps the fill credit (EPH-I0816)" {
 test "ZA607: if-arm fill with empty else is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else path never assigns x; an empty else arm must not silence
@@ -63572,7 +63664,7 @@ test "ZA607: if-arm fill with empty else is detected" {
 test "ZA607: if-arm fill with non-assigning else is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else arm runs code but never assigns x, so the read stays a
@@ -63600,7 +63692,7 @@ test "ZA607: if-arm fill with non-assigning else is detected" {
 test "ZA607: else-if-arm-only assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The fill sits in the else-if branch; the c-true path and the
@@ -63628,7 +63720,7 @@ test "ZA607: else-if-arm-only assignment is detected" {
 test "ZA607: else-if assignment past struct-literal arm is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The struct literal in the first arm must not hide the conditional
@@ -63659,7 +63751,7 @@ test "ZA607: else-if assignment past struct-literal arm is detected" {
 test "ZA607: if and else-if fills without final else are detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Both named arms assign x, but the neither-c-nor-d path falls
@@ -63687,7 +63779,7 @@ test "ZA607: if and else-if fills without final else are detected" {
 test "ZA607: non-assigning final else does not cover earlier fills" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The final else runs code but never assigns x, so the c-false
@@ -63717,7 +63809,7 @@ test "ZA607: non-assigning final else does not cover earlier fills" {
 test "ZA607: fills in every arm of if/else-if/else are silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every path assigns x, so the read is safe (EPH-I0087 guard).
@@ -63746,7 +63838,7 @@ test "ZA607: fills in every arm of if/else-if/else are silent" {
 test "ZA607: allman else-arm-only assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Allman style: the bare `else` line still opens a conditional arm,
@@ -63776,7 +63868,7 @@ test "ZA607: allman else-arm-only assignment is detected" {
 test "ZA607: braceless else-arm assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A single-statement else body is still a conditional arm; its fill
@@ -63801,7 +63893,7 @@ test "ZA607: braceless else-arm assignment is detected" {
 test "ZA607: three-link else-if chain without final else is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every named arm assigns x, but the all-conditions-false path falls
@@ -63831,7 +63923,7 @@ test "ZA607: three-link else-if chain without final else is detected" {
 test "ZA607: braceless else-if statement body is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A single-statement else-if body assigns only on the d-true path;
@@ -63856,7 +63948,7 @@ test "ZA607: braceless else-if statement body is detected" {
 test "ZA607: payload-else next-line body keeps the else arm conditional (EPH-I0119)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0119 repro variant: the true arm never assigns x, the
@@ -63887,7 +63979,7 @@ test "ZA607: payload-else next-line body keeps the else arm conditional (EPH-I01
 test "ZA607: payload-else with both arms filling stays silent (EPH-I0119)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The issue's exact repro: both arms fill x, so the trailing read is
@@ -63914,7 +64006,7 @@ test "ZA607: payload-else with both arms filling stays silent (EPH-I0119)" {
 
 test "buildCFG: payload-else next-line body lands in the else arm (EPH-I0119)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const lines = [_][]const u8{
@@ -63946,7 +64038,7 @@ test "buildCFG: payload-else next-line body lands in the else arm (EPH-I0119)" {
 
 test "buildCFG: payload-else if-statement body closes same-line (EPH-I0119)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A payload-else whose body is an if-statement is a statement body,
@@ -63981,7 +64073,7 @@ test "buildCFG: payload-else if-statement body closes same-line (EPH-I0119)" {
 test "ZA607: unconditional assignment before read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -64003,7 +64095,7 @@ test "ZA607: unconditional assignment before read is silent" {
 test "ZA607: early return on unassigned paths is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every path either assigns k or returns before the read.
@@ -64032,7 +64124,7 @@ test "ZA607: early return on unassigned paths is silent" {
 test "ZA607: correlated guard read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The read is inside `if (cond)` and the same condition guards an
@@ -64061,7 +64153,7 @@ test "ZA607: correlated guard read is silent" {
 test "ZA607: loop guard-continue before same-scope assignment is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every path reaching the reads passed the unconditional `x = create(...)`
@@ -64100,7 +64192,7 @@ test "ZA607: loop guard-continue before same-scope assignment is silent" {
 test "ZA607: same-line return guard before dominating assignment is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace-less `if (a) return 1;` guard block is return-terminal; the
@@ -64127,7 +64219,7 @@ test "ZA607: same-line return guard before dominating assignment is silent" {
 test "ZA607: chained same-line return guards before dominating assignment are silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Two brace-less return guards in a row: every path reaching the read
@@ -64154,7 +64246,7 @@ test "ZA607: chained same-line return guards before dominating assignment are si
 test "ZA607: same-line guarded assignment keeps the locked verdict" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The mid-line `y = 1;` virtual body runs only on the a-true path, but
@@ -64182,7 +64274,7 @@ test "ZA607: same-line guarded assignment keeps the locked verdict" {
 test "ZA607: braceless if with next-line body is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The next-line virtual body assigns only on the cond-true path; the
@@ -64207,7 +64299,7 @@ test "ZA607: braceless if with next-line body is detected" {
 test "ZA607: multi-line condition with next-line body is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The header stays open across lines; the body after the closing paren
@@ -64233,7 +64325,7 @@ test "ZA607: multi-line condition with next-line body is detected" {
 test "ZA607: nested braceless if bodies are detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The inner header is the outer header's body; x assigns only on the
@@ -64259,7 +64351,7 @@ test "ZA607: nested braceless if bodies are detected" {
 test "ZA607: brace text in a header comment does not disarm the guard" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A `{` inside the trailing comment must not read as a braced body;
@@ -64284,7 +64376,7 @@ test "ZA607: brace text in a header comment does not disarm the guard" {
 test "ZA607: payload-capture if with next-line body is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The null path reaches the read with x undefined (EPH-I0095).
@@ -64308,7 +64400,7 @@ test "ZA607: payload-capture if with next-line body is detected" {
 test "ZA607: braceless else-if with next-line body is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else-if arm assigns only on the d-true path; the CFG wires the
@@ -64335,7 +64427,7 @@ test "ZA607: braceless else-if with next-line body is detected" {
 test "ZA607: unguarded assignment after braceless if stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The guarded x = 1 must not count, but the unconditional x = 2 still
@@ -64361,7 +64453,7 @@ test "ZA607: unguarded assignment after braceless if stays silent" {
 test "ZA607: both braceless arms assigning is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Both virtual bodies assign; the CFG merge covers the read without
@@ -64388,7 +64480,7 @@ test "ZA607: both braceless arms assigning is silent" {
 test "ZA607: same-line braced if does not cover the later read (EPH-I0849)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The one-line braced if's fill runs on the guarded path only, so a
@@ -64415,7 +64507,7 @@ test "ZA607: same-line braced if does not cover the later read (EPH-I0849)" {
 test "ZA607: nested conditional in a one-line guard block fires (EPH-I0846)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The x assignment sits inside `if (d)` nested in the one-line if (c)
@@ -64444,7 +64536,7 @@ test "ZA607: nested conditional in a one-line guard block fires (EPH-I0846)" {
 test "ZA607: same-block guard correlation in a one-line arm stays silent (EPH-I0846)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Control for the I0846 fix: the guard and x assignments share the
@@ -64472,7 +64564,7 @@ test "ZA607: same-block guard correlation in a one-line arm stays silent (EPH-I0
 test "ZA607: one-line-else return arm keeps the later read silent (EPH-I0846/49)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The c == false path returns inside the else arm, so the later read
@@ -64499,7 +64591,7 @@ test "ZA607: one-line-else return arm keeps the later read silent (EPH-I0846/49)
 test "ZA607: same-condition later one-line if stays silent (EPH-I0849)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The later read shares the guard-if's condition text: the
@@ -64526,7 +64618,7 @@ test "ZA607: same-condition later one-line if stays silent (EPH-I0849)" {
 test "ZA607: string-literal else text in an else arm is not an exit (EPH-I0846/49)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else arm holds a string whose content looks like a one-line
@@ -64557,7 +64649,7 @@ test "ZA607: string-literal else text in an else arm is not an exit (EPH-I0846/4
 test "ZA607: blank line after a same-line braced if keeps the read uncovered (EPH-I0846/49)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A blank line between the one-line if and the read normalized the
@@ -64585,7 +64677,7 @@ test "ZA607: blank line after a same-line braced if keeps the read uncovered (EP
 test "ZA607: read after fill inside a same-line braced arm is covered (EPH-I0873)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The read `_ = x` runs only on the c=true path, after `x = 1`: it is
@@ -64614,7 +64706,7 @@ test "ZA607: read after fill inside a same-line braced arm is covered (EPH-I0873
 test "ZA607: same-line nested if body return no longer severs coverage (EPH-I0121)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The editor.zig:5653 shape: `if (cond) if (c) { ...; return; };`
@@ -64672,7 +64764,7 @@ test "ZA607: same-line nested if body return no longer severs coverage (EPH-I012
 test "ZA607: no-nest editor shape control stays silent (EPH-I0121)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The p14_editor_no_nest.zig control: the guarded read at the fn
@@ -64722,7 +64814,7 @@ test "ZA607: no-nest editor shape control stays silent (EPH-I0121)" {
 test "ZA607: string content no longer fakes a same-line fill (EPH-I0124)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // probe_mixed.zig: the string `"x = 1"` faked an assignment
@@ -64773,7 +64865,7 @@ test "ZA607: string content no longer fakes a same-line fill (EPH-I0124)" {
 test "ZA607: string content in a branch arm no longer arms the suppressor (EPH-I0870)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // p_s2.zig: the else arm's string `"{ x = 5; }"` faked an assignment
@@ -64803,7 +64895,7 @@ test "ZA607: string content in a branch arm no longer arms the suppressor (EPH-I
 test "ZA607: second same-line control arm stays silent (EPH-I0871, documented residual)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // q1.zig: `if (a) { x = 1; } if (b) { x = 2; } return x;` stays
@@ -64833,7 +64925,7 @@ test "ZA607: second same-line control arm stays silent (EPH-I0871, documented re
 test "ZA607: one-line else-if chain unassigned path stays silent (EPH-I0872, documented residual)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // r2_d.zig: `if (a) { x = 1; } else if (b) { return 1; } return x;`
@@ -64864,7 +64956,7 @@ test "ZA607: one-line else-if chain unassigned path stays silent (EPH-I0872, doc
 test "ZA607: multi-line else-if chain split fires on the unassigned path (EPH-I0872, EPH-I1063)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // t4.zig: the A=false,B=true path runs sink() and leaves x
@@ -64904,7 +64996,7 @@ test "ZA607: multi-line else-if chain split fires on the unassigned path (EPH-I0
 test "ZA607: braceless while body keeps pre-B2 verdict" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Brace-less loops are outside the CFG's virtual-body modeling
@@ -64930,7 +65022,7 @@ test "ZA607: braceless while body keeps pre-B2 verdict" {
 test "ZA607: sibling ifs with assignment only in first is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Assigning x under `if (a)` must not silence the read under `if (b)`:
@@ -64960,7 +65052,7 @@ test "ZA607: sibling ifs with assignment only in first is detected" {
 test "ZA607: equal-length different var assignment does not mask undefined read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0078: `x = 1;` must not mark z assigned — isAssignmentTarget was
@@ -64985,7 +65077,7 @@ test "ZA607: equal-length different var assignment does not mask undefined read"
 test "ZA607: one-char name not poisoned by other var field assignment" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0078: t[1..] of `y.field = 1;` is `.field = 1;`, which the
@@ -65009,7 +65101,7 @@ test "ZA607: one-char name not poisoned by other var field assignment" {
 test "ZA607: one-char name not poisoned by other var subscript assignment" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0078: t[1..] of `y[i] = 1;` is `[i] = 1;`, which the subscript
@@ -65033,7 +65125,7 @@ test "ZA607: one-char name not poisoned by other var subscript assignment" {
 test "ZA607: direct assignment of tracked var stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard must keep accepting the genuine `x = 1` gen (no FP).
@@ -65056,7 +65148,7 @@ test "ZA607: direct assignment of tracked var stays silent" {
 test "ZA607: field assignment of tracked var still counts as assignment" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `x.field = 1` still gens x — the fix must not change that semantic.
@@ -65079,7 +65171,7 @@ test "ZA607: field assignment of tracked var still counts as assignment" {
 test "ZA607: longer-name prefix assignment does not count" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `xyz = 1;` is not an assignment to x; locks the boundary behavior.
@@ -65102,7 +65194,7 @@ test "ZA607: longer-name prefix assignment does not count" {
 test "ZA607: indexed assignment to different var in loop does not mask read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Neighbor audit: checkIndexedAssign matched "x" inside "box" without a
@@ -65128,7 +65220,7 @@ test "ZA607: indexed assignment to different var in loop does not mask read" {
 test "ZA607: plain subscript assignment in for loop stays silent (EPH-I0327)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Positive control: `buf[x] = 1` is the fill idiom the heuristic
@@ -65154,7 +65246,7 @@ test "ZA607: plain subscript assignment in for loop stays silent (EPH-I0327)" {
 test "ZA607: loop field write on other var does not mask local read (EPH-I0753)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `foo.buf[x] = 1` writes foo's field, not the local buf. The pre-fix
@@ -65182,7 +65274,7 @@ test "ZA607: loop field write on other var does not mask local read (EPH-I0753)"
 test "ZA607: subscript read before same-loop assignment stays silent (EPH-I0327)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `buf[x] == 0` comparison does not initialize, but the later
@@ -65342,7 +65434,7 @@ test "isAssignmentTarget quoted field with escaped quote (EPH-I0787)" {
 test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `sum +%= buf[x]` reads an element. It never initializes buf. The
@@ -65370,7 +65462,7 @@ test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
 test "ZA607: loop compound-op element read of undefined buffer is detected (EPH-I0752)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[x] += 1` reads the element before writing it, so it cannot
@@ -65395,7 +65487,7 @@ test "ZA607: loop compound-op element read of undefined buffer is detected (EPH-
 test "ZA607: loop tuple-init element read of undefined buffer is detected (EPH-I0752)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `.{ buf[x], 1 }` copies the element into the aggregate — a genuine
@@ -65426,7 +65518,7 @@ test "ZA607: loop tuple-init element read of undefined buffer is detected (EPH-I
 test "ZA607: loop element write-through stays silent (EPH-I0752)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[x].append(1)` writes through the element. The write-through
@@ -65455,7 +65547,7 @@ test "ZA607: loop element write-through stays silent (EPH-I0752)" {
 test "ZA607: loop nested method write-through stays silent (EPH-I0775)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[x].list.append(1)` writes through a field of the element. The
@@ -65486,7 +65578,7 @@ test "ZA607: loop nested method write-through stays silent (EPH-I0775)" {
 test "ZA607: loop quoted field chain assignment stays silent (EPH-I0777)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[x].@"f" = 1` assigns through the quoted field chain. The
@@ -65518,7 +65610,7 @@ test "ZA607: loop quoted field chain assignment stays silent (EPH-I0777)" {
 test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `send(buf[0..])` is the slice form: slice reads keep their fill
@@ -65544,7 +65636,7 @@ test "ZA607: loop slice pass keeps the fill verdict (EPH-I0752)" {
 test "ZA607: one-line loop element read of undefined buffer is detected (EPH-I0772)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The element read sits on the loop-header line. The pre-fix
@@ -65570,7 +65662,7 @@ test "ZA607: one-line loop element read of undefined buffer is detected (EPH-I07
 test "ZA607: one-line loop indexed fill stays silent (EPH-I0772)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[x] = 1` on the loop-header line is a genuine fill. The write
@@ -65594,7 +65686,7 @@ test "ZA607: one-line loop indexed fill stays silent (EPH-I0772)" {
 test "ZA607: one-line loop slice pass keeps the fill verdict (EPH-I0772)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `send(buf[0..])` on the loop-header line is the slice form. Slice
@@ -65618,7 +65710,7 @@ test "ZA607: one-line loop slice pass keeps the fill verdict (EPH-I0772)" {
 test "ZA607: one-line loop read before same-line fill stays silent (EPH-I0772)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The first `buf[x]` reads, the second fills. The read verdict on the
@@ -65644,7 +65736,7 @@ test "ZA607: one-line loop read before same-line fill stays silent (EPH-I0772)" 
 test "ZA607: post-loop fill does not mask a one-line loop element read (EPH-I0785)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The one-line loop's braces balance on the header line, so the
@@ -65672,7 +65764,7 @@ test "ZA607: post-loop fill does not mask a one-line loop element read (EPH-I078
 test "ZA607: one-line loop fill still covers a post-loop read (EPH-I0785)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The same-line `buf[x] = 1` is a genuine fill. checkIndexedAssign
@@ -65697,7 +65789,7 @@ test "ZA607: one-line loop fill still covers a post-loop read (EPH-I0785)" {
 test "ZA607: multi-line loop fill still covers a post-loop read (EPH-I0785)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The balanced-close rule fires only on the tracker's start line. A
@@ -65725,7 +65817,7 @@ test "ZA607: multi-line loop fill still covers a post-loop read (EPH-I0785)" {
 test "ZA607: spaced-dot field write does not fill the local (EPH-I0786)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `foo . buf[0] = 1` writes foo's field through a spaced dot. The
@@ -65751,7 +65843,7 @@ test "ZA607: spaced-dot field write does not fill the local (EPH-I0786)" {
 test "ZA607: loop spaced-dot field write does not mask local read (EPH-I0786)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `foo . buf[x] = 1` writes foo's field through a spaced dot. The
@@ -65778,7 +65870,7 @@ test "ZA607: loop spaced-dot field write does not mask local read (EPH-I0786)" {
 test "ZA607: one-line loop spaced-dot field write does not mask local read (EPH-I0786)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The spaced-dot field write sits on the loop-header line. The
@@ -65803,7 +65895,7 @@ test "ZA607: one-line loop spaced-dot field write does not mask local read (EPH-
 test "ZA607: post-loop fill does not mask a brace-less one-line loop read (EPH-I0789)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace-less one-line loop completes at its line end, but the
@@ -65831,7 +65923,7 @@ test "ZA607: post-loop fill does not mask a brace-less one-line loop read (EPH-I
 test "ZA607: post-loop fill does not mask a trailing-statement one-line loop read (EPH-I0789)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The balanced body closes mid-line and a trailing statement follows.
@@ -65859,7 +65951,7 @@ test "ZA607: post-loop fill does not mask a trailing-statement one-line loop rea
 test "ZA607: brace-less multi-line loop keeps the historical tracker behavior (EPH-I0789)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The scope boundary of the fix: a brace-less body that continues
@@ -65887,7 +65979,7 @@ test "ZA607: brace-less multi-line loop keeps the historical tracker behavior (E
 test "ZA607: brace-less one-line loop fill still covers a post-loop read (EPH-I0789)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // checkIndexedAssign records the same-line fill before the line-end
@@ -65911,7 +66003,7 @@ test "ZA607: brace-less one-line loop fill still covers a post-loop read (EPH-I0
 test "ZA607: spaced-dot field read does not read the local (EPH-I0790)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `foo . buf[0]` reads foo's field through a spaced dot. The pre-fix
@@ -65936,7 +66028,7 @@ test "ZA607: spaced-dot field read does not read the local (EPH-I0790)" {
 test "ZA607: spaced-dot plain field write does not fill the local (EPH-I0790)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `foo . buf = 1` writes foo's field through a spaced dot. The
@@ -65965,7 +66057,7 @@ test "ZA607: spaced-dot plain field write does not fill the local (EPH-I0790)" {
 test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (flags[x] == 1)` reads the element inside the condition parens.
@@ -65995,7 +66087,7 @@ test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)"
 test "ZA607: by-value call-arg element read of undefined buffer is detected (EPH-I0773)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `use(buf[x])` copies the element into the call: a genuine read of
@@ -66025,7 +66117,7 @@ test "ZA607: by-value call-arg element read of undefined buffer is detected (EPH
 test "ZA607: slice pass in call arg stays silent (EPH-I0773)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `send(buf[0..])` hands the callee a mutable slice it can fill
@@ -66054,7 +66146,7 @@ test "ZA607: slice pass in call arg stays silent (EPH-I0773)" {
 test "ZA607: element address pass in call arg stays silent (EPH-I0773)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `fill(&buf[x])` hands the callee the element address. The callee
@@ -66086,7 +66178,7 @@ test "ZA607: element address pass in call arg stays silent (EPH-I0773)" {
 test "ZA607: slice-parameter fill still suppresses the read (EPH-I0773)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Control: `fillSlice(buf[0..])` is a genuine definite assignment
@@ -66113,7 +66205,7 @@ test "ZA607: slice-parameter fill still suppresses the read (EPH-I0773)" {
 test "ZA607: field assignment on other var does not mask read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Neighbor audit: `foo.x = 1` assigns foo's field, not local x —
@@ -66137,7 +66229,7 @@ test "ZA607: field assignment on other var does not mask read" {
 test "ZA607: mutating method call on other var does not mask read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Neighbor audit: hasModifyingMethodCall matched "x" inside "box".
@@ -66160,7 +66252,7 @@ test "ZA607: mutating method call on other var does not mask read" {
 test "ZA607: builtin dest with longer prefix name does not mask read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Neighbor audit: @memcpy(xyz, ...) must not count as filling x —
@@ -66184,7 +66276,7 @@ test "ZA607: builtin dest with longer prefix name does not mask read" {
 test "ZA607: fill call on longer prefix name does not mask read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Neighbor audit: f.read(&xyz) must not count as filling x —
@@ -66208,7 +66300,7 @@ test "ZA607: fill call on longer prefix name does not mask read" {
 test "ZA607: init call on other var does not mask read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Neighbor audit: box.init() must not fill x — the .init( heuristic
@@ -66532,7 +66624,7 @@ test "nextFillCallOccurrence bridges the amp-paren bare name (EPH-I0822)" {
 test "ZA607: parenthesized bare-name amp fill stays silent (EPH-I0822)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // End-to-end parity: `use(&(x))` and `use(&((x)))` silence the read
@@ -66612,7 +66704,7 @@ test "isStructFieldPattern accepts whitespace-spaced dot fields (EPH-I0796)" {
 test "ZA607: or-guard read not suppressed by other-var assignment in body" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0082 repro: blockContainsAssignment matched "x" inside "box" and
@@ -66638,7 +66730,7 @@ test "ZA607: or-guard read not suppressed by other-var assignment in body" {
 test "ZA607: or-guard read fires outside a loop and without a null guard" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0330 (band-B01b F-04): the loop narrative needs a loop and a
@@ -66666,7 +66758,7 @@ test "ZA607: or-guard read fires outside a loop and without a null guard" {
 test "ZA607: correlated-guard read not suppressed by other-var assignment" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0082: same name-blindness via the isCorrelatedGuardRead call
@@ -66695,7 +66787,7 @@ test "ZA607: correlated-guard read not suppressed by other-var assignment" {
 test "ZA607: correlated guard with genuine assignment stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Genuine correlated assignment must keep suppressing (x is read only
@@ -67213,7 +67305,7 @@ test "guardDominatesRead reaches a divergent opener beyond the window (EPH-I0847
 test "ZA607: far divergent guard-if fires past the 40-line window (EPH-I0847)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The guard-if is nested in if (c), the read is not, and 42 padding
@@ -67351,7 +67443,7 @@ test "blockContainsAssignment counts only the guard block's top level (EPH-I0329
 test "ZA607: null-guard correlation not suppressed by other-var field assignment" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0098: `foo.x = 1` assigns a field of foo, not local x — the
@@ -67382,7 +67474,7 @@ test "ZA607: null-guard correlation not suppressed by other-var field assignment
 test "ZA607: null-guard correlation keeps same-line second-occurrence assignment" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0098: the correlation's assignment search must scan every
@@ -67421,7 +67513,7 @@ test "ZA607: null-guard correlation keeps same-line second-occurrence assignment
 test "ZA607: one-line else arm guard does not suppress the correlated read (EPH-I0842)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-05 bad shape: the guard's non-null assignments sit in
@@ -67461,7 +67553,7 @@ test "ZA607: one-line else arm guard does not suppress the correlated read (EPH-
 test "ZA607: indented same-block correlation stays silent (EPH-I0842)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The guard and var assignments share one brace-delimited block in
@@ -67494,7 +67586,7 @@ test "ZA607: indented same-block correlation stays silent (EPH-I0842)" {
 test "ZA607: or-guard fires with a same-line pre-assigned guard (EPH-I0843)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-04 bad shape: the guard is set non-null on the same
@@ -67526,7 +67618,7 @@ test "ZA607: or-guard fires with a same-line pre-assigned guard (EPH-I0843)" {
 test "ZA607: same-condition sibling ifs report the correlated read (EPH-I0848)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Chosen direction (band-B01b F-05): the same-block correlation does
@@ -67563,7 +67655,7 @@ test "ZA607: same-condition sibling ifs report the correlated read (EPH-I0848)" 
 test "ZA607: comparison operators in or-condition are reads on every path" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `!=`, `<=`, `>=` in the condition all read x; a body assigning only
@@ -67600,7 +67692,7 @@ test "ZA607: comparison operators in or-condition are reads on every path" {
 test "ZA607: nested guard-if does not suppress the correlated read (EPH-I0329)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-03 bad shape: the assignment-if `if (c)` sits inside
@@ -67633,7 +67725,7 @@ test "ZA607: nested guard-if does not suppress the correlated read (EPH-I0329)" 
 test "ZA607: nested assignment inside the guard block does not suppress (EPH-I0329)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-03 bad shape: the assignment sits at depth 2 inside the
@@ -67665,7 +67757,7 @@ test "ZA607: nested assignment inside the guard block does not suppress (EPH-I03
 test "ZA607: else-if guard does not suppress the correlated read (EPH-I0329)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-03 bad shape: the assignment-if is an else-if arm. When
@@ -67696,7 +67788,7 @@ test "ZA607: else-if guard does not suppress the correlated read (EPH-I0329)" {
 test "ZA607: loop-enclosed guard-if does not suppress the read (EPH-I0329)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The assignment-if inside the for loop may never run (empty
@@ -67728,7 +67820,7 @@ test "ZA607: loop-enclosed guard-if does not suppress the read (EPH-I0329)" {
 test "ZA607: correlated guard keeps the documented stability approximation (EPH-I0329)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The condition-variable mutation between the guard and the read is
@@ -67762,7 +67854,7 @@ test "ZA607: correlated guard keeps the documented stability approximation (EPH-
 test "ZA607: or-guard fires on the first iteration with a non-null guard (EPH-I0330)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-04: the guard is a parameter — it may be non-null when
@@ -67790,7 +67882,7 @@ test "ZA607: or-guard fires on the first iteration with a non-null guard (EPH-I0
 test "ZA607: or-guard fires when the guard is set non-null before the loop (EPH-I0330)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The guard is null-initialized, then assigned non-null before the
@@ -67819,7 +67911,7 @@ test "ZA607: or-guard fires when the guard is set non-null before the loop (EPH-
 test "ZA607: or-guard stays silent in the loop with a null guard (EPH-I0330)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The loop-carried control: the guard is null at the loop entry, so
@@ -67849,7 +67941,7 @@ test "ZA607: or-guard stays silent in the loop with a null guard (EPH-I0330)" {
 test "ZA607: or-guard fires when the guard declaration line carries another var's null (EPH-I0852)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `g` is declared non-null on the first line; the line-level `= null`
@@ -67879,7 +67971,7 @@ test "ZA607: or-guard fires when the guard declaration line carries another var'
 test "ZA607: or-guard stays silent when the guard's own declaration initializer is null (EPH-I0852)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The mirror: `g`'s own initializer is null, so the first iteration
@@ -67908,7 +68000,7 @@ test "ZA607: or-guard stays silent when the guard's own declaration initializer 
 test "ZA607: or-guard ignores a string-position or token (EPH-I0298)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The string "x == null or y" fakes a first " or " at a raw-substring
@@ -67941,7 +68033,7 @@ test "ZA607: or-guard ignores a string-position or token (EPH-I0298)" {
 test "ZA607: or-guard ignores a trailing-comment or token (EPH-I0298)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The comment "z == null or y" holds the only " or " on the line; the
@@ -67995,7 +68087,7 @@ test "realTokenPos skips string and comment positions, keeps word bounds (EPH-I0
 test "ZA607: null-guard correlation fires for sibling-branch assignments (EPH-I0331)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-05 bad shape: the guard and the var are assigned in
@@ -68030,7 +68122,7 @@ test "ZA607: null-guard correlation fires for sibling-branch assignments (EPH-I0
 test "ZA607: null-guard correlation fires for a nested var assignment (EPH-I0331)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The var assignment nested inside the guard block runs only when c2
@@ -68063,7 +68155,7 @@ test "ZA607: null-guard correlation fires for a nested var assignment (EPH-I0331
 test "ZA607: method call on a field of another var does not init the local (EPH-I0332)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B01b F-06: `other.x.init()` initializes a field of other, not
@@ -68089,7 +68181,7 @@ test "ZA607: method call on a field of another var does not init the local (EPH-
 test "ZA607: method call on the bare local keeps the fill verdict (EPH-I0332)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The control: `x.init()` on the bare local still counts as indirect
@@ -68115,7 +68207,7 @@ test "ZA607: method call on the bare local keeps the fill verdict (EPH-I0332)" {
 test "ZA607: loop-carried guard under a shared loop stays silent (EPH-I0329)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The sig cmd.zig shape: the guard-if and the read share the while
@@ -68150,7 +68242,7 @@ test "ZA607: loop-carried guard under a shared loop stays silent (EPH-I0329)" {
 test "ZA607: nested-in-conditional assignment inside the loop still fires (EPH-I0329)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The control: the assignment nested in a conditional inside the loop
@@ -68186,7 +68278,7 @@ test "ZA607: nested-in-conditional assignment inside the loop still fires (EPH-I
 test "ZA607: switch prong arrow does not count as assignment" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0082: isAssignmentOp accepted `=>`, so `x => ...` both gen'd x
@@ -68213,7 +68305,7 @@ test "ZA607: switch prong arrow does not count as assignment" {
 test "ZA607: switch prong read of assigned var stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // With x genuinely assigned before the switch, the prong read is safe;
@@ -68241,7 +68333,7 @@ test "ZA607: switch prong read of assigned var stays silent" {
 test "ZA607: switch expr struct prongs inside if keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: the `)` before the switch brace misread the brace as a
@@ -68276,7 +68368,7 @@ test "ZA607: switch expr struct prongs inside if keeps fill conditional" {
 test "ZA607: switch expr scalar prongs inside if keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: same paren-container brace bug as the struct-prong case.
@@ -68311,7 +68403,7 @@ test "ZA607: switch expr scalar prongs inside if keeps fill conditional" {
 test "ZA607: union(enum) decl inside if keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: `union(enum) {` has the same `)`-preceded brace as a
@@ -68346,7 +68438,7 @@ test "ZA607: union(enum) decl inside if keeps fill conditional" {
 test "ZA607: enum(u8) decl inside if keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: `enum(u8) {` shares the `)`-preceded brace shape with
@@ -68380,7 +68472,7 @@ test "ZA607: enum(u8) decl inside if keeps fill conditional" {
 test "ZA607: switch expr else prong inside if keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: the old code fired here only by accident — the `else =>`
@@ -68415,7 +68507,7 @@ test "ZA607: switch expr else prong inside if keeps fill conditional" {
 test "ZA607: top-level switch else prong does not leak conditional depth" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: with the switch brace counted as an expression brace, an
@@ -68449,7 +68541,7 @@ test "ZA607: top-level switch else prong does not leak conditional depth" {
 test "ZA607: multi-line switch header inside if keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: the header spans lines, so the same-line paren scan
@@ -68487,7 +68579,7 @@ test "ZA607: multi-line switch header inside if keeps fill conditional" {
 test "ZA607: multi-line switch header with call args keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: a call inside a multi-line header adds nested parens.
@@ -68526,7 +68618,7 @@ test "ZA607: multi-line switch header with call args keeps fill conditional" {
 test "ZA607: multi-line switch header without else prong keeps fill conditional" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0106: the no-else multi-line shape was a false negative even
@@ -68563,7 +68655,7 @@ test "ZA607: multi-line switch header without else prong keeps fill conditional"
 test "ZA607: int prong fill does not cover the discard arm (EPH-I0679)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0679: integer and `_` prongs opened no arm block, so the fill
@@ -68594,7 +68686,7 @@ test "ZA607: int prong fill does not cover the discard arm (EPH-I0679)" {
 test "ZA607: fills in int and discard arms stay silent (EPH-I0679)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0679 control: every arm fills x, so the read is safe before and
@@ -68624,7 +68716,7 @@ test "ZA607: fills in int and discard arms stay silent (EPH-I0679)" {
 test "ZA607: range prong and else fills stay silent (EPH-I0679)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0679 control: the range prong and the else arm both fill x.
@@ -68653,7 +68745,7 @@ test "ZA607: range prong and else fills stay silent (EPH-I0679)" {
 test "ZA607: range prong fill with empty else flags the read (EPH-I0679)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0679: the range prong was invisible, so its fill attributed to
@@ -68683,7 +68775,7 @@ test "ZA607: range prong fill with empty else flags the read (EPH-I0679)" {
 test "ZA607: string prong body does not fill the header (EPH-I0679)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0679: a string prong opened no arm block, so its fill passed as
@@ -68713,7 +68805,7 @@ test "ZA607: string prong body does not fill the header (EPH-I0679)" {
 test "ZA607: arrow text inside an arm string stays silent (EPH-I0679)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0679 quote-mask guard: the `=>` inside the string literal is
@@ -68744,7 +68836,7 @@ test "ZA607: arrow text inside an arm string stays silent (EPH-I0679)" {
 test "ZA607: nested int prongs wire to the inner switch header (EPH-I0318)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // handleSwitchArm scans the block stack innermost-first, so the inner
@@ -68784,7 +68876,7 @@ test "ZA607: nested int prongs wire to the inner switch header (EPH-I0318)" {
 test "ZA607: self-assignment RHS read of undefined var is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0080: gen was block-granular, so the assignment on `x = x + 1;`
@@ -68809,7 +68901,7 @@ test "ZA607: self-assignment RHS read of undefined var is detected" {
 test "ZA607: same-block assignment before read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Line-order-aware gen must keep covering reads that come AFTER an
@@ -68837,7 +68929,7 @@ test "ZA607: same-block assignment before read is silent" {
 test "ZA607: same-block read before assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `y = x;` read precedes the `x = 1;` assignment in the same block;
@@ -68865,7 +68957,7 @@ test "ZA607: same-block read before assignment is detected" {
 test "ZA607: initialized var self-assignment is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `var x: u32 = 0;` is definitely assigned at declaration, so the
@@ -68889,7 +68981,7 @@ test "ZA607: initialized var self-assignment is silent" {
 test "ZA607: same-line assignment before read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The assignment takes effect at its `;`, so the later same-line read
@@ -68916,7 +69008,7 @@ test "ZA607: same-line assignment before read is silent" {
 test "ZA607: same-line read before assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `use(x)` reads x before the same-line `x = 1;` takes effect — the
@@ -68943,7 +69035,7 @@ test "ZA607: same-line read before assignment is detected" {
 test "ZA607: var-decl RHS read of undefined var is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0101: isRealUseOfVar bailed on var/const lines, so the RHS read
@@ -68970,7 +69062,7 @@ test "ZA607: var-decl RHS read of undefined var is detected" {
 test "ZA607: undefined decl without reads is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The LHS name on a decl line is the declaration, not a read — a bare
@@ -68993,7 +69085,7 @@ test "ZA607: undefined decl without reads is silent" {
 test "ZA607: initialized var read on decl RHS is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // x is definitely assigned at declaration, so the decl-RHS read in
@@ -69018,7 +69110,7 @@ test "ZA607: initialized var read on decl RHS is silent" {
 test "ZA607: field read on decl RHS does not count as local read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `foo.x` reads foo's field, not the local x — the decl-RHS use check
@@ -69044,7 +69136,7 @@ test "ZA607: field read on decl RHS does not count as local read" {
 test "ZA607: multi-line assignment continuation self-read is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0103: the first line of a multi-line fill won immediately, so x
@@ -69073,7 +69165,7 @@ test "ZA607: multi-line assignment continuation self-read is detected" {
 test "ZA607: conditional multi-line self-read is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0103 lock: the conditional variant fires on the path that skips
@@ -69104,7 +69196,7 @@ test "ZA607: conditional multi-line self-read is detected" {
 test "ZA607: first-line self-read of multi-line assignment is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0103 lock: the first-line self-read fires via the EPH-I0080
@@ -69133,7 +69225,7 @@ test "ZA607: first-line self-read of multi-line assignment is detected" {
 test "ZA607: multi-line fill without self-read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The continuation reads only the DEFINED y — the fill of x completes
@@ -69163,7 +69255,7 @@ test "ZA607: multi-line fill without self-read is silent" {
 test "ZA607: read after multi-line fill completes is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The read in `use(x)` follows the statement-terminating `;`, so it
@@ -69192,7 +69284,7 @@ test "ZA607: read after multi-line fill completes is silent" {
 test "ZA607: same-line read before fill-call is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0102: `use(x)` reads x before the same-line `fill(&x)` takes
@@ -69218,7 +69310,7 @@ test "ZA607: same-line read before fill-call is detected" {
 test "ZA607: same-line fill-call before read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The fill completes at its `;`, so the later same-line read observes
@@ -69243,7 +69335,7 @@ test "ZA607: same-line fill-call before read is silent" {
 test "ZA607: same-line read before @memset dest is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0102: the `@memset(&x, 0)` dest is a fill-call effect, not a
@@ -69266,7 +69358,7 @@ test "ZA607: same-line read before @memset dest is detected" {
 test "ZA607: same-line @memset dest before read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `@memset` effect point is its `;`, which precedes the read.
@@ -69288,7 +69380,7 @@ test "ZA607: same-line @memset dest before read is silent" {
 test "ZA607: same-line read before bare @memset slice dest is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0102: a bare slice dest (`@memset(s, 0)`, no `&`) is the same
@@ -69312,7 +69404,7 @@ test "ZA607: same-line read before bare @memset slice dest is detected" {
 test "ZA607: init-call vars keep their dropped verdict" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pinned, not fixed (EPH-I0102 scope decision): removeIndirectlyInitVars
@@ -69348,7 +69440,7 @@ test "ZA607: init-call vars keep their dropped verdict" {
 test "ZA607: same-line slice read keeps Pattern-2 whole-line cover" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pinned (EPH-I0102): hasDirectFill Pattern-2 counts any `buf[`
@@ -69381,7 +69473,7 @@ test "ZA607: same-line slice read keeps Pattern-2 whole-line cover" {
 test "ZA607: read after multi-line fill-call completes is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Verdict pinned, mechanism moved (EPH-I0102): the drop used to come
@@ -69407,7 +69499,7 @@ test "ZA607: read after multi-line fill-call completes is silent" {
 test "ZA607: same-line read before multi-line fill-call is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0102: the `use(x)` on the first line precedes the fill-call, and
@@ -69431,7 +69523,7 @@ test "ZA607: same-line read before multi-line fill-call is detected" {
 test "ZA607: fill-call continuation self-read is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0102 + EPH-I0103: the continuation-line `x` argument reads x
@@ -69456,7 +69548,7 @@ test "ZA607: fill-call continuation self-read is detected" {
 test "ZA607: fill-call then read on later lines is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Mainline no-regression: a completed fill-call covers reads on later
@@ -69480,7 +69572,7 @@ test "ZA607: fill-call then read on later lines is silent" {
 test "ZA607: address-escape var stays dropped" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pinned (EPH-I0102): `const p = &x;` lets the pointer escape — writes
@@ -69508,7 +69600,7 @@ test "ZA607: address-escape var stays dropped" {
 test "ZA607: fill-call in else-if condition covers the arm body" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Flow project_manager shape (EPH-I0102 A/B): the condition's extract
@@ -69542,7 +69634,7 @@ test "ZA607: fill-call in else-if condition covers the arm body" {
 test "ZA607: slice read fed by same-line fill-call is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Flow win32/gui shape (EPH-I0102 A/B): `buf[0 .. fillRet(&buf)]`
@@ -69571,7 +69663,7 @@ test "ZA607: slice read fed by same-line fill-call is silent" {
 test "ZA607: sibling-scope decl names of filled vars stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Ghostty os/hostname shape (EPH-I0102 A/B): two if-arms each declare
@@ -69606,7 +69698,7 @@ test "ZA607: sibling-scope decl names of filled vars stay silent" {
 test "ZA607: fill-call before same-line self-assignment is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The line holds both a fill-call and an assignment: the earliest
@@ -69631,7 +69723,7 @@ test "ZA607: fill-call before same-line self-assignment is silent" {
 test "ZA607: self-assignment before same-line fill-call is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The min effect is the assignment's own `;` here — the RHS read
@@ -69733,7 +69825,7 @@ test "findFillCallOccurrence grouping-paren non-call matches (EPH-I0123 doc)" {
 test "ZA607: payload capture of a filled same-name var is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Flow tui.zig shape (EPH-I0102 A/B): the loop-body `var arg` is
@@ -69774,7 +69866,7 @@ test "ZA607: payload capture of a filled same-name var is silent" {
 test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pinned FN (EPH-I0102, reviewer-accepted): `use(x)` precedes the
@@ -69805,7 +69897,7 @@ test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
 test "ZA607: if/else-if chain condition fills cover the post-chain read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Flow editor.save_file shape (EPH-I0102 A/B): every condition in the
@@ -69846,7 +69938,7 @@ test "ZA607: if/else-if chain condition fills cover the post-chain read" {
 test "ZA607: bool guard without any fill is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Sensitivity control: `then` is set in an arm that never fills cmd,
@@ -69874,7 +69966,7 @@ test "ZA607: bool guard without any fill is detected" {
 test "ZA607: multi-line struct literal in if body keeps conditional fill detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The literal's closing `};` is an expression brace: it must not pop
@@ -69909,7 +70001,7 @@ test "ZA607: multi-line struct literal in if body keeps conditional fill detecte
 test "ZA607: single-line struct literal in if body keeps conditional fill detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same FN on one line: the literal's `}` must not pop the if nesting
@@ -69940,7 +70032,7 @@ test "ZA607: single-line struct literal in if body keeps conditional fill detect
 test "ZA607: nested struct literal in if body keeps conditional fill detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every nested literal brace is an expression brace, at any depth
@@ -69973,7 +70065,7 @@ test "ZA607: nested struct literal in if body keeps conditional fill detected" {
 test "ZA607: struct literal in call args in if body keeps conditional fill detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A literal inside unclosed call parens is expression depth: its `}`
@@ -70008,7 +70100,7 @@ test "ZA607: struct literal in call args in if body keeps conditional fill detec
 test "ZA607: brace in string literal does not close conditional block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A `}` inside a string literal is content, not a block close
@@ -70039,7 +70131,7 @@ test "ZA607: brace in string literal does not close conditional block" {
 test "ZA607: brace in comment does not close conditional block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A `}` inside a comment is not a block close (EPH-I0085).
@@ -70068,7 +70160,7 @@ test "ZA607: brace in comment does not close conditional block" {
 test "ZA607: struct literal before if block keeps conditional fill detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard: the literal sits OUTSIDE the if, so it never touched the
@@ -70099,7 +70191,7 @@ test "ZA607: struct literal before if block keeps conditional fill detected" {
 test "ZA607: scalar const in if body keeps conditional fill detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard: no braces in the if body at all — fired before the fix and
@@ -70130,7 +70222,7 @@ test "ZA607: scalar const in if body keeps conditional fill detected" {
 test "ZA607: struct literal in if branch with else fill stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard: both branches assign, so the read is definite-assigned — the
@@ -70164,7 +70256,7 @@ test "ZA607: struct literal in if branch with else fill stays silent" {
 test "ZA607: nested while-else fill reaches the post-loop read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0086: a multi-line while-else inside an outer loop stole the
@@ -70204,7 +70296,7 @@ test "ZA607: nested while-else fill reaches the post-loop read" {
 test "ZA607: while-else without else fill still flags the unfilled path" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (EPH-I0086): the else runs but assigns nothing, so the 0-trip
@@ -70239,7 +70331,7 @@ test "ZA607: while-else without else fill still flags the unfilled path" {
 test "ZA607: top-level while-else fill stays silent at the read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (EPH-I0086): the top-level shape was already silent; the fixed
@@ -70278,7 +70370,7 @@ test "ZA607: top-level while-else fill stays silent at the read" {
 test "ZA607: string-literal assignment text is not a fill" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0104: hasDirectFill matched `y =` inside the string literal, and
@@ -70305,7 +70397,7 @@ test "ZA607: string-literal assignment text is not a fill" {
 test "ZA607: multiline-string assignment text is not a fill" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0104: hasDirectFill matched `x =` on the `\\` multiline-string
@@ -70335,7 +70427,7 @@ test "ZA607: multiline-string assignment text is not a fill" {
 test "ZA607: fill assigning a string literal still counts" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (EPH-I0104): the fill target sits outside the string. The string
@@ -70361,7 +70453,7 @@ test "ZA607: fill assigning a string literal still counts" {
 test "ZA607: escaped quotes around assignment text stay non-fill" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0104: the escaped `\"` must not end the string scan. The `name =`
@@ -70388,7 +70480,7 @@ test "ZA607: escaped quotes around assignment text stay non-fill" {
 test "ZA607: char literal quote does not suppress a real fill" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0104 review (Finding A): the `"` inside the `'"'` char literal
@@ -70416,7 +70508,7 @@ test "ZA607: char literal quote does not suppress a real fill" {
 test "ZA607: trailing-comment assignment text is not a fill" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0104 review (Finding C): the mid-line `//` guard mirrors
@@ -70443,7 +70535,7 @@ test "ZA607: trailing-comment assignment text is not a fill" {
 test "ZA607: fill assigning a multiline string still counts" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (EPH-I0104): the fill statement is real code. Its `\\`
@@ -70473,7 +70565,7 @@ test "ZA607: fill assigning a multiline string still counts" {
 test "ZA607: brace-less comptime var statement does not wedge the tracker (EPH-I0328)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The comptime statement scopes only its own line: the later
@@ -70501,7 +70593,7 @@ test "ZA607: brace-less comptime var statement does not wedge the tracker (EPH-I
 test "ZA607: brace-less comptime expression statement does not wedge the tracker (EPH-I0328)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -70526,7 +70618,7 @@ test "ZA607: brace-less comptime expression statement does not wedge the tracker
 test "ZA607: string containing comptime does not wedge the tracker (EPH-I0328)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -70552,7 +70644,7 @@ test "ZA607: string containing comptime does not wedge the tracker (EPH-I0328)" 
 test "ZA607: comment containing comptime does not wedge the tracker (EPH-I0328)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -70577,7 +70669,7 @@ test "ZA607: comment containing comptime does not wedge the tracker (EPH-I0328)"
 test "ZA607: comptime block skips its body and closes at its own brace (EPH-I0328)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The decl inside the block is comptime code (skipped); the decl
@@ -70607,7 +70699,7 @@ test "ZA607: comptime block skips its body and closes at its own brace (EPH-I032
 test "ZA607: @field read in rvalue position does not clear the var (EPH-I0333)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `total += @field(x, f.name)` reads x; the read of x on the return
@@ -70636,7 +70728,7 @@ test "ZA607: @field read in rvalue position does not clear the var (EPH-I0333)" 
 test "ZA607: @field comparison read does not clear the var (EPH-I0333)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `==` after the close paren compares the field value: a read.
@@ -70658,7 +70750,7 @@ test "ZA607: @field comparison read does not clear the var (EPH-I0333)" {
 test "ZA607: genuine @field assignment clears the var (EPH-I0333)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -70681,7 +70773,7 @@ test "ZA607: genuine @field assignment clears the var (EPH-I0333)" {
 test "ZA607: multi-line @field assignment with switch argument clears (EPH-I0333)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second argument spans lines; the close paren and `=` sit on a
@@ -70709,7 +70801,7 @@ test "ZA607: multi-line @field assignment with switch argument clears (EPH-I0333
 test "ZA607: fill inside a switch arm stays conditional (EPH-I0334)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `else` arm never assigns x, so the read after the switch is a
@@ -70741,7 +70833,7 @@ test "ZA607: fill inside a switch arm stays conditional (EPH-I0334)" {
 test "ZA607: all-arms switch assignment stays silent (EPH-I0334)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Every arm assigns x: the CFG merge is definitely assigned, so the
@@ -70772,7 +70864,7 @@ test "ZA607: all-arms switch assignment stays silent (EPH-I0334)" {
 test "ZA607: one-line arm-list fill is a documented FN (EPH-I0334)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented FN (accepted, fail-unsafe): a switch whose first arm
@@ -70803,7 +70895,7 @@ test "ZA607: one-line arm-list fill is a documented FN (EPH-I0334)" {
 test "integration: no false positive for valid catch-free-return" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -70879,7 +70971,7 @@ test "parseSemver rejects invalid versions" {
 
 test "parseVersionFromZon extracts version" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const zon_content =
@@ -70897,7 +70989,7 @@ test "parseVersionFromZon extracts version" {
 
 test "parseVersionFromZon returns null for missing version" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const bad_content = ".{ .name = .ephor }";
@@ -72349,7 +72441,7 @@ test "fnReturnsType ignores parens inside a comment (EPH-I0465)" {
 
 test "checkVarNaming: fn-valued vars are still snake_case (declaration kind rules)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -72376,7 +72468,7 @@ test "checkVarNaming: fn-valued vars are still snake_case (declaration kind rule
 
 test "checkVarNaming: non-snake_case var is flagged" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -72507,7 +72599,7 @@ test "findDeclEnd: unterminated declaration ends at end of line (EPH-I0896)" {
 test "analyzeNaming: bindgen const type modifiers stay silent (EPH-I0886)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72545,7 +72637,7 @@ test "analyzeNaming: bindgen const type modifiers stay silent (EPH-I0886)" {
 test "analyzeNaming: second same-line const decl is checked (EPH-I0888)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72574,7 +72666,7 @@ test "analyzeNaming: second same-line const decl is checked (EPH-I0888)" {
 test "analyzeNaming: @import exemption does not bleed to a same-line decl (EPH-I0897)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72603,7 +72695,7 @@ test "analyzeNaming: @import exemption does not bleed to a same-line decl (EPH-I
 test "analyzeNaming: @import decls stay exempt in their own segment (EPH-I0897)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72631,7 +72723,7 @@ test "analyzeNaming: @import decls stay exempt in their own segment (EPH-I0897)"
 test "analyzeNaming: extern fn line still checks a trailing const decl (EPH-I0901)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72660,7 +72752,7 @@ test "analyzeNaming: extern fn line still checks a trailing const decl (EPH-I090
 test "analyzeNaming: extern const line still checks a trailing const decl (EPH-I0901)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72689,7 +72781,7 @@ test "analyzeNaming: extern const line still checks a trailing const decl (EPH-I
 test "analyzeNaming: function-alias exemption does not bleed to a same-line decl (EPH-I0898)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72719,7 +72811,7 @@ test "analyzeNaming: function-alias exemption does not bleed to a same-line decl
 test "analyzeNaming: real function alias stays silent (EPH-I0898)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72750,7 +72842,7 @@ test "analyzeNaming: real function alias stays silent (EPH-I0898)" {
 test "analyzeNaming: second same-line var decl is checked (EPH-I0888)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72777,7 +72869,7 @@ test "analyzeNaming: second same-line var decl is checked (EPH-I0888)" {
 test "analyzeNaming: const decl after a type-modifier const is checked (EPH-I0890)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72806,7 +72898,7 @@ test "analyzeNaming: const decl after a type-modifier const is checked (EPH-I089
 test "analyzeNaming: qualifier-before-const bindgen types stay silent (EPH-I0889)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72839,7 +72931,7 @@ test "analyzeNaming: qualifier-before-const bindgen types stay silent (EPH-I0889
 test "analyzeNaming: const-to-const bindgen adjacency stays silent (EPH-I0889)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72864,7 +72956,7 @@ test "analyzeNaming: const-to-const bindgen adjacency stays silent (EPH-I0889)" 
 test "analyzeNaming: conforming same-line decls stay silent (EPH-I0888)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72888,7 +72980,7 @@ test "analyzeNaming: conforming same-line decls stay silent (EPH-I0888)" {
 test "analyzeNaming: type-def const before a snake const stays silent (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72925,7 +73017,7 @@ test "analyzeNaming: type-def const before a snake const stays silent (EPH-I0896
 test "analyzeNaming: conforming type-def const before a snake const is silent (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72950,7 +73042,7 @@ test "analyzeNaming: conforming type-def const before a snake const is silent (E
 test "analyzeNaming: closure alias before a snake const stays silent (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -72975,7 +73067,7 @@ test "analyzeNaming: closure alias before a snake const stays silent (EPH-I0896)
 test "analyzeNaming: plain const before a type-def const stays silent (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73000,7 +73092,7 @@ test "analyzeNaming: plain const before a type-def const stays silent (EPH-I0896
 test "analyzeNaming: lone lowercase type-def const still fires (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73028,7 +73120,7 @@ test "analyzeNaming: lone lowercase type-def const still fires (EPH-I0896)" {
 test "analyzeNaming: second decl after a type-def const is still checked (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73062,7 +73154,7 @@ test "analyzeNaming: second decl after a type-def const is still checked (EPH-I0
 test "analyzeNaming: multi-line closure alias stays silent (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73090,7 +73182,7 @@ test "analyzeNaming: multi-line closure alias stays silent (EPH-I0896)" {
 test "analyzeNaming: multi-line closure alias fires the function kind (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73121,7 +73213,7 @@ test "analyzeNaming: multi-line closure alias fires the function kind (EPH-I0896
 test "analyzeNaming: multi-line lowercase type-def const still fires (EPH-I0896)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73152,7 +73244,7 @@ test "analyzeNaming: multi-line lowercase type-def const still fires (EPH-I0896)
 test "analyzeNaming: threadlocal var forms are checked (EPH-I0466)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73181,7 +73273,7 @@ test "analyzeNaming: threadlocal var forms are checked (EPH-I0466)" {
 test "analyzeNaming: one-line-block decls are checked (EPH-I0468)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73214,7 +73306,7 @@ test "analyzeNaming: one-line-block decls are checked (EPH-I0468)" {
 test "analyzeNaming: non-canonical pub spacing is checked (EPH-I0469)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73247,7 +73339,7 @@ test "analyzeNaming: non-canonical pub spacing is checked (EPH-I0469)" {
 test "analyzeNaming: quoted identifiers are checked as their inner name (EPH-I0467)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -73587,7 +73679,7 @@ test "registerFnSignature falls through on fn-pointer-typed decls (EPH-I0395)" {
 
 test "parseFileTypeContext registers fn-pointer-typed vars (EPH-I0395)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -73608,7 +73700,7 @@ test "parseFileTypeContext registers fn-pointer-typed vars (EPH-I0395)" {
 
 test "parseFileTypeContext: fn-pointer shadow does not erase a real var type (EPH-I1043)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     // A later fn-pointer-typed shadow (`const w: fn (u8) void = ...`)
@@ -73638,7 +73730,7 @@ test "parseFileTypeContext: fn-pointer shadow does not erase a real var type (EP
 
 test "parseFileTypeContext registers pub-prefixed fn-pointer vars (EPH-I1044)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     // `pub const f: fn (u8) void = g;` did not match the var/const-only
@@ -73659,7 +73751,7 @@ test "parseFileTypeContext registers pub-prefixed fn-pointer vars (EPH-I1044)" {
 
 test "parseFileTypeContext skips signatures embedded in string literals (EPH-I0396)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     // band-B04 F11: a string literal carrying a full `fn name(...) T`
@@ -73688,7 +73780,7 @@ test "parseFileTypeContext skips signatures embedded in string literals (EPH-I03
 
 test "parseFileTypeContext registers wrapped method signatures (EPH-I0388)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -73749,7 +73841,7 @@ test "extractMethodTarget stops at the previous dot (EPH-I0394 pin)" {
 
 test "isMethodOnStdlibVar matches receivers by name identity (EPH-I0394 pin)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var vars = std.StringHashMapUnmanaged(void){};
@@ -73894,7 +73986,7 @@ test "extractMethodCall returns the last call on a multi-call line (EPH-I0398)" 
 
 test "checkErrorNaming: use-site error references never fire (EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -73939,7 +74031,7 @@ test "checkErrorNaming: use-site error references never fire (EPH-I1075)" {
 
 test "checkErrorNaming: declaration fires while use sites stay silent (EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -73972,7 +74064,7 @@ test "checkErrorNaming: declaration fires while use sites stay silent (EPH-I1075
 
 test "checkErrorNaming: error set members must be snake_case" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -73996,7 +74088,7 @@ test "checkErrorNaming: error set members must be snake_case" {
 
 test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473, EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74073,7 +74165,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
 
 test "checkErrorNaming: title_case mode stays silent on std-name members (EPH-I0473)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74094,7 +74186,7 @@ test "checkErrorNaming: title_case mode stays silent on std-name members (EPH-I0
 
 test "checkErrorNaming: non-std TitleCase error set members are still flagged" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74119,7 +74211,7 @@ test "checkErrorNaming: non-std TitleCase error set members are still flagged" {
 
 test "checkErrorNaming: error set composition stops at ||" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74147,7 +74239,7 @@ test "checkErrorNaming: error set composition stops at ||" {
 
 test "checkErrorNaming: TitleCase mode use sites stay silent (EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74189,7 +74281,7 @@ test "checkErrorNaming: TitleCase mode use sites stay silent (EPH-I1075)" {
 
 test "checkErrorNaming: TitleCase mode flags snake_case error set members" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74216,7 +74308,7 @@ test "checkErrorNaming: TitleCase mode flags snake_case error set members" {
 
 test "checkErrorNaming: member scan stops at the set's closing brace" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74254,7 +74346,7 @@ test "checkErrorNaming: member scan stops at the set's closing brace" {
 
 test "checkErrorNaming: member scan stops at the error-union boundary (EPH-I0274)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74341,7 +74433,7 @@ test "analyzeNaming: bare return type after a closed set is not a member (EPH-I0
 
 test "checkErrorNaming: TitleCase mode exempts std-lib and underscore names" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74405,7 +74497,7 @@ test "analyzeNaming: TitleCase default flags snake_case member declarations only
 
 test "checkFnNaming: extern declarations are exempt" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74431,7 +74523,7 @@ test "checkFnNaming: extern declarations are exempt" {
 
 test "checkVarNaming: extern line still checks a trailing var decl (EPH-I0901)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74456,7 +74548,7 @@ test "checkVarNaming: extern line still checks a trailing var decl (EPH-I0901)" 
 
 test "checkFnNaming: extern line still checks a trailing fn decl (EPH-I0901)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74481,7 +74573,7 @@ test "checkFnNaming: extern line still checks a trailing fn decl (EPH-I0901)" {
 
 test "checkFnNaming: non-camelCase fn is still flagged" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74499,7 +74591,7 @@ test "checkFnNaming: non-camelCase fn is still flagged" {
 
 test "checkFnNaming: fn keyword in a trailing comment is ignored (EPH-I0228)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74517,7 +74609,7 @@ test "checkFnNaming: fn keyword in a trailing comment is ignored (EPH-I0228)" {
 
 test "checkFnNaming: bad fn name still fires (EPH-I0228 pin)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74535,7 +74627,7 @@ test "checkFnNaming: bad fn name still fires (EPH-I0228 pin)" {
 
 test "checkFnNaming: declaration before a trailing comment still fires (EPH-I0228)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74553,7 +74645,7 @@ test "checkFnNaming: declaration before a trailing comment still fires (EPH-I022
 
 test "checkFnNaming: fn keyword inside a string literal is ignored (pin)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74571,7 +74663,7 @@ test "checkFnNaming: fn keyword inside a string literal is ignored (pin)" {
 
 test "checkFnNaming: full-comment line is ignored (pin)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74589,7 +74681,7 @@ test "checkFnNaming: full-comment line is ignored (pin)" {
 
 test "checkFnNaming: every same-line fn decl is checked (EPH-I0888)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74618,7 +74710,7 @@ test "checkFnNaming: every same-line fn decl is checked (EPH-I0888)" {
 
 test "checkFnNaming: string-first fn cannot suppress a real decl (EPH-I0888)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74643,7 +74735,7 @@ test "checkFnNaming: string-first fn cannot suppress a real decl (EPH-I0888)" {
 
 test "checkFnNaming: fn-pointer type is not a declaration (EPH-I0888)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74663,7 +74755,7 @@ test "checkFnNaming: fn-pointer type is not a declaration (EPH-I0888)" {
 
 test "checkErrorNaming: underscore-prefixed error names are exempt" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74681,7 +74773,7 @@ test "checkErrorNaming: underscore-prefixed error names are exempt" {
 
 test "checkErrorNaming: member scan is code-position masked (EPH-I0274, B57c)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74725,7 +74817,7 @@ test "checkErrorNaming: member scan is code-position masked (EPH-I0274, B57c)" {
 
 test "checkErrorNaming: comment after a char-literal quote is prose (EPH-I0464)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -74747,7 +74839,7 @@ test "checkErrorNaming: comment after a char-literal quote is prose (EPH-I0464)"
 
 test "resolveReturnKind resolves struct method returns" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var ctx = TypeContext.init();
@@ -74777,7 +74869,7 @@ test "resolveReturnKind resolves struct method returns" {
 
 test "resolveReturnKind resolves standalone functions" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var ctx = TypeContext.init();
@@ -74798,7 +74890,7 @@ test "resolveReturnKind resolves standalone functions" {
 
 test "parseFileTypeContext builds struct methods" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -74827,7 +74919,7 @@ test "parseFileTypeContext registers quoted fn names (EPH-I0922)" {
     // registerFnSignature consumed the line without a table entry. The
     // quoted name now registers under its inner content.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -74843,7 +74935,7 @@ test "parseFileTypeContext registers quoted fn names (EPH-I0922)" {
 
 test "parseFileTypeContext: string brace does not corrupt type scope (EPH-I0894)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     // The struct body line `const label = "}";` holds a string close
@@ -74868,7 +74960,7 @@ test "parseFileTypeContext: string brace does not corrupt type scope (EPH-I0894)
 
 test "parseFileTypeContext builds var types" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -74887,7 +74979,7 @@ test "parseFileTypeContext builds var types" {
 
 test "parseFileTypeContext builds stdlib vars" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -74904,7 +74996,7 @@ test "parseFileTypeContext builds stdlib vars" {
 
 test "parseFileTypeContext builds top-level functions" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -74926,7 +75018,7 @@ test "parseFileTypeContext builds top-level functions" {
 
 test "parseFileTypeContext parses enum methods" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -74953,7 +75045,7 @@ test "parseFileTypeContext parses enum methods" {
 
 test "parseFileTypeContext parses union methods" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -74983,7 +75075,7 @@ test "parseFileTypeContext parses union methods" {
 
 test "parseFileTypeContext parses packed and extern types" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -75014,7 +75106,7 @@ test "parseFileTypeContext parses packed and extern types" {
 
 test "isSafeToDiscard uses TypeContext for user-defined void methods" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var ctx = TypeContext.init();
@@ -75032,7 +75124,7 @@ test "isSafeToDiscard uses TypeContext for user-defined void methods" {
 
 test "isSafeToDiscard rejects user-defined error methods" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     var ctx = TypeContext.init();
@@ -75050,7 +75142,7 @@ test "isSafeToDiscard rejects user-defined error methods" {
 
 test "buildNoFreeParamFunctions detects single-line call" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -75066,7 +75158,7 @@ test "buildNoFreeParamFunctions detects single-line call" {
 
 test "buildNoFreeParamFunctions detects multi-line call" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -75087,7 +75179,7 @@ test "buildNoFreeParamFunctions detects multi-line call" {
 
 test "buildNoFreeParamFunctions skips function definitions" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -75115,7 +75207,7 @@ test "isArenaName is exact-match only (EPH-I0387, ADR-0007)" {
 
 test "buildNoFreeParamFunctions ignores call-shaped comments and strings (EPH-I0391)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
 
     const content =
@@ -75276,7 +75368,7 @@ test "isOrelseReturnAlloc keeps plain orelse value binding" {
 
 test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75321,7 +75413,7 @@ test "analyzeCFGDeferCoverage detects dupe with no defer (ZA101)" {
 
 test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75366,7 +75458,7 @@ test "analyzeCFGDeferCoverage detects allocPrint with no defer (ZA101)" {
 
 test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75409,7 +75501,7 @@ test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
 
 test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75457,7 +75549,7 @@ test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101
 test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75492,7 +75584,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for dupe (ZA103)" {
 test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75525,7 +75617,7 @@ test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103
 test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75563,7 +75655,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)
 
 test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75608,7 +75700,7 @@ test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
 
 test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75657,7 +75749,7 @@ test "analyzeCFGDeferCoverage detects toOwnedSlice with no defer (ZA101)" {
 test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75689,7 +75781,7 @@ test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
 
 test "analyzeCFGDeferCoverage no false positive for ownership transfer via return (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75732,7 +75824,7 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
 test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75770,7 +75862,7 @@ test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)"
 test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice (ZA101)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75813,7 +75905,7 @@ test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice 
 test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75846,7 +75938,7 @@ test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
 test "analyzeCFGDeferCoverage no false positive for create with defer destroy (ZA102)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75876,7 +75968,7 @@ test "analyzeCFGDeferCoverage no false positive for create with defer destroy (Z
 
 test "analyzeCFGDeferCoverage no false positive for create with ownership transfer (ZA102)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const test_content =
@@ -75920,7 +76012,7 @@ test "analyzeCFGDeferCoverage no false positive for create with ownership transf
 test "analyzeCFGDeferCoverage no false positive for create on arena allocator (ZA102)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75957,7 +76049,7 @@ test "analyzeCFGDeferCoverage no false positive for create on arena allocator (Z
 test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -75992,7 +76084,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)
 test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76033,7 +76125,7 @@ test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
     var diag = testDiagCtx();
     // Tests direct UAF: free(data) then data[idx] = val
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76069,7 +76161,7 @@ test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
 test "analyzeCFGMemory no false positive for defer free (ZA105)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76102,7 +76194,7 @@ test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
     var diag = testDiagCtx();
     // Tests alias UAF: const alias = data; free(data); use(alias);
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76146,7 +76238,7 @@ test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
     // Arena accessed through struct field: self.arena.allocator().alloc()
     // Type-based detection: field declared as std.heap.ArenaAllocator
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76185,7 +76277,7 @@ test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
     var diag = testDiagCtx();
     // FixedBufferAllocator accessed through struct field
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76229,7 +76321,7 @@ test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
     // treated as no-free. This is the Zig compiler's pervasive pattern:
     // const Sema = struct { arena: Allocator, ... };
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76269,7 +76361,7 @@ test "no FP for function parameter arena: Allocator (ZA101)" {
     // Function parameter named "arena" with type Allocator should be no-free.
     // Pattern: fn foo(arena: Allocator) !void { arena.alloc(...) }
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76302,7 +76394,7 @@ test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
     var diag = testDiagCtx();
     // Deep chain: self.ctx.arena.alloc() where arena field is Allocator type
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76342,7 +76434,7 @@ test "no FP for allocPrint with arena param (ZA101)" {
     var diag = testDiagCtx();
     // std.fmt.allocPrint(arena, ...) where arena is a function parameter
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76376,7 +76468,7 @@ test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
     // A parameter named "allocator" (not "arena") should still trigger warnings.
     // This verifies the heuristic is name-specific, not over-broad.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76449,7 +76541,7 @@ test "arena param no FP for ZA103 errdefer (name-based)" {
     var diag = testDiagCtx();
     // Arena-named parameter should not trigger ZA103 either
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76483,7 +76575,7 @@ test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
     // var fba: std.heap.FixedBufferAllocator = .init(&buf);
     // Zig 0.15+ anonymous init syntax
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76519,7 +76611,7 @@ test "no FP for arena param used as receiver and first-arg (ZA103)" {
     // Reproduces git.zig pattern: fn init(arena: Allocator, ...) with
     // arena.dupe() and allocPrint(arena, ...)
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76556,7 +76648,7 @@ test "no FP for arena as non-first parameter (ZA103)" {
     var diag = testDiagCtx();
     // Reproduces Value.zig pattern: fn sqrt(val, float_type, arena: Allocator, pt)
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76592,7 +76684,7 @@ test "no FP for multiline allocPrint with arena (ZA101)" {
     var diag = testDiagCtx();
     // Reproduces glibc.zig pattern: allocPrint(\n    arena,\n    fmt, ...)
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76632,7 +76724,7 @@ test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
     var diag = testDiagCtx();
     // Reproduces glibc.zig pattern: arena_allocator.allocator() alias used in allocPrint
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76669,7 +76761,7 @@ test "no FP for local arena alias from struct field access (ZA101)" {
     // Reproduces git.zig pattern: const arena = session.arena; arena.alloc(...)
     // where Session has arena: Allocator field
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76708,7 +76800,7 @@ test "no FP for custom-receiver dupe with arena first arg (ZA101)" {
     // zls analyser/completions.zig shape: `tuple_info.types.dupe(arena, ip)`
     // — a custom receiver whose dupe takes the allocator as first arg.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76741,7 +76833,7 @@ test "no FP for multiline custom-receiver dupe with arena first arg (ZA101)" {
     var diag = testDiagCtx();
     // Multiline variant: the allocator first arg sits on the next line.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76778,7 +76870,7 @@ test "no FP for replaceOwned with arena-named second arg (ZA101)" {
     // std.mem.replaceOwned(comptime T, allocator, ...) is type-param-first;
     // the allocator is the second argument (verified against 0.15/0.16 stdlib).
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76812,7 +76904,7 @@ test "no FP for replaceOwned with dotted arena field second arg (ZA101)" {
     // zls features/code_actions.zig:163 shape:
     // `std.mem.replaceOwned(u8, builder.arena, parsed, ...)`.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76848,7 +76940,7 @@ test "ZA101 fires for allocator-receiver dupe with arena-named source (lock)" {
     // arena-named value is the SOURCE string, not the allocator. Extraction
     // sees the type param `u8`, which must never suppress (EPH-I0008 FN lock).
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76886,7 +76978,7 @@ test "ZA101 fires for allocator-receiver dupe with plain source (lock)" {
     // `allocator.dupe(u8, str)` — first-arg extraction returns the type param
     // `u8`, matching neither no-free names nor arena names: nothing suppressed.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76924,7 +77016,7 @@ test "ZA101 fires for replaceOwned with real allocator second arg (lock)" {
     // Type-first extraction must not over-suppress: a real (non-arena)
     // allocator as the second arg still requires a defer.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -76962,7 +77054,7 @@ test "ZA101 fires for custom-receiver dupe with non-arena first arg (lock)" {
     // ghostty PageList.zig shape: `src_link.dupe(src_page, self.page)` — a
     // custom receiver whose first arg is neither no-free nor arena-named.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77006,7 +77098,7 @@ test "no FP for multiline replaceOwned with arena second arg (ZA101)" {
     // zig-fmt split form: `std.mem.replaceOwned(\n    u8, arena, ...)` —
     // suppression must survive the call being split across lines.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77042,7 +77134,7 @@ test "no FP for replaceOwned with comma-bearing fn-pointer type param (ZA101)" {
     // skip must be bracket-depth-aware. A naive comma-skip stops inside the fn
     // type, extracts `u8`, and regresses this to a false positive.
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77099,7 +77191,7 @@ test "no FP for non-memory alloc method (ZA103)" {
     // std.mem.Allocator.alloc() always takes a type as first arg (u8, MyStruct, etc.).
     // Non-memory .alloc() takes runtime values (ids, counts, etc.).
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77141,7 +77233,7 @@ test "real alloc with type arg still triggers (ZA101)" {
     var diag = testDiagCtx();
     // Ensure that real allocator.alloc(u8, 100) still triggers warnings
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77180,7 +77272,7 @@ test "real alloc with type arg still triggers (ZA101)" {
 test "ZA204 fires for unfilled var undefined" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77216,7 +77308,7 @@ test "ZA204 fires for unfilled var undefined" {
 test "ZA204 fires when only a different longer var is assigned" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77254,7 +77346,7 @@ test "ZA204 fires when only a different longer var is assigned" {
 test "ZA204 no FP for memset after undefined" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77285,7 +77377,7 @@ test "ZA204 no FP for memset after undefined" {
 test "ZA204 no FP when modifying method call follows other-var receiver" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77323,7 +77415,7 @@ test "ZA204 no FP when modifying method call follows other-var receiver" {
 test "ZA202 catch unreachable fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77359,7 +77451,7 @@ test "ZA202 catch unreachable fires via analyzeErrors" {
 test "ZA202 second catch site fires after a @TypeOf-suppressed first (EPH-I0508 F24)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77390,7 +77482,7 @@ test "ZA202 second catch site fires after a @TypeOf-suppressed first (EPH-I0508 
 test "ZA202 second catch site fires after a bufPrint-suppressed first (EPH-I0945)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77422,7 +77514,7 @@ test "ZA202 second catch site fires after a bufPrint-suppressed first (EPH-I0945
 test "ZA202 second catch site fires after a safe-stdlib-suppressed first (EPH-I0945)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77454,7 +77546,7 @@ test "ZA202 second catch site fires after a safe-stdlib-suppressed first (EPH-I0
 test "ZA202 second catch site fires on a multi-line bufPrint closing line (EPH-I0969)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77489,7 +77581,7 @@ test "ZA202 second catch site fires on a multi-line bufPrint closing line (EPH-I
 test "ZA202 second catch site fires on a zig-fmt bufPrint closing line (EPH-I0969)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77526,7 +77618,7 @@ test "ZA202 second catch site fires on a zig-fmt bufPrint closing line (EPH-I096
 test "ZA202 second catch site fires on a multi-line safe-stdlib closing line (EPH-I0969)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77559,7 +77651,7 @@ test "ZA202 second catch site fires on a multi-line safe-stdlib closing line (EP
 test "ZA203 orelse unreachable fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77595,7 +77687,7 @@ test "ZA203 orelse unreachable fires via analyzeErrors" {
 test "analyzeErrors ZA203 silent on the guarded same-line idioms (EPH-I0864)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The line-based ZA203 emitter routes through the same null-guard
@@ -77638,7 +77730,7 @@ test "analyzeErrors ZA203 silent on the guarded same-line idioms (EPH-I0864)" {
 test "analyzeErrors ZA203 still fires on the unguarded and nested-exit shapes (EPH-I0864)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // An unguarded `orelse unreachable` and a guard whose same-line exit
@@ -77674,7 +77766,7 @@ test "analyzeErrors ZA203 still fires on the unguarded and nested-exit shapes (E
 test "ZA203 silent on a trailing-comment mention via the CFG tier (EPH-I0491)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // F8: the CFG emitter (checkOrelseUnreachable) checked only
@@ -77715,7 +77807,7 @@ test "ZA203 silent on a trailing-comment mention via the CFG tier (EPH-I0491)" {
 test "ZA207 catch undefined fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77750,7 +77842,7 @@ test "ZA207 catch undefined fires" {
 test "ZA207 catch |_| undefined fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77792,7 +77884,7 @@ test "ZA207 catch |_| undefined fires" {
 test "ZA208 @panic fires in non-test context" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77826,7 +77918,7 @@ test "ZA208 @panic fires in non-test context" {
 test "ZA208 @panic does NOT fire in test block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77859,7 +77951,7 @@ test "ZA208 @panic does NOT fire in test block" {
 test "ZA206 std.posix.exit fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77921,7 +78013,7 @@ test "extractFuncName ignores fn in comments and strings (EPH-I0416)" {
 test "ZA206: trailing-comment exit prose never fires (EPH-I0416)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77956,7 +78048,7 @@ test "ZA206: trailing-comment exit prose never fires (EPH-I0416)" {
 test "ZA206: string-bearing exit( never suppresses the real call (EPH-I0416)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -77992,7 +78084,7 @@ test "ZA206: string-bearing exit( never suppresses the real call (EPH-I0416)" {
 test "ZA206: mid-line defer arms exit-bypasses-defer (EPH-I0416)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78027,7 +78119,7 @@ test "ZA206: mid-line defer arms exit-bypasses-defer (EPH-I0416)" {
 test "ZA206: trailing-comment fn name never resets the fn context (EPH-I0416)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78063,7 +78155,7 @@ test "ZA206: trailing-comment fn name never resets the fn context (EPH-I0416)" {
 test "ZA105: no false positive on variable reassignment after free" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78105,7 +78197,7 @@ test "ZA105: no false positive on variable reassignment after free" {
 test "ZA105: no false positive on for-loop capture variable" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78149,7 +78241,7 @@ test "ZA105: no false positive on for-loop capture variable" {
 test "ZA105: still detects real use-after-free with reassignment check" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78481,7 +78573,7 @@ test "ZA201 silent when close sits past the probe window (I0151 bound)" {
 test "ZT104 fires on comment-only catch body in test context (I0151)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78608,7 +78700,7 @@ test "ZA207 silent on split catch with real handling (I0152 pin)" {
 test "ZA202 split form fires end-to-end via analyzeErrors (I0152)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78747,7 +78839,7 @@ test "I0309: repeated over-cap path records one skipped-file entry" {
 test "ZA202 suppressed in test block via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78778,7 +78870,7 @@ test "ZA202 suppressed in test block via analyzeErrors" {
 test "ZA203 suppressed in test block via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -78809,7 +78901,7 @@ test "ZA203 suppressed in test block via analyzeErrors" {
 test "ZA202 still fires outside test block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79062,7 +79154,7 @@ fn createImportTestAnalysis(
 test "ZA401 unused import flagged despite filename string match" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79095,7 +79187,7 @@ test "ZA401 unused import flagged despite filename string match" {
 test "ZA401 silent when import has a real use" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79128,7 +79220,7 @@ test "ZA401 silent when import has a real use" {
 test "ZA401 flagged when uses are only in strings and comments" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79164,7 +79256,7 @@ test "ZA401 flagged when uses are only in strings and comments" {
 test "ZA401 another file importing same filename does not count as use" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79212,7 +79304,7 @@ test "ZA401 another file importing same filename does not count as use" {
 test "ZA401 alias differing from filename stem still flagged" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79243,7 +79335,7 @@ test "ZA401 alias differing from filename stem still flagged" {
 test "ZA401 member-access import alias is flagged when unused (EPH-I0445)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79279,7 +79371,7 @@ test "ZA401 member-access import alias is flagged when unused (EPH-I0445)" {
 test "ZA401 member-access import alias is silent when used (EPH-I0445)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79314,7 +79406,7 @@ test "ZA401 member-access import alias is silent when used (EPH-I0445)" {
 test "ZA402 unused const flagged despite string and comment mentions" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79344,7 +79436,7 @@ test "ZA402 unused const flagged despite string and comment mentions" {
 test "ZA402 silent when const has a real use" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79372,7 +79464,7 @@ test "ZA402 silent when const has a real use" {
 test "ZA403 unused var flagged despite string mention" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79404,7 +79496,7 @@ test "ZA403 unused var flagged despite string mention" {
 test "ZA201 catch |err| {} fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79430,7 +79522,7 @@ test "ZA201 catch |err| {} fires via analyzeErrors" {
 test "ZA201 catch{} without whitespace fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79456,7 +79548,7 @@ test "ZA201 catch{} without whitespace fires via analyzeErrors" {
 test "ZA201 multi-line empty catch fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79484,7 +79576,7 @@ test "ZA201 multi-line empty catch fires via analyzeErrors" {
 test "ZA201 multi-line catch closes only on exact brace line" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79513,7 +79605,7 @@ test "ZA201 multi-line catch closes only on exact brace line" {
 test "ZA201 one-line catch with handled body stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79541,7 +79633,7 @@ test "ZA201 one-line catch with handled body stays silent" {
 test "ZA202 catch |e| unreachable fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79568,7 +79660,7 @@ test "ZA202 catch |e| unreachable fires via analyzeErrors" {
 test "ZA202 catch unreachable with extra whitespace fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79595,7 +79687,7 @@ test "ZA202 catch unreachable with extra whitespace fires" {
 test "ZA207 catch |err| undefined fires via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79626,7 +79718,7 @@ test "ZA207 catch |err| undefined fires via analyzeErrors" {
 test "ZA201 silent in trailing comment via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79652,7 +79744,7 @@ test "ZA201 silent in trailing comment via analyzeErrors" {
 test "ZA202 silent in trailing comment via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79678,7 +79770,7 @@ test "ZA202 silent in trailing comment via analyzeErrors" {
 test "ZA203 silent in trailing comment via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79704,7 +79796,7 @@ test "ZA203 silent in trailing comment via analyzeErrors" {
 test "ZA207 silent in trailing comment via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79730,7 +79822,7 @@ test "ZA207 silent in trailing comment via analyzeErrors" {
 test "ZA208 silent in trailing comment via analyzeErrors" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79756,7 +79848,7 @@ test "ZA208 silent in trailing comment via analyzeErrors" {
 test "ZA201 fires when double-slash is inside a string literal" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79819,7 +79911,7 @@ test "branchLimit applies 8x for data dispatch" {
 test "ZA304 suppressed for fromJson with many branches" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79903,7 +79995,7 @@ test "countFnParams counts across multi-line signatures" {
 test "ZA303 fires on multi-line signature with too many params" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -79943,7 +80035,7 @@ test "ZA303 fires on multi-line signature with too many params" {
 test "ZA303 exempts extern and callconv(.c) declarations (EPH-I1059)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -80073,7 +80165,7 @@ test "visibleLengthExcludingStrings does not treat '\"' char literal as a string
 test "generated-file banner silences ZA701 and ZA703 (EPH-I1062)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Real corpus shape (sig v2/lib/crypto/ed25519/wycheproof.zig): a
@@ -80152,7 +80244,7 @@ test "banner tokens past the head do not mark a file generated (EPH-I1062)" {
 test "ZA701 exempts lines over-length solely due to string literals" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -80222,7 +80314,7 @@ test "ZA701: malformed clusters stay byte-counted, valid ones collapse (EPH-I024
 test "ZA701: a long CJK comment line is silent, a long ASCII+CJK line fires (EPH-I0248)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -80392,7 +80484,7 @@ test "isInsideTypeOf: closed @TypeOf parens do not contain the catch (EPH-I0492)
 test "ZA202 fires on the closed @TypeOf shape (EPH-I0492)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // End-to-end: the closed `@TypeOf(u8);` on the same line no longer
@@ -80968,7 +81060,7 @@ test "opensCognitiveScope ignores a try in a string or comment (EPH-I0226)" {
 test "ZA305: keyword-heavy trailing comment does not inflate CCN (EPH-I0226)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81298,7 +81390,7 @@ test "hasSameLineGuardExit applies the depth-2 then+else rule (EPH-I0861)" {
 test "analyzeCFGMemory ZA203 fires past a same-line nested conditional exit in a braced guard (EPH-I0861)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (p == null) { if (q) return 0; }` on one line: the exit sits
@@ -81325,7 +81417,7 @@ test "analyzeCFGMemory ZA203 fires past a same-line nested conditional exit in a
 test "analyzeCFGMemory ZA203 silent past a same-line direct guard exit (EPH-I0861)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The direct same-line guard exit keeps its ZA203 suppression under
@@ -81349,7 +81441,7 @@ test "analyzeCFGMemory ZA203 silent past a same-line direct guard exit (EPH-I086
 test "analyzeCFGMemory ZA203 silent past deref and transparent-paren guard operands (EPH-I0906)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The qa-gate batch-9 probe shapes (p1/p2): `(p) == null` and
@@ -81379,7 +81471,7 @@ test "analyzeCFGMemory ZA203 silent past deref and transparent-paren guard opera
 test "analyzeCFGMemory ZA203 fires when a call operand guards (EPH-I0906)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The qa-gate batch-9 probe p3: `foo(p) == null` tells nothing about
@@ -81593,7 +81685,7 @@ fn expectNoCognitiveWarnings(issues: []const Issue, path: []const u8) !void {
 test "ZA305: empty function has CCN 1, no warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81615,7 +81707,7 @@ test "ZA305: empty function has CCN 1, no warning" {
 test "ZA305: 5-decision-point function no warning at default threshold" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81645,7 +81737,7 @@ test "ZA305: 5-decision-point function no warning at default threshold" {
 test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81698,7 +81790,7 @@ test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
 test "ZA306: flat branches have low cognitive, no warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81731,7 +81823,7 @@ test "ZA306: flat branches have low cognitive, no warning" {
 test "ZA306: nested structures produce higher cognitive than flat" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81765,7 +81857,7 @@ test "ZA306: nested structures produce higher cognitive than flat" {
 test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81813,7 +81905,7 @@ test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
 test "ZA305: try and catch contribute to cyclomatic" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81839,7 +81931,7 @@ test "ZA305: try and catch contribute to cyclomatic" {
 test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81884,7 +81976,7 @@ test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
 test "ZA305/ZA306: switch arms count as decision points" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81934,7 +82026,7 @@ test "ZA305/ZA306: switch arms count as decision points" {
 test "ZA305/ZA306: simple function has CCN=1 cognitive=0" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -81966,7 +82058,7 @@ test "ZA305/ZA306: simple function has CCN=1 cognitive=0" {
 test "ZA901: unspaced and non-1 decrement forms fire" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -82004,7 +82096,7 @@ test "ZA901: unspaced and non-1 decrement forms fire" {
 test "ZA901: spaced decrement still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -82030,7 +82122,7 @@ test "ZA901: spaced decrement still fires" {
 test "ZA901: guarded unspaced decrement stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -82056,7 +82148,7 @@ test "ZA901: guarded unspaced decrement stays silent" {
 test "ZA901: zero-check same-line exits judged at the guard's depth (EPH-I0865)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The isZeroCheckGuard same-line exit is judged at the guard's own
@@ -82157,7 +82249,7 @@ test "isZeroCheckGuard accepts a compound-line zero guard (EPH-I0892)" {
 test "ZA901: boolean-assignment guard shape does not suppress (EPH-I0486)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const b = m > 0;` computes a value; it guards nothing, so it must
@@ -82188,7 +82280,7 @@ test "ZA901: boolean-assignment guard shape does not suppress (EPH-I0486)" {
 test "ZA901: guard on a later line does not suppress an earlier decrement (EPH-I0486)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Reversed order in one block: the `if (m > 0)` guard holds only from
@@ -82217,7 +82309,7 @@ test "ZA901: guard on a later line does not suppress an earlier decrement (EPH-I
 test "ZA901: while-header guard still covers the loop body (EPH-I0486 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The temporal rule must not break the loop-body suppression: the
@@ -82567,7 +82659,7 @@ test "hasBreakGuardOnPriorLines judges a closed non-loop block's guard opener (E
 test "ZA901: pre-loop break guard does not suppress the loop-body decrement (EPH-I0498)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The guard breaks the enclosing y-loop; the inner loop's
@@ -82602,7 +82694,7 @@ test "ZA901: pre-loop break guard does not suppress the loop-body decrement (EPH
 test "ZA901: in-loop break guard does not suppress the after-loop decrement (EPH-I0936)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The loop can exit via its condition with m == 0, so the after-loop
@@ -82635,7 +82727,7 @@ test "ZA901: in-loop break guard does not suppress the after-loop decrement (EPH
 test "ZA901: Allman in-loop break guard does not suppress the after-loop decrement (EPH-I0951)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The Allman twin of the EPH-I0936 shape: the loop body opens on
@@ -82673,7 +82765,7 @@ test "ZA901: Allman in-loop break guard does not suppress the after-loop decreme
 test "ZA901: Allman loop-condition guard covers the bare-brace body (EPH-I0952)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The loop var's own in-body decrement stays silent: the
@@ -82711,7 +82803,7 @@ test "ZA901: Allman loop-condition guard covers the bare-brace body (EPH-I0952)"
 test "ZA901: guard above a closed sibling loop keeps the prong decrement silent (EPH-I0941)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // guard -> sibling loop -> switch prong is sequential control flow:
@@ -82755,7 +82847,7 @@ test "ZA901: guard above a closed sibling loop keeps the prong decrement silent 
 test "ZA901: Allman sibling-loop body guard does not suppress the prong decrement (EPH-I0951)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The Allman twin of the closed-sibling-loop dominance rule
@@ -82797,7 +82889,7 @@ test "ZA901: Allman sibling-loop body guard does not suppress the prong decremen
 test "ZA901: brace-less inner-loop body decrement fires (EPH-I0936 review F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace-less twin of the EPH-I0498 shape: the inner loop's body
@@ -82834,7 +82926,7 @@ test "ZA901: brace-less inner-loop body decrement fires (EPH-I0936 review F1)" {
 test "ZA901: brace-less top-guard loop-body decrement fires (EPH-I0936 review F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace-less twin of the top-guard shape: the guard above the
@@ -82865,7 +82957,7 @@ test "ZA901: brace-less top-guard loop-body decrement fires (EPH-I0936 review F1
 test "ZA901: brace-less loop with a block-body statement keeps firing (EPH-I0936 review F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `while (y > 1) if (q) { m -= 1; };` — the brace-less loop body is
@@ -82902,7 +82994,7 @@ test "ZA901: brace-less loop with a block-body statement keeps firing (EPH-I0936
 test "ZA901: char-literal terminator in the header keeps the brace-less body firing (EPH-I0936 review r3 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `while (c == ';')` — the `;` sits inside a char literal, so it is
@@ -82936,7 +83028,7 @@ test "ZA901: char-literal terminator in the header keeps the brace-less body fir
 test "ZA901: char-literal terminator in the header keeps the Allman body firing (EPH-I0936 review r3 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The Allman twin of the brace-less shape: the `;` inside `';'` in
@@ -82970,7 +83062,7 @@ test "ZA901: char-literal terminator in the header keeps the Allman body firing 
 test "ZA901: char-literal terminator in the header keeps the block-body firing (EPH-I0936 review r3 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The block-body twin: `while (c == ';') if (q) { m -= 1; };`.
@@ -83004,7 +83096,7 @@ test "ZA901: char-literal terminator in the header keeps the block-body firing (
 test "ZA901: char-literal brace in the header keeps the Allman after-loop firing (EPH-I0936 review r3 F2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `while (c == '{')` with an Allman body: the `{` inside `'{'` is
@@ -83040,7 +83132,7 @@ test "ZA901: char-literal brace in the header keeps the Allman after-loop firing
 test "ZA901: char-literal close brace in the header keeps the brace-less body firing (EPH-I0957)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `while (c == '}')` — the `}` sits inside a char literal, so it is
@@ -83074,7 +83166,7 @@ test "ZA901: char-literal close brace in the header keeps the brace-less body fi
 test "ZA901: char-literal close brace in the header keeps the braced body firing (EPH-I0957)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The braced twin: `while (c == '}') {` balanced zero pre-fix (the
@@ -83109,7 +83201,7 @@ test "ZA901: char-literal close brace in the header keeps the braced body firing
 test "ZA901: a blank line between header and body keeps the decrement firing (EPH-I0936 review r3 F3)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A blank line between a brace-less header and its body carries no
@@ -83142,7 +83234,7 @@ test "ZA901: a blank line between header and body keeps the decrement firing (EP
 test "ZA901: real same-line body plus guard-above keeps the bare-block decrement silent (EPH-I0936 review r3 F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The regression guard for the char-literal fix: `while (y > 0)
@@ -83177,7 +83269,7 @@ test "ZA901: real same-line body plus guard-above keeps the bare-block decrement
 test "ZA903: else-arm index arithmetic stays silent past a guarded if (EPH-I0487)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else arm of `if (i < n)` implies i >= n, so `arr[i - 1]` in it
@@ -83205,7 +83297,7 @@ test "ZA903: else-arm index arithmetic stays silent past a guarded if (EPH-I0487
 test "ZA901: else-arm decrement stays silent past a guarded if (EPH-I0487)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The same else-guard mechanism on the decrement family: `if (i < n)`
@@ -83237,7 +83329,7 @@ test "ZA901: else-arm decrement stays silent past a guarded if (EPH-I0487)" {
 test "ZA903: else-if chain guard covers the final else arm (EPH-I0487)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `} else if (i <= m) {` — the else-if opener matches the walk the
@@ -83267,7 +83359,7 @@ test "ZA903: else-if chain guard covers the final else arm (EPH-I0487)" {
 test "ZA903: string-literal brace cannot misdirect the else-guard walk (EPH-I0487)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const s = "{";` carries a brace only inside the literal. The
@@ -83297,7 +83389,7 @@ test "ZA903: string-literal brace cannot misdirect the else-guard walk (EPH-I048
 test "ZA903: candidate outside an else arm still fires (EPH-I0487 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else-guard walk must not widen: the candidate sits in the if
@@ -83323,7 +83415,7 @@ test "ZA903: candidate outside an else arm still fires (EPH-I0487 lock)" {
 test "ZA901: literal, increment, comment, and string forms stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -83416,7 +83508,7 @@ test "hasRangeEndInitGuard requires a literal init witness (EPH-I0499)" {
 test "ZA903: no-witness slice-end range fires (EPH-I0499)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `arr[0 .. n - 1]` with `n` a parameter: n < 1 underflows the
@@ -83442,7 +83534,7 @@ test "ZA903: no-witness slice-end range fires (EPH-I0499)" {
 test "ZA903: empty-slice range with an init witness stays silent (EPH-I0499)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const n = 1; arr[0 .. n - 1]` slices `arr[0 .. 0]` — the empty
@@ -83469,7 +83561,7 @@ test "ZA903: empty-slice range with an init witness stays silent (EPH-I0499)" {
 test "ZA903: range-end witness does not cover an earlier unwitnessed index (batch 24 review F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `arr[b - 1][0 .. x - 1][0]` with `const x = 5` and b a parameter:
@@ -83499,7 +83591,7 @@ test "ZA903: range-end witness does not cover an earlier unwitnessed index (batc
 test "ZA903: range-start subtraction honors the init witness (batch 24 review F2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[x - 1 .. i]`: the subtraction is the range START, a real
@@ -83846,7 +83938,7 @@ test "EPH-I0931 review r3: a slice-cut body's final-line write stays inside the 
 test "ZA903: a range-end witness does not silence a later unwitnessed index (batch 24 review F-B)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[0 .. n - 1][i - 1]` with `const n = 5` and i a parameter:
@@ -83877,7 +83969,7 @@ test "ZA903: a range-end witness does not silence a later unwitnessed index (bat
 test "ZA903: a witnessed later index keeps the range line silent (batch 24 review F-B)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `buf[0 .. n - 1][b - 1]` with `const n = 5; const b = 5;`: both
@@ -83927,7 +84019,7 @@ test "rangeEndSubOf binds the call-head argument var (EPH-I0938)" {
 test "ZA903: zero-check-exit guard silences the range end (EPH-I0935)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The tmp_tigerbeetle.zig:125 shape: `if (port_buf_len == 0) {
@@ -83958,7 +84050,7 @@ test "ZA903: zero-check-exit guard silences the range end (EPH-I0935)" {
 test "ZA903: zero-check-exit guard silences the index form (EPH-I0935)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The backstop covers the plain `[i - 1]` form too, without an
@@ -83985,7 +84077,7 @@ test "ZA903: zero-check-exit guard silences the index form (EPH-I0935)" {
 test "ZA903: zero-check-exit guard binds the candidate's own var (EPH-I0935)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A zero-check on `j` proves nothing about `i`: the backstop binds
@@ -84012,7 +84104,7 @@ test "ZA903: zero-check-exit guard binds the candidate's own var (EPH-I0935)" {
 test "ZA903: witnessed call-head range end stays silent (EPH-I0938)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `arr[0 .. id(n - 1)]` with `const n = 5`: the subtraction runs on
@@ -84044,7 +84136,7 @@ test "ZA903: witnessed call-head range end stays silent (EPH-I0938)" {
 test "ZA903: unwitnessed call-head range end fires (EPH-I0938)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A parameter `n` proves nothing about the argument value: the
@@ -84073,7 +84165,7 @@ test "ZA903: unwitnessed call-head range end fires (EPH-I0938)" {
 test "ZA903: multi-sub call-head range end stays a finding (EPH-I0938)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `sub2(n - 1, m - 1)` subtracts twice: the `n` witness covers only
@@ -84103,7 +84195,7 @@ test "ZA903: multi-sub call-head range end stays a finding (EPH-I0938)" {
 test "ZA903: loop-init witness does not silence a later unwitnessed index (EPH-I0939)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `arr[i - 1][j - 1]` in a loop with `var i = 5` and `j` a
@@ -84135,7 +84227,7 @@ test "ZA903: loop-init witness does not silence a later unwitnessed index (EPH-I
 test "ZA903: loop-init witness survives a fn ( string in the body (EPH-I0949)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The string `const pat = "fn (";` between the loop header and the
@@ -84172,7 +84264,7 @@ test "ZA903: loop-init witness survives a fn ( string in the body (EPH-I0949)" {
 test "ZA903: loop-init witness survives a } string in the body (EPH-I0949)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The string `const s = "}";` between the loop header and the
@@ -84206,7 +84298,7 @@ test "ZA903: loop-init witness survives a } string in the body (EPH-I0949)" {
 test "ZA903: Allman loop-condition bound covers the bare-brace body (EPH-I0952)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The ZA903 twin of the Allman guard pin: the `while (n > 2)` bound
@@ -84240,7 +84332,7 @@ test "ZA903: Allman loop-condition bound covers the bare-brace body (EPH-I0952)"
 test "ZA903: witnessed later index keeps the loop-init line silent (EPH-I0939)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // With `var j = 5` too, both brackets carry an init witness, so the
@@ -84273,7 +84365,7 @@ test "ZA903: witnessed later index keeps the loop-init line silent (EPH-I0939)" 
 test "ZA903: enclosing-block witness does not silence a later unwitnessed index (EPH-I0939)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (i > 0) { arr[i - 1][j - 1]; }` with `j` a parameter: the
@@ -84323,7 +84415,7 @@ test "ZA903: enclosing-block witness does not silence a later unwitnessed index 
 test "ZA903: the zero-check backstop does not mask a later unwitnessed bracket (EPH-I0935, EPH-I0939)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (i == 0) return; arr[i - 1][j - 1];`: the backstop proves
@@ -84351,7 +84443,7 @@ test "ZA903: the zero-check backstop does not mask a later unwitnessed bracket (
 test "ZA903: index subtrahend 2 under a zero-check exit fires (EPH-I0959)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Probe A: the `== 0` exit proves x >= 1, which covers x - 1 but
@@ -84379,7 +84471,7 @@ test "ZA903: index subtrahend 2 under a zero-check exit fires (EPH-I0959)" {
 test "ZA903: range-end subtrahend 2 under a zero-check exit fires (EPH-I0959)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Probe E: `if (n == 0) return;` proves n >= 1, not n >= 2: n == 1
@@ -84407,7 +84499,7 @@ test "ZA903: range-end subtrahend 2 under a zero-check exit fires (EPH-I0959)" {
 test "ZA903: loop-body zero-check break with subtrahend 2 fires (EPH-I0959)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Probe T: the in-body break proves x >= 1, not x >= 2. Pre-fix
@@ -84438,7 +84530,7 @@ test "ZA903: loop-body zero-check break with subtrahend 2 fires (EPH-I0959)" {
 test "ZA901: decrement amount 2 under a zero-check exit fires (EPH-I0960)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `== 0` exit proves m >= 1, which covers `-= 1` only: m == 1
@@ -84468,7 +84560,7 @@ test "ZA901: decrement amount 2 under a zero-check exit fires (EPH-I0960)" {
 test "ZA901: guard-to-decrement reassignment defeats the zero-check exit (EPH-I0960)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `m = 0;` between the guard and the decrement re-introduces zero:
@@ -84499,7 +84591,7 @@ test "ZA901: guard-to-decrement reassignment defeats the zero-check exit (EPH-I0
 test "ZA901: decrement amount 1 under a zero-check exit stays silent (EPH-I0960)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `== 0` exit proves m >= 1, which covers `-= 1`: the
@@ -84535,7 +84627,7 @@ test "ZA901: decrement amount 1 under a zero-check exit stays silent (EPH-I0960)
 test "ZA901/ZA903: bounded writes defeat the prior guard proof (EPH-I0978 doc-arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Documented coarse-defeat class (EPH-I0978): the shared defeat
@@ -84593,7 +84685,7 @@ test "ZA901/ZA903: bounded writes defeat the prior guard proof (EPH-I0978 doc-ar
 test "ZA903: compound range end binds the summed subtrahends (EPH-I0958)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `n - 1 - 2` evaluates 2 - 1 - 2 = -1 at runtime with `const n =
@@ -84648,7 +84740,7 @@ test "ZA903: compound range end binds the summed subtrahends (EPH-I0958)" {
 test "ZA903: non-decimal range-end subtrahends parse by base (EPH-I0977)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the digit scan stopped at the literal suffix (`0x1` as
@@ -84744,7 +84836,7 @@ test "ZA903: non-decimal range-end subtrahends parse by base (EPH-I0977)" {
 test "ZA903: non-decimal index-form subtrahends bind the witness amount (EPH-I0977)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The index-form witness parser (extractIndexSubtraction) carried
@@ -84801,7 +84893,7 @@ test "ZA903: non-decimal index-form subtrahends bind the witness amount (EPH-I09
 test "ZA903: Allman if header proves the bound above a bare-brace body (EPH-I0976)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (n > 2)` with the `{` on the next line: the header's own
@@ -84833,7 +84925,7 @@ test "ZA903: Allman if header proves the bound above a bare-brace body (EPH-I097
 test "ZA903: Allman if header below the subtrahend still fires (EPH-I0976)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The amount judgment binds the Allman if header like the loop
@@ -84864,7 +84956,7 @@ test "ZA903: Allman if header below the subtrahend still fires (EPH-I0976)" {
 test "ZA903: non-decimal init literals witness the loop-init bound (EPH-I0994)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `var i = 0x10` inits i to 16, which covers `arr[i - 1]`; the
@@ -84902,7 +84994,7 @@ test "ZA903: non-decimal init literals witness the loop-init bound (EPH-I0994)" 
 test "ZA903: loop-init witness requires the literal to close the init (EPH-I0994)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `var i = 5 - 3` inits 2 and `var i = 5 / 3` inits 1: the
@@ -84991,7 +85083,7 @@ test "ZA903: loop-init witness requires the literal to close the init (EPH-I0994
 test "ZA903: chain-arm own condition witnesses an in-arm range end (EPH-I0996)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `} else if (m > 3) {` proves m >= 4, which covers the range end
@@ -85121,7 +85213,7 @@ test "ZA903: chain-arm own condition witnesses an in-arm range end (EPH-I0996)" 
 test "ZA903: wrapped range end with an additive tail stays silent (EPH-I0958 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A wrapped span (a call head, a paren group) keeps the
@@ -85162,7 +85254,7 @@ test "ZA903: wrapped range end with an additive tail stays silent (EPH-I0958 r1)
 test "ZA903: wrapped range end with a subtractive tail still fires (EPH-I0958 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `f(k - 1) - 5` carries a second subtraction in the tail: the
@@ -85193,7 +85285,7 @@ test "ZA903: wrapped range end with a subtractive tail still fires (EPH-I0958 r1
 test "ZA903: guard-to-candidate reassignment defeats the zero-check exit (EPH-I0959)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Probe C: `x = 0;` between the guard and the read re-introduces
@@ -85222,7 +85314,7 @@ test "ZA903: guard-to-candidate reassignment defeats the zero-check exit (EPH-I0
 test "ZA903: subtrahend-1 shapes under the zero-check exit stay silent (EPH-I0959)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Probes B and D: the amount-aware backstop keeps the pins that
@@ -85256,7 +85348,7 @@ test "ZA903: subtrahend-1 shapes under the zero-check exit stay silent (EPH-I095
 test "ZA903: range form under an enclosing lower-bound guard (EPH-I0959)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Second face: `if (n > 0) { arr[0 .. n - 2] }` fires — n >= 1
@@ -85377,7 +85469,7 @@ test "ZA903: guardBoundOnVar saturates the maxInt RHS and rejects non-literal RH
 test "ZA903: disjunction and negcall enclosing guards fire (EPH-I0961)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The body runs when ANY disjunction arm holds: `n > 0 or n > 5`
@@ -85522,7 +85614,7 @@ test "guardExprBound recursion is capped by the depth budget (EPH-I0966)" {
 test "ZA903: guard-to-candidate reassignment defeats the enclosing bound (EPH-I0962)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `n = 1` restores n below the subtrahend before the read; the
@@ -85574,7 +85666,7 @@ test "ZA903: guard-to-candidate reassignment defeats the enclosing bound (EPH-I0
 test "ZA903: else-branch candidate escapes the antecedent opener (EPH-I0963)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else arm runs at n <= 1: the if-opener's bound does not
@@ -85644,7 +85736,7 @@ test "ZA903: else-branch candidate escapes the antecedent opener (EPH-I0963)" {
 test "ZA903: else-open skip does not over-apply below closed arms (EPH-I0963 r4)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The candidate below a closed multi-line else-if arm runs when q
@@ -85712,7 +85804,7 @@ test "ZA903: else-open skip does not over-apply below closed arms (EPH-I0963 r4)
 test "ZA901: else-open skip does not over-apply below closed arms (EPH-I0963 r4)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The legacy walk mirrors the ZA903 judgment: the decrement below
@@ -85755,7 +85847,7 @@ test "ZA901: else-open skip does not over-apply below closed arms (EPH-I0963 r4)
 test "ZA903: mid-line else-open escapes the antecedent credit (EPH-I0965)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // f2a: the else-open line carries the antecedent's close AND the
@@ -85820,7 +85912,7 @@ test "ZA903: mid-line else-open escapes the antecedent credit (EPH-I0965)" {
 test "ZA903: one-line if/else chains keep their verdict (EPH-I0965 f2b)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The walk never examines the candidate's own line, so the all-one-
@@ -85858,7 +85950,7 @@ test "ZA903: one-line if/else chains keep their verdict (EPH-I0965 f2b)" {
 test "ZA903: mid-line else-if with a foreign condition fires (EPH-I0965)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The mid-line else-if arm's own condition guards only its own var:
@@ -85888,7 +85980,7 @@ test "ZA903: mid-line else-if with a foreign condition fires (EPH-I0965)" {
 test "ZA903: mid-line else-if skip does not over-apply under an outer guard (EPH-I0965 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The mid-line else-open carries its antecedent on its own line
@@ -85932,7 +86024,7 @@ test "ZA903: mid-line else-if skip does not over-apply under an outer guard (EPH
 test "ZA903: classic else-open skip survives a mid-line else above it (EPH-I0965 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The classic else-open (`} else {`) still skips its antecedent
@@ -85967,7 +86059,7 @@ test "ZA903: classic else-open skip survives a mid-line else above it (EPH-I0965
 test "ZA903: else-open line edges — string, comment, and ident-adjacent else (EPH-I0980)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else-keyword classifier must skip an `else` inside a string
@@ -86019,7 +86111,7 @@ test "ZA903: else-open line edges — string, comment, and ident-adjacent else (
 test "ZA903: two-else chain opens the final arm; plain-span junk tail fires (EPH-I0980)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The last else keyword wins: the final `} else {` arm of a
@@ -86058,7 +86150,7 @@ test "ZA903: two-else chain opens the final arm; plain-span junk tail fires (EPH
 test "ZA901: decrement in a mid-line else arm fires (EPH-I0980)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The mid-line else arm runs at m <= 1, so `m -= 1` underflows at
@@ -86105,7 +86197,7 @@ test "ZA901: decrement in a mid-line else arm fires (EPH-I0980)" {
 test "ZA901: chain-arm own condition guards a decrement past the opener walk (EPH-I0993)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else-if arm's own condition (`m > 3`) must guard the
@@ -86186,7 +86278,7 @@ test "ZA901: chain-arm own condition guards a decrement past the opener walk (EP
 test "ZA903: maxInt comparison RHS cannot crash and saturates (EPH-I0964)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `n > maxInt` can never hold, so the body never runs: the arm
@@ -86229,7 +86321,7 @@ test "ZA903: maxInt comparison RHS cannot crash and saturates (EPH-I0964)" {
 test "ZA903: unspaced index subtraction fires end-to-end" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -86250,7 +86342,7 @@ test "ZA903: unspaced index subtraction fires end-to-end" {
 test "ZA903: guarded unspaced subtraction stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -86272,7 +86364,7 @@ test "ZA903: guarded unspaced subtraction stays silent" {
 test "ZA903: trailing comment and string forms stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -86315,7 +86407,7 @@ test "hasExitStatement matches exit keywords on word boundaries (EPH-I0494)" {
 test "ZA901: trailing-comment return does not arm the == 0 guard (EPH-I0494)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // F11 fan-out: hasGuardOnLine's `== 0` + exit arm matched the
@@ -86422,7 +86514,7 @@ test "lineHasIf requires a word boundary (EPH-I0506)" {
 test "ZA903: comparison after the index does not suppress (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17 probe 1: `arr[i - 1] > 0 and ...` — the comparison
@@ -86446,7 +86538,7 @@ test "ZA903: comparison after the index does not suppress (EPH-I0506)" {
 test "ZA903: upper-bound if-expression does not suppress (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17 probe 2: `if (i < n) arr[i - 1] else 0` — the
@@ -86470,7 +86562,7 @@ test "ZA903: upper-bound if-expression does not suppress (EPH-I0506)" {
 test "ZA903: unrelated-var same-line guard does not suppress (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17: `if (j > 0) return a[i - 1];` — the guard relates
@@ -86494,7 +86586,7 @@ test "ZA903: unrelated-var same-line guard does not suppress (EPH-I0506)" {
 test "ZA903: dif-shaped if does not suppress (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17: the `if (` substring matched identifiers ending in
@@ -86520,7 +86612,7 @@ test "ZA903: dif-shaped if does not suppress (EPH-I0506)" {
 test "ZA901: unrelated-var same-line guard does not suppress (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17 (decrement family): `if (j > 0) x -= 1;` — the guard
@@ -86544,7 +86636,7 @@ test "ZA901: unrelated-var same-line guard does not suppress (EPH-I0506)" {
 test "ZA903: short-circuit pattern after the index does not suppress (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17: `values[offset - 1] == 0 or ...` — the short-circuit
@@ -86568,7 +86660,7 @@ test "ZA903: short-circuit pattern after the index does not suppress (EPH-I0506)
 test "ZA903: same-line guards that relate to the index var stay silent (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The constraint arm keeps the sound same-line shapes silent: a
@@ -86598,7 +86690,7 @@ test "ZA903: same-line guards that relate to the index var stay silent (EPH-I050
 test "ZA903: != 0 with an or-tail does not suppress (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17: the `!= 0` guard needs tail discipline — `x != 0 or y`
@@ -86628,7 +86720,7 @@ test "ZA903: != 0 with an or-tail does not suppress (EPH-I0506)" {
 test "ZA903: or-tails do not suppress on the > arm or whitespace variants (EPH-I0942)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17 residual (EPH-I0942): `y > 0 or x > 0` ran the body
@@ -86663,7 +86755,7 @@ test "ZA903: or-tails do not suppress on the > arm or whitespace variants (EPH-I
 test "ZA903: a b.len guard does not silence an a[a.len - 1] candidate (EPH-I0933)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F14 done-when: the CFG .len key is exact — the guard
@@ -86693,7 +86785,7 @@ test "ZA903: a b.len guard does not silence an a[a.len - 1] candidate (EPH-I0933
 test "ZA903: nested bracket index keeps the same-line guard (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17: `a[b[i - 1]]` under `if (i > 0)` — the extractor must
@@ -86718,7 +86810,7 @@ test "ZA903: nested bracket index keeps the same-line guard (EPH-I0506)" {
 test "ZA903: multiline > 0 and guard stays silent (EPH-I0506)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B12 F17: the `> 0 and` short-circuit arm — `if (offset > 0 and`
@@ -86746,7 +86838,7 @@ test "ZA903: multiline > 0 and guard stays silent (EPH-I0506)" {
 test "ZA901: max_x guard does not suppress an x candidate (EPH-I0493)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // F10: `if (max_x > 0) {` guarded `x -= 1` inside the block — the
@@ -86773,7 +86865,7 @@ test "ZA901: max_x guard does not suppress an x candidate (EPH-I0493)" {
 test "ZA901: assert bound below the decrement amount still fires (EPH-I0495)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // F13: any `assert(x >= N)` suppressed any `x -= M`. The bound now
@@ -86798,7 +86890,7 @@ test "ZA901: assert bound below the decrement amount still fires (EPH-I0495)" {
 test "ZA901: assert bound at least the decrement amount stays silent (EPH-I0495)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -86841,7 +86933,7 @@ test "parseDecrementAmount reads only a terminated decimal literal (EPH-I0495)" 
 test "ZA901: same-line if-guard judges the decrement amount (EPH-I0995)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (m > 1) { m -= 5; }` underflows at m == 2: the guard proves
@@ -86880,7 +86972,7 @@ test "ZA901: same-line if-guard judges the decrement amount (EPH-I0995)" {
 test "ZA901: multi-line arm guard judges the decrement amount (EPH-I0995)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The multi-line twin of the same-line pin: the arm block's entry
@@ -86919,7 +87011,7 @@ test "ZA901: multi-line arm guard judges the decrement amount (EPH-I0995)" {
 test "ZA901: multi-line or-tail guard judges the decrement amount (EPH-I1000)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A condition that opens on the guard line but closes on the next
@@ -86972,7 +87064,7 @@ test "ZA901: multi-line or-tail guard judges the decrement amount (EPH-I1000)" {
 test "ZA901: multi-line Allman or-tail guard judges the amount (EPH-I1000)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The Allman twin: the body open sits on its own line, so the
@@ -87015,7 +87107,7 @@ test "ZA901: multi-line Allman or-tail guard judges the amount (EPH-I1000)" {
 test "ZA901: mid-line else-if multi-line own condition covers its arm (EPH-I1000)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A chain arm's multi-line own condition joins from the arm region
@@ -87149,7 +87241,7 @@ test "joinGuardCondition joins clean multi-line conditions and bails on poison (
 test "ZA901: same-line closed-chain else-arm decrement fires (EPH-I1001)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A same-line closed chain's else arm runs under the NEGATED
@@ -87208,7 +87300,7 @@ test "ZA901: same-line closed-chain else-arm decrement fires (EPH-I1001)" {
 test "ZA901: chain-arm own condition still covers a same-line candidate (EPH-I1001)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The region split mirrors the record path: a chain arm's OWN
@@ -87311,7 +87403,7 @@ test "ZA901: the == 0 exit must precede the candidate column (EPH-I1012)" {
 test "ZA901: then-arm decrement under an else-arm zero-exit fires (EPH-I1012)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The end-to-end twin of the unit pin: the then-arm decrement runs
@@ -87345,7 +87437,7 @@ test "ZA901: then-arm decrement under an else-arm zero-exit fires (EPH-I1012)" {
 test "ZA901: 3+-arm chain middle-arm candidate judged by its own arm (EPH-I1014)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A middle-arm candidate under its own arm's condition stays
@@ -87380,7 +87472,7 @@ test "ZA901: 3+-arm chain middle-arm candidate judged by its own arm (EPH-I1014)
 test "ZA903: multi-line lookback condition joins and covers the bound (EPH-I1013)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The ZA903 lookback joins a multi-line opener condition like the
@@ -87484,7 +87576,7 @@ test "ZA903: char-literal paren does not leak through closesGroupOpenedAbove (EP
 test "ZA903: closed same-line guard above a char-paren opener does not cover the fall-through (EPH-I1021)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The closed same-line guard `if (m > 8) { return 0; }` proves its
@@ -87555,7 +87647,7 @@ test "ZA901: Allman multi-line header with a foreign-var first line covers the b
 test "ZA901: multi-line Allman and K&R foreign-var headers stay silent end-to-end (EPH-I1018, EPH-I1019)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The Allman (I1018) and K&R (I1019) walk twins: the covered
@@ -87650,7 +87742,7 @@ test "ZA901: multi-line Allman and K&R foreign-var headers stay silent end-to-en
 test "ZA901/ZA903: closed same-line K&R opener does not cover the bare block below (EPH-I1034)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A same-line K&R body closes on the opener line, so the opener
@@ -87776,7 +87868,7 @@ test "ZA903: Allman chain-arm header covers its bare-brace body (EPH-I1019)" {
 test "ZA903: Allman chain-arm header end-to-end, plain-else arm keeps firing (EPH-I1019)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The classic `} else if` Allman chain covers its bare-brace body
@@ -87880,7 +87972,7 @@ test "guardOnLineAt judges each arm's decrement against its own region (EPH-I102
 test "ZA901: one-line multi-arm chain reports the unguarded later-arm decrement (EPH-I1022)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The middle arm's `m -= 2` is covered by its own arm's bound and
@@ -87967,7 +88059,7 @@ test "ZA901: joined multi-line == conjuncts stay conservative (EPH-I1015)" {
 test "ZA903: mismatched-array .len guard does not suppress the candidate (EPH-I0496)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // F14: `if (a.len == 0) return;` silenced `b[i - 1]` — the .len
@@ -88026,7 +88118,7 @@ test "ZA903: mismatched-array .len guard does not suppress the candidate (EPH-I0
 test "ZA903: matching-array .len guard stays silent (EPH-I0496)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -88079,7 +88171,7 @@ test "ZA903: matching-array .len guard stays silent (EPH-I0496)" {
 test "ZA903: transparent-paren .len guard binds the inner base (EPH-I0496)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `(x).len == 0` guards `x[i - 1]` — the parens change nothing, so
@@ -88136,7 +88228,7 @@ test "ZA903: transparent-paren .len guard binds the inner base (EPH-I0496)" {
 test "ZA903: call-result .len guard does not suppress the candidate (EPH-I0496)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `foo(x).len == 0` is a call-result guard: it says nothing about
@@ -88196,7 +88288,7 @@ test "ZA903: call-result .len guard does not suppress the candidate (EPH-I0496)"
 test "ZA903: loop-init guard without a loop does not suppress (EPH-I0497)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // F15: `var i = 5;` before the candidate suppressed without any
@@ -88245,7 +88337,7 @@ test "ZA903: loop-init guard without a loop does not suppress (EPH-I0497)" {
 test "ZA903: loop-init guard with a reassignment does not suppress (EPH-I0497)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -88290,7 +88382,7 @@ test "ZA903: loop-init guard with a reassignment does not suppress (EPH-I0497)" 
 test "ZA903: loop-init guard without a reassignment stays silent (EPH-I0497)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -88335,7 +88427,7 @@ test "ZA903: loop-init guard without a reassignment stays silent (EPH-I0497)" {
 test "ZA301: outer fn with local struct method is reported" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -88377,7 +88469,7 @@ test "ZA301: outer fn with local struct method is reported" {
 test "ZA301: short outer fn with local struct stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -88408,7 +88500,7 @@ test "ZA301: short outer fn with local struct stays silent" {
 test "ZA304: outer fn branches reported despite local struct" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -88495,7 +88587,7 @@ test "opensCognitiveScope ignores keywords inside strings" {
 test "ZA305: unspaced if-chain trips cyclomatic threshold" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -88549,7 +88641,7 @@ test "ZA305: unspaced if-chain trips cyclomatic threshold" {
 test "ZA204: multiple pending undefined vars are all tracked" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -88582,7 +88674,7 @@ test "ZA204: multiple pending undefined vars are all tracked" {
 test "ZA204: two undefined decls on one line are both tracked" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -88615,7 +88707,7 @@ test "ZA204: two undefined decls on one line are both tracked" {
 test "ZA204: multi-line undefined declaration is tracked" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -88653,7 +88745,7 @@ test "ZA204: multi-line undefined declaration is tracked" {
 test "ZA204: type-qualified const in decl does not shadow the var name" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -88950,7 +89042,7 @@ test "extractStructFieldName walks from the given occurrence (EPH-I0893)" {
 test "ZA204: unfilled struct field reports at the fn closing line (EPH-I0421)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -88996,7 +89088,7 @@ test "ZA204: unfilled struct field reports at the fn closing line (EPH-I0421)" {
 test "ZA204: brace in a string literal does not end the pending field scope (EPH-I0421)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -89036,7 +89128,7 @@ test "ZA204: brace in a string literal does not end the pending field scope (EPH
 test "ZA204: brace in a trailing comment does not end the pending field scope (EPH-I0421)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -89099,7 +89191,7 @@ test "isInTestContext: block flag or the shared path classifier (EPH-I0422)" {
 test "ZA201 fires inside a catch block body (EPH-I0414)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -89278,7 +89370,7 @@ test "analyzeUnused errdefer frees the partial list on every failure point (EPH-
 test "ZA204: filled vars stay silent with multi-var tracking" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -89314,7 +89406,7 @@ test "ZA204: filled vars stay silent with multi-var tracking" {
 test "ZA204: single-line struct literal undefined field is reported (EPH-I0413)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -89361,7 +89453,7 @@ test "ZA204: single-line struct literal undefined field is reported (EPH-I0413)"
 test "ZA204: later anonymous literal field is not misattributed (EPH-I0413)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -89409,7 +89501,7 @@ test "ZA204: later anonymous literal field is not misattributed (EPH-I0413)" {
 test "ZA204: struct literal field default stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -89449,7 +89541,7 @@ test "ZA204: indexed undefined write fires, pointer poison stays silent (EPH-I04
 
 test "ZA204: indexed undefined write reports an issue (EPH-I0418)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var set = PendingUndefinedSet{};
@@ -89862,7 +89954,7 @@ fn expectMeasuredFnLines(diag: *DiagCtx, allocator: Allocator, case: FnLinesCase
 test "ZA301: two block prongs plus a trailing statement measure the full fn (EPH-I0451)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The true body is 56 lines. Pre-fix the second prong's close ended
@@ -89899,7 +89991,7 @@ test "ZA301: two block prongs plus a trailing statement measure the full fn (EPH
 test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // 61-line fn with `else => {},`. Pre-fix the fn ended at the switch
@@ -89924,7 +90016,7 @@ test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
 test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I0451)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // handleBlockEnd-shaped: four block prongs, then work after the
@@ -89962,7 +90054,7 @@ test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I
 test "ZA302: poisoned arrow line does not hide a deeply nested tail" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90009,7 +90101,7 @@ test "ZA302: poisoned arrow line does not hide a deeply nested tail" {
 test "ZA302: char-literal braces do not inflate nesting depth" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90046,7 +90138,7 @@ test "ZA302: char-literal braces do not inflate nesting depth" {
 test "ZA306: else-prong second same-line brace adds no cognitive nest (EPH-I0884)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90099,7 +90191,7 @@ test "ZA306: else-prong second same-line brace adds no cognitive nest (EPH-I0884
 test "ZA302: same-line struct literals do not inflate nesting depth (EPH-I0811)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90140,7 +90232,7 @@ test "ZA302: same-line struct literals do not inflate nesting depth (EPH-I0811)"
 test "ZA302: multiline initializers do not inflate nesting depth (EPH-I0811, EPH-I0026)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90182,7 +90274,7 @@ test "ZA302: multiline initializers do not inflate nesting depth (EPH-I0811, EPH
 test "ZA302: genuine control-flow nesting at depth 4 still fires (EPH-I0811)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90223,7 +90315,7 @@ test "ZA302: genuine control-flow nesting at depth 4 still fires (EPH-I0811)" {
 test "ZA306: keyword+literal lines do not leak cognitive nesting (EPH-I0818)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90307,7 +90399,7 @@ test "ZA306: keyword+literal lines do not leak cognitive nesting (EPH-I0818)" {
 test "ZA306: else-family chains measure at the if's level with no residue (EPH-I0453)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90411,7 +90503,7 @@ test "detectFnStart reports the line-absolute column for indented methods (EPH-I
 test "ZA306: catch after a labeled block closes costs 1+0 and leaks nothing (EPH-I0453)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90462,7 +90554,7 @@ test "ZA306: catch after a labeled block closes costs 1+0 and leaks nothing (EPH
 test "ZA306: trailing-comment brace line leaks no cognitive nesting (EPH-I0452)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90504,7 +90596,7 @@ test "ZA306: trailing-comment brace line leaks no cognitive nesting (EPH-I0452)"
 test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90578,7 +90670,7 @@ test "isTypeFactory: real factory with fn-pointer param still detected (EPH-I045
 test "ZA301: blank lines inside a fn stay out of fn_lines (EPH-I0458)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90699,7 +90791,7 @@ test "findRealFnDef: quoted fn name is a real def (EPH-I0442)" {
 test "ZA301: wrapped extern decl followed by a real fn reports no phantom (EPH-I0756)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -90754,7 +90846,7 @@ test "detectFnStart: wrapped real fn def opens state with the def line's identit
 test "ZA301: wrapped real fn def counts its signature lines (EPH-I0756)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90848,7 +90940,7 @@ const plain_sig_i0788 =
 test "ZA301: full-line comments in a wrapped signature stay out of fn_lines (EPH-I0788)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -90889,7 +90981,7 @@ test "ZA301: full-line comments in a wrapped signature stay out of fn_lines (EPH
 test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -90921,7 +91013,7 @@ test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {
 test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The @cImport marker makes isCImportFile true for any filename; the
@@ -90992,7 +91084,7 @@ test "isCImportFile: __builtin_ in code skips, in string does not (EPH-I0758)" {
 test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The markers live only in string data; the over-cap fn must be measured.
@@ -91026,7 +91118,7 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
 test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The real file carries the markers only as string-literal data (this
@@ -91094,7 +91186,7 @@ fn countBySeverity(
 test "ZT102: test with no assertions warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91113,7 +91205,7 @@ test "ZT102: test with no assertions warns" {
 test "ZT102: try-only smoke test is a note, not a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91136,7 +91228,7 @@ test "ZT102: try-only smoke test is a note, not a warning" {
 test "ZT102: char literal with a paren is not a try-call (EPH-I0432)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `try x == '('` compares against a char — no call, so the block is
@@ -91161,7 +91253,7 @@ test "ZT102: char literal with a paren is not a try-call (EPH-I0432)" {
 test "ZT102: Allman test opener with the brace on the next line is tracked (EPH-I0435)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Grammar-proven shape (zig ast-check, 2026-08-12): the block brace
@@ -91186,7 +91278,7 @@ test "ZT102: Allman test opener with the brace on the next line is tracked (EPH-
 test "ZT102: Allman test with a real assertion stays silent (EPH-I0435 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard: the pending opener must not leak — an Allman test whose body
@@ -91207,7 +91299,7 @@ test "ZT102: Allman test with a real assertion stays silent (EPH-I0435 guard)" {
 test "ZT102/ZT105: anonymous no-space test{ opener with assertions stays silent (EPH-I0915)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Grammar-accepted no-space anonymous opener (zig ast-check,
@@ -91240,7 +91332,7 @@ test "ZT102/ZT105: anonymous no-space test{ opener with assertions stays silent 
 test "ZT102: pending Allman opener does not survive a fn def line (EPH-I0435 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The brace must be the next line's first code token: a fn def after
@@ -91264,7 +91356,7 @@ test "ZT102: pending Allman opener does not survive a fn def line (EPH-I0435 gua
 test "ZT102: spaced assertion call counts as an assertion (EPH-I0433)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `expect (n == 0)` with whitespace before the paren: pre-fix it was
@@ -91285,7 +91377,7 @@ test "ZT102: spaced assertion call counts as an assertion (EPH-I0433)" {
 test "ZT102: try expectEqual counts as an assertion" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ZT103 fires on the identical args here (covered in ZT103 tests);
@@ -91305,7 +91397,7 @@ test "ZT102: try expectEqual counts as an assertion" {
 test "ZT102: std.debug.assert counts as an assertion" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91326,7 +91418,7 @@ test "ZT102: std.debug.assert counts as an assertion" {
 test "ZT102: camelCase Assert helpers count as assertions" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91350,7 +91442,7 @@ test "ZT102: camelCase Assert helpers count as assertions" {
 test "ZT102: multi-line vacuous test warns at the test line" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91376,7 +91468,7 @@ test "ZT102: multi-line vacuous test warns at the test line" {
 test "ZT102: expect text in strings and comments is not an assertion" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91398,7 +91490,7 @@ test "ZT102: expect text in strings and comments is not an assertion" {
 test "ZT102: FailingAllocator leak-sweep test is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The leak detector in std.testing.allocator (via FailingAllocator) is
@@ -91446,7 +91538,7 @@ test "ZT102: FailingAllocator leak-sweep test is silent" {
 test "ZT102: direct std.testing.allocator use is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // No expect calls and no FailingAllocator — but the testing allocator's
@@ -91476,7 +91568,7 @@ test "ZT102: direct std.testing.allocator use is silent" {
 test "ZT102: loop without allocator or assertions still warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91501,7 +91593,7 @@ test "ZT102: loop without allocator or assertions still warns" {
 test "ZT102: try-only smoke test without allocator stays a note" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91526,7 +91618,7 @@ test "ZT102: try-only smoke test without allocator stays a note" {
 test "ZT102: allocator mention in the test name alone still warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The carve-out reads block-body code only — a name-string mention is
@@ -91549,7 +91641,7 @@ test "ZT102: allocator mention in the test name alone still warns" {
 test "ZT103: expect(true) warns, including whitespace variant" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91568,7 +91660,7 @@ test "ZT103: expect(true) warns, including whitespace variant" {
 test "ZT103: expectEqual with identical args warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91589,7 +91681,7 @@ test "ZT103: expectEqual with identical args warns" {
 test "ZT103: expect with identical comparison operands warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91614,7 +91706,7 @@ test "ZT103: expect with identical comparison operands warns" {
 test "ZT103: real assertions with different args are silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91635,7 +91727,7 @@ test "ZT103: real assertions with different args are silent" {
 test "ZT103: string-literal args are not split or misread" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91654,7 +91746,7 @@ test "ZT103: string-literal args are not split or misread" {
 test "ZT103: trivially-true assertion outside a test block is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91671,7 +91763,7 @@ test "ZT103: trivially-true assertion outside a test block is silent" {
 test "ZT102: braces in test names and strings do not corrupt block tracking" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `catch {}` in the test name and a lone `}` inside a fixture string
@@ -91695,7 +91787,7 @@ test "ZT102: braces in test names and strings do not corrupt block tracking" {
 test "ZT102: test-reference blocks are not vacuous" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The Zig idioms for pulling other declarations into the test binary:
@@ -91725,7 +91817,7 @@ test "ZT102: test-reference blocks are not vacuous" {
 test "ZT102: no-space single-line test-reference block is not vacuous (EPH-I0915 class)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The no-space sibling of the pinned ref form: `test{_ = @import(...)}`
@@ -91746,7 +91838,7 @@ test "ZT102: no-space single-line test-reference block is not vacuous (EPH-I0915
 test "ZT102: vacuous test still warns next to a reference block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91774,7 +91866,7 @@ test "ZT102: vacuous test still warns next to a reference block" {
 test "ZT102: helper-mediated assertion via file-local helper is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The test body has no assertion of its own, but the file-local helper
@@ -91797,7 +91889,7 @@ test "ZT102: helper-mediated assertion via file-local helper is silent" {
 test "ZT102: transitive helper-mediated assertion is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The assertion lives one delegation hop further: test -> outer -> inner.
@@ -91822,7 +91914,7 @@ test "ZT102: transitive helper-mediated assertion is silent" {
 test "ZT102: helper with no assertions anywhere still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -91843,7 +91935,7 @@ test "ZT102: helper with no assertions anywhere still fires" {
 test "ZT102: call-graph cycle terminates with the correct verdict" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // a <-> b recursion, no assertions on either side: the walk must not
@@ -91869,7 +91961,7 @@ test "ZT102: call-graph cycle terminates with the correct verdict" {
 test "ZT102: cross-file asserting helper is silent (project-wide witness)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ghostty's `try lib.checkGhosttyHEnum(State, ...)` shape: the helper
@@ -91897,7 +91989,7 @@ test "ZT102: cross-file asserting helper is silent (project-wide witness)" {
 test "ZT102: lowercase cross-file name collisions do not suppress" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // RhyOS bzip2 shape: the block calls BitReader.init + a non-asserting
@@ -91936,7 +92028,7 @@ test "ZT102: lowercase cross-file name collisions do not suppress" {
 test "ZT102: asserting helper with brace literal in signature is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle flags.zig parse_flag_value_fuzz shape: the `struct {`
@@ -91975,7 +92067,7 @@ test "ZT102: asserting helper with brace literal in signature is silent" {
 test "ZT102: snapshot snap/diff_fmt assertion verbs are silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle stdx/prng.zig shape: `try snap(@src(), ...).diff_fmt(...)`
@@ -92000,7 +92092,7 @@ test "ZT102: snapshot snap/diff_fmt assertion verbs are silent" {
 test "ZT102: dotted diff method call counts as an assertion" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92018,7 +92110,7 @@ test "ZT102: dotted diff method call counts as an assertion" {
 test "ZT102: snaplen-style data names are not snapshot assertions" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // RhyOS pcap shape: `initWithSnaplen` merely contains the substring
@@ -92042,7 +92134,7 @@ test "ZT102: snaplen-style data names are not snapshot assertions" {
 test "ZT102: print-only test still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92064,7 +92156,7 @@ test "ZT102: print-only test still fires" {
 test "ZT101: warns when the fn a test is named after is never called" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The body asserts something unrelated but never touches parseHeader:
@@ -92093,7 +92185,7 @@ test "ZT101: warns when the fn a test is named after is never called" {
 test "ZT101: silent when the body calls the named fn" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92116,7 +92208,7 @@ test "ZT101: silent when the body calls the named fn" {
 test "ZT101: prose-only test names have no candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92140,7 +92232,7 @@ test "ZT101: prose-only test names have no candidates" {
 test "ZT101: ident-form test calling its fn is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92161,7 +92253,7 @@ test "ZT101: ident-form test calling its fn is silent" {
 test "ZT101: ident-form test that never calls its fn warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92183,7 +92275,7 @@ test "ZT101: ident-form test that never calls its fn warns" {
 test "ZT101: fns from other files are not candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // parseHeader is not defined in this file — the name references a fn
@@ -92206,7 +92298,7 @@ test "ZT101: fns from other files are not candidates" {
 test "ZT101: generic fns are not lie candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Tests name the generic but only call its instantiations — absence of
@@ -92232,7 +92324,7 @@ test "ZT101: generic fns are not lie candidates" {
 test "ZT101: type-factory fns are not lie candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92256,7 +92348,7 @@ test "ZT101: type-factory fns are not lie candidates" {
 test "ZT101: one of several candidates called is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92282,7 +92374,7 @@ test "ZT101: one of several candidates called is silent" {
 test "ZT101: no candidate called warns once" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92309,7 +92401,7 @@ test "ZT101: no candidate called warns once" {
 test "ZT101: dotted calls satisfy the candidate" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92334,7 +92426,7 @@ test "ZT101: dotted calls satisfy the candidate" {
 test "ZT101: helper-mediated calls satisfy the candidate" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The test exercises parseHeader through a file-local helper — the
@@ -92362,7 +92454,7 @@ test "ZT101: helper-mediated calls satisfy the candidate" {
 test "ZT101: lowercase prose words are not candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // "access" is a fn here, but in the test name it is an English prose
@@ -92388,7 +92480,7 @@ test "ZT101: lowercase prose words are not candidates" {
 test "ZT101: comptime-reflection invocation is invisible to the call graph (EPH-I0029)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zlint Error.zig: the test name references Severity.jsonParse, but
@@ -92434,7 +92526,7 @@ test "ZT101: comptime-reflection invocation is invisible to the call graph (EPH-
 test "ZT101: value reference silences the reflection shape (EPH-I0029)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The documented workaround: `_ = Severity.jsonParse;` is a textual
@@ -92478,7 +92570,7 @@ test "ZT101: value reference silences the reflection shape (EPH-I0029)" {
 test "ZT104: empty catch in a test is a note" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The error is eaten and the test still passes — the failure is
@@ -92501,7 +92593,7 @@ test "ZT104: empty catch in a test is a note" {
 test "ZT104: payload forms of empty catch are notes" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92525,7 +92617,7 @@ test "ZT104: payload forms of empty catch are notes" {
 test "ZT104: catch unreachable in a test is a note" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92596,7 +92688,7 @@ fn runBothPipelines(
 test "ZA201/ZT104 overlap: empty catch in a test reports exactly ZT104" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92615,7 +92707,7 @@ test "ZA201/ZT104 overlap: empty catch in a test reports exactly ZT104" {
 test "ZA202/ZT104 overlap: catch unreachable in a test reports exactly ZT104" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92634,7 +92726,7 @@ test "ZA202/ZT104 overlap: catch unreachable in a test reports exactly ZT104" {
 test "ZA207/ZT104 overlap: catch undefined in a test reports exactly ZA207" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ZA207 keeps the catch-undefined report at warning severity — ZT104
@@ -92655,7 +92747,7 @@ test "ZA207/ZT104 overlap: catch undefined in a test reports exactly ZA207" {
 test "ZA201 still fires outside test context" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92674,7 +92766,7 @@ test "ZA201 still fires outside test context" {
 test "ZT104: two-line empty catch form is a note" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -92696,7 +92788,7 @@ test "ZT104: two-line empty catch form is a note" {
 test "ZT104: handled catch is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The payload is bound and the body asserts on the error — the failure
@@ -92721,7 +92813,7 @@ test "ZT104: handled catch is silent" {
 test "ZT104: catch outside test context is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Non-test path, not inside a test block: ZA2xx's domain, not ZT104's.
@@ -92743,7 +92835,7 @@ test "ZT104: catch outside test context is silent" {
 test "ZT104: test-file path is test context" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ZA2xx is suppressed across whole *_test.zig files; ZT104 inverts the
@@ -92766,7 +92858,7 @@ test "ZT104: test-file path is test context" {
 test "ZT104: while-condition catch idiom is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `catch {}` in condition position converts the error to end-of-
@@ -92795,7 +92887,7 @@ test "ZT104: while-condition catch idiom is silent" {
 test "ZT101: candidates passed as values are exercised" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Passing the fn as a value to a fuzz/table harness exercises it
@@ -92824,7 +92916,7 @@ test "ZT101: candidates passed as values are exercised" {
 test "ZT101: char-literal contents do not mark a candidate referenced (EPH-I0432)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the `'f'` char literal read as a value reference to the
@@ -92848,7 +92940,7 @@ test "ZT101: char-literal contents do not mark a candidate referenced (EPH-I0432
 test "ZT101: spaced call satisfies the candidate through a helper (EPH-I0433)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `helper ()` is a call of helper — whitespace between target and
@@ -92876,7 +92968,7 @@ test "ZT101: spaced call satisfies the candidate through a helper (EPH-I0433)" {
 test "ZT101: Allman test opener keeps its name candidates (EPH-I0435)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The lie candidates come from the opener line's name even when the
@@ -92903,7 +92995,7 @@ test "ZT101: Allman test opener keeps its name candidates (EPH-I0435)" {
 
 test "ZT101: comment fn text does not hijack the next fn's span (EPH-I0427)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the comment's `fn fake()` registered as a pending def and
@@ -92926,7 +93018,7 @@ test "ZT101: comment fn text does not hijack the next fn's span (EPH-I0427)" {
 test "ZT101: fn after a comment-def line stays a lie candidate (EPH-I0427)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The phantom `fake` def from the comment used to unregister the real
@@ -92954,7 +93046,7 @@ test "ZT101: fn after a comment-def line stays a lie candidate (EPH-I0427)" {
 
 test "ZT101: extern decl with trailing comment drops, real fn registers (EPH-I0755)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the raw-line `endsWith(t, ";")` missed the `;` hidden by the
@@ -92980,7 +93072,7 @@ test "ZT101: extern decl with trailing comment drops, real fn registers (EPH-I07
 
 test "ZT101: extern decl without a comment still drops (EPH-I0755)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Over-strip guard: the plain `;`-terminated decl must keep dropping.
@@ -93000,7 +93092,7 @@ test "ZT101: extern decl without a comment still drops (EPH-I0755)" {
 
 test "ZT101: real fn def whose trailing comment ends in `;` keeps callees (EPH-I0782)" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Inverse of the EPH-I0755 extern class: the pre-fix raw-line
@@ -93025,7 +93117,7 @@ test "ZT101: real fn def whose trailing comment ends in `;` keeps callees (EPH-I
 test "ZT104: defer cleanup catch is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Best-effort teardown of a temp file is not the test's subject.
@@ -93051,7 +93143,7 @@ test "ZT104: defer cleanup catch is silent" {
 test "ZT104: defer-block cleanup catch is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -93079,7 +93171,7 @@ test "ZT104: defer-block cleanup catch is silent" {
 test "ZT104: catch unreachable in a defer still notes" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The cleanup exemption covers only the empty-catch form; converting
@@ -93152,7 +93244,7 @@ fn countUntestedFnNotes(
 test "ZT105: pub fn never called from any test is a note" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -93186,7 +93278,7 @@ test "ZT105: pub fn never called from any test is a note" {
 test "ZT105: pub fn called from a test in another file is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The corpus is project-level: a per-file implementation would flag
@@ -93226,7 +93318,7 @@ test "ZT105: pub fn called from a test in another file is silent" {
 test "ZT105: generic pub fns are not candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Tests call instantiations, never the generic itself; the wrapped
@@ -93268,7 +93360,7 @@ test "ZT105: generic pub fns are not candidates" {
 test "ZT105: type-factory pub fns are not candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -93297,7 +93389,7 @@ test "ZT105: type-factory pub fns are not candidates" {
 test "ZT105: pub fn main is not a candidate" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The entry point is exercised by running the binary; flagging it
@@ -93322,7 +93414,7 @@ test "ZT105: pub fn main is not a candidate" {
 test "ZT105: pub fn referenced as a value in a test is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A fn handed to a harness is exercised without a syntactic call
@@ -93352,7 +93444,7 @@ test "ZT105: pub fn referenced as a value in a test is silent" {
 test "ZT105: pub fn exercised through a private helper is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The test calls harness, harness calls target_api — file-local
@@ -93385,7 +93477,7 @@ test "ZT105: pub fn exercised through a private helper is silent" {
 test "ZT105: re-export alias suppresses conservatively" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `pub const public_fn = impl_fn;` puts impl_fn in a non-test value
@@ -93412,7 +93504,7 @@ test "ZT105: re-export alias suppresses conservatively" {
 test "ZT105: strings and comments are not evidence" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ghost_api appears only in the test NAME (a string literal) and
@@ -93456,7 +93548,7 @@ test "ZT105: strings and comments are not evidence" {
 test "ZT105: pub fn used only inside a test file is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Everything in a test file exists to support tests — including its
@@ -93500,7 +93592,7 @@ test "ZT105: pub fn used only inside a test file is silent" {
 test "ZT105 EPH-I0429: pub fn defer-called from hosted tests in other files stays silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // RhyOS resetForTest shape: the pub fn lives in scheduler.zig; hosted
@@ -93552,7 +93644,7 @@ test "ZT105 EPH-I0429: pub fn defer-called from hosted tests in other files stay
 test "ZT105 EPH-I0429: test file through a cross-file helper reaches the pub fn" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zig-pulse processBlock shape: the test in the _test.zig file calls
@@ -93603,7 +93695,7 @@ test "ZT105 EPH-I0429: test file through a cross-file helper reaches the pub fn"
 test "ZT105 EPH-I0429: pub fn reached through a helper in the same non-test file" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zig-pulse signWith shape: build_attestation and sign_with both live
@@ -93648,7 +93740,7 @@ test "ZT105 EPH-I0429: pub fn reached through a helper in the same non-test file
 test "ZT105 EPH-I0429: two-hop cross-file chain reaches the pub fn in the impl file" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zig-pulse hashTreeRootOfUint64 shape: the test file calls
@@ -93701,7 +93793,7 @@ test "ZT105 EPH-I0429: two-hop cross-file chain reaches the pub fn in the impl f
 test "ZT105 EPH-I0031: pub noinline fn is a candidate" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix the pub_fn_prefixes list skipped `pub noinline fn`, so the
@@ -93736,7 +93828,7 @@ test "ZT105 EPH-I0031: pub noinline fn is a candidate" {
 test "ZT105 EPH-I0031: pub fn with callconv(.C) is a candidate" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `pub fn ` prefix already matched a callconv(.C) signature; the
@@ -93766,7 +93858,7 @@ test "ZT105 EPH-I0031: pub fn with callconv(.C) is a candidate" {
 test "ZT105 EPH-I0031: quoted fn name is a candidate and a test call is evidence" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Pre-fix a `pub fn @"..."` decl was skipped (the name scan only
@@ -93807,7 +93899,7 @@ test "ZT105 EPH-I0031: quoted fn name is a candidate and a test call is evidence
 test "ZT105 EPH-I0908: quoted-name call through a helper chain is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // qa-gate gate-b11 probe shape: the test file calls helper in the
@@ -93859,7 +93951,7 @@ test "ZT105 EPH-I0908: quoted-name call through a helper chain is silent" {
 test "ZT105 EPH-I0907: type-factory-nested pub fns keep the name-union bound pinned" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle tree_fuzz apply shape: the pub fns sit inside a type
@@ -93922,7 +94014,7 @@ test "ZT105 EPH-I0907: type-factory-nested pub fns keep the name-union bound pin
 test "ZT105 EPH-I0909: struct-literal field names are not value references" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Fs.cwd class: `.cwd = .{...}` and `.iterate = true` literal LHS
@@ -93965,7 +94057,7 @@ test "ZT105 EPH-I0909: struct-literal field names are not value references" {
 test "ZT105 EPH-I0910: pub fn build in build.zig is not a candidate" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `zig build` exercises build.zig's build entry point exactly as the
@@ -93992,7 +94084,7 @@ test "ZT105 EPH-I0910: pub fn build in build.zig is not a candidate" {
 test "ZT105 EPH-I0911: ptr-deref and optional-unwrap field access aliases" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `ptr.*.field` dereferences to a value and `x.?.field` unwraps to a
@@ -94035,7 +94127,7 @@ test "ZT105 EPH-I0911: ptr-deref and optional-unwrap field access aliases" {
 test "ZT105 EPH-I0913: continuation-line value chain aliases (newline-dot)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle src/state_machine.zig shape: a struct-literal RHS value
@@ -94071,7 +94163,7 @@ test "ZT105 EPH-I0913: continuation-line value chain aliases (newline-dot)" {
 test "ZT105 EPH-I0913 guard: enum tags after keywords and if-branches stay bare" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The whitespace walk must not alias enum tags: `return .tag`,
@@ -94136,7 +94228,7 @@ test "ZT105 EPH-I0913 guard: enum tags after keywords and if-branches stay bare"
 test "ZT105 EPH-I0912: nested and build.zig-suffixed files are candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The root "build.zig" (bare path, the root of its own scan) keeps
@@ -94174,7 +94266,7 @@ test "ZT105 EPH-I0912: root build.zig classification across scan forms" {
 test "ZT105: spaced call in non-test code is a call, not an alias (EPH-I0433)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A spaced call `spaced_api ()` from non-test code exercises nothing
@@ -94199,7 +94291,7 @@ test "ZT105: spaced call in non-test code is a call, not an alias (EPH-I0433)" {
 test "ZT105: segment-collision suppression is pinned — test-local variable (EPH-I0434 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard pin for the documented name-based boundary: every identifier
@@ -94225,7 +94317,7 @@ test "ZT105: segment-collision suppression is pinned — test-local variable (EP
 test "ZT105: segment-collision suppression is pinned — value-position segment (EPH-I0434 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard pin for the documented name-based boundary: a non-test
@@ -94249,7 +94341,7 @@ test "ZT105: segment-collision suppression is pinned — value-position segment 
 test "ZT105: Allman test opener covers the pub fn it calls (EPH-I0435)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The ZT105 scan tracks test context with the same pending-opener
@@ -94320,7 +94412,7 @@ fn expectZC101Counts(
 test "ZC101: lock with plain unlock is a note, not a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -94340,7 +94432,7 @@ test "ZC101: lock with plain unlock is a note, not a warning" {
 test "ZC101: lock with no release at all is a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -94359,7 +94451,7 @@ test "ZC101: lock with no release at all is a warning" {
 test "ZC101: lock with defer unlock is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -94379,7 +94471,7 @@ test "ZC101: lock with defer unlock is silent" {
 test "ZC101: conditional and block-form defers count as coverage" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `defer if (c) mu.unlock();` is the zls InternPool should_lock idiom;
@@ -94408,7 +94500,7 @@ test "ZC101: conditional and block-form defers count as coverage" {
 test "ZC101: multi-line } defer { body releases at the defer depth (EPH-I0926)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `if (c) { ... } defer { ... }` continuation: the leading `}`
@@ -94451,7 +94543,7 @@ test "ZC101: multi-line } defer { body releases at the defer depth (EPH-I0926)" 
 test "ZC101: tiny acquire wrapper is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `fn acquire() void { mu.lock(); }` is one half of an intentional
@@ -94472,7 +94564,7 @@ test "ZC101: tiny acquire wrapper is silent" {
 test "ZC101: cross-fn acquire/release pair is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Mirrors zls string_pool.zig: lock in stringToSliceLock (two
@@ -94496,7 +94588,7 @@ test "ZC101: cross-fn acquire/release pair is silent" {
 test "ZC101: cross-fn release on a DIFFERENT receiver does not suppress" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // other.mutex.unlock() exists in the file but names a different
@@ -94520,7 +94612,7 @@ test "ZC101: cross-fn release on a DIFFERENT receiver does not suppress" {
 test "ZC101: a release in ANOTHER file does not satisfy the acquire (EPH-I0443 doc arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The documented file-local bound: hasCrossFnRelease sees only this
@@ -94561,7 +94653,7 @@ test "ZC101: a release in ANOTHER file does not satisfy the acquire (EPH-I0443 d
 test "ZC101: free-function fileUnlock satisfies the cross-fn release (EPH-I0903)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // skytale advanced_features.zig shape: the file lock is acquired as a
@@ -94591,7 +94683,7 @@ test "ZC101: free-function fileUnlock satisfies the cross-fn release (EPH-I0903)
 test "ZC101: free-function fileUnlock with a MISMATCHED argument does not suppress" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The release unlocks a DIFFERENT file (`other`) than the acquire
@@ -94615,7 +94707,7 @@ test "ZC101: free-function fileUnlock with a MISMATCHED argument does not suppre
 test "ZC101: deferred free-function fileUnlock covers a same-fn acquire (EPH-I0903)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The deferred free-function release registers as defer coverage at
@@ -94638,7 +94730,7 @@ test "ZC101: deferred free-function fileUnlock covers a same-fn acquire (EPH-I09
 test "ZC101: 0.16 form lock(io) with defer unlock(io) is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -94658,7 +94750,7 @@ test "ZC101: 0.16 form lock(io) with defer unlock(io) is silent" {
 test "ZC101: lockShared pairs with unlockShared, not plain unlock" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // f is correctly paired (silent); g releases a shared lock with the
@@ -94688,7 +94780,7 @@ test "ZC101: lockShared pairs with unlockShared, not plain unlock" {
 test "ZC101: semaphore wait/post is silent; WaitGroup wait is not an acquire" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // f is a real semaphore (post evidence exists). g's wg.wait() has no
@@ -94714,7 +94806,7 @@ test "ZC101: semaphore wait/post is silent; WaitGroup wait is not an acquire" {
 test "ZC101: discarded tryLock result is not an acquire (file-lock idiom)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ghostty DiskCache: `_ = file.tryLock(.exclusive) catch return ...`
@@ -94736,7 +94828,7 @@ test "ZC101: discarded tryLock result is not an acquire (file-lock idiom)" {
 test "ZC101: identifier-underscore binding is a tracked acquire, bare _ discard is not (EPH-I0927)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `x_ = mu.tryLock()` binds the result to a variable — an acquire,
@@ -94770,7 +94862,7 @@ test "ZC101: identifier-underscore binding is a tracked acquire, bare _ discard 
 test "ZC101: strings and comments are neither acquires nor releases" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The comment `// defer mu.unlock();` and the string "mu.unlock()"
@@ -94796,7 +94888,7 @@ test "ZC101: strings and comments are neither acquires nor releases" {
 test "ZC101: comment braces never count toward the defer depth (EPH-I0925)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Mid-edit invalid text (Zig has no block comments — the I0916
@@ -94822,7 +94914,7 @@ test "ZC101: comment braces never count toward the defer depth (EPH-I0925)" {
 test "ZC101: // } tail on a defer line never corrupts the attributed depth (EPH-I0925 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard pin (passes pre-fix): the constructible line-comment form.
@@ -94850,7 +94942,7 @@ test "ZC101: // } tail on a defer line never corrupts the attributed depth (EPH-
 test "ZC101: release text after a mid-line multiline opener is string data (EPH-I0444 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const s = \\ mu.unlock();` — the tail is string data, so no
@@ -94878,7 +94970,7 @@ test "ZC101: release text after a mid-line multiline opener is string data (EPH-
 test "ZC101: bare lock() calls and fn decls named lock are not acquires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `fn lock(...)` is a declaration, `lock(self)` a free call — neither
@@ -94903,7 +94995,7 @@ test "ZC101: bare lock() calls and fn decls named lock are not acquires" {
 test "ZC101: errdefer unlock counts as deferred coverage" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The dominant correct form: success path unlocks plainly, error path
@@ -94926,7 +95018,7 @@ test "ZC101: errdefer unlock counts as deferred coverage" {
 test "ZC101: each acquire is judged independently" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // a is defer-covered; b is never released => exactly one warning.
@@ -94948,7 +95040,7 @@ test "ZC101: each acquire is judged independently" {
 test "ZC101: tryLock in an if-condition with defer inside is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -94969,7 +95061,7 @@ test "ZC101: tryLock in an if-condition with defer inside is silent" {
 test "ZC101: acquires inside defer blocks are not evaluated" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zls diagnostics.zig idiom: lock inside a defer-block cleanup.
@@ -94994,7 +95086,7 @@ test "ZC101: acquires inside defer blocks are not evaluated" {
 test "ZC101: lock calls inside test blocks are not attributed" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Fn-span tracking never enters a test block — lock hygiene in tests
@@ -95015,7 +95107,7 @@ test "ZC101: lock calls inside test blocks are not attributed" {
 test "ZC101: failure-branch release with sibling unlock API is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zls DocumentStore.tryLockConfig/unlockConfig: the in-fn unlock
@@ -95043,7 +95135,7 @@ test "ZC101: failure-branch release with sibling unlock API is silent" {
 test "ZC101: lone branch-scoped release is a note (some paths leak)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The unlock covers only the c==true path; c==false leaks. No defer,
@@ -95065,7 +95157,7 @@ test "ZC101: lone branch-scoped release is a note (some paths leak)" {
 test "ZC101: branch-scoped defer does not cover an outer-depth acquire" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // f: the defer registers only on the c path and runs at the BLOCK
@@ -95104,7 +95196,7 @@ test "ZC101: branch-scoped defer does not cover an outer-depth acquire" {
 test "ZC101: waitUncancelable is a semaphore acquire (0.16 Io.Semaphore)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // f is defer-covered => silent. g has a top-level plain post, which
@@ -95130,7 +95222,7 @@ test "ZC101: waitUncancelable is a semaphore acquire (0.16 Io.Semaphore)" {
 
 test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var cfg = Config{
@@ -95179,7 +95271,7 @@ test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
 test "ZC101: tiny wrapper with a conditional acquire is silent (EPH-I0033, documented FN)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The tiny-wrapper suppression counts body statements, so the
@@ -95200,7 +95292,7 @@ test "ZC101: tiny wrapper with a conditional acquire is silent (EPH-I0033, docum
 test "ZC101: close() is not a release — lock with only a close warns (EPH-I0033)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // close() is outside the release family, so a resource whose lock is
@@ -95223,7 +95315,7 @@ test "ZC101: close() is not a release — lock with only a close warns (EPH-I003
 test "ZC101: cross-fn release spelled differently is invisible (EPH-I0033)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The cross-fn suppression needs the receiver field-chain text to
@@ -95248,7 +95340,7 @@ test "ZC101: cross-fn release spelled differently is invisible (EPH-I0033)" {
 test "ZC101: mis-paired release beside a correct pair is masked (EPH-I0033)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Strict pairing only governs coverage; a mis-paired release is never
@@ -95273,7 +95365,7 @@ test "ZC101: mis-paired release beside a correct pair is masked (EPH-I0033)" {
 test "ZC101: fn-scope defer over a conditional tryLock is covered (EPH-I0033, ZC103 inverse)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The fn-scope defer at depth 0 satisfies the depth rule for the
@@ -95300,7 +95392,7 @@ test "ZC101: fn-scope defer over a conditional tryLock is covered (EPH-I0033, ZC
 test "ZC101: block-close then defer on one line is deferred coverage (EPH-I0439)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `} defer mu.unlock();` continues the line after the block close —
@@ -95324,7 +95416,7 @@ test "ZC101: block-close then defer on one line is deferred coverage (EPH-I0439)
 test "ZC101: semicolon-continuation defer is deferred coverage (EPH-I0439)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (x) doWork(); defer mu.unlock();` — the defer opens a new
@@ -95347,7 +95439,7 @@ test "ZC101: semicolon-continuation defer is deferred coverage (EPH-I0439)" {
 test "ZC101: one-line guard-block defer is branch-scoped (EPH-I0439)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer opens the guard's block on the same line: it registers
@@ -95373,7 +95465,7 @@ test "ZC101: one-line guard-block defer is branch-scoped (EPH-I0439)" {
 test "ZC101: defer word in a string or comment is not a defer line (EPH-I0439 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard (passes pre-fix): the statement-position keyword scan skips
@@ -95395,7 +95487,7 @@ test "ZC101: defer word in a string or comment is not a defer line (EPH-I0439 gu
 test "ZC101: struct-literal lock argument is not a condition position (EPH-I0440)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `.{}` argument brace sat AFTER the call, so the old brace
@@ -95422,7 +95514,7 @@ test "ZC101: struct-literal lock argument is not a condition position (EPH-I0440
 test "ZC101: unspaced discard is not an acquire (EPH-I0446)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `_=file.tryLock();` — the compiler accepts the missing spaces
@@ -95467,7 +95559,7 @@ fn expectZC102Counts(
 test "ZC102: lock twice on the same receiver is a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -95487,7 +95579,7 @@ test "ZC102: lock twice on the same receiver is a warning" {
 test "ZC102: lock;unlock;lock is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -95506,7 +95598,7 @@ test "ZC102: lock;unlock;lock is silent" {
 test "ZC102: acquires in sibling if/else arms are disjoint paths" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // One acquire per arm, one shared unlock after — never both on a path.
@@ -95532,7 +95624,7 @@ test "ZC102: acquires in sibling if/else arms are disjoint paths" {
 test "ZC102: switch prong blocks are disjoint paths" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `},` close marks a list element: the next same-depth block is a
@@ -95559,7 +95651,7 @@ test "ZC102: switch prong blocks are disjoint paths" {
 test "ZC102: lock;defer unlock;lock warns — the defer runs at scope exit" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second lock EXECUTES while the lock is still held — the defer
@@ -95580,7 +95672,7 @@ test "ZC102: lock;defer unlock;lock warns — the defer runs at scope exit" {
 test "ZC102: block-close defer runs at scope exit — later lock warns (EPH-I0439)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `} defer` release registers after the close and runs at the
@@ -95606,7 +95698,7 @@ test "ZC102: block-close defer runs at scope exit — later lock warns (EPH-I043
 test "ZC102: close line of an open defer block with a sibling defer — later lock warns (EPH-I0926)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Regression pin (fails pre-fix): the `} defer mu.unlock();` close
@@ -95639,7 +95731,7 @@ test "ZC102: close line of an open defer block with a sibling defer — later lo
 test "ZC102: loop-body defer releases at each iteration's scope exit" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Canonical per-iteration pairing: the defer fires at the loop body's
@@ -95663,7 +95755,7 @@ test "ZC102: loop-body defer releases at each iteration's scope exit" {
 test "ZC102: tryLock guard-block defer covers the acquired paths" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // On the success path the guard-block defer releases at the block's
@@ -95688,7 +95780,7 @@ test "ZC102: tryLock guard-block defer covers the acquired paths" {
 test "ZC102: branch-scoped defer leaves the non-branch path held" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer fires at the if-block's exit on the c path only; on the
@@ -95711,7 +95803,7 @@ test "ZC102: branch-scoped defer leaves the non-branch path held" {
 test "ZC102: sequential if-blocks holding the lock warn (paths overlap)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Unlike if/else arms, sequential ifs can BOTH execute: the c-and-d
@@ -95735,7 +95827,7 @@ test "ZC102: sequential if-blocks holding the lock warn (paths overlap)" {
 test "ZC102: arm ends when the else chain ends — later if warns (F2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The else arm's plain close ends the sibling chain: the lock taken
@@ -95763,7 +95855,7 @@ test "ZC102: arm ends when the else chain ends — later if warns (F2)" {
 test "ZC102: arm ends after the last switch prong — later if warns (F2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Prong acquires are disjoint from each other but not from what
@@ -95794,7 +95886,7 @@ test "ZC102: arm ends after the last switch prong — later if warns (F2)" {
 test "ZC102: acquire-less middle prong does not break the arm chain (F2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Prongs 0 and else are disjoint paths even with prong 1 between
@@ -95825,7 +95917,7 @@ test "ZC102: acquire-less middle prong does not break the arm chain (F2)" {
 test "ZC102: branch-scoped plain release leaves the non-branch path held (F4)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The unlock runs on the c path only; on the !c path the second lock
@@ -95849,7 +95941,7 @@ test "ZC102: branch-scoped plain release leaves the non-branch path held (F4)" {
 test "ZC102: different receivers never interact" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -95867,7 +95959,7 @@ test "ZC102: different receivers never interact" {
 test "ZC102: double lockShared is a note (recursive read lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // std.Io.RwLock is writer-preferring: a queued writer between the two
@@ -95889,7 +95981,7 @@ test "ZC102: double lockShared is a note (recursive read lock)" {
 test "ZC102: tryLock as second acquire cannot block — silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A tryLock while held just returns false; only a BLOCKING second
@@ -95912,7 +96004,7 @@ test "ZC102: tryLock as second acquire cannot block — silent" {
 test "ZC102: semaphore wait twice is legal (counting semaphore)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // wait is not a lock — a semaphore with count >= 2 waits twice
@@ -95937,7 +96029,7 @@ test "ZC102: semaphore wait twice is legal (counting semaphore)" {
 test "ZC102: lock() text in strings and comments is not an acquire" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // One real acquire; the string and comment carry two more lock()
@@ -95962,7 +96054,7 @@ test "ZC102: lock() text in strings and comments is not an acquire" {
 test "ZC102: type-factory method wrappers are independent fns (mach Objects)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tryLock/lock/unlock methods of a struct built inside a type factory
@@ -95994,7 +96086,7 @@ test "ZC102: type-factory method wrappers are independent fns (mach Objects)" {
 test "ZC102: double lock inside one nested method still warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Control for the boundary reset: two acquires inside ONE nested
@@ -96018,7 +96110,7 @@ test "ZC102: double lock inside one nested method still warns" {
 test "ZC102: bare-block release reads as branch-scoped — the FP-unsafe class (EPH-I0036)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A bare {} block always executes, so the release really clears the
@@ -96046,7 +96138,7 @@ test "ZC102: bare-block release reads as branch-scoped — the FP-unsafe class (
 test "ZC102: multiline else ends the arm chain — arms read as sequential (EPH-I0036)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The arm chain needs `} else {` on one line (the zig fmt form); an
@@ -96095,7 +96187,7 @@ fn expectZC103Counts(
 test "ZC103: unlock with no lock evidence in the file is silent (EPH-I0903)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A release whose receiver never acquires anywhere in the file is an
@@ -96118,7 +96210,7 @@ test "ZC103: unlock with no lock evidence in the file is silent (EPH-I0903)" {
 test "ZC103: identity-gate unlock is an app-domain call, not a release (EPH-I0903)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // skytale http_server_handlers_identity.zig:110 shape: the receiver
@@ -96146,7 +96238,7 @@ test "ZC103: identity-gate unlock is an app-domain call, not a release (EPH-I090
 test "ZC103: nested-fn identity-gate unlock is silent (EPH-I0903)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // skytale client_identity_gate_tests.zig:605 shape: the unlock runs
@@ -96174,7 +96266,7 @@ test "ZC103: nested-fn identity-gate unlock is silent (EPH-I0903)" {
 test "ZC103: cross-fn acquire/release idiom is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zls string_pool shape: the acquire lives in a sibling fn of the
@@ -96197,7 +96289,7 @@ test "ZC103: cross-fn acquire/release idiom is silent" {
 test "ZC103: fn-scope defer unlock after conditional tryLock is a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0033 item 8: the defer registers on every path, so the
@@ -96220,7 +96312,7 @@ test "ZC103: fn-scope defer unlock after conditional tryLock is a warning" {
 test "ZC103: defer inside the tryLock guard block is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The defer one level deeper than the condition-position acquire runs
@@ -96243,7 +96335,7 @@ test "ZC103: defer inside the tryLock guard block is silent" {
 test "ZC103: tryLock as a call argument is not in condition position (EPH-I0440)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `.{ ... }` after the tryLock is an ARGUMENT of the enclosing
@@ -96268,7 +96360,7 @@ test "ZC103: tryLock as a call argument is not in condition position (EPH-I0440)
 test "ZC103: normal lock with defer unlock is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -96288,7 +96380,7 @@ test "ZC103: normal lock with defer unlock is silent" {
 test "ZC103: defer registered before the acquire is silent (fires at exit)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Weird but legal: the defer fires at scope exit, after the acquire
@@ -96309,7 +96401,7 @@ test "ZC103: defer registered before the acquire is silent (fires at exit)" {
 test "ZC103: semaphore post without in-fn wait is the producer shape" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Producers post semaphores they never wait on — `post` is never a
@@ -96328,7 +96420,7 @@ test "ZC103: semaphore post without in-fn wait is the producer shape" {
 test "ZC103: unlock with deferred re-lock is the borrow idiom" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The fn received the lock held, releases it for a slow operation,
@@ -96352,7 +96444,7 @@ test "ZC103: unlock with deferred re-lock is the borrow idiom" {
 test "ZC103: discarded tryLock satisfies the deferred unlock" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `_ = file.tryLock(...) catch return` is the hold-till-close file
@@ -96395,7 +96487,7 @@ fn expectZC104Counts(
 test "ZC104: spawn with no join or detach is a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `_ = t;` silences the unused-const compile error without resolving
@@ -96416,7 +96508,7 @@ test "ZC104: spawn with no join or detach is a warning" {
 test "ZC104: immediate detach is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The ghostty os/open.zig shape: spawn, then detach on the next line.
@@ -96436,7 +96528,7 @@ test "ZC104: immediate detach is silent" {
 test "ZC104: join later in the function is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -96457,7 +96549,7 @@ test "ZC104: join later in the function is silent" {
 test "ZC104: field-stored handle joined elsewhere in the file is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle context.zig shape: context.thread = spawn(...) with the
@@ -96480,7 +96572,7 @@ test "ZC104: field-stored handle joined elsewhere in the file is silent" {
 test "ZC104: returned handle is silent (caller owns the obligation)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tigerbeetle stdx/shell.zig shape: return try std.Thread.spawn(...).
@@ -96499,7 +96591,7 @@ test "ZC104: returned handle is silent (caller owns the obligation)" {
 test "ZC104: spawn passed as a call argument is silent (ownership transfer)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Container-put shape: the handle escapes into the pool, which owns
@@ -96519,7 +96611,7 @@ test "ZC104: spawn passed as a call argument is silent (ownership transfer)" {
 test "ZC104: process spawn is not a thread spawn (child.spawn)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ghostty os/open.zig: exe.spawn() spawns a PROCESS — reaped by
@@ -96542,7 +96634,7 @@ test "ZC104: process spawn is not a thread spawn (child.spawn)" {
 test "ZC104: spawns inside test blocks are not attributed" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Parity with ZC101: thread hygiene in tests is the ZT band's domain.
@@ -96562,7 +96654,7 @@ test "ZC104: spawns inside test blocks are not attributed" {
 test "ZC104: join text in strings and comments is not evidence" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The comment and string both carry t.join() text — if they counted,
@@ -96586,7 +96678,7 @@ test "ZC104: join text in strings and comments is not evidence" {
 test "ZC104: a join in ANOTHER file does not resolve the spawn (EPH-I0443 doc arm)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The documented file-local bound: findSpawnResolution searches the
@@ -96627,7 +96719,7 @@ test "ZC104: a join in ANOTHER file does not resolve the spawn (EPH-I0443 doc ar
 test "ZC104: join text after a mid-line multiline opener is not evidence (EPH-I0444 guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const s = \\ t.join();` — the tail is string data, so the phantom
@@ -96652,7 +96744,7 @@ test "ZC104: join text after a mid-line multiline opener is not evidence (EPH-I0
 test "ZC104: field handle joined through an alias copy is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // tb_client context.zig: `context.thread = spawn(...)` in init, then
@@ -96678,7 +96770,7 @@ test "ZC104: field handle joined through an alias copy is silent" {
 test "ZC104: field-stored handle never joined still warns" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Control for the alias fallback: `self.thread` with no join anywhere
@@ -96701,7 +96793,7 @@ test "ZC104: field-stored handle never joined still warns" {
 test "ZC104: optional handle joined with .?.join() is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // messenger dht_kademlia_ops: `worker.thread = spawn(...) catch ...`
@@ -96725,7 +96817,7 @@ test "ZC104: optional handle joined with .?.join() is silent" {
 test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `.thread = std.Thread.spawn(...)` inside an anonymous struct
@@ -96748,7 +96840,7 @@ test "ZC104: struct-literal field init is an ownership transfer (mach alsa)" {
 test "ZC104: spawn aliased before the call is invisible (EPH-I0036, documented FN)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const spawn = std.Thread.spawn;` then spawn(...) — the call-target
@@ -96771,7 +96863,7 @@ test "ZC104: spawn aliased before the call is invisible (EPH-I0036, documented F
 test "ZC104: last-segment fallback over-suppresses same-named locals (EPH-I0036)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The field-bound handle ctx.thread is searched by its last segment
@@ -96796,7 +96888,7 @@ test "ZC104: last-segment fallback over-suppresses same-named locals (EPH-I0036)
 test "ZC104: dotted-receiver plain join satisfies the field-bound handle (EPH-I0904)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // skytale dht_link_rpc_tests.zig:311 / dht_replication_tests.zig:783
@@ -96823,7 +96915,7 @@ test "ZC104: dotted-receiver plain join satisfies the field-bound handle (EPH-I0
 test "ZC104: dotted-receiver defer join satisfies the field-bound handle (EPH-I0904)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // skytale p2p_core_tests.zig:4871/4878 shape: the handle is bound as
@@ -96848,7 +96940,7 @@ test "ZC104: dotted-receiver defer join satisfies the field-bound handle (EPH-I0
 test "ZC104: test-name/fixture/trailing braces keep block bounds (EPH-I0437)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard pins: the EPH-I0883 literal-aware trackTestBlock already
@@ -96883,7 +96975,7 @@ test "ZC104: test-name/fixture/trailing braces keep block bounds (EPH-I0437)" {
 test "ZC104: brace-carrying test name arms and closes the block exactly once (EPH-I0437)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `test "leaky {" {` arms on the REAL `{` after the name string. The
@@ -96917,7 +97009,7 @@ test "ZC104: brace-carrying test name arms and closes the block exactly once (EP
 test "ZC104: spawn inside an Allman test block is not attributed (EPH-I0924)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Regression pin (fails pre-fix): a brace-less `test "name"` opener
@@ -96949,7 +97041,7 @@ test "ZC104: spawn inside an Allman test block is not attributed (EPH-I0924)" {
 test "ZC104: comment between the Allman opener and its brace keeps the block a test (EPH-I0924)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Regression pin (fails pre-fix): a comment line between the
@@ -96984,7 +97076,7 @@ test "ZC104: comment between the Allman opener and its brace keeps the block a t
 test "ZC101: wrapped signature with .{} default opens the record at the real body (EPH-I0447)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Regression pin (fails pre-fix): the `.{}` default on the wrapped
@@ -97011,7 +97103,7 @@ test "ZC101: wrapped signature with .{} default opens the record at the real bod
 test "ZC101: fn-pointer field never opens a phantom fn span (EPH-I0447)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard pin: findRealFnDef requires an identifier after "fn ", so a
@@ -97040,7 +97132,7 @@ test "ZC101: fn-pointer field never opens a phantom fn span (EPH-I0447)" {
 test "ZC101: quoted-name fn def opens a span, lock calls reach the evaluator (EPH-I0442)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Regression pin (fails pre-fix): `fn @"weird-name"()` never matched
@@ -97063,7 +97155,7 @@ test "ZC101: quoted-name fn def opens a span, lock calls reach the evaluator (EP
 test "ZA202: error-scan test tracking survives brace shapes (EPH-I0921, guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard pin for the updateErrorState trackTestBlock site (:15846).
@@ -97105,7 +97197,7 @@ test "ZA202: error-scan test tracking survives brace shapes (EPH-I0921, guard)" 
 test "ZA103: CFG test tracking survives brace shapes (EPH-I0921, guard)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Guard pin for the analyzeCFGFile trackTestBlock site (:22831).
@@ -97166,7 +97258,7 @@ fn runErrorsCheck(
 test "ZA110: plain ownership-transfer idiom is silent (established pattern)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `var list = ...; return list;` with no armed defer: the local is dead
@@ -97191,7 +97283,7 @@ test "ZA110: plain ownership-transfer idiom is silent (established pattern)" {
 test "ZA110: error-union form with armed defer fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97215,7 +97307,7 @@ test "ZA110: error-union form with armed defer fires" {
 test "ZA110: errdefer deinit is silent (never runs on success path)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97239,7 +97331,7 @@ test "ZA110: errdefer deinit is silent (never runs on success path)" {
 test "ZA110: conditional defer deinit still fires (armed on some path)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97262,7 +97354,7 @@ test "ZA110: conditional defer deinit still fires (armed on some path)" {
 test "ZA110: trailing-comment defer text is not an armed defer (F1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `defer list.deinit();` lives inside a trailing `//` comment —
@@ -97287,7 +97379,7 @@ test "ZA110: trailing-comment defer text is not an armed defer (F1)" {
 test "ZA110: same-line errdefer is not an armed defer (F2)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `errdefer` contains "defer " at offset 3 — a mid-line errdefer must
@@ -97312,7 +97404,7 @@ test "ZA110: same-line errdefer is not an armed defer (F2)" {
 test "ZA110: deferred deinit makes the by-value return a certain dangle" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97335,7 +97427,7 @@ test "ZA110: deferred deinit makes the by-value return a certain dangle" {
 test "ZA110: moveToOwnedSlice return is silent (slice, single owner)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97357,7 +97449,7 @@ test "ZA110: moveToOwnedSlice return is silent (slice, single owner)" {
 test "ZA110: empty-init expression return is silent (no aliasing)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97378,7 +97470,7 @@ test "ZA110: empty-init expression return is silent (no aliasing)" {
 test "ZA110: pointer return type is silent (not a by-value copy)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97399,7 +97491,7 @@ test "ZA110: pointer return type is silent (not a by-value copy)" {
 test "ZA110: field of a local with armed defer fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97423,7 +97515,7 @@ test "ZA110: field of a local with armed defer fires" {
 test "ZA110: self field return is silent (receiver owned by caller)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97447,7 +97539,7 @@ test "ZA110: self field return is silent (receiver owned by caller)" {
 test "ZA110: self field return with exact-path armed defer fires (EPH-I0482)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B11 F8: the locals gate (self is not a tracked local) must
@@ -97478,7 +97570,7 @@ test "ZA110: self field return with exact-path armed defer fires (EPH-I0482)" {
 test "ZA110: self whole-owner return under an armed field stays silent (EPH-I0482)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The F8 fix fires only the exact-path shape: `return self;` while
@@ -97507,7 +97599,7 @@ test "ZA110: self whole-owner return under an armed field stays silent (EPH-I048
 test "ZA110: armed whole-owner defer with field return stays silent (EPH-I1046)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B11 F7: deferPathArmsReturn fires the whole-owner branch only
@@ -97537,7 +97629,7 @@ test "ZA110: armed whole-owner defer with field return stays silent (EPH-I1046)"
 test "ZA110: slice pointee return with armed defer stays silent (EPH-I0485)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // band-B11 F9: the `[` return-type gate excludes slice returns — the
@@ -97580,7 +97672,7 @@ test "containsTypePattern: non-generic patterns need a right boundary (EPH-I0485
 test "ZA110: inline-storage container (EnumSet) by value is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EnumSet is inline storage — copying does NOT alias a heap backing,
@@ -97605,7 +97697,7 @@ test "ZA110: inline-storage container (EnumSet) by value is silent" {
 test "ZA110: multi-line signature with armed defer fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -97741,7 +97833,7 @@ test "ZA110: deferPathArmsReturn resolves copy aliases (EPH-I0480)" {
 test "ZA110: string-literal defer text never arms a phantom defer (EPH-I0475)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `"defer missing"` is a string; `old.deinit()` is an inline call, not
@@ -97767,7 +97859,7 @@ test "ZA110: string-literal defer text never arms a phantom defer (EPH-I0475)" {
 test "ZA110: pre-keyword deinit does not arm the return (EPH-I0476)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `old.deinit()` runs inline before the unrelated defer; `old` is not
@@ -97793,7 +97885,7 @@ test "ZA110: pre-keyword deinit does not arm the return (EPH-I0476)" {
 test "ZA110: every defer-deinit on a line arms (EPH-I0476)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The second same-line defer used to be lost (first-`.deinit(`-only).
@@ -97818,7 +97910,7 @@ test "ZA110: every defer-deinit on a line arms (EPH-I0476)" {
 test "ZA110: multi-line defer block arms (EPH-I0477)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The standard zig-fmt defer-block shape: `defer {` opens, the body
@@ -97847,7 +97939,7 @@ test "ZA110: multi-line defer block arms (EPH-I0477)" {
 test "ZA110: braceless one-line returns fire (EPH-I0478)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `if (c) return list;` never starts with `return `, so the old
@@ -97873,7 +97965,7 @@ test "ZA110: braceless one-line returns fire (EPH-I0478)" {
 test "ZA110: comment return text never fires (EPH-I0478)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A mid-line return scan must keep the comment discipline: the
@@ -97899,7 +97991,7 @@ test "ZA110: comment return text never fires (EPH-I0478)" {
 test "ZA110: struct-default params keep the signature join (EPH-I0479)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `.{}` default truncated the join inside the parens, so
@@ -97925,7 +98017,7 @@ test "ZA110: struct-default params keep the signature join (EPH-I0479)" {
 test "ZA110: joined error-set return with armed defer fires (EPH-I1042)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A wrapped error-set return type (`error{OutOfMemory}!T`) used to
@@ -97954,7 +98046,7 @@ test "ZA110: joined error-set return with armed defer fires (EPH-I1042)" {
 test "ZA110: const copy alias with armed original fires (EPH-I0480)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `out` copies the list header, so the returned copy shares the
@@ -97980,7 +98072,7 @@ test "ZA110: const copy alias with armed original fires (EPH-I0480)" {
 test "ZA110: armed copy alias with bare original return fires (EPH-I0480)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The reverse shape: `c` copies `list`, the defer arms the copy, and
@@ -98007,7 +98099,7 @@ test "ZA110: armed copy alias with bare original return fires (EPH-I0480)" {
 test "ZA110: rebound copy alias never fires (EPH-I0480)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `c = other;` breaks the single-copy link: the defer on `c` frees
@@ -98035,7 +98127,7 @@ test "ZA110: rebound copy alias never fires (EPH-I0480)" {
 test "ZA110: RHS-rebound copy alias never fires (EPH-I1048)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `list = other;` rebinds the alias RHS after the declaration: the
@@ -98075,7 +98167,7 @@ test "ZA110: RHS-rebound copy alias never fires (EPH-I1048)" {
 test "ZA209: error-union fn that never fails fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98096,7 +98188,7 @@ test "ZA209: error-union fn that never fails fires" {
 test "ZA209: single-line body fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98115,7 +98207,7 @@ test "ZA209: single-line body fires" {
 test "ZA209: body with try is silent (real error path)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98138,7 +98230,7 @@ test "ZA209: body with try is silent (real error path)" {
 test "ZA209: inline-enum param keeps the try body in the fn scan (EPH-I0479)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The fixed signature join reaches fns with a brace inside the param
@@ -98168,7 +98260,7 @@ test "ZA209: inline-enum param keeps the try body in the fn scan (EPH-I0479)" {
 test "ZA209: inline-enum param fn that never fails fires (EPH-I0479)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same signature shape, genuinely infallible body (non-shim: six
@@ -98201,7 +98293,7 @@ test "ZA209: inline-enum param fn that never fails fires (EPH-I0479)" {
 test "ZA209: joined error-set return fn that never fails fires (EPH-I1042)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same join class as the ZA110 pin: the error-set brace used to end
@@ -98231,7 +98323,7 @@ test "ZA209: joined error-set return fn that never fails fires (EPH-I1042)" {
 test "ZA209: multi-line error-set return fn that never fails fires (EPH-I1042)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The zig-fmt-wrapped error set spans lines: the join must carry the
@@ -98263,7 +98355,7 @@ test "ZA209: multi-line error-set return fn that never fails fires (EPH-I1042)" 
 test "ZA209: fn-pointer ret leaves the outer fn silent, inner noted (EPH-I1042 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Wrong-victim pin (sig sync/once_cell.zig:194 class): the outer fn
@@ -98308,7 +98400,7 @@ test "ZA209: fn-pointer ret leaves the outer fn silent, inner noted (EPH-I1042 r
 test "ZA209: body with return error is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98328,7 +98420,7 @@ test "ZA209: body with return error is silent" {
 test "ZA209: non-error-union fn is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98349,7 +98441,7 @@ test "ZA209: non-error-union fn is silent" {
 test "ZA209: catch-payload return propagation is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98372,7 +98464,7 @@ test "ZA209: catch-payload return propagation is silent" {
 test "ZA209: multi-line catch block with payload return is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98399,7 +98491,7 @@ test "ZA209: multi-line catch block with payload return is silent" {
 test "ZA209: unreachable body is silent (assertion-style fn)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98419,7 +98511,7 @@ test "ZA209: unreachable body is silent (assertion-style fn)" {
 test "ZA209: unresolved call result return is silent (possible propagation)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `return g();` with g from another module: over-suppressed (note rule,
@@ -98444,7 +98536,7 @@ test "ZA209: unresolved call result return is silent (possible propagation)" {
 test "ZA209: multi-line signature with error-union return fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98468,7 +98560,7 @@ test "ZA209: multi-line signature with error-union return fires" {
 test "ZA209: quoted-name error-union fn reports the quoted name (EPH-I0922)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98501,7 +98593,7 @@ test "ZA209: quoted-name error-union fn reports the quoted name (EPH-I0922)" {
 test "ZA209: error-set member return is silent (return ErrSet.Member idiom)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Corpus FP (abi connector.zig): `return ConnectorError.Timeout;` is a
@@ -98524,7 +98616,7 @@ test "ZA209: error-set member return is silent (return ErrSet.Member idiom)" {
 test "ZA209: namespaced error constant return is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Corpus FP (ghostty cli): `pub const help_error = error.X;` inside an
@@ -98550,7 +98642,7 @@ test "ZA209: namespaced error constant return is silent" {
 test "ZA209: interface shim with discards and constant return is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ghostty KeymapNoop.translate shape: the body is param discards plus
@@ -98575,7 +98667,7 @@ test "ZA209: interface shim with discards and constant return is silent" {
 test "ZA209: single-line interface shim is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98597,7 +98689,7 @@ test "ZA209: single-line interface shim is silent" {
 test "ZA209: inline-enum param shim stays silent (EPH-I1047)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // feedShimLine used the FIRST `{` on the line (paren-blind): an
@@ -98624,7 +98716,7 @@ test "ZA209: inline-enum param shim stays silent (EPH-I1047)" {
 test "ZA209: switch-in-return-type signature body starts (EPH-I1047 r1)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A parenthesized switch in the return type makes the closer line
@@ -98665,7 +98757,7 @@ test "ZA209: literal brace on a >512-byte line cannot close the fn early (EPH-I0
     // literal brace masked.
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const long_line = "    const s = \"" ++ ("x" ** 600) ++ "}\";";
@@ -98690,7 +98782,7 @@ test "ZA209: literal brace on a >512-byte line cannot keep the fn open (EPH-I042
     // closed and its ZA209 note was swallowed.
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const long_line = "    const s = \"" ++ ("x" ** 600) ++ "{\";";
@@ -98717,7 +98809,7 @@ test "ZA209: char-literal brace cannot close the fn early (EPH-I0423 r1)" {
     // closing the fn before its error path and reporting a false ZA209.
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98745,7 +98837,7 @@ test "ZA209: char-literal brace cannot keep the fn open (EPH-I0423 r1)" {
     // and its ZA209 note was swallowed.
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98771,7 +98863,7 @@ test "ZA209: escaped char literal reaches the chunk mask without asserting (EPH-
     // (isInsideLiteral) keeps the ascending assert.
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98797,7 +98889,7 @@ test "ZA209: escaped char literal reaches the chunk mask without asserting (EPH-
 test "ZA209: real infallible computation without discards still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // parseVersion-style real computation: no discards, so the shim
@@ -98824,7 +98916,7 @@ test "ZA209: real infallible computation without discards still fires" {
 test "ZA209: discards plus real call logic still fires (draw class)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // ghostty draw*-style body: an unused-param discard but real computed
@@ -98855,7 +98947,7 @@ test "ZA209: discards plus real call logic still fires (draw class)" {
 test "ZA209: discard of a call result is not a shim discard" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -98878,7 +98970,7 @@ test "ZA209: discard of a call result is not a shim discard" {
 test "ZA209: discards with a computed return still fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Param discards but the return carries computed state — not a noop.
@@ -98901,7 +98993,7 @@ test "ZA209: discards with a computed return still fires" {
 test "ZA209: // try prose never proves an error path (EPH-I0411)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Trailing comments naming try/return error are prose, not evidence:
@@ -98927,7 +99019,7 @@ test "ZA209: // try prose never proves an error path (EPH-I0411)" {
 test "ZA209: labeled-block error path is not scanned — the note fires (EPH-I0040)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // break :blk error.Fail is a real error path, but the scan does not
@@ -98990,7 +99082,7 @@ test "ZA210: catch payload in a trailing comment is prose (EPH-I0417)" {
 test "ZA210: integration through analyzeErrors emits the note" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -99010,7 +99102,7 @@ test "ZA210: integration through analyzeErrors emits the note" {
 
 test "ZA210: off by default; explicit enable turns it on" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var cfg = Config{
@@ -99093,7 +99185,7 @@ fn runIntCastTest(
 
 test "ZA904: off via ZA9 prefix" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     var cfg = testConfig();
@@ -99108,7 +99200,7 @@ test "ZA904: off via ZA9 prefix" {
 test "ZA904: unguarded @intCast fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -99133,7 +99225,7 @@ test "ZA904: unguarded @intCast fires" {
 test "ZA904: comparison guards stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Same-line guard (x < 256) and preceding exit guard (x >= 256 return).
@@ -99159,7 +99251,7 @@ test "ZA904: comparison guards stay silent" {
 test "ZA904: @min clamp and std.math.cast stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -99183,7 +99275,7 @@ test "ZA904: @min clamp and std.math.cast stay silent" {
 test "ZA904: comptime-known literals stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Direct literal arg (not an identifier — skipped) and const-from-literal
@@ -99208,7 +99300,7 @@ test "ZA904: comptime-known literals stay silent" {
 test "ZA904: @truncate without proof fires with data-loss message" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -99230,7 +99322,7 @@ test "ZA904: @truncate without proof fires with data-loss message" {
 test "ZA904: string, comment, and expression forms stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `@intCast(x + 1)` — non-identifier arg, skipped silently (documented).
@@ -99253,7 +99345,7 @@ test "ZA904: string, comment, and expression forms stay silent" {
 test "ZA904: guard for a different variable does not suppress" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The guard bounds z, not the casted x — must still fire (proves the
@@ -99275,7 +99367,7 @@ test "ZA904: guard for a different variable does not suppress" {
 test "ZA904: maxInt guard and testing.expect lines stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     const content =
@@ -99299,7 +99391,7 @@ test "ZA904: maxInt guard and testing.expect lines stay silent" {
 test "ZA904: range-for index casts stay silent, item casts still fire" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `for (0..N) |i|` bounds i to [0, N) — a textual proof. `for (freq) |f|`
@@ -99329,7 +99421,7 @@ test "ZA904: range-for index casts stay silent, item casts still fire" {
 test "ZA904: @min clamp for a different variable does not suppress (EPH-I0510 F26a)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const y = @min(x, 255);` bounds y, not x — the casted x must still
@@ -99352,7 +99444,7 @@ test "ZA904: @min clamp for a different variable does not suppress (EPH-I0510 F2
 test "ZA904: typed-const clamp declaration proves the bound (EPH-I0946)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const c: u8 = @min(x, 255);` clamps c exactly like the untyped
@@ -99375,7 +99467,7 @@ test "ZA904: typed-const clamp declaration proves the bound (EPH-I0946)" {
 test "ZA904: clamp assignment not first on the line proves the bound (EPH-I0946)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The clamp is the first statement and a later statement carries the
@@ -99399,7 +99491,7 @@ test "ZA904: clamp assignment not first on the line proves the bound (EPH-I0946)
 test "ZA904: clamp inside a call argument does not prove the bound (EPH-I0970)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const c = foo(@min(x, 255));` assigns foo's result, not the clamp
@@ -99423,7 +99515,7 @@ test "ZA904: clamp inside a call argument does not prove the bound (EPH-I0970)" 
 test "ZA904: clamp plus an offset does not prove the bound (EPH-I0970)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const c = @min(x, 255) + 1;` can reach 256 — the rhs is not the
@@ -99446,7 +99538,7 @@ test "ZA904: clamp plus an offset does not prove the bound (EPH-I0970)" {
 test "ZA904: string-literal comparisons never prove a bound (EPH-I0510 F26c)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const s = "x < 5";` mentions x and carries a `<` — string data,
@@ -99469,7 +99561,7 @@ test "ZA904: string-literal comparisons never prove a bound (EPH-I0510 F26c)" {
 test "ZA904: range-for index proof does not cross the loop closing brace (EPH-I0510 F26d)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The cast sits after the loop's closing brace: the range-for header
@@ -99493,7 +99585,7 @@ test "ZA904: range-for index proof does not cross the loop closing brace (EPH-I0
 test "ZA904: range-for proof survives a braced multiline string in the loop body (EPH-I0510 F26d)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A multiline string with brace content sits between the header and
@@ -99524,7 +99616,7 @@ test "ZA904: range-for proof survives a braced multiline string in the loop body
 test "ZA904: continuation line after a mid-line string opener stays masked (EPH-I0944)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A `}`-starting continuation line after a mid-line `\\` opener is
@@ -99553,7 +99645,7 @@ test "ZA904: continuation line after a mid-line string opener stays masked (EPH-
 test "ZA904: the ; } string terminator keeps its real brace (EPH-I0944)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `; }` ends the multiline string AND closes the loop body on the
@@ -99580,7 +99672,7 @@ test "ZA904: the ; } string terminator keeps its real brace (EPH-I0944)" {
 test "ZA904: a );-closed string call keeps the code after it code (EPH-I0972)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zig-fmt closes a call whose last argument is a multiline string
@@ -99615,7 +99707,7 @@ test "ZA904: a );-closed string call keeps the code after it code (EPH-I0972)" {
 test "ZA904: a );-closed string call keeps the loop close real (EPH-I0972)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The `);` closer is code, so the loop's own `}` below it still
@@ -99648,7 +99740,7 @@ test "ZA904: a );-closed string call keeps the loop close real (EPH-I0972)" {
 test "ZA904: a };-closed string array keeps the code after it code (EPH-I0972)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // zig-fmt closes a container whose last element is a multiline
@@ -99677,7 +99769,7 @@ test "ZA904: a };-closed string array keeps the code after it code (EPH-I0972)" 
 test "ZA904: a clamp rhs on the next line loses the proof — pinned residual (EPH-I0971)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const c = @min(x,` / `255);` — the clamp rhs continues on the
@@ -99706,7 +99798,7 @@ test "ZA904: a clamp rhs on the next line loses the proof — pinned residual (E
 test "ZA904: a bare } container close on its own line keeps the loop close real (EPH-I0973)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // A multiline-string array element list closed by a bare `}` on its
@@ -99739,7 +99831,7 @@ test "ZA904: a bare } container close on its own line keeps the loop close real 
 test "ZA904: broken ) } continuations in invalid regions stay masked (EPH-I0974)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // `const msg = \\usage` then `) } weird` (or `} ;`) is invalid Zig
@@ -103009,7 +103101,7 @@ test {
 
 test "buildCFG: else-if condition line attributes to the condition header" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0102: the `} else if (cond) {` line ran into the closing arm
@@ -103043,7 +103135,7 @@ test "buildCFG: else-if condition line attributes to the condition header" {
 
 test "buildCFG: multi-line condition continuations attribute to the origin block" {
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0102: the guard condition spans lines 4-7, so lines 5-6 are
@@ -103074,7 +103166,7 @@ test "buildCFG: multi-line condition continuations attribute to the origin block
 test "ZA607: multi-line guard condition fills cover post-guard reads" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // Flow mainview/Project shape (EPH-I0102 A/B): extracts inside a
@@ -103114,7 +103206,7 @@ test "ZA607: multi-line guard condition fills cover post-guard reads" {
 test "ZA607: string brace in a conditional body does not suppress the read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0107: the `{` inside the string literal paid off the backward
@@ -103145,7 +103237,7 @@ test "ZA607: string brace in a conditional body does not suppress the read" {
 test "ZA607: string brace in the if condition does not suppress the read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0107: the `{` inside the condition string read as the block
@@ -103178,7 +103270,7 @@ test "ZA607: string brace in the if condition does not suppress the read" {
 test "ZA607: string brace after the fill does not suppress the read" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0107: the fill precedes the string line. The backward walk still
@@ -103209,7 +103301,7 @@ test "ZA607: string brace after the fill does not suppress the read" {
 test "ZA607: conditional fill without string content fires" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0107 control: the same shape minus the string. Locks the
@@ -103238,7 +103330,7 @@ test "ZA607: conditional fill without string content fires" {
 test "ZA607: same-line if/else with else-arm fill only is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0111: the if arm does not fill x, so the c-true path reads
@@ -103265,7 +103357,7 @@ test "ZA607: same-line if/else with else-arm fill only is detected" {
 test "ZA607: if-arm close sharing a line with a statement before else is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0111: `_ = c; } else {` puts a statement and the if-arm close
@@ -103296,7 +103388,7 @@ test "ZA607: if-arm close sharing a line with a statement before else is detecte
 test "ZA607: same-line if/else with fills in both arms is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0111 regression lock: every path fills x before the read, so
@@ -103322,7 +103414,7 @@ test "ZA607: same-line if/else with fills in both arms is silent" {
 test "ZA607: same-line braced if with same-line read is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0111: the read shares the line with a no-else one-line if.
@@ -103350,7 +103442,7 @@ test "ZA607: same-line braced if with same-line read is detected" {
 test "ZA607: if-arm close sharing a line with its last fill is detected" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0111: `x = 1; }` puts the arm's last fill and the close on one
@@ -103379,7 +103471,7 @@ test "ZA607: if-arm close sharing a line with its last fill is detected" {
 test "ZA607: one-line switch with else prong is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0111: the else prong makes the switch exhaustive, so every
@@ -103406,7 +103498,7 @@ test "ZA607: one-line switch with else prong is silent" {
 test "ZA607: one-line enum switch without else prong is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // EPH-I0111: the two prongs cover the whole enum, so every path
@@ -103982,7 +104074,7 @@ test "writeCodeSnippet neutralizes fence sequences in source lines" {
 test "ZT101: control bytes in a test name are sanitized at print time" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
     // The test name carries ESC and CR bytes raw, as a hostile repo file
@@ -104172,7 +104264,7 @@ fn makeTestIssue(file: []const u8) Issue {
 test "parseFmtOutput findings own their file bytes after the source frees" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

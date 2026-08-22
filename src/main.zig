@@ -41264,10 +41264,13 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
 }
 
 /// Split the merged CFG list into the memory, null-safety, and panic
-/// report buckets (dropping the ZA2 duplicates analyzeErrors owns). The
-/// ZA2-ownership test pins the assumption: it proves analyzeErrors and
-/// analyzeIgnoredErrors emit every ZA2 class the drop would swallow,
-/// while the CFG list carries none (EPH-I0174).
+/// report buckets, dropping the ZA2 items the CFG error tier emits
+/// (ZA202/ZA203, runCFGSafetyAnalyses → analyzeCFGErrors): analyzeErrors
+/// re-emits each one at the same (file, line), so keeping them here
+/// would double-print. The ZA2-ownership test pins the twin assumption
+/// — every dropped CFG ZA2 must have a same-(file, line, rule) twin in
+/// the errors list — and that the drop is the only thing keeping ZA2
+/// out of the buckets (EPH-I0174).
 fn filterMemIssues(alloc: Allocator, items: []const Issue) !FilteredMemIssues {
     var filtered = FilteredMemIssues{
         .mem_only = .empty,
@@ -42519,18 +42522,20 @@ test "AST skip note stays off the JSON machine stream (EPH-I0213)" {
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
 }
 
-test "check ZA2 ownership: error analyzers cover every class, CFG drops none (EPH-I0174)" {
+test "check ZA2 ownership: every dropped CFG ZA2 has an errors twin (EPH-I0174)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // One file with every ZA2 trigger shape the error analyzers emit
-    // (ZA201/204/206/209/210 by analyzeErrors, ZA205 by
-    // analyzeIgnoredErrors). filterMemIssues drops ZA2 items from the
-    // CFG memory list on the "analyzeErrors covers them" assumption; this
-    // test pins both halves of that assumption: the error analyzers own
-    // every class, and the CFG list carries none to drop.
+    // One file with every ZA2 trigger shape the analyzers emit: the six
+    // line-based classes (ZA201/204/206/209/210 by analyzeErrors, ZA205
+    // by analyzeIgnoredErrors) plus the two the CFG error tier emits
+    // (ZA202 catch unreachable, ZA203 orelse unreachable, via
+    // runCFGSafetyAnalyses → analyzeCFGErrors). filterMemIssues drops
+    // CFG-list ZA2 items because analyzeErrors re-emits each one at the
+    // same (file, line); this test pins that twin assumption and the
+    // drop mechanism on a live CFG-ZA2 input.
     const content =
         \\const std = @import("std");
         \\fn mayFail() !void {
@@ -42558,11 +42563,19 @@ test "check ZA2 ownership: error analyzers cover every class, CFG drops none (EP
         \\fn verboseTry() !void {
         \\    mayFail() catch |e| return e;
         \\}
+        \\fn catchesUnreachable() void {
+        \\    const v = mayFail() catch unreachable;
+        \\    _ = v;
+        \\}
+        \\fn orelseUnreachable(p: ?*u8) u8 {
+        \\    const x = p orelse unreachable;
+        \\    return x.*;
+        \\}
     ;
     var run = try runErrorsCheck(&diag, allocator, "za2_ownership.zig", content);
     defer run.deinit(allocator);
 
-    // Half one: analyzeErrors emits every class it owns.
+    // Half one: the line-based error analyzers emit every class they own.
     try std.testing.expectEqual(
         @as(usize, 1),
         countRuleIssues(run.issues.items, "za2_ownership.zig", RULE_SILENT_CATCH),
@@ -42593,12 +42606,44 @@ test "check ZA2 ownership: error analyzers cover every class, CFG drops none (EP
         countRuleIssues(ignored.items, "za2_ownership.zig", RULE_IGNORED_ERROR),
     );
 
-    // Half two: the CFG memory list carries no ZA2 item, so
-    // filterMemIssues' ZA2 drop never swallows a finding. A future CFG
-    // emitter adding a ZA2 class breaks this assertion and forces the
-    // accounting question the drop bypasses.
+    // Half two: the CFG list CAN carry ZA2 items — the CFG error tier
+    // emits ZA202/ZA203 on this fixture — and filterMemIssues drops
+    // them. Pin both halves of the drop's contract: every dropped CFG
+    // ZA2 item has a same-(file, line, rule) twin in the errors list,
+    // and the drop is the only thing keeping ZA2 out of the buckets.
     var cfg_issues = try analyzeCFGMemory(allocator, &run.graph);
     defer deinitIssues(&cfg_issues, allocator);
+
+    // Positive control: the fixture triggers both CFG ZA2 emitters, so
+    // the twin and bucket assertions below run on a non-empty input.
+    try std.testing.expect(countRuleIssues(
+        cfg_issues.items,
+        "za2_ownership.zig",
+        RULE_CATCH_UNREACHABLE,
+    ) > 0);
+    try std.testing.expect(countRuleIssues(
+        cfg_issues.items,
+        "za2_ownership.zig",
+        RULE_ORELSE_UNREACHABLE,
+    ) > 0);
+
+    for (cfg_issues.items) |cfg_issue| {
+        if (!mem.startsWith(u8, cfg_issue.rule, "ZA2")) continue;
+        var twin = false;
+        for (run.issues.items) |err_issue| {
+            if (mem.eql(u8, err_issue.rule, cfg_issue.rule) and
+                mem.eql(u8, err_issue.file, cfg_issue.file) and
+                err_issue.line == cfg_issue.line)
+            {
+                twin = true;
+                break;
+            }
+        }
+        // A CFG-only ZA2 class would vanish in the drop: the errors twin
+        // is what keeps the finding visible (EPH-I0174).
+        try std.testing.expect(twin);
+    }
+
     var filtered = try filterMemIssues(allocator, cfg_issues.items);
     defer filtered.deinit(allocator);
     for (filtered.mem_only.items) |issue|

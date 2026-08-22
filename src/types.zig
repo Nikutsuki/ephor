@@ -766,6 +766,10 @@ pub const FileAnalysis = struct {
     has_tests: bool,
     pub_function_count: usize,
     line_count: usize,
+    /// True when the head carries a generated-file banner (EPH-I1062).
+    /// ZA701 and ZA703 stay silent on generated files; every other
+    /// analyzer keeps full coverage.
+    is_generated: bool,
 
     pub fn deinit(self: *FileAnalysis, allocator: Allocator) void {
         allocator.free(self.path);

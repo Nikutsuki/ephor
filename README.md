@@ -362,6 +362,20 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | **ZA501** | warning | ON | Orphan file (not imported from entry points) |
 | **ZA502** | warning | ON | File reaches or exceeds the 10 MiB source read cap and is skipped from analysis (split the file into smaller units) |
 
+**ZA501 and the build graph:** build.zig contributes reachability
+through its `b.path("...")` references — test roots and tools that
+nothing `@import`s are alive only because build.zig compiles them.
+When the scan tree lacks a readable build.zig (a scratch copy that
+omits it, a broken symlink), ephor cannot see those compile roots, and
+ZA501 would misreport them as orphans. In that build-blind mode ZA501
+applies a conservative rule: it skips any file that some analyzed file
+imports, and any file that declares `pub fn main` (a main is only
+compilable as a root module, so it is root-surface evidence). The rule
+silences the false-positive class; it never fires new findings. A dead
+file that nothing imports and that carries no main still fires. When
+ephor reads build.zig, normal reachability applies unchanged
+(EPH-I1060).
+
 ### Formatting (ZA6xx)
 
 | Rule | Severity | Default | Description |
@@ -409,6 +423,27 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 **ZA703 fire surface:** ZA703 fires on error-set member declarations only — the body of an `error{...}` set, whether a named const or an inline set in a signature or type. Use sites of an error value are never flagged: a used error value cannot be restyled per site, and renaming the set is a cross-tree refactor unrelated to the change that triggered the hit (EPH-I1075).
 
 **ZA703 exemptions:** `extern fn` declarations are exempt — their names are ABI-fixed (`export fn` names are NOT exempt — they are project-chosen identifiers). Identifiers on the right-hand side of error-set composition (`error{ a, b } || other.Error`) are references to other error sets, not members, and are not checked. Variables are judged by declaration kind: `var` is always `snake_case`, even when its value is a function reference.
+
+#### Generated files
+
+A file whose head (first two non-empty lines) carries one of these
+banner tokens inside a comment is treated as generated:
+
+- `Code generated` (protoc-gen-zig style)
+- `AUTO-GENERATED` (ClockHelper-zig style)
+- `DO NOT EDIT` (sig wycheproof, ghostty nerd-font, zls Config.zig style)
+
+ZA701 (line length) and ZA703 (naming) stay silent on generated files:
+the generator chose the names and line shapes, and the project cannot
+restyle them by hand. Every other analyzer keeps full coverage
+(EPH-I1062). The banner must sit in the head — a prose mention later
+in the file does not mark a file generated.
+
+Generated trees that carry no banner (libqt6zig's Qt bindings, for
+example) are an accepted corpus cost: put the generated directories in
+`exclude` in `ephor.json` when the project wants them out of the
+report. Banner detection cannot serve marker-less trees, and no
+path-class heuristic is grounded for them.
 
 ### Null Safety (ZA8xx)
 

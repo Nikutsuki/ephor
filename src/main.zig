@@ -12881,6 +12881,12 @@ const ImportGraph = struct {
     /// every analyzer and orphan detection with no warning. Owned dupes,
     /// freed in deinit.
     skipped_files: std.ArrayListUnmanaged([]const u8),
+    /// True when markBuildPathReferences read a build.zig's content in
+    /// this run (EPH-I1060). False means the build graph is invisible —
+    /// the tree lacks a readable build.zig — and ZA501 must fall back to
+    /// the conservative liveness rule instead of trusting reachability
+    /// that cannot see b.path() compile roots.
+    build_zig_read: bool,
 
     fn init(allocator: Allocator, diag: *DiagCtx) ImportGraph {
         return .{
@@ -12894,6 +12900,7 @@ const ImportGraph = struct {
             .marked_dirs = .empty,
             .walked_file_inodes = .empty,
             .skipped_files = .empty,
+            .build_zig_read = false,
         };
     }
 
@@ -13113,6 +13120,7 @@ const ImportGraph = struct {
             .has_tests = has_tests,
             .pub_function_count = pub_fn_count,
             .line_count = types.countLines(content),
+            .is_generated = detectGeneratedHeader(content),
         };
         content_owned = false;
         pair_owned = false;
@@ -13560,6 +13568,11 @@ const ImportGraph = struct {
                 max_source_file_bytes,
             ) catch continue;
             defer self.allocator.free(content);
+            // A successfully read build.zig makes the build graph visible
+            // (EPH-I1060): the b.path() channel below can now see compile
+            // roots, so ZA501 may trust the reachability it produces.
+            if (mem.eql(u8, std.fs.path.basename(path), "build.zig"))
+                self.build_zig_read = true;
             try self.scanContentBuildPathRefs(content, build_root);
         }
 
@@ -13866,6 +13879,67 @@ const ImportGraph = struct {
         return null;
     }
 
+    /// True when `content` declares `pub fn main` at a code position
+    /// (EPH-I1060). A main is only compilable as a root module, so in a
+    /// build.zig-blind scan it is root-surface evidence: build.zig must
+    /// reference the file for the main to exist at all. The word boundary
+    /// after "main" keeps `pub fn mainOld` from counting; a `pub fn main`
+    /// method inside a container type also counts — the documented bound
+    /// of this probe (conservative: it only silences ZA501, never fires).
+    fn contentDeclaresMain(content: []const u8) bool {
+        const tag = "pub fn main";
+        var lines = mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            var from: usize = 0;
+            while (findTagInCode(line, tag, from)) |idx| {
+                const after = idx + tag.len;
+                if (after == line.len or !isIdent(line[after])) return true;
+                from = after;
+            }
+        }
+        return false;
+    }
+
+    /// Fill `targets` with the resolved path of every @import an analyzed
+    /// file records (EPH-I1060). The keys are borrowed: they alias the
+    /// ImportInfo slices owned by `files`, so the map holds nothing to
+    /// free.
+    fn collectImportedTargets(
+        self: *ImportGraph,
+        targets: *std.StringHashMapUnmanaged(void),
+    ) void {
+        var iter = self.files.iterator();
+        while (iter.next()) |f| {
+            for (f.value_ptr.imports.items) |imp| {
+                self.tryRecordImportTarget(targets, imp.resolved);
+            }
+        }
+    }
+
+    /// Record one resolved import target. A put failure means a missed
+    /// skip, never a crash (EPH-I1060): the conservative rule can only
+    /// silence ZA501, and a missed silence is the pre-fix behavior.
+    fn tryRecordImportTarget(
+        self: *ImportGraph,
+        targets: *std.StringHashMapUnmanaged(void),
+        resolved: ?[]const u8,
+    ) void {
+        const r = resolved orelse return;
+        targets.put(self.allocator, r, {}) catch return;
+    }
+
+    /// Conservative-liveness verdict for a candidate ZA501 target
+    /// (EPH-I1060): true when some analyzed file imports it, or when it
+    /// declares pub fn main. Consulted only while the build graph is
+    /// invisible, where reachability cannot see b.path() compile roots.
+    fn conservativeLiveness(
+        a: FileAnalysis,
+        imported: *const std.StringHashMapUnmanaged(void),
+    ) bool {
+        if (contentDeclaresMain(a.content)) return true;
+        return imported.contains(a.resolved_path);
+    }
+
     fn getOrphanIssues(
         self: *ImportGraph,
         allocator: Allocator,
@@ -13873,6 +13947,17 @@ const ImportGraph = struct {
     ) !std.ArrayListUnmanaged(Issue) {
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
         errdefer deinitIssues(&issues, allocator);
+
+        // EPH-I1060: when the build graph is invisible (no build.zig was
+        // read), reachability under-approximates — files only build.zig
+        // references (b.path() compile roots and their @import closures)
+        // read as orphans. The conservative rule skips a candidate when
+        // some analyzed file imports it, or when it declares pub fn main:
+        // root-surface evidence no dead file produces by accident.
+        var imported_targets: std.StringHashMapUnmanaged(void) = .empty;
+        if (!self.build_zig_read) self.collectImportedTargets(&imported_targets);
+        defer imported_targets.deinit(self.allocator);
+
         var iter = self.files.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
@@ -13882,6 +13967,9 @@ const ImportGraph = struct {
 
             // Use cached resolved_path instead of per-iteration realpath.
             if (self.reachable.contains(entry.value_ptr.resolved_path)) continue;
+            if (!self.build_zig_read and
+                conservativeLiveness(entry.value_ptr.*, &imported_targets))
+                continue;
             try issues.append(allocator, .{
                 .file = key,
                 .line = 1,
@@ -23733,6 +23821,46 @@ fn reportLineTooLong(
     });
 }
 
+/// Canonical generated-file banner tokens (EPH-I1062). Each token is
+/// grounded in a corpus file header verified live on 2026-08-22:
+/// - "Code generated": protoc-gen-zig output
+///   (`// Code generated by protoc-gen-zig`, sig conformance v1.pb.zig)
+/// - the ClockHelper-zig clocktrees auto-generated marker (`//` plus the
+///   table's second token plus ` FILE. DO NOT MODIFY.`)
+/// - "DO NOT EDIT": sig wycheproof.zig (`//! DO NOT EDIT! ...`),
+///   ghostty nerd_font_attributes.zig (`//! DO NOT EDIT BY HAND!`), and
+///   zls src/Config.zig (generated by src/tools/config_gen.zig)
+/// libqt6zig's generated bindings carry no banner; that class stays an
+/// accepted corpus cost (README "Generated files", EPH-I1062).
+const generated_banner_tokens = [_][]const u8{
+    "Code generated",
+    "AUTO-" ++ "GENERATED",
+    "DO NOT EDIT",
+};
+
+/// True when `content` carries a generated-file banner in its head: one
+/// of `generated_banner_tokens` inside a comment among the first two
+/// non-empty lines. Every banner verified in the corpus sits on line 1
+/// or 2; the two-line window keeps a prose mention on line 3 or later
+/// from marking hand-written code generated, and the comment-line
+/// requirement keeps a string literal on line one from matching. Both
+/// bounds are pinned by the EPH-I1062 test.
+fn detectGeneratedHeader(content: []const u8) bool {
+    var seen: usize = 0;
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        if (seen >= 2) return false;
+        seen += 1;
+        if (!mem.startsWith(u8, t, "//")) continue;
+        for (generated_banner_tokens) |token| {
+            if (mem.indexOf(u8, t, token) != null) return true;
+        }
+    }
+    return false;
+}
+
 /// Per-file style scan: ZA701 line length, ZA702 file size. ZA701 keeps its
 /// own narrower line skip (only multiline strings) so long comment lines
 /// still count toward line length.
@@ -23747,6 +23875,12 @@ fn analyzeStyleFile(
     // ZA702: File too long (off by default, enable with --enable=ZA702)
     if (a.content.len > th.max_file_bytes)
         try reportFileTooLong(ctx, a.content.len, th.max_file_bytes);
+
+    // Generated files skip ZA701 (EPH-I1062): the banner says the bytes
+    // came from a generator, so line-length findings are noise the
+    // project cannot fix by hand. ZA702 stays active — an oversized
+    // generated file is still a real corpus cost.
+    if (a.is_generated) return;
 
     var line_num: usize = 1;
     var lines = mem.splitScalar(u8, a.content, '\n');
@@ -24422,6 +24556,10 @@ fn analyzeNaming(
     var iter = graph.files.iterator();
 
     while (iter.next()) |entry| {
+        // Generated files skip ZA703 (EPH-I1062): machine-chosen names
+        // (qmediaformat, New/New2/New3 in libqt6zig's bindings) are not
+        // restylable by the project that ships the generator output.
+        if (entry.value_ptr.is_generated) continue;
         try analyzeNamingFile(&issues, allocator, entry.value_ptr.*, error_naming);
     }
     return issues;
@@ -42021,6 +42159,7 @@ fn addChainNode(graph: *ImportGraph, i: usize, next: ?usize) !void {
         .has_tests = false,
         .pub_function_count = 0,
         .line_count = 0,
+        .is_generated = false,
     };
     errdefer analysis.deinit(allocator);
     if (next) |j| {
@@ -43038,6 +43177,123 @@ test "extractBareImports still records a real bare @import (EPH-I0227)" {
     try graph.markReachable(entry);
 
     try std.testing.expect(graph.reachable.contains(real));
+}
+
+// ============================================================================
+// EPH-I1060: build.zig-blind orphan verdicts
+// ============================================================================
+
+test "build.zig-blind orphan scan skips main roots and imported modules (EPH-I1060)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The skytale scratch shape (verified 2026-08-22, probe .tmp/b57d):
+    // a tree whose build.zig is absent. probe_main is a compile root only
+    // build.zig references, compat is its @import, dead is imported by
+    // nothing. With the build graph invisible, reachability cannot see
+    // the b.path() root, so pre-fix all three fired ZA501.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "const util = @import(\"util.zig\");\n" ++
+            "pub fn main() void { _ = util; }\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "util.zig", .data = "pub const v: u32 = 1;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "probe_main.zig",
+        .data = "const compat = @import(\"compat.zig\");\n" ++
+            "pub fn main() void { _ = compat; }\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "compat.zig", .data = "pub const shim = 1;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dead.zig", .data = "pub const d = 1;\n" });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
+    defer allocator.free(entry);
+    const util = try tmpFilePath(allocator, &tmp, "util.zig");
+    defer allocator.free(util);
+    const probe = try tmpFilePath(allocator, &tmp, "probe_main.zig");
+    defer allocator.free(probe);
+    const compat_path = try tmpFilePath(allocator, &tmp, "compat.zig");
+    defer allocator.free(compat_path);
+    const dead = try tmpFilePath(allocator, &tmp, "dead.zig");
+    defer allocator.free(dead);
+    try graph.analyzeFile(entry);
+    try graph.analyzeFile(util);
+    try graph.analyzeFile(probe);
+    try graph.analyzeFile(compat_path);
+    try graph.analyzeFile(dead);
+    try graph.markReachable(entry);
+
+    // Production flow: the build ref scan finds no build.zig (the tmp
+    // tree has none), so build_zig_read stays false and the conservative
+    // rule engages.
+    var cfg = testConfig();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    cfg.path = root;
+    try graph.markBuildPathReferences(&cfg);
+
+    var issues = try graph.getOrphanIssues(allocator, &cfg);
+    defer deinitIssues(&issues, allocator);
+    // util rides entry's closure. probe_main carries pub fn main (root
+    // surface) and compat is imported by an analyzed file — both are
+    // conservative-live. Only dead, imported by nobody and without a
+    // main, still fires.
+    try std.testing.expect(!hasOrphanIssue(issues.items, probe));
+    try std.testing.expect(!hasOrphanIssue(issues.items, compat_path));
+    try std.testing.expect(!hasOrphanIssue(issues.items, util));
+    try std.testing.expect(hasOrphanIssue(issues.items, dead));
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+}
+
+test "dead main still fires when the build graph is visible (EPH-I1060)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The gate pin: the conservative rule engages ONLY when no build.zig
+    // was read. With build.zig present and reachable, a main that the
+    // build file never references is genuinely dead and must fire.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void { _ = b; }\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dead_main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const entry = try tmpFilePath(allocator, &tmp, "entry.zig");
+    defer allocator.free(entry);
+    const dead = try tmpFilePath(allocator, &tmp, "dead_main.zig");
+    defer allocator.free(dead);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{root});
+    // The map takes ownership of the key; the pin must not free it again.
+    try graph.analyzeFile(entry);
+    try graph.analyzeFile(dead);
+    try graph.markReachable(entry);
+    try graph.reachable.put(build_path, {});
+
+    var cfg = testConfig();
+    cfg.path = root;
+    try graph.markBuildPathReferences(&cfg);
+
+    var issues = try graph.getOrphanIssues(allocator, &cfg);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expect(hasOrphanIssue(issues.items, dead));
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
 }
 
 test "build-path scanners ignore refs inside strings (EPH-I0227)" {
@@ -45081,6 +45337,7 @@ fn createTestFileAnalysis(
         .has_tests = false,
         .pub_function_count = 0,
         .line_count = countLines(content),
+        .is_generated = detectGeneratedHeader(content),
     };
 }
 
@@ -79678,6 +79935,89 @@ test "visibleLengthExcludingStrings does not treat '\"' char literal as a string
     const mixed = "    if (c == '\"') return \"" ++ "x" ** 100 ++ "\";";
     try std.testing.expect(calculateVisibleLength(mixed) > 100);
     try std.testing.expectEqual(@as(usize, 28), visibleLengthExcludingStrings(mixed));
+}
+
+// ============================================================================
+// EPH-I1062: generated-file banner detection
+// ============================================================================
+
+test "generated-file banner silences ZA701 and ZA703 (EPH-I1062)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Real corpus shape (sig v2/lib/crypto/ed25519/wycheproof.zig): a
+    // `//! DO NOT EDIT` head banner over generated content. The camelCase
+    // const (should be snake_case) and the over-long line both fire on
+    // hand-written code; the banner marks the file generated and silences
+    // both. The twin without a banner is the control.
+    const generated =
+        "//! DO NOT EDIT! File generated by `gen_tool.zig`.\n" ++
+        "const badName = 1;\n" ++
+        "const line = " ++ ("x" ** 130) ++ ";\n";
+    const hand_written =
+        "const badName = 1;\n" ++
+        "const line = " ++ ("x" ** 130) ++ ";\n";
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const gen = try createTestFileAnalysis(allocator, "gen.zig", generated);
+    try graph.files.put(gen.path, gen);
+    const plain = try createTestFileAnalysis(allocator, "plain.zig", hand_written);
+    try graph.files.put(plain.path, plain);
+
+    var style = try analyzeStyle(allocator, &graph, .{});
+    defer deinitIssues(&style, allocator);
+    var naming = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&naming, allocator);
+
+    for (style.items) |issue| {
+        try std.testing.expect(!mem.eql(u8, issue.file, "gen.zig"));
+    }
+    for (naming.items) |issue| {
+        try std.testing.expect(!mem.eql(u8, issue.file, "gen.zig"));
+    }
+    // The control still fires both rules: the banner, not the content,
+    // drives the silence.
+    var control_style: usize = 0;
+    var control_naming: usize = 0;
+    for (style.items) |issue| {
+        if (mem.eql(u8, issue.file, "plain.zig")) control_style += 1;
+    }
+    for (naming.items) |issue| {
+        if (mem.eql(u8, issue.file, "plain.zig")) control_naming += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), control_style);
+    try std.testing.expectEqual(@as(usize, 1), control_naming);
+}
+
+test "banner tokens past the head do not mark a file generated (EPH-I1062)" {
+    // The detector reads only the first two non-empty lines: a prose
+    // mention mid-file (zls src/tools/config_gen.zig documents generating
+    // src/Config.zig far below the head) must not mark hand-written code
+    // generated.
+    const content =
+        "const std = @import(\"std\");\n" ++
+        "pub fn main() void {}\n" ++
+        "// NOTE: the deploy step regenerates the config below. DO NOT EDIT it by hand.\n" ++
+        "const BadName = 1;\n";
+    try std.testing.expect(!detectGeneratedHeader(content));
+
+    // A string literal on line one carrying a token is data, not a banner.
+    const string_head =
+        "const s = \"DO NOT EDIT\";\n" ++
+        "const BadName = 1;\n";
+    try std.testing.expect(!detectGeneratedHeader(string_head));
+
+    // Each canonical token does fire inside a head comment.
+    try std.testing.expect(detectGeneratedHeader("// Code generated by protoc-gen-zig\nconst x = 1;\n"));
+    try std.testing.expect(detectGeneratedHeader("//" ++ "AUTO-" ++ "GENERATED FILE. DO NOT MODIFY.\nconst x = 1;\n"));
+    try std.testing.expect(detectGeneratedHeader("//! DO NOT EDIT\nconst x = 1;\n"));
+    // Beyond the second non-empty line the token is inert.
+    try std.testing.expect(!detectGeneratedHeader(
+        "// header\n// second\n//! DO NOT EDIT\nconst x = 1;\n",
+    ));
 }
 
 test "ZA701 exempts lines over-length solely due to string literals" {

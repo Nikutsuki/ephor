@@ -269,32 +269,46 @@ fi
 # Detect Zig version and pick compatible ephor version
 ZIG_VERSION=$(zig version 2>/dev/null || echo "")
 EPHOR_URL=""
+# Print the undetectable-version warning and resolve the latest tag
+# (EPH-I0630). The garbage-shape arm and the non-numeric component arm
+# share this helper.
+warn_bad_zig_version() {
+    echo "warning: could not parse the zig version '${ZIG_VERSION}', defaulting to latest" >&2
+    EPHOR_TAG=$(resolve_ephor_tag)
+}
 # EPH-I0630: the integer tests below need numeric components. The old
 # code tested unparsed version text, printed two "Illegal number" lines
 # on garbage, and silently pinned the 0.15-era release even on systems
-# running Zig 0.16+. The case globs gate the tests: a non-numeric
-# version counts as undetectable and takes the latest-tag path with a
-# warning. Real zig version output always has two dots.
+# running Zig 0.16+. The outer glob gates only the shape (a glob * is a
+# wildcard, not a digit repetition, so "1a.2b.3c" passes it), so the
+# components get a second gate: a non-numeric component counts as
+# undetectable and takes the latest-tag path with a warning.
 case "$ZIG_VERSION" in
     [0-9]*.[0-9]*.*)
         ZIG_MAJOR=$(printf '%s\n' "$ZIG_VERSION" | cut -d. -f1)
         ZIG_MINOR=$(printf '%s\n' "$ZIG_VERSION" | cut -d. -f2)
-        # Zig 0.16.0 and later track the latest ephor release. Zig 0.15.x
-        # uses the pinned 0.15-era release by commit hash.
-        if [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
-            EPHOR_TAG=$(resolve_ephor_tag)
-        else
-            EPHOR_TAG="v0.11.13"
-            EPHOR_URL="${REPO}/archive/${EPHOR_0_15_COMMIT}.tar.gz"
-        fi
+        case "$ZIG_MAJOR$ZIG_MINOR" in
+            *[!0-9]*)
+                warn_bad_zig_version
+                ;;
+            *)
+                # Zig 0.16.0 and later track the latest ephor release. Zig
+                # 0.15.x uses the pinned 0.15-era release by commit hash.
+                if [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
+                    EPHOR_TAG=$(resolve_ephor_tag)
+                else
+                    EPHOR_TAG="v0.11.13"
+                    EPHOR_URL="${REPO}/archive/${EPHOR_0_15_COMMIT}.tar.gz"
+                fi
+                ;;
+        esac
         ;;
     '')
         echo "warning: could not detect zig version, defaulting to latest" >&2
         EPHOR_TAG=$(resolve_ephor_tag)
         ;;
     *)
-        echo "warning: could not parse the zig version '${ZIG_VERSION}', defaulting to latest" >&2
-        EPHOR_TAG=$(resolve_ephor_tag)
+        warn_bad_zig_version
         ;;
 esac
 
@@ -469,8 +483,12 @@ else
     # statement. EPH-I0626: the search anchors to code lines, so a
     # comment that mentions installArtifact cannot win. The insert line
     # extends forward to the statement terminator, so a multi-line call
-    # is not split. Boundary: a statement body that carries a semicolon
-    # on its own line (a labeled block) ends the scan early.
+    # is not split. Boundaries: a statement body that carries a
+    # semicolon on its own line (a labeled block) ends the scan early.
+    # A trailing line comment after the terminator
+    # (b.installArtifact(exe); // note) masks the semicolon match: the
+    # block then lands after the next semicolon line, which is still
+    # valid Zig, or the install refuses when no semicolon line follows.
     echo "Adding ephor build steps to build.zig..."
 
     LINE=$(grep -nE '^[[:space:]]*[^/.\\[:space:]].*installArtifact' build.zig \

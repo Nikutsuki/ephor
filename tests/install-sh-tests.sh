@@ -66,6 +66,15 @@ run_installer() {
     (cd "$1" && "$INSTALL_RUNNER" "$INSTALL_SH") > "$1/out.log" 2> "$1/err.log" || rc=$?
 }
 
+# Run the installer with FAKE_ZIG_VERSION set for this one run, then
+# restore the suite default. A bare prefix assignment is not portable:
+# bash keeps it after the function returns, dash does not.
+run_installer_with_zig() { # version, dir
+    FAKE_ZIG_VERSION="$1"
+    run_installer "$2"
+    FAKE_ZIG_VERSION="0.16.0"
+}
+
 assert_eq() { # want, got, label
     [ "$1" = "$2" ] || fail "$3 (want [$1], got [$2])"
 }
@@ -84,7 +93,7 @@ assert_unchanged() { # file, original, label
     cmp -s "$1" "$2" || fail "$3 (file changed)"
 }
 assert_empty() { # file, label
-    [ ! -s "$1" ] || fail "$3 (expected empty, got $(wc -c < "$1" | tr -d ' ') bytes)"
+    [ ! -s "$1" ] || fail "$2 (expected empty, got $(wc -c < "$1" | tr -d ' ') bytes)"
 }
 count_of() { # file, pattern -> count on stdout
     grep -cF "$2" "$1" | cat
@@ -343,7 +352,7 @@ pass "t12 valid directory name unchanged (F-5 positive)"
 D="$TEST_ROOT/t13"
 mkdir -p "$D"
 write_fresh_build_zig "$D"
-FAKE_ZIG_VERSION="abc" run_installer "$D"
+run_installer_with_zig "abc" "$D"
 assert_rc 0
 assert_grep "$D/err.log" 'could not parse the zig version' 'missing parse warning'
 assert_grep "$D/out.log" 'v0.99.1' 'did not take the latest-tag path'
@@ -357,7 +366,7 @@ pass "t13 garbage zig version takes latest tag (F-6)"
 D="$TEST_ROOT/t14"
 mkdir -p "$D"
 write_fresh_build_zig "$D"
-FAKE_ZIG_VERSION="0.16.0" run_installer "$D"
+run_installer_with_zig "0.16.0" "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'v0.99.1' 'latest tag not chosen'
 assert_empty "$D/err.log" 'stderr not empty'
@@ -367,7 +376,7 @@ pass "t14 zig 0.16.0 takes latest tag (F-6 positive)"
 D="$TEST_ROOT/t15"
 mkdir -p "$D"
 write_fresh_build_zig "$D"
-FAKE_ZIG_VERSION="0.15.0" run_installer "$D"
+run_installer_with_zig "0.15.0" "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'v0.11.13' '0.15 pin not chosen'
 assert_not_grep "$D/out.log" 'v0.99.1' 'latest tag chosen for 0.15'
@@ -431,6 +440,93 @@ assert_rc 1
 assert_grep "$D/err.log" 'does not end before the end' 'no refusal warning'
 assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
 pass "t18 unterminated statement refuses (F-2)"
+
+# --- t19 (F-B65-1): digit-led garbage with non-numeric components must
+# warn and take the latest tag; the integer tests must never see it.
+D="$TEST_ROOT/t19"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+run_installer_with_zig "1a.2b.3c" "$D"
+assert_rc 0
+assert_grep "$D/err.log" 'could not parse the zig version' 'missing parse warning'
+assert_grep "$D/out.log" 'v0.99.1' 'did not take the latest-tag path'
+cat "$D/out.log" "$D/err.log" > "$D/both.log"
+assert_not_grep "$D/both.log" 'Illegal number' 'dash noise present'
+assert_not_grep "$D/both.log" 'integer expression' 'bash noise present'
+assert_not_grep "$D/out.log" 'v0.11.13' '0.15-era pin chosen on garbage'
+pass "t19 non-numeric components take latest tag (F-B65-1)"
+
+# --- t20 (F-B65-2): the legacy v0.11.x snippet migrates to the
+# canonical block.
+D="$TEST_ROOT/t20"
+mkdir -p "$D"
+{
+    echo 'const std = @import("std");'
+    echo 'pub fn build(b: *std.Build) !void {'
+    echo '    const target = b.standardTargetOptions(.{});'
+    echo '    const optimize = b.standardOptimizeOption(.{});'
+    echo ''
+    echo '    // === Ephor Static Analysis ==='
+    echo '    const ephor_dep = b.dependency("ephor", .{'
+    echo '        .target = target,'
+    echo '        .optimize = .ReleaseSafe,'
+    echo '    });'
+    echo '    const ephor_exe = ephor_dep.artifact("ephor");'
+    echo '    const ephor_step = b.step("ephor", "Run ephor static analysis");'
+    echo '    ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);'
+    echo '}'
+} > "$D/build.zig"
+run_installer "$D"
+assert_rc 0
+assert_grep "$D/out.log" 'migrated from v0.11.x snippet' 'no migration message'
+assert_empty "$D/err.log" 'stderr not empty'
+assert_eq 0 "$(count_of "$D/build.zig" '=== Ephor Static Analysis ===')" 'legacy marker remains'
+assert_eq 1 "$(count_of "$D/build.zig" '    // Ephor static analysis')" 'canonical marker missing'
+assert_not_grep "$D/build.zig" 'ephor_exe' 'legacy symbol remains'
+assert_grep "$D/build.zig" 'ephor_upgrade_step.dependOn' 'upgrade step missing'
+pass "t20 legacy snippet migrates (F-B65-2)"
+
+# --- t21 (F-B65-2): a legacy snippet missing its end marker refuses.
+D="$TEST_ROOT/t21"
+mkdir -p "$D"
+{
+    echo 'const std = @import("std");'
+    echo 'pub fn build(b: *std.Build) !void {'
+    echo '    const target = b.standardTargetOptions(.{});'
+    echo '    // === Ephor Static Analysis ==='
+    echo '    const ephor_dep = b.dependency("ephor", .{'
+    echo '        .target = target,'
+    echo '        .optimize = .ReleaseSafe,'
+    echo '    });'
+    echo '    const ephor_exe = ephor_dep.artifact("ephor");'
+    echo '    const ephor_step = b.step("ephor", "Run ephor static analysis");'
+    echo '}'
+} > "$D/build.zig"
+cp "$D/build.zig" "$D/build.zig.orig"
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'missing one of its markers' 'no refusal warning'
+assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
+pass "t21 legacy snippet without end marker refuses (F-B65-2)"
+
+# --- t22 (F-B65-3): a trailing line comment after the statement
+# terminator masks the semicolon scan. With no later semicolon line the
+# install refuses (loud, fail-safe) instead of guessing a cut point.
+D="$TEST_ROOT/t22"
+mkdir -p "$D"
+cat > "$D/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) !void {
+    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{}) });
+    b.installArtifact(exe); // build the artifact
+}
+EOF
+cp "$D/build.zig" "$D/build.zig.orig"
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'does not end before the end' 'no refusal warning'
+assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
+pass "t22 trailing-comment terminator refuses (F-B65-3 pin)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

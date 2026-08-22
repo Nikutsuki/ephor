@@ -71093,11 +71093,21 @@ test "readUpdateCache fails closed on an oversized cache file (band-T04 F-6)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // One byte over UPDATE_CACHE_MAX_BYTES: the size-capped read rejects
-    // the file whole, so a growing cache can never be trusted partially.
-    const big = try allocator.alloc(u8, UPDATE_CACHE_MAX_BYTES + 1);
+    // A parseable header under filler sized one byte over the current
+    // UPDATE_CACHE_MAX_BYTES (4096): the test pins rejection-over-parse.
+    // Without the cap the entry would parse (valid epoch + semver), so
+    // only the size limit can produce null. The fixture size is a literal
+    // on purpose: derived from the constant, a cap raise would scale the
+    // fixture in lockstep and the pin would stay green through the very
+    // regression it exists to catch. A cap raise or a dropped limit makes
+    // this expect flip (and the returned version would also trip the
+    // leak-checking allocator); the round-trip test above pins sub-cap
+    // acceptance.
+    const header = "1800000000\n1.0.0\n";
+    const big = try allocator.alloc(u8, 4097);
     defer allocator.free(big);
-    @memset(big, 'x');
+    @memcpy(big[0..header.len], header);
+    @memset(big[header.len..], 'x');
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cache", .data = big });
     const path = try tmpFilePath(allocator, &tmp, "cache");
     defer allocator.free(path);
@@ -71865,7 +71875,7 @@ const analysis_write_guard_config =
 /// probe, the scan, the orphan pass, then every file-touching analyzer.
 /// Excludes runFmtCheck: it spawns `zig fmt --check`, a read-only
 /// subprocess. The battery stays subprocess-free; the one spawn in this
-/// family lives in the dedicated zigContentParses test below, which needs
+/// family lives in the dedicated zigContentParses test, which needs
 /// the same zig binary through tool_zig_path (PATH, or the
 /// EPHOR_ZIG_PATH override) (band-T04 F-1).
 fn runCheckAnalysisBattery(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {

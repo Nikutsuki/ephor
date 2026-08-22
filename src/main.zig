@@ -70999,6 +70999,10 @@ test "parseVersionFromZon returns null for missing version" {
 // --- Update cache test seam ---
 // resolveLatestVersion takes the fetcher as a function pointer so tests can
 // count calls and control the result without touching the network.
+// Reset-at-start, not save+restore (band-T04 F-4): sound under zig's
+// sequential test runner because every test in this family calls
+// resetFetchSeam before its first assert. A parallel runner would need
+// save+restore (or per-test state) for these two globals.
 var test_fetch_calls: usize = 0;
 var test_fetch_result: ?[]const u8 = null;
 
@@ -71068,6 +71072,36 @@ test "update cache write/read round-trip" {
     defer allocator.free(cached.version);
     try std.testing.expectEqualStrings("1.2.3", cached.version);
     try std.testing.expectEqual(now, cached.epoch);
+}
+
+test "readUpdateCache fails closed on a valid epoch with a bad version (band-T04 F-6)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The epoch parses; the version line is not semver. The whole entry
+    // must be rejected, not just the version field.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "cache",
+        .data = "1800000000\nbanana\n",
+    });
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    try std.testing.expect(readUpdateCache(std.testing.io, allocator, path) == null);
+}
+
+test "readUpdateCache fails closed on an oversized cache file (band-T04 F-6)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // One byte over UPDATE_CACHE_MAX_BYTES: the size-capped read rejects
+    // the file whole, so a growing cache can never be trusted partially.
+    const big = try allocator.alloc(u8, UPDATE_CACHE_MAX_BYTES + 1);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cache", .data = big });
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    try std.testing.expect(readUpdateCache(std.testing.io, allocator, path) == null);
 }
 
 test "writeUpdateCache replaces a planted symlink and sets 0600 (EPH-I0167)" {
@@ -71711,6 +71745,11 @@ test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    // The spawn routes through tool_zig_path: a zig binary reachable via
+    // PATH (or the EPHOR_ZIG_PATH override) is a test-host requirement
+    // here, exactly as it is for runFmtCheck (band-T04 F-1). The bare
+    // "zig" default resolves through PATH; an absolute-path toolchain
+    // host sets EPHOR_ZIG_PATH for the test run.
     try std.testing.expect(zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build() void {}\n"));
     try std.testing.expect(!zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build( void {\n"));
 
@@ -71727,11 +71766,15 @@ test "resolveToolFromEnv falls back to the bare name when unset (EPH-I0154)" {
 
 test "resolveToolFromEnv accepts an absolute override that resolves (EPH-I0154)" {
     var diag = testDiagCtx();
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    try std.testing.expectEqualStrings(
-        "/bin/sh",
-        resolveToolFromEnv(&diag, .zig, "/bin/sh"),
-    );
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A fixture inside tmpDir, not a host path: the test asserts the
+    // resolution branch, not the host's /bin/sh (band-T04 F-2).
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sh", .data = "" });
+    const tool_path = try tmpFilePath(allocator, &tmp, "sh");
+    defer allocator.free(tool_path);
+    try std.testing.expectEqualStrings(tool_path, resolveToolFromEnv(&diag, .zig, tool_path));
 }
 
 test "resolveToolFromEnv warns and falls back on a relative override (EPH-I0154)" {
@@ -71821,7 +71864,10 @@ const analysis_write_guard_config =
 /// cfg.path (EPH-I0271). Mirrors the .check arm in main: the known-issues
 /// probe, the scan, the orphan pass, then every file-touching analyzer.
 /// Excludes runFmtCheck: it spawns `zig fmt --check`, a read-only
-/// subprocess that needs a zig binary the test host does not guarantee.
+/// subprocess. The battery stays subprocess-free; the one spawn in this
+/// family lives in the dedicated zigContentParses test below, which needs
+/// the same zig binary through tool_zig_path (PATH, or the
+/// EPHOR_ZIG_PATH override) (band-T04 F-1).
 fn runCheckAnalysisBattery(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     try loadKnownIssues(diag, allocator, cfg);
     var g = ImportGraph.init(allocator, diag);
@@ -71957,6 +72003,18 @@ test "analysis path never writes project manifest files (EPH-I0271)" {
         try std.testing.expect(expected);
     }
     try std.testing.expectEqual(@as(usize, 3), root_entries);
+
+    // The guard also covers one directory deep (band-T04 F-5): a stray
+    // write inside src/ (a log file, a backup) must flip this red too.
+    var src_dir = try tmp.dir.openDir(std.testing.io, "src", .{ .iterate = true });
+    defer src_dir.close(std.testing.io);
+    var src_it = src_dir.iterate();
+    var src_entries: usize = 0;
+    while (try src_it.next(std.testing.io)) |entry| {
+        src_entries += 1;
+        try std.testing.expect(mem.eql(u8, entry.name, "x.zig"));
+    }
+    try std.testing.expectEqual(@as(usize, 1), src_entries);
 }
 
 // ============================================================================
@@ -75652,6 +75710,13 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)
 // ============================================================================
 // ZA101 additional unit tests: qualified functions, container methods, transfers
 // ============================================================================
+// Deliberately per-case (band-T04 F-9), not a case table: each pin keeps
+// its own buildCFG or full-graph harness so a failure names the case and
+// each case stays independently editable. The two pipelines (direct
+// buildCFG versus graph-level analyzeCFGMemory) are distinct mechanisms —
+// a single table would mix harnesses — and the per-case comments
+// (arena, transfer, const+return) document which exemption each pin
+// covers. The ~45-line setup repeats; accepted maintenance cost.
 
 test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};

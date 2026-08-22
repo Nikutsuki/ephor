@@ -45979,6 +45979,29 @@ fn countRuleIssues(
     return n;
 }
 
+/// Assert exactly one ZA607 issue for `file`, reported at `line`, with
+/// `needle` inside the message. `needle` carries the quoted var name
+/// (the message form is `variable 'x' potentially read before
+/// assignment`). A count-only assertion cannot see a wrong-line or
+/// wrong-var attribution regression (EPH-I0243 pins emission order,
+/// not the read site), so each DA family pins one read site here.
+fn expectSingleDAIssue(
+    run: *const CFGTestRun,
+    file: []const u8,
+    line: usize,
+    needle: []const u8,
+) !void {
+    var matches: usize = 0;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, file)) continue;
+        if (!mem.eql(u8, issue.rule, RULE_DEFINITE_ASSIGNMENT)) continue;
+        matches += 1;
+        try std.testing.expectEqual(line, issue.line);
+        try std.testing.expect(mem.indexOf(u8, issue.message, needle) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), matches);
+}
+
 test "ZA105/ZA106/ZA101: over-line-cap function skips memory analysis with a note (EPH-I0350)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -63589,10 +63612,7 @@ test "ZA607: never-assigned undefined var is detected" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_never.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_never.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_never.zig", 3, "'y'");
 }
 
 test "ZA607: single-branch if assignment is detected" {
@@ -64416,10 +64436,7 @@ test "ZA607: braceless if with next-line body is detected" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_nextline.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_nextline.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_nextline.zig", 5, "'x'");
 }
 
 test "ZA607: multi-line condition with next-line body is detected" {
@@ -64624,10 +64641,7 @@ test "ZA607: same-line braced if does not cover the later read (EPH-I0849)" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_sameline_braced.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_sameline_braced.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_sameline_braced.zig", 4, "'x'");
 }
 
 test "ZA607: nested conditional in a one-line guard block fires (EPH-I0846)" {
@@ -65127,6 +65141,7 @@ test "ZA607: braceless while body keeps pre-B2 verdict" {
 
     // Brace-less loops are outside the CFG's virtual-body modeling
     // (EPH-I0079 B2 exclusion), so the shortcut keeps its pre-B2 verdict.
+    // The FN is tracked in EPH-I0129 (inline and braceless loop bodies).
     const content =
         \\fn whileBraceless(n: u32) u32 {
         \\    var x: u32 = undefined;
@@ -65169,10 +65184,7 @@ test "ZA607: sibling ifs with assignment only in first is detected" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_twoifs.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_twoifs.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_twoifs.zig", 7, "'x'");
 }
 
 test "ZA607: equal-length different var assignment does not mask undefined read" {
@@ -65194,10 +65206,7 @@ test "ZA607: equal-length different var assignment does not mask undefined read"
     var run = try runCFGMemoryTest(&diag, allocator, "da_eqlen.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_eqlen.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_eqlen.zig", 5, "'z'");
 }
 
 test "ZA607: one-char name not poisoned by other var field assignment" {
@@ -65254,10 +65263,15 @@ test "ZA607: direct assignment of tracked var stays silent" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Guard must keep accepting the genuine `x = 1` gen (no FP).
+    // The unconditional assignment sits after an unrelated empty
+    // conditional: the CFG merge must still see `x = 1` dominating the
+    // read (no FP). The empty conditional distinguishes this pin from the
+    // plain unconditional shape pinned in da_uncond.zig.
     const content =
-        \\fn directAssign() u32 {
+        \\fn directAssign(c: bool) u32 {
         \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\    }
         \\    x = 1;
         \\    return x;
         \\}
@@ -65579,10 +65593,7 @@ test "ZA607: loop element read of undefined buffer is detected (EPH-I0752)" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_i0752_elemread.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_i0752_elemread.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_i0752_elemread.zig", 5, "'buf'");
 }
 
 test "ZA607: loop compound-op element read of undefined buffer is detected (EPH-I0752)" {
@@ -65779,10 +65790,7 @@ test "ZA607: one-line loop element read of undefined buffer is detected (EPH-I07
     var run = try runCFGMemoryTest(&diag, allocator, "da_i0772_elemread.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_i0772_elemread.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_i0772_elemread.zig", 4, "'buf'");
 }
 
 test "ZA607: one-line loop indexed fill stays silent (EPH-I0772)" {
@@ -66204,10 +66212,7 @@ test "ZA607: condition element read of undefined buffer is detected (EPH-I0773)"
     var run = try runCFGMemoryTest(&diag, allocator, "da_i0773_condread.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_i0773_condread.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_i0773_condread.zig", 5, "'flags'");
 }
 
 test "ZA607: by-value call-arg element read of undefined buffer is detected (EPH-I0773)" {
@@ -66875,10 +66880,7 @@ test "ZA607: or-guard read fires outside a loop and without a null guard" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_orguard_neg.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_orguard_neg.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_orguard_neg.zig", 3, "'x'");
 }
 
 test "ZA607: correlated-guard read not suppressed by other-var assignment" {
@@ -69537,7 +69539,9 @@ test "ZA607: init-call vars keep their dropped verdict" {
     // drops every var with a method call, because an unknown `x.setup(...)`
     // may initialize x. Statement-precise `x.init()` would require narrowing
     // that filter to known fill methods, which trades these FNs for FPs on
-    // genuine init methods the analyzer cannot know.
+    // genuine init methods the analyzer cannot know. The FN remainder is
+    // tracked in EPH-I1101 (band-T03 F3, remainder: statement-precise
+    // init narrowing).
     const content =
         \\const Box = struct {
         \\    fn init() Box {
@@ -69573,7 +69577,7 @@ test "ZA607: same-line slice read keeps Pattern-2 whole-line cover" {
     // occurrence — including the slice READ `buf[0..n]` — as a whole-line
     // fill, so the earlier `use(buf)` stays covered. Tightening Pattern-2
     // produced 4 ghostty/flow FPs last time. It is load-bearing and stays
-    // crude here.
+    // crude here. The element-level remainder is tracked in EPH-I0132.
     const content =
         \\fn assignThenSliceRead(n: usize) void {
         \\    var buf: [8]u8 = undefined;
@@ -69640,10 +69644,7 @@ test "ZA607: same-line read before multi-line fill-call is detected" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_fc_ml_read.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_fc_ml_read.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_fc_ml_read.zig", 3, "'x'");
 }
 
 test "ZA607: fill-call continuation self-read is detected" {
@@ -69704,7 +69705,8 @@ test "ZA607: address-escape var stays dropped" {
     // Pinned (EPH-I0102): `const p = &x;` lets the pointer escape — writes
     // through p are untrackable, so removeAddressOfVars still drops the
     // var. Only `&x` call arguments (the fill-call heuristic) stay
-    // trackable.
+    // trackable. The pre-escape read FN is tracked in EPH-I1101
+    // (band-T03 F3, remainder: pre-escape reads).
     const content =
         \\fn addrEscapeDrops() u32 {
         \\    var x: u32 = undefined;
@@ -70001,7 +70003,8 @@ test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
     // whole function, and the read is missed. The drop is deliberate: a
     // payload binding anywhere makes every same-name occurrence suspect,
     // and a wrong-fire is worse than a miss. A scope-aware payload model
-    // would recover this read.
+    // would recover this read. Tracked in EPH-I1101 (band-T03 F3,
+    // remainder: scope-aware payload model).
     const content =
         \\fn overDrop(items: []const u32) void {
         \\    var x: u32 = undefined;
@@ -70950,10 +70953,7 @@ test "ZA607: fill inside a switch arm stays conditional (EPH-I0334)" {
     var run = try runCFGMemoryTest(&diag, allocator, "da_switch_arm.zig", content);
     defer run.deinit(allocator);
 
-    try std.testing.expectEqual(
-        1,
-        countRuleIssues(run.issues.items, "da_switch_arm.zig", RULE_DEFINITE_ASSIGNMENT),
-    );
+    try expectSingleDAIssue(&run, "da_switch_arm.zig", 12, "'x'");
 }
 
 test "ZA607: all-arms switch assignment stays silent (EPH-I0334)" {
@@ -71017,6 +71017,10 @@ test "ZA607: one-line arm-list fill is a documented FN (EPH-I0334)" {
         countRuleIssues(run.issues.items, "da_switch_oneline.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
+
+// ============================================================================
+// CFG Memory Integration Tests (ZA105)
+// ============================================================================
 
 test "integration: no false positive for valid catch-free-return" {
     var diag = testDiagCtx();

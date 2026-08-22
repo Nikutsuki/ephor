@@ -14579,11 +14579,72 @@ fn classifyReturnType(ret: []const u8) ReturnKind {
     // r1). The outer fn returns a value; the pointee's error union
     // registers when the inner fn's own signature is scanned.
     if (mem.startsWith(u8, t, "fn ") or mem.startsWith(u8, t, "fn(")) return .value;
-    // Error union: starts with '!' or contains '!' before the type
+    // The OUTER binding operator decides the kind. A wrapper-prefixed fn
+    // pointer (`*const fn () !void`, `?fn () !void`, `[]const fn () !void`)
+    // carries its `!` as the fn TYPE's own return — it sits after the
+    // fn's parameter parens, at depth 0, so a raw bang scan read it as the
+    // outer operator. The outer fn returns a pointer, an optional, or a
+    // slice. It cannot fail. The generic bang-index arm then reported the
+    // never-fails note on the outer line while swallowing the pointee's
+    // own note — the wrong-victim class one prefix step away (EPH-I1066).
+    if (topLevelFnTypeStart(t)) |fn_pos| return classifyWrapperPrefix(t[0..fn_pos]);
+    // No fn type: a leading `!`/`?` binds first, then a top-level `!`
+    // ("ErrorSet!T" or "anyerror!T").
     if (t[0] == '!') return .error_union;
-    // "ErrorSet!T" or "anyerror!T" patterns
-    if (mem.indexOf(u8, t, "!") != null) return .error_union;
     if (t[0] == '?') return .optional;
+    if (topLevelBangIndex(t) != null) return .error_union;
+    return .value;
+}
+
+/// Advance `depth` for one byte of a type walk: openers increment, closers
+/// decrement (saturating), everything else is neutral.
+fn typeDepthStep(c: u8, depth: *usize) void {
+    if (c == '(' or c == '[' or c == '{') {
+        depth.* += 1;
+        return;
+    }
+    if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
+}
+
+/// Index of the first `!` at paren/bracket/brace depth 0 in `t`, or null.
+/// A bang nested inside another type never registers as the outer
+/// error-union operator (EPH-I1066).
+fn topLevelBangIndex(t: []const u8) ?usize {
+    var depth: usize = 0;
+    for (t, 0..) |c, i| {
+        typeDepthStep(c, &depth);
+        if (c == '!' and depth == 0) return i;
+    }
+    return null;
+}
+
+/// Index of the first `fn` type keyword at depth 0, or null. A fn TYPE is
+/// the only depth-0 `fn` in a return type, and its bang is the fn's own
+/// return, never the outer operator (EPH-I1066).
+fn topLevelFnTypeStart(t: []const u8) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i + 2 <= t.len) : (i += 1) {
+        typeDepthStep(t[i], &depth);
+        if (depth != 0 or t[i] != 'f' or !mem.startsWith(u8, t[i..], "fn")) continue;
+        if (i > 0 and isIdent(t[i - 1])) continue;
+        const after = i + 2;
+        if (after < t.len and isIdent(t[after])) continue;
+        return i;
+    }
+    return null;
+}
+
+/// Classify the wrapper chain before a fn-pointer return's fn type. The
+/// prefix's own outer operator decides: `?fn (...) !void` is an optional,
+/// `*const fn (...) !void` and `[]fn (...) !void` are values, and
+/// `error{a}!fn (...) T` stays an error union (EPH-I1066).
+fn classifyWrapperPrefix(prefix: []const u8) ReturnKind {
+    const t = mem.trim(u8, prefix, " \t\r");
+    if (t.len == 0) return .value;
+    if (t[0] == '!') return .error_union;
+    if (t[0] == '?') return .optional;
+    if (topLevelBangIndex(t) != null) return .error_union;
     return .value;
 }
 
@@ -22396,6 +22457,10 @@ const ComplexityState = struct {
     params: usize = 0,
     is_type_factory: bool = false,
     is_data_dispatch: bool = false,
+    // EPH-I1059: extern / callconv(.c) fns. The C ABI pins the parameter
+    // list (skytale proc_pidinfo carries 5 params the macOS libproc C API
+    // fixes), so ZA303 never fires on them.
+    is_c_abi: bool = false,
     cyclomatic: usize = 1,
     cognitive: usize = 0,
     cog_nest: usize = 0,
@@ -22438,6 +22503,10 @@ const PendingFnStart = struct {
     col: usize,
     abs_start: usize,
     is_data_dispatch: bool,
+    // EPH-I1059: C-ABI prefix (`extern `, `pub extern `, `callconv(.c)`)
+    // seen before the `fn` keyword on the keyword line. Carried to the
+    // state open so a wrapped signature keeps the exemption.
+    is_c_abi_prefix: bool = false,
     sig_parens: usize,
     // EPH-I0788: count of processed signature lines before the body opens.
     // Starts at 1 for the keyword line. Full-line comments never reach
@@ -22869,6 +22938,9 @@ fn reportComplexityIssues(
 ) !void {
     const checks = buildComplexityChecks(state, th);
     for (checks) |c| {
+        // EPH-I1059: a C-ABI-pinned signature can never be refactored into
+        // fewer parameters, so ZA303 skips it.
+        if (state.is_c_abi and mem.eql(u8, c.rule, RULE_TOO_MANY_PARAMS)) continue;
         try reportSingleComplexity(ctx, state, c);
     }
 }
@@ -23000,6 +23072,63 @@ fn isTypeFactory(sig: []const u8) bool {
     return false;
 }
 
+/// True when a callconv(.c)/(.C) mark follows the parameter list of `sig`
+/// (the suffix form: `fn f(...) callconv(.c) void {`). The `.c`/`.C` arg
+/// spells the C calling convention, whose signature the C ABI pins, so
+/// ZA303 skips it (EPH-I1059). The scan is bounded at the body brace: a
+/// callconv token on a later declaration (a neighboring fn type, a field)
+/// never exempts the outer fn.
+fn sigSuffixIsCAbi(sig: []const u8) bool {
+    const close = paramListEnd(sig) orelse return false;
+    const body_open = bodyBraceAfter(sig, close + 1) orelse sig.len;
+    return hasCCallconv(sig[close + 1 .. body_open]);
+}
+
+/// Index of the first code-position `{` at or after `from` in `sig`
+/// (literal-masked), or null. The first `{` after the parameter list ends
+/// the return-type span — normally the body opener, and an anonymous-struct
+/// return type's brace bounds it the same way (EPH-I1059).
+fn bodyBraceAfter(sig: []const u8, from: usize) ?usize {
+    var lit = types.LiteralState.forLine(sig) orelse return null;
+    var i: usize = from;
+    while (i < sig.len) : (i += 1) {
+        if (sig[i] == '\n') lit.in_comment = false;
+        const pos = lit.updateForChar(sig, i) orelse continue;
+        if (sig[pos] == '{') return pos;
+    }
+    return null;
+}
+
+/// Index of the close paren of `sig`'s parameter list, literal-masked so a
+/// `)` inside a string or comment param never closes the list early. Null
+/// when the signature has no parameter list or it never closes in `sig`.
+fn paramListEnd(sig: []const u8) ?usize {
+    const open = mem.indexOf(u8, sig, "(") orelse return null;
+    var lit = types.LiteralState.forLine(sig) orelse return null;
+    var depth: usize = 0;
+    var i: usize = open;
+    while (i < sig.len) : (i += 1) {
+        if (sig[i] == '\n') lit.in_comment = false;
+        const pos = lit.updateForChar(sig, i) orelse continue;
+        if (sig[pos] == '(') depth += 1;
+        if (sig[pos] == ')' and depth > 0) {
+            depth -= 1;
+            if (depth == 0) return pos;
+        }
+    }
+    return null;
+}
+
+/// True when a code-position callconv(.c) or callconv(.C) token appears in
+/// `t`. Both spell the C calling convention; the ident-boundary filter keeps
+/// `callconv(.cc)` and `callconv(.Cdecl)` out (EPH-I1059).
+fn hasCCallconv(t: []const u8) bool {
+    inline for (.{ "callconv(.c)", "callconv(.C)" }) |mark| {
+        if (realTokenPos(t, mark) != null) return true;
+    }
+    return false;
+}
+
 /// Open fn complexity state for a def whose body brace arrived. The def's
 /// identity comes from `pending`, built on the fn keyword line. `fn_lines`
 /// backfills the processed signature lines from `pending`: full-line
@@ -23021,6 +23150,8 @@ fn openFnState(
         // marker sits on a later line than the keyword line.
         .is_type_factory = isTypeFactory(sig),
         .is_data_dispatch = pending.is_data_dispatch,
+        // EPH-I1059: the C ABI pins the parameter list, so ZA303 skips it.
+        .is_c_abi = pending.is_c_abi_prefix or sigSuffixIsCAbi(sig),
         .params = countFnParams(sig),
         .fn_name = pending.name,
         .fn_lines = pending.sig_lines,
@@ -23070,6 +23201,12 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     // fn the same way call sites do.
     const fn_name = pubFnNameAt(t, pos + 3) orelse return;
     const name = fn_name.name;
+    // EPH-I1059: the text before the `fn` keyword carries the C-ABI prefix
+    // (`extern `, `pub extern `, `callconv(.c)`) when one is present.
+    const pre = mem.trimStart(u8, t[0..pos], " \t");
+    const is_c_abi_prefix = mem.startsWith(u8, pre, "extern ") or
+        mem.startsWith(u8, pre, "pub extern ") or
+        hasCCallconv(pre);
     var pending: PendingFnStart = .{
         .name = name,
         .start_line = line_num,
@@ -23079,6 +23216,7 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
         .col = view.lead + pos + 1,
         .abs_start = view.line_offset + pos,
         .is_data_dispatch = isDataDispatchFunction(name),
+        .is_c_abi_prefix = is_c_abi_prefix,
         .sig_parens = 0,
         .sig_lines = 1,
     };
@@ -24104,69 +24242,36 @@ fn checkFnNaming(ctx: NamingLineCtx) !void {
     }
 }
 
-/// Check error value (`error.MyError`) and error set member naming against
-/// the configured convention (ZA703; default TitleCase, the community
-/// standard — the stdlib itself declares TitleCase error names).
+/// Check error naming against the configured convention (ZA703; default
+/// TitleCase, the community standard — the stdlib itself declares TitleCase
+/// error names).
+///
+/// FIRE SURFACE RULING (EPH-I1075): ZA703 fires on error-set member
+/// DECLARATIONS only — the body of an `error{...}` set, whether a named
+/// const or an inline set in a signature or type. `error.Name` value
+/// references never fire: a used error value cannot be restyled per use
+/// site, and renaming the set is a cross-tree refactor unrelated to the
+/// change that triggered the hit (RhyOS accepted ~48 of this class,
+/// ephor-error.log 2026-07-30). The declaration is the one actionable
+/// surface.
 fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
-    try checkErrorValueNames(ctx);
     if (!in_error_block) return;
     try checkErrorSetMemberNames(ctx);
-}
-
-/// Scan one line's `error.Name` value references, reporting names that
-/// violate the configured convention. Std-lib and `_`-prefixed names are
-/// exempt by convention: a reference to `error.FileNotFound` names the
-/// std error, which project code cannot rename (EPH-I0473 — declared
-/// members carry no such exemption; see checkErrorSetMemberNames).
-fn checkErrorValueNames(ctx: NamingLineCtx) !void {
-    const t = ctx.t;
-    // Trailing-comment text is prose, not a reference (same rule as strings).
-    const limit = lineCommentStart(t);
-    // One classifier walk per line (EPH-I0153): candidates ascend.
-    var cls = LineClassifier.init(t);
-    var pos: usize = 0;
-    while (pos < t.len) {
-        const err_pos = mem.indexOfPos(u8, t[0..limit], pos, "error.") orelse break;
-        // `error.` must be a standalone keyword, not part of a larger identifier.
-        if (err_pos > 0 and isIdent(t[err_pos - 1])) {
-            pos = err_pos + 6;
-            continue;
-        }
-        // `error.` inside a string literal is data (fixture text), not a reference.
-        if (cls.isInsideString(err_pos)) {
-            pos = err_pos + 6;
-            continue;
-        }
-        var end = err_pos + 6;
-        while (end < t.len and isIdent(t[end])) end += 1;
-        if (end <= err_pos + 6) {
-            pos = err_pos + 6;
-            continue;
-        }
-        const name = t[err_pos + 6 .. end];
-        if (name[0] == '_' or isStdErrorName(name)) {
-            pos = end;
-            continue;
-        }
-        if (!errorNameMatchesMode(ctx.error_naming, name)) try reportNaming(ctx, .{
-            .col = err_pos + 7,
-            .kind = "error value",
-            .name = name,
-            .expected = ctx.error_naming.str(),
-        });
-        pos = end;
-    }
 }
 
 /// Find where the error set body starts on this line: just past `error{...}`.
 /// For lines like `const E = error{ Foo, Bar }`, only the body is checked.
 /// Continuation lines (no `error` keyword) return 0 — the whole line is checked.
+/// The match is code-position-masked: `error{` inside a string, char literal,
+/// or comment is prose, not an opener — a continuation line carrying
+/// `// doc: error{notreal}` once read as a member declaration (EPH-I0274
+/// sibling, B57c).
 fn errorSetBodyStart(t: []const u8) usize {
-    var epos: usize = 0;
-    while (epos < t.len) {
-        const found = mem.indexOfPos(u8, t, epos, "error") orelse break;
-        if (matchesErrorSetOpen(t, found)) |start| return start;
-        epos = found + 5;
+    var lit = types.LiteralState.forLine(t) orelse return 0;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (matchesErrorSetOpen(t, pos)) |start| return start;
     }
     return 0;
 }
@@ -24211,10 +24316,9 @@ fn skipErrorSetTrivia(t: []const u8, start: usize, depth: *usize) ?usize {
 /// (caller guarantees the line is inside an error block). `_`-prefixed
 /// names are exempt; std-lib names are NOT — a project DECLARES its own
 /// members, so it can rename a member that collides with a std name
-/// (EPH-I0473). The std exemption is for references only (checkErrorValueNames):
-/// `error.FileNotFound` names the std error, which project code cannot
-/// rename. In title_case mode std names conform anyway, so this only
-/// changes snake_case-mode reporting.
+/// (EPH-I0473). References never fire at all (EPH-I1075), so the std-name
+/// exemption applies to declarations only, and only in snake_case mode
+/// (title_case std names conform anyway).
 fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     var i: usize = errorSetBodyStart(t);
@@ -24441,446 +24545,6 @@ fn isScreamingCase(name: []const u8) bool {
         }
     }
     return true;
-}
-
-/// Error names declared by the Zig standard library. Std-declared error names
-/// are exempt from ZA703 — project code cannot rename them.
-///
-/// Provenance: curated subset of public std error names, drawn from the union
-/// of supported std versions (0.15/0.16) — e.g. `NotConnected` is 0.14-era.
-/// Extracted from the std sources of public API modules (fs, posix, Io, net,
-/// crypto, compress, fmt, json, unicode, math, process, testing, http, tls,
-/// zon, os); excludes std-internal/test junk and single generic words that
-/// would mask common project errors. The list may grow.
-const std_error_names = [_][]const u8{
-    // std.mem.Allocator.Error
-    "OutOfMemory",
-    // std.fs / std.posix file system errors
-    "AccessDenied",
-    "BadFd",
-    "BadPathName",
-    "CrossDevice",
-    "CurrentDirUnlinked",
-    "DeadLock",
-    "DeviceBusy",
-    "DirNotEmpty",
-    "DiskQuota",
-    "FileBusy",
-    "FileDescriptorInBadState",
-    "FileDescriptorInvalid",
-    "FileDescriptorNotASocket",
-    "FileLocksUnsupported",
-    "FileNotFound",
-    "FileSystem",
-    "FileTooBig",
-    "FilesNotRegistered",
-    "InodeMountFail",
-    "InvalidFileDescriptor",
-    "InvalidProtocolOption",
-    "InvalidUserId",
-    "IsDir",
-    "LimitTooBig",
-    "LinkQuotaExceeded",
-    "LockViolation",
-    "MessageOversize",
-    "NameTooLong",
-    "NoDevice",
-    "NoSpaceLeft",
-    "NotAssociatedWithFileSystem",
-    "NotATerminal",
-    "InvalidProcessGroupId",
-    "NotDir",
-    "NotLink",
-    "NotTerminalDevice",
-    "ParamsOutsideAccessibleAddressSpace",
-    "PathAlreadyExists",
-    "PermissionDenied",
-    "PipeBusy",
-    "ProcessFdQuotaExceeded",
-    "ProcessNotFound",
-    "ProtocolUnreachable",
-    "ReadOnlyFileSystem",
-    "ResourceLimitReached",
-    "SharingViolation",
-    "SocketUnconnected",
-    "SymLinkLoop",
-    "SystemFdQuotaExceeded",
-    "SizeTooSmall",
-    "SystemResources",
-    "TooManyBreakpoints",
-    "TooManyParentDirs",
-    // std.Io / net errors
-    "AddressFamilyUnsupported",
-    "AddressInUse",
-    "AddressUnavailable",
-    "AlreadyConnected",
-    "AlreadyReported",
-    "AlreadyTerminated",
-    "AntivirusInterference",
-    "BlockedByFirewall",
-    "BrokenPipe",
-    "BufferTooSmall",
-    "BufferUnderrun",
-    "CancelRequested",
-    "Canceled",
-    "ClockUnavailable",
-    "ConcurrencyUnavailable",
-    "ConnectionAborted",
-    "ConnectionPending",
-    "ConnectionRefused",
-    "ConnectionResetByPeer",
-    "ConnectionTimedOut",
-    "DetectingNetworkConfigurationFailed",
-    "EntropyUnavailable",
-    "EventNotFound",
-    "FastOpenAlreadyInProgress",
-    "HostUnreachable",
-    "InputOutput",
-    "InterfaceNotFound",
-    "InvalidAddress",
-    "InvalidDnsAAAARecord",
-    "InvalidDnsARecord",
-    "InvalidDnsCnameRecord",
-    "InvalidDnsPacket",
-    "InvalidHostName",
-    "InvalidPort",
-    "IpAddressConflict",
-    "LockedMemoryLimitExceeded",
-    "MadviseUnavailable",
-    "MappingAlreadyExists",
-    "MemoryMappingNotSupported",
-    "MessageTooLong",
-    "MincoreUnavailable",
-    "NameServerFailure",
-    "NetworkDown",
-    "NetworkNotFound",
-    "NetworkUnreachable",
-    "NoAddressReturned",
-    "NoBufferSelected",
-    "NotConnected",
-    "NotOpenForReading",
-    "NotOpenForWriting",
-    "OperationAborted",
-    "PortUnreachable",
-    "ProtocolUnsupportedByAddressFamily",
-    "ProtocolUnsupportedBySystem",
-    "ReadFailed",
-    "ResolvConfParseFailed",
-    "SignalInterrupt",
-    "SocketModeUnsupported",
-    "SocketNotConnected",
-    "SocketNotListening",
-    "SystemCannotYield",
-    "SystemOutdated",
-    "Timeout",
-    "TimeoutTooBig",
-    "UnknownHostName",
-    "UnmappedMemory",
-    "UnresolvedScope",
-    "WouldBlock",
-    "WriteFailed",
-    // std.os.linux io_uring / bpf errors
-    "ArgumentsInvalid",
-    "BufferInvalid",
-    "BuffersNotRegistered",
-    "CompletionQueueOvercommitted",
-    "EntriesNotInRange",
-    "EntriesNotPowerOfTwo",
-    "EntriesZero",
-    "EventNotSupported",
-    "EventRequiresUnsupportedCpuFeature",
-    "FieldInAttrNeedsZeroing",
-    "FilesAlreadyRegistered",
-    "FilesEmpty",
-    "InvalidProgram",
-    "InvalidSyscall",
-    "InvalidSyscallParameters",
-    "MapTypeOrAttrInvalid",
-    "MarkAlreadyExists",
-    "OpcodeNotSupported",
-    "ReachedMaxEntries",
-    "RingShuttingDown",
-    "RingShuttingDownOrAlreadyRegisteringFiles",
-    "SubmissionQueueEntryInvalid",
-    "SubmissionQueueFull",
-    "UserFdQuotaExceeded",
-    "UserMarkQuotaExceeded",
-    // streams, fmt, parse
-    "Closed",
-    "EndOfFile",
-    "EndOfStream",
-    "InvalidCharacter",
-    "InvalidEnumTag",
-    "InvalidFormat",
-    "InvalidPadding",
-    "StreamTooLong",
-    "Unexpected",
-    // std.math
-    "DivisionByZero",
-    "NegativeDenominator",
-    "NegativeIntoUnsigned",
-    "Overflow",
-    "SqrtOfNegativeNumber",
-    "TargetTooSmall",
-    "Underflow",
-    // std.unicode
-    "CodepointTooLarge",
-    "DanglingSurrogateHalf",
-    "ExpectedSecondSurrogateHalf",
-    "InvalidCodepoint",
-    "InvalidUtf8",
-    "InvalidWtf8",
-    "TruncatedInput",
-    "UnexpectedEof",
-    "UnexpectedSecondSurrogateHalf",
-    "Utf16InvalidStartCodeUnit",
-    "Utf8CannotEncodeSurrogateHalf",
-    "Utf8CodepointTooLarge",
-    "Utf8EncodesSurrogateHalf",
-    "Utf8ExpectedContinuation",
-    "Utf8InvalidStartByte",
-    "Utf8OverlongEncoding",
-    // std.crypto
-    "AuthenticationFailed",
-    "ContextTooLong",
-    "EvenModulus",
-    "IdentityElement",
-    "InsufficientEntropy",
-    "InsufficientRandomness",
-    "InsufficientSeed",
-    "InvalidBool",
-    "InvalidEncoding",
-    "InvalidLength",
-    "InvalidSignature",
-    "KeyMismatch",
-    "LargeValue",
-    "LengthMismatch",
-    "ModulusTooSmall",
-    "NonCanonical",
-    "NotSquare",
-    "NullExponent",
-    "PasswordVerificationFailed",
-    "RejectionSamplingFailed",
-    "SignatureVerificationFailed",
-    "UnexpectedElement",
-    "UnexpectedRepresentation",
-    "UnexpectedSubgroup",
-    "UnknownOid",
-    "UnsupportedCertificateVersion",
-    "WeakParameters",
-    "WeakPublicKey",
-    // std.crypto TLS / X.509 certificates
-    "CertificateAuthorityBundleTooBig",
-    "CertificateBundleLoadFailure",
-    "CertificateExpired",
-    "CertificateFieldHasInvalidLength",
-    "CertificateFieldHasWrongDataType",
-    "CertificateHasInvalidBitString",
-    "CertificateHasUnrecognizedObjectId",
-    "CertificateHostMismatch",
-    "CertificateIssuerMismatch",
-    "CertificateIssuerNotFound",
-    "CertificateNotYetValid",
-    "CertificatePublicKeyInvalid",
-    "CertificateSignatureAlgorithmMismatch",
-    "CertificateSignatureAlgorithmUnsupported",
-    "CertificateSignatureInvalid",
-    "CertificateSignatureInvalidLength",
-    "CertificateSignatureNamedCurveUnsupported",
-    "CertificateSignatureUnsupportedBitCount",
-    "CertificateTimeInvalid",
-    "MissingEndCertificateMarker",
-    "TlsAlert",
-    "TlsAlertAccessDenied",
-    "TlsAlertBadCertificate",
-    "TlsAlertBadCertificateStatusResponse",
-    "TlsAlertBadRecordMac",
-    "TlsAlertCertificateExpired",
-    "TlsAlertCertificateRequired",
-    "TlsAlertCertificateRevoked",
-    "TlsAlertCertificateUnknown",
-    "TlsAlertDecodeError",
-    "TlsAlertDecryptError",
-    "TlsAlertHandshakeFailure",
-    "TlsAlertIllegalParameter",
-    "TlsAlertInappropriateFallback",
-    "TlsAlertInsufficientSecurity",
-    "TlsAlertInternalError",
-    "TlsAlertMissingExtension",
-    "TlsAlertNoApplicationProtocol",
-    "TlsAlertProtocolVersion",
-    "TlsAlertRecordOverflow",
-    "TlsAlertUnexpectedMessage",
-    "TlsAlertUnknown",
-    "TlsAlertUnknownCa",
-    "TlsAlertUnknownPskIdentity",
-    "TlsAlertUnrecognizedName",
-    "TlsAlertUnsupportedCertificate",
-    "TlsAlertUnsupportedExtension",
-    "TlsBadLength",
-    "TlsBadRecordMac",
-    "TlsBadRsaSignatureBitCount",
-    "TlsBadSignatureScheme",
-    "TlsCertificateNotVerified",
-    "TlsConnectionTruncated",
-    "TlsDecodeError",
-    "TlsDecryptError",
-    "TlsDecryptFailure",
-    "TlsIllegalParameter",
-    "TlsInitializationFailed",
-    "TlsRecordOverflow",
-    "TlsSequenceOverflow",
-    "TlsUnexpectedMessage",
-    // std.compress
-    "BadGzipHeader",
-    "BadHeader",
-    "BadMagic",
-    "BadZlibHeader",
-    "BlockOversize",
-    "ChecksumFailure",
-    "CompressedSizeMismatch",
-    "ContentOversize",
-    "CorruptInput",
-    "CrcError",
-    "DecompressedSizeMismatch",
-    "DictionaryIdFlagUnsupported",
-    "EndOfMedia",
-    "HuffmanTreeIncomplete",
-    "IncompleteHuffmanTree",
-    "InputBufferUndersize",
-    "InvalidBitStream",
-    "InvalidBitString",
-    "InvalidBlockType",
-    "InvalidDynamicBlockHeader",
-    "InvalidMatch",
-    "InvalidRangeCode",
-    "MalformedAccuracyLog",
-    "MalformedCompressedBlock",
-    "MalformedFrame",
-    "MalformedFseBits",
-    "MalformedFseTable",
-    "MalformedHuffmanTree",
-    "MalformedLiteralsLength",
-    "MalformedLiteralsSection",
-    "MalformedSequence",
-    "MissingEndOfBlockCode",
-    "MissingMaskBit",
-    "MissingPrefix",
-    "MissingStartBit",
-    "NotXzStream",
-    "OutputBufferUndersize",
-    "OutputTooLong",
-    "OverheadTooLarge",
-    "OversubscribedHuffmanTree",
-    "RepeatModeFirst",
-    "ReservedBitSet",
-    "ReservedBlock",
-    "SequenceBufferUndersize",
-    "SuccessfulEndOfStream",
-    "TreelessLiteralsFirst",
-    "UnexpectedEndOfLiteralStream",
-    "UnexpectedOpCode",
-    "UnsupportedCompressionMethod",
-    "WindowOversize",
-    "WindowSizeUnknown",
-    "WrongChecksum",
-    "WrongStoredBlockNlen",
-    // std.http
-    "ConnectionClose",
-    "HttpChunkInvalid",
-    "HttpChunkTruncated",
-    "HttpConnectionClosing",
-    "HttpContentEncodingUnsupported",
-    "HttpExpectationFailed",
-    "HttpHeaderContinuationsUnsupported",
-    "HttpHeadersInvalid",
-    "HttpHeadersOversize",
-    "HttpRedirectLocationInvalid",
-    "HttpRedirectLocationMissing",
-    "HttpRedirectLocationOversize",
-    "HttpRequestTruncated",
-    "HttpTransferEncodingUnsupported",
-    "InvalidContentLength",
-    "MissingFinalNewline",
-    "RedirectRequiresResend",
-    "TooManyHttpRedirects",
-    "TunnelNotSupported",
-    "UnknownHttpMethod",
-    "UnsupportedUriScheme",
-    // std.json / std.zon parse errors
-    "DuplicateField",
-    "ExceededMaxDepth",
-    "InnerCarriageReturn",
-    "InvalidNumber",
-    "MissingField",
-    "ParseZon",
-    "UnexpectedCharacter",
-    "UnexpectedEndOfInput",
-    "UnexpectedRemainder",
-    "UnexpectedToken",
-    "UnknownField",
-    "ValueTooLong",
-    "WrongType",
-    // std.process
-    "CorruptPasswordFile",
-    "InvalidArg0",
-    "InvalidBatchScriptArg",
-    "InvalidExe",
-    "ProcessAlreadyExec",
-    "ProcessOrphaned",
-    "ProcessResources",
-    "UnrecoverableInvalidExe",
-    "UnsafeProgram",
-    "UserNotFound",
-    // std.testing
-    "ExpectedError",
-    "FailedTest",
-    "MemoryLeakDetected",
-    "NondeterministicMemoryUsage",
-    "SampleMaxStackOverflow",
-    "SampleStackNotSupported",
-    "SkipZigTest",
-    "SwallowedOutOfMemoryError",
-    "TestExpectedApproxEqAbs",
-    "TestExpectedApproxEqRel",
-    "TestExpectedEndsWith",
-    "TestExpectedEqual",
-    "TestExpectedError",
-    "TestExpectedStartsWith",
-    "TestFailed",
-    "TestUnexpectedError",
-    "TestUnexpectedResult",
-    // misc public std errors
-    "BadBufferSize",
-    "EnvironmentVariableMissing",
-    "IncompatibleVersion",
-    "InvalidName",
-    "NotFound",
-    "NotNtPath",
-    "OperationUnsupported",
-    "OptionUnsupported",
-    "OutOfResources",
-    "ParseError",
-    "ParseFailed",
-    "SectionOversize",
-    "UnalignedMemory",
-    "UnexpectedRemapFailure",
-    "UnknownTotalSystemMemory",
-    "Unsupported",
-    "UnsupportedClock",
-    "UnsupportedFeature",
-    "UnsupportedFlags",
-    "UnsupportedOperation",
-    "UnsupportedReparsePointType",
-    "WouldExceedMaximumResidentSetSize",
-};
-
-/// Std-declared error names are exempt from ZA703 — project code cannot rename them.
-fn isStdErrorName(name: []const u8) bool {
-    for (std_error_names) |std_name| {
-        if (mem.eql(u8, name, std_name)) return true;
-    }
-    return false;
 }
 
 /// Check if keyword is followed by valid boundary char
@@ -73308,6 +72972,27 @@ test "classifyReturnType identifies values" {
     try std.testing.expectEqual(ReturnKind.value, classifyReturnType("fn () error{}!u64"));
 }
 
+test "classifyReturnType resolves wrapper-prefixed fn pointers depth-aware (EPH-I1066)" {
+    // Pointer-prefixed: the outer fn returns a pointer, never an error
+    // union — the `!` sits inside the pointee's parens.
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("*const fn () !void"));
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("*fn () !void"));
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("[]const fn () !void"));
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("[2]fn () !void"));
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("(fn () !void)"));
+    // Optional-prefixed: the outer fn returns an optional.
+    try std.testing.expectEqual(ReturnKind.optional, classifyReturnType("?fn () !void"));
+    try std.testing.expectEqual(ReturnKind.optional, classifyReturnType("?*const fn () !void"));
+    // Optional-wrapped error unions: the outer operator is `?`.
+    try std.testing.expectEqual(ReturnKind.optional, classifyReturnType("?error{a}!T"));
+    // Unchanged shapes: a leading pointer/optional qualifier with no bang
+    // stays a value, and error unions at depth 0 still classify.
+    try std.testing.expectEqual(ReturnKind.value, classifyReturnType("*const ?T"));
+    try std.testing.expectEqual(ReturnKind.error_union, classifyReturnType("error{a}!T"));
+    try std.testing.expectEqual(ReturnKind.error_union, classifyReturnType("anyerror!T"));
+    try std.testing.expectEqual(ReturnKind.error_union, classifyReturnType("!?T"));
+}
+
 test "classifyReturnType returns unknown for empty" {
     try std.testing.expectEqual(ReturnKind.unknown, classifyReturnType(""));
     try std.testing.expectEqual(ReturnKind.unknown, classifyReturnType("   "));
@@ -73748,7 +73433,7 @@ test "extractMethodCall returns the last call on a multi-call line (EPH-I0398)" 
 // ZA703 Error Naming Tests
 // ============================================================================
 
-test "checkErrorNaming: snake_case error values pass" {
+test "checkErrorNaming: use-site error references never fire (EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
@@ -73756,6 +73441,8 @@ test "checkErrorNaming: snake_case error values pass" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
+    // Conforming and violating references alike: the declaration is the
+    // only actionable surface (EPH-I1075).
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -73772,10 +73459,26 @@ test "checkErrorNaming: snake_case error values pass" {
         .line_num = 1,
         .error_naming = .snake_case,
     }, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.MyCustomFailure;",
+        .line_num = 2,
+        .error_naming = .snake_case,
+    }, false);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "return error.my_project_error;",
+        .line_num = 3,
+        .error_naming = .title_case,
+    }, false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "checkErrorNaming: CamelCase error values are flagged" {
+test "checkErrorNaming: declaration fires while use sites stay silent (EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
@@ -73783,17 +73486,27 @@ test "checkErrorNaming: CamelCase error values are flagged" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
+    // The declaration of MyCustomFailure is the actionable surface...
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error{ MyCustomFailure }",
+        .line_num = 1,
+        .error_naming = .snake_case,
+    }, true);
+    // ...while a use site of the same name stays silent.
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
         .path = "test.zig",
         .t = "return error.MyCustomFailure;",
-        .line_num = 1,
+        .line_num = 2,
         .error_naming = .snake_case,
     }, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
-        "error value 'MyCustomFailure' should be snake_case",
+        "error set member 'MyCustomFailure' should be snake_case",
         issues.items[0].message,
     );
 }
@@ -73822,7 +73535,7 @@ test "checkErrorNaming: error set members must be snake_case" {
     );
 }
 
-test "checkErrorNaming: std-lib error names are exempt in REFERENCES only (EPH-I0473)" {
+test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473, EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
@@ -73830,6 +73543,10 @@ test "checkErrorNaming: std-lib error names are exempt in REFERENCES only (EPH-I
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
+    // Use sites never fire (EPH-I1075), so this pin lives entirely on the
+    // declaration surface: a project DECLARES its own members and can
+    // rename a member that collides with a std name, so snake_case mode
+    // reports it (EPH-I0473).
     const oom_line = "    if (err == error.OutOfMemory) return error.OutOfMemory;";
     try checkErrorNaming(.{
         .issues = &issues,
@@ -73863,7 +73580,7 @@ test "checkErrorNaming: std-lib error names are exempt in REFERENCES only (EPH-I
         .line_num = 4,
         .error_naming = .snake_case,
     }, false);
-    // References to std names stay exempt: project code cannot rename them.
+    // The reference lines never fire (EPH-I1075).
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 
     // A DECLARED member colliding with a std name is the project's own
@@ -73916,7 +73633,7 @@ test "checkErrorNaming: title_case mode stays silent on std-name members (EPH-I0
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "checkErrorNaming: non-std TitleCase error values are still flagged" {
+test "checkErrorNaming: non-std TitleCase error set members are still flagged" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
@@ -73924,17 +73641,19 @@ test "checkErrorNaming: non-std TitleCase error values are still flagged" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
+    // The declaration surface carries the flag: a project-declared member
+    // carries no std-name exemption (EPH-I0473, EPH-I1075).
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
         .path = "test.zig",
-        .t = "return error.TotallyMadeUp;",
+        .t = "error{ TotallyMadeUp }",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, false);
+    }, true);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
-        "error value 'TotallyMadeUp' should be snake_case",
+        "error set member 'TotallyMadeUp' should be snake_case",
         issues.items[0].message,
     );
 }
@@ -73967,7 +73686,7 @@ test "checkErrorNaming: error set composition stops at ||" {
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "checkErrorNaming: TitleCase mode flags snake_case error values" {
+test "checkErrorNaming: TitleCase mode use sites stay silent (EPH-I1075)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
@@ -73975,6 +73694,8 @@ test "checkErrorNaming: TitleCase mode flags snake_case error values" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
+    // Use sites of a snake_case error stay silent even in TitleCase mode:
+    // the declaration is the only actionable surface (EPH-I1075).
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -73983,7 +73704,6 @@ test "checkErrorNaming: TitleCase mode flags snake_case error values" {
         .line_num = 1,
         .error_naming = .title_case,
     }, false);
-    // TitleCase names pass in TitleCase mode.
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -73992,9 +73712,18 @@ test "checkErrorNaming: TitleCase mode flags snake_case error values" {
         .line_num = 2,
         .error_naming = .title_case,
     }, false);
+    // The declaration of the same name fires in TitleCase mode.
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "error{ my_project_error }",
+        .line_num = 3,
+        .error_naming = .title_case,
+    }, true);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
-        "error value 'my_project_error' should be TitleCase",
+        "error set member 'my_project_error' should be TitleCase",
         issues.items[0].message,
     );
 }
@@ -74064,6 +73793,93 @@ test "checkErrorNaming: member scan stops at the set's closing brace" {
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
+test "checkErrorNaming: member scan stops at the error-union boundary (EPH-I0274)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+
+    // Each shape pins the evidence class: the payload/return type is
+    // TitleCase (snake_case mode would flag an over-read) while the real
+    // member violates the mode (the scan demonstrably fires).
+    // Shape 1: parenthesized union payload (zig-pulse core/types.zig:471).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "pub fn encode(v: anytype) (rlp.EncodeError || error{BadMember})!Hash32 {",
+        .line_num = 1,
+        .error_naming = .snake_case,
+    }, true);
+    // Shape 2: inline error-union payload (error{usage}!ParsedArgs).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "pub fn parse() error{BadUsage}!ParsedArgs {",
+        .line_num = 2,
+        .error_naming = .snake_case,
+    }, true);
+    // Shape 4: error{invalid_hex}!LineLayout and error{invalid_hex}!T
+    // (ZPL-I0805).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "fn parseLine(s: []const u8) error{InvalidHex}!LineLayout {",
+        .line_num = 3,
+        .error_naming = .snake_case,
+    }, true);
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "fn decodeHex(comptime T: type) error{InvalidHex}!T {",
+        .line_num = 4,
+        .error_naming = .snake_case,
+    }, true);
+    // Exactly the four real members fire; payload and return types never do.
+    try std.testing.expectEqual(@as(usize, 4), issues.items.len);
+    const expected = [_][]const u8{
+        "error set member 'BadMember' should be snake_case",
+        "error set member 'BadUsage' should be snake_case",
+        "error set member 'InvalidHex' should be snake_case",
+        "error set member 'InvalidHex' should be snake_case",
+    };
+    for (issues.items, expected) |issue, msg| {
+        try std.testing.expectEqualStrings(msg, issue.message);
+    }
+}
+
+test "analyzeNaming: bare return type after a closed set is not a member (EPH-I0274 shape 3)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Shape 3: the set closes, then a bare-Errno fn follows. The scan must
+    // stop at the close brace — both when the close shares the open line
+    // (the RhyOS 2026-07-30 composition) and when a multi-line set precedes
+    // the fn (the carried depth must die at the close).
+    const code =
+        \\const E = error{ usage };
+        \\fn f() Errno {
+        \\    return undefined;
+        \\}
+        \\const F = error{ usage }; fn g() Errno { return undefined; }
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_bare_errno.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_bare_errno.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .snake_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
 test "checkErrorNaming: TitleCase mode exempts std-lib and underscore names" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -74098,7 +73914,7 @@ test "checkErrorNaming: TitleCase mode exempts std-lib and underscore names" {
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "analyzeNaming: TitleCase default flags snake_case error names in files" {
+test "analyzeNaming: TitleCase default flags snake_case member declarations only (EPH-I1075)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var graph = ImportGraph.init(allocator, &diag);
@@ -74120,15 +73936,11 @@ test "analyzeNaming: TitleCase default flags snake_case error names in files" {
     var issues = try analyzeNaming(allocator, &graph, .title_case);
     defer deinitIssues(&issues, allocator);
 
-    // Exactly the two snake_case names fire: the member and the value.
-    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    // Only the declaration fires; both use sites stay silent (EPH-I1075).
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'bad_member' should be TitleCase",
         issues.items[0].message,
-    );
-    try std.testing.expectEqualStrings(
-        "error value 'bad_member' should be TitleCase",
-        issues.items[1].message,
     );
 }
 
@@ -74408,7 +74220,7 @@ test "checkErrorNaming: underscore-prefixed error names are exempt" {
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "checkErrorNaming: does not flag someerror.foo as error value" {
+test "checkErrorNaming: member scan is code-position masked (EPH-I0274, B57c)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const a = gpa.allocator();
@@ -74416,72 +74228,38 @@ test "checkErrorNaming: does not flag someerror.foo as error value" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
+    // A fake `error{` inside a trailing comment is prose, not an opener:
+    // the line is inside a real set, and only its real member fires.
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
         .path = "test.zig",
-        .t = "const x = someerror.foo;",
+        .t = "    usage, // doc: error{NotReal}",
         .line_num = 1,
-    }, false);
-    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
-}
-
-test "checkErrorNaming: does not flag error. inside string literal" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const a = gpa.allocator();
-
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    defer deinitIssues(&issues, a);
-
+        .error_naming = .snake_case,
+    }, true);
+    // A fake `error{` inside a string literal is data, not an opener.
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
         .path = "test.zig",
-        .t = "const msg = \"error.FileNotFound\";",
-        .line_num = 1,
-    }, false);
-    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
-}
-
-test "checkErrorNaming: does not flag error. in a trailing line comment" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const a = gpa.allocator();
-
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    defer deinitIssues(&issues, a);
-
-    // Comment prose is data in BOTH modes (title_case would flag the
-    // snake_case mention without comment-awareness).
-    try checkErrorNaming(.{
-        .issues = &issues,
-        .allocator = a,
-        .path = "test.zig",
-        .t = "const x = 1; // returns error.not_a_reference",
-        .line_num = 1,
-        .error_naming = .title_case,
-    }, false);
-    try checkErrorNaming(.{
-        .issues = &issues,
-        .allocator = a,
-        .path = "test.zig",
-        .t = "const x = 1; // returns error.AlsoNotAReference",
+        .t = "    usage, // \"error{Fake}\"",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, false);
-    // A `//` inside a string is not a comment: real code after it is checked.
+    }, true);
+    // Control: a real member on the same line still fires — the mask must
+    // not swallow the set's own body.
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
         .path = "test.zig",
-        .t = "const u = \"http://a//b\"; return error.real_bad;",
+        .t = "    BadMember, // doc: error{NotReal}",
         .line_num = 3,
-        .error_naming = .title_case,
-    }, false);
+        .error_naming = .snake_case,
+    }, true);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
-        "error value 'real_bad' should be TitleCase",
+        "error set member 'BadMember' should be snake_case",
         issues.items[0].message,
     );
 }
@@ -74494,16 +74272,17 @@ test "checkErrorNaming: comment after a char-literal quote is prose (EPH-I0464)"
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    // The `"` inside `'"'` is character data: the scanner must not treat the
-    // trailing comment as string content (it flagged the prose error name).
+    // The `"` inside `'"'` is character data: the literal-masked member
+    // scan must not treat the trailing comment as string content (it once
+    // flagged the prose error name as a member).
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
         .path = "test.zig",
-        .t = "const q = '\"'; // error.badName",
+        .t = "    const q = '\"'; // doc: error{BadName}",
         .line_num = 1,
-        .error_naming = .title_case,
-    }, false);
+        .error_naming = .snake_case,
+    }, true);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -79689,6 +79468,82 @@ test "ZA303 fires on multi-line signature with too many params" {
             mem.eql(u8, issue.file, "test_multiline_params.zig")) za303_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), za303_count);
+}
+
+test "ZA303 exempts extern and callconv(.c) declarations (EPH-I1059)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // Three C-ABI shapes carry 5 params the C API pins (skytale
+    // proc_pidinfo): a bodied extern fn, a suffix callconv(.c), and a
+    // prefix callconv(.c). The plain 5-param fn is the control.
+    const code =
+        \\pub extern fn proc_pidinfo(
+        \\    pid: c_int,
+        \\    flavor: c_int,
+        \\    arg: u64,
+        \\    buffer: ?*u8,
+        \\    buffer_size: c_int,
+        \\) c_int {
+        \\    return undefined;
+        \\}
+        \\pub fn rustle(comptime T: type, a: u8, b: u8, c: u8, d: u8) callconv(.c) void {
+        \\    _ = T;
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = c;
+        \\    _ = d;
+        \\}
+        \\pub callconv(.C) fn jingle(
+        \\    a: u8,
+        \\    b: u8,
+        \\    c: u8,
+        \\    d: u8,
+        \\    e: u8,
+        \\) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = c;
+        \\    _ = d;
+        \\    _ = e;
+        \\}
+        \\pub fn plainFive(a: u8, b: u8, c: u8, d: u8, e: u8) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = c;
+        \\    _ = d;
+        \\    _ = e;
+        \\}
+        \\fn decoy(a: u8, b: u8, c: u8, d: u8, e: u8) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = c;
+        \\    _ = d;
+        \\    _ = e;
+        \\}
+        \\const EntryPoint = *const fn (ctx: usize, result: *u8) callconv(.c) i32;
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_c_abi.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_c_abi.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var za303_count: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS) and
+            mem.eql(u8, issue.file, "test_c_abi.zig")) za303_count += 1;
+    }
+    // The three C-ABI shapes are exempt; plainFive and decoy still fire
+    // (the EntryPoint callconv on a later declaration exempts neither).
+    try std.testing.expectEqual(@as(usize, 2), za303_count);
 }
 
 // ============================================================================

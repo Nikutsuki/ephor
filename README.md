@@ -221,7 +221,7 @@ Example config:
 | `enable` | Rule IDs to enable (overrides disable) |
 | `strict` | `true` to exit 1 when any warning/error is found (CI gate) |
 | `fail_on` | Finer CI gate: `error`, `warning`, `note`, `never` (overrides `strict`) |
-| `error_naming` | ZA703 convention for error values and error set members: `TitleCase` (default; `PascalCase` accepted as an alias) or `snake_case` |
+| `error_naming` | ZA703 convention for error set member declarations: `TitleCase` (default; `PascalCase` accepted as an alias) or `snake_case` |
 | `thresholds` | Complexity and style thresholds. Values clamp at documented maxima (see Config trust model) |
 
 ### Config trust model
@@ -326,7 +326,7 @@ An override that is not absolute or does not resolve prints a warning and falls 
 |------|----------|---------|-------------|
 | **ZA301** | warning | ON | Function exceeds max lines (default: 50; type factories get 3x) |
 | **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
-| **ZA303** | warning | ON | Function has too many parameters (default: 4; counted across multi-line signatures) |
+| **ZA303** | warning | ON | Function has too many parameters (default: 4; counted across multi-line signatures). Exempt: `extern` and `callconv(.c)`/`callconv(.C)` declarations — the C ABI pins the signature (EPH-I1059) |
 | **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
 | **ZA305** | warning | OFF | Function has high cyclomatic complexity — McCabe CCN (default: 10) |
 | **ZA306** | warning | OFF | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
@@ -400,14 +400,15 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | Constants (`const`) | `snake_case` | `const max_size = 1024;` |
 | Type aliases (`const`) | `TitleCase` | `const Allocator = std.mem.Allocator;` |
 | Function aliases (`const`) | `camelCase` | `const eql = std.mem.eql;` |
-| Error values (`error.Foo`) | `TitleCase` | `return error.FileNotFound;` |
 | Error set members | `TitleCase` | `error{ FileNotFound }` |
 | Imports | (not checked) | `const std = @import("std");` |
 | Names starting with `_` | (exempt) | `fn _helper() void {}` |
 
 **Error naming:** `TitleCase` is the default because the stdlib and virtually all community code declare TitleCase error names (the pre-0.14.4 ZA703 default of `snake_case` produced false positives on idiomatic Zig). Set `"error_naming": "snake_case"` in `ephor.json` to keep the old behavior.
 
-**ZA703 exemptions:** std-lib error names (`error.OutOfMemory`, `error.FileNotFound`, …) are exempt — project code cannot rename them. `extern fn` declarations are exempt — their names are ABI-fixed (`export fn` names are NOT exempt — they are project-chosen identifiers). Identifiers on the right-hand side of error-set composition (`error{ a, b } || other.Error`) are references to other error sets, not members, and are not checked. Variables are judged by declaration kind: `var` is always `snake_case`, even when its value is a function reference.
+**ZA703 fire surface:** ZA703 fires on error-set member declarations only — the body of an `error{...}` set, whether a named const or an inline set in a signature or type. Use sites of an error value are never flagged: a used error value cannot be restyled per site, and renaming the set is a cross-tree refactor unrelated to the change that triggered the hit (EPH-I1075).
+
+**ZA703 exemptions:** `extern fn` declarations are exempt — their names are ABI-fixed (`export fn` names are NOT exempt — they are project-chosen identifiers). Identifiers on the right-hand side of error-set composition (`error{ a, b } || other.Error`) are references to other error sets, not members, and are not checked. Variables are judged by declaration kind: `var` is always `snake_case`, even when its value is a function reference.
 
 ### Null Safety (ZA8xx)
 
@@ -1213,14 +1214,23 @@ Ephor uses three testing layers:
 
 ### v0.15.0 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (unreleased)
 
-**Changed (ZA703 default flip):** Error values and error set members now
-default to `TitleCase` (`error.FileNotFound`), matching the stdlib and
-virtually all community code — the old `snake_case` default false-positived
-on idiomatic Zig (Codeberg issue #1, EPH-I0092). Set
-`"error_naming": "snake_case"` in `ephor.json` to keep the old behavior;
-`"PascalCase"` is accepted as an alias for `TitleCase`. Unknown values warn
-and fall back to the default. `error.Name` text inside trailing `//`
-comments is no longer scanned (prose, not a reference).
+**Changed (ZA703 default flip):** Error set members now default to
+`TitleCase` (`error{ FileNotFound }`), matching the stdlib and virtually
+all community code — the old `snake_case` default false-positived on
+idiomatic Zig (Codeberg issue #1, EPH-I0092). Set `"error_naming":
+"snake_case"` in `ephor.json` to keep the old behavior; `"PascalCase"` is
+accepted as an alias for `TitleCase`. Unknown values warn and fall back to
+the default.
+
+**Changed (ZA703 fire surface):** ZA703 now fires on error-set member
+declarations only. Use sites of an error value are never flagged — a used
+error value cannot be restyled per site (EPH-I1075). The member scan stops
+at the error-union boundary, so payload and plain return types are never
+flagged as members (EPH-I0274).
+
+**Changed (ZA303 exemption):** `extern` and `callconv(.c)`/`callconv(.C)`
+declarations are exempt from parameter counting — the C ABI pins the
+signature (EPH-I1059).
 
 **Changed (migration required):** Inline-ignore directives are now anchored —
 only plain `//` comments whose first token is `ephor:ignore` /

@@ -36779,6 +36779,12 @@ fn checkProjectPrerequisites(diag: *DiagCtx, project_dir: std.Io.Dir) bool {
 
 /// Spawn `zig fetch --save=ephor <url_z>` in project_dir and return the
 /// child's exit code. Install and upgrade share the one spawn (EPH-I0235).
+/// Network boundary for install/upgrade (band-T05 F5, EPH-I0572): every
+/// hermetic install/upgrade test must fail before this point. The
+/// no-network test property rests on the callers' validation order
+/// (version, floor, prerequisites, dependency before the fetch), not on an
+/// injected spawn seam. A reorder that reaches this spawn turns the
+/// hermetic tests into network clients inside the test runner.
 fn runZigFetchSave(diag: *DiagCtx, project_dir: std.Io.Dir, url_z: [:0]const u8) !u8 {
     var child = try std.process.spawn(diag.io, .{
         .argv = &.{ tool_zig_path, "fetch", "--save=ephor", url_z },
@@ -36798,7 +36804,9 @@ fn runZigFetchSave(diag: *DiagCtx, project_dir: std.Io.Dir, url_z: [:0]const u8)
 /// --version returns error.InvalidVersion before any project check
 /// (EPH-I0155). Every other failure path returns error.InstallFailed
 /// (EPH-I0235): a CI step doing `ephor install && zig build ephor` must
-/// not proceed on a failed install.
+/// not proceed on a failed install. The zig-fetch spawn must stay after
+/// the version and prerequisite gates: the hermetic tests rely on that
+/// order (band-T05 F5, EPH-I0572 — the pin lives at runZigFetchSave).
 fn runInstallCommand(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -37136,7 +37144,12 @@ fn printRecordedHash(io: std.Io, allocator: Allocator, ver: []const u8) void {
 /// same directory in production. An invalid --version returns
 /// error.InvalidVersion before any fetch (EPH-I0155). Every other failure
 /// path returns error.UpgradeFailed (EPH-I0235): a script must see a
-/// nonzero exit.
+/// nonzero exit. The version, floor, and dependency gates must stay before
+/// the zig-fetch spawn: the hermetic upgrade tests rely on that order
+/// (band-T05 F5, EPH-I0572 — the pin lives at runZigFetchSave). The
+/// implicit-version fetch (fetchLatestVersion) is exempt from that order:
+/// the floor must compare the resolved target (B13-20), and no test
+/// reaches it.
 /// CLI options for one upgrade run: an optional explicit version pin plus
 /// the downgrade-override latch (--force, EPH-I0193).
 const UpgradeOptions = struct {
@@ -42566,22 +42579,47 @@ test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-
 
 test "entryCoveredByScan folds alternate spellings of one file (EPH-I0812)" {
     const diag = testDiagCtx();
-    // Real-file pairs: the absolute and infix-dot spellings resolve to the
-    // relative form's realpath, so all three count as covered.
+    // Real-file fixture created in the invocation cwd (EPH-I0575): the
+    // absolute and infix-dot spellings resolve to the relative form's
+    // realpath, so all three count as covered. The fixture is created
+    // here, not assumed, and deleted after.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "ephor-i0812-spell/src");
+    defer cwd.deleteTree(std.testing.io, "ephor-i0812-spell") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-spell/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-spell/src/types.zig",
+        .data = "pub fn main() void {}\n",
+    });
     var buf: [Fs.max_path_bytes]u8 = undefined;
-    const abs = try Fs.cwd(diag.io).realpath("src/main.zig", &buf);
+    const abs = try Fs.cwd(diag.io).realpath("ephor-i0812-spell/src/main.zig", &buf);
     var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
-    const cwd = try Fs.cwd(diag.io).realpath(".", &cwd_buf);
-    const infix = try std.fmt.allocPrint(std.testing.allocator, "{s}/./src/main.zig", .{cwd});
+    const cwd_real = try Fs.cwd(diag.io).realpath(".", &cwd_buf);
+    const infix = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/./ephor-i0812-spell/src/main.zig",
+        .{cwd_real},
+    );
     defer std.testing.allocator.free(infix);
-    try std.testing.expect(entryCoveredByScan(diag.io, "src/main.zig", "src/main.zig"));
-    try std.testing.expect(entryCoveredByScan(diag.io, abs, "src/main.zig"));
-    try std.testing.expect(entryCoveredByScan(diag.io, infix, "src/main.zig"));
+    try std.testing.expect(entryCoveredByScan(
+        diag.io,
+        "ephor-i0812-spell/src/main.zig",
+        "ephor-i0812-spell/src/main.zig",
+    ));
+    try std.testing.expect(entryCoveredByScan(diag.io, abs, "ephor-i0812-spell/src/main.zig"));
+    try std.testing.expect(entryCoveredByScan(diag.io, infix, "ephor-i0812-spell/src/main.zig"));
     // A different physical file is not covered.
-    try std.testing.expect(!entryCoveredByScan(diag.io, abs, "src/types.zig"));
-    // Both sides resolve here: the realpath pair decides (src covers
-    // src/main.zig).
-    try std.testing.expect(entryCoveredByScan(diag.io, "src", "src/main.zig"));
+    try std.testing.expect(!entryCoveredByScan(diag.io, abs, "ephor-i0812-spell/src/types.zig"));
+    // Both sides resolve here: the realpath pair decides (the dir covers
+    // the file).
+    try std.testing.expect(entryCoveredByScan(
+        diag.io,
+        "ephor-i0812-spell/src",
+        "ephor-i0812-spell/src/main.zig",
+    ));
     // Unresolvable paths fall back to the textual test.
     try std.testing.expect(!entryCoveredByScan(diag.io, "main.zig", "other.zig"));
 }
@@ -42653,8 +42691,8 @@ test "buildCheckGraph wires the entries-widen note (EPH-I0803)" {
 /// EPH-I0812 run fixture: run context and graph wired around a configured
 /// cfg. The caller owns the cfg (path and entries), its deinit, and the
 /// cache (the EPH-I0803 pattern at the buildCheckGraph tests). The
-/// spelling tests read the repo's real src/main.zig and src/types.zig
-/// from the invocation cwd, so they run from the project root.
+/// spelling tests create their own file fixtures in the invocation cwd
+/// and delete them after, so they run from any cwd (EPH-I0575).
 const SpellingRun = struct {
     ctx: RunCtx,
     graph: ImportGraph,
@@ -42686,14 +42724,21 @@ test "relative CLI path keeps one graph key for a covered entry (EPH-I0812)" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
-    // The repo's own src/main.zig stands in for the sandbox project's
-    // main.zig: a real file a relative path resolves against from the
-    // invocation cwd. The kept entry shares the scan path's spelling, so
-    // the join must stay silent (Files: 1, no widen note).
+    // A real fixture file created in the invocation cwd (EPH-I0575): the
+    // relative path resolves against it from any cwd. The kept entry
+    // shares the scan path's spelling, so the join must stay silent
+    // (Files: 1, no widen note).
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "ephor-i0812-rel/src");
+    defer cwd.deleteTree(std.testing.io, "ephor-i0812-rel") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-rel/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try setOwnedPath(allocator, &cfg, "src/main.zig");
-    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    try setOwnedPath(allocator, &cfg, "ephor-i0812-rel/src/main.zig");
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "ephor-i0812-rel/src/main.zig"));
     var cache = IgnoreCache.init(allocator);
     defer cache.deinit();
     var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
@@ -42707,6 +42752,15 @@ test "dot-slash CLI path keeps one graph key for a covered entry (EPH-I0812)" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
+    // A real fixture file created in the invocation cwd (EPH-I0575): the
+    // dot-slash path resolves against it from any cwd.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "ephor-i0812-dot/src");
+    defer cwd.deleteTree(std.testing.io, "ephor-i0812-dot") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-dot/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     var cli_entries = false;
@@ -42722,9 +42776,9 @@ test "dot-slash CLI path keeps one graph key for a covered entry (EPH-I0812)" {
     };
     // The parse layer sheds the leading ./ (acceptPositionalPath), so the
     // run sees the same spelling as the kept entry.
-    try parseCliArg(cli_ctx, "./src/main.zig");
-    try std.testing.expectEqualStrings("src/main.zig", cfg.path);
-    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    try parseCliArg(cli_ctx, "./ephor-i0812-dot/src/main.zig");
+    try std.testing.expectEqualStrings("ephor-i0812-dot/src/main.zig", cfg.path);
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "ephor-i0812-dot/src/main.zig"));
     var cache = IgnoreCache.init(allocator);
     defer cache.deinit();
     var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
@@ -42738,15 +42792,22 @@ test "absolute CLI path keeps one graph key for a covered entry (EPH-I0812)" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
-    // The absolute spelling of the same physical file: the kept relative
-    // entry must not join under a second key, and the widen note must not
-    // fire for it.
+    // The absolute spelling of the same physical fixture file (created in
+    // the invocation cwd, EPH-I0575): the kept relative entry must not
+    // join under a second key, and the widen note must not fire for it.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "ephor-i0812-abs/src");
+    defer cwd.deleteTree(std.testing.io, "ephor-i0812-abs") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-abs/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
     var buf: [Fs.max_path_bytes]u8 = undefined;
-    const abs = try Fs.cwd(diag.io).realpath("src/main.zig", &buf);
+    const abs = try Fs.cwd(diag.io).realpath("ephor-i0812-abs/src/main.zig", &buf);
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, abs);
-    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "ephor-i0812-abs/src/main.zig"));
     var cache = IgnoreCache.init(allocator);
     defer cache.deinit();
     var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
@@ -42760,14 +42821,23 @@ test "infix-dot CLI path keeps one graph key for a covered entry (EPH-I0812)" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
+    // A real fixture file created in the invocation cwd (EPH-I0575): the
+    // infix-dot path resolves against it from any cwd.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "ephor-i0812-infix/src");
+    defer cwd.deleteTree(std.testing.io, "ephor-i0812-infix") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-infix/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
     var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
-    const cwd = try Fs.cwd(diag.io).realpath(".", &cwd_buf);
-    const infix = try std.fmt.allocPrint(allocator, "{s}/./src/main.zig", .{cwd});
+    const cwd_real = try Fs.cwd(diag.io).realpath(".", &cwd_buf);
+    const infix = try std.fmt.allocPrint(allocator, "{s}/./ephor-i0812-infix/src/main.zig", .{cwd_real});
     defer allocator.free(infix);
     var cfg = testConfig();
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, infix);
-    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "ephor-i0812-infix/src/main.zig"));
     var cache = IgnoreCache.init(allocator);
     defer cache.deinit();
     var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
@@ -42781,13 +42851,25 @@ test "distinct entry files stay distinct graph keys (EPH-I0812)" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
-    // A genuinely different physical file stays outside the scan path: it
-    // joins (two keys) and the widen note counts it (the RED4-3 orphan
+    // A genuinely different physical fixture file (created in the
+    // invocation cwd, EPH-I0575) stays outside the scan path: it joins
+    // (two keys) and the widen note counts it (the RED4-3 orphan
     // feature).
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "ephor-i0812-dist/src");
+    defer cwd.deleteTree(std.testing.io, "ephor-i0812-dist") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-dist/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i0812-dist/src/types.zig",
+        .data = "pub fn main() void {}\n",
+    });
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try setOwnedPath(allocator, &cfg, "src/main.zig");
-    try cfg.entries.append(allocator, try allocator.dupe(u8, "src/types.zig"));
+    try setOwnedPath(allocator, &cfg, "ephor-i0812-dist/src/main.zig");
+    try cfg.entries.append(allocator, try allocator.dupe(u8, "ephor-i0812-dist/src/types.zig"));
     var cache = IgnoreCache.init(allocator);
     defer cache.deinit();
     var run = SpellingRun.init(&diag, allocator, &cfg, &cache);
@@ -44791,23 +44873,33 @@ test "parseFmtOutput keeps the dot-root ./ echo (EPH-I1038)" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
+    // A real fixture file created in the invocation cwd (EPH-I0575): the
+    // root-resolution gate must see it from any cwd.
+    var cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(std.testing.io, "ephor-i1038-echo/src");
+    defer cwd.deleteTree(std.testing.io, "ephor-i1038-echo") catch {};
+    try cwd.writeFile(std.testing.io, .{
+        .sub_path = "ephor-i1038-echo/src/main.zig",
+        .data = "fn main()void{}\n",
+    });
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
     const root_real = Fs.cwd(std.testing.io).realpath(".", &root_buf) catch
         return error.SkipZigTest;
 
     // A dot-root scan path reaches the child as "." and zig fmt joins it
-    // with "/", so the echo "./src/main.zig" carries the scan path itself,
-    // not an argv artifact. The finding keeps the "./": the report-path
-    // gate compares the name textually against cfg.path, and "src/main.zig"
-    // fails the ancestor test for "." — pre-fix the unconditional strip
-    // dropped every ZA601 on a "." or "./" scan silently.
-    var issues = try parseFmtOutput(&diag, allocator, "./src/main.zig\n", .{
+    // with "/", so the echo "./ephor-i1038-echo/src/main.zig" carries the
+    // scan path itself, not an argv artifact. The finding keeps the "./":
+    // the report-path gate compares the name textually against cfg.path,
+    // and "ephor-i1038-echo/src/main.zig" fails the ancestor test for "."
+    // — pre-fix the unconditional strip dropped every ZA601 on a "." or
+    // "./" scan silently.
+    var issues = try parseFmtOutput(&diag, allocator, "./ephor-i1038-echo/src/main.zig\n", .{
         .scan_path = ".",
         .root_real = root_real,
     });
     defer deinitIssues(&issues, allocator);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
-    try std.testing.expectEqualStrings("./src/main.zig", issues.items[0].file);
+    try std.testing.expectEqualStrings("./ephor-i1038-echo/src/main.zig", issues.items[0].file);
     try std.testing.expect(issues.items[0].file_owned);
     try std.testing.expectEqualStrings(RULE_NEEDS_FORMAT, issues.items[0].rule);
     // The gate-equivalent: the kept name must survive classifyIssue's
@@ -44873,10 +44965,30 @@ test "config path_dir ./ and ./src normalize like the CLI channel (EPH-I1038)" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
+    // Hermetic containment root (EPH-I0575): the config's directory is a
+    // tmpDir, not the cwd, so the "./src" resolution works from any cwd.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    var ignored_any = false;
+    const source: ConfigSource = .{
+        .trusted = true,
+        .path = "ephor.json",
+        .dir = dir_path,
+        .ignored_any = &ignored_any,
+    };
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"./src\"}", &cfg);
+    try parseConfigJsonSource(.{
+        .diag = &diag,
+        .allocator = allocator,
+        .content = "{\"path_dir\": \"./src\"}",
+        .cfg = &cfg,
+        .source = source,
+    });
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(cfg.path_owned);
 
@@ -44886,7 +44998,13 @@ test "config path_dir ./ and ./src normalize like the CLI channel (EPH-I1038)" {
     // dot-root echo, see the EPH-I1038 keep pin) — never a silent drop.
     var dot_cfg = testConfig();
     defer dot_cfg.deinit(allocator);
-    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"./\"}", &dot_cfg);
+    try parseConfigJsonSource(.{
+        .diag = &diag,
+        .allocator = allocator,
+        .content = "{\"path_dir\": \"./\"}",
+        .cfg = &dot_cfg,
+        .source = source,
+    });
     try stripTrailingSlashes(allocator, &dot_cfg);
     try std.testing.expectEqualStrings(".", dot_cfg.path);
     try std.testing.expect(isPathAncestorOrEqual(dot_cfg.path, "./src/unfmt.zig"));
@@ -76018,6 +76136,11 @@ test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
     try std.testing.expect(found_za105);
 }
 
+// Arena-heuristic family note (band-T05 F10, EPH-I0578): the per-case
+// bodies stay boilerplate on purpose. Each test keeps its fixture and its
+// regression comment self-contained; a table-drive would move both into
+// rows and bury the per-case reasoning. A new case copies the nearest
+// sibling. This choice is documented, not pending.
 test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
     var diag = testDiagCtx();
     // Arena accessed through struct field: self.arena.allocator().alloc()
@@ -77971,8 +78094,10 @@ test "ZA105: no false positive on variable reassignment after free" {
         if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
             mem.eql(u8, issue.file, "test_reassign.zig"))
         {
-            std.debug.print("unexpected ZA105: {s} line {d}\n", .{ issue.message, issue.line });
-            try std.testing.expect(false);
+            // The finding text is the failure payload: the runner's
+            // expected/found diff carries it, so no stderr print is needed
+            // (band-T05 F9, EPH-I0577).
+            try std.testing.expectEqualStrings("no ZA105 expected", issue.message);
         }
     }
 }
@@ -78013,8 +78138,10 @@ test "ZA105: no false positive on for-loop capture variable" {
         if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
             mem.eql(u8, issue.file, "test_capture.zig"))
         {
-            std.debug.print("unexpected ZA105: {s} line {d}\n", .{ issue.message, issue.line });
-            try std.testing.expect(false);
+            // The finding text is the failure payload: the runner's
+            // expected/found diff carries it, so no stderr print is needed
+            // (band-T05 F9, EPH-I0577).
+            try std.testing.expectEqualStrings("no ZA105 expected", issue.message);
         }
     }
 }
@@ -79736,8 +79863,10 @@ test "ZA304 suppressed for fromJson with many branches" {
         if (mem.eql(u8, issue.rule, RULE_TOO_MANY_BRANCHES) and
             mem.eql(u8, issue.file, "test_dispatch.zig"))
         {
-            std.debug.print("unexpected ZA304 for fromJson: {s}\n", .{issue.message});
-            try std.testing.expect(false);
+            // The finding text is the failure payload: the runner's
+            // expected/found diff carries it, so no stderr print is needed
+            // (band-T05 F9, EPH-I0577).
+            try std.testing.expectEqualStrings("no ZA304 expected", issue.message);
         }
     }
 }
@@ -81412,17 +81541,41 @@ test "hasEnclosingGuardForVar misses a guard beyond the window (EPH-I0225)" {
 }
 
 test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
+    // 20000-line fixture per helper. Each queried helper gets its own
+    // findable target at index 0: 19999 lines back, outside every window,
+    // yet reachable by that helper's unbounded walk. Each assertion expects
+    // the target MISSED, so a window-removal regression walks to index 0,
+    // finds its target, and fails. Pre-fix the fixture planted only the
+    // null guard; the other five assertions passed even with an unbounded
+    // scan because nothing on the fixture matched them (band-T05 F6,
+    // EPH-I0574). The comment-only filler carries none of the queried
+    // shapes and breaks no walk: the `;`-ending "work();" filler stopped
+    // the short-circuit walk at the first line regardless of its window.
     var buf: [20000][]const u8 = undefined;
-    const lines = guardScanFixture(&buf, "work();", "if (x == null) return;", 0);
-    // The only guard sits 19999 lines back, past every window. The unbounded
-    // pre-fix scans walked all 20000 lines per call. Each query now returns
-    // after at most its window of lines.
-    try std.testing.expect(!hasNullGuard(lines, lines.len - 1, 0, "x"));
-    try std.testing.expect(!hasPairedIncrementInLines(lines, "x"));
-    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines, lines.len - 1, "x"));
-    try std.testing.expect(findEnclosingIfCondition(lines, lines.len - 1, 0) == null);
-    try std.testing.expect(findEnclosingIfLine(lines, lines.len - 1) == null);
-    try std.testing.expect(!hasEnclosingGuardForVar(lines, lines.len - 1, "x", null));
+
+    // hasNullGuard keys on a bound `== null` exit (20-line window).
+    const lines_null = guardScanFixture(&buf, "// deep filler", "if (x == null) return;", 0);
+    try std.testing.expect(!hasNullGuard(lines_null, lines_null.len - 1, 0, "x"));
+
+    // hasPairedIncrementInLines keys on a `x += 1` pair (20-line window).
+    const lines_incr = guardScanFixture(&buf, "// deep filler", "x += 1;", 0);
+    try std.testing.expect(!hasPairedIncrementInLines(lines_incr, "x"));
+
+    // hasShortCircuitGuardOnPriorLines keys on an `x == 0 or` guard
+    // (10-line window).
+    const lines_sc = guardScanFixture(&buf, "// deep filler", "if (x == 0 or x >= buf.len) return;", 0);
+    try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines_sc, lines_sc.len - 1, "x"));
+
+    // findEnclosingIfCondition / findEnclosingIfLine key on an opener line
+    // with an if-condition (40-line window).
+    const lines_cond = guardScanFixture(&buf, "// deep filler", "if (deep_flag) {", 0);
+    try std.testing.expect(findEnclosingIfCondition(lines_cond, lines_cond.len - 1, 0) == null);
+    try std.testing.expect(findEnclosingIfLine(lines_cond, lines_cond.len - 1) == null);
+
+    // hasEnclosingGuardForVar keys on an opener whose condition guards the
+    // var (40-line window).
+    const lines_guard = guardScanFixture(&buf, "// deep filler", "if (x > 0) {", 0);
+    try std.testing.expect(!hasEnclosingGuardForVar(lines_guard, lines_guard.len - 1, "x", null));
 }
 
 // --- Integration tests with exact counts ---
@@ -90879,7 +91032,12 @@ test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
     // The real file carries the markers only as string-literal data (this
     // predicate, its tests), so the dogfood target must be analyzed.
     const max_main_bytes = 16 * 1024 * 1024;
-    const content = try Fs.cwd(std.testing.io).readFileAlloc(allocator, "src/main.zig", max_main_bytes);
+    // Self-analysis pin (EPH-I0575): the repo's own src/main.zig is the
+    // dogfood target, so the test only runs where the repo root is the
+    // cwd. A foreign cwd skips it: a tmpDir stand-in would pin the
+    // stand-in, not the real file.
+    const content = Fs.cwd(std.testing.io).readFileAlloc(allocator, "src/main.zig", max_main_bytes) catch
+        return error.SkipZigTest;
     defer allocator.free(content);
     try std.testing.expect(!isCImportFile("src/main.zig", content));
 
@@ -94154,6 +94312,11 @@ fn expectZC101Counts(
     );
 }
 
+// ZC101 family note (band-T05 F10, EPH-I0578): the per-case bodies stay
+// boilerplate on purpose. Each test keeps its fixture and its regression
+// comment self-contained; a table-drive would move both into rows and bury
+// the per-case reasoning. A new case copies the nearest sibling. This
+// choice is documented, not pending.
 test "ZC101: lock with plain unlock is a note, not a warning" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -97903,6 +98066,11 @@ test "ZA110: RHS-rebound copy alias never fires (EPH-I1048)" {
 // ============================================================================
 // ZA209 Tests — useless-error-return (!T fn that never fails)
 // ============================================================================
+// Family note (band-T05 F10, EPH-I0578): the per-case bodies stay
+// boilerplate on purpose. Each test keeps its fixture and its regression
+// comment self-contained; a table-drive would move both into rows and bury
+// the per-case reasoning. A new case copies the nearest sibling. This
+// choice is documented, not pending.
 
 test "ZA209: error-union fn that never fails fires" {
     var diag = testDiagCtx();
@@ -99613,6 +99781,11 @@ test "ZA904: broken ) } continuations in invalid regions stay masked (EPH-I0974)
 // Strict CI gating (--strict / --fail-on / config strict/fail_on)
 // ============================================================================
 
+// computeExitCode family note (band-T05 F10, EPH-I0578): the eight
+// one-liner cases stay separate on purpose. Each test names its level and
+// count shape; a table-drive would move both into rows and hide the
+// level-by-level reasoning in a loop. This choice is documented, not
+// pending.
 test "computeExitCode: default (never) passes with warnings" {
     const counts = PrintCounts{ .warnings = 1 };
     try std.testing.expectEqual(@as(u8, 0), computeExitCode(counts, .never));
@@ -100359,9 +100532,13 @@ test "findPathDirInContent returns null when nothing matches" {
 test "detectPathDirFromBuildZig reads the project build.zig through diag" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
+    // Self-analysis pin (EPH-I0575): the repo's own build.zig declares
+    // root_source_file = "src/main.zig". A foreign cwd has no build.zig,
+    // so the test skips there: a tmpDir stand-in would pin the stand-in,
+    // not the repo layout.
+    Fs.cwd(std.testing.io).access("build.zig", .{}) catch return error.SkipZigTest;
     const dir = detectPathDirFromBuildZig(&diag, allocator);
     defer allocator.free(dir);
-    // The repo's own build.zig declares root_source_file = "src/main.zig".
     try std.testing.expectEqualStrings("src", dir);
 }
 
@@ -101489,23 +101666,57 @@ test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)
 
 test "config path_dir outside the config directory is rejected (RED4-1)" {
     var diag = testDiagCtx();
-    // Assumes tests run from the project root: ".." and "/" resolve outside
-    // it, while "src" resolves inside it.
-    const allocator = std.testing.allocator;
     diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // Hermetic containment root (band-T05 F7, EPH-I0575): the config's
+    // directory is a tmpDir, not the cwd. Pre-fix the test assumed the cwd
+    // was the repo root (".." outside, "src" inside), so a test run from
+    // any other cwd failed spuriously. parseConfigJsonSource is the
+    // production path; parseConfigJson just pins dir=".".
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try tmp.dir.createDirPath(std.testing.io, "src");
+
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"..\"}", &cfg);
+    var ignored_any = false;
+    const source: ConfigSource = .{
+        .trusted = true,
+        .path = "ephor.json",
+        .dir = dir_path,
+        .ignored_any = &ignored_any,
+    };
+    try parseConfigJsonSource(.{
+        .diag = &diag,
+        .allocator = allocator,
+        .content = "{\"path_dir\": \"..\"}",
+        .cfg = &cfg,
+        .source = source,
+    });
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(!cfg.path_owned);
 
-    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"/\"}", &cfg);
+    try parseConfigJsonSource(.{
+        .diag = &diag,
+        .allocator = allocator,
+        .content = "{\"path_dir\": \"/\"}",
+        .cfg = &cfg,
+        .source = source,
+    });
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(!cfg.path_owned);
     try std.testing.expectEqual(@as(usize, 2), diag.path_dir_reject_count);
 
     // A path inside the config directory is honored.
-    try parseConfigJson(&diag, allocator, "{\"path_dir\": \"src\"}", &cfg);
+    try parseConfigJsonSource(.{
+        .diag = &diag,
+        .allocator = allocator,
+        .content = "{\"path_dir\": \"src\"}",
+        .cfg = &cfg,
+        .source = source,
+    });
     try std.testing.expectEqualStrings("src", cfg.path);
     try std.testing.expect(cfg.path_owned);
     try std.testing.expectEqual(@as(usize, 2), diag.path_dir_reject_count);
@@ -101517,13 +101728,33 @@ test "config path_dir aliases code, src, root all route to the same key (B13-10)
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     diag.cli_diagnostics_enabled = false;
+    // Hermetic containment root (EPH-I0575): the config's directory is a
+    // tmpDir, not the cwd, so the "src" resolution works from any cwd.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    var ignored_any = false;
+    const source: ConfigSource = .{
+        .trusted = true,
+        .path = "ephor.json",
+        .dir = dir_path,
+        .ignored_any = &ignored_any,
+    };
     const aliases = [_][]const u8{ "code", "src", "root" };
     for (aliases) |alias| {
         var cfg = testConfig();
         defer cfg.deinit(allocator);
         const content = try std.fmt.allocPrint(allocator, "{{\"{s}\": \"src\"}}", .{alias});
         defer allocator.free(content);
-        try parseConfigJson(&diag, allocator, content, &cfg);
+        try parseConfigJsonSource(.{
+            .diag = &diag,
+            .allocator = allocator,
+            .content = content,
+            .cfg = &cfg,
+            .source = source,
+        });
         try std.testing.expectEqualStrings("src", cfg.path);
         try std.testing.expect(cfg.path_owned);
         try std.testing.expectEqual(@as(usize, 0), diag.path_dir_reject_count);
@@ -102478,6 +102709,8 @@ test "install without project files returns InstallFailed (EPH-I0235)" {
     var diag = testDiagCtx();
     // Regression: `ephor install` outside a Zig project printed help and
     // exited 0, so CI proceeded to `zig build ephor` on a failed install.
+    // Fails before the spawn: the no-network property rests on the
+    // validation order pinned at runZigFetchSave (band-T05 F5, EPH-I0572).
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -102652,6 +102885,8 @@ test "patchBuildZig rejects a mid-expression splice and keeps the file (EPH-I051
 test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {
     var diag = testDiagCtx();
     // Regression: an explicit --version reached the fetch URL unvalidated.
+    // Fails before the spawn: the no-network property rests on the
+    // validation order pinned at runZigFetchSave (band-T05 F5, EPH-I0572).
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -102670,7 +102905,9 @@ test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {
 test "install with an invalid --version returns InvalidVersion (EPH-I0155)" {
     var diag = testDiagCtx();
     // Validation runs before the project-file gate: an empty directory
-    // must report the version error, not InstallFailed.
+    // must report the version error, not InstallFailed. Fails before the
+    // spawn: the no-network property rests on the validation order pinned
+    // at runZigFetchSave (band-T05 F5, EPH-I0572).
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -102684,7 +102921,9 @@ test "install with an invalid --version returns InvalidVersion (EPH-I0155)" {
 test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
     var diag = testDiagCtx();
     // Regression: the downgrade-floor refusal printed and exited 0, so a
-    // script could not detect the refusal.
+    // script could not detect the refusal. Fails before the spawn: the
+    // no-network property rests on the validation order pinned at
+    // runZigFetchSave (band-T05 F5, EPH-I0572).
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -102702,6 +102941,8 @@ test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
 
 test "upgrade without ephor dependency returns UpgradeFailed (EPH-I0235)" {
     var diag = testDiagCtx();
+    // Fails before the spawn: the no-network property rests on the
+    // validation order pinned at runZigFetchSave (band-T05 F5, EPH-I0572).
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -103343,6 +103584,11 @@ test "suppression: config disable and exclude land in their own buckets" {
 
 test "suppression: zero suppression emits no note" {
     var diag = testDiagCtx();
+    // Mute like the other suppression tests: a regression that prints the
+    // note must not spray the runner log with failure-shaped stderr before
+    // the counter assert below trips (band-T05 F8, EPH-I0576). The mute
+    // does not change the verdict: suppression_note_count is diag state.
+    diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     var h = try initSuppressHarness(&diag, allocator, "src/sup_none.zig", suppress_leak_source);
     defer h.deinit(allocator);

@@ -2439,14 +2439,6 @@ fn hasRealCleanupPattern(t: []const u8) bool {
     return false;
 }
 
-/// Check if a specific pattern appears NOT inside a string literal
-fn hasPatternNotInString(t: []const u8, pattern: []const u8) bool {
-    if (mem.indexOf(u8, t, pattern)) |pos| {
-        return !isPatternInString(t, pos);
-    }
-    return false;
-}
-
 /// Check if a keyword appears as real code: not inside a string literal,
 /// not embedded in a longer identifier (`@panic("Retry ...")` contains
 /// "try " on both counts), and not inside a trailing `//` comment
@@ -16010,72 +16002,49 @@ fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize
 // Analysis Functions
 // ============================================================================
 
-/// Detect if allocation is returned (factory pattern)
-fn isReturnPattern(t: []const u8, alloc_name: []const u8) bool {
-    if (!mem.startsWith(u8, t, "return ")) return false;
-    return mem.indexOf(u8, t, alloc_name) != null;
-}
-
-/// Detect direct field assignment: var.field = try allocator.alloc(...)
-/// This handles patterns like ctx.editing_buffer = try self.allocator.alloc(...)
-fn isDirectFieldAssignment(t: []const u8, alloc_name: []const u8) bool {
-    // Look for pattern: identifier.field = ... alloc_name
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
-    const lhs = t[0..eq_pos];
-    const rhs = t[eq_pos + 3 ..];
-
-    // LHS should be identifier.field (e.g., ctx.editing_buffer, self.buffer)
-    if (mem.indexOf(u8, lhs, ".") == null) return false;
-
-    // RHS should contain an allocation method pattern (skip patterns in strings)
-    var has_alloc = false;
-    for (compat.getAllocMethodPatterns()) |pat| {
-        if (!hasPatternNotInString(rhs, pat)) continue;
-        has_alloc = true;
-        break;
-    }
-    if (!has_alloc) {
-        for (compat.getQualifiedAllocFnPatterns()) |pat| {
-            if (!hasPatternNotInString(rhs, pat)) continue;
-            has_alloc = true;
-            break;
-        }
-    }
-    if (!has_alloc) return false;
-
-    // Check if lhs field name matches alloc_name (e.g., ctx.editing_buffer with editing_buffer)
-    if (mem.indexOf(u8, lhs, alloc_name) != null) return true;
-
-    return false;
-}
-
-/// Detect ownership transfer via function call argument
-/// Uses general approach: if alloc_name appears as argument to any function call,
-/// ownership may have been transferred. This is project-agnostic.
-fn isOwnershipTransferCall(t: []const u8, alloc_name: []const u8) bool {
-    return isFunctionArgTransfer(t, alloc_name);
-}
-
-/// Detect function argument ownership transfer
-/// Catches: someFunc(alloc_name, ...) or someFunc(..., alloc_name) or someFunc(alloc_name)
-/// Excludes: alloc_name.method() and alloc_name[...] and simple comparisons
-/// Walk backward from a position to find the enclosing function call name.
-/// Returns true if it's a non-allocation function call (ownership transfer).
-/// Allocation function names (from compat layer) don't count as ownership transfer.
+/// Walk backward from a call paren to the enclosing call name (ZC104).
+/// True when the name is a non-allocation function call: passing the
+/// handle as an argument is ownership-transfer evidence. Allocation
+/// short names from the compat layer do not count, and control-flow
+/// keywords never name a transfer — `if (name == x)` is a condition,
+/// not a call (EPH-I0402).
 fn isNonAllocFnCallAt(t: []const u8, paren_pos: usize) bool {
     if (paren_pos == 0) return false;
     var name_end = paren_pos;
-    while (name_end > 0 and t[name_end - 1] == ' ') name_end -= 1;
+    // Space and tab both sit between a name and '(' (EPH-I0406):
+    // `foo\t(x)` names the same call as `foo(x)`.
+    while (name_end > 0 and (t[name_end - 1] == ' ' or t[name_end - 1] == '\t')) {
+        name_end -= 1;
+    }
     if (name_end == 0 or !isIdent(t[name_end - 1])) return false;
     var fname_start = name_end - 1;
     while (fname_start > 0 and isIdent(t[fname_start - 1])) fname_start -= 1;
     const fname = t[fname_start..name_end];
+    if (isControlFlowKeyword(fname)) return false;
     for (compat.getAllocMethodShortNames()) |afn| {
         if (mem.eql(u8, fname, afn)) return false;
     }
     return true;
 }
 
+/// Control-flow keywords can precede '(' without naming a call
+/// (EPH-I0402). `if (name == x)`, `while (name)`, `switch (name)`,
+/// `return (name)`, `catch (name)`, and `orelse (name)` leave ownership
+/// with the current function. The ident walk in isNonAllocFnCallAt
+/// cannot tell these keywords from call names.
+fn isControlFlowKeyword(fname: []const u8) bool {
+    const keywords = [_][]const u8{
+        "if", "while", "for", "switch", "return", "catch", "orelse",
+    };
+    for (keywords) |kw| {
+        if (mem.eql(u8, fname, kw)) return true;
+    }
+    return false;
+}
+
+/// Walk backward from `pos` for the nearest unmatched '(' and judge its
+/// call name through isNonAllocFnCallAt. The caller must blank string
+/// literals and strip comments first (findSpawnResolution does).
 fn isInsideFunctionCallArg(t: []const u8, pos: usize) bool {
     var depth: usize = 0;
     var i = pos;
@@ -16095,6 +16064,12 @@ fn isInsideFunctionCallArg(t: []const u8, pos: usize) bool {
     return false;
 }
 
+/// Detect function-argument ownership transfer (ZC104): the name appears
+/// inside a non-alloc call's parens, so the call may take ownership.
+/// Catches someFunc(name, ...) and someFunc(name). Excludes name.method()
+/// (the paren sits after the name), name[...] (no paren), and control-flow
+/// conditions like `if (name == x)` (EPH-I0402). The caller must blank
+/// literals and strip comments first, so `"foo(name)"` is never evidence.
 fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
     var search_start: usize = 0;
     while (mem.indexOf(u8, t[search_start..], alloc_name)) |rel_pos| {
@@ -16150,91 +16125,6 @@ fn hasAmpVar(t: []const u8, var_name: []const u8) bool {
         const end = j + 1 + var_name.len;
         if (end >= t.len or !isIdent(t[end])) return true;
     }
-    return false;
-}
-
-/// Detect module-level variable assignment (singleton/global pattern)
-/// Pattern: identifier = alloc_name (no const/var keyword, not field assignment)
-fn isModuleLevelAssignment(t: []const u8, alloc_name: []const u8) bool {
-    // Must contain alloc_name
-    if (mem.indexOf(u8, t, alloc_name) == null) return false;
-
-    // Must have an assignment
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
-
-    // Must not be a const/var declaration (those are local)
-    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return false;
-
-    // Extract lhs (the assigned-to variable)
-    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-    if (lhs.len == 0) return false;
-
-    // Skip field assignments (any identifier.field pattern — ownership
-    // transfer, not module-level)
-    if (mem.indexOf(u8, lhs, ".") != null) return false;
-
-    // LHS is a simple identifier = module-level variable assignment
-    // Ensure alloc_name appears on RHS
-    const rhs = t[eq_pos + 3 ..];
-    return mem.indexOf(u8, rhs, alloc_name) != null;
-}
-
-/// Detect direct module-level allocation (not a local var, not a field)
-/// Pattern: identifier = try allocator.alloc/create(...) where identifier is module-level
-fn isDirectModuleLevelAlloc(t: []const u8) bool {
-    // Must have an assignment
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
-
-    // Must not be a const/var declaration (those are local)
-    if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) return false;
-
-    // Extract lhs (the assigned-to variable)
-    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-    if (lhs.len == 0) return false;
-
-    // Skip any field assignment (identifier.field — ownership transfer, not module-level)
-    if (mem.indexOf(u8, lhs, ".") != null) return false;
-
-    // LHS must be a valid identifier (letters, numbers, underscores)
-    for (lhs) |c| {
-        if (!isIdent(c)) return false;
-    }
-
-    // RHS must contain an allocation method pattern (skip patterns in strings)
-    const rhs = t[eq_pos + 3 ..];
-    for (compat.getAllocMethodPatterns()) |pat| {
-        if (hasPatternNotInString(rhs, pat)) return true;
-    }
-    for (compat.getQualifiedAllocFnPatterns()) |pat| {
-        if (hasPatternNotInString(rhs, pat)) return true;
-    }
-    return false;
-}
-
-/// Check if allocation is directly assigned to a struct field (x.field = alloc)
-/// These are managed by the struct's lifecycle and don't need local defer
-fn isFieldAssignmentAlloc(t: []const u8) bool {
-    const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
-    const lhs = mem.trim(u8, t[0..eq_pos], " \t");
-
-    // Not a field assignment if it's a const/var declaration
-    if (mem.startsWith(u8, lhs, "const ") or mem.startsWith(u8, lhs, "var ")) {
-        return false;
-    }
-
-    // Check if LHS is a field access (contains .)
-    return mem.indexOf(u8, lhs, ".") != null;
-}
-
-/// Check if allocation is directly returned (return alloc.alloc(...))
-/// Ownership transfers to caller, no defer needed
-fn isDirectReturnAlloc(t: []const u8) bool {
-    // Direct return statement
-    if (mem.startsWith(u8, t, "return ")) return true;
-    // Part of return if-else expression (check if line ends with semicolon after alloc)
-    // Pattern: return if (...) ... else try alloc.alloc(...);
-    // The alloc line might not start with return but is part of return expression
-    if (mem.indexOf(u8, t, "return if") != null) return true;
     return false;
 }
 
@@ -97146,6 +97036,49 @@ test "ZC104: comment between the Allman opener and its brace keeps the block a t
     defer run.deinit(allocator);
 
     try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "ZC104: a handle comparison is not resolution evidence (EPH-I0402)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Regression pin (fails pre-fix): isNonAllocFnCallAt read the `if (`
+    // keyword as a call name, the condition counted as an ownership
+    // transfer, and the leak went unreported. A comparison is use, not
+    // a hand-off.
+    const content =
+        \\fn work() void {}
+        \\fn f() !void {
+        \\    const t = try std.Thread.spawn(.{}, work, .{});
+        \\    if (t == other) {
+        \\        _ = other;
+        \\    }
+        \\    _ = t;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc104_compare.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC104Counts(run.issues.items, 1, 0);
+}
+
+test "transfer predicate: control-flow keywords are not call evidence (EPH-I0402)" {
+    // Direct pins on the live helper chain. Pre-fix every keyword arm
+    // returned true: the ident walk cannot tell `if (` from `foo(`.
+    try std.testing.expect(!isFunctionArgTransfer("if (name == x) {", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("while (name != null) {", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("for (name) |n| {", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("switch (name) {", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("return (name);", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("probe() catch (name);", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("maybe orelse (name);", "name"));
+    // F7 pin: a tab between the call name and '(' still reads as a call.
+    // Pre-fix the space-only skip missed the tab and the transfer vanished.
+    try std.testing.expect(isFunctionArgTransfer("pool.put\t(name);", "name"));
+    // Positive control: a real call argument still transfers.
+    try std.testing.expect(isFunctionArgTransfer("pool.put(name);", "name"));
 }
 
 test "ZC101: wrapped signature with .{} default opens the record at the real body (EPH-I0447)" {

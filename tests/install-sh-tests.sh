@@ -1,5 +1,6 @@
 #!/bin/sh
-# Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630).
+# Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630;
+# batch B66: EPH-I0631 through EPH-I0636).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -29,16 +30,37 @@ rm -rf "$TEST_ROOT"
 mkdir -p "$TEST_ROOT/bin"
 
 # The fake zig answers version from FAKE_ZIG_VERSION and succeeds on
-# every fetch without network.
+# every fetch without network. When FETCH_FAIL_FILE names an existing
+# file, the next fetch consumes it, prints its content on stderr, and
+# exits 1 (the F-10 fingerprint-heal tests).
 cat > "$TEST_ROOT/bin/zig" <<'EOF'
 #!/bin/sh
 if [ "$1" = "version" ]; then
     printf '%s\n' "$FAKE_ZIG_VERSION"
     exit 0
 fi
+if [ -n "${FETCH_FAIL_FILE:-}" ] && [ -e "$FETCH_FAIL_FILE" ]; then
+    cat "$FETCH_FAIL_FILE" >&2
+    rm -f "$FETCH_FAIL_FILE"
+    exit 1
+fi
 exit 0
 EOF
 chmod +x "$TEST_ROOT/bin/zig"
+
+# The fake chmod forwards to the real chmod. It blocks for three seconds
+# while the F-9 test's project-local marker exists, so the test can send
+# TERM to the installer with a live temp file. The installer calls chmod
+# only in make_install_tmp and preserve_mode.
+cat > "$TEST_ROOT/bin/chmod" <<'EOF'
+#!/bin/sh
+if [ -e .ephor-chmod-block ]; then
+    sleep 3
+    [ -e .ephor-chmod-block ] || exit 0
+fi
+exec /bin/chmod "$@"
+EOF
+chmod +x "$TEST_ROOT/bin/chmod"
 
 printf '%s\n' '[{"name":"v0.99.1"}]' > "$TEST_ROOT/tags.json"
 
@@ -73,6 +95,44 @@ run_installer_with_zig() { # version, dir
     FAKE_ZIG_VERSION="$1"
     run_installer "$2"
     FAKE_ZIG_VERSION="0.16.0"
+}
+
+# Run the installer with the first fetch failing (F-10): the fake zig
+# consumes FETCH_FAIL_FILE once and answers that fetch with its content.
+# The variable is exported for the run and unset after it, so no run
+# leaks it into a later test.
+run_installer_with_fetch_fail() { # failure_file, dir
+    FETCH_FAIL_FILE="$1"
+    export FETCH_FAIL_FILE
+    run_installer "$2"
+    FETCH_FAIL_FILE=""
+    export FETCH_FAIL_FILE
+}
+
+# Run the installer with a strict umask (F-8): umasks that strip owner
+# write must still leave the temp files writable.
+run_installer_with_umask() { # umask, dir
+    rc=0
+    (umask "$1" && cd "$2" && "$INSTALL_RUNNER" "$INSTALL_SH") \
+        > "$2/out.log" 2> "$2/err.log" || rc=$?
+}
+
+# Run the installer with no zig on PATH (F-7).
+run_installer_without_zig() { # dir
+    OLD_PATH=$PATH
+    PATH="/usr/bin:/bin"
+    run_installer "$1"
+    PATH=$OLD_PATH
+}
+
+# Run the installer with $1/bin prepended to PATH for this one run
+# (F-12 GNU-dialect arm: a fake uname selects the stat -c branch and a
+# fake GNU stat serves it through the gate machine's BSD stat).
+run_installer_with_bin() { # bin_dir, dir
+    OLD_PATH=$PATH
+    PATH="$1:$PATH"
+    run_installer "$2"
+    PATH=$OLD_PATH
 }
 
 assert_eq() { # want, got, label
@@ -527,6 +587,174 @@ assert_rc 1
 assert_grep "$D/err.log" 'does not end before the end' 'no refusal warning'
 assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
 pass "t22 trailing-comment terminator refuses (F-B65-3 pin)"
+
+# --- t23 (EPH-I0631): with no zig on PATH the installer must refuse
+# before creating or changing any file, with a clear message.
+D="$TEST_ROOT/t23"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+run_installer_without_zig "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'zig is not installed' 'no missing-zig error'
+assert_not_grep "$D/out.log" 'Done!' 'Done! printed without zig'
+if [ -e "$D/build.zig.zon" ]; then
+    fail "build.zig.zon was created without zig"
+fi
+pass "t23 missing zig refuses before mutation (F-7)"
+
+# --- t24 (EPH-I0632): a umask that strips owner write (0277) must not
+# leave the temp files unwritable. The full install completes.
+D="$TEST_ROOT/t24"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+run_installer_with_umask 0277 "$D"
+assert_rc 0
+assert_grep "$D/out.log" 'Done!' 'install did not complete'
+assert_grep "$D/build.zig.zon" '.name = .t24,' 'zon not created'
+assert_grep "$D/build.zig" '    // Ephor static analysis' 'block not added'
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t24 strict umask completes (F-8)"
+
+# --- t25 (EPH-I0633): a TERM while a temp file is live must still clean
+# it up: the signal becomes an exit, so the EXIT trap runs.
+D="$TEST_ROOT/t25"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+: > "$D/.ephor-chmod-block"
+(cd "$D" && exec "$INSTALL_RUNNER" "$INSTALL_SH") > "$D/out.log" 2> "$D/err.log" &
+INSTALL_PID=$!
+i=0
+while [ "$i" -lt 200 ]; do
+    set -- "$D"/build.zig.zon.tmp.*
+    if [ -e "$1" ]; then
+        break
+    fi
+    sleep 0.05
+    i=$((i + 1))
+done
+if [ ! -e "$1" ]; then
+    kill -9 "$INSTALL_PID" 2>/dev/null || true
+    rm -f "$D/.ephor-chmod-block"
+    fail "temp file never appeared"
+fi
+kill -TERM "$INSTALL_PID"
+i=0
+while kill -0 "$INSTALL_PID" 2>/dev/null && [ "$i" -lt 200 ]; do
+    sleep 0.05
+    i=$((i + 1))
+done
+if kill -0 "$INSTALL_PID" 2>/dev/null; then
+    kill -9 "$INSTALL_PID" 2>/dev/null || true
+    rm -f "$D/.ephor-chmod-block"
+    fail "installer did not exit after TERM"
+fi
+rc=0
+wait "$INSTALL_PID" || rc=$?
+rm -f "$D/.ephor-chmod-block"
+assert_rc 1
+leftovers=$(ls "$D"/build.zig.zon.tmp.* 2>/dev/null || true)
+[ -z "$leftovers" ] || fail "temp file left after TERM"
+pass "t25 TERM runs the EXIT trap (F-9)"
+
+# --- t26 (EPH-I0634): two hint lines in one fetch failure must take the
+# first hint, not abort sed with a multi-line replacement.
+D="$TEST_ROOT/t26"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+printf 'error: unable to verify package\nuse this value: 0x1234dead\nuse this value: 0xbeefcafe\n' \
+    > "$TEST_ROOT/fail-hints.txt"
+run_installer_with_fetch_fail "$TEST_ROOT/fail-hints.txt" "$D"
+assert_rc 0
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x1234dead,' 'first hint not used'
+assert_not_grep "$D/build.zig.zon" '0xbeefcafe' 'second hint leaked into the zon'
+if [ -e "$D/build.zig.zon.bak" ]; then
+    fail "sed backup left behind"
+fi
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t26 first fingerprint hint wins (F-10)"
+
+# --- t27 (EPH-I0634): a hint with a bare 0x (no hex digits) must refuse
+# instead of writing a broken fingerprint.
+D="$TEST_ROOT/t27"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+printf 'use this value: 0x\n' > "$TEST_ROOT/fail-bare.txt"
+run_installer_with_fetch_fail "$TEST_ROOT/fail-bare.txt" "$D"
+assert_rc 1
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x0,' 'fingerprint changed'
+assert_grep "$D/err.log" 'use this value: 0x' 'fetch error not shown'
+assert_not_grep "$D/out.log" 'Done!' 'Done! printed after refusal'
+pass "t27 bare 0x hint refuses (F-10)"
+
+# --- t28 (EPH-I0635): no installArtifact line means the build steps
+# cannot be added. The dependency landed, so the exit code must not
+# report success, and the summary must not print Done!.
+D="$TEST_ROOT/t28"
+mkdir -p "$D"
+cat > "$D/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) !void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+}
+EOF
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'build steps were not' 'no partial-install message'
+assert_not_grep "$D/out.log" 'Done!' 'Done! printed after refusal'
+assert_grep "$D/build.zig.zon" '.name = .t28,' 'zon was not created'
+pass "t28 missing installArtifact fails the install (F-11)"
+
+# --- t29 (EPH-I0636): the splice preserves the original mode. A 0600
+# build.zig stays 0600 instead of re-normalizing to the umask default.
+# The mode read uses the BSD stat form: the suite gate machine is macOS.
+D="$TEST_ROOT/t29"
+mkdir -p "$D"
+{
+    echo 'const std = @import("std");'
+    echo 'pub fn build(b: *std.Build) !void {'
+    write_canonical_block
+    echo '}'
+} > "$D/build.zig"
+chmod 600 "$D/build.zig"
+run_installer "$D"
+assert_rc 0
+[ "$(stat -f '%Lp' "$D/build.zig")" = "600" ] || fail "build.zig mode not preserved"
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t29 splice preserves mode (F-12, BSD stat arm)"
+
+# --- t30 (EPH-I0636): the GNU-dialect arm. A fake uname selects the
+# stat -c branch; a fake GNU stat serves -c %a through the gate
+# machine's BSD stat. Same assertion as t29.
+D="$TEST_ROOT/t30"
+BINDIR="$TEST_ROOT/t30-bin"
+mkdir -p "$D" "$BINDIR"
+cat > "$BINDIR/uname" <<'EOF'
+#!/bin/sh
+printf 'Linux\n'
+EOF
+cat > "$BINDIR/stat" <<'EOF'
+#!/bin/sh
+# GNU-dialect stat double: serve the installer's "stat -c %a file" call.
+if [ "$#" -ne 3 ] || [ "$1" != "-c" ] || [ "$2" != "%a" ]; then
+    echo "fake stat: unexpected arguments" >&2
+    exit 2
+fi
+exec /usr/bin/stat -f '%Lp' "$3"
+EOF
+chmod +x "$BINDIR/uname" "$BINDIR/stat"
+{
+    echo 'const std = @import("std");'
+    echo 'pub fn build(b: *std.Build) !void {'
+    write_canonical_block
+    echo '}'
+} > "$D/build.zig"
+chmod 600 "$D/build.zig"
+run_installer_with_bin "$BINDIR" "$D"
+assert_rc 0
+[ "$(stat -f '%Lp' "$D/build.zig")" = "600" ] || fail "build.zig mode not preserved (GNU arm)"
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t30 splice preserves mode (F-12, GNU stat arm)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

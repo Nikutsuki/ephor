@@ -12,15 +12,36 @@ set -eu
 # mv, whose rename replaces a planted symlink instead of following it. The
 # trap removes the temp file when the script exits before the mv.
 INSTALL_TMP=""
+# EPH-I0633: dash does not run the EXIT trap on SIGTERM or SIGHUP, so a
+# signal during the install litters the temp file in the project dir.
+# Convert the signals into an exit; the EXIT trap then always cleans.
+trap 'exit 1' TERM HUP INT
 trap '[ -z "$INSTALL_TMP" ] || rm -f "$INSTALL_TMP"' EXIT
 
 # Create the swap file for the next mktemp+mv write and publish its path in
-# INSTALL_TMP for the EXIT trap. mktemp makes the file 0600, but the files
-# this script replaces came from a ">" redirect at 0666 & ~umask. Restore
-# that mode so the install does not tighten project files to 0600.
+# INSTALL_TMP for the EXIT trap. mktemp makes the file 0600. chmod applies
+# the project default (0666 & ~umask) with owner write kept unconditionally
+# (EPH-I0632): umasks like 0277 or 0777 strip owner write, and the next
+# redirect would fail with EACCES.
 make_install_tmp() {
     INSTALL_TMP=$(mktemp "$1")
-    chmod "$(printf '%03o' $((0666 & ~$(umask))))" "$INSTALL_TMP"
+    chmod "$(printf '%03o' $((0600 | (0666 & ~$(umask)))))" "$INSTALL_TMP"
+}
+
+# Preserve the original file's mode across the splice (EPH-I0636). The mv
+# below renames the temp over the original, so the result takes the temp's
+# mode: a 0600 or +x build.zig re-normalizes otherwise. Call this right
+# before each build.zig mv. stat is not POSIX, but the two target
+# platforms each have one dialect, and an exotic platform fails the chmod
+# loudly instead of silently re-normalizing. The BSD form reads the low
+# three octal digits, so setuid bits are not preserved; xattrs and ACLs
+# are not preserved on any platform. Both losses are accepted: a build
+# file that carries them is out of scope.
+preserve_mode() { # original file
+    case "$(uname -s)" in
+        Darwin|FreeBSD|OpenBSD|NetBSD) chmod "$(stat -f '%Lp' "$1")" "$INSTALL_TMP" ;;
+        *) chmod "$(stat -c '%a' "$1")" "$INSTALL_TMP" ;;
+    esac
 }
 
 REPO="https://codeberg.org/RhyosLabs/ephor"
@@ -192,6 +213,15 @@ zon_name_is_keyword() {
     printf '%s\n' "$ZON_RESERVED_WORDS" | grep -qxF "$1"
 }
 
+# EPH-I0631: without zig the fetch below dies with a shell "not found"
+# message and exit 127 after the zon was already created. Refuse first,
+# before any file is created or changed.
+if ! command -v zig >/dev/null 2>&1; then
+    echo "error: zig is not installed or not on PATH." >&2
+    echo "Install Zig, then re-run the install." >&2
+    exit 1
+fi
+
 # Check we're in a Zig project
 if [ ! -f "build.zig" ]; then
     echo "error: no build.zig found in current directory"
@@ -336,7 +366,11 @@ echo "Adding ephor dependency..."
 # the computed fingerprint. Patch the hint in and fetch again.
 FETCH_OUT=$(zig fetch --save=ephor "$EPHOR_URL" 2>&1) && FETCH_RC=0 || FETCH_RC=$?
 if [ "$FETCH_RC" -ne 0 ]; then
-    SUGGESTED=$(printf '%s\n' "$FETCH_OUT" | grep -o 'use this value: 0x[0-9a-f]*' \
+    # EPH-I0634: take the first hint only (a multi-line SUGGESTED breaks
+    # the sed script below) and require at least one hex digit (a bare 0x
+    # would write a broken zon). BSD grep supports -m1 as GNU grep does.
+    SUGGESTED=$(printf '%s\n' "$FETCH_OUT" \
+        | grep -m1 -o 'use this value: 0x[0-9a-f][0-9a-f]*' \
         | sed 's/use this value: //')
     if [ -z "$SUGGESTED" ]; then
         # No hint means a real fetch failure (network, hash, server). Show
@@ -442,6 +476,7 @@ if grep -qE "$CANON_START" build.zig; then
     fi
     echo "$EPHOR_BLOCK" >> "$INSTALL_TMP"
     tail -n +"$((END_LINE + 1))" build.zig >> "$INSTALL_TMP"
+    preserve_mode build.zig
     mv "$INSTALL_TMP" build.zig
     INSTALL_TMP=""
     echo "Updated ephor build steps in build.zig"
@@ -471,6 +506,7 @@ elif grep -qE "$LEGACY_START" build.zig; then
     fi
     echo "$EPHOR_BLOCK" >> "$INSTALL_TMP"
     tail -n +"$((END_LINE + 1))" build.zig >> "$INSTALL_TMP"
+    preserve_mode build.zig
     mv "$INSTALL_TMP" build.zig
     INSTALL_TMP=""
     echo "Updated ephor build steps in build.zig (migrated from v0.11.x snippet)"
@@ -495,9 +531,12 @@ else
         | tail -1 | cut -d: -f1)
 
     if [ -z "$LINE" ]; then
-        echo "warning: could not find installArtifact in build.zig"
-        echo "Please add the ephor build steps manually (see README)"
-        exit 0
+        # EPH-I0635: the dependency landed but the build steps did not.
+        # Exit nonzero so CI does not mistake a partial install for success.
+        echo "warning: could not find installArtifact in build.zig" >&2
+        echo "The ephor dependency was added, but the build steps were not." >&2
+        echo "Add the build steps manually (see README)." >&2
+        exit 1
     fi
 
     OFFSET=$(tail -n +"$LINE" build.zig | grep -nE ';[[:space:]]*$' | head -1 | cut -d: -f1)
@@ -513,6 +552,7 @@ else
     head -n "$INSERT_AT" build.zig > "$INSTALL_TMP"
     echo "$EPHOR_BLOCK" >> "$INSTALL_TMP"
     tail -n +"$((INSERT_AT + 1))" build.zig >> "$INSTALL_TMP"
+    preserve_mode build.zig
     mv "$INSTALL_TMP" build.zig
     INSTALL_TMP=""
 fi

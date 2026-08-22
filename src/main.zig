@@ -19061,6 +19061,16 @@ fn checkLineTrivialAsserts(
 }
 
 // --- ZT101: lie tests (the name promises a fn the body never calls) ---
+//
+// Blind spot: comptime name dispatch exercises the named fn with no
+// textual call or value reference. The stdlib shape
+// `std.json.parseFromSlice(T, ...)` invokes T's method through internal
+// reflection (EPH-I0029), and `@field(ns, "parseHeader")(...)` names the
+// fn only inside a string literal (band-B07 F2, EPH-I0428). String
+// contents are data, not call evidence — ZT105 pins the same line — so
+// such tests fire as lies. The documented workaround is a value
+// reference (`_ = Severity.jsonParse;`), which the compiler itself
+// checks. Both verdicts are locked as-is with tests.
 
 /// Bounded candidate set: fn names referenced by a test's own name (ZT101).
 /// A test name mentioning more than 8 distinct local fns is pathological.
@@ -19538,7 +19548,10 @@ fn sharesImplCallee(
 /// ZT101: a test whose name references a local fn but whose body never
 /// calls it — directly, through file-local helpers, or via the candidate's
 /// own implementation — lies about what it verifies; `zig build test`
-/// reports it green either way.
+/// reports it green either way. Comptime name dispatch is invisible:
+/// `@field(ns, "parseHeader")(...)` leaves only a string occurrence, and
+/// string contents are data, not call evidence — such tests fire, with a
+/// value reference as the documented workaround (EPH-I0029, EPH-I0428).
 fn reportLieTest(ctx: *const TestScanCtx, state: *const TestFileScanState) !void {
     const lie = state.lie;
     if (lie.candidate_count == 0) return;
@@ -23894,12 +23907,31 @@ fn reportNaming(ctx: NamingLineCtx, v: NameViolation) !void {
 /// top-level `;`, EPH-I0896): the first `= ` in the segment is the
 /// declaration's own equals, so a same-line neighbor's RHS cannot read as
 /// this declaration's alias source (EPH-I0898).
+///
+/// The relation keys on the TERMINAL segment of the RHS path, read after
+/// the LAST dot (EPH-I0463): the first-dot check read the second segment
+/// of a multi-segment path, so both `const eql = std.mem.eql;` and
+/// `const parseJson = std.json.parse;` FP'd as constants. Two arms:
+/// the declared name equals the terminal (or the name starts it — the
+/// `eql` shape), or the name EXTENDS the terminal identifier (the
+/// `parseJson` shape). A call tail (`parse(`) binds a call result, not
+/// the function, so it is not an alias. Heuristic limits, flagged rather
+/// than exempted when the relation is unverifiable: a rename that extends
+/// an EARLIER segment (`const fooBar = mod.fooBar.baz;` — name matches
+/// segment 2 of 3) and a rename whose name does not extend the terminal
+/// (`const jsonParse = std.json.parse;`) both stay flagged.
 fn isFunctionAlias(t: []const u8, name: []const u8) bool {
     if (!isCamelCase(name)) return false;
     const eq_pos = mem.indexOf(u8, t, "= ") orelse return false;
     const rhs = t[eq_pos + 2 ..];
-    const dot_pos = mem.indexOf(u8, rhs, ".") orelse return false;
-    return mem.startsWith(u8, rhs[dot_pos + 1 ..], name);
+    const dot_pos = mem.lastIndexOf(u8, rhs, ".") orelse return false;
+    const after_dot = rhs[dot_pos + 1 ..];
+    if (mem.startsWith(u8, after_dot, name)) return true;
+    var ident_end: usize = 0;
+    while (ident_end < after_dot.len and isIdent(after_dot[ident_end])) ident_end += 1;
+    if (ident_end == 0) return false;
+    if (ident_end < after_dot.len and after_dot[ident_end] == '(') return false;
+    return mem.startsWith(u8, name, after_dot[0..ident_end]);
 }
 
 /// Check if constant naming follows conventions. `seg` is the checked
@@ -34670,6 +34702,15 @@ const IgnoreCache = struct {
         file: []const u8,
         rule: []const u8,
     ) !*const RuleFacts {
+        // Read-only fast path (band-T02 F-03, EPH-I0557): a cached
+        // (file, rule) pair answers with ZERO allocations — the point of
+        // the cache on issue-count-bound projects. getPtr probes with
+        // borrowed keys and mutates nothing, so no unwind hazard exists
+        // on this path; a caller passing key-aliased slices is safe here
+        // too, since nothing rehashes while the pointer is borrowed.
+        if (self.files.getPtr(file)) |file_entry| {
+            if (file_entry.getPtr(rule)) |facts| return facts;
+        }
         // Build-then-commit (EPH-I0061 class, EPH-I0365): the key dupe
         // lands BEFORE getOrPut, so the slot always holds an owned key and
         // unwinding never needs a map remove — a future caller may pass
@@ -57725,11 +57766,12 @@ test "analyzeIgnoredErrors no false positive for try" {
     var issues = try analyzeIgnoredErrors(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT report ZA205 for try usage
+    // Should NOT report ZA205 for try usage. The graph holds one file, so
+    // a file filter is a no-op — assert rule-absence across all issues so
+    // an FP with an empty or mangled file field cannot slip the filter
+    // (band-T02 F-02, EPH-I0556).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_good_try.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_IGNORED_ERROR));
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_IGNORED_ERROR));
     }
 }
 
@@ -57759,11 +57801,11 @@ test "analyzeIgnoredErrors no false positive for catch" {
     var issues = try analyzeIgnoredErrors(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT report ZA205 for explicit catch
+    // Should NOT report ZA205 for explicit catch. The graph holds one
+    // file, so a file filter is a no-op — assert rule-absence across all
+    // issues (band-T02 F-02, EPH-I0556).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_good_catch.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_IGNORED_ERROR));
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_IGNORED_ERROR));
     }
 }
 
@@ -58742,27 +58784,9 @@ test "Config.isRuleEnabled respects explicit enable" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    var cfg = Config{
-        .command = .check,
-        .path = "src",
-        .path_owned = false,
-        .entries = .empty,
-        .exclude = .empty,
-        .orphan_exclude = .empty,
-        .disabled_rules = .empty,
-        .enabled_rules = .empty,
-        .verbose = false,
-        .show_summary = false,
-        .format = .text,
-        .thresholds = .{},
-        .init_build = false,
-        .export_path = null,
-        .known_issues_path = null,
-        .known_issues = .empty,
-        .auto_approve = false,
-        .runtime_command = null,
-        .install_version = null,
-    };
+    // Default-config builder (band-T02 F-05, EPH-I0558): the hand-rolled
+    // 20-field literals this test family carried duplicated testConfig().
+    var cfg = testConfig();
     defer cfg.deinit(allocator);
 
     // Enable ZA702 explicitly
@@ -58777,27 +58801,8 @@ test "Config.isRuleEnabled respects disable prefix" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    var cfg = Config{
-        .command = .check,
-        .path = "src",
-        .path_owned = false,
-        .entries = .empty,
-        .exclude = .empty,
-        .orphan_exclude = .empty,
-        .disabled_rules = .empty,
-        .enabled_rules = .empty,
-        .verbose = false,
-        .show_summary = false,
-        .format = .text,
-        .thresholds = .{},
-        .init_build = false,
-        .export_path = null,
-        .known_issues_path = null,
-        .known_issues = .empty,
-        .auto_approve = false,
-        .runtime_command = null,
-        .install_version = null,
-    };
+    // Default-config builder (band-T02 F-05, EPH-I0558).
+    var cfg = testConfig();
     defer cfg.deinit(allocator);
 
     // Disable all ZA3xx rules
@@ -58823,27 +58828,8 @@ test "Config.isRuleEnabled enable overrides disable" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    var cfg = Config{
-        .command = .check,
-        .path = "src",
-        .path_owned = false,
-        .entries = .empty,
-        .exclude = .empty,
-        .orphan_exclude = .empty,
-        .disabled_rules = .empty,
-        .enabled_rules = .empty,
-        .verbose = false,
-        .show_summary = false,
-        .format = .text,
-        .thresholds = .{},
-        .init_build = false,
-        .export_path = null,
-        .known_issues_path = null,
-        .known_issues = .empty,
-        .auto_approve = false,
-        .runtime_command = null,
-        .install_version = null,
-    };
+    // Default-config builder (band-T02 F-05, EPH-I0558).
+    var cfg = testConfig();
     defer cfg.deinit(allocator);
 
     // Disable all ZA3xx rules
@@ -59624,6 +59610,25 @@ test "IgnoreCache allocation-failure paths fall back without leaking" {
     }
 }
 
+test "IgnoreCache second same-(file, rule) query performs zero allocations" {
+    // Engagement proof (band-T02 F-03, EPH-I0557): the differential test
+    // above pins verdict equality, which a store-and-drop regression
+    // (build facts, return, never cache) still passes. A counting
+    // allocator proves the second identical query allocates NOTHING — it
+    // answers from the read-only fast path — so a rebuild-per-query
+    // regression allocates and trips the pin. FailingAllocator with the
+    // default fail_index never fails; .allocations counts every success.
+    var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache = IgnoreCache.init(counter.allocator());
+    defer cache.deinit();
+    const content = "const a = foo() catch {}; // ephor:ignore ZA201\n" ++
+        "const b = bar() catch {};\n";
+    _ = cache.isSuppressed(content, "probe.zig", 1, "ZA201");
+    const first = counter.allocations;
+    _ = cache.isSuppressed(content, "probe.zig", 1, "ZA201");
+    try std.testing.expectEqual(first, counter.allocations);
+}
+
 test "checkSilentCatch detects catch {}" {
     // Basic catch {} should be detected
     const issue = checkSilentCatch(.{
@@ -59804,11 +59809,11 @@ test "analyzeCFGDeferCoverage no false positive for proper defer" {
     });
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT report issues for properly deferred allocation
+    // Should NOT report issues for properly deferred allocation. The run
+    // carries one file path, so a file filter is a no-op — assert
+    // rule-absence across all issues (band-T02 F-02, EPH-I0556).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_good.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -59907,8 +59912,10 @@ test "integration: use-after-free patterns" {
             uaf_count += 1;
         }
     }
-    // Should detect both UAF patterns
-    try std.testing.expect(uaf_count >= 2);
+    // Should detect both UAF patterns. The fixture carries exactly two
+    // sites, so the pin is exact: over-count drift (double-reporting one
+    // site) must fail, which `>=` cannot see (band-T02 F-04, EPH-I0558).
+    try std.testing.expect(uaf_count == 2);
 }
 
 test "integration: double-free patterns" {
@@ -73047,6 +73054,71 @@ test "analyzeNaming: real function alias stays silent (EPH-I0898)" {
     defer deinitIssues(&issues, allocator);
 
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: multi-segment path alias stays silent (EPH-I0463)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // band-B10 B10-1 (EPH-I0463): the alias check keyed on the FIRST dot,
+    // so the terminal segment of a multi-segment path never reached the
+    // comparison. Both shapes must stay silent: the name EQUALS the
+    // terminal (the AGENTS.md canonical `const eql = std.mem.eql;`) and
+    // the name EXTENDS the terminal (`parseJson` extends `parse`).
+    const code =
+        \\const eql = std.mem.eql;
+        \\const parseJson = std.json.parse;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_multiseg_alias.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_multiseg_alias.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "analyzeNaming: terminal-segment alias boundary stays flagged (EPH-I0463)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The heuristic boundary (EPH-I0463): when the relation to the
+    // terminal segment is unverifiable, flag rather than exempt.
+    // jsonParse renames `parse` without extending it (the name does not
+    // start with the terminal), and the call tail `parse()` binds a call
+    // RESULT, not the function — neither is a function alias, so both
+    // fire as constants.
+    const code =
+        \\const jsonParse = std.json.parse;
+        \\const parseResult = std.json.parse();
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_alias_boundary.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_alias_boundary.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'jsonParse' should be snake_case",
+        issues.items[0].message,
+    );
+    try std.testing.expectEqualStrings(
+        "constant 'parseResult' should be snake_case",
+        issues.items[1].message,
+    );
 }
 
 test "analyzeNaming: second same-line var decl is checked (EPH-I0888)" {
@@ -92781,6 +92853,42 @@ test "ZT101: value reference silences the reflection shape (EPH-I0029)" {
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "zt101_refwork.zig", RULE_TEST_LIE),
+    );
+}
+
+test "ZT101: @field name dispatch is invisible and stays flagged (EPH-I0428)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // band-B07 F2 (EPH-I0428): `@field(ns, "parseHeader")(...)` invokes
+    // the fn through comptime name dispatch — the candidate name lives
+    // only inside the string literal, which is data, not call evidence.
+    // Documented limitation (the @field flavor of EPH-I0029): the verdict
+    // is locked as-is, so a future string-content change trips this pin
+    // and must re-derive the documented choice. The real expect line
+    // keeps the body from reading as a bare reference block (the
+    // `_ = ...` carve-out), which is what a genuine table-driven test
+    // looks like anyway.
+    const content =
+        \\const Handlers = struct {
+        \\    fn parseHeader(buf: []const u8) !void {
+        \\        _ = buf;
+        \\    }
+        \\};
+        \\
+        \\test "parseHeader" {
+        \\    _ = @field(Handlers, "parseHeader")(&.{});
+        \\    try std.testing.expect(2 == 1 + 1);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_field.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_LIE, .warning),
     );
 }
 

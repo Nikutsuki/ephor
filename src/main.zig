@@ -23911,27 +23911,39 @@ fn reportNaming(ctx: NamingLineCtx, v: NameViolation) !void {
 /// The relation keys on the TERMINAL segment of the RHS path, read after
 /// the LAST dot (EPH-I0463): the first-dot check read the second segment
 /// of a multi-segment path, so both `const eql = std.mem.eql;` and
-/// `const parseJson = std.json.parse;` FP'd as constants. Two arms:
-/// the declared name equals the terminal (or the name starts it — the
-/// `eql` shape), or the name EXTENDS the terminal identifier (the
-/// `parseJson` shape). A call tail (`parse(`) binds a call result, not
-/// the function, so it is not an alias. Heuristic limits, flagged rather
-/// than exempted when the relation is unverifiable: a rename that extends
-/// an EARLIER segment (`const fooBar = mod.fooBar.baz;` — name matches
-/// segment 2 of 3) and a rename whose name does not extend the terminal
-/// (`const jsonParse = std.json.parse;`) both stay flagged.
+/// `const parseJson = std.json.parse;` FP'd as constants. The terminal is
+/// scanned to its identifier and the tail byte decides FIRST
+/// (EPH-I1103 FA-1): a call tail (`(`) or index tail (`[`) binds a call
+/// result or an element, not the function — `const callTail =
+/// ns.callTail();` and `const indexTail = x.indexTail[0];` are not
+/// aliases and stay flagged. Two name relations then exempt: the terminal
+/// starts with the declared name (the `eql` shape), or the name EXTENDS
+/// the terminal (the `parseJson` shape). Heuristic limits: a rename that
+/// extends an EARLIER segment (`const fooBar = mod.fooBar.baz;` — name
+/// matches segment 2 of 3) and a rename whose name does not extend the
+/// terminal (`const jsonParse = std.json.parse;`) stay flagged. The
+/// exemption-side limit (EPH-I1103 FA-2): the terminal can be a FIELD,
+/// not a fn — `const itemsA = self.list.items;` also exempts, and fn vs
+/// field is indistinguishable without symbol resolution, so that false
+/// accept stays until a symbol-resolving pass lands. The current exempt
+/// verdict is pinned by test with this issue cited.
 fn isFunctionAlias(t: []const u8, name: []const u8) bool {
     if (!isCamelCase(name)) return false;
     const eq_pos = mem.indexOf(u8, t, "= ") orelse return false;
     const rhs = t[eq_pos + 2 ..];
     const dot_pos = mem.lastIndexOf(u8, rhs, ".") orelse return false;
     const after_dot = rhs[dot_pos + 1 ..];
-    if (mem.startsWith(u8, after_dot, name)) return true;
     var ident_end: usize = 0;
     while (ident_end < after_dot.len and isIdent(after_dot[ident_end])) ident_end += 1;
     if (ident_end == 0) return false;
-    if (ident_end < after_dot.len and after_dot[ident_end] == '(') return false;
-    return mem.startsWith(u8, name, after_dot[0..ident_end]);
+    if (ident_end < after_dot.len and
+        (after_dot[ident_end] == '(' or after_dot[ident_end] == '['))
+    {
+        return false;
+    }
+    const terminal = after_dot[0..ident_end];
+    if (mem.startsWith(u8, terminal, name)) return true;
+    return mem.startsWith(u8, name, terminal);
 }
 
 /// Check if constant naming follows conventions. `seg` is the checked
@@ -73093,15 +73105,19 @@ test "analyzeNaming: terminal-segment alias boundary stays flagged (EPH-I0463)" 
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The heuristic boundary (EPH-I0463): when the relation to the
-    // terminal segment is unverifiable, flag rather than exempt.
+    // The heuristic boundary (EPH-I0463, EPH-I1103): when the relation to
+    // the terminal segment is unverifiable, flag rather than exempt.
     // jsonParse renames `parse` without extending it (the name does not
     // start with the terminal), and the call tail `parse()` binds a call
-    // RESULT, not the function — neither is a function alias, so both
-    // fire as constants.
+    // RESULT, not the function. The FA-1 pins (EPH-I1103): a call tail
+    // and an index tail bind values, not functions — the name comparison
+    // must never run before the tail guard, or `callTail()`/`indexTail[0]`
+    // read as the alias shape and exempt.
     const code =
         \\const jsonParse = std.json.parse;
         \\const parseResult = std.json.parse();
+        \\const callTail = ns.callTail();
+        \\const indexTail = x.indexTail[0];
     ;
     const analysis = try createTestFileAnalysis(allocator, "test_alias_boundary.zig", code);
     try graph.files.put(analysis.path, analysis);
@@ -73110,7 +73126,7 @@ test "analyzeNaming: terminal-segment alias boundary stays flagged (EPH-I0463)" 
     var issues = try analyzeNaming(allocator, &graph, .title_case);
     defer deinitIssues(&issues, allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqual(@as(usize, 4), issues.items.len);
     try std.testing.expectEqualStrings(
         "constant 'jsonParse' should be snake_case",
         issues.items[0].message,
@@ -73118,6 +73134,49 @@ test "analyzeNaming: terminal-segment alias boundary stays flagged (EPH-I0463)" 
     try std.testing.expectEqualStrings(
         "constant 'parseResult' should be snake_case",
         issues.items[1].message,
+    );
+    try std.testing.expectEqualStrings(
+        "constant 'callTail' should be snake_case",
+        issues.items[2].message,
+    );
+    try std.testing.expectEqualStrings(
+        "constant 'indexTail' should be snake_case",
+        issues.items[3].message,
+    );
+}
+
+test "analyzeNaming: field-terminal extension stays exempt (EPH-I1103 honest-lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // FA-2 honest-lock (EPH-I1103): `const itemsA = self.list.items;`
+    // exempts because the name extends the terminal `items`, but the
+    // terminal is a FIELD, not a fn — fn vs field is indistinguishable
+    // without symbol resolution, so the false accept stays until a
+    // symbol-resolving pass lands. This pin locks the CURRENT exempt
+    // verdict (the honest-lock pattern, EPH-I0428): a future fix flips
+    // it deliberately. The control `itemList` does not extend the
+    // terminal and still fires, so the pin is not a blanket silence.
+    const code =
+        \\const itemsA = self.list.items;
+        \\const itemList = self.list.items;
+    ;
+    const analysis = try createTestFileAnalysis(allocator, "test_field_alias.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_field_alias.zig"), {});
+
+    var issues = try analyzeNaming(allocator, &graph, .title_case);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(
+        "constant 'itemList' should be snake_case",
+        issues.items[0].message,
     );
 }
 

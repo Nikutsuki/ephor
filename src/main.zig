@@ -37495,6 +37495,16 @@ const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/
 /// Stored update notification (printed after analysis output)
 var update_notification: ?[]const u8 = null;
 
+/// Free the pending update notification and clear the slot. runEphor
+/// registers this as a defer so the abort and error return paths free
+/// it too (EPH-I0545); the null reset keeps a second call a no-op.
+fn freeUpdateNotification(allocator: Allocator) void {
+    if (update_notification) |msg| {
+        allocator.free(msg);
+        update_notification = null;
+    }
+}
+
 /// Name of the update-check cache file inside $HOME.
 const UPDATE_CACHE_FILENAME = ".ephor_update_check";
 
@@ -37905,6 +37915,7 @@ fn parseCommand(cmd: []const u8) ?Command {
         .{ .name = "help", .cmd = .help },
         .{ .name = "--help", .cmd = .help },
         .{ .name = "-h", .cmd = .help },
+        .{ .name = "version", .cmd = .version },
         .{ .name = "--version", .cmd = .version },
         .{ .name = "-v", .cmd = .version },
     };
@@ -41253,7 +41264,10 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
 }
 
 /// Split the merged CFG list into the memory, null-safety, and panic
-/// report buckets (dropping the ZA2 duplicates analyzeErrors owns).
+/// report buckets (dropping the ZA2 duplicates analyzeErrors owns). The
+/// ZA2-ownership test pins the assumption: it proves analyzeErrors and
+/// analyzeIgnoredErrors emit every ZA2 class the drop would swallow,
+/// while the CFG list carries none (EPH-I0174).
 fn filterMemIssues(alloc: Allocator, items: []const Issue) !FilteredMemIssues {
     var filtered = FilteredMemIssues{
         .mem_only = .empty,
@@ -41424,18 +41438,20 @@ fn collectAllIssues(
     return all;
 }
 
-/// Error exit path. JSON mode owns the stream as a machine contract:
-/// the runtime's bare error line would break it (EPH-I0213), so the
-/// run emits one machine-readable error object and exits with the
+/// Error exit path (EPH-I0543). JSON mode owns the stream as a machine
+/// contract: the runtime's bare error line would break it (EPH-I0213),
+/// so the run emits one machine-readable error object and returns the
 /// failure code (EPH-I1067). `msg` rides as the message member — the
 /// stashed diagnostic for a parse abort, empty for a mid-run handler
 /// failure, where no diagnostic belongs to the abort. Text mode
-/// propagates the error so the runtime prints the diagnostic.
-fn exitOnError(diag: *DiagCtx, allocator: Allocator, err: anyerror, msg: []const u8) !void {
+/// propagates the error so the runtime prints the diagnostic. Neither
+/// mode exits here: runEphor's defers run at its return, and the entry
+/// wrapper applies the code through std.process.exit from a scope with
+/// no pending defers.
+fn errorExitCode(diag: *DiagCtx, allocator: Allocator, err: anyerror, msg: []const u8) !u8 {
     if (!diag.json_stream) return err;
     printAbortJson(allocator, err, msg);
-    // ephor:disable-next-line ZA206
-    std.process.exit(1);
+    return 1;
 }
 
 /// Print the JSON-mode abort object once (EPH-I1067): the error name and
@@ -41486,14 +41502,16 @@ fn reportUnknownVersionWarning(diag: *DiagCtx) void {
     cliDiag(diag, "{s}", .{compat.unknown_version_warning_text});
 }
 
-/// Exit a failed run (EPH-I1070 follow-up). Text mode keeps the silent
-/// exit(1). JSON mode must leave a readable document on the armed
-/// stream, so the abort object rides the exit: the stashed diagnostic
-/// (possibly empty) rides as the message, exactly like the parse abort.
-/// One branch covers the flag-first, no-entries, and strict-fail
-/// shapes. A clean run returns and main's defers hold.
-fn exitFailedRun(diag: *DiagCtx, allocator: Allocator, ctx: *const RunCtx) void {
-    if (!(ctx.should_exit_error or ctx.strict_fail)) return;
+/// Exit code for a failed run (EPH-I1070 follow-up, EPH-I0543). Text
+/// mode keeps the silent exit(1). JSON mode must leave a readable
+/// document on the armed stream, so the abort object rides the code:
+/// the stashed diagnostic (possibly empty) rides as the message,
+/// exactly like the parse abort. One branch covers the flag-first,
+/// no-entries, and strict-fail shapes. A clean run returns 0 and
+/// runEphor's defers hold; the entry wrapper applies the code after
+/// they run.
+fn failedRunExitCode(diag: *DiagCtx, allocator: Allocator, ctx: *const RunCtx) u8 {
+    if (!(ctx.should_exit_error or ctx.strict_fail)) return 0;
     if (diag.json_stream) {
         printAbortJson(
             allocator,
@@ -41501,11 +41519,23 @@ fn exitFailedRun(diag: *DiagCtx, allocator: Allocator, ctx: *const RunCtx) void 
             diag.last_muted_diag[0..diag.last_muted_diag_len],
         );
     }
-    // ephor:disable-next-line ZA206
-    std.process.exit(1);
+    return 1;
 }
 
+/// Entry point. The run body lives in runEphor so its defers (the
+/// config strings, the suppression cache, the DebugAllocator leak
+/// report) run before any non-zero exit code applies (EPH-I0543):
+/// std.process.exit never runs defers, so the exit must sit in a scope
+/// with none pending — this one. A propagated error reaches the Zig
+/// runtime's error path unchanged, exit code 1.
 pub fn main(init: std.process.Init) !void {
+    std.process.exit(try runEphor(init));
+}
+
+/// The run body (EPH-I0543): parse, dispatch, and the exit-code
+/// computation. Every exit disposition returns through this function so
+/// its defers run; the entry wrapper applies the code after they do.
+fn runEphor(init: std.process.Init) !u8 {
     var diag = DiagCtx{ .io = init.io };
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -41520,7 +41550,7 @@ pub fn main(init: std.process.Init) !void {
         // The parse abort must still carry a machine-readable object on
         // the JSON stream: the stashed diagnostic rides as the message
         // (EPH-I1067).
-        return exitOnError(&diag, alloc, err, diag.last_muted_diag[0..diag.last_muted_diag_len]);
+        return errorExitCode(&diag, alloc, err, diag.last_muted_diag[0..diag.last_muted_diag_len]);
     };
     defer cfg.deinit(alloc);
 
@@ -41533,6 +41563,10 @@ pub fn main(init: std.process.Init) !void {
             init.environ_map.get("EPHOR_NO_UPDATE_CHECK"),
         );
     }
+    // The pending notification outlives every return path from here
+    // (abort, handler error, clean epilogue), so a deferred free covers
+    // them all; the epilogue only prints (EPH-I0545).
+    defer freeUpdateNotification(alloc);
 
     // Get absolute base path for relative path calculation
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -41555,13 +41589,14 @@ pub fn main(init: std.process.Init) !void {
         // JSON mode owns the stream as a machine contract: the runtime's
         // bare error line would break it, so a failing handler emits the
         // machine error object with no diagnostic message (a mid-run
-        // message does not belong to the abort) and exits with the
-        // failure code (EPH-I0213, EPH-I1067).
-        .fallible => |h| h(&ctx) catch |err| return exitOnError(&diag, alloc, err, ""),
+        // message does not belong to the abort) and returns the failure
+        // code (EPH-I0213, EPH-I1067).
+        .fallible => |h| h(&ctx) catch |err| return errorExitCode(&diag, alloc, err, ""),
     }
-    // A declined runtime prompt returns before the epilogue, exactly like
-    // the pre-split bare return from main.
-    if (ctx.abort_epilogue) return;
+    // A declined runtime prompt returns 0 before the epilogue (no update
+    // notification print, no exit-code application), exactly like the
+    // pre-split bare return from main.
+    if (ctx.abort_epilogue) return 0;
 
     // Unknown-version fallback warning (EPH-I1054): compat recorded the
     // flag during analysis; the epilogue routes the message through
@@ -41570,20 +41605,19 @@ pub fn main(init: std.process.Init) !void {
     reportUnknownVersionWarning(&diag);
 
     // Print update notification after all analysis output. JSON mode
-    // skips it so the machine stream stays pure (EPH-I0213).
+    // skips it so the machine stream stays pure (EPH-I0213). The
+    // deferred free above covers every return path (EPH-I0545).
     if (update_notification) |msg| {
         if (cfg.format != .json) std.debug.print("{s}", .{msg});
-        alloc.free(msg);
-        update_notification = null;
     }
 
-    // Exit with error code AFTER all defers have run (cfg.deinit, gpa.deinit)
-    // A failed run exits here: text mode exits 1 silently, JSON mode
-    // emits the abort object first so the armed stream never ends
-    // without a document (EPH-I1070 follow-up). EPH-I0543 tracks the
-    // flag-first grammar gap itself; this call only keeps the stream
-    // contract.
-    exitFailedRun(&diag, alloc, &ctx);
+    // Exit code AFTER all defers run (EPH-I0543): runEphor computes the
+    // code, its defers (cfg.deinit, gpa.deinit) run at the return, and
+    // only then does the entry wrapper apply it through
+    // std.process.exit. A failed run returns 1 here: text mode silently,
+    // JSON mode emitting the abort object first so the armed stream
+    // never ends without a document (EPH-I1070 follow-up).
+    return failedRunExitCode(&diag, alloc, &ctx);
 }
 
 // ============================================================================
@@ -42054,6 +42088,15 @@ fn freeChainImport(allocator: Allocator, import: ImportInfo) void {
 fn addChainNode(graph: *ImportGraph, i: usize, next: ?usize) !void {
     const allocator = graph.allocator;
     const path = try std.fmt.allocPrint(allocator, "/chain/f{d}.zig", .{i});
+    // The `.content` dupe in the struct literal sits between this alloc
+    // and the analysis.deinit errdefer below. The 0-len dupe cannot fail
+    // today (allocBytesWithAlignment short-circuits byte_count == 0), so
+    // the window is closed by construction — this errdefer is insurance:
+    // a future non-empty content literal would reopen it silently. The
+    // flag disarms once deinit takes ownership, so the two never
+    // double-free (EPH-I0546).
+    var path_owned = true;
+    errdefer if (path_owned) allocator.free(path);
     var analysis = FileAnalysis{
         .path = path,
         .resolved_path = path,
@@ -42064,6 +42107,7 @@ fn addChainNode(graph: *ImportGraph, i: usize, next: ?usize) !void {
         .line_count = 0,
         .is_generated = false,
     };
+    path_owned = false;
     errdefer analysis.deinit(allocator);
     if (next) |j| {
         const import = try makeChainImport(allocator, j);
@@ -42205,6 +42249,42 @@ test "scanForNestedBuildZig stops at the depth cap" {
     defer allocator.free(shallow);
     try std.testing.expect(graph.reachable.contains(shallow));
     try std.testing.expectEqual(@as(u32, 1), graph.reachable.count());
+}
+
+/// One failing-allocator iteration over addChainNode: build the graph
+/// from the failing allocator and run the helper. The sweep asserts byte
+/// balance after every induced failure (the EPH-I0895 seam-guard family).
+/// The band's F4 window itself cannot fail today: the content dupe is
+/// 0-len and allocBytesWithAlignment short-circuits byte_count == 0, so
+/// no fail index strikes it. The guard covers a future non-empty content
+/// literal, where the insurance errdefer is what keeps the balance.
+fn sweepAddChainNodeOnce(failing: *std.testing.FailingAllocator) !void {
+    const a = failing.allocator();
+    var diag = testDiagCtx();
+    var graph = ImportGraph.init(a, &diag);
+    defer graph.deinit();
+    try addChainNode(&graph, 0, null);
+}
+
+test "addChainNode stays byte-balanced under every induced OOM (EPH-I0546)" {
+    const allocator = std.testing.allocator;
+    // Cold run measures the allocation count so the sweep covers every
+    // induced failure point (plus one no-failure run).
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    try sweepAddChainNodeOnce(&probe);
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index <= total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        if (sweepAddChainNodeOnce(&failing)) |_| {} else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        // Byte balance at every failure point is the leak proof.
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "summary text carries the AST tier counts" {
@@ -42437,6 +42517,96 @@ test "AST skip note stays off the JSON machine stream (EPH-I0213)" {
     diag.json_stream = true;
     noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 });
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
+}
+
+test "check ZA2 ownership: error analyzers cover every class, CFG drops none (EPH-I0174)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // One file with every ZA2 trigger shape the error analyzers emit
+    // (ZA201/204/206/209/210 by analyzeErrors, ZA205 by
+    // analyzeIgnoredErrors). filterMemIssues drops ZA2 items from the
+    // CFG memory list on the "analyzeErrors covers them" assumption; this
+    // test pins both halves of that assumption: the error analyzers own
+    // every class, and the CFG list carries none to drop.
+    const content =
+        \\const std = @import("std");
+        \\fn mayFail() !void {
+        \\    return error.Fail;
+        \\}
+        \\fn work() void {}
+        \\fn silentCatch() void {
+        \\    mayFail() catch {};
+        \\}
+        \\fn usesUndefined(allocator: std.mem.Allocator) void {
+        \\    var x: u32 = undefined;
+        \\    _ = x;
+        \\    _ = allocator;
+        \\}
+        \\fn ignoredError() void {
+        \\    _ = mayFail();
+        \\}
+        \\fn exitsBypassingDefer() void {
+        \\    defer work();
+        \\    std.process.exit(1);
+        \\}
+        \\fn neverFails() !void {
+        \\    work();
+        \\}
+        \\fn verboseTry() !void {
+        \\    mayFail() catch |e| return e;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za2_ownership.zig", content);
+    defer run.deinit(allocator);
+
+    // Half one: analyzeErrors emits every class it owns.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za2_ownership.zig", RULE_SILENT_CATCH),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za2_ownership.zig", RULE_UNDEFINED_USAGE),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za2_ownership.zig", RULE_EXIT_BYPASSES_DEFER),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za2_ownership.zig", RULE_USELESS_ERROR_RETURN),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za2_ownership.zig", RULE_NO_CATCH_RETURN),
+    );
+
+    // ZA205 rides the ignored-errors analyzer, which feeds its own list
+    // in the .check pipeline — outside the CFG drop entirely.
+    var ignored = try analyzeIgnoredErrors(allocator, &run.graph);
+    defer deinitIssues(&ignored, allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(ignored.items, "za2_ownership.zig", RULE_IGNORED_ERROR),
+    );
+
+    // Half two: the CFG memory list carries no ZA2 item, so
+    // filterMemIssues' ZA2 drop never swallows a finding. A future CFG
+    // emitter adding a ZA2 class breaks this assertion and forces the
+    // accounting question the drop bypasses.
+    var cfg_issues = try analyzeCFGMemory(allocator, &run.graph);
+    defer deinitIssues(&cfg_issues, allocator);
+    var filtered = try filterMemIssues(allocator, cfg_issues.items);
+    defer filtered.deinit(allocator);
+    for (filtered.mem_only.items) |issue|
+        try std.testing.expect(!mem.startsWith(u8, issue.rule, "ZA2"));
+    for (filtered.null_safety.items) |issue|
+        try std.testing.expect(!mem.startsWith(u8, issue.rule, "ZA2"));
+    for (filtered.panic.items) |issue|
+        try std.testing.expect(!mem.startsWith(u8, issue.rule, "ZA2"));
 }
 
 test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-I0784)" {
@@ -43953,6 +44123,27 @@ test "joinPathSegments guards the empty slice and propagates OOM (EPH-I0528)" {
         error.OutOfMemory,
         joinPathSegments(failing.allocator(), &.{"a.zig"}, 5),
     );
+}
+
+test "parseCommand maps the bare version word (EPH-I0544)" {
+    // The bare word is the most common version-query spelling; pre-fix it
+    // fell through to the path latch and died with FileNotFound plus a
+    // misleading outside-root note.
+    try std.testing.expectEqual(
+        Command.version,
+        parseCommand("version") orelse return error.TestUnexpectedResult,
+    );
+    // The flag spellings still map.
+    try std.testing.expectEqual(
+        Command.version,
+        parseCommand("--version") orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expectEqual(
+        Command.version,
+        parseCommand("-v") orelse return error.TestUnexpectedResult,
+    );
+    // An unknown word still falls through to the path latch.
+    try std.testing.expect(parseCommand("src") == null);
 }
 
 test "parseCommandIntoArgv parses tokens within the buffer" {
@@ -70931,6 +71122,18 @@ test "isCacheFresh boundary and fail-closed cases" {
     // Future epochs: tolerated inside the skew window, stale beyond it.
     try std.testing.expect(isCacheFresh(now + UPDATE_CACHE_FUTURE_SKEW_S, now));
     try std.testing.expect(!isCacheFresh(now + UPDATE_CACHE_FUTURE_SKEW_S + 1, now));
+}
+
+test "freeUpdateNotification frees once and clears the slot (EPH-I0545)" {
+    const allocator = std.testing.allocator;
+    update_notification = try allocator.dupe(u8, "pending banner");
+    // The defer mirrors runEphor's registration: a second call after the
+    // manual free must be a no-op, not a double free.
+    defer freeUpdateNotification(allocator);
+    freeUpdateNotification(allocator);
+    try std.testing.expect(update_notification == null);
+    freeUpdateNotification(allocator);
+    try std.testing.expect(update_notification == null);
 }
 
 test "resolveUpdateCachePath requires HOME" {

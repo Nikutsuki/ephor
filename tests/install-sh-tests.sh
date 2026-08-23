@@ -1,6 +1,7 @@
 #!/bin/sh
 # Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630;
-# batch B66: EPH-I0631 through EPH-I0636).
+# batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
+# EPH-I0642).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -133,6 +134,15 @@ run_installer_with_bin() { # bin_dir, dir
     PATH="$1:$PATH"
     run_installer "$2"
     PATH=$OLD_PATH
+}
+
+# Run the installer with the tags API file replaced for this one run
+# (F-13): write $1 over the shared tags.json, run, then restore the
+# suite default so no run leaks the fixture into a later test.
+run_installer_with_tags() { # tags_file, dir
+    cp "$1" "$TEST_ROOT/tags.json"
+    run_installer "$2"
+    printf '%s\n' '[{"name":"v0.99.1"}]' > "$TEST_ROOT/tags.json"
 }
 
 assert_eq() { # want, got, label
@@ -755,6 +765,119 @@ assert_rc 0
 [ "$(stat -f '%Lp' "$D/build.zig")" = "600" ] || fail "build.zig mode not preserved (GNU arm)"
 assert_empty "$D/err.log" 'stderr not empty'
 pass "t30 splice preserves mode (F-12, GNU stat arm)"
+
+# --- t31 (EPH-I0641): a comment that mentions the dependency call must
+# not mislabel a fresh install as an upgrade.
+D="$TEST_ROOT/t31"
+mkdir -p "$D"
+cat > "$D/build.zig" <<'EOF'
+const std = @import("std");
+// The docs show b.dependency("ephor", .{}); the real line is gone.
+pub fn build(b: *std.Build) !void {
+    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{}) });
+    b.installArtifact(exe);
+}
+EOF
+run_installer "$D"
+assert_rc 0
+assert_grep "$D/out.log" 'Installing ephor v0.99.1' 'fresh install labeled as upgrade'
+assert_not_grep "$D/out.log" 'Upgrading' 'comment triggered the upgrade label'
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t31 comment mentioning the dependency stays Installing (F-17)"
+
+# --- t32 (EPH-I0641): a real zon dependency entry must label the run
+# as an upgrade even when build.zig no longer mentions the dependency.
+D="$TEST_ROOT/t32"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+cat > "$D/build.zig.zon" <<'EOF'
+.{
+    .name = .t32,
+    .version = "0.0.0",
+    .fingerprint = 0x1234dead,
+    .dependencies = .{
+        .ephor = .{
+            .url = "https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz",
+            .hash = "ephor-0.14.2-p-Eoi3CRFQAKLECH5wnEI78GscKz2AUYXXf0qlr-sOfX",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+EOF
+run_installer "$D"
+assert_rc 0
+assert_grep "$D/out.log" 'Upgrading ephor v0.99.1' 'zon dependency not detected'
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t32 zon dependency entry labels the run Upgrading (F-17)"
+
+# --- t33 (EPH-I0637): the tags request asks for the API's per-page
+# maximum, so the whole tag set arrives in one page (15 tags today).
+# The file:// test channel ignores the query string, so this test pins
+# the request URL the installer ships.
+assert_grep "$INSTALL_SH" 'tags?limit=50' 'tags request does not ask for the full page'
+pass "t33 tags request uses limit=50 (F-13)"
+
+# --- t34 (EPH-I0637): a re-dated old tag at the top of the
+# date-ordered response must never downgrade the install; the semver
+# max wins across the whole window. Behavior pin: the parent already
+# sorts the full file, so this test is green before the fix and guards
+# the invariant the raised limit relies on.
+D="$TEST_ROOT/t34"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+printf '%s\n' '[{"name":"v0.13.0"},{"name":"v0.14.2"},{"name":"v0.99.1"}]' \
+    > "$TEST_ROOT/tags-t34.json"
+run_installer_with_tags "$TEST_ROOT/tags-t34.json" "$D"
+assert_rc 0
+assert_grep "$D/out.log" 'v0.99.1' 'semver max not chosen'
+assert_not_grep "$D/out.log" 'v0.13.0' 're-dated old tag won'
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t34 re-dated old tag loses to the semver max (F-13)"
+
+# --- t35 (EPH-I0637): when every resolved tag sorts below the pinned
+# fallback, the floor holds the install at the fallback tag. Behavior
+# pin: green before the fix; it guards the floor F-13 names as the
+# damage cap.
+D="$TEST_ROOT/t35"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+printf '%s\n' '[{"name":"v0.12.3"},{"name":"v0.12.4"}]' > "$TEST_ROOT/tags-t35.json"
+run_installer_with_tags "$TEST_ROOT/tags-t35.json" "$D"
+assert_rc 0
+assert_grep "$D/out.log" 'v0.14.2' 'fallback floor not applied'
+assert_grep "$D/err.log" 'below the fallback' 'no below-fallback warning'
+pass "t35 below-fallback tags hold the floor (F-13)"
+
+# --- t36 (EPH-I0640): the missing-build.zig error keeps STE prose, and
+# no contraction remains anywhere in the script.
+D="$TEST_ROOT/t36"
+mkdir -p "$D"
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/out.log" 'no build.zig found in the current directory' 'article missing'
+assert_not_grep "$INSTALL_SH" "we're" 'contraction remains in install.sh'
+pass "t36 missing-build.zig prose is STE (F-16)"
+
+# --- t37 (EPH-I0642): make_install_tmp refuses a second call while its
+# single slot still holds a live temp, and still works on a free slot.
+# The misuse path has no reachable trigger through the installer flow,
+# so the test extracts the function and drives it directly.
+sed -n '/^make_install_tmp() {/,/^}/p' "$INSTALL_SH" > "$TEST_ROOT/make-install-tmp.inc"
+[ -s "$TEST_ROOT/make-install-tmp.inc" ] || fail "could not extract make_install_tmp from install.sh"
+D="$TEST_ROOT/t37"
+mkdir -p "$D"
+rc=0
+(INSTALL_TMP="live" && cd "$D" && . "$TEST_ROOT/make-install-tmp.inc" \
+    && make_install_tmp ./x.XXXXXXXX) > "$D/out.log" 2> "$D/err.log" || rc=$?
+assert_rc 1
+assert_grep "$D/err.log" 'INSTALL_TMP already holds' 'no slot guard message'
+[ -z "$(ls "$D"/x.* 2>/dev/null || true)" ] || fail "misuse arm created a temp file"
+rc=0
+(INSTALL_TMP="" && cd "$D" && . "$TEST_ROOT/make-install-tmp.inc" \
+    && make_install_tmp ./y.XXXXXXXX) > "$D/out2.log" 2> "$D/err2.log" || rc=$?
+assert_rc 0
+[ -n "$(ls "$D"/y.* 2>/dev/null || true)" ] || fail "clean arm created no temp file"
+pass "t37 INSTALL_TMP slot guard (F-18)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

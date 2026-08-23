@@ -4,6 +4,10 @@
 
 # pipefail is not portable to POSIX sh (dash), so each fallible command
 # handles its own exit status explicitly.
+# EPH-I0638: mktemp, grep -o, and sed -i.bak go beyond POSIX. macOS and
+# Linux ship all three, and an exotic system fails loudly at the first
+# use instead of misbehaving silently, so the dependency is accepted
+# and documented here. stat gets the same treatment at preserve_mode.
 set -eu
 
 # EPH-I0194: a cloned repo can plant a symlink at a fixed temp name such as
@@ -24,6 +28,14 @@ trap '[ -z "$INSTALL_TMP" ] || rm -f "$INSTALL_TMP"' EXIT
 # (EPH-I0632): umasks like 0277 or 0777 strip owner write, and the next
 # redirect would fail with EACCES.
 make_install_tmp() {
+    # EPH-I0642: INSTALL_TMP is one slot, and only the mv at each call
+    # site clears it. A second call before that mv would orphan the live
+    # temp file. Refuse the internal misuse instead of leaking it; the
+    # EXIT trap removes the live temp on the way out.
+    if [ -n "$INSTALL_TMP" ]; then
+        echo "error: INSTALL_TMP already holds a live temp file." >&2
+        exit 1
+    fi
     INSTALL_TMP=$(mktemp "$1")
     chmod "$(printf '%03o' $((0600 | (0666 & ~$(umask)))))" "$INSTALL_TMP"
 }
@@ -46,7 +58,13 @@ preserve_mode() { # original file
 
 REPO="https://codeberg.org/RhyosLabs/ephor"
 # Tests override this URL through EPHOR_TAGS_API to simulate an API failure.
-TAGS_API="${EPHOR_TAGS_API:-https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10}"
+# EPH-I0637: the API orders tags by date, so limit=10 left a window: ten
+# re-dated old tags could evict the true max from the page. limit=50 is
+# the API's per-page maximum and holds every tag the repo has released
+# so far (15, verified 2026-08-22), so the window is closed today. When
+# the repo grows past 50 tags it reopens, and the fallback floor in
+# resolve_ephor_tag caps the damage at the pinned tag.
+TAGS_API="${EPHOR_TAGS_API:-https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50}"
 # This tag is the fallback when the Codeberg tags API fails. Refresh it on every release.
 EPHOR_FALLBACK_TAG="v0.14.2"
 # Pin for Zig 0.15.x. Every remote tag (v0.12.3 and later) declares
@@ -222,9 +240,9 @@ if ! command -v zig >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check we're in a Zig project
+# Check that this is a Zig project.
 if [ ! -f "build.zig" ]; then
-    echo "error: no build.zig found in current directory"
+    echo "error: no build.zig found in the current directory"
     echo ""
     echo "  Ephor requires a Zig project with build.zig and build.zig.zon."
     echo "  To initialize a Zig project, run:"
@@ -342,8 +360,16 @@ case "$ZIG_VERSION" in
         ;;
 esac
 
-# Detect if this is an upgrade or fresh install
-if grep -q 'dependency("ephor"' build.zig 2>/dev/null || grep -q '"ephor"' build.zig.zon 2>/dev/null; then
+# Detect if this is an upgrade or fresh install.
+# EPH-I0641: both probes anchor to code context, so a comment that
+# mentions ephor cannot mislabel a fresh install as an upgrade. The
+# build.zig probe uses the same code-line idiom as the installArtifact
+# search below. The zon probe matches the .ephor = dependency entry
+# line that zig fetch writes; the old '"ephor"' pattern matched no
+# real zon shape, only comments.
+DEP_PROBE='^[[:space:]]*[^/.\\[:space:]].*dependency\("ephor"'
+ZON_DEP_PROBE='^[[:space:]]*\.ephor[[:space:]]*='
+if grep -qE "$DEP_PROBE" build.zig 2>/dev/null || grep -qE "$ZON_DEP_PROBE" build.zig.zon 2>/dev/null; then
     ACTION="Upgrading"
 else
     ACTION="Installing"
@@ -454,6 +480,11 @@ if grep -qE "$CANON_START" build.zig; then
     # anywhere, so a doc comment quoting the marker pointed the splice
     # at the comment and deleted the code between it and the real
     # block.
+    # EPH-I0639: the splice line numbers are read here and written
+    # later, so a concurrent edit to build.zig in that window can
+    # misalign the splice. The risk is accepted: the installer runs
+    # once, and a corrupt splice fails the next zig build loudly. The
+    # same window applies to every splice branch below.
     START_LINE=$(grep -nE "$CANON_START" build.zig | head -1 | cut -d: -f1)
     END_LINE=$(grep -nE "$CANON_END" build.zig | head -1 | cut -d: -f1)
     START_COUNT=$(grep -cE "$CANON_START" build.zig | cat)

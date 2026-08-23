@@ -533,6 +533,25 @@ const ReturnKind = types.ReturnKind;
 const FileAnalysis = types.FileAnalysis;
 const Thresholds = types.Thresholds;
 
+/// Move every issue from `src` into `dst` with one appendSlice transfer.
+/// The move is atomic: an allocation failure leaves `src` intact and
+/// `dst` unchanged, so each list then frees exactly its own payloads. On
+/// success `src` is empty and its owner frees only the array.
+///
+/// The per-item move idiom — `for (src.items) |i| try dst.append(alloc,
+/// i);` followed by `src.items.len = 0;` — is forbidden (EPH-I0690, the
+/// design-memory-model F-2 rule). An OOM mid-loop strands the payloads
+/// the source's deinit never sees, and a source that frees its payloads
+/// (deinitIssues) frees items 0..k-1 twice on that path.
+fn moveIssues(
+    allocator: Allocator,
+    dst: *std.ArrayListUnmanaged(Issue),
+    src: *std.ArrayListUnmanaged(Issue),
+) !void {
+    try dst.appendSlice(allocator, src.items);
+    src.items.len = 0;
+}
+
 // ============================================================================
 // Control Flow Graph (CFG) Infrastructure - Phase 4
 // ============================================================================
@@ -13130,7 +13149,23 @@ const ImportGraph = struct {
         // A failed put must release the analysis: the content, the path
         // copies, and the imports all belong to it (band-B03 F15,
         // EPH-I0375).
-        try self.files.put(analysis.path, analysis);
+        //
+        // First ingest wins (EPH-I0693, F-6): a `put` on a duplicate
+        // textual path would overwrite the stored FileAnalysis without
+        // deinit, leaking its content, path copies, and imports. The
+        // walk gate (EPH-I0823) and the entry dedupe (EPH-I0812/I0817)
+        // make a duplicate unreachable today; the guard keeps the
+        // ownership contract unconditional, so a future ingest path
+        // cannot silently reopen the leak.
+        const gop = try self.files.getOrPut(analysis.path);
+        if (gop.found_existing) {
+            // The stored analysis stays: it is the analysis every later
+            // pass reads. The new one is a redundant re-read.
+            analysis.deinit(self.allocator);
+            analysis_owned = false;
+            return;
+        }
+        gop.value_ptr.* = analysis;
         analysis_owned = false;
         if (pair.resolved.ptr != pair.path.ptr) {
             try self.resolved_to_key.put(self.allocator, pair.resolved, pair.path);
@@ -13256,11 +13291,19 @@ const ImportGraph = struct {
         if (mem.eql(u8, import_path, "std")) return;
         if (mem.eql(u8, import_path, "builtin")) return;
 
+        // Build the record fully, then commit: each dupe frees itself on
+        // a later failure, and the append hands ownership to the analysis
+        // on success (the tryAddBareImport EPH-I0582 pattern, EPH-I0691).
+        const path_copy = try self.allocator.dupe(u8, import_path);
+        errdefer self.allocator.free(path_copy);
+        const name_copy = try self.allocator.dupe(u8, var_name);
+        errdefer self.allocator.free(name_copy);
         const resolved = try self.resolveImport(ctx.file_path, import_path);
+        errdefer if (resolved) |r| self.allocator.free(r);
         try ctx.analysis.imports.append(self.allocator, .{
-            .path = try self.allocator.dupe(u8, import_path),
+            .path = path_copy,
             .resolved = resolved,
-            .name = try self.allocator.dupe(u8, var_name),
+            .name = name_copy,
             .line = ctx.line_num,
             .col = ctx.col,
             .is_pub = is_pub,
@@ -33358,6 +33401,10 @@ fn runFmtCheck(
         // the ZR104 finding below carries the same fact as machine data.
         cliDiag(diag, "error: cannot run zig fmt: {}\n", .{err});
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        // Accumulator discipline (EPH-I0692, F-4): every production
+        // issue list carries an errdefer deinitIssues. reportFmtFailure
+        // guards its own message, but the sweep rule stays uniform.
+        errdefer deinitIssues(&issues, allocator);
         try reportFmtFailure(allocator, &issues, err);
         return issues;
     };
@@ -41040,16 +41087,19 @@ fn printNoEntriesError(diag: *DiagCtx) void {
 }
 
 /// ZA502 skipped files ride the structure list (EPH-I0150): same
-/// graph-owned lifetime, static messages. The merge moves items, so the
-/// skipped list frees only its array.
+/// graph-owned lifetime, static messages. moveIssues moves the items
+/// atomically (EPH-I0690, F-2), so the skipped list frees only its
+/// array after the move.
 fn mergeSkippedIssues(
     alloc: Allocator,
     g: *ImportGraph,
     into: *std.ArrayListUnmanaged(Issue),
 ) !void {
     var skipped_issues = try g.getSkippedFileIssues(alloc);
-    defer skipped_issues.deinit(alloc);
-    for (skipped_issues.items) |si| try into.append(alloc, si);
+    errdefer deinitIssues(&skipped_issues, alloc);
+    try moveIssues(alloc, into, &skipped_issues);
+    skipped_issues.deinit(alloc);
+    skipped_issues = .empty;
 }
 
 /// `orphans` command: report files no entry point can reach.
@@ -41092,9 +41142,15 @@ fn handleMemory(ctx: *RunCtx) !void {
     // Stats stay null: check is the coverage surface (its summary carries
     // the parsed/skipped counts, EPH-I0200). memory prints findings only.
     var ast_issues = try analyzeAstTier(ctx.alloc, &g, null);
-    defer ast_issues.deinit(ctx.alloc);
-    for (ast_issues.items) |ai| try issues.append(ctx.alloc, ai);
-    ast_issues.items.len = 0; // ownership moved to issues
+    // Atomic move (EPH-I0690, F-2): the ZA111 payloads are owned, so an
+    // OOM mid-move keeps them with this list for the errdefer; after the
+    // move the list is empty and the explicit deinit frees only the
+    // array. The reset disarms the errdefer for later fallible calls
+    // (0.16 deinit leaves the list undefined).
+    errdefer deinitIssues(&ast_issues, ctx.alloc);
+    try moveIssues(ctx.alloc, &issues, &ast_issues);
+    ast_issues.deinit(ctx.alloc);
+    ast_issues = .empty;
     const c = printIssues(issues.items, "memory", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
@@ -41111,13 +41167,15 @@ fn handleErrors(ctx: *RunCtx) !void {
     defer deinitIssues(&issues, ctx.alloc);
     // ZA205: discarded error union results
     var ignored = try analyzeIgnoredErrors(ctx.alloc, &g);
-    defer deinitIssues(&ignored, ctx.alloc);
-    // Merge ignored errors into issues for unified output
-    for (ignored.items) |item| {
-        try issues.append(ctx.alloc, item);
-    }
-    // Clear ignored without deiniting items (now owned by issues)
-    ignored.items.len = 0;
+    // Atomic move (EPH-I0690, F-2): a per-item append would leave items
+    // 0..k-1 in both lists on an OOM mid-loop, and both deinitIssues
+    // paths would free them — a double-free one owned-message addition
+    // away. moveIssues moves every item or none, so each list frees
+    // exactly its own payloads.
+    errdefer deinitIssues(&ignored, ctx.alloc);
+    try moveIssues(ctx.alloc, &issues, &ignored);
+    ignored.deinit(ctx.alloc);
+    ignored = .empty;
     const c = printIssues(issues.items, "errors", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
@@ -41509,20 +41567,25 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
 
 /// ZA904 (opt-in note) rides the CFG list so it flows through the ZA9 →
 /// panic category filter and the export list. Messages are static (not
-/// owned), so the cast list frees only its array after the move.
+/// owned), so the cast list frees only its array after the atomic move
+/// (EPH-I0690, F-2).
 fn mergeIntCastIssues(
     alloc: Allocator,
     g: *ImportGraph,
     into: *std.ArrayListUnmanaged(Issue),
 ) !void {
     var cast_issues = try analyzeIntCastGuards(alloc, g);
-    defer cast_issues.deinit(alloc);
-    for (cast_issues.items) |ci| try into.append(alloc, ci);
+    errdefer deinitIssues(&cast_issues, alloc);
+    try moveIssues(alloc, into, &cast_issues);
+    cast_issues.deinit(alloc);
+    cast_issues = .empty;
 }
 
 /// AST tier (ZA111): merged into cfg_mem_issues so it flows through the
-/// ZA1 → memory category filter and the export list. Item ownership moves
-/// with the append, so the tier list frees only its array.
+/// ZA1 → memory category filter and the export list. Item ownership
+/// moves with the atomic moveIssues transfer (EPH-I0690, F-2), so the
+/// tier list frees only its array on the success path; an OOM keeps the
+/// owned payloads with the list for the errdefer.
 fn mergeAstTierIssues(
     alloc: Allocator,
     g: *ImportGraph,
@@ -41530,9 +41593,10 @@ fn mergeAstTierIssues(
     into: *std.ArrayListUnmanaged(Issue),
 ) !void {
     var ast_issues = try analyzeAstTier(alloc, g, stats);
-    defer ast_issues.deinit(alloc);
-    for (ast_issues.items) |ai| try into.append(alloc, ai);
-    ast_issues.items.len = 0;
+    errdefer deinitIssues(&ast_issues, alloc);
+    try moveIssues(alloc, into, &ast_issues);
+    ast_issues.deinit(alloc);
+    ast_issues = .empty;
 }
 
 /// Print every category's findings, the suppression note, the optional
@@ -42385,6 +42449,154 @@ test "ImportGraph.deinit frees reachable keys when the key list append fails (EP
             continue;
         };
     }
+}
+
+/// Test helper: append one finding with an owned message, the payload
+/// shape the merge-atomicity sweep needs (EPH-I0690).
+fn appendOwnedMsg(
+    allocator: Allocator,
+    list: *std.ArrayListUnmanaged(Issue),
+    text: []const u8,
+) !void {
+    const msg = try allocator.dupe(u8, text);
+    errdefer allocator.free(msg);
+    try list.append(allocator, .{
+        .file = "f.zig",
+        .line = 1,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZAX99",
+        .message = msg,
+        .help = "test helper payload",
+        .message_owned = true,
+    });
+}
+
+test "moveIssues moves atomically under allocation failure (EPH-I0690)" {
+    // A per-item append move double-frees when the source deinits its
+    // payloads: an OOM at item k leaves items 0..k-1 in both lists.
+    // moveIssues transfers with one appendSlice, so every failure index
+    // leaves each item owned by exactly one list. Any leak or
+    // double-free fails the test at std.testing.allocator deinit.
+    // Six items: the list grows 0 → 4 → 8, so the per-item variant
+    // allocates twice (the fifth append grows again) while appendSlice
+    // allocates once — the sweep must reach the second growth's index.
+    const allocator = std.testing.allocator;
+    const msgs = [_][]const u8{ "m1", "m2", "m3", "m4", "m5", "m6" };
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var dst: std.ArrayListUnmanaged(Issue) = .empty;
+        var src: std.ArrayListUnmanaged(Issue) = .empty;
+        defer deinitIssues(&dst, probe.allocator());
+        defer deinitIssues(&src, probe.allocator());
+        for (msgs) |m| try appendOwnedMsg(probe.allocator(), &src, m);
+        try moveIssues(probe.allocator(), &dst, &src);
+        try std.testing.expectEqual(@as(usize, 6), dst.items.len);
+        try std.testing.expectEqual(@as(usize, 0), src.items.len);
+    }
+    const total_allocs = probe.allocations;
+
+    // The sweep bound carries a margin past the probe's count: the
+    // atomic transfer allocates once, but the forbidden per-item
+    // variant allocates per capacity growth, so a bound at exactly
+    // total_allocs stops one index short of the mid-loop failure the
+    // test must discriminate (the double-free index). The extra indices
+    // only repeat the success case for the atomic implementation.
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs + 2) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var dst: std.ArrayListUnmanaged(Issue) = .empty;
+        defer deinitIssues(&dst, failing.allocator());
+        var src: std.ArrayListUnmanaged(Issue) = .empty;
+        defer deinitIssues(&src, failing.allocator());
+        var built = true;
+        for (msgs) |m| {
+            appendOwnedMsg(failing.allocator(), &src, m) catch {
+                built = false;
+                break;
+            };
+        }
+        if (!built) continue;
+        moveIssues(failing.allocator(), &dst, &src) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        // Success: dst holds every item and src is empty. The armed
+        // defers free every payload exactly once.
+        try std.testing.expectEqual(@as(usize, 6), dst.items.len);
+        try std.testing.expectEqual(@as(usize, 0), src.items.len);
+    }
+}
+
+test "tryRecordConstImport leaks nothing under allocation failure (EPH-I0691)" {
+    // OOM sweep over tryRecordConstImport's allocations: a const import
+    // of an existing file exercises the resolved dupe, the path and name
+    // dupes, and the append growth. Pre-fix, a failed dupe or append
+    // leaked the earlier allocations (the resolved slice and the path
+    // copy).
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "f.zig",
+        .data = "const dep = @import(\"dep.zig\");\n",
+    });
+    const file_path = try tmpFilePath(allocator, &tmp, "f.zig");
+    defer allocator.free(file_path);
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var graph = ImportGraph.init(probe.allocator(), &diag);
+        defer graph.deinit();
+        try graph.analyzeFile(file_path);
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var graph = ImportGraph.init(failing.allocator(), &diag);
+        defer graph.deinit();
+        graph.analyzeFile(file_path) catch continue;
+    }
+}
+
+test "analyzeFile keeps the first analysis of a duplicate path (EPH-I0693)" {
+    // A files.put on a duplicate textual path would overwrite the
+    // stored FileAnalysis without deinit: the old content, path copies,
+    // and imports leak. The ingest guard keeps the first analysis and
+    // frees the redundant re-read. std.testing.allocator fails the test
+    // on any leak or double-free.
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "f.zig",
+        .data = "const dep = @import(\"dep.zig\");\npub fn f() void {}\n",
+    });
+    const file_path = try tmpFilePath(allocator, &tmp, "f.zig");
+    defer allocator.free(file_path);
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.analyzeFile(file_path);
+    try graph.analyzeFile(file_path);
+    try std.testing.expectEqual(@as(usize, 1), graph.files.count());
+    const stored = graph.files.get(file_path).?;
+    try std.testing.expectEqualStrings(
+        "const dep = @import(\"dep.zig\");\npub fn f() void {}\n",
+        stored.content,
+    );
+    try std.testing.expectEqual(@as(usize, 1), stored.imports.items.len);
 }
 
 /// Test helper: build the ImportInfo for a chain node's import of the

@@ -15,8 +15,13 @@ const Allocator = mem.Allocator;
 pub const RULE_ALLOC_NO_DEFER = "ZA101";
 pub const RULE_CREATE_NO_DEFER = "ZA102";
 pub const RULE_ALLOC_NO_ERRDEFER = "ZA103";
+// ZA104 (memory leak) is RETIRED — removed in 0.11.0 when the non-CFG
+// memory analysis path was deleted. Never reuse the ID: consumer
+// inline-ignores reference it.
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
+// ZA107-ZA109: never issued. The numbering skipped straight to ZA110;
+// no rule ever carried these IDs (verified against git history).
 pub const RULE_MUST_RETURN_REF = "ZA110";
 pub const RULE_RETURNED_STACK_REF = "ZA111";
 
@@ -52,6 +57,8 @@ pub const RULE_FILE_TOO_LARGE = "ZA502";
 // ZA6xx - Formatting (ZA607 is a semantic definite-assignment check that kept
 // its ZA6xx ID for backward compatibility with existing inline-ignores)
 pub const RULE_NEEDS_FORMAT = "ZA601";
+// ZA602-ZA606: never issued. The band jumps straight to ZA607, whose
+// out-of-band ID is deliberate (see above).
 pub const RULE_DEFINITE_ASSIGNMENT = "ZA607";
 
 // ZA7xx - Style
@@ -67,6 +74,9 @@ pub const RULE_ORELSE_QUESTION_UNSAFE = "ZA802";
 
 // ZA9xx - Panic/Overflow Detection
 pub const RULE_DECREMENT_WITHOUT_CHECK = "ZA901";
+// ZA902 is RETIRED — removed with the dead legacy line-based panic
+// analyzer cluster (EPH-I0015, EPH-I0041): its only emitter never
+// emitted. Never reuse the ID: consumer inline-ignores reference it.
 pub const RULE_INDEX_ARITHMETIC = "ZA903";
 pub const RULE_INTCAST_NO_BOUNDS = "ZA904";
 
@@ -152,6 +162,11 @@ pub const FailOn = enum {
         };
     }
 
+    /// Accepted spellings are the str() forms: never, error, warning,
+    /// note (lowercase, exact). "err" and "warn" are rejected on purpose:
+    /// the CI gate fails closed on a misspelled level (EPH-I0024), so the
+    /// accepted set stays minimal and the runtime diagnostics name it
+    /// verbatim (EPH-I0587).
     pub fn fromString(s: []const u8) ?FailOn {
         if (std.mem.eql(u8, s, "never")) return .never;
         if (std.mem.eql(u8, s, "error")) return .err;
@@ -182,6 +197,9 @@ pub const ErrorNaming = enum {
     }
 
     /// "PascalCase" is accepted as an alias for TitleCase (common spelling).
+    /// Accepted spellings: TitleCase, PascalCase, snake_case. "title_case"
+    /// (the enum-tag spelling) is rejected: the accepted set is the str()
+    /// forms plus the PascalCase alias (EPH-I0587).
     pub fn fromString(s: []const u8) ?ErrorNaming {
         if (std.mem.eql(u8, s, "TitleCase")) return .title_case;
         if (std.mem.eql(u8, s, "PascalCase")) return .title_case;
@@ -851,7 +869,10 @@ pub const ProjectStats = struct {
     files_with_tests: usize = 0,
     /// AST-tier coverage (EPH-I0200). Zero unless the caller merges the
     /// ast_tier.Stats counters in: getStats walks content only and cannot
-    /// observe parse outcomes. The .check flow owns that merge.
+    /// observe parse outcomes. The .check flow owns that merge. The stats
+    /// command never runs the AST tier, so its JSON omits both members
+    /// (EPH-I0588): printing them would report a constant zero that reads
+    /// as a parse run the command never performed.
     ast_parsed: usize = 0,
     ast_skipped: usize = 0,
 };
@@ -924,7 +945,10 @@ pub fn countOccurrences(h: []const u8, n: []const u8) usize {
     return count;
 }
 
+/// Line count of `content`: one per newline plus one for the final line.
+/// Empty content has zero lines (EPH-I0586).
 pub fn countLines(content: []const u8) usize {
+    if (content.len == 0) return 0;
     var count: usize = 1;
     for (content) |c| {
         if (c == '\n') count += 1;
@@ -1132,6 +1156,7 @@ test "countOccurrences counts correctly" {
 }
 
 test "countLines counts newlines" {
+    try std.testing.expectEqual(@as(usize, 0), countLines(""));
     try std.testing.expectEqual(@as(usize, 3), countLines("a\nb\nc"));
     try std.testing.expectEqual(@as(usize, 1), countLines("no newlines"));
 }
@@ -1240,6 +1265,145 @@ test "LiteralState keeps escape runs inside char literals (EPH-I0671)" {
     }
     try std.testing.expect(!lit.in_mline);
     try std.testing.expect(tail_code);
+}
+
+test "LiteralState.forLine returns null for a multiline body line (EPH-I0585)" {
+    // After optional leading whitespace, `\\` makes the whole line string
+    // data: no position on it is code, so forLine reports no state.
+    try std.testing.expect(LiteralState.forLine("\\\\ body") == null);
+    try std.testing.expect(LiteralState.forLine("  \\\\ body") == null);
+    try std.testing.expect(LiteralState.forLine("\t\\\\ body") == null);
+    // Every other line carries code: empty, plain code, and a mid-line
+    // opener (the opener is updateForChar's job, not forLine's).
+    try std.testing.expect(LiteralState.forLine("") != null);
+    try std.testing.expect(LiteralState.forLine("const x = 1;") != null);
+    try std.testing.expect(LiteralState.forLine("x = \\\\") != null);
+}
+
+test "LiteralState masks delimiter bytes and reports code (EPH-I0585)" {
+    // Target: const s = "ab"; x = 1; — the quotes themselves are masked
+    // (null), and code positions resume after the closing delimiter.
+    const line = "const s = \"ab\"; x = 1;";
+    var lit = LiteralState.forLine(line) orelse unreachable;
+    try std.testing.expectEqual(@as(?usize, 0), lit.updateForChar(line, 0));
+    try std.testing.expect(lit.updateForChar(line, 10) == null);
+    try std.testing.expect(lit.in_str);
+    try std.testing.expect(lit.updateForChar(line, 11) == null);
+    try std.testing.expect(lit.updateForChar(line, 13) == null);
+    try std.testing.expect(!lit.in_str);
+    try std.testing.expectEqual(@as(?usize, 14), lit.updateForChar(line, 14));
+
+    // Target: const c = 'a'; x(); — same contract for char delimiters.
+    const ch = "const c = 'a'; x();";
+    var clit = LiteralState.forLine(ch) orelse unreachable;
+    try std.testing.expect(clit.updateForChar(ch, 10) == null);
+    try std.testing.expect(clit.in_chr);
+    try std.testing.expect(clit.updateForChar(ch, 11) == null);
+    try std.testing.expect(clit.updateForChar(ch, 12) == null);
+    try std.testing.expect(!clit.in_chr);
+    try std.testing.expectEqual(@as(?usize, 13), clit.updateForChar(ch, 13));
+
+    // Target: x = 1; // c — both comment slashes and the tail are masked.
+    const cm = "x = 1; // c";
+    var mlit = LiteralState.forLine(cm) orelse unreachable;
+    try std.testing.expect(mlit.updateForChar(cm, 7) == null);
+    try std.testing.expect(mlit.in_comment);
+    try std.testing.expect(mlit.updateForChar(cm, 8) == null);
+    try std.testing.expect(mlit.updateForChar(cm, cm.len - 1) == null);
+}
+
+test "LiteralState honors odd and even backslash runs (EPH-I0585)" {
+    // Target: const q = '\''; x = 1; — the escaped quote (odd run) stays
+    // content, so the char literal closes at the final quote (even run).
+    const line = "const q = '\\''; x = 1;";
+    var lit = LiteralState.forLine(line) orelse unreachable;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const pos = lit.updateForChar(line, i);
+        if (i == 12) {
+            try std.testing.expectEqual(@as(?usize, null), pos);
+            try std.testing.expect(lit.in_chr);
+        }
+        if (i == 13) try std.testing.expect(!lit.in_chr);
+        if (i == 14) try std.testing.expectEqual(@as(?usize, 14), pos);
+    }
+
+    // Target: const s = "a \" b"; x(); — the escaped quote stays content.
+    const str_line = "const s = \"a \\\" b\"; x();";
+    var slit = LiteralState.forLine(str_line) orelse unreachable;
+    i = 0;
+    while (i < str_line.len) : (i += 1) {
+        const pos = slit.updateForChar(str_line, i);
+        if (i == 14) {
+            try std.testing.expectEqual(@as(?usize, null), pos);
+            try std.testing.expect(slit.in_str);
+        }
+        if (i == 17) try std.testing.expect(!slit.in_str);
+        if (i == 18) try std.testing.expectEqual(@as(?usize, 18), pos);
+    }
+
+    // Target: const s = "a\\"; x(); — the even run closes the string.
+    const even_close = "const s = \"a\\\\\"; x();";
+    var elit = LiteralState.forLine(even_close) orelse unreachable;
+    i = 0;
+    while (i < even_close.len) : (i += 1) {
+        const pos = elit.updateForChar(even_close, i);
+        if (i == 14) try std.testing.expect(!elit.in_str);
+        if (i == 15) try std.testing.expectEqual(@as(?usize, 15), pos);
+    }
+}
+
+test "LiteralState keeps an unterminated literal masked (EPH-I0585)" {
+    // No closing quote: every later byte is literal data, so the tail
+    // positions return null and the literal flag stays set.
+    const line = "const s = \"abc";
+    var lit = LiteralState.forLine(line) orelse unreachable;
+    var last: ?usize = null;
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) last = lit.updateForChar(line, i);
+    try std.testing.expect(last == null);
+    try std.testing.expect(lit.in_str);
+    const ch = "const c = 'a";
+    var clit = LiteralState.forLine(ch) orelse unreachable;
+    last = null;
+    i = 0;
+    while (i < ch.len) : (i += 1) last = clit.updateForChar(ch, i);
+    try std.testing.expect(last == null);
+    try std.testing.expect(clit.in_chr);
+}
+
+test "LiteralState never opens a comment inside a literal (EPH-I0585)" {
+    // Target: const s = "http://x"; y = 1; — the `//` is string data, so
+    // the comment never opens and code resumes after the real close.
+    const line = "const s = \"http://x\"; y = 1;";
+    var lit = LiteralState.forLine(line) orelse unreachable;
+    var i: usize = 0;
+    var tail_code = false;
+    while (i < line.len) : (i += 1) {
+        if (lit.updateForChar(line, i)) |pos| {
+            if (pos >= 20) tail_code = true;
+        }
+    }
+    try std.testing.expect(tail_code);
+    try std.testing.expect(!lit.in_comment);
+    // The comment form still opens in code context.
+    const code = "x = 1; // real";
+    var clit = LiteralState.forLine(code) orelse unreachable;
+    var j: usize = 0;
+    while (j < code.len) : (j += 1) _ = clit.updateForChar(code, j);
+    try std.testing.expect(clit.in_comment);
+}
+
+test "hasEvenBackslashRun distinguishes delimiters from escaped quotes (EPH-I0585)" {
+    // No backslash before the quote: even run, delimiter.
+    try std.testing.expect(hasEvenBackslashRun("\"", 0));
+    try std.testing.expect(hasEvenBackslashRun("x\"", 1));
+    // One backslash: odd run, escaped content.
+    try std.testing.expect(!hasEvenBackslashRun("\\\"", 1));
+    // Two: even again, delimiter.
+    try std.testing.expect(hasEvenBackslashRun("\\\\\"", 2));
+    // Three: odd again.
+    try std.testing.expect(!hasEvenBackslashRun("\\\\\\\"", 3));
 }
 
 test "LineClassifier bounds work to one walk per line" {
@@ -1538,6 +1702,94 @@ test "skipWhitespace skips blanks and stops at code" {
     try std.testing.expectEqual(@as(usize, 0), skipWhitespace("ab  ", 0));
     try std.testing.expectEqual(@as(usize, 2), skipWhitespace("  x", 1));
     try std.testing.expectEqual(@as(usize, 3), skipWhitespace("abc", 3));
+}
+
+test "deinitIssues frees owned messages and leaves borrowed ones (EPH-I0585)" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    const owned = try allocator.dupe(u8, "owned message");
+    try issues.append(allocator, .{
+        .file = "borrowed.zig",
+        .line = 1,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = owned,
+        .help = null,
+        .message_owned = true,
+    });
+    try issues.append(allocator, .{
+        .file = "borrowed.zig",
+        .line = 2,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "borrowed message",
+        .help = null,
+    });
+    deinitIssues(&issues, allocator);
+    // std.testing.allocator fails the test when the owned message leaks
+    // or when the borrowed message is freed (an invalid free).
+}
+
+test "FileAnalysis.deinit frees every owned field (EPH-I0585)" {
+    const allocator = std.testing.allocator;
+    // Distinct path and resolved_path: both freed.
+    var fa = FileAnalysis{
+        .path = try allocator.dupe(u8, "src/a.zig"),
+        .resolved_path = try allocator.dupe(u8, "/repo/src/a.zig"),
+        .imports = .empty,
+        .content = try allocator.dupe(u8, "const x = 1;\n"),
+        .has_tests = false,
+        .pub_function_count = 0,
+        .line_count = 1,
+        .is_generated = false,
+    };
+    fa.deinit(allocator);
+
+    // Realpath fallback: resolved_path and path share the pointer, so
+    // deinit frees the buffer exactly once.
+    const shared = try allocator.dupe(u8, "src/b.zig");
+    var fb = FileAnalysis{
+        .path = shared,
+        .resolved_path = shared,
+        .imports = .empty,
+        .content = try allocator.dupe(u8, ""),
+        .has_tests = false,
+        .pub_function_count = 0,
+        .line_count = 0,
+        .is_generated = false,
+    };
+    fb.deinit(allocator);
+
+    // Owned imports: path, name, and resolved all freed.
+    var imports: std.ArrayListUnmanaged(ImportInfo) = .empty;
+    try imports.append(allocator, .{
+        .path = try allocator.dupe(u8, "std"),
+        .resolved = try allocator.dupe(u8, "/zig/lib/std"),
+        .name = try allocator.dupe(u8, "std"),
+        .line = 3,
+        .col = 1,
+    });
+    try imports.append(allocator, .{
+        .path = try allocator.dupe(u8, "./mod"),
+        .resolved = null,
+        .name = try allocator.dupe(u8, "mod"),
+        .line = 4,
+        .col = 1,
+    });
+    var fc = FileAnalysis{
+        .path = try allocator.dupe(u8, "src/c.zig"),
+        .resolved_path = try allocator.dupe(u8, "/repo/src/c.zig"),
+        .imports = imports,
+        .content = try allocator.dupe(u8, "const y = 2;\n"),
+        .has_tests = true,
+        .pub_function_count = 1,
+        .line_count = 1,
+        .is_generated = false,
+    };
+    fc.deinit(allocator);
+    // std.testing.allocator fails the test on any leak or double free.
 }
 
 test "formatText sanitizes hostile file and message bytes" {

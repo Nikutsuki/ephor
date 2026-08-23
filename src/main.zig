@@ -39690,6 +39690,10 @@ fn printHelp() void {
         \\  orphan_exclude REPLACES the built-in defaults (build.zig,
         \\  _test.zig, and the directory patterns), it does not extend
         \\  them — list a built-in you still want (B13-15).
+        \\  fail_on accepts never, error, warning, note (lowercase, exact).
+        \\  "err" and "warn" are rejected: the CI gate fails closed on a
+        \\  misspelled level. error_naming accepts TitleCase, PascalCase (alias
+        \\  for TitleCase), and snake_case. "title_case" is rejected (EPH-I0587).
         \\
         \\CONFIG TRUST MODEL:
         \\  A config file is trusted when its directory is the working
@@ -40556,9 +40560,12 @@ const quality_todo_label = "TO" ++ "DO/FIX" ++ "ME";
 /// Print the project statistics block in the configured format. The
 /// counts come from getStats: the check --summary flow merges the
 /// AST-tier counters before printing (printCheckSummary), the stats
-/// command prints the graph counts directly. The Files line is the
-/// graph count, so a check summary includes the joined entry points
-/// while a stats run counts the scan path alone (EPH-I0541).
+/// command prints the graph counts directly. The stats JSON omits
+/// ast_parsed and ast_skipped on purpose: the stats command never runs
+/// the AST tier (handleStats calls getStats only), so the members would
+/// print constant zeros that read as a parse run (EPH-I0588). The Files
+/// line is the graph count, so a check summary includes the joined entry
+/// points while a stats run counts the scan path alone (EPH-I0541).
 fn printStats(s: ProjectStats, format: OutputFormat) void {
     if (format == .json) {
         std.debug.print(
@@ -42073,7 +42080,9 @@ test "isIdent" {
     try std.testing.expect(isIdent('a'));
     try std.testing.expect(isIdent('Z'));
     try std.testing.expect(isIdent('_'));
+    try std.testing.expect(isIdent('0'));
     try std.testing.expect(!isIdent(' '));
+    try std.testing.expect(!isIdent('-'));
 }
 
 test "relativePath" {

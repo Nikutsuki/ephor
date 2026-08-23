@@ -1174,11 +1174,23 @@ Allocations transferred to stdlib containers (e.g., `list.append(ptr)`) or retur
 
 ### Known Limitations
 
+The line-based analyzers mask string, char, `//` comment, and multiline-string content when they scan for braces, parens, and trigger patterns. This masking includes mid-line `\\` opener tails. Multi-line signatures resolve through a param lookahead, and split-RHS alloc declarations join into one logical line before the analysis. A `.?` inside a string or a trailing comment is prose, never an unwrap. The table below lists the residual shapes the masking still misses. Each row carries its tracker issue ID.
+
+#### Line-Based Analysis — Residual Blind Spots
+
+| Residual | Family | Effect | Tracker |
+|----------|--------|--------|---------|
+| ZA903 misses RHS operands that are `@`-builtins, string literals, or unary negatives | ZA9xx | False negative | EPH-I0016 |
+| Test-block tracking is string-literal blind on shared ZA2xx/ZA3xx paths | ZA2xx/ZA3xx | Test-context misclassification | EPH-I0025 |
+| ZA701 exempts string-literal tails from the column count | ZA6xx | False negative | EPH-I0267 |
+| `@import` missed when the string opens on the next line | ZA5xx | Import-graph false negative | EPH-I0300 |
+| fn-naming check stops at the first match and masks a real fn later on the line | ZA7xx | False negative | EPH-I0302 |
+| Files over the 64 KiB AST cap lose ZA111 coverage | AST tier | False negative | EPH-I0293 |
+
 #### What Is NOT Parsed
 
 | Pattern | Why | Fallback |
 |---------|-----|----------|
-| Multi-line function signatures | Line-by-line parser can't join lines | Falls through to `.unknown` → vocab |
 | Cross-file type resolution | Types defined in imported files | Falls through to `.unknown` → vocab |
 | Generic type parameters | `ArrayList(u8)` stored as full text, lookup mismatch | Falls through to `.unknown` → vocab |
 | Type aliases | `const MyList = ArrayList;` not tracked | Falls through to `.unknown` → vocab |

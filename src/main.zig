@@ -27007,12 +27007,27 @@ fn intersectPredChecks(ctx: NullMeetCtx, bid: usize) !bool {
     return any_changed;
 }
 
+/// True when the `.?` trigger at `col` sits in prose, not code: inside a
+/// string/char literal, or at or after the comment start (EPH-I0672).
+/// One classifier walk plus one comment-start walk per call (EPH-I0153);
+/// the comment start is string-aware, so a `//` inside a string never
+/// fakes a comment (EPH-I0412). A missing comment start clamps to the
+/// line length: no column reaches it.
+fn isProseDotQTrigger(t: []const u8, col: usize) bool {
+    var cls = LineClassifier.init(t);
+    const comment_pos = findCommentStart(t) orelse t.len;
+    return cls.isInsideString(col) or col >= comment_pos;
+}
+
 /// Check for unsafe .? unwrap on a line
 fn checkOptionalUnwrap(ctx: NullSafetyCtx, line: NullLineCtx) !void {
     if (isInSafeContext(line.t)) return;
     var pos: usize = 0;
     while (mem.indexOfPos(u8, line.t, pos, ".?")) |col| {
         pos = col + 2;
+        // Trigger masking (EPH-I0672): a `.?` inside a string literal or
+        // a trailing comment is prose, never an unwrap.
+        if (isProseDotQTrigger(line.t, col)) continue;
         // Per-site suppression: a bare `opt.?;` clears only its own site,
         // so a second real unwrap on the line still fires (band-B12 F24).
         if (!isUnsafeUnwrapUsage(line.t, col)) continue;
@@ -57514,6 +57529,55 @@ test "analyzeCFGMemory ZA801 fires past orelse in string literal (EPH-I0224)" {
         "test_za801_orelse_str.zig",
         RULE_OPTIONAL_UNWRAP_UNSAFE,
     ) == 1);
+}
+
+test "analyzeCFGMemory ZA801 silent on .? inside a string literal (EPH-I0672)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Pre-fix the raw .? trigger fired on the string's .? (the ident
+    // before the dot extracted as the unwrapped var).
+    const content =
+        \\fn f() u32 {
+        \\    const s = "a.?";
+        \\    return s.len + 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_str_dotq.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_str_dotq.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA801 silent on .? inside a trailing comment (EPH-I0672)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Pre-fix the raw .? trigger fired on comment prose: a .? followed
+    // by text, and the terminator shape .? at the comment's end.
+    const content =
+        \\fn f() u32 {
+        \\    work(); // use bar.? tail here
+        \\    quit(); // use qux.?
+        \\    return 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za801_comment_dotq.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za801_comment_dotq.zig",
+        RULE_OPTIONAL_UNWRAP_UNSAFE,
+    ) == 0);
 }
 
 test "analyzeCFGMemory ZA802 fires past unexpected_ identifier (EPH-I0224)" {

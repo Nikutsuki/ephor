@@ -447,9 +447,17 @@ fn tagUnit(s: []const u8) HostileUnit {
     if (s.len < 4) return .{ .len = s.len, .cp = 0xFFFD };
     if (s[1] != 0xA0) return .{ .len = 0, .cp = 0 };
     if (s[2] == 0x80 and s[3] == 0x81) return .{ .len = 4, .cp = 0xE0001 };
-    if (s[2] == 0x80 and s[3] >= 0xA0)
+    return tagRangeUnit(s);
+}
+
+/// U+E0020..U+E007F under 0xF3 0xA0, each bounded to valid continuation
+/// bytes (0x80..0xBF): an out-of-range fourth byte is invalid UTF-8 and
+/// passes clean here, so the JSON validator turns it into U+FFFD
+/// (EPH-I1120).
+fn tagRangeUnit(s: []const u8) HostileUnit {
+    if (s[2] == 0x80 and s[3] >= 0xA0 and s[3] <= 0xBF)
         return .{ .len = 4, .cp = 0xE0020 + @as(u21, s[3] - 0xA0) };
-    if (s[2] == 0x81 and s[3] >= 0x80)
+    if (s[2] == 0x81 and s[3] >= 0x80 and s[3] <= 0xBF)
         return .{ .len = 4, .cp = 0xE0040 + @as(u21, s[3] - 0x80) };
     return .{ .len = 0, .cp = 0 };
 }
@@ -1487,6 +1495,11 @@ test "escapeJson replaces invalid lead bytes with U+FFFD (EPH-I0580)" {
         .{ .input = "\xF0\x80\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
         .{ .input = "\xF4\x90\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
         .{ .input = "\xE1\x80", .want = "\\uFFFD\\uFFFD" },
+        // Tag-lead bytes with an out-of-range fourth byte are invalid
+        // UTF-8: the lead falls to the validator and each byte becomes
+        // U+FFFD (EPH-I1120).
+        .{ .input = "\xF3\xA0\x80\xC5", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
+        .{ .input = "\xF3\xA0\x81\xC5", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
         // Truncated hostile tails consume the rest as one U+FFFD, the
         // long-standing terminal-filter behavior on the JSON side.
         .{ .input = "ab\xE2\x80", .want = "ab\\uFFFD" },

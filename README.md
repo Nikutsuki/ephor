@@ -1174,7 +1174,7 @@ Allocations transferred to stdlib containers (e.g., `list.append(ptr)`) or retur
 
 ### Known Limitations
 
-The line-based analyzers mask string, char, `//` comment, and multiline-string content when they scan for braces, parens, and trigger patterns. This masking includes mid-line `\\` opener tails. Multi-line signatures resolve through a param lookahead, and split-RHS alloc declarations join into one logical line before the analysis. A `.?` inside a string or a trailing comment is prose, never an unwrap. The table below lists the residual shapes the masking still misses. Each row carries its tracker issue ID.
+The line-based analyzers mask string, char, `//` comment, and multiline-string content when they scan for braces, parens, and trigger patterns. This masking includes mid-line `\\` opener tails. Multi-line signatures resolve through a param lookahead, and split-RHS alloc declarations join into one logical line before the analysis. A `.?` inside a string or a trailing comment is prose, never an unwrap. The table below lists the residual shapes the line-model audit identified that the masking still misses. Each row carries its tracker issue ID.
 
 #### Line-Based Analysis — Residual Blind Spots
 

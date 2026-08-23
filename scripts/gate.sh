@@ -17,12 +17,13 @@
 # - tests: the minimum test count. Update the baseline in the commit that
 #   adds tests.
 #
-# Corpus A/B: rolling pre-vs-post. Each run scans the 4 corpora with the
-# freshly built binary and diffs against the outputs the previous gate run
-# stored (.tmp/gate/ab/baseline-*). The first run seeds the baselines. A
-# differing corpus output fails the gate; the commit author fixes the
-# regression or explains the delta and re-seeds by deleting the baseline
-# files (the practical form of the B-series pre-vs-post A/B).
+# Corpus A/B: pre-vs-post with frozen baselines. The first run seeds the
+# baseline outputs (.tmp/gate/ab/baseline-*) and every later run diffs the
+# freshly built binary's outputs against those frozen baselines. The
+# baselines never move by themselves: a differing corpus output fails the
+# gate, and the commit author either fixes the regression or explains the
+# delta and re-seeds by deleting the baseline files (the practical form of
+# the B-series pre-vs-post A/B).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -54,7 +55,7 @@ while ! mkdir "$LOCK_DIR" 2>/dev/null; do
         rm -rf "$LOCK_DIR"
         continue
     fi
-    printf '[FAIL] gate: another gate run holds the lock (%s/pid)\n' "$LOCK_DIR"
+    printf '[FAIL] gate: another gate run holds the lock (%s/pid). If no gate is running, remove %s.\n' "$LOCK_DIR" "$LOCK_DIR"
     exit 1
 done
 trap 'rm -rf "$LOCK_DIR"' EXIT
@@ -119,6 +120,8 @@ STEPS_TOTAL="$(printf '%s\n' "$TESTS_LINE" | sed -nE 's/^Build Summary: ([0-9]+)
 TESTS_BASE="$(awk '$1 == "tests" {print $2}' "$BASELINES")"
 if [ -z "$TESTS_PASSED" ] || [ -z "$STEPS_OK" ]; then
     fail "test ratchet (cannot parse the Build Summary line)"
+elif [ -z "$TESTS_BASE" ]; then
+    fail "test ratchet (baseline missing or malformed in $BASELINES)"
 elif [ "$STEPS_OK" != "$STEPS_TOTAL" ]; then
     fail "test ratchet ($STEPS_OK/$STEPS_TOTAL steps succeeded)"
 elif [ "$TESTS_PASSED" != "$TESTS_TOTAL" ]; then
@@ -132,24 +135,40 @@ fi
 # --- 4. dogfood ratchet ----------------------------------------------------
 # fail_on: warning is the intended posture: the check exits 1 while
 # warnings exist. The ratchet is tracked, not green.
+#
+# Footer contract (printResultFooter, src/main.zig:40530-40551): the run
+# prints "ephor: N warning(s)[, M note(s)] found" when warnings exist,
+# "ephor: N note(s) found" when only notes exist, and NO footer when the
+# tree is clean (0 warnings + 0 notes). The counts singularize at 1. The
+# summary TOTAL: includes notes (src/main.zig:40762), so the footer is the
+# warning-count source.
 set +e
 ./zig-out/bin/ephor check src/ --summary > "$GATE_DIR/dogfood.log" 2>&1
 DOGFOOD_EXIT=$?
 set -e
-DOG_COUNT="$(grep -oE 'ephor: [0-9]+ warnings(, [0-9]+ notes)? found' "$GATE_DIR/dogfood.log" | tail -1 | grep -oE '^ephor: [0-9]+' | grep -oE '[0-9]+' || true)"
+DOG_COUNT="$(sed -nE 's/^ephor: ([0-9]+) warnings?(, [0-9]+ notes?)? found$/\1/p' "$GATE_DIR/dogfood.log" | tail -1 || true)"
 DOG_BASE="$(awk '$1 == "dogfood" {print $2}' "$BASELINES")"
-if [ -z "$DOG_COUNT" ]; then
-    fail "dogfood ratchet (cannot parse the findings footer)"
-elif [ "$DOG_COUNT" -gt "$DOG_BASE" ]; then
+if [ -z "$DOG_BASE" ]; then
+    fail "dogfood ratchet (baseline missing or malformed in $BASELINES)"
+elif [ -n "$DOG_COUNT" ] && [ "$DOG_COUNT" -gt "$DOG_BASE" ]; then
     fail "dogfood ratchet ($DOG_COUNT above baseline $DOG_BASE)"
 else
-    ok "dogfood ratchet ($DOG_COUNT <= baseline $DOG_BASE)"
+    ok "dogfood ratchet (${DOG_COUNT:-0} <= baseline $DOG_BASE)"
 fi
-if [ -n "$DOG_COUNT" ]; then
-    if [ "$DOG_COUNT" -gt 0 ] && [ "$DOGFOOD_EXIT" -ne 1 ]; then
-        fail "dogfood fail_on pairing ($DOG_COUNT warnings but exit $DOGFOOD_EXIT)"
-    elif [ "$DOG_COUNT" -eq 0 ] && [ "$DOGFOOD_EXIT" -ne 0 ]; then
+if [ -z "$DOG_COUNT" ]; then
+    # Zero warnings: the notes-only footer or the clean form (no footer).
+    # A completed --summary scan always prints the STATUS line; its absence
+    # at a zero count means the scan did not complete.
+    if ! grep -qE '^STATUS: ' "$GATE_DIR/dogfood.log"; then
+        fail "dogfood ratchet (0 warnings but no summary block — scan did not complete)"
+    elif [ "$DOGFOOD_EXIT" -ne 0 ]; then
         fail "dogfood fail_on pairing (0 warnings but exit $DOGFOOD_EXIT)"
+    else
+        ok "dogfood fail_on pairing (warnings=0, exit=$DOGFOOD_EXIT)"
+    fi
+else
+    if [ "$DOGFOOD_EXIT" -ne 1 ]; then
+        fail "dogfood fail_on pairing ($DOG_COUNT warnings but exit $DOGFOOD_EXIT)"
     else
         ok "dogfood fail_on pairing (warnings=$DOG_COUNT, exit=$DOGFOOD_EXIT)"
     fi
@@ -172,10 +191,17 @@ for corpus in $CORPORA; do
     ./zig-out/bin/ephor check "$cdir" --export="$AB_DIR/current-$corpus.md" > "$txt" 2>&1
     scan_exit=$?
     set -e
-    # Exit 1 means findings (the fail_on: warning posture). A crash (exit
-    # 128+) or a scan error (no findings footer) fails the leg.
-    if [ "$scan_exit" -gt 1 ] || ! grep -qE 'ephor: [0-9]+ warnings(, [0-9]+ notes)? found' "$txt"; then
+    # Scan contract (printResultFooter, src/main.zig:40530-40551): a clean
+    # scan exits 0 (no footer at 0 warnings + 0 notes); a findings scan
+    # exits 1 and prints one of the three footer forms (warnings, warnings
+    # + notes, notes only — counts singularize at 1); a crash (exit 128+)
+    # or a run error (exit 1 without a footer) fails the leg.
+    if [ "$scan_exit" -gt 1 ]; then
         fail "corpus A/B: $corpus scan (exit $scan_exit; see $txt)"
+        continue
+    fi
+    if [ "$scan_exit" -eq 1 ] && ! grep -qE '^ephor: ([0-9]+ warnings?(, [0-9]+ notes?)?|[0-9]+ notes?) found$' "$txt"; then
+        fail "corpus A/B: $corpus scan (exit 1 without a findings footer; see $txt)"
         continue
     fi
     norm="$AB_DIR/current-$corpus.norm.md"

@@ -218,7 +218,10 @@ usage error the diagnostic rides the `message` member. For example, an
 unknown flag emits:
 
 ```
-{"error": "UnknownFlag", "message": "error: unknown flag '--bogusflag' (see ephor --help)\n"}
+{
+  "error": "UnknownFlag",
+  "message": "error: unknown flag '--bogusflag' (see ephor --help)\n"
+}
 ```
 
 A mid-run handler failure (for example an unreadable explicit

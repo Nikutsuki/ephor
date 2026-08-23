@@ -1,0 +1,9 @@
+# ephor Layer-1 gate baselines (EPH-I1074).
+#
+# dogfood: the maximum allowed warning TOTAL from `ephor check src/ --summary`
+#   (the REL-GATE-2 ratchet — monotone-decreasing, zero at the release gate).
+#   Update this line only in the commit that fixes dogfood warnings.
+# tests: the minimum test count from `zig build test --summary all`
+#   (the test ratchet). Update this line only in the commit that adds tests.
+dogfood 216
+tests 2501

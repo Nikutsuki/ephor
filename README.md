@@ -108,23 +108,21 @@ zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.
 Then add to `build.zig`:
 
 ```zig
-const ephor_dep = b.dependency("ephor", .{
-    .target = target,
-    .optimize = .ReleaseSafe,
-});
-const ephor_artifact = ephor_dep.artifact("ephor");
-const ephor_cmd = b.addRunArtifact(ephor_artifact);
-if (b.args) |args| {
-    ephor_cmd.addArgs(args);
-}
-const ephor_step = b.step("ephor", "Run ephor static analysis");
-ephor_step.dependOn(&ephor_cmd.step);
+    // Ephor static analysis
+    const ephor_dep = b.dependency("ephor", .{ .target = target, .optimize = .ReleaseSafe });
+    const ephor_artifact = ephor_dep.artifact("ephor");
+    const ephor_cmd = b.addRunArtifact(ephor_artifact);
+    if (b.args) |args| {
+        ephor_cmd.addArgs(args);
+    }
+    const ephor_step = b.step("ephor", "Run ephor static analysis");
+    ephor_step.dependOn(&ephor_cmd.step);
 
-// Ephor upgrade
-const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
-ephor_upgrade_cmd.addArgs(&.{"upgrade"});
-const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
-ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
+    // Ephor upgrade
+    const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);
+    ephor_upgrade_cmd.addArgs(&.{"upgrade"});
+    const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
+    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
 ```
 
 </details>

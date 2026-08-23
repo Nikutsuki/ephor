@@ -17,6 +17,12 @@ fn printTestSeed(step: *std.Build.Step, options: std.Build.Step.MakeOptions) !vo
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    // EPH-I0623 (documented arm): keep standardOptimizeOption without a
+    // preferred mode. In Zig 0.16.0 a preferred mode deletes the -Doptimize
+    // flag (std/Build.zig standardOptimizeOption registers only -Drelease on
+    // that branch) and a bare `zig build` stays Debug by stdlib design. The
+    // ReleaseSafe guarantee lives in the gate: scripts/gate.sh builds with
+    // -Doptimize=ReleaseSafe explicitly.
     const optimize = b.standardOptimizeOption(.{});
 
     // Main executable

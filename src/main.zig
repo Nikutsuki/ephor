@@ -13066,8 +13066,12 @@ const ImportGraph = struct {
     /// Edge-triggered corpus-size warning (EPH-I0199). The graph holds
     /// every file's full content until deinit, so a hostile monorepo can
     /// OOM the audit host. Fires once per run on the first threshold
-    /// crossing. The long-term fix is a resident budget with streaming or
-    /// LRU eviction. The warning is this issue's scope.
+    /// crossing. The counter tracks content bytes only (F11, EPH-I0698):
+    /// analysis structures and allocator metadata add a measured 30-100%
+    /// on top, so the message states the real-RSS estimate rather than
+    /// presenting the content count as the process total. The long-term
+    /// fix is a resident budget with streaming or LRU eviction, which
+    /// retires the class entirely. The warning is this issue's scope.
     fn warnIfCorpusBytesCrossed(self: *ImportGraph) void {
         if (self.diag.corpus_warn_count > 0) return;
         if (self.resident_bytes <= self.diag.corpus_bytes_warn_threshold) return;
@@ -13075,8 +13079,11 @@ const ImportGraph = struct {
         const gib = self.resident_bytes / (1024 * 1024 * 1024);
         cliDiag(
             self.diag,
-            "warning: corpus content exceeds {d} GiB resident. " ++
-                "ephor keeps all file content in memory. " ++
+            "warning: corpus content exceeds {d} GiB. " ++
+                "This count covers file content only. " ++
+                "Analysis structures and allocator metadata add roughly " ++
+                "30 to 100 percent more, so real memory use is about " ++
+                "1.3 to 2 times higher. " ++
                 "Scan subtrees separately on huge trees.\n",
             .{gib},
         );
@@ -41893,6 +41900,10 @@ pub fn main(init: std.process.Init) !void {
 /// its defers run; the entry wrapper applies the code after they do.
 fn runEphor(init: std.process.Init) !u8 {
     var diag = DiagCtx{ .io = init.io };
+    // Production keeps the safety-on DebugAllocator by decision
+    // (ADR-0008, F12, EPH-I0699): fail-closed heap checking on hostile
+    // corpus input plus the exit leak report every gate relies on. Do
+    // not switch allocators without a user ruling.
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();

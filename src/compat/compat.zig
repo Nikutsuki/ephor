@@ -254,10 +254,12 @@ fn fallbackTablesFor(version: VersionInfo) Tables {
 /// process: the first call also records the unknown-version fallback when
 /// it applies. The plain global is race-free because compat is read only
 /// from the main thread: the process's only non-test worker is the parse
-/// worker (ast_tier.zig:54), which spawns per file, calls only Ast.parse
-/// (never compat), and joins before analysis resumes (ast_tier.zig:59);
-/// a test-only chain-walk thread (spawn at main.zig:42440) joins before
-/// any compat access and never touches compat either (F10).
+/// worker (spawn at ast_tier.zig:147), which spawns per file, calls only
+/// Ast.parse (never compat), and joins before analysis resumes
+/// (ast_tier.zig:161); a test-only chain-walk thread (spawn at
+/// main.zig:42705) joins before any compat access and never touches
+/// compat either. The worker-side pin of the same contract lives at the
+/// spawn site (F10, EPH-I0697).
 var cached_tables: ?Tables = null;
 
 /// Pending unknown-version fallback state (EPH-I1054): currentTables

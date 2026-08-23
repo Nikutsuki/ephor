@@ -137,6 +137,13 @@ const ParseOutcome = union(enum) {
 
 /// Creates the parse worker thread. Split out so the degrade contract
 /// is testable: tests inject a refusing spawner (EPH-I0597).
+///
+/// Worker-thread contract (F10, EPH-I0697): the worker must never call
+/// compat helpers. compat.cached_tables is a plain unsynchronized lazy
+/// global, and its race-freedom rests on compat being reachable from
+/// the main thread only (the thread-safety comment in compat.zig names
+/// the same invariant). The join-then-resume shape makes the worker
+/// the process's only concurrent code: keep it allocator- and Ast-only.
 fn spawnParseWorker(job: *ParseJob) anyerror!std.Thread {
     return std.Thread.spawn(.{ .stack_size = parse_stack_bytes }, parseWorker, .{job});
 }

@@ -165,11 +165,11 @@ pub const builtins = [_][]const u8{
     "@setEvalBranchQuota",
     "@setFloatMode",
     "@setAlignStack",
-    "@setCold",
     "@optimizeFor",
     "@prefetch",
 
-    // WebAssembly
+    // GPU and WebAssembly builtins (verified against the 0.16.0 compiler;
+    // @setCold left in 0.14 — it is not in this list)
     "@wasmMemorySize",
     "@wasmMemoryGrow",
     "@workItemId",
@@ -186,7 +186,6 @@ pub const builtins = [_][]const u8{
 pub const optional_methods = [_][]const u8{
     // Iterator methods (return ?T)
     ".next()",
-    ".peek()",
 
     // HashMap/StringHashMap lookups (return ?V or ?*V)
     ".get(",
@@ -194,22 +193,15 @@ pub const optional_methods = [_][]const u8{
     ".getEntry(",
     ".getPtr(",
     ".fetchRemove(",
-    ".fetchPut(",
 
     // ArrayHashMap methods
     ".getIndex(",
     ".swapRemove(",
     ".orderedRemove(",
 
-    // ArrayList optional methods
-    ".popOrNull()",
+    // ArrayList/container optional methods (pop returns ?T since 0.15.1)
+    ".pop(",
     ".getLastOrNull(",
-
-    // BoundedArray
-    ".popOrNull()",
-
-    // MultiArrayList
-    ".popOrNull()",
 
     // std.mem module functions (return ?usize)
     "mem.indexOf(",
@@ -223,29 +215,15 @@ pub const optional_methods = [_][]const u8{
     "mem.lastIndexOfAny(",
     "mem.lastIndexOfNone(",
 
-    // String/slice searching
-    "std.mem.indexOf(",
-    "std.mem.lastIndexOf(",
-
-    // fs.path functions
+    // fs.path functions (only dirname returns an optional: fs/path.zig:845)
     "fs.path.dirname(",
-    "fs.path.basename(",
-    "fs.path.extension(",
-    "std.fs.path.dirname(",
-    "std.fs.path.basename(",
-    "std.fs.path.extension(",
 
     // Tokenizer/Parser methods
     ".peek(",
-    ".peekNext(",
 
-    // Environment
-    "std.process.getenv(",
+    // Environment (posix.getenv returns ?[:0]const u8: posix.zig:2029;
+    // std.process.getenv left in 0.15 — process has getenvW and EnvironMap)
     "std.posix.getenv(",
-
-    // JSON
-    ".objectGet(",
-    ".objectGetPtr(",
 };
 
 // ============================================================================
@@ -254,7 +232,7 @@ pub const optional_methods = [_][]const u8{
 // ============================================================================
 
 pub const error_methods = [_][]const u8{
-    // File operations
+    // File operations (close is void in 0.15: fs/File.zig:202, fs/Dir.zig:806)
     ".read(",
     ".readAll(",
     ".readAtLeast(",
@@ -268,7 +246,6 @@ pub const error_methods = [_][]const u8{
     ".openDir(",
     ".openDirAbsolute(",
     ".openIterableDir(",
-    ".close(",
     ".create(",
     ".createFile(",
     ".makeDir(",
@@ -299,7 +276,6 @@ pub const error_methods = [_][]const u8{
     ".allocSentinel(",
     ".realloc(",
     ".resize(",
-    ".create(",
     ".alignedAlloc(",
     ".dupeZ(",
     ".dupe(",
@@ -314,14 +290,11 @@ pub const error_methods = [_][]const u8{
     ".recvFrom(",
     ".bind(",
 
-    // Process operations
+    // Process and thread operations
     ".spawn(",
     ".wait(",
     ".kill(",
     ".exec(",
-
-    // Thread operations
-    ".spawn(",
     ".join(",
 
     // Parsing
@@ -337,10 +310,7 @@ pub const error_methods = [_][]const u8{
     ".bufPrint(",
 
     // JSON
-    ".parse(",
-    ".parseFromSlice(",
     ".stringify(",
-    ".stringifyAlloc(",
 
     // Compression
     ".compress(",
@@ -367,14 +337,12 @@ pub const error_methods = [_][]const u8{
     ".toOwnedSlice(",
     ".clone(",
 
-    // HashMap operations that can fail
+    // HashMap operations that can fail (fetchPut returns !?KV: hash_map.zig:347)
     ".put(",
     ".putNoClobber(",
     ".getOrPut(",
     ".getOrPutValue(",
     ".fetchPut(",
-    ".ensureTotalCapacity(",
-    ".ensureUnusedCapacity(",
 
     // Build system
     ".addModule(",
@@ -470,7 +438,6 @@ pub const keywords = [_][]const u8{
     "union ",
     "error ",
     "test ",
-    "usingnamespace ",
     "threadlocal ",
     "extern ",
     "export ",
@@ -479,14 +446,15 @@ pub const keywords = [_][]const u8{
     "volatile ",
     "allowzero ",
     "anytype ",
-    "anyframe ",
     "anyopaque ",
     "anyerror ",
+    // suspend/resume/nosuspend/anyframe stay: the pinned 0.16.0 compiler
+    // still rejects them as identifiers (probe compile), so they remain
+    // reserved words even though async fn support left in 0.11.
     "suspend ",
     "resume ",
-    "async ",
-    "await ",
     "nosuspend ",
+    "anyframe ",
 };
 
 // ============================================================================
@@ -516,8 +484,11 @@ pub const DeprecatedPattern = vocab.DeprecatedPattern;
 
 pub const deprecated_patterns = [_]DeprecatedPattern{
     .{
-        .pattern = "std.ArrayList(",
-        .replacement = "Use std.ArrayListUnmanaged with allocator",
+        // 0.15 made ArrayList the unmanaged default: the Unmanaged spelling
+        // is the deprecated alias, not the other way around (0.16 std.zig:59
+        // "Deprecated; use `ArrayList`" corroborates).
+        .pattern = "std.ArrayListUnmanaged(",
+        .replacement = "std.ArrayList (unmanaged by default since 0.15)",
         .rule = "ZAV101",
     },
     .{
@@ -568,7 +539,6 @@ pub const std_modules = [_][]const u8{
     "std.meta",
     "std.net",
     "std.process",
-    "std.rand",
     "std.sort",
     "std.testing",
     "std.time",
@@ -727,7 +697,9 @@ pub const container_methods = [_]vocab.ContainerMethod{
 };
 
 /// Stdlib methods safe to discard (void or value-returning, not error-returning).
-/// Used by isSafeToDiscard and isSafeBuiltin in main.zig.
+/// Used by isSafeToDiscard and isSafeBuiltin in main.zig. The .write( and
+/// .print( IO methods are NOT here: both return error unions (!usize, !void),
+/// and discarding them is exactly what ZA205 exists to catch (F7).
 pub const safe_methods = [_]vocab.SafeMethod{
     // Void methods (container lifecycle)
     .{ .pattern = ".clear(", .is_void = true },
@@ -735,7 +707,6 @@ pub const safe_methods = [_]vocab.SafeMethod{
     .{ .pattern = ".clearRetainingCapacity(", .is_void = true },
     .{ .pattern = ".reset(", .is_void = true },
     .{ .pattern = ".close(", .is_void = true },
-    .{ .pattern = ".skip(", .is_void = true },
     // Value-returning methods (T or ?T, not !T)
     .{ .pattern = ".pop(", .is_void = false },
     .{ .pattern = ".remove(", .is_void = false },
@@ -746,15 +717,12 @@ pub const safe_methods = [_]vocab.SafeMethod{
     .{ .pattern = ".count()", .is_void = false },
     .{ .pattern = ".next()", .is_void = false },
     .{ .pattern = ".peek()", .is_void = false },
-    // IO methods (return usize or !void, but commonly discarded)
-    .{ .pattern = ".write(", .is_void = false },
-    .{ .pattern = ".print(", .is_void = false },
     // Validation/check (returns diagnostic info)
     .{ .pattern = ".check(", .is_void = false },
     // std.debug and std.testing (always void or noreturn)
     .{ .pattern = "debug.print", .is_void = true },
     .{ .pattern = "assert(", .is_void = true },
-    .{ .pattern = "expect(", .is_void = false },
+    .{ .pattern = "expect(", .is_void = true },
 };
 
 // ============================================================================
@@ -831,26 +799,22 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".allocWithOptions(",
     // std.fmt (allocator as first arg)
     ".allocPrint(",
-    ".allocPrintZ(",
     // Container methods that produce owned memory
     ".toOwnedSlice(",
     ".toOwnedSliceSentinel(",
     ".cloneWithAllocator(",
-    // File I/O (allocating reads)
+    // File I/O (allocating reads; allocator is the first argument)
     ".readFileAlloc(",
     ".readFileAllocOptions(",
-    ".readToEndAlloc(",
-    ".readToEndAllocOptions(",
-    ".readAllAlloc(",
-    // Path operations
+    ".readAlloc(",
+    ".allocRemaining(",
+    // Path operations (fs.zig:521/656/683)
     ".selfExePathAlloc(",
     ".selfExeDirPathAlloc(",
     ".realpathAlloc(",
     // String operations
     ".replaceOwned(",
     ".concatWithSentinel(",
-    // JSON/serialization
-    ".stringifyAlloc(",
 };
 
 /// Short names for allocation methods (identifier matching, e.g. "alloc")
@@ -864,21 +828,18 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "dupeZ",
     "allocWithOptions",
     "allocPrint",
-    "allocPrintZ",
     "toOwnedSlice",
     "toOwnedSliceSentinel",
     "cloneWithAllocator",
     "readFileAlloc",
     "readFileAllocOptions",
-    "readToEndAlloc",
-    "readToEndAllocOptions",
-    "readAllAlloc",
+    "readAlloc",
+    "allocRemaining",
     "selfExePathAlloc",
     "selfExeDirPathAlloc",
     "realpathAlloc",
     "replaceOwned",
     "concatWithSentinel",
-    "stringifyAlloc",
 };
 
 /// Fully-qualified stdlib function patterns that allocate memory.
@@ -921,7 +882,6 @@ pub const safe_method_patterns: []const []const u8 = &.{
     ".clearRetainingCapacity(",
     ".reset(",
     ".close(",
-    ".skip(",
     ".pop(",
     ".remove(",
     ".swapRemove(",
@@ -931,8 +891,6 @@ pub const safe_method_patterns: []const []const u8 = &.{
     ".count()",
     ".next()",
     ".peek()",
-    ".write(",
-    ".print(",
     ".check(",
     "debug.print",
     "assert(",
@@ -946,9 +904,9 @@ pub const void_method_patterns: []const []const u8 = &.{
     ".clearRetainingCapacity(",
     ".reset(",
     ".close(",
-    ".skip(",
     "debug.print",
     "assert(",
+    "expect(",
 };
 
 /// Pointer type patterns for no-free allocator parameter detection
@@ -984,7 +942,8 @@ pub const modifying_method_patterns: []const []const u8 = &.{
 /// Used by collectStdlibVarNames() to track which variables hold stdlib types.
 /// Only types from std whose methods (.clear, .append, etc.) are known void.
 pub const stdlib_container_init_patterns: []const []const u8 = &.{
-    // Collections
+    // Collections (linked lists are non-generic structs since 0.15:
+    // std.zig:13 and :30 import them as plain `pub const`)
     "ArrayList(",
     "ArrayListUnmanaged(",
     "ArrayListAligned(",
@@ -992,8 +951,8 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
     "SegmentedList(",
     "PriorityQueue(",
     "PriorityDequeue(",
-    "SinglyLinkedList(",
-    "DoublyLinkedList(",
+    "SinglyLinkedList",
+    "DoublyLinkedList",
     // Maps
     "StringHashMap(",
     "StringHashMapUnmanaged(",
@@ -1009,11 +968,12 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
     "EnumSet(",
     "BufSet.init(",
     "BufMap.init(",
-    // IO
+    // IO (File and Dir stay at std.fs in 0.15: fs.zig:18-19; Reader moved
+    // to std.Io in 0.15: Io.zig:82; the BufferedReader/BufferedWriter names
+    // left the stdlib in 0.15)
     "std.fs.File",
     "fs.File",
-    "BufferedReader(",
-    "BufferedWriter(",
+    "Io.Reader",
 };
 
 /// Managed-container type families: structs that own a heap backing store
@@ -1233,11 +1193,16 @@ test "containsAllocation detects allocation patterns" {
     try std.testing.expect(!containsAllocation("const x = 42"));
 }
 
-test "checkDeprecated finds deprecated patterns" {
-    const line = "var list = std.ArrayList(u8).init(alloc);";
+test "checkDeprecated flags the deprecated ArrayListUnmanaged alias (F5)" {
+    // 0.15 made ArrayList the unmanaged default, so the Unmanaged spelling
+    // is the deprecated form — not the other way around.
+    const line = "var list = std.ArrayListUnmanaged(u8){};";
     const result = checkDeprecated(line);
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("ZAV101", result.?.rule);
+    // The canonical form must NOT be flagged.
+    const canonical = "var list = std.ArrayList(u8){};";
+    try std.testing.expect(checkDeprecated(canonical) == null);
 }
 
 test "ArrayListAppend works with ArrayListUnmanaged" {

@@ -236,8 +236,12 @@ fn fallbackTablesFor(version: VersionInfo) Tables {
 
 /// Resolved tables for the running compiler. The resolve runs once per
 /// process: the first call also records the unknown-version fallback when
-/// it applies. The analyzer is single-threaded, so a plain global is
-/// race-free here.
+/// it applies. The plain global is race-free because compat is read only
+/// from the main thread: the process's only non-test worker is the parse
+/// worker (ast_tier.zig:54), which spawns per file, calls only Ast.parse
+/// (never compat), and joins before analysis resumes (ast_tier.zig:59);
+/// a test-only chain-walk thread (main.zig:42426) joins before any compat
+/// access and never touches compat either (F10).
 var cached_tables: ?Tables = null;
 
 /// Pending unknown-version fallback state (EPH-I1054): currentTables

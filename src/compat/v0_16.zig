@@ -167,11 +167,12 @@ pub const builtins = [_][]const u8{
     "@setEvalBranchQuota",
     "@setFloatMode",
     "@setAlignStack",
-    "@setCold",
     "@optimizeFor",
     "@prefetch",
 
-    // WebAssembly
+    // GPU and WebAssembly builtins: all five names verified against the
+    // pinned 0.16.0 compiler (probe compile; a recognized builtin reports
+    // a scope or target error, an unknown name reports invalid builtin).
     "@wasmMemorySize",
     "@wasmMemoryGrow",
     "@workItemId",
@@ -189,7 +190,6 @@ pub const builtins = [_][]const u8{
 pub const optional_methods = [_][]const u8{
     // Iterator methods (return ?T)
     ".next()",
-    ".peek()",
 
     // HashMap/StringHashMap lookups (return ?V or ?*V)
     ".get(",
@@ -197,22 +197,15 @@ pub const optional_methods = [_][]const u8{
     ".getEntry(",
     ".getPtr(",
     ".fetchRemove(",
-    ".fetchPut(",
 
     // ArrayHashMap methods
     ".getIndex(",
     ".swapRemove(",
     ".orderedRemove(",
 
-    // ArrayList optional methods
-    ".popOrNull()",
+    // ArrayList/container optional methods (pop returns ?T since 0.15.1)
+    ".pop(",
     ".getLastOrNull(",
-
-    // BoundedArray
-    ".popOrNull()",
-
-    // MultiArrayList
-    ".popOrNull()",
 
     // std.mem module functions (return ?usize)
     "mem.indexOf(",
@@ -226,29 +219,11 @@ pub const optional_methods = [_][]const u8{
     "mem.lastIndexOfAny(",
     "mem.lastIndexOfNone(",
 
-    // String/slice searching
-    "std.mem.indexOf(",
-    "std.mem.lastIndexOf(",
-
-    // fs.path functions
+    // fs.path functions (only dirname returns an optional: fs/path.zig:1318)
     "fs.path.dirname(",
-    "fs.path.basename(",
-    "fs.path.extension(",
-    "std.fs.path.dirname(",
-    "std.fs.path.basename(",
-    "std.fs.path.extension(",
 
     // Tokenizer/Parser methods
     ".peek(",
-    ".peekNext(",
-
-    // Environment
-    "std.process.getenv(",
-    "std.posix.getenv(",
-
-    // JSON
-    ".objectGet(",
-    ".objectGetPtr(",
 };
 
 // ============================================================================
@@ -258,7 +233,7 @@ pub const optional_methods = [_][]const u8{
 // ============================================================================
 
 pub const error_methods = [_][]const u8{
-    // File operations
+    // File operations (close is void in 0.16: Io/File.zig:221, Io/Dir.zig:490)
     ".read(",
     ".readAll(",
     ".readAtLeast(",
@@ -272,7 +247,6 @@ pub const error_methods = [_][]const u8{
     ".openDir(",
     ".openDirAbsolute(",
     ".openIterableDir(",
-    ".close(",
     ".create(",
     ".createFile(",
     ".makeDir(",
@@ -303,7 +277,6 @@ pub const error_methods = [_][]const u8{
     ".allocSentinel(",
     ".realloc(",
     ".resize(",
-    ".create(",
     ".alignedAlloc(",
     ".dupeZ(",
     ".dupe(",
@@ -318,14 +291,11 @@ pub const error_methods = [_][]const u8{
     ".recvFrom(",
     ".bind(",
 
-    // Process operations
+    // Process and thread operations
     ".spawn(",
     ".wait(",
     ".kill(",
     ".exec(",
-
-    // Thread operations
-    ".spawn(",
     ".join(",
 
     // Parsing
@@ -341,10 +311,7 @@ pub const error_methods = [_][]const u8{
     ".bufPrint(",
 
     // JSON
-    ".parse(",
-    ".parseFromSlice(",
     ".stringify(",
-    ".stringifyAlloc(",
 
     // Compression
     ".compress(",
@@ -371,14 +338,12 @@ pub const error_methods = [_][]const u8{
     ".toOwnedSlice(",
     ".clone(",
 
-    // HashMap operations that can fail
+    // HashMap operations that can fail (fetchPut returns !?KV: hash_map.zig:347)
     ".put(",
     ".putNoClobber(",
     ".getOrPut(",
     ".getOrPutValue(",
     ".fetchPut(",
-    ".ensureTotalCapacity(",
-    ".ensureUnusedCapacity(",
 
     // Build system
     ".addModule(",
@@ -474,7 +439,6 @@ pub const keywords = [_][]const u8{
     "union ",
     "error ",
     "test ",
-    "usingnamespace ",
     "threadlocal ",
     "extern ",
     "export ",
@@ -483,14 +447,15 @@ pub const keywords = [_][]const u8{
     "volatile ",
     "allowzero ",
     "anytype ",
-    "anyframe ",
     "anyopaque ",
     "anyerror ",
+    // suspend/resume/nosuspend/anyframe stay: the pinned 0.16.0 compiler
+    // still rejects them as identifiers (probe compile), so they remain
+    // reserved words even though async fn support left in 0.11.
     "suspend ",
     "resume ",
-    "async ",
-    "await ",
     "nosuspend ",
+    "anyframe ",
 };
 
 // ============================================================================
@@ -544,8 +509,23 @@ pub const deprecated_patterns = [_]DeprecatedPattern{
     },
     .{
         .pattern = "SinglyLinkedList(",
-        .replacement = "SinglyLinkedList (non-generic in 0.16)",
+        .replacement = "SinglyLinkedList (non-generic since 0.15)",
         .rule = "ZAV205",
+    },
+    .{
+        .pattern = "DoublyLinkedList(",
+        .replacement = "DoublyLinkedList (non-generic since 0.15)",
+        .rule = "ZAV206",
+    },
+    .{
+        .pattern = "std.ArrayListUnmanaged(",
+        .replacement = "std.ArrayList (unmanaged by default since 0.15)",
+        .rule = "ZAV207",
+    },
+    .{
+        .pattern = "ThreadSafeAllocator",
+        .replacement = "SmpAllocator",
+        .rule = "ZAV208",
     },
 };
 
@@ -557,7 +537,7 @@ pub const deprecated_patterns = [_]DeprecatedPattern{
 pub const std_modules = [_][]const u8{
     "std.mem",
     "std.fs",
-    "std.io",
+    "std.Io",
     "std.os",
     "std.posix",
     "std.debug",
@@ -569,32 +549,31 @@ pub const std_modules = [_][]const u8{
     "std.heap",
     "std.math",
     "std.meta",
-    "std.net",
     "std.process",
-    "std.rand",
     "std.sort",
     "std.testing",
     "std.time",
     "std.unicode",
     "std.ArrayList",
-    "std.ArrayListUnmanaged",
-    "std.AutoArrayHashMap",
     "std.AutoHashMap",
     "std.MultiArrayList",
     "std.PriorityQueue",
-    "std.SegmentedList",
     "std.SinglyLinkedList",
     "std.StaticStringMap",
     "std.StringHashMap",
-    "std.StringArrayHashMap",
 };
 
 // ============================================================================
 // Stdlib Vocabulary - Allocator Types, Methods, and Patterns
-// Single source of truth for Zig 0.16.x stdlib knowledge
-// NOTE: 0.16.0-dev — currently mirrors 0.15.x, diverge here when APIs change
+// Single source of truth for Zig 0.16.x stdlib knowledge. Re-grounded
+// against the pinned 0.16.0 std tree in B71 (mega-audit file-compat batch).
 // ============================================================================
 
+/// Current 0.16 allocator vocabulary. Removed names (GeneralPurposeAllocator,
+/// ThreadSafeAllocator) and the deprecated MemoryPoolAligned alias live only
+/// in deprecated_patterns (ZAV202/ZAV203/ZAV208) — verified against the
+/// pinned 0.16 std heap.zig (zero text for GPA and ThreadSafeAllocator;
+/// MemoryPoolAligned exists only as the alias at heap.zig:33).
 pub const allocator_types = [_]vocab.AllocatorType{
     .{
         .name = "ArenaAllocator",
@@ -618,13 +597,6 @@ pub const allocator_types = [_]vocab.AllocatorType{
         .cleanup_method = ".deinit(",
     },
     .{
-        .name = "GeneralPurposeAllocator",
-        .full_path = "std.heap.GeneralPurposeAllocator",
-        .init_pattern = "GeneralPurposeAllocator(",
-        .needs_free = true,
-        .cleanup_method = ".deinit(",
-    },
-    .{
         .name = "DebugAllocator",
         .full_path = "std.heap.DebugAllocator",
         .init_pattern = "DebugAllocator(",
@@ -632,23 +604,9 @@ pub const allocator_types = [_]vocab.AllocatorType{
         .cleanup_method = ".deinit(",
     },
     .{
-        .name = "ThreadSafeAllocator",
-        .full_path = "std.heap.ThreadSafeAllocator",
-        .init_pattern = "ThreadSafeAllocator.init(",
-        .needs_free = true,
-        .cleanup_method = ".deinit(",
-    },
-    .{
         .name = "MemoryPool",
         .full_path = "std.heap.MemoryPool",
         .init_pattern = "MemoryPool(",
-        .needs_free = true,
-        .cleanup_method = ".deinit(",
-    },
-    .{
-        .name = "MemoryPoolAligned",
-        .full_path = "std.heap.MemoryPoolAligned",
-        .init_pattern = "MemoryPoolAligned(",
         .needs_free = true,
         .cleanup_method = ".deinit(",
     },
@@ -731,7 +689,9 @@ pub const container_methods = [_]vocab.ContainerMethod{
 };
 
 /// Stdlib methods safe to discard (void or value-returning, not error-returning).
-/// Used by isSafeToDiscard and isSafeBuiltin in main.zig.
+/// Used by isSafeToDiscard and isSafeBuiltin in main.zig. The .write( and
+/// .print( IO methods are NOT here: both return error unions (!usize, !void),
+/// and discarding them is exactly what ZA205 exists to catch (F7).
 pub const safe_methods = [_]vocab.SafeMethod{
     // Void methods (container lifecycle)
     .{ .pattern = ".clear(", .is_void = true },
@@ -739,7 +699,8 @@ pub const safe_methods = [_]vocab.SafeMethod{
     .{ .pattern = ".clearRetainingCapacity(", .is_void = true },
     .{ .pattern = ".reset(", .is_void = true },
     .{ .pattern = ".close(", .is_void = true },
-    .{ .pattern = ".skip(", .is_void = true },
+    // process.Args.Iterator.skip returns bool (Args.zig:68)
+    .{ .pattern = ".skip(", .is_void = false },
     // Value-returning methods (T or ?T, not !T)
     .{ .pattern = ".pop(", .is_void = false },
     .{ .pattern = ".remove(", .is_void = false },
@@ -750,15 +711,12 @@ pub const safe_methods = [_]vocab.SafeMethod{
     .{ .pattern = ".count()", .is_void = false },
     .{ .pattern = ".next()", .is_void = false },
     .{ .pattern = ".peek()", .is_void = false },
-    // IO methods (return usize or !void, but commonly discarded)
-    .{ .pattern = ".write(", .is_void = false },
-    .{ .pattern = ".print(", .is_void = false },
     // Validation/check (returns diagnostic info)
     .{ .pattern = ".check(", .is_void = false },
     // std.debug and std.testing (always void or noreturn)
     .{ .pattern = "debug.print", .is_void = true },
     .{ .pattern = "assert(", .is_void = true },
-    .{ .pattern = "expect(", .is_void = false },
+    .{ .pattern = "expect(", .is_void = true },
 };
 
 // ============================================================================
@@ -800,11 +758,8 @@ pub const all_init_patterns: []const []const u8 = &.{
     "FixedBufferAllocator{",
     "StackFallbackAllocator(",
     "stackFallback(",
-    "GeneralPurposeAllocator(",
     "DebugAllocator(",
-    "ThreadSafeAllocator.init(",
     "MemoryPool(",
-    "MemoryPoolAligned(",
 };
 
 pub const global_alloc_names: []const []const u8 = &.{
@@ -828,26 +783,21 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".allocWithOptions(",
     // std.fmt (allocator as first arg)
     ".allocPrint(",
-    ".allocPrintZ(",
     // Container methods that produce owned memory
     ".toOwnedSlice(",
     ".toOwnedSliceSentinel(",
     ".cloneWithAllocator(",
-    // File I/O (allocating reads)
+    // File I/O (allocating reads; allocator is the first argument)
     ".readFileAlloc(",
     ".readFileAllocOptions(",
-    ".readToEndAlloc(",
-    ".readToEndAllocOptions(",
-    ".readAllAlloc(",
-    // Path operations
-    ".selfExePathAlloc(",
-    ".selfExeDirPathAlloc(",
-    ".realpathAlloc(",
+    ".readAlloc(",
+    ".allocRemaining(",
+    // Path operations (0.15's realpathAlloc moved and renamed to
+    // Io.Dir.realPathFileAlloc, where the allocator is the third argument —
+    // the first-arg extractor cannot model it, so it is deliberately absent)
     // String operations
     ".replaceOwned(",
     ".concatWithSentinel(",
-    // JSON/serialization
-    ".stringifyAlloc(",
 };
 
 pub const alloc_method_short_names: []const []const u8 = &.{
@@ -860,21 +810,15 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "dupeZ",
     "allocWithOptions",
     "allocPrint",
-    "allocPrintZ",
     "toOwnedSlice",
     "toOwnedSliceSentinel",
     "cloneWithAllocator",
     "readFileAlloc",
     "readFileAllocOptions",
-    "readToEndAlloc",
-    "readToEndAllocOptions",
-    "readAllAlloc",
-    "selfExePathAlloc",
-    "selfExeDirPathAlloc",
-    "realpathAlloc",
+    "readAlloc",
+    "allocRemaining",
     "replaceOwned",
     "concatWithSentinel",
-    "stringifyAlloc",
 };
 
 /// Fully-qualified stdlib function patterns that allocate memory.
@@ -883,9 +827,6 @@ pub const alloc_method_short_names: []const []const u8 = &.{
 pub const qualified_alloc_fn_patterns: []const []const u8 = &.{
     "mem.concat(",
     "mem.join(",
-    "mem.joinZ(",
-    "process.getEnvVarOwned(",
-    "fs.getAppDataDir(",
 };
 
 pub const cleanup_pattern_strs: []const []const u8 = &.{
@@ -925,8 +866,6 @@ pub const safe_method_patterns: []const []const u8 = &.{
     ".count()",
     ".next()",
     ".peek()",
-    ".write(",
-    ".print(",
     ".check(",
     "debug.print",
     "assert(",
@@ -940,9 +879,9 @@ pub const void_method_patterns: []const []const u8 = &.{
     ".clearRetainingCapacity(",
     ".reset(",
     ".close(",
-    ".skip(",
     "debug.print",
     "assert(",
+    "expect(",
 };
 
 pub const no_free_type_ptrs: []const []const u8 = &.{
@@ -975,16 +914,16 @@ pub const modifying_method_patterns: []const []const u8 = &.{
 /// Used by collectStdlibVarNames() to track which variables hold stdlib types.
 /// Only types from std whose methods (.clear, .append, etc.) are known void.
 pub const stdlib_container_init_patterns: []const []const u8 = &.{
-    // Collections
+    // Collections (linked lists are non-generic structs since 0.15:
+    // std.zig:10 and :26 import them as plain `pub const`)
     "ArrayList(",
     "ArrayListUnmanaged(",
     "ArrayListAligned(",
     "MultiArrayList(",
-    "SegmentedList(",
     "PriorityQueue(",
     "PriorityDequeue(",
-    "SinglyLinkedList(",
-    "DoublyLinkedList(",
+    "SinglyLinkedList",
+    "DoublyLinkedList",
     // Maps
     "StringHashMap(",
     "StringHashMapUnmanaged(",
@@ -1000,28 +939,30 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
     "EnumSet(",
     "BufSet.init(",
     "BufMap.init(",
-    // IO
-    "std.fs.File",
-    "fs.File",
-    "BufferedReader(",
-    "BufferedWriter(",
+    // IO (0.16 moved File and Dir from std.fs to std.Io: Io.zig:41-45;
+    // the BufferedReader/BufferedWriter names left the stdlib in 0.15)
+    "Io.File",
+    "Io.Dir",
+    "Io.Reader",
 };
 
-/// Managed-container type families: structs that own a heap backing store
-/// (ptr + capacity + allocator fields), so a BY-VALUE copy aliases the same
-/// backing allocation — returning one from a fn creates a second owner with
-/// no language-level transfer (double-free on deinit, dangle after a callee
-/// defer). Deliberately EXCLUDES the inline-storage entries of
+/// Managed-container type families: structs that own a backing resource
+/// (ptr + capacity + allocator fields for the containers; an OS handle for
+/// Io.File/Io.Dir), so a BY-VALUE copy aliases the same backing — returning
+/// one from a fn creates a second owner with no language-level transfer
+/// (double-free on deinit, dangle after a callee defer, use of a closed
+/// handle). Deliberately EXCLUDES the inline-storage entries of
 /// stdlib_container_init_patterns (EnumArray/EnumMap/EnumSet/StaticStringMap
-/// copy safely) and node-based linked lists (nodes stay user-owned).
-/// Patterns carry the trailing `(` of a generic instantiation except the
-/// non-generic BufMap/BufSet. Used by ZA110 return-type classification.
+/// copy safely), node-based linked lists (nodes stay user-owned), and
+/// Io.Reader (an interface struct whose by-value return is the idiomatic
+/// construction pattern). Patterns carry the trailing `(` of a generic
+/// instantiation except the non-generic BufMap/BufSet and the Io handles.
+/// Used by ZA110 return-type classification.
 pub const managed_container_type_patterns: []const []const u8 = &.{
     "ArrayList(",
     "ArrayListUnmanaged(",
     "ArrayListAligned(",
     "MultiArrayList(",
-    "SegmentedList(",
     "PriorityQueue(",
     "PriorityDequeue(",
     "StringHashMap(",
@@ -1034,6 +975,8 @@ pub const managed_container_type_patterns: []const []const u8 = &.{
     "StringArrayHashMapUnmanaged(",
     "BufMap",
     "BufSet",
+    "Io.File",
+    "Io.Dir",
 };
 
 // ============================================================================
@@ -1228,7 +1171,10 @@ test "containsAllocation detects allocation patterns" {
 }
 
 test "vocabulary allocator_types has expected count" {
-    try std.testing.expectEqual(@as(usize, 8), allocator_types.len);
+    // ArenaAllocator, FixedBufferAllocator, StackFallbackAllocator,
+    // DebugAllocator, MemoryPool — the removed GeneralPurposeAllocator,
+    // ThreadSafeAllocator, and deprecated MemoryPoolAligned left (F4).
+    try std.testing.expectEqual(@as(usize, 5), allocator_types.len);
 }
 
 test "vocabulary global_allocators includes testing.allocator" {

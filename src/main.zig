@@ -15856,6 +15856,13 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
 /// matches neither no-free names nor arena names, so nothing is suppressed.
 /// Only custom-receiver calls with a non-type allocator first arg
 /// (`tuple_info.types.dupe(arena, ip)`) gain suppression.
+/// The version-agnostic superset mirrors compat's alloc_method_patterns:
+/// the 0.15-only path ops stay (fs.zig:521/656/683), and the 0.15.1+/0.16
+/// reader allocs (.readAlloc/.allocRemaining — allocator is the first arg
+/// after the receiver in both: Io/Reader.zig:682/288 and :739/292) joined.
+/// The removed readToEndAlloc/readAllAlloc/stringifyAlloc/allocPrintZ forms
+/// left with B71: they match no released stdlib (gone in both 0.15.1 and
+/// 0.16), so findAllocCall never reaches them here.
 const first_arg_alloc_patterns = [_][]const u8{
     ".allocPrint(",
     ".allocPrintSentinel(",
@@ -15864,14 +15871,12 @@ const first_arg_alloc_patterns = [_][]const u8{
     ".cloneWithAllocator(",
     ".readFileAlloc(",
     ".readFileAllocOptions(",
-    ".readToEndAlloc(",
-    ".readToEndAllocOptions(",
-    ".readAllAlloc(",
+    ".readAlloc(",
+    ".allocRemaining(",
     ".selfExePathAlloc(",
     ".selfExeDirPathAlloc(",
     ".realpathAlloc(",
     ".concatWithSentinel(",
-    ".stringifyAlloc(",
     ".dupe(",
     ".dupeZ(",
 };
@@ -75864,14 +75869,28 @@ test "findAllocCall detects .readFileAlloc(" {
     try std.testing.expect(result != null);
 }
 
-test "findAllocCall detects .realpathAlloc(" {
-    const result = findAllocCall("    const path = try std.fs.cwd().realpathAlloc(allocator, \".\");", null);
+test "findAllocCall detects .readAlloc(" {
+    const result = findAllocCall("    const data = try reader.readAlloc(allocator, 1024);", null);
     try std.testing.expect(result != null);
 }
 
-test "findAllocCall detects .stringifyAlloc(" {
-    const result = findAllocCall("    const json = try std.json.stringifyAlloc(allocator, value, .{});", null);
+test "findAllocCall detects .allocRemaining(" {
+    const result = findAllocCall("    const data = try reader.allocRemaining(allocator, .{ .max = 1024 });", null);
     try std.testing.expect(result != null);
+}
+
+test "findAllocCall no longer detects .realpathAlloc( (removed with B71)" {
+    // realpathAlloc left the vocabulary: 0.15.1 keeps it (fs.zig:683) but the
+    // running 0.16 tables dropped it, and its 0.16 successor
+    // (Io.Dir.realPathFileAlloc) takes the allocator as the third argument,
+    // which the first-arg extractor cannot model.
+    const result = findAllocCall("    const path = try std.fs.cwd().realpathAlloc(allocator, \".\");", null);
+    try std.testing.expect(result == null);
+}
+
+test "findAllocCall no longer detects .stringifyAlloc( (removed with B71)" {
+    const result = findAllocCall("    const json = try std.json.stringifyAlloc(allocator, value, .{});", null);
+    try std.testing.expect(result == null);
 }
 
 test "findAllocCall detects .replaceOwned(" {
@@ -75894,14 +75913,14 @@ test "findAllocCall detects mem.join(" {
     try std.testing.expect(result != null);
 }
 
-test "findAllocCall detects process.getEnvVarOwned(" {
+test "findAllocCall no longer detects process.getEnvVarOwned( (removed with B71)" {
     const result = findAllocCall("    const home = try std.process.getEnvVarOwned(allocator, \"HOME\");", null);
-    try std.testing.expect(result != null);
+    try std.testing.expect(result == null);
 }
 
-test "findAllocCall detects Fs.getAppDataDir(" {
+test "findAllocCall no longer detects Fs.getAppDataDir( (removed with B71)" {
     const result = findAllocCall("    const dir = try std.fs.getAppDataDir(allocator, \"myapp\");", null);
-    try std.testing.expect(result != null);
+    try std.testing.expect(result == null);
 }
 
 test "findAllocCall does NOT detect .clone(" {

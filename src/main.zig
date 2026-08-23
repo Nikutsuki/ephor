@@ -15856,13 +15856,20 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
 /// matches neither no-free names nor arena names, so nothing is suppressed.
 /// Only custom-receiver calls with a non-type allocator first arg
 /// (`tuple_info.types.dupe(arena, ip)`) gain suppression.
-/// The version-agnostic superset mirrors compat's alloc_method_patterns:
-/// the 0.15-only path ops stay (fs.zig:521/656/683), and the 0.15.1+/0.16
-/// reader allocs (.readAlloc/.allocRemaining — allocator is the first arg
-/// after the receiver in both: Io/Reader.zig:682/288 and :739/292) joined.
+/// KEEP IN SYNC with compat's per-version alloc_method_patterns
+/// (v0_15.zig / v0_16.zig): this list is the version-agnostic superset
+/// of the method-style first-arg forms, and its SOLE consumer is
+/// matchAllocArgPattern (the extractor for allocator names). findAllocCall
+/// does NOT read this list — it reads compat.getAllocMethodPatterns() and
+/// compat.getQualifiedAllocFnPatterns(), so a pattern must first exist in
+/// those tables before any entry here matters. The 0.15-only path ops stay
+/// (fs.zig:521/656/683), and the 0.15.1+/0.16 reader allocs
+/// (.readAlloc/.allocRemaining — allocator is the first arg after the
+/// receiver in both: Io/Reader.zig:682/288 and :739/292) joined.
 /// The removed readToEndAlloc/readAllAlloc/stringifyAlloc/allocPrintZ forms
 /// left with B71: they match no released stdlib (gone in both 0.15.1 and
-/// 0.16), so findAllocCall never reaches them here.
+/// 0.16), so the compat tables never match them and matchAllocArgPattern
+/// never reaches these entries.
 const first_arg_alloc_patterns = [_][]const u8{
     ".allocPrint(",
     ".allocPrintSentinel(",
@@ -75910,6 +75917,14 @@ test "findAllocCall detects mem.concat(" {
 
 test "findAllocCall detects mem.join(" {
     const result = findAllocCall("    const joined = try std.mem.join(allocator, \", \", parts);", null);
+    try std.testing.expect(result != null);
+}
+
+test "findAllocCall detects mem.joinZ(" {
+    // std.mem.joinZ allocates with the allocator as the first argument
+    // (pinned std mem.zig:3493), and "mem.join(" does not substring-match
+    // "mem.joinZ(" — the pattern must carry its own entry.
+    const result = findAllocCall("    const joined = try std.mem.joinZ(allocator, \", \", parts);", null);
     try std.testing.expect(result != null);
 }
 

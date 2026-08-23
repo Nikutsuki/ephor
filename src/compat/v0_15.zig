@@ -297,7 +297,11 @@ pub const error_methods = [_][]const u8{
     ".exec(",
     ".join(",
 
-    // Parsing
+    // Parsing. The flat list matches all call shapes: one entry per
+    // pattern, never per std module. ".parseFromSlice(" also covers
+    // std.json.parseFromSlice (0.15.1 json.zig alias of json/static.zig;
+    // json.zig:26-27 use it), so the old JSON-section duplicate collapsed
+    // here (F7 dedup).
     ".parse(",
     ".parseFromSlice(",
     ".parseInt(",
@@ -309,7 +313,10 @@ pub const error_methods = [_][]const u8{
     ".allocPrint(",
     ".bufPrint(",
 
-    // JSON
+    // JSON. The parse family stays in the Parsing section above, and
+    // ".stringifyAlloc(" left the table: it is absent from 0.15.1's
+    // json.zig, json/Stringify.zig, json/dynamic.zig, and json/static.zig
+    // (verified against the fetched 0.15.1 sources).
     ".stringify(",
 
     // Compression
@@ -323,7 +330,10 @@ pub const error_methods = [_][]const u8{
     ".encrypt(",
     ".decrypt(",
 
-    // ArrayList/containers that can fail
+    // ArrayList/containers that can fail. ".ensureTotalCapacity(" and
+    // ".ensureUnusedCapacity(" also cover the HashMap methods
+    // (0.15.1 hash_map.zig:303/:310 — !void), so the old HashMap-section
+    // duplicates collapsed here (F7 dedup).
     ".append(",
     ".appendSlice(",
     ".appendNTimes(",
@@ -697,9 +707,10 @@ pub const container_methods = [_]vocab.ContainerMethod{
 };
 
 /// Stdlib methods safe to discard (void or value-returning, not error-returning).
-/// Used by isSafeToDiscard and isSafeBuiltin in main.zig. The .write( and
-/// .print( IO methods are NOT here: both return error unions (!usize, !void),
-/// and discarding them is exactly what ZA205 exists to catch (F7).
+/// Used by isSafeToDiscard and isSafeBuiltin in main.zig. The .write(, .print(,
+/// and expect( forms are NOT here: all three return error unions (!usize,
+/// !void, !void) and discarding them is exactly what ZA205 exists to catch
+/// (B71 F7, r2 F2 — testing.zig:614).
 pub const safe_methods = [_]vocab.SafeMethod{
     // Void methods (container lifecycle)
     .{ .pattern = ".clear(", .is_void = true },
@@ -719,10 +730,11 @@ pub const safe_methods = [_]vocab.SafeMethod{
     .{ .pattern = ".peek()", .is_void = false },
     // Validation/check (returns diagnostic info)
     .{ .pattern = ".check(", .is_void = false },
-    // std.debug and std.testing (always void or noreturn)
+    // std.debug and std.testing void calls. "expect(" is NOT safe:
+    // std.testing.expect returns !void (testing.zig:614) — an error union,
+    // so discarding it is the ZA205 class, same as .write( and .print(.
     .{ .pattern = "debug.print", .is_void = true },
     .{ .pattern = "assert(", .is_void = true },
-    .{ .pattern = "expect(", .is_void = true },
 };
 
 // ============================================================================
@@ -894,7 +906,6 @@ pub const safe_method_patterns: []const []const u8 = &.{
     ".check(",
     "debug.print",
     "assert(",
-    "expect(",
 };
 
 /// Stdlib void methods (subset of safe_methods where is_void == true)
@@ -906,7 +917,6 @@ pub const void_method_patterns: []const []const u8 = &.{
     ".close(",
     "debug.print",
     "assert(",
-    "expect(",
 };
 
 /// Pointer type patterns for no-free allocator parameter detection

@@ -240,8 +240,8 @@ fn fallbackTablesFor(version: VersionInfo) Tables {
 /// from the main thread: the process's only non-test worker is the parse
 /// worker (ast_tier.zig:54), which spawns per file, calls only Ast.parse
 /// (never compat), and joins before analysis resumes (ast_tier.zig:59);
-/// a test-only chain-walk thread (main.zig:42426) joins before any compat
-/// access and never touches compat either (F10).
+/// a test-only chain-walk thread (spawn at main.zig:42440) joins before
+/// any compat access and never touches compat either (F10).
 var cached_tables: ?Tables = null;
 
 /// Pending unknown-version fallback state (EPH-I1054): currentTables

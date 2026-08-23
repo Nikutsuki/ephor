@@ -177,15 +177,16 @@ ephor check --format=json
 `--format=json` writes one stream of top-level JSON objects to stderr: one
 object per analyzer (orphans, memory, errors, null-safety, panic, unused,
 complexity, format, naming, style, tests, concurrency), then the summary
-object when `--summary` is set, and the suppression-accounting object. The
-stream serves machine consumers, so JSON mode suppresses every human
-diagnostic: the footer, the strict-failure notice, the
-suppression-accounting note, the AST-skip note, the update-check
+object when `--summary` is set. The suppression counts ride the summary's
+`"suppressed"` member with `--summary`. Without it they print as a trailing
+top-level object. The stream serves machine consumers, so JSON mode
+suppresses every human diagnostic: the footer, the strict-failure notice,
+the suppression-accounting note, the AST-skip note, the update-check
 notification and fetch warning, the export confirmation, and the runtime
-band's "Running:" line. The suppressed counts ride the `"suppressed"`
-object. The AST-skipped count rides the summary's `ast_skipped` member.
-The export file itself confirms the export. See [Suppression
-Accounting](#suppression-accounting) for the `"suppressed"` object shape.
+band's "Running:" line. The AST-skipped count rides the summary's
+`ast_skipped` member. The export file itself confirms the export. See
+[Suppression Accounting](#suppression-accounting) for the `"suppressed"`
+object shape.
 
 The summary `issues` member gained `"notes"`. Each per-category bucket
 counts warnings, and error-severity findings ride inside the warning
@@ -199,23 +200,30 @@ appears at most once in the stream.
 
 The strict gate prints no human notice in JSON mode. The exit code
 carries the gate. A failed run closes the stream with one machine error
-object and exits 1:
+object and exits 1. The `message` member carries the last human
+diagnostic the machine latch muted during the run. It is empty when the run
+muted nothing. A strict run whose scan printed the entry-widen note
+closed with:
 
 ```
 {
   "error": "RunFailed",
-  "message": ""
+  "message": "note: scan includes 1 entry point outside scandir/bad.zig (entry points always join the scan)\n"
 }
 ```
 
-On a usage error the diagnostic rides the `message` member. For example,
-an unknown flag emits:
+A run that aborts before analysis closes with the same object. A
+no-entries run carries the stashed hint (`"  run: ephor init\n"`). On a
+usage error the diagnostic rides the `message` member. For example, an
+unknown flag emits:
 
 ```
-{"error": "UnknownFlag", "message": "error: unknown flag '--bogus' (see ephor --help)"}
+{"error": "UnknownFlag", "message": "error: unknown flag '--bogusflag' (see ephor --help)\n"}
 ```
 
-A mid-run or gate failure carries an empty message.
+A mid-run handler failure (for example an unreadable explicit
+`--known-issues` file) carries an empty message: the dispatch does not
+attach a mid-run diagnostic to the abort.
 
 Boundaries: `--verbose` is a no-op in JSON mode. The machine latch arms
 before the config load and the tool-path resolution, so diagnostics from

@@ -320,21 +320,43 @@ pub const Issue = struct {
     }
 
     /// Print the text form to stderr. Buffers through formatText so each
-    /// finding lands in one write.
-    pub fn printText(self: Issue, allocator: Allocator, base_path: []const u8) void {
+    /// finding lands in one write. The writer seam (EPH-I0687):
+    /// tests pass a capture writer, which keeps hostile fixture bytes off
+    /// the green-run log (the EPH-I0288 noise class) and lets the test
+    /// assert the printed bytes directly. Production passes null for the
+    /// raw stderr path, byte-identical with the pre-seam output.
+    pub fn printText(
+        self: Issue,
+        allocator: Allocator,
+        base_path: []const u8,
+        writer: ?*std.Io.Writer,
+    ) void {
         var out = OutBuf{ .allocator = allocator };
         defer out.deinit();
         self.formatText(base_path, &out) catch {
             // OOM mid-format: emit a bare notice rather than drop the
             // finding silently.
-            std.debug.print("ephor: out of memory printing {s} finding\n", .{
-                self.rule,
-            });
+            printWriteFallback("ephor: out of memory printing {s} finding\n", .{self.rule}, writer);
             return;
         };
-        std.debug.print("{s}", .{out.buf.items});
+        printWriteFallback("{s}", .{out.buf.items}, writer);
     }
 };
+
+/// Write through the writer seam (EPH-I0687): the capture
+/// writer when one is supplied, raw stderr otherwise (the production
+/// default, byte-identical with std.debug.print). A full capture buffer
+/// fails the write and the caller's content assertion, so the WriteFailed
+/// swallow is a truncation policy, not a silent error path.
+fn printWriteFallback(comptime fmt: []const u8, args: anytype, writer: ?*std.Io.Writer) void {
+    if (writer) |w| {
+        w.print(fmt, args) catch |err| switch (err) {
+            error.WriteFailed => {},
+        };
+    } else {
+        std.debug.print(fmt, args);
+    }
+}
 
 // ============================================================================
 // Output Sanitization (RED5: EPH-I0146, I0147, I0148, I0149, I0162)
@@ -1883,7 +1905,7 @@ test "formatJson emits a trailing comma unless last" {
     try std.testing.expect(mem.endsWith(u8, mid.buf.items, "  },\n"));
 }
 
-test "printText writes a sanitized line to stderr" {
+test "printText renders the sanitized line through the writer seam (EPH-I0687)" {
     const issue = Issue{
         .file = "ev\x1bil.zig",
         .line = 5,
@@ -1893,11 +1915,13 @@ test "printText writes a sanitized line to stderr" {
         .message = "m",
         .help = null,
     };
-    // ZT105 coverage: the direct call is the point. stderr itself is
-    // uncapturable, so the content assertion rides the formatText core.
-    issue.printText(std.testing.allocator, "/repo");
-    var out = OutBuf{ .allocator = std.testing.allocator };
-    defer out.deinit();
-    try issue.formatText("/repo", &out);
-    try std.testing.expect(std.mem.indexOfScalar(u8, out.buf.items, 0x1B) == null);
+    // The writer seam keeps the hostile fixture bytes off the green-run
+    // log (EPH-I0687, the EPH-I0288 noise class) and lets the test assert
+    // the printed bytes directly instead of riding the formatText core.
+    // The expected line pins the sanitizer's replacement too: the ESC
+    // byte (the \x1b escape in the fixture) renders as '?'.
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    issue.printText(std.testing.allocator, "/repo", &w);
+    try std.testing.expectEqualStrings("ev?il.zig:5:1: warning[ZT101]: m\n", w.buffered());
 }

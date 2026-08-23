@@ -40571,7 +40571,8 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
     } else {
         for (issues) |issue| {
             if (!shouldPrintIssue(issue, out)) continue;
-            issue.printText(out.allocator, out.base_path);
+            // null writer: the raw stderr path (EPH-I0687).
+            issue.printText(out.allocator, out.base_path, null);
         }
     }
     return counts;

@@ -185,6 +185,17 @@ const NestingScan = struct {
 ///   try / anyframe->                   right-recursive   run
 ///   comptime/nosuspend/resume/         right-recursive   run
 ///   break/return (expression prefix)
+///   await                              no keyword        identifier
+///                                      (async removed in 0.15; verified
+///                                      absent from the 0.16.0 stdlib:
+///                                      no tokenizer keyword, no
+///                                      Parse.zig production, no Ast
+///                                      tag — EPH-I0591)
+///   suspend payloads                   statement prefix  not counted
+///                                      (KEYWORD_suspend
+///                                      BlockExprStatement — one frame
+///                                      per keyword, `;` resets, cannot
+///                                      chain; the defer/errdefer class)
 ///   if/while/for bodies                right-recursive   run
 ///   fn-type chains `fn() fn() void`    right-recursive   run (fn + `(`)
 ///   binary ops and/or/orelse/catch     left-assoc loop   not counted
@@ -293,7 +304,11 @@ fn nextNonSpaceIsParen(line: []const u8, i: usize) bool {
 
 /// Keywords whose productions recurse into the following expression or
 /// type without a delimiter (grammar-audit table, EPH-I0268). `fn` is
-/// handled apart: only its type form recurses.
+/// handled apart: only its type form recurses. `await` is absent by
+/// design: async was removed in 0.15 and the 0.16.0 stdlib has no await
+/// keyword (EPH-I0591). `suspend` is a statement-level production with a
+/// BlockExprStatement operand — the defer/errdefer class, not a chain
+/// (EPH-I0591).
 fn isRightRecursiveKeyword(word: []const u8) bool {
     const keywords = [_][]const u8{
         "try",    "comptime", "nosuspend", "resume", "break",
@@ -316,22 +331,29 @@ fn isRightRecursiveKeyword(word: []const u8) bool {
 //   MISSED:   return var[lo..hi];          (slice of local array — silent)
 //   MISSED:   return &param;               (params are stack slots — silent)
 //   MISSED:   return &param.field;         (silent)
+//   MISSED:   return &var.slice_field;     (no index — slot address, silent)
+//   MISSED:   return &var.ptr_field;       (slot address, silent)
+//   MISSED:   return &opt.?;               (?*T and ?[]T payloads, silent)
 //   MISSED:   const p = &var; return p;    (const alias — silent)
 //   SAFE:     const x: u32 = 42; return &x; (comptime const → static memory)
 //   SAFE:     comptime params / comptime-only typed params (→ static)
 //   SAFE:     comptime var (comptime string-builder idiom → static memory)
 // ZA111 covers exactly the MISSED forms; the bare-var form is skipped so
 // ephor never duplicates a hard compile error.
+// (The three slot-address rows re-verified 2026-08-23,
+// .tmp/b75-probes/f1_gaps.zig — EPH-I0590.)
 //
 // Precision policy (ephor's false-positive-elimination rule): a chained
 // address-of is flagged only when every hop provably stays inside the
 // stack frame. A hop through a pointer/slice(-typed) binding or field is
-// safe (caller memory); an unresolvable hop (out-of-file type, inferred
-// anonymous type, @field builtin) is SILENT, not flagged. Deferred forms
-// (tracked): runtime-known const locals, out-param escape, labeled-block
-// escape, payload-capture escape, @ptrCast evasion, named array aliases,
-// var-alias pointer return, var slice-binding return, slice of array
-// field, slice of array param.
+// safe (caller memory) when hops remain behind it; an unresolvable hop
+// (out-of-file type, inferred anonymous type, @field builtin) is SILENT,
+// not flagged. Deferred forms (tracked): runtime-known const locals,
+// out-param escape, labeled-block escape, payload-capture escape,
+// @ptrCast evasion, named array aliases, var-alias pointer return, var
+// slice-binding return, slice of array field, slice of array param,
+// global-var stores (`g = &x;`), field stores (`caller.field = &x;`),
+// destructured-binding chains (no type node on lhs patterns).
 
 const RULE_ZA111 = types.RULE_RETURNED_STACK_REF;
 
@@ -410,6 +432,10 @@ const FnScan = struct {
 //
 // Coverage policy: an unlisted tag pushes no children. That can only cause
 // a missed detection (false negative), never a crash or a false positive.
+// `await` needs no arm: async was removed in 0.15 and the 0.16.0 stdlib
+// has no await tag — `await` parses as an identifier leaf (EPH-I0596).
+// `assign_destructure` pushes its lhs binding patterns so destructured
+// `var` names enter FnScan as by-value untyped locals (EPH-I0596).
 
 const Walker = struct {
     a: Allocator,
@@ -585,6 +611,27 @@ const Walker = struct {
         try self.push(at.ast.elem_type);
     }
 
+    /// Destructured `var` bindings are stack slots and must enter FnScan
+    /// through their lhs patterns. The patterns carry no type node, so
+    /// their chains resolve silent under the precision policy (EPH-I0596).
+    fn pushDestructure(self: *Walker, node: NodeIndex) !void {
+        const d = self.tree.assignDestructure(node);
+        try self.pushAll(d.ast.variables);
+        try self.push(d.ast.value_expr);
+    }
+
+    /// Children of the `extra_and_node` tags: plain pointer types push
+    /// their elem type; `assign_destructure` pushes lhs bindings plus
+    /// the value (EPH-I0596).
+    fn pushShapedTail(self: *Walker, node: NodeIndex) !void {
+        const data = self.tree.nodeData(node);
+        if (self.tree.nodeTag(node) == .assign_destructure) {
+            try self.pushDestructure(node);
+            return;
+        }
+        try self.push(data.extra_and_node[1]);
+    }
+
     /// Simple expressions: children follow directly from the tag's fixed
     /// data shape. Unlisted tags are leaves for this walk's purposes.
     fn pushShaped(self: *Walker, node: NodeIndex) !void {
@@ -620,7 +667,7 @@ const Walker = struct {
                 try self.push(elem);
             },
             .ptr_type, .ptr_type_bit_range, .assign_destructure => {
-                try self.push(data.extra_and_node[1]);
+                try self.pushShapedTail(node);
             },
             else => {},
         }
@@ -721,16 +768,68 @@ fn isBoundaryTag(tag: Ast.Node.Tag) bool {
 // .unknown and the caller stays silent.
 
 const TypeIndex = struct {
-    map: std.StringHashMapUnmanaged(NodeIndex) = .empty,
+    /// name -> declared containers, each with its lexical scope. Scoped
+    /// per fn (EPH-I0592): two disjoint fn-local types with one name no
+    /// longer collide, and a fn-local type shadows a same-named
+    /// file-scope type for chains inside its function. Residual
+    /// over-approximation, documented honestly: block scopes inside a
+    /// fn are folded into the fn body, so two same-named types in
+    /// sibling blocks of one fn still collide (later declaration wins).
+    /// A chain whose type is not visible falls back to silence, the
+    /// precision policy for unprovable hops.
+    map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(TypeEntry)) = .empty,
 
     fn deinit(self: *TypeIndex, a: Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(a);
         self.map.deinit(a);
     }
 
-    fn lookup(self: *const TypeIndex, name: []const u8) ?NodeIndex {
-        return self.map.get(name);
+    /// The container a chain in `body` resolves `name` against: the
+    /// innermost fn-local scope containing `body`, else the file-scope
+    /// declaration. Same-scope duplicates are a compile error in real
+    /// code; the later declaration wins for determinism.
+    fn lookup(
+        self: *const TypeIndex,
+        tree: *const Ast,
+        name: []const u8,
+        body: NodeIndex,
+    ) ?NodeIndex {
+        const entries = self.map.get(name) orelse return null;
+        const body_first = tree.firstToken(body);
+        const body_last = tree.lastToken(body);
+        var scoped: ?NodeIndex = null;
+        var scoped_len: u32 = 0;
+        var file_scope: ?NodeIndex = null;
+        for (entries.items) |entry| {
+            const sb = entry.scope_body orelse {
+                file_scope = entry.container;
+                continue;
+            };
+            if (!bodyInside(tree, sb, body_first, body_last)) continue;
+            const len = tree.lastToken(sb) - tree.firstToken(sb);
+            if (scoped == null or len <= scoped_len) {
+                scoped = entry.container;
+                scoped_len = len;
+            }
+        }
+        return scoped orelse file_scope;
     }
 };
+
+/// One indexed container declaration plus its lexical scope.
+const TypeEntry = struct {
+    container: NodeIndex,
+    /// The innermost fn body containing the declaration, null at file
+    /// scope. See TypeIndex for the block-scope over-approximation.
+    scope_body: ?NodeIndex,
+};
+
+/// True when `body`'s token range sits inside scope `sb` (or is `sb`
+/// itself): the scope's declarations are visible from the body.
+fn bodyInside(tree: *const Ast, sb: NodeIndex, body_first: u32, body_last: u32) bool {
+    return body_first >= tree.firstToken(sb) and body_last <= tree.lastToken(sb);
+}
 
 fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {
@@ -753,19 +852,52 @@ fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
 
 /// Index every `const Name = struct/union/enum {...};` in the file,
 /// including fn-local ones (a fn-local type's methods are analyzed with
-/// their own function scans). Name collisions across scopes: last wins.
+/// their own function scans). Each entry records its innermost fn body
+/// so lookups resolve per function (EPH-I0592).
 fn buildTypeIndex(a: Allocator, tree: *const Ast) !TypeIndex {
     var idx = TypeIndex{};
     errdefer idx.deinit(a);
+    var bodies: std.ArrayListUnmanaged(NodeIndex) = .empty;
+    defer bodies.deinit(a);
     var i: usize = 1;
+    while (i < tree.nodes.len) : (i += 1) {
+        const node: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        try bodies.append(a, tree.nodeData(node).node_and_node[1]);
+    }
+    i = 1;
     while (i < tree.nodes.len) : (i += 1) {
         const node: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
         const vd = tree.fullVarDecl(node) orelse continue;
         const init = vd.ast.init_node.unwrap() orelse continue;
         if (!isContainerDeclTag(tree.nodeTag(init))) continue;
-        try idx.map.put(a, tree.tokenSlice(vd.ast.mut_token + 1), init);
+        const name = tree.tokenSlice(vd.ast.mut_token + 1);
+        const gop = try idx.map.getOrPut(a, name);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(a, .{
+            .container = init,
+            .scope_body = innermostFnBody(tree, bodies.items, tree.firstToken(node)),
+        });
     }
     return idx;
+}
+
+/// The innermost fn body whose token range contains `tok`, null when the
+/// token sits at file scope.
+fn innermostFnBody(tree: *const Ast, bodies: []const NodeIndex, tok: u32) ?NodeIndex {
+    var found: ?NodeIndex = null;
+    var found_len: u32 = 0;
+    for (bodies) |body| {
+        const first = tree.firstToken(body);
+        const last = tree.lastToken(body);
+        if (tok <= first or tok >= last) continue;
+        const len = last - first;
+        if (found == null or len < found_len) {
+            found = body;
+            found_len = len;
+        }
+    }
+    return found;
 }
 
 /// The declared type node of a container field, when resolvable.
@@ -816,46 +948,51 @@ fn classifyTypeNode(tree: *const Ast, node: NodeIndex) TypeStep {
     }
 }
 
-fn stepThroughHop(tree: *const Ast, tidx: *const TypeIndex, cur: TypeStep, hop: Hop) TypeStep {
+fn stepThroughHop(sctx: ScanCtx, cur: TypeStep, hop: Hop) TypeStep {
     switch (cur) {
         .safe, .unknown => return cur,
         .array_elem => |elem| {
             if (hop != .index) return .unknown;
-            return classifyTypeNode(tree, elem);
+            return classifyTypeNode(sctx.tree, elem);
         },
         .optional_payload => |payload| {
             if (hop != .unwrap) return .unknown;
-            return classifyTypeNode(tree, payload);
+            return classifyTypeNode(sctx.tree, payload);
         },
         .named => |name| {
-            const container = tidx.lookup(name) orelse return .unknown;
+            const container = sctx.tidx.lookup(sctx.tree, name, sctx.body) orelse return .unknown;
             if (hop != .field) return .unknown;
-            const ft = fieldTypeNode(tree, container, hop.field) orelse return .unknown;
-            return classifyTypeNode(tree, ft);
+            const ft = fieldTypeNode(sctx.tree, container, hop.field) orelse return .unknown;
+            return classifyTypeNode(sctx.tree, ft);
         },
     }
 }
 
 const ChainSafety = enum { unsafe, safe, unknown };
 
+/// The `.safe` verdict for one hop: safe only while hops remain after
+/// it. A final-hop `.safe` addresses the slot that stores the
+/// pointer/slice value itself, inside the stack copy (EPH-I0590).
+fn safeVerdict(hi: usize) ChainSafety {
+    return if (hi == 0) .unsafe else .safe;
+}
+
 /// Resolve whether a chained address-of provably stays inside the stack
 /// frame. Hops are stored outermost-first, so resolution walks them in
 /// reverse (root-adjacent hop first).
-fn resolveChainSafety(
-    tree: *const Ast,
-    tidx: *const TypeIndex,
-    info: ChainInfo,
-    root_type: OptIndex,
-) ChainSafety {
+fn resolveChainSafety(sctx: ScanCtx, info: ChainInfo, root_type: OptIndex) ChainSafety {
     if (info.overflow) return .unknown;
     const root_node = root_type.unwrap() orelse return .unknown;
-    var cur = classifyTypeNode(tree, root_node);
+    var cur = classifyTypeNode(sctx.tree, root_node);
     var hi = info.hop_count;
     while (hi > 0) {
         hi -= 1;
-        cur = stepThroughHop(tree, tidx, cur, info.hops[hi]);
+        cur = stepThroughHop(sctx, cur, info.hops[hi]);
         switch (cur) {
-            .safe => return .safe,
+            // Pointer/slice terminates the walk safely only while hops
+            // remain after it: the address then points BEHIND the
+            // pointer/slice (EPH-I0590).
+            .safe => return safeVerdict(hi),
             .unknown => return .unknown,
             else => {},
         }
@@ -1073,6 +1210,8 @@ fn isArrayVarDecl(tree: *const Ast, vd: Ast.full.VarDecl) bool {
 const ScanCtx = struct {
     tree: *const Ast,
     tidx: *const TypeIndex,
+    /// The fn body under analysis: scopes TypeIndex lookups (EPH-I0592).
+    body: NodeIndex,
 };
 
 /// Phase 2: const aliases (`const p = &x...;`). Fixed-point over the decl
@@ -1106,7 +1245,7 @@ fn tryCollectAlias(
     const name = tree.tokenSlice(vd.ast.mut_token + 1);
     if (scan.aliasRoot(name) != null) return false;
     const init = vd.ast.init_node.unwrap() orelse return false;
-    const root = aliasTarget(sctx.tree, sctx.tidx, scan, init) orelse return false;
+    const root = aliasTarget(sctx, scan, init) orelse return false;
     try scan.aliases.append(a, .{ .name = name, .root = root });
     return true;
 }
@@ -1114,33 +1253,23 @@ fn tryCollectAlias(
 /// The stack local or param an alias initializer points into, if provable.
 /// A chained address resolved safe/unknown (`&ptr.x`, `&v.slice[i]`, or
 /// unresolvable) does not point into the stack frame — no alias.
-fn aliasTarget(
-    tree: *const Ast,
-    tidx: *const TypeIndex,
-    scan: *const FnScan,
-    init: NodeIndex,
-) ?[]const u8 {
-    const e = unwrapGroup(tree, init);
-    switch (tree.nodeTag(e)) {
-        .address_of => return aliasAddressTarget(tree, tidx, scan, e),
+fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 {
+    const e = unwrapGroup(sctx.tree, init);
+    switch (sctx.tree.nodeTag(e)) {
+        .address_of => return aliasAddressTarget(sctx, scan, e),
         .identifier => {
-            const name = tree.tokenSlice(tree.nodeMainToken(e));
+            const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(e));
             return scan.aliasRoot(name);
         },
         else => return null,
     }
 }
 
-fn aliasAddressTarget(
-    tree: *const Ast,
-    tidx: *const TypeIndex,
-    scan: *const FnScan,
-    amp: NodeIndex,
-) ?[]const u8 {
-    const info = chainInfo(tree, tree.nodeData(amp).node);
+fn aliasAddressTarget(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?[]const u8 {
+    const info = chainInfo(sctx.tree, sctx.tree.nodeData(amp).node);
     if (info.root.len == 0) return null;
     const bind = bindForRoot(info.root, scan) orelse return null;
-    if (info.hop_count > 0 and !chainIsUnsafe(tree, tidx, info, bind)) return null;
+    if (info.hop_count > 0 and !chainIsUnsafe(sctx, info, bind)) return null;
     return info.root;
 }
 
@@ -1164,14 +1293,9 @@ fn bindForRoot(name: []const u8, scan: *const FnScan) ?Bind {
     return null;
 }
 
-fn chainIsUnsafe(
-    tree: *const Ast,
-    tidx: *const TypeIndex,
-    info: ChainInfo,
-    bind: Bind,
-) bool {
+fn chainIsUnsafe(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
     if (bind.is_pointer) return false;
-    return resolveChainSafety(tree, tidx, info, bind.type_node) == .unsafe;
+    return resolveChainSafety(sctx, info, bind.type_node) == .unsafe;
 }
 
 // ============================================================================
@@ -1187,29 +1311,19 @@ const Finding = struct {
     is_param: bool = false,
 };
 
-fn classifyReturn(
-    tree: *const Ast,
-    tidx: *const TypeIndex,
-    scan: *const FnScan,
-    node: NodeIndex,
-) ?Finding {
-    const expr = tree.nodeData(node).opt_node.unwrap() orelse return null;
-    const e = unwrapGroup(tree, expr);
-    return switch (tree.nodeTag(e)) {
-        .address_of => classifyAddressOf(tree, tidx, scan, e),
-        .slice_open, .slice, .slice_sentinel => classifySlice(tree, scan, e),
-        .identifier => classifyAliasReturn(tree, scan, e),
+fn classifyReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
+    const expr = sctx.tree.nodeData(node).opt_node.unwrap() orelse return null;
+    const e = unwrapGroup(sctx.tree, expr);
+    return switch (sctx.tree.nodeTag(e)) {
+        .address_of => classifyAddressOf(sctx, scan, e),
+        .slice_open, .slice, .slice_sentinel => classifySlice(sctx.tree, scan, e),
+        .identifier => classifyAliasReturn(sctx.tree, scan, e),
         else => null,
     };
 }
 
-fn classifyAddressOf(
-    tree: *const Ast,
-    tidx: *const TypeIndex,
-    scan: *const FnScan,
-    amp: NodeIndex,
-) ?Finding {
-    const info = chainInfo(tree, tree.nodeData(amp).node);
+fn classifyAddressOf(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?Finding {
+    const info = chainInfo(sctx.tree, sctx.tree.nodeData(amp).node);
     if (info.root.len == 0) return null;
     const bind = bindForRoot(info.root, scan) orelse return null;
     if (info.hop_count == 0) {
@@ -1217,7 +1331,7 @@ fn classifyAddressOf(
         if (!bind.is_param) return null;
         return .{ .name = info.root, .via = null, .is_slice = false, .is_param = true };
     }
-    if (!chainIsUnsafe(tree, tidx, info, bind)) return null;
+    if (!chainIsUnsafe(sctx, info, bind)) return null;
     return .{ .name = info.root, .via = null, .is_slice = false, .is_param = bind.is_param };
 }
 
@@ -1262,6 +1376,9 @@ fn emitZa111(ctx: *const Za111Ctx, node: NodeIndex, f: Finding) !void {
     else
         try std.fmt.allocPrint(ctx.a, "returned pointer refers to stack {s} " ++
             "'{s}' — its storage expires when the function returns", .{ what, f.name });
+    // The append below allocates the Issue before the message slot is
+    // committed: on append failure the message must not leak (EPH-I0594).
+    errdefer ctx.a.free(msg);
     const lc = ctx.actx.nodeLineCol(node);
     try ctx.out.append(ctx.a, .{
         .file = ctx.path,
@@ -1286,7 +1403,7 @@ fn analyzeOneFn(
     try walker.run(body);
     sortDeclsBySource(&ctx.actx.tree, walker.var_decls.items);
 
-    const sctx = ScanCtx{ .tree = &ctx.actx.tree, .tidx = ctx.tidx };
+    const sctx = ScanCtx{ .tree = &ctx.actx.tree, .tidx = ctx.tidx, .body = body };
     var scan = FnScan{};
     defer scan.deinit(ctx.a);
     try collectParams(ctx.a, sctx.tree, proto, &scan);
@@ -1294,7 +1411,7 @@ fn analyzeOneFn(
     try collectAliases(ctx.a, sctx, walker.var_decls.items, &scan);
 
     for (walker.returns.items) |ret| {
-        const f = classifyReturn(sctx.tree, sctx.tidx, &scan, ret) orelse continue;
+        const f = classifyReturn(sctx, &scan, ret) orelse continue;
         try emitZa111(ctx, ret, f);
     }
 }
@@ -1713,6 +1830,65 @@ test "ZA111: slice-field chain is silent (tigerbeetle cache pattern)" {
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
+test "ZA111: slice field address without index fires (EPH-I0590)" {
+    const a = std.testing.allocator;
+    // `&self.words` addresses the slice FIELD inside the stack copy of
+    // self, not the caller-owned backing. The index form above is safe;
+    // this form is stack UB the compiler also misses.
+    var issues = try runZa111(a,
+        \\const P = struct { words: []u32 };
+        \\fn word(self: P) *[]u32 {
+        \\    return &self.words;
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try expectZa111(issues.items, 3, "'self'");
+}
+
+test "ZA111: pointer field address fires (EPH-I0590)" {
+    const a = std.testing.allocator;
+    var issues = try runZa111(a,
+        \\const P = struct { p: *u32 };
+        \\fn slot(self: P) **u32 {
+        \\    return &self.p;
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try expectZa111(issues.items, 3, "'self'");
+}
+
+test "ZA111: optional pointer payload address fires (EPH-I0590)" {
+    const a = std.testing.allocator;
+    var issues = try runZa111(a,
+        \\fn slot(opt: ?*u32) **u32 {
+        \\    return &opt.?;
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try expectZa111(issues.items, 2, "'opt'");
+}
+
+test "ZA111: fn-local type collision resolves per fn (EPH-I0592)" {
+    const a = std.testing.allocator;
+    // Two disjoint fn-local types share the name S. A last-wins index
+    // resolves one fn's chain against the other's type: the slice S
+    // would silence the array fn (false negative) or the array S would
+    // fire in the slice fn (false positive). Per-fn scoping keeps the
+    // slice fn silent and fires only the array fn.
+    var issues = try runZa111(a,
+        \\fn slice_shape(v: S) *u32 {
+        \\    const S = struct { s: []u32 };
+        \\    return &v.s[0];
+        \\}
+        \\fn array_shape(v: S) *u32 {
+        \\    const S = struct { s: [4]u32 };
+        \\    return &v.s[0];
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try expectZa111(issues.items, 7, "'v'");
+}
+
 test "ZA111: array-field chain fires (resolved unsafe)" {
     const a = std.testing.allocator;
     var issues = try runZa111(a,
@@ -1755,6 +1931,77 @@ test "ZA111: optional-unwrap chain fires" {
     );
     defer types.deinitIssues(&issues, a);
     try expectZa111(issues.items, 3, "'s'");
+}
+
+test "ZA111: await parses as an identifier, no walker arm needed (EPH-I0596)" {
+    const a = std.testing.allocator;
+    // `await` is a plain identifier in 0.16 (async removed in 0.15), so
+    // the walker treats it as a leaf. This pins that await-named code
+    // parses and that the walk keeps finding the real finding.
+    var issues = try runZa111(a,
+        \\fn f() *u32 {
+        \\    const await = 42;
+        \\    _ = await;
+        \\    var s: S = .{ .a = 1 };
+        \\    return &s.a;
+        \\}
+        \\const S = struct { a: u32 };
+    );
+    defer types.deinitIssues(&issues, a);
+    try expectZa111(issues.items, 5, "'s'");
+}
+
+test "walker: assign_destructure pushes lhs bindings (EPH-I0596)" {
+    const a = std.testing.allocator;
+    var ctx = try AstContext.init(a,
+        \\const S = struct { a: u32 };
+        \\fn f(pair: [2]S) void {
+        \\    var x, var y = pair;
+        \\    _ = x;
+        \\    _ = y;
+        \\}
+    );
+    defer ctx.deinit(a);
+    var body: ?NodeIndex = null;
+    var i: usize = 1;
+    while (i < ctx.tree.nodes.len) : (i += 1) {
+        const n: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
+        if (ctx.tree.nodeTag(n) == .fn_decl) {
+            body = ctx.tree.nodeData(n).node_and_node[1];
+        }
+    }
+    var walker = Walker{ .a = a, .tree = &ctx.tree };
+    defer walker.deinit();
+    try walker.run(body.?);
+    // The destructure lhs patterns are var decls: both bindings must
+    // enter FnScan through the walker.
+    var found_x = false;
+    var found_y = false;
+    for (walker.var_decls.items) |n| {
+        const vd = ctx.tree.fullVarDecl(n).?;
+        const name = ctx.tree.tokenSlice(vd.ast.mut_token + 1);
+        found_x = found_x or mem.eql(u8, name, "x");
+        found_y = found_y or mem.eql(u8, name, "y");
+    }
+    try std.testing.expect(found_x);
+    try std.testing.expect(found_y);
+}
+
+test "ZA111: destructured binding chains stay silent (untyped lhs, EPH-I0596)" {
+    const a = std.testing.allocator;
+    // Destructured `var` bindings enter FnScan as by-value locals, but
+    // their lhs patterns carry no type node, so chains resolve silent
+    // under the precision policy. This pins the honest limit and guards
+    // the new lhs push against crashes on real destructure trees.
+    var issues = try runZa111(a,
+        \\const S = struct { a: u32 };
+        \\fn f(pair: [2]S) *u32 {
+        \\    var x, var y = pair;
+        \\    return &x.a;
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 // ============================================================================
@@ -2004,6 +2251,22 @@ test "exceedsNestingBudget: right-recursive keywords count (holes B and E)" {
     try std.testing.expect(!exceedsNestingBudget("const x = comptime comptime comptime true;", 3));
     try std.testing.expect(exceedsNestingBudget("if (a) if (b) if (c) x;", 2));
     try std.testing.expect(!exceedsNestingBudget("if (a) if (b) if (c) x;", 3));
+}
+
+test "exceedsNestingBudget: await does not count (no 0.16 keyword, EPH-I0591)" {
+    // `await` is a plain identifier in 0.15/0.16 (async removed in 0.15,
+    // verified absent from the 0.16.0 stdlib). A keyword entry for it
+    // would count a non-production. If a future Zig version restores
+    // await as a right-recursive prefix, this pin fails and the table
+    // must be re-audited. (Paren-free: parens count in depth, not run.)
+    try std.testing.expect(!exceedsNestingBudget("await await await x", 0));
+}
+
+test "exceedsNestingBudget: suspend statements do not count (EPH-I0591)" {
+    // `suspend` parses KEYWORD_suspend BlockExprStatement — the
+    // defer/errdefer class: one frame per keyword, `;` resets, and the
+    // statements cannot chain. Counting it would only over-count.
+    try std.testing.expect(!exceedsNestingBudget("suspend x; suspend x; suspend x;", 0));
 }
 
 test "exceedsNestingBudget: fn-type chains count, declarations do not (hole D)" {

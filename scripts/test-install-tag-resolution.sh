@@ -258,8 +258,13 @@ ACTUAL_OUT=$(printf '' | max_stable_tag); ACTUAL_RC=$?
 expect "max_stable_tag on empty input prints nothing" "" "0"
 
 # 17. EPH-I0662: version_older known answers. The compare must stay numeric
-# (EPH-I0193): a string compare sorts 0.14.10 below 0.14.1.
+# (EPH-I0193): a string compare sorts 0.14.10 below 0.14.2, so the
+# v0.14.2/v0.14.10 pair discriminates (string: rc 1, numeric: rc 0). The
+# v0.14.1/v0.14.10 pair does not: a prefix sorts before its extension, so
+# both collations order 0.14.1 first (EPH-I1129).
 ACTUAL_OUT=$(version_older v0.14.1 v0.14.10); ACTUAL_RC=$?
+expect "version_older accepts a lower first" "" "0"
+ACTUAL_OUT=$(version_older v0.14.2 v0.14.10); ACTUAL_RC=$?
 expect "version_older compares numerically" "" "0"
 ACTUAL_OUT=$(version_older v0.14.10 v0.14.1); ACTUAL_RC=$?
 expect "version_older rejects a higher first" "" "1"

@@ -11,6 +11,25 @@
 $installExitCode = & {
     $ErrorActionPreference = "Stop"
 
+    # Write $Message to the process standard error stream.
+    # EPH-I0650: Write-Error under $ErrorActionPreference "Stop" throws
+    # before the return below runs, so the exit code never reaches the
+    # caller. EPH-I0653: Write-Host writes to the host stream, which
+    # automation cannot capture through stderr. [Console]::Error is the
+    # direct stderr handle on every supported host, needs no EAP
+    # handling, and adds no PowerShell decoration, so the output matches
+    # install.sh's echo >&2 line for line. The framework flushes this
+    # writer on every write (verified: .NET Framework
+    # InitializeStdOutError sets AutoFlush = true on the error writer).
+    # A test harness must capture this output at the process level (a
+    # shell redirect or Start-Process -RedirectStandardError), because
+    # the text bypasses the PowerShell streams and an in-session 2>&1
+    # sees nothing.
+    function Write-Stderr {
+        param([string]$Message)
+        [Console]::Error.WriteLine($Message)
+    }
+
     $REPO = "https://codeberg.org/RhyosLabs/ephor"
     # Fetch the newest stable tags from the Codeberg tags API (not cached
     # raw files). 30s: observed answers from the Codeberg API take 20s+ on
@@ -20,7 +39,13 @@ $installExitCode = & {
     # limit=50 is the API's per-page maximum and holds every tag the repo
     # has released so far (15, verified 2026-08-22), so the window is
     # closed today. install.sh uses the same limit.
-    $TAGS_API = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50"
+    # EPH-I0652: tests override this URL through EPHOR_TAGS_API to
+    # simulate an API failure (install.sh channel). Empty or unset takes
+    # the default, like install.sh's ${EPHOR_TAGS_API:-...} expansion.
+    $TAGS_API = $env:EPHOR_TAGS_API
+    if (-not $TAGS_API) {
+        $TAGS_API = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50"
+    }
     # This tag is the fallback when the Codeberg tags API fails. Refresh it
     # on every release.
     $EPHOR_FALLBACK_TAG = "v0.14.2"
@@ -38,7 +63,7 @@ $installExitCode = & {
     # under irm | iex a stale 0 used to skip the failure branch below and
     # the install reported success with no dependency saved.
     if (-not (Get-Command zig -CommandType Application -ErrorAction SilentlyContinue)) {
-        Write-Error @"
+        Write-Stderr @"
 error: zig is not installed or not on PATH.
 
   Ephor requires a Zig compiler to fetch the dependency.
@@ -91,7 +116,12 @@ error: zig is not installed or not on PATH.
         # future redirect takes the fallback path instead of being
         # followed. This is stricter than install.sh, which still follows
         # https-to-https redirects.
-        $tagsJson = Invoke-RestMethod -Uri $TAGS_API -TimeoutSec 30 -MaximumRedirection 0
+        # EPH-I0652: the clamp covers the default https URL only. A
+        # test-channel URL (http:// or file://) skips it, matching
+        # install.sh's scheme check, so a local test server may redirect.
+        $irmParams = @{ Uri = $TAGS_API; TimeoutSec = 30 }
+        if ($TAGS_API.StartsWith("https://")) { $irmParams.MaximumRedirection = 0 }
+        $tagsJson = Invoke-RestMethod @irmParams
         $maxTag = $null
         $maxVersion = $null
         foreach ($entry in $tagsJson) {
@@ -127,15 +157,15 @@ error: zig is not installed or not on PATH.
             $tag = $null
         }
         if (-not $tag) {
-            Write-Host "warning: could not resolve the latest ephor tag from the Codeberg API."
-            Write-Host "The install continues with the fallback tag $EPHOR_FALLBACK_TAG."
+            Write-Stderr "warning: could not resolve the latest ephor tag from the Codeberg API."
+            Write-Stderr "The install continues with the fallback tag $EPHOR_FALLBACK_TAG."
             return $EPHOR_FALLBACK_TAG
         }
         if (Test-VersionOlder $tag $EPHOR_FALLBACK_TAG) {
             # EPH-I0193: a stale or re-dated API response must not
             # downgrade the install below the pinned fallback.
-            Write-Host "warning: the resolved tag $tag is below the fallback $EPHOR_FALLBACK_TAG."
-            Write-Host "The install continues with the fallback tag."
+            Write-Stderr "warning: the resolved tag $tag is below the fallback $EPHOR_FALLBACK_TAG."
+            Write-Stderr "The install continues with the fallback tag."
             return $EPHOR_FALLBACK_TAG
         }
         return $tag
@@ -143,7 +173,7 @@ error: zig is not installed or not on PATH.
 
     # Check that this directory is a Zig project.
     if (-not (Test-Path "build.zig")) {
-        Write-Error @"
+        Write-Stderr @"
 error: no build.zig found in current directory
 
   Ephor requires a Zig project with build.zig and build.zig.zon.
@@ -152,7 +182,7 @@ error: no build.zig found in current directory
     zig init
 
   Then re-run the install:
-    irm $REPO/raw/main/install.ps1 | iex
+    irm $REPO/raw/branch/main/install.ps1 | iex
 "@
         return 1
     }
@@ -202,7 +232,7 @@ error: no build.zig found in current directory
             $EPHOR_URL = "$REPO/archive/$EPHOR_0_15_COMMIT.tar.gz"
         }
     } else {
-        Write-Host "warning: could not detect zig version, defaulting to latest"
+        Write-Stderr "warning: could not detect zig version, defaulting to latest"
         $EPHOR_TAG = Resolve-EphorTag
     }
 
@@ -212,7 +242,12 @@ error: no build.zig found in current directory
         Write-Host "Installing ephor $EPHOR_TAG..."
     }
     if (-not $EPHOR_URL) {
-        $EPHOR_URL = "$REPO/archive/$EPHOR_TAG.tar.gz"
+        # EPH-I0652: tests override the archive URL through
+        # EPHOR_ARCHIVE_URL (install.sh channel). The Zig 0.15 pin path
+        # above sets $EPHOR_URL directly and never takes the override,
+        # matching install.sh's ordering.
+        $EPHOR_URL = $env:EPHOR_ARCHIVE_URL
+        if (-not $EPHOR_URL) { $EPHOR_URL = "$REPO/archive/$EPHOR_TAG.tar.gz" }
     }
 
     Write-Host "Adding ephor dependency..."
@@ -243,8 +278,8 @@ error: no build.zig found in current directory
             # fetch the same way.
             $patched = $zon -creplace '\.fingerprint[ \t]*=[ \t]*0x0\b', ".fingerprint = $suggested"
             if ($patched -eq $zon) {
-                Write-Host $fetchOut
-                Write-Error @"
+                Write-Stderr $fetchOut
+                Write-Stderr @"
 error: could not repair the fingerprint in build.zig.zon
 
   The .fingerprint field does not match the 0x0 placeholder.
@@ -252,6 +287,12 @@ error: could not repair the fingerprint in build.zig.zon
 "@
                 return 1
             }
+            # EPH-I0649: $zon keeps the file's trailing newline
+            # (Get-Content -Raw), and Set-Content appends one terminator
+            # of its own. Trim the trailing CR/LF first so each repair
+            # writes the same end-of-file the zon already had instead of
+            # adding one blank line per repair.
+            $patched = $patched.TrimEnd("`r", "`n")
             Set-ContentNoFollow -Path "build.zig.zon" -Value $patched
             # This fetch is authoritative: a failure aborts the install.
             # EPH-I0645: capture the exit code under "Continue" like the
@@ -265,13 +306,13 @@ error: could not repair the fingerprint in build.zig.zon
             $ErrorActionPreference = $prevEAP
             if ($null -eq $fetchRc2) { $fetchRc2 = 1 }
             if ($fetchRc2 -ne 0) {
-                Write-Host $fetchOut2
+                Write-Stderr $fetchOut2
                 return $fetchRc2
             }
         } else {
             # No hint means a real fetch failure (network, hash, server).
             # Show the captured error and keep the original exit code.
-            Write-Host $fetchOut
+            Write-Stderr $fetchOut
             return $fetchRc
         }
     }
@@ -324,8 +365,8 @@ error: could not repair the fingerprint in build.zig.zon
             Write-Host "Updated ephor build steps in build.zig"
         }
     } elseif ($buildContent -match 'dependency\("ephor"') {
-        Write-Host "warning: ephor dependency found but build steps have non-standard layout"
-        Write-Host "Please update your ephor build steps manually (see README)"
+        Write-Stderr "warning: ephor dependency found but build steps have non-standard layout"
+        Write-Stderr "Please update your ephor build steps manually (see README)"
     } else {
         Write-Host "Adding ephor build steps to build.zig..."
 
@@ -342,9 +383,9 @@ error: could not repair the fingerprint in build.zig.zon
             # EPH-I0635 parity: the dependency landed but the build steps
             # did not. Exit nonzero so automation does not mistake a
             # partial install for success.
-            Write-Host "warning: could not find installArtifact in build.zig"
-            Write-Host "The ephor dependency was added, but the build steps were not."
-            Write-Host "Add the build steps manually (see README)."
+            Write-Stderr "warning: could not find installArtifact in build.zig"
+            Write-Stderr "The ephor dependency was added, but the build steps were not."
+            Write-Stderr "Add the build steps manually (see README)."
             return 1
         }
 

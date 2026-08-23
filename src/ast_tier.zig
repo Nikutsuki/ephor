@@ -13,18 +13,25 @@
 //! partial and `AstContext.ok` is false — AST rules skip the file and the
 //! line tier still covers it. Files that nest delimiters or prefix
 //! operators past `max_nesting_depth` skip the same way before the parse
-//! runs (EPH-I0191). Nothing is logged per file. Corpus runs touch
-//! thousands of files.
+//! runs (EPH-I0191). A refused parse thread skips the file too
+//! (EPH-I0597). Nothing is logged per file. Corpus runs touch thousands
+//! of files.
+//!
+//! ZA111 (returned-stack-reference) lives in ast_tier_za111.zig, split
+//! out so each half stays under the 64 KiB AST-tier input cap
+//! (EPH-I0601): the file that implements the rule must stay small
+//! enough for the rule to analyze it. This file owns the parse, the
+//! nesting pre-scan, and the per-file pipeline.
 
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const types = @import("types.zig");
+const za111 = @import("ast_tier_za111.zig");
 
 const Issue = types.Issue;
 const Ast = std.zig.Ast;
 const NodeIndex = Ast.Node.Index;
-const OptIndex = Ast.Node.OptionalIndex;
 
 /// 1-based source position, matching Issue line/col conventions.
 pub const LineCol = struct {
@@ -48,17 +55,15 @@ pub const AstContext = struct {
     /// allocation happens-before the caller resumes: no concurrent
     /// allocator access. Direct use on untrusted input above
     /// `max_ast_file_bytes` still reopens the crash class. Production
-    /// callers must go through `analyzeFileAstTier`.
+    /// callers must go through `analyzeFileAstTier`. A refusal to create
+    /// the worker thread surfaces as `error.ThreadSpawnFailed`; the tier
+    /// turns it into a counted skip (EPH-I0597).
     pub fn init(allocator: Allocator, source: []const u8) !AstContext {
-        var job = ParseJob{ .allocator = allocator, .source = source };
-        const worker = try std.Thread.spawn(
-            .{ .stack_size = parse_stack_bytes },
-            parseWorker,
-            .{&job},
-        );
-        worker.join();
-        if (job.err) |err| return err;
-        return job.result.?;
+        return switch (runGuardedParse(allocator, source, spawnParseWorker)) {
+            .ok => |ctx| ctx,
+            .spawn_refused => error.ThreadSpawnFailed,
+            .err => |err| err,
+        };
     }
 
     pub fn deinit(self: *AstContext, allocator: Allocator) void {
@@ -75,7 +80,11 @@ pub const AstContext = struct {
 
 /// Per-run tier counters, collected only when requested via AstTierOut.
 pub const Stats = struct {
+    /// Files whose AST analysis completed. A file that fails mid-analysis
+    /// (allocation) is not counted here (EPH-I0600).
     parsed: usize = 0,
+    /// Files degraded to line-tier coverage: parse errors, deep nesting,
+    /// a size past the byte cap, or a refused parse thread (EPH-I0597).
     skipped: usize = 0,
 };
 
@@ -113,6 +122,54 @@ fn parseOnCurrentThread(allocator: Allocator, source: []const u8) !AstContext {
     };
 }
 
+/// How one guarded parse ended. A spawn refusal is separated from
+/// worker-side errors: the tier degrades the file on a refusal but
+/// propagates allocation errors (EPH-I0597).
+const ParseOutcome = union(enum) {
+    ok: AstContext,
+    /// The worker thread could not be created. Parsing on the caller's
+    /// stack would reopen the EPH-I0191 crash class, so the file
+    /// degrades to line-tier coverage instead.
+    spawn_refused,
+    /// The worker ran and failed (allocation).
+    err: anyerror,
+};
+
+/// Creates the parse worker thread. Split out so the degrade contract
+/// is testable: tests inject a refusing spawner (EPH-I0597).
+fn spawnParseWorker(job: *ParseJob) anyerror!std.Thread {
+    return std.Thread.spawn(.{ .stack_size = parse_stack_bytes }, parseWorker, .{job});
+}
+
+/// One guarded parse through the injectable spawner. The caller joins
+/// the worker before it resumes, so every allocation happens-before
+/// the caller: no concurrent allocator access.
+fn runGuardedParse(
+    allocator: Allocator,
+    source: []const u8,
+    spawn: *const fn (*ParseJob) anyerror!std.Thread,
+) ParseOutcome {
+    var job = ParseJob{ .allocator = allocator, .source = source };
+    const worker = spawn(&job) catch return .spawn_refused;
+    worker.join();
+    if (job.err) |err| return .{ .err = err };
+    return .{ .ok = job.result.? };
+}
+
+/// The tier's view of a parse outcome: a spawn refusal degrades to a
+/// counted skip (an environment failure, not a file defect), and
+/// worker-side errors propagate (EPH-I0597).
+fn resolveParseOutcome(outcome: ParseOutcome, stats: ?*Stats) !?AstContext {
+    return switch (outcome) {
+        .ok => |ctx| ctx,
+        .spawn_refused => {
+            if (stats) |s| s.skipped += 1;
+            return null;
+        },
+        .err => |err| err,
+    };
+}
+
 /// Sink for one file's AST-tier analysis: issues plus optional counters.
 pub const AstTierOut = struct {
     issues: *std.ArrayListUnmanaged(Issue),
@@ -145,13 +202,18 @@ pub const max_nesting_depth: usize = 512;
 pub const max_ast_file_bytes: usize = 64 * 1024;
 
 /// Carried state for the pre-scan: two counters that estimate live
-/// parser frames, plus the pending-arrow watch for `anyframe->`.
+/// parser frames, plus the pending-arrow watch for `anyframe->` and the
+/// pending-fn watch for the fn-type paren (EPH-I0598).
 const NestingScan = struct {
     depth: usize = 0,
     run: usize = 0,
     /// Set while an `anyframe` keyword waits for its `->`. The word alone
     /// is a type operand, so the run parks here until the arrow decides.
     arrow_run: ?usize = null,
+    /// Set while a `fn` waits for its `(`: the type form's paren may sit
+    /// on a later line, so the next non-blank code char decides
+    /// (EPH-I0598).
+    pending_fn: bool = false,
 };
 
 /// True when `source` would push the recursive host parser past `budget`.
@@ -197,7 +259,9 @@ const NestingScan = struct {
 ///                                      per keyword, `;` resets, cannot
 ///                                      chain; the defer/errdefer class)
 ///   if/while/for bodies                right-recursive   run
-///   fn-type chains `fn() fn() void`    right-recursive   run (fn + `(`)
+///   fn-type chains `fn() fn() void`    right-recursive   run (fn + `(`,
+///                                      the paren may sit on a later
+///                                      line — EPH-I0598)
 ///   binary ops and/or/orelse/catch     left-assoc loop   not counted
 ///   switch prongs                      iterative list    not counted
 ///   defer/errdefer payloads            block statements  not counted
@@ -220,10 +284,21 @@ fn lineCrossesBudget(line: []const u8, scan: *NestingScan, budget: usize) bool {
     var i: usize = 0;
     while (i < line.len) : (i += 1) {
         _ = lit.updateForChar(line, i) orelse continue;
+        if (scan.pending_fn) resolvePendingFn(scan, line[i]);
         scanCodeChar(line, &i, scan);
         if (scan.depth > budget or scan.run > budget) return true;
     }
     return false;
+}
+
+/// Resolve a `fn` split from its `(` across a line break (EPH-I0598).
+/// A `(` counts the type form; any other non-blank char is the
+/// declaration form or garbage. Blank chars keep the watch alive across
+/// blank lines, matching the same-line lookahead's whitespace skip.
+fn resolvePendingFn(scan: *NestingScan, c: u8) void {
+    if (c == ' ' or c == '\t' or c == '\r') return;
+    scan.pending_fn = false;
+    if (c == '(') scan.run += 1;
 }
 
 /// Fold one code-context char into the scan. Advances `i` past
@@ -240,7 +315,10 @@ fn scanCodeChar(line: []const u8, i: *usize, scan: *NestingScan) void {
         // Whitespace and the arrow's `-` keep the watch alive.
         if (c == '-' or c == ' ' or c == '\t' or c == '\r') return;
         scan.arrow_run = null;
-        scan.run = 0;
+        // The frames parked before the bare `anyframe` operand stay
+        // live after the operand completes: restore them instead of
+        // discarding them (EPH-I0599).
+        scan.run = saved;
         // Fall through: the char that broke the arrow still counts.
     }
     switch (c) {
@@ -285,7 +363,14 @@ fn scanWordOrReset(line: []const u8, i: *usize, scan: *NestingScan) void {
         // A declaration `fn name(` is one iterative frame in the
         // container loop. The type form `fn (` recurses per level
         // (audit table, fn-type chains), so only that form counts.
-        if (nextNonSpaceIsParen(line, i.*)) scan.run += 1;
+        if (nextNonSpaceIsParen(line, i.*)) {
+            scan.run += 1;
+            return;
+        }
+        // `fn` with no `(` on this line: the paren may sit on a later
+        // line. Park the decision until the next non-blank code char
+        // (EPH-I0598).
+        scan.pending_fn = true;
         return;
     }
     if (isRightRecursiveKeyword(word)) scan.run += 1;
@@ -320,1117 +405,10 @@ fn isRightRecursiveKeyword(word: []const u8) bool {
     return false;
 }
 
-// ============================================================================
-// ZA111: returned-stack-reference
-// ============================================================================
-//
-// Compiler-gap evidence (zig 0.16.0, `zig build-obj -fno-emit-bin` probes):
-//   CAUGHT:   return &var_local;           (Sema errors on the bare form)
-//   MISSED:   return &var.field;           (silent — stack UB)
-//   MISSED:   return &var[i];              (silent, comptime index too)
-//   MISSED:   return var[lo..hi];          (slice of local array — silent)
-//   MISSED:   return &param;               (params are stack slots — silent)
-//   MISSED:   return &param.field;         (silent)
-//   MISSED:   return &var.slice_field;     (no index — slot address, silent)
-//   MISSED:   return &var.ptr_field;       (slot address, silent)
-//   MISSED:   return &opt.?;               (?*T and ?[]T payloads, silent)
-//   MISSED:   const p = &var; return p;    (const alias — silent)
-//   SAFE:     const x: u32 = 42; return &x; (comptime const → static memory)
-//   SAFE:     comptime params / comptime-only typed params (→ static)
-//   SAFE:     comptime var (comptime string-builder idiom → static memory)
-// ZA111 covers exactly the MISSED forms; the bare-var form is skipped so
-// ephor never duplicates a hard compile error.
-// (The three slot-address rows re-verified 2026-08-23,
-// .tmp/b75-probes/f1_gaps.zig — EPH-I0590.)
-//
-// Precision policy (ephor's false-positive-elimination rule): a chained
-// address-of is flagged only when every hop provably stays inside the
-// stack frame. A hop through a pointer/slice(-typed) binding or field is
-// safe (caller memory) when hops remain behind it; an unresolvable hop
-// (out-of-file type, inferred anonymous type, @field builtin) is SILENT,
-// not flagged. Deferred forms (tracked): runtime-known const locals,
-// out-param escape, labeled-block escape, payload-capture escape,
-// @ptrCast evasion, named array aliases, var-alias pointer return, var
-// slice-binding return, slice of array field, slice of array param,
-// global-var stores (`g = &x;`), field stores (`caller.field = &x;`),
-// destructured-binding chains (no type node on lhs patterns).
-
-const RULE_ZA111 = types.RULE_RETURNED_STACK_REF;
-
-/// A `var` local: always a runtime stack slot.
-const StackLocal = struct {
-    name: []const u8,
-    /// True only when the type is provably an array — slicing a slice
-    /// copies a caller-owned pointer and must not be flagged.
-    provably_array: bool,
-    /// True when the binding's type is a pointer/slice. `&ptr.x` and
-    /// `&ptr[i]` address memory BEHIND the pointer (owned by the caller),
-    /// not the stack slot — only the bare slot address is escapable.
-    is_pointer: bool,
-    /// Explicit type annotation (or the type of an explicit init), .none
-    /// when the type is inferred and unprovable.
-    type_node: OptIndex,
-};
-
-/// A by-value function parameter: its slot lives on the stack frame.
-const Param = struct {
-    name: []const u8,
-    is_pointer: bool,
-    type_node: OptIndex,
-};
-
-/// A `const p = &x...;` binding: p's value points into root's stack slot.
-const Alias = struct {
-    name: []const u8,
-    root: []const u8,
-};
-
-/// Per-function collected state for ZA111.
-const FnScan = struct {
-    locals: std.ArrayListUnmanaged(StackLocal) = .empty,
-    aliases: std.ArrayListUnmanaged(Alias) = .empty,
-    params: std.ArrayListUnmanaged(Param) = .empty,
-
-    fn deinit(self: *FnScan, a: Allocator) void {
-        self.locals.deinit(a);
-        self.aliases.deinit(a);
-        self.params.deinit(a);
-    }
-
-    fn localByName(self: *const FnScan, name: []const u8) ?StackLocal {
-        for (self.locals.items) |l| {
-            if (mem.eql(u8, l.name, name)) return l;
-        }
-        return null;
-    }
-
-    fn aliasRoot(self: *const FnScan, name: []const u8) ?[]const u8 {
-        for (self.aliases.items) |al| {
-            if (mem.eql(u8, al.name, name)) return al.root;
-        }
-        return null;
-    }
-
-    fn paramByName(self: *const FnScan, name: []const u8) ?Param {
-        for (self.params.items) |p| {
-            if (mem.eql(u8, p.name, name)) return p;
-        }
-        return null;
-    }
-};
-
-// ============================================================================
-// Body walker
-// ============================================================================
-//
-// std.Ast's Node.Data is an untagged union, so children are reached through
-// the tree's typed full.* helpers (composite constructs) plus a per-tag
-// shape switch (simple expressions). Nested container declarations are a
-// hard boundary: their methods are separate functions, reached by the
-// file-wide fn_decl scan — walking into them would misattribute their
-// locals/returns to the enclosing function.
-//
-// Coverage policy: an unlisted tag pushes no children. That can only cause
-// a missed detection (false negative), never a crash or a false positive.
-// `await` needs no arm: async was removed in 0.15 and the 0.16.0 stdlib
-// has no await tag — `await` parses as an identifier leaf (EPH-I0596).
-// `assign_destructure` pushes its lhs binding patterns so destructured
-// `var` names enter FnScan as by-value untyped locals (EPH-I0596).
-
-const Walker = struct {
-    a: Allocator,
-    tree: *const Ast,
-    stack: std.ArrayListUnmanaged(NodeIndex) = .empty,
-    var_decls: std.ArrayListUnmanaged(NodeIndex) = .empty,
-    returns: std.ArrayListUnmanaged(NodeIndex) = .empty,
-
-    fn deinit(self: *Walker) void {
-        self.stack.deinit(self.a);
-        self.var_decls.deinit(self.a);
-        self.returns.deinit(self.a);
-    }
-
-    fn push(self: *Walker, node: NodeIndex) !void {
-        try self.stack.append(self.a, node);
-    }
-
-    fn pushOpt(self: *Walker, node: OptIndex) !void {
-        try self.push(node.unwrap() orelse return);
-    }
-
-    fn pushAll(self: *Walker, nodes: []const NodeIndex) !void {
-        for (nodes) |n| try self.push(n);
-    }
-
-    /// DFS over one function body, recording var decls and returns.
-    fn run(self: *Walker, body: NodeIndex) !void {
-        try self.push(body);
-        while (self.stack.pop()) |node| {
-            switch (self.tree.nodeTag(node)) {
-                .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-                    try self.var_decls.append(self.a, node);
-                },
-                .@"return" => try self.returns.append(self.a, node),
-                else => {},
-            }
-            try self.pushChildren(node);
-        }
-    }
-
-    fn pushChildren(self: *Walker, node: NodeIndex) !void {
-        const tag = self.tree.nodeTag(node);
-        if (isBoundaryTag(tag)) return;
-        if (try self.pushCompositeStmt(node)) return;
-        if (try self.pushCompositeExpr(node)) return;
-        try self.pushShaped(node);
-    }
-
-    /// Composite statement constructs, via the tree's typed helpers.
-    fn pushCompositeStmt(self: *Walker, node: NodeIndex) !bool {
-        const tree = self.tree;
-        switch (tree.nodeTag(node)) {
-            .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-                const vd = tree.fullVarDecl(node) orelse return true;
-                try self.pushOpt(vd.ast.type_node);
-                try self.pushOpt(vd.ast.init_node);
-            },
-            .if_simple, .@"if" => {
-                const f = tree.fullIf(node) orelse return true;
-                try self.push(f.ast.cond_expr);
-                try self.push(f.ast.then_expr);
-                try self.pushOpt(f.ast.else_expr);
-            },
-            .while_simple, .while_cont, .@"while" => {
-                const w = tree.fullWhile(node) orelse return true;
-                try self.push(w.ast.cond_expr);
-                try self.pushOpt(w.ast.cont_expr);
-                try self.push(w.ast.then_expr);
-                try self.pushOpt(w.ast.else_expr);
-            },
-            .for_simple, .@"for" => {
-                const f = tree.fullFor(node) orelse return true;
-                try self.pushAll(f.ast.inputs);
-                try self.push(f.ast.then_expr);
-                try self.pushOpt(f.ast.else_expr);
-            },
-            .@"switch", .switch_comma => {
-                const s = tree.fullSwitch(node) orelse return true;
-                try self.push(s.ast.condition);
-                try self.pushAll(s.ast.cases);
-            },
-            .switch_case_one,
-            .switch_case,
-            .switch_case_inline_one,
-            .switch_case_inline,
-            => {
-                const c = tree.fullSwitchCase(node) orelse return true;
-                try self.pushAll(c.ast.values);
-                try self.push(c.ast.target_expr);
-            },
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                var buf: [2]NodeIndex = undefined;
-                try self.pushAll(tree.blockStatements(&buf, node) orelse return true);
-            },
-            else => return false,
-        }
-        return true;
-    }
-
-    /// Composite expression constructs, via the tree's typed helpers.
-    fn pushCompositeExpr(self: *Walker, node: NodeIndex) !bool {
-        switch (self.tree.nodeTag(node)) {
-            .call, .call_comma, .call_one, .call_one_comma => try self.pushCall(node),
-            .builtin_call,
-            .builtin_call_comma,
-            .builtin_call_two,
-            .builtin_call_two_comma,
-            => try self.pushBuiltinCall(node),
-            .struct_init,
-            .struct_init_comma,
-            .struct_init_dot,
-            .struct_init_dot_comma,
-            .struct_init_dot_two,
-            .struct_init_dot_two_comma,
-            .struct_init_one,
-            .struct_init_one_comma,
-            => try self.pushStructInit(node),
-            .array_init,
-            .array_init_comma,
-            .array_init_dot,
-            .array_init_dot_comma,
-            .array_init_dot_two,
-            .array_init_dot_two_comma,
-            .array_init_one,
-            .array_init_one_comma,
-            => try self.pushArrayInit(node),
-            .slice_open, .slice, .slice_sentinel => try self.pushSlice(node),
-            .array_type, .array_type_sentinel => try self.pushArrayType(node),
-            else => return false,
-        }
-        return true;
-    }
-
-    fn pushCall(self: *Walker, node: NodeIndex) !void {
-        var buf: [1]NodeIndex = undefined;
-        const c = self.tree.fullCall(&buf, node) orelse return;
-        try self.push(c.ast.fn_expr);
-        try self.pushAll(c.ast.params);
-    }
-
-    fn pushBuiltinCall(self: *Walker, node: NodeIndex) !void {
-        var buf: [2]NodeIndex = undefined;
-        try self.pushAll(self.tree.builtinCallParams(&buf, node) orelse return);
-    }
-
-    fn pushStructInit(self: *Walker, node: NodeIndex) !void {
-        var buf: [2]NodeIndex = undefined;
-        const s = self.tree.fullStructInit(&buf, node) orelse return;
-        try self.pushOpt(s.ast.type_expr);
-        try self.pushAll(s.ast.fields);
-    }
-
-    fn pushArrayInit(self: *Walker, node: NodeIndex) !void {
-        var buf: [2]NodeIndex = undefined;
-        const ai = self.tree.fullArrayInit(&buf, node) orelse return;
-        try self.pushOpt(ai.ast.type_expr);
-        try self.pushAll(ai.ast.elements);
-    }
-
-    fn pushSlice(self: *Walker, node: NodeIndex) !void {
-        const s = self.tree.fullSlice(node) orelse return;
-        try self.push(s.ast.sliced);
-        try self.push(s.ast.start);
-        try self.pushOpt(s.ast.end);
-        try self.pushOpt(s.ast.sentinel);
-    }
-
-    fn pushArrayType(self: *Walker, node: NodeIndex) !void {
-        const at = self.tree.fullArrayType(node) orelse return;
-        try self.push(at.ast.elem_count);
-        try self.pushOpt(at.ast.sentinel);
-        try self.push(at.ast.elem_type);
-    }
-
-    /// Destructured `var` bindings are stack slots and must enter FnScan
-    /// through their lhs patterns. The patterns carry no type node, so
-    /// their chains resolve silent under the precision policy (EPH-I0596).
-    fn pushDestructure(self: *Walker, node: NodeIndex) !void {
-        const d = self.tree.assignDestructure(node);
-        try self.pushAll(d.ast.variables);
-        try self.push(d.ast.value_expr);
-    }
-
-    /// Children of the `extra_and_node` tags: plain pointer types push
-    /// their elem type; `assign_destructure` pushes lhs bindings plus
-    /// the value (EPH-I0596).
-    fn pushShapedTail(self: *Walker, node: NodeIndex) !void {
-        const data = self.tree.nodeData(node);
-        if (self.tree.nodeTag(node) == .assign_destructure) {
-            try self.pushDestructure(node);
-            return;
-        }
-        try self.push(data.extra_and_node[1]);
-    }
-
-    /// Simple expressions: children follow directly from the tag's fixed
-    /// data shape. Unlisted tags are leaves for this walk's purposes.
-    fn pushShaped(self: *Walker, node: NodeIndex) !void {
-        if (try self.pushShapedBinary(node)) return;
-        const data = self.tree.nodeData(node);
-        switch (self.tree.nodeTag(node)) {
-            .field_access, .unwrap_optional, .grouped_expression => {
-                try self.push(data.node_and_token[0]);
-            },
-            .address_of,
-            .deref,
-            .bool_not,
-            .negation,
-            .negation_wrap,
-            .bit_not,
-            .optional_type,
-            .@"try",
-            .@"comptime",
-            .@"defer",
-            .@"suspend",
-            .@"resume",
-            .@"nosuspend",
-            => try self.push(data.node),
-            .@"return" => try self.pushOpt(data.opt_node),
-            .@"errdefer" => try self.push(data.opt_token_and_node[1]),
-            .anyframe_type => try self.push(data.token_and_node[1]),
-            .@"break", .@"continue" => {
-                try self.pushOpt(data.opt_token_and_opt_node[1]);
-            },
-            .ptr_type_aligned, .ptr_type_sentinel => {
-                const opt, const elem = data.opt_node_and_node;
-                try self.pushOpt(opt);
-                try self.push(elem);
-            },
-            .ptr_type, .ptr_type_bit_range, .assign_destructure => {
-                try self.pushShapedTail(node);
-            },
-            else => {},
-        }
-    }
-
-    /// Binary operators, assignments, ranges, catch/orelse, error unions —
-    /// all `node_and_node` (verified against Parse.zig's operTable).
-    fn pushShapedBinary(self: *Walker, node: NodeIndex) !bool {
-        const tag = self.tree.nodeTag(node);
-        const data = self.tree.nodeData(node);
-        if (binary_like_tags.contains(tag)) {
-            const lhs, const rhs = data.node_and_node;
-            try self.push(lhs);
-            try self.push(rhs);
-            return true;
-        }
-        // `lhs..rhs` and open `lhs..` — the end is optional (shape is
-        // node_and_opt_node, NOT node_and_node; verified against
-        // Parse.zig forPrefix).
-        if (tag == .for_range) {
-            const lhs, const rhs = data.node_and_opt_node;
-            try self.push(lhs);
-            try self.pushOpt(rhs);
-            return true;
-        }
-        return false;
-    }
-};
-
-/// Tags whose data is `node_and_node` (binary ops, assignments, ranges,
-/// catch/orelse, error unions — verified against Parse.zig's operTable).
-const binary_like_tags = blk: {
-    var set = std.EnumSet(Ast.Node.Tag).initEmpty();
-    const tags = [_]Ast.Node.Tag{
-        .assign,          .assign_mul,      .assign_div,      .assign_mod,
-        .assign_add,      .assign_sub,      .assign_shl,      .assign_shl_sat,
-        .assign_shr,      .assign_bit_and,  .assign_bit_xor,  .assign_bit_or,
-        .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat,
-        .assign_add_sat,  .assign_sub_sat,  .equal_equal,     .bang_equal,
-        .less_than,       .greater_than,    .less_or_equal,   .greater_or_equal,
-        .mul,             .div,             .mod,             .array_mult,
-        .mul_wrap,        .mul_sat,         .add,             .sub,
-        .array_cat,       .add_wrap,        .sub_wrap,        .add_sat,
-        .sub_sat,         .shl,             .shl_sat,         .shr,
-        .bit_and,         .bit_xor,         .bit_or,          .bool_and,
-        .bool_or,         .@"orelse",       .@"catch",        .merge_error_sets,
-        .switch_range,    .error_union,     .array_access,
-    };
-    for (tags) |t| set.insert(t);
-    break :blk set;
-};
-
-/// Tags whose subtrees must not be entered during a fn-body walk.
-fn isBoundaryTag(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .root,
-        .test_decl,
-        .error_set_decl,
-        .container_decl,
-        .container_decl_trailing,
-        .container_decl_two,
-        .container_decl_two_trailing,
-        .container_decl_arg,
-        .container_decl_arg_trailing,
-        .tagged_union,
-        .tagged_union_trailing,
-        .tagged_union_two,
-        .tagged_union_two_trailing,
-        .tagged_union_enum_tag,
-        .tagged_union_enum_tag_trailing,
-        .global_var_decl,
-        .fn_decl,
-        .fn_proto,
-        .fn_proto_one,
-        .fn_proto_simple,
-        .fn_proto_multi,
-        .container_field,
-        .container_field_init,
-        .container_field_align,
-        .asm_simple,
-        .@"asm",
-        .asm_input,
-        .asm_output,
-        => true,
-        else => false,
-    };
-}
-
-// ============================================================================
-// Same-file type index (field-type resolution for chained address-of)
-// ============================================================================
-//
-// `&v.words[i]` is stack UB when `words` is an array field but safe when
-// it is a slice field — the syntax is identical, only the field type
-// differs. This index maps type names to their container declarations so
-// chain hops can be resolved. It is deliberately not a semantic layer:
-// only same-file, name-resolvable types participate; everything else is
-// .unknown and the caller stays silent.
-
-const TypeIndex = struct {
-    /// name -> declared containers, each with its lexical scope. Scoped
-    /// per fn (EPH-I0592): two disjoint fn-local types with one name no
-    /// longer collide, and a fn-local type shadows a same-named
-    /// file-scope type for chains inside its function. Residual
-    /// over-approximation, documented honestly: block scopes inside a
-    /// fn are folded into the fn body, so two same-named types in
-    /// sibling blocks of one fn still collide (later declaration wins).
-    /// A chain whose type is not visible falls back to silence, the
-    /// precision policy for unprovable hops.
-    map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(TypeEntry)) = .empty,
-
-    fn deinit(self: *TypeIndex, a: Allocator) void {
-        var it = self.map.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(a);
-        self.map.deinit(a);
-    }
-
-    /// The container a chain in `body` resolves `name` against: the
-    /// innermost fn-local scope containing `body`, else the file-scope
-    /// declaration. Same-scope duplicates are a compile error in real
-    /// code; the later declaration wins for determinism.
-    fn lookup(
-        self: *const TypeIndex,
-        tree: *const Ast,
-        name: []const u8,
-        body: NodeIndex,
-    ) ?NodeIndex {
-        const entries = self.map.get(name) orelse return null;
-        const body_first = tree.firstToken(body);
-        const body_last = tree.lastToken(body);
-        var scoped: ?NodeIndex = null;
-        var scoped_len: u32 = 0;
-        var file_scope: ?NodeIndex = null;
-        for (entries.items) |entry| {
-            const sb = entry.scope_body orelse {
-                file_scope = entry.container;
-                continue;
-            };
-            if (!bodyInside(tree, sb, body_first, body_last)) continue;
-            const len = tree.lastToken(sb) - tree.firstToken(sb);
-            if (scoped == null or len <= scoped_len) {
-                scoped = entry.container;
-                scoped_len = len;
-            }
-        }
-        return scoped orelse file_scope;
-    }
-};
-
-/// One indexed container declaration plus its lexical scope.
-const TypeEntry = struct {
-    container: NodeIndex,
-    /// The innermost fn body containing the declaration, null at file
-    /// scope. See TypeIndex for the block-scope over-approximation.
-    scope_body: ?NodeIndex,
-};
-
-/// True when `body`'s token range sits inside scope `sb` (or is `sb`
-/// itself): the scope's declarations are visible from the body.
-fn bodyInside(tree: *const Ast, sb: NodeIndex, body_first: u32, body_last: u32) bool {
-    return body_first >= tree.firstToken(sb) and body_last <= tree.lastToken(sb);
-}
-
-fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .container_decl,
-        .container_decl_trailing,
-        .container_decl_two,
-        .container_decl_two_trailing,
-        .container_decl_arg,
-        .container_decl_arg_trailing,
-        .tagged_union,
-        .tagged_union_trailing,
-        .tagged_union_two,
-        .tagged_union_two_trailing,
-        .tagged_union_enum_tag,
-        .tagged_union_enum_tag_trailing,
-        => true,
-        else => false,
-    };
-}
-
-/// Index every `const Name = struct/union/enum {...};` in the file,
-/// including fn-local ones (a fn-local type's methods are analyzed with
-/// their own function scans). Each entry records its innermost fn body
-/// so lookups resolve per function (EPH-I0592).
-fn buildTypeIndex(a: Allocator, tree: *const Ast) !TypeIndex {
-    var idx = TypeIndex{};
-    errdefer idx.deinit(a);
-    var bodies: std.ArrayListUnmanaged(NodeIndex) = .empty;
-    defer bodies.deinit(a);
-    var i: usize = 1;
-    while (i < tree.nodes.len) : (i += 1) {
-        const node: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        try bodies.append(a, tree.nodeData(node).node_and_node[1]);
-    }
-    i = 1;
-    while (i < tree.nodes.len) : (i += 1) {
-        const node: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
-        const vd = tree.fullVarDecl(node) orelse continue;
-        const init = vd.ast.init_node.unwrap() orelse continue;
-        if (!isContainerDeclTag(tree.nodeTag(init))) continue;
-        const name = tree.tokenSlice(vd.ast.mut_token + 1);
-        const gop = try idx.map.getOrPut(a, name);
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(a, .{
-            .container = init,
-            .scope_body = innermostFnBody(tree, bodies.items, tree.firstToken(node)),
-        });
-    }
-    return idx;
-}
-
-/// The innermost fn body whose token range contains `tok`, null when the
-/// token sits at file scope.
-fn innermostFnBody(tree: *const Ast, bodies: []const NodeIndex, tok: u32) ?NodeIndex {
-    var found: ?NodeIndex = null;
-    var found_len: u32 = 0;
-    for (bodies) |body| {
-        const first = tree.firstToken(body);
-        const last = tree.lastToken(body);
-        if (tok <= first or tok >= last) continue;
-        const len = last - first;
-        if (found == null or len < found_len) {
-            found = body;
-            found_len = len;
-        }
-    }
-    return found;
-}
-
-/// The declared type node of a container field, when resolvable.
-fn fieldTypeNode(tree: *const Ast, container: NodeIndex, field: []const u8) ?NodeIndex {
-    var buf: [2]NodeIndex = undefined;
-    const cd = tree.fullContainerDecl(&buf, container) orelse return null;
-    for (cd.ast.members) |member| {
-        switch (tree.nodeTag(member)) {
-            .container_field, .container_field_init, .container_field_align => {},
-            else => continue,
-        }
-        const name = tree.tokenSlice(tree.nodeMainToken(member));
-        if (!mem.eql(u8, name, field)) continue;
-        const cf = tree.fullContainerField(member) orelse return null;
-        return cf.ast.type_expr.unwrap();
-    }
-    return null;
-}
-
-/// One step of chain resolution through a type expression.
-const TypeStep = union(enum) {
-    /// Pointer/slice: everything beyond is caller-owned memory.
-    safe,
-    /// Named type: resolvable further via the TypeIndex.
-    named: []const u8,
-    /// `[N]T` — an index hop stays inside the stack slot.
-    array_elem: NodeIndex,
-    /// `?T` — an unwrap hop stays inside the stack slot.
-    optional_payload: NodeIndex,
-    /// Unprovable from the AST — the caller stays silent.
-    unknown,
-};
-
-fn classifyTypeNode(tree: *const Ast, node: NodeIndex) TypeStep {
-    if (isPointerTypeExpr(tree, node)) return .safe;
-    switch (tree.nodeTag(node)) {
-        .identifier => {
-            return .{ .named = tree.tokenSlice(tree.nodeMainToken(node)) };
-        },
-        .array_type, .array_type_sentinel => {
-            const at = tree.fullArrayType(node) orelse return .unknown;
-            return .{ .array_elem = at.ast.elem_type };
-        },
-        .optional_type => {
-            return .{ .optional_payload = tree.nodeData(node).node };
-        },
-        else => return .unknown,
-    }
-}
-
-fn stepThroughHop(sctx: ScanCtx, cur: TypeStep, hop: Hop) TypeStep {
-    switch (cur) {
-        .safe, .unknown => return cur,
-        .array_elem => |elem| {
-            if (hop != .index) return .unknown;
-            return classifyTypeNode(sctx.tree, elem);
-        },
-        .optional_payload => |payload| {
-            if (hop != .unwrap) return .unknown;
-            return classifyTypeNode(sctx.tree, payload);
-        },
-        .named => |name| {
-            const container = sctx.tidx.lookup(sctx.tree, name, sctx.body) orelse return .unknown;
-            if (hop != .field) return .unknown;
-            const ft = fieldTypeNode(sctx.tree, container, hop.field) orelse return .unknown;
-            return classifyTypeNode(sctx.tree, ft);
-        },
-    }
-}
-
-const ChainSafety = enum { unsafe, safe, unknown };
-
-/// The `.safe` verdict for one hop: safe only while hops remain after
-/// it. A final-hop `.safe` addresses the slot that stores the
-/// pointer/slice value itself, inside the stack copy (EPH-I0590).
-fn safeVerdict(hi: usize) ChainSafety {
-    return if (hi == 0) .unsafe else .safe;
-}
-
-/// Resolve whether a chained address-of provably stays inside the stack
-/// frame. Hops are stored outermost-first, so resolution walks them in
-/// reverse (root-adjacent hop first).
-fn resolveChainSafety(sctx: ScanCtx, info: ChainInfo, root_type: OptIndex) ChainSafety {
-    if (info.overflow) return .unknown;
-    const root_node = root_type.unwrap() orelse return .unknown;
-    var cur = classifyTypeNode(sctx.tree, root_node);
-    var hi = info.hop_count;
-    while (hi > 0) {
-        hi -= 1;
-        cur = stepThroughHop(sctx, cur, info.hops[hi]);
-        switch (cur) {
-            // Pointer/slice terminates the walk safely only while hops
-            // remain after it: the address then points BEHIND the
-            // pointer/slice (EPH-I0590).
-            .safe => return safeVerdict(hi),
-            .unknown => return .unknown,
-            else => {},
-        }
-    }
-    return .unsafe;
-}
-
-// ============================================================================
-// ZA111 collection passes
-// ============================================================================
-
-/// Unwrap parenthesized expressions: `return (&x);` is `return &x;`.
-fn unwrapGroup(tree: *const Ast, node: NodeIndex) NodeIndex {
-    var cur = node;
-    while (tree.nodeTag(cur) == .grouped_expression) {
-        cur = tree.nodeData(cur).node_and_token[0];
-    }
-    return cur;
-}
-
-/// One hop of an address-of chain.
-const Hop = union(enum) {
-    field: []const u8,
-    index,
-    unwrap,
-};
-
-/// Peeled address-of chain: `s.a[i].?` roots at `s` with hops
-/// [unwrap, index, field a] collected outermost-first (resolution walks
-/// them in reverse). Chains longer than the buffer are unresolvable.
-const ChainInfo = struct {
-    root: []const u8 = "",
-    hops: [8]Hop = undefined,
-    hop_count: usize = 0,
-    overflow: bool = false,
-};
-
-/// Peel one chain hop, advancing `cur` past it; null ends the chain.
-fn peelHop(tree: *const Ast, cur: *NodeIndex) ?Hop {
-    cur.* = unwrapGroup(tree, cur.*);
-    switch (tree.nodeTag(cur.*)) {
-        .field_access => {
-            const tok = tree.nodeData(cur.*).node_and_token[1];
-            cur.* = tree.nodeData(cur.*).node_and_token[0];
-            return .{ .field = tree.tokenSlice(tok) };
-        },
-        .unwrap_optional => {
-            cur.* = tree.nodeData(cur.*).node_and_token[0];
-            return .unwrap;
-        },
-        .array_access => {
-            cur.* = tree.nodeData(cur.*).node_and_node[0];
-            return .index;
-        },
-        else => return null,
-    }
-}
-
-fn chainInfo(tree: *const Ast, start: NodeIndex) ChainInfo {
-    var info = ChainInfo{};
-    var cur = start;
-    while (peelHop(tree, &cur)) |hop| {
-        if (info.hop_count >= info.hops.len) {
-            info.overflow = true;
-        } else {
-            info.hops[info.hop_count] = hop;
-            info.hop_count += 1;
-        }
-    }
-    if (tree.nodeTag(cur) == .identifier) {
-        info.root = tree.tokenSlice(tree.nodeMainToken(cur));
-    }
-    return info;
-}
-
-/// Params whose address is provably static or unprovable are excluded:
-/// comptime params and comptime-only types live in constant memory, and
-/// anytype params cannot be proven runtime from the AST alone.
-fn collectParams(
-    a: Allocator,
-    tree: *const Ast,
-    proto: NodeIndex,
-    scan: *FnScan,
-) !void {
-    var buf: [1]NodeIndex = undefined;
-    const fp = tree.fullFnProto(&buf, proto) orelse return;
-    var it = fp.iterate(tree);
-    while (it.next()) |param| {
-        if (param.anytype_ellipsis3 != null) continue;
-        const name_tok = param.name_token orelse continue;
-        if (param.comptime_noalias) |t| {
-            if (mem.eql(u8, tree.tokenSlice(t), "comptime")) continue;
-        }
-        var is_pointer = false;
-        var type_node: OptIndex = .none;
-        if (param.type_expr) |te| {
-            if (isComptimeOnlyType(tree, te)) continue;
-            is_pointer = isPointerTypeExpr(tree, te);
-            type_node = te.toOptional();
-        }
-        try scan.params.append(a, .{
-            .name = tree.tokenSlice(name_tok),
-            .is_pointer = is_pointer,
-            .type_node = type_node,
-        });
-    }
-}
-
-fn isComptimeOnlyType(tree: *const Ast, node: NodeIndex) bool {
-    if (tree.nodeTag(node) != .identifier) return false;
-    const name = tree.tokenSlice(tree.nodeMainToken(node));
-    const comptime_types = [_][]const u8{ "comptime_int", "comptime_float", "type" };
-    for (comptime_types) |ct| {
-        if (mem.eql(u8, name, ct)) return true;
-    }
-    return false;
-}
-
-/// True when a type expression is a pointer/slice type (`*T`, `[]T`,
-/// `[*]T`, plus align/sentinel/bitrange variants). Optional-wrapped
-/// pointers stay false: `&opt.?` addresses the payload inside the
-/// optional's own stack slot, so it remains escapable.
-fn isPointerTypeExpr(tree: *const Ast, node: NodeIndex) bool {
-    return switch (tree.nodeTag(node)) {
-        .ptr_type, .ptr_type_aligned, .ptr_type_sentinel, .ptr_type_bit_range => true,
-        else => false,
-    };
-}
-
-/// Phase 1: all `var` locals. `var` is always a runtime stack slot;
-/// `const` locals are only tracked as aliases (a comptime-known const
-/// lives in static memory — flagging it would be a false positive).
-fn collectLocals(
-    a: Allocator,
-    tree: *const Ast,
-    decls: []const NodeIndex,
-    scan: *FnScan,
-) !void {
-    for (decls) |node| {
-        const vd = tree.fullVarDecl(node) orelse continue;
-        if (!mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "var")) continue;
-        // `comptime var` lives in static memory (the comptime string-
-        // builder idiom) — its address never refers to the stack frame.
-        if (vd.comptime_token != null) continue;
-        try scan.locals.append(a, .{
-            .name = tree.tokenSlice(vd.ast.mut_token + 1),
-            .provably_array = isArrayVarDecl(tree, vd),
-            .is_pointer = isPointerVarDecl(tree, vd, scan),
-            .type_node = varDeclTypeNode(tree, vd),
-        });
-    }
-}
-
-/// The best available type node for a var local: the explicit annotation,
-/// or the type of an explicitly-typed init (`var s = S{...}`).
-fn varDeclTypeNode(tree: *const Ast, vd: Ast.full.VarDecl) OptIndex {
-    if (vd.ast.type_node != .none) return vd.ast.type_node;
-    const init = vd.ast.init_node.unwrap() orelse return .none;
-    var buf: [2]NodeIndex = undefined;
-    if (tree.fullStructInit(&buf, init)) |si| return si.ast.type_expr;
-    if (tree.fullArrayInit(&buf, init)) |ai| return ai.ast.type_expr;
-    return .none;
-}
-
-/// Pointer-ness of a var local: explicit pointer annotation, an
-/// address-of init (`var p = &x;` — address-of always yields a pointer),
-/// or an inferred type copied from a binding already known to be a
-/// pointer (`var q = p;`). Anything else inferred is unprovable from the
-/// AST — treated as by-value.
-fn isPointerVarDecl(tree: *const Ast, vd: Ast.full.VarDecl, scan: *const FnScan) bool {
-    if (vd.ast.type_node.unwrap()) |t| return isPointerTypeExpr(tree, t);
-    const init = vd.ast.init_node.unwrap() orelse return false;
-    const e = unwrapGroup(tree, init);
-    if (tree.nodeTag(e) == .address_of) return true;
-    if (tree.nodeTag(e) != .identifier) return false;
-    const name = tree.tokenSlice(tree.nodeMainToken(e));
-    if (scan.paramByName(name)) |p| return p.is_pointer;
-    // Local-to-local inference needs source order (use-before-decl is
-    // impossible, so the source of the copy is always earlier). The
-    // caller sorts decls by first token before this pass.
-    if (scan.localByName(name)) |l| return l.is_pointer;
-    return false;
-}
-
-fn declTokenLessThan(tree: *const Ast, a: NodeIndex, b: NodeIndex) bool {
-    return tree.firstToken(a) < tree.firstToken(b);
-}
-
-/// Sort declarations into source order: the walker discovers them in
-/// DFS pop order, but pointer inference and alias resolution rely on
-/// use-before-decl ordering.
-fn sortDeclsBySource(tree: *const Ast, decls: []NodeIndex) void {
-    std.sort.pdq(NodeIndex, decls, tree, declTokenLessThan);
-}
-
-fn isArrayVarDecl(tree: *const Ast, vd: Ast.full.VarDecl) bool {
-    if (vd.ast.type_node.unwrap()) |t| {
-        switch (tree.nodeTag(t)) {
-            .array_type, .array_type_sentinel => return true,
-            else => {},
-        }
-    }
-    const init = vd.ast.init_node.unwrap() orelse return false;
-    return switch (tree.nodeTag(init)) {
-        .array_init,
-        .array_init_comma,
-        .array_init_one,
-        .array_init_one_comma,
-        => true,
-        else => false,
-    };
-}
-
-/// Bundled immutable context for the collection passes (keeps ≤4 params).
-const ScanCtx = struct {
-    tree: *const Ast,
-    tidx: *const TypeIndex,
-    /// The fn body under analysis: scopes TypeIndex lookups (EPH-I0592).
-    body: NodeIndex,
-};
-
-/// Phase 2: const aliases (`const p = &x...;`). Fixed-point over the decl
-/// list so transitive aliases (`const q = p;`) resolve regardless of the
-/// walk's discovery order. Bounded by one round per declaration.
-fn collectAliases(
-    a: Allocator,
-    sctx: ScanCtx,
-    decls: []const NodeIndex,
-    scan: *FnScan,
-) !void {
-    var progress = true;
-    var rounds: usize = 0;
-    while (progress and rounds <= decls.len) : (rounds += 1) {
-        progress = false;
-        for (decls) |node| {
-            if (try tryCollectAlias(a, sctx, node, scan)) progress = true;
-        }
-    }
-}
-
-fn tryCollectAlias(
-    a: Allocator,
-    sctx: ScanCtx,
-    node: NodeIndex,
-    scan: *FnScan,
-) !bool {
-    const tree = sctx.tree;
-    const vd = tree.fullVarDecl(node) orelse return false;
-    if (!mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) return false;
-    const name = tree.tokenSlice(vd.ast.mut_token + 1);
-    if (scan.aliasRoot(name) != null) return false;
-    const init = vd.ast.init_node.unwrap() orelse return false;
-    const root = aliasTarget(sctx, scan, init) orelse return false;
-    try scan.aliases.append(a, .{ .name = name, .root = root });
-    return true;
-}
-
-/// The stack local or param an alias initializer points into, if provable.
-/// A chained address resolved safe/unknown (`&ptr.x`, `&v.slice[i]`, or
-/// unresolvable) does not point into the stack frame — no alias.
-fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 {
-    const e = unwrapGroup(sctx.tree, init);
-    switch (sctx.tree.nodeTag(e)) {
-        .address_of => return aliasAddressTarget(sctx, scan, e),
-        .identifier => {
-            const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(e));
-            return scan.aliasRoot(name);
-        },
-        else => return null,
-    }
-}
-
-fn aliasAddressTarget(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?[]const u8 {
-    const info = chainInfo(sctx.tree, sctx.tree.nodeData(amp).node);
-    if (info.root.len == 0) return null;
-    const bind = bindForRoot(info.root, scan) orelse return null;
-    if (info.hop_count > 0 and !chainIsUnsafe(sctx, info, bind)) return null;
-    return info.root;
-}
-
-/// The chain-relevant view of a binding (param or local).
-const Bind = struct {
-    is_pointer: bool,
-    type_node: OptIndex,
-    /// Bare `&param` is missed by Sema (flag); bare `&var` is a hard
-    /// compile error (never echo).
-    is_param: bool,
-};
-
-/// Resolve a chain-root identifier to its binding, params first.
-fn bindForRoot(name: []const u8, scan: *const FnScan) ?Bind {
-    if (scan.paramByName(name)) |p| {
-        return .{ .is_pointer = p.is_pointer, .type_node = p.type_node, .is_param = true };
-    }
-    if (scan.localByName(name)) |l| {
-        return .{ .is_pointer = l.is_pointer, .type_node = l.type_node, .is_param = false };
-    }
-    return null;
-}
-
-fn chainIsUnsafe(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
-    if (bind.is_pointer) return false;
-    return resolveChainSafety(sctx, info, bind.type_node) == .unsafe;
-}
-
-// ============================================================================
-// ZA111 return classification + emission
-// ============================================================================
-
-const Finding = struct {
-    /// Stack local or param the returned pointer/slice refers to.
-    name: []const u8,
-    /// Alias the pointer was returned through, when not returned directly.
-    via: ?[]const u8,
-    is_slice: bool,
-    is_param: bool = false,
-};
-
-fn classifyReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
-    const expr = sctx.tree.nodeData(node).opt_node.unwrap() orelse return null;
-    const e = unwrapGroup(sctx.tree, expr);
-    return switch (sctx.tree.nodeTag(e)) {
-        .address_of => classifyAddressOf(sctx, scan, e),
-        .slice_open, .slice, .slice_sentinel => classifySlice(sctx.tree, scan, e),
-        .identifier => classifyAliasReturn(sctx.tree, scan, e),
-        else => null,
-    };
-}
-
-fn classifyAddressOf(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?Finding {
-    const info = chainInfo(sctx.tree, sctx.tree.nodeData(amp).node);
-    if (info.root.len == 0) return null;
-    const bind = bindForRoot(info.root, scan) orelse return null;
-    if (info.hop_count == 0) {
-        // Bare &var is a hard compile error (Zig Sema) — never echo it.
-        if (!bind.is_param) return null;
-        return .{ .name = info.root, .via = null, .is_slice = false, .is_param = true };
-    }
-    if (!chainIsUnsafe(sctx, info, bind)) return null;
-    return .{ .name = info.root, .via = null, .is_slice = false, .is_param = bind.is_param };
-}
-
-fn classifySlice(tree: *const Ast, scan: *const FnScan, node: NodeIndex) ?Finding {
-    const s = tree.fullSlice(node) orelse return null;
-    const sliced = unwrapGroup(tree, s.ast.sliced);
-    if (tree.nodeTag(sliced) != .identifier) return null;
-    const name = tree.tokenSlice(tree.nodeMainToken(sliced));
-    const local = scan.localByName(name) orelse return null;
-    // Only provable arrays: slicing a slice copies the caller-owned pointer.
-    if (!local.provably_array) return null;
-    return .{ .name = name, .via = null, .is_slice = true };
-}
-
-fn classifyAliasReturn(tree: *const Ast, scan: *const FnScan, node: NodeIndex) ?Finding {
-    const name = tree.tokenSlice(tree.nodeMainToken(node));
-    const root = scan.aliasRoot(name) orelse return null;
-    return .{
-        .name = root,
-        .via = name,
-        .is_slice = false,
-        .is_param = scan.paramByName(root) != null,
-    };
-}
-
-const Za111Ctx = struct {
-    a: Allocator,
-    actx: *const AstContext,
-    tidx: *const TypeIndex,
-    path: []const u8,
-    out: *std.ArrayListUnmanaged(Issue),
-};
-
-fn emitZa111(ctx: *const Za111Ctx, node: NodeIndex, f: Finding) !void {
-    const what = if (f.is_param) "parameter" else "local";
-    const msg = if (f.via) |via|
-        try std.fmt.allocPrint(ctx.a, "returned pointer '{s}' refers to stack {s} " ++
-            "'{s}' — its storage expires when the function returns", .{ via, what, f.name })
-    else if (f.is_slice)
-        try std.fmt.allocPrint(ctx.a, "returned slice refers to stack array " ++
-            "'{s}' — its storage expires when the function returns", .{f.name})
-    else
-        try std.fmt.allocPrint(ctx.a, "returned pointer refers to stack {s} " ++
-            "'{s}' — its storage expires when the function returns", .{ what, f.name });
-    // The append below allocates the Issue before the message slot is
-    // committed: on append failure the message must not leak (EPH-I0594).
-    errdefer ctx.a.free(msg);
-    const lc = ctx.actx.nodeLineCol(node);
-    try ctx.out.append(ctx.a, .{
-        .file = ctx.path,
-        .line = lc.line,
-        .col = lc.col,
-        .severity = .err,
-        .rule = RULE_ZA111,
-        .message = msg,
-        .message_owned = true,
-        .help = "copy the value out, heap-allocate it, " ++
-            "or have the caller provide the buffer",
-    });
-}
-
-fn analyzeOneFn(
-    ctx: *const Za111Ctx,
-    proto: NodeIndex,
-    body: NodeIndex,
-) !void {
-    var walker = Walker{ .a = ctx.a, .tree = &ctx.actx.tree };
-    defer walker.deinit();
-    try walker.run(body);
-    sortDeclsBySource(&ctx.actx.tree, walker.var_decls.items);
-
-    const sctx = ScanCtx{ .tree = &ctx.actx.tree, .tidx = ctx.tidx, .body = body };
-    var scan = FnScan{};
-    defer scan.deinit(ctx.a);
-    try collectParams(ctx.a, sctx.tree, proto, &scan);
-    try collectLocals(ctx.a, sctx.tree, walker.var_decls.items, &scan);
-    try collectAliases(ctx.a, sctx, walker.var_decls.items, &scan);
-
-    for (walker.returns.items) |ret| {
-        const f = classifyReturn(sctx, &scan, ret) orelse continue;
-        try emitZa111(ctx, ret, f);
-    }
-}
-
-fn analyzeFileZa111(ctx: *const Za111Ctx) !void {
-    const tree = &ctx.actx.tree;
-    var i: usize = 1;
-    while (i < tree.nodes.len) : (i += 1) {
-        const node: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
-        if (tree.nodeTag(node) != .fn_decl) continue;
-        const proto, const body = tree.nodeData(node).node_and_node;
-        try analyzeOneFn(ctx, proto, body);
-    }
-}
-
 /// Run every AST-tier rule over one file. Files with parse errors, deep
-/// nesting, or a size past `max_ast_file_bytes` are skipped. The line
-/// tier still covers them. Only allocation and thread-spawn errors are
-/// propagated.
+/// nesting, a size past `max_ast_file_bytes`, or a refused parse thread
+/// are skipped and counted; the line tier still covers them. Allocation
+/// errors propagate (EPH-I0597).
 pub fn analyzeFileAstTier(
     a: Allocator,
     out: AstTierOut,
@@ -1451,28 +429,38 @@ pub fn analyzeFileAstTier(
         if (out.stats) |s| s.skipped += 1;
         return;
     }
-    var actx = try AstContext.init(a, content);
-    defer actx.deinit(a);
-    if (!actx.ok) {
+    const outcome = runGuardedParse(a, content, spawnParseWorker);
+    var parsed = try resolveParseOutcome(outcome, out.stats) orelse return;
+    defer parsed.deinit(a);
+    if (!parsed.ok) {
         if (out.stats) |s| s.skipped += 1;
         return;
     }
-    if (out.stats) |s| s.parsed += 1;
-    var tidx = try buildTypeIndex(a, &actx.tree);
+    var tidx = try za111.buildTypeIndex(a, &parsed.tree);
     defer tidx.deinit(a);
-    var ctx = Za111Ctx{
+    var ctx = za111.Za111Ctx{
         .a = a,
-        .actx = &actx,
+        .tree = &parsed.tree,
         .tidx = &tidx,
         .path = path,
         .out = out.issues,
     };
-    try analyzeFileZa111(&ctx);
+    try za111.analyzeFileZa111(&ctx);
+    // A file counts parsed only when its analysis completes: an OOM
+    // mid-analysis must not count the file as analyzed (EPH-I0600).
+    if (out.stats) |s| s.parsed += 1;
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
+
+test {
+    // Test-reference idiom: the ast_tier_za111 split's tests must join
+    // the suite (EPH-I0601). Body-only references do not force analysis
+    // of test declarations.
+    _ = za111;
+}
 
 fn runZa111(a: Allocator, content: []const u8) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -1519,6 +507,39 @@ test "AstContext: nodeLineCol is 1-based" {
     const lc = ctx.nodeLineCol(decl.?);
     try std.testing.expectEqual(@as(usize, 1), lc.line);
     try std.testing.expectEqual(@as(usize, 1), lc.col);
+}
+
+/// Test seam: a spawner that always refuses, standing in for an
+/// environment that cannot create the parse thread (EPH-I0597).
+fn refusingSpawn(job: *ParseJob) anyerror!std.Thread {
+    _ = job;
+    return error.TestThreadRefused;
+}
+
+test "spawn refusal degrades the file to a counted skip (EPH-I0597)" {
+    const a = std.testing.allocator;
+    const outcome = runGuardedParse(a, "fn f() void {}\n", refusingSpawn);
+    try std.testing.expect(outcome == .spawn_refused);
+    var stats = Stats{};
+    const parsed = try resolveParseOutcome(outcome, &stats);
+    try std.testing.expect(parsed == null);
+    try std.testing.expectEqual(@as(usize, 0), stats.parsed);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped);
+}
+
+test "guarded parse runs the worker and yields the context (EPH-I0597)" {
+    const a = std.testing.allocator;
+    var outcome = runGuardedParse(a, "fn f() void {}\n", spawnParseWorker);
+    switch (outcome) {
+        .ok => |*ctx| ctx.deinit(a),
+        .spawn_refused => return error.TestExpectedSpawn,
+        .err => |err| return err,
+    }
+}
+
+test "F12 guard: both AST-tier halves stay under the ZA111 byte cap (EPH-I0601)" {
+    try std.testing.expect(@embedFile("ast_tier.zig").len <= max_ast_file_bytes);
+    try std.testing.expect(@embedFile("ast_tier_za111.zig").len <= max_ast_file_bytes);
 }
 
 test "ZA111: field of local var fires" {
@@ -1951,42 +972,6 @@ test "ZA111: await parses as an identifier, no walker arm needed (EPH-I0596)" {
     try expectZa111(issues.items, 5, "'s'");
 }
 
-test "walker: assign_destructure pushes lhs bindings (EPH-I0596)" {
-    const a = std.testing.allocator;
-    var ctx = try AstContext.init(a,
-        \\const S = struct { a: u32 };
-        \\fn f(pair: [2]S) void {
-        \\    var x, var y = pair;
-        \\    _ = x;
-        \\    _ = y;
-        \\}
-    );
-    defer ctx.deinit(a);
-    var body: ?NodeIndex = null;
-    var i: usize = 1;
-    while (i < ctx.tree.nodes.len) : (i += 1) {
-        const n: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
-        if (ctx.tree.nodeTag(n) == .fn_decl) {
-            body = ctx.tree.nodeData(n).node_and_node[1];
-        }
-    }
-    var walker = Walker{ .a = a, .tree = &ctx.tree };
-    defer walker.deinit();
-    try walker.run(body.?);
-    // The destructure lhs patterns are var decls: both bindings must
-    // enter FnScan through the walker.
-    var found_x = false;
-    var found_y = false;
-    for (walker.var_decls.items) |n| {
-        const vd = ctx.tree.fullVarDecl(n).?;
-        const name = ctx.tree.tokenSlice(vd.ast.mut_token + 1);
-        found_x = found_x or mem.eql(u8, name, "x");
-        found_y = found_y or mem.eql(u8, name, "y");
-    }
-    try std.testing.expect(found_x);
-    try std.testing.expect(found_y);
-}
-
 test "ZA111: destructured binding chains stay silent (untyped lhs, EPH-I0596)" {
     const a = std.testing.allocator;
     // Destructured `var` bindings enter FnScan as by-value locals, but
@@ -2046,6 +1031,27 @@ test "exceedsNestingBudget: unbalanced closers clamp at zero" {
     try std.testing.expect(exceedsNestingBudget(")((", 1));
 }
 
+test "exceedsNestingBudget: fn-type split across lines counts (EPH-I0598)" {
+    // The type form is `fn (`: with the paren on the next line the
+    // lookahead crosses the break and counts like the single-line form.
+    // Two chained fn types drive the run past the `(`'s own depth, so
+    // only the crossed-line lookahead can cross the budget.
+    try std.testing.expect(exceedsNestingBudget("const x: fn\n() fn() void = undefined;", 1));
+    try std.testing.expect(!exceedsNestingBudget("const x: fn\n() fn() void = undefined;", 2));
+    // The single-line chain crosses the same budget.
+    try std.testing.expect(exceedsNestingBudget("const x: fn () fn () void = undefined;", 1));
+    // A declaration split across the break does not count.
+    try std.testing.expect(!exceedsNestingBudget("fn\nname() void {}", 1));
+}
+
+test "exceedsNestingBudget: broken anyframe watch restores the parked run (EPH-I0599)" {
+    // Frames parked before a bare `anyframe` operand stay live after
+    // the operand: a non-arrow break restores them instead of
+    // discarding them, so chains past the break keep counting.
+    try std.testing.expect(exceedsNestingBudget("?anyframe.x*", 1));
+    try std.testing.expect(!exceedsNestingBudget("?anyframe.x*", 2));
+}
+
 /// Valid Zig with `n` nested grouped expressions: `const x = (((1)));`.
 /// The shape stays parseable at any depth, so only the budget decides
 /// skip vs parse.
@@ -2090,6 +1096,46 @@ fn expectTierCounters(src: []const u8, want_parsed: usize, want_skipped: usize) 
     try std.testing.expectEqual(want_parsed, stats.parsed);
     try std.testing.expectEqual(want_skipped, stats.skipped);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+}
+
+test "parsed counts only fully analyzed files (EPH-I0600)" {
+    const src =
+        \\const S = struct { a: u32 };
+        \\fn f() *u32 {
+        \\    var s: S = undefined;
+        \\    return &s.a;
+        \\}
+    ;
+    // A clean run parses and analyzes the file.
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        defer types.deinitIssues(&issues, probe.allocator());
+        var stats = Stats{};
+        try analyzeFileAstTier(probe.allocator(), .{ .issues = &issues, .stats = &stats }, "test.zig", src);
+        try std.testing.expectEqual(@as(usize, 1), stats.parsed);
+        try std.testing.expectEqual(@as(usize, 0), stats.skipped);
+    }
+    const total_allocs = probe.allocations;
+    // Every induced allocation failure must leave `parsed` at zero: a
+    // file counts parsed only when its analysis completes.
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        defer types.deinitIssues(&issues, failing.allocator());
+        var stats = Stats{};
+        const err = analyzeFileAstTier(
+            failing.allocator(),
+            .{ .issues = &issues, .stats = &stats },
+            "test.zig",
+            src,
+        ) catch |e| e;
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(@as(usize, 0), stats.parsed);
+    }
 }
 
 test "EPH-I0191: over-budget nesting skips the AST tier, counted in stats" {

@@ -13332,11 +13332,19 @@ const ImportGraph = struct {
         if (mem.eql(u8, imp, "std")) return;
         if (mem.eql(u8, imp, "builtin")) return;
         if (hasImportPath(analysis, imp)) return;
+        // Build the record fully, then commit: each dupe frees itself on
+        // a later failure, and the append hands ownership to the analysis
+        // on success (EPH-I0582, hashmap-ownership rule).
+        const path_copy = try self.allocator.dupe(u8, imp);
+        errdefer self.allocator.free(path_copy);
+        const name_copy = try self.allocator.dupe(u8, "_");
+        errdefer self.allocator.free(name_copy);
         const resolved = try self.resolveImport(file_path, imp);
+        errdefer if (resolved) |r| self.allocator.free(r);
         try analysis.imports.append(self.allocator, .{
-            .path = try self.allocator.dupe(u8, imp),
+            .path = path_copy,
             .resolved = resolved,
-            .name = try self.allocator.dupe(u8, "_"),
+            .name = name_copy,
             .line = 0,
             .col = 0,
             .is_pub = false,
@@ -18619,7 +18627,7 @@ fn quotedCallSite(code: []const u8, i: usize) ?CallSite {
     if (i + 1 >= code.len or code[i + 1] != '"') return null;
     const after = skipQuotedIdent(code, i + 2);
     if (after <= i + 2 or after > code.len or code[after - 1] != '"') return null;
-    const paren = skipWhitespace(code, after, false);
+    const paren = skipWhitespace(code, after);
     if (paren < code.len and code[paren] == '(') {
         return .{ .start = i, .name_end = after, .open_paren = paren };
     }
@@ -18657,7 +18665,7 @@ fn nextCallSite(code: []const u8, from: usize) ?CallSite {
             continue;
         }
         const end = identRunEnd(code, i);
-        const paren = skipWhitespace(code, end, false);
+        const paren = skipWhitespace(code, end);
         if (paren < code.len and code[paren] == '(') {
             return .{ .start = i, .name_end = end, .open_paren = paren };
         }
@@ -20170,7 +20178,7 @@ fn collectQuotedIdentEvidence(
     const after_quote = skipQuotedIdent(code, i + 2);
     if (after_quote <= i + 2 or code[after_quote - 1] != '"') return null;
     const quoted = code[i + 2 .. after_quote - 1];
-    const paren = skipWhitespace(code, after_quote, false);
+    const paren = skipWhitespace(code, after_quote);
     const is_call = paren < code.len and code[paren] == '(';
     if (in_test_context) {
         try ctx.evidence.tested.put(ctx.allocator, quoted, {});
@@ -20332,7 +20340,7 @@ fn collectUntestedFnIdents(
             continue;
         }
         const end = identRunEnd(code, i);
-        const paren = skipWhitespace(code, end, false);
+        const paren = skipWhitespace(code, end);
         const is_call = paren < code.len and code[paren] == '(';
         // A bare `.field` run is a struct-literal LHS/shorthand or an enum
         // tag — a field name, never a fn value reference (EPH-I0909): it
@@ -36347,7 +36355,7 @@ fn parseConfigJsonSource(ctx: ConfigParseCtx) !void {
         const key_result = parseJsonString(content, i);
         const sep_stop = findKeySeparator(content, key_result.end);
         if (sep_stop < content.len and content[sep_stop] == ':') {
-            i = skipWhitespace(content, sep_stop + 1, false);
+            i = skipWhitespace(content, sep_stop + 1);
             i = try handleConfigKey(ctx, i, key_result.val);
             continue;
         }
@@ -42219,6 +42227,42 @@ test "analyzeFile releases the analysis when the graph insert fails (EPH-I0375)"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.zig", .data = "const x = @import(\"std\");\npub fn f() void {}\n" });
+    const file_path = try tmpFilePath(allocator, &tmp, "f.zig");
+    defer allocator.free(file_path);
+
+    var probe = std.testing.FailingAllocator.init(allocator, .{});
+    {
+        var graph = ImportGraph.init(probe.allocator(), &diag);
+        defer graph.deinit();
+        try graph.analyzeFile(file_path);
+    }
+    const total_allocs = probe.allocations;
+
+    var fail_index: usize = 0;
+    while (fail_index < total_allocs) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{
+            .fail_index = fail_index,
+        });
+        var graph = ImportGraph.init(failing.allocator(), &diag);
+        defer graph.deinit();
+        graph.analyzeFile(file_path) catch continue;
+    }
+}
+
+test "tryAddBareImport leaks nothing under allocation failure (EPH-I0582)" {
+    // OOM sweep over tryAddBareImport's allocations: a bare import of an
+    // existing file exercises the resolved dupe, the path and name dupes,
+    // and the append growth. Pre-fix, a failed dupe or append leaked the
+    // earlier allocations (the resolved slice and the path copy).
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "f.zig",
+        .data = "fn f() void { _ = @import(\"dep.zig\"); }\n",
+    });
     const file_path = try tmpFilePath(allocator, &tmp, "f.zig");
     defer allocator.free(file_path);
 

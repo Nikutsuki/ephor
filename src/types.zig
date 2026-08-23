@@ -210,6 +210,9 @@ pub const Issue = struct {
     severity: Severity,
     rule: []const u8,
     message: []const u8,
+    /// Always borrowed: never heap-owned by this issue, and deinit never
+    /// frees it (EPH-I0583). Producers point it at comptime literals or
+    /// at buffers whose lifetime exceeds the issue's.
     help: ?[]const u8,
     message_owned: bool = false,
     /// True when `file` is heap-owned by this issue and deinit must free
@@ -348,66 +351,116 @@ pub const OutBuf = struct {
     }
 };
 
+/// One hostile format unit: the input bytes it spans and the codepoint it
+/// carries. A clean sequence reports len 0.
+const HostileUnit = struct {
+    len: usize,
+    cp: u21,
+};
+
+/// Inclusive window for a lead byte's first continuation byte.
+const ByteWindow = struct {
+    min: u8,
+    max: u8,
+};
+
 /// Byte length of the hostile sequence starting at `s[0]`, or 0 when the
 /// byte is safe to print. Multi-byte format characters consume their full
 /// UTF-8 sequence so one placeholder replaces the whole character.
 fn hostileSeqLen(s: []const u8) usize {
     const b = s[0];
     if (b < 0x20 or b == 0x7F) return 1;
-    if (b == 0xC2) return c1SeqLen(s);
-    if (b == 0xE2) return formatSeqLen(s);
-    if (b == 0xEF) return bomSeqLen(s);
-    return 0;
+    return hostileUnit(s).len;
 }
 
-/// C1 controls (U+0080..U+009F) arrive UTF-8 encoded as 0xC2 0x80..0x9F.
-/// U+0085 NEL is a line terminator and a log-forgery vector on its own. A
-/// truncated lead byte consumes the rest: it is invalid UTF-8 regardless.
-fn c1SeqLen(s: []const u8) usize {
-    if (s.len < 2) return s.len;
-    if (s[1] >= 0x80 and s[1] <= 0x9F) return 2;
-    return 0;
-}
-
-/// Hostile format characters under the 0xE2 lead (see formatCodepoint).
-fn formatSeqLen(s: []const u8) usize {
-    if (s.len < 3) return s.len;
-    if (formatCodepoint(s) != null) return 3;
-    return 0;
-}
-
-/// U+FEFF (zero-width no-break space, BOM) under the 0xEF lead.
-fn bomSeqLen(s: []const u8) usize {
-    if (s.len < 3) return s.len;
-    if (s[1] == 0xBB and s[2] == 0xBF) return 3;
-    return 0;
-}
-
-/// Codepoint of a hostile U+20xx format character (s[0] == 0xE2, s.len >=
-/// 3), or null when the sequence is clean: U+200E/U+200F bidi marks,
-/// U+2028/U+2029 line and paragraph separators, U+202A..U+202E bidi
-/// embeddings and overrides, U+2066..U+2069 bidi isolates. Shared by the
-/// terminal filter and the JSON escaper so both reject the same set.
-fn formatCodepoint(s: []const u8) ?u21 {
-    if (s[1] == 0x80 and s[2] >= 0xA8 and s[2] <= 0xAE) {
-        return 0x2028 + @as(u21, s[2] - 0xA8);
+/// Classify the byte at `s[0]` against the hostile bidi and invisible
+/// format set (EPH-I0579): U+061C Arabic Letter Mark, U+00AD soft hyphen,
+/// U+200B..U+200F zero-width and bidi marks, U+2028/U+2029 line and
+/// paragraph separators, U+202A..U+202E bidi embeddings and overrides,
+/// U+2060..U+206F invisible operators, bidi isolates, and deprecated
+/// shaping marks (the unassigned U+2065 included: filtering it is free
+/// and conservative), U+FEFF BOM, U+FFF9..U+FFFB interlinear
+/// annotation anchors, and the tag characters U+E0001 and
+/// U+E0020..U+E007F. A truncated lead consumes the rest (invalid UTF-8
+/// regardless) and reports U+FFFD. Shared by the terminal filter and the
+/// JSON escaper so both reject the same set.
+fn hostileUnit(s: []const u8) HostileUnit {
+    switch (s[0]) {
+        0xC2 => return c2Unit(s),
+        0xD8 => return almUnit(s),
+        0xE2 => return formatUnit(s),
+        0xEF => return efUnit(s),
+        0xF3 => return tagUnit(s),
+        else => return .{ .len = 0, .cp = 0 },
     }
-    if (s[1] == 0x80 and (s[2] == 0x8E or s[2] == 0x8F)) {
-        return 0x200E + @as(u21, s[2] - 0x8E);
-    }
-    if (s[1] == 0x81 and s[2] >= 0xA6 and s[2] <= 0xA9) {
-        return 0x2066 + @as(u21, s[2] - 0xA6);
-    }
-    return null;
+}
+
+/// C1 controls (U+0080..U+009F) and U+00AD soft hyphen under the 0xC2
+/// lead. U+0085 NEL is a line terminator and a log-forgery vector on its
+/// own. A truncated lead consumes the rest: it is invalid UTF-8 regardless.
+fn c2Unit(s: []const u8) HostileUnit {
+    if (s.len < 2) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] >= 0x80 and s[1] <= 0x9F) return .{ .len = 2, .cp = s[1] };
+    if (s[1] == 0xAD) return .{ .len = 2, .cp = 0xAD };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// U+061C Arabic Letter Mark (bidi) under the 0xD8 lead.
+fn almUnit(s: []const u8) HostileUnit {
+    if (s.len < 2) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0x9C) return .{ .len = 2, .cp = 0x061C };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// Hostile U+20xx format characters under the 0xE2 lead.
+fn formatUnit(s: []const u8) HostileUnit {
+    if (s.len < 3) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0x80) return format80Unit(s);
+    if (s[1] == 0x81 and s[2] >= 0xA0 and s[2] <= 0xAF)
+        return .{ .len = 3, .cp = 0x2060 + @as(u21, s[2] - 0xA0) };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// U+200B..U+200F and U+2028..U+202E under 0xE2 0x80.
+fn format80Unit(s: []const u8) HostileUnit {
+    if (s[2] >= 0x8B and s[2] <= 0x8F)
+        return .{ .len = 3, .cp = 0x200B + @as(u21, s[2] - 0x8B) };
+    if (s[2] >= 0xA8 and s[2] <= 0xAE)
+        return .{ .len = 3, .cp = 0x2028 + @as(u21, s[2] - 0xA8) };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// U+FEFF BOM and U+FFF9..U+FFFB interlinear annotation anchors under the
+/// 0xEF lead.
+fn efUnit(s: []const u8) HostileUnit {
+    if (s.len < 3) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0xBB and s[2] == 0xBF) return .{ .len = 3, .cp = 0xFEFF };
+    if (s[1] == 0xBF and s[2] >= 0xB9 and s[2] <= 0xBB)
+        return .{ .len = 3, .cp = 0xFFF9 + @as(u21, s[2] - 0xB9) };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// Tag characters under the 0xF3 lead: U+E0001 and U+E0020..U+E007F. The
+/// unassigned gap U+E0002..U+E001F passes clean: no assigned character
+/// exists there to attack with.
+fn tagUnit(s: []const u8) HostileUnit {
+    if (s.len < 4) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] != 0xA0) return .{ .len = 0, .cp = 0 };
+    if (s[2] == 0x80 and s[3] == 0x81) return .{ .len = 4, .cp = 0xE0001 };
+    if (s[2] == 0x80 and s[3] >= 0xA0)
+        return .{ .len = 4, .cp = 0xE0020 + @as(u21, s[3] - 0xA0) };
+    if (s[2] == 0x81 and s[3] >= 0x80)
+        return .{ .len = 4, .cp = 0xE0040 + @as(u21, s[3] - 0x80) };
+    return .{ .len = 0, .cp = 0 };
 }
 
 /// Filter terminal-hostile bytes from attacker-derived text: C0 controls
 /// (CR and LF included, so no byte forges a new log line), DEL, C1
-/// controls, bidi and invisible format characters. Each hostile sequence
-/// becomes one visible '?' so redaction gaps stay visible. Clean input
-/// borrows without allocation. The filter assumes valid UTF-8: bare
-/// 0x80..0x9F bytes and overlong lead bytes pass through, which is inert
-/// to a UTF-8 decoder.
+/// controls, and the hostile bidi and invisible format set that
+/// hostileUnit enumerates. Each hostile sequence becomes one visible '?'
+/// so redaction gaps stay visible. Clean input borrows without
+/// allocation. The filter assumes valid UTF-8: bare 0x80..0x9F bytes and
+/// overlong lead bytes pass through, which is inert to a UTF-8 decoder.
 pub fn sanitizeTerminal(
     allocator: Allocator,
     input: []const u8,
@@ -445,17 +498,19 @@ pub fn sanitizeTerminal(
 }
 
 /// One classified input unit for JSON escaping: how many input bytes it
-/// spans and which escaped form to emit.
+/// spans, how many output bytes it emits, and which escaped form to
+/// write. The classifier owns both counts so the two passes cannot drift.
 const JsonEscape = struct {
     consumed: usize,
+    emitted: usize,
     kind: Kind,
     named_char: u8 = 0,
     codepoint: u21 = 0,
 
     const Kind = enum {
-        clean, // copy the byte raw
+        clean, // copy the bytes raw
         named, // two-character escape: backslash plus named_char
-        unicode, // \uXXXX of codepoint
+        unicode, // \uXXXX (BMP) or the \uDXXX\uDXXX surrogate pair
     };
 };
 
@@ -477,50 +532,75 @@ fn jsonNamedEscape(b: u8) ?u8 {
 fn classifyJsonUnit(s: []const u8) JsonEscape {
     const b = s[0];
     if (jsonNamedEscape(b)) |c| {
-        return .{ .consumed = 1, .kind = .named, .named_char = c };
+        return .{ .consumed = 1, .emitted = 2, .kind = .named, .named_char = c };
     }
     if (b < 0x20 or b == 0x7F) {
-        return .{ .consumed = 1, .kind = .unicode, .codepoint = b };
+        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = b };
     }
-    if (b == 0xC2) return classifyJsonC1(s);
-    if (b == 0xE2) return classifyJsonFormat(s);
-    if (b == 0xEF) return classifyJsonBom(s);
-    return .{ .consumed = 1, .kind = .clean };
+    if (b < 0x80) return .{ .consumed = 1, .emitted = 1, .kind = .clean };
+    // Hostile format characters escape as their codepoint: \uXXXX inside
+    // the BMP, the RFC 8259 surrogate pair beyond it.
+    const hostile = hostileUnit(s);
+    if (hostile.len != 0) {
+        return .{
+            .consumed = hostile.len,
+            .emitted = jsonEscapeBytes(hostile.cp),
+            .kind = .unicode,
+            .codepoint = hostile.cp,
+        };
+    }
+    // Other multi-byte bytes: well-formed sequences pass through whole;
+    // invalid bytes become U+FFFD so the document stays strict UTF-8
+    // (RFC 8259 section 8.1, EPH-I0580).
+    const expect = utf8ExpectLen(b) orelse
+        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = 0xFFFD };
+    if (!utf8Valid(s, expect))
+        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = 0xFFFD };
+    return .{ .consumed = expect, .emitted = expect, .kind = .clean };
 }
 
-/// C1 controls escape as their codepoint (U+0080..U+009F); a truncated
-/// lead byte becomes U+FFFD.
-fn classifyJsonC1(s: []const u8) JsonEscape {
-    if (s.len < 2) {
-        return .{ .consumed = 1, .kind = .unicode, .codepoint = 0xFFFD };
-    }
-    if (s[1] >= 0x80 and s[1] <= 0x9F) {
-        return .{ .consumed = 2, .kind = .unicode, .codepoint = s[1] };
-    }
-    return .{ .consumed = 1, .kind = .clean };
+/// Output bytes of a codepoint's JSON escape: 6 for the BMP \uXXXX form,
+/// 12 for the astral surrogate pair (RFC 8259 section 7).
+fn jsonEscapeBytes(cp: u21) usize {
+    return if (cp <= 0xFFFF) 6 else 12;
 }
 
-/// Hostile U+20xx format characters escape as their codepoint; a truncated
-/// sequence becomes one U+FFFD.
-fn classifyJsonFormat(s: []const u8) JsonEscape {
-    if (s.len < 3) {
-        return .{ .consumed = s.len, .kind = .unicode, .codepoint = 0xFFFD };
-    }
-    const cp = formatCodepoint(s) orelse {
-        return .{ .consumed = 1, .kind = .clean };
+/// Expected UTF-8 sequence length for the lead byte `b` (b >= 0x80), or
+/// null when `b` can never start a valid sequence: stray continuation
+/// bytes, overlong leads 0xC0/0xC1, and out-of-range leads 0xF5..0xFF.
+fn utf8ExpectLen(b: u8) ?usize {
+    if (b >= 0xC2 and b <= 0xDF) return 2;
+    if (b >= 0xE0 and b <= 0xEF) return 3;
+    if (b >= 0xF0 and b <= 0xF4) return 4;
+    return null;
+}
+
+/// Valid window for the first continuation byte of lead `b`. The narrow
+/// entries pin the RFC 3629 range guards: 0xE0 rejects overlong forms,
+/// 0xED rejects surrogates, 0xF0 rejects overlong forms, 0xF4 rejects
+/// values beyond U+10FFFF.
+fn utf8SecondWindow(lead: u8) ByteWindow {
+    return switch (lead) {
+        0xE0 => .{ .min = 0xA0, .max = 0xBF },
+        0xED => .{ .min = 0x80, .max = 0x9F },
+        0xF0 => .{ .min = 0x90, .max = 0xBF },
+        0xF4 => .{ .min = 0x80, .max = 0x8F },
+        else => .{ .min = 0x80, .max = 0xBF },
     };
-    return .{ .consumed = 3, .kind = .unicode, .codepoint = cp };
 }
 
-/// U+FEFF escapes as its codepoint; a truncated 0xEF lead becomes U+FFFD.
-fn classifyJsonBom(s: []const u8) JsonEscape {
-    if (s.len < 3) {
-        return .{ .consumed = s.len, .kind = .unicode, .codepoint = 0xFFFD };
+/// True when the bytes at `s` form a well-formed UTF-8 sequence of
+/// `expect` bytes: enough input, every continuation byte inside
+/// 0x80..0xBF, and the first continuation inside the lead's window.
+fn utf8Valid(s: []const u8, expect: usize) bool {
+    if (s.len < expect) return false;
+    const window = utf8SecondWindow(s[0]);
+    if (s[1] < window.min or s[1] > window.max) return false;
+    var i: usize = 2;
+    while (i < expect) : (i += 1) {
+        if (s[i] < 0x80 or s[i] > 0xBF) return false;
     }
-    if (s[1] == 0xBB and s[2] == 0xBF) {
-        return .{ .consumed = 3, .kind = .unicode, .codepoint = 0xFEFF };
-    }
-    return .{ .consumed = 1, .kind = .clean };
+    return true;
 }
 
 /// Write one escaped unit into `dst`, returning the bytes written. The
@@ -528,8 +608,8 @@ fn classifyJsonBom(s: []const u8) JsonEscape {
 fn writeJsonUnit(dst: []u8, unit: JsonEscape, src: []const u8) usize {
     switch (unit.kind) {
         .clean => {
-            dst[0] = src[0];
-            return 1;
+            @memcpy(dst[0..unit.consumed], src[0..unit.consumed]);
+            return unit.consumed;
         },
         .named => {
             dst[0] = '\\';
@@ -540,22 +620,41 @@ fn writeJsonUnit(dst: []u8, unit: JsonEscape, src: []const u8) usize {
     }
 }
 
-/// Write `\uXXXX` (uppercase hex) into `dst`, returning 6.
+/// Write the JSON escape of `cp` into `dst`: `\uXXXX` (uppercase hex) for
+/// a BMP codepoint, the `\uDXXX\uDXXX` surrogate pair for an astral one
+/// (RFC 8259 section 7). Returns the bytes written.
 fn writeJsonUnicode(dst: []u8, cp: u21) usize {
-    const hex = "0123456789ABCDEF";
+    if (cp <= 0xFFFF) {
+        dst[0] = '\\';
+        dst[1] = 'u';
+        writeHex4(dst[2..6], @intCast(cp));
+        return 6;
+    }
+    const pair = cp - 0x10000;
     dst[0] = '\\';
     dst[1] = 'u';
-    dst[2] = hex[@intCast((cp >> 12) & 0xF)];
-    dst[3] = hex[@intCast((cp >> 8) & 0xF)];
-    dst[4] = hex[@intCast((cp >> 4) & 0xF)];
-    dst[5] = hex[@intCast(cp & 0xF)];
-    return 6;
+    writeHex4(dst[2..6], @intCast(0xD800 + (pair >> 10)));
+    dst[6] = '\\';
+    dst[7] = 'u';
+    writeHex4(dst[8..12], @intCast(0xDC00 + (pair & 0x3FF)));
+    return 12;
+}
+
+/// Write four uppercase hex digits of `v` into `dst`.
+fn writeHex4(dst: []u8, v: u16) void {
+    const hex = "0123456789ABCDEF";
+    dst[0] = hex[(v >> 12) & 0xF];
+    dst[1] = hex[(v >> 8) & 0xF];
+    dst[2] = hex[(v >> 4) & 0xF];
+    dst[3] = hex[v & 0xF];
 }
 
 /// Escape a string for embedding in JSON output: quotes, backslashes, and
-/// control bytes use the standard escapes, and bidi or invisible format
-/// characters escape as \uXXXX (legal raw in JSON but hostile to humans
-/// and downstream tools). Clean input borrows without allocation.
+/// control bytes use the standard escapes, bidi or invisible format
+/// characters escape as \uXXXX (the surrogate-pair form beyond the BMP;
+/// legal raw in JSON but hostile to humans and downstream tools), and
+/// invalid UTF-8 bytes become \uFFFD so the document always satisfies
+/// RFC 8259 section 8.1. Clean input borrows without allocation.
 pub fn escapeJson(
     allocator: Allocator,
     input: []const u8,
@@ -566,11 +665,7 @@ pub fn escapeJson(
     while (i < input.len) {
         const unit = classifyJsonUnit(input[i..]);
         if (unit.kind != .clean) dirty = true;
-        out_len += switch (unit.kind) {
-            .clean => 1,
-            .named => 2,
-            .unicode => 6,
-        };
+        out_len += unit.emitted;
         i += unit.consumed;
     }
     if (!dirty) return .{ .slice = input, .owned = false };
@@ -997,57 +1092,18 @@ fn hasEvenBackslashRun(t: []const u8, i: usize) bool {
     return backslashes % 2 == 0;
 }
 
-/// Check if a rule is disabled via inline comment
-pub fn isInlineDisabled(
-    content: []const u8,
-    line_num: usize,
-    rule: []const u8,
-) bool {
-    var lines = mem.splitScalar(u8, content, '\n');
-    var current_line: usize = 1;
-
-    while (lines.next()) |line| {
-        if (current_line == line_num or current_line == line_num - 1) {
-            if (checkDisableComment(line, rule)) return true;
-        }
-        if (current_line > line_num) break;
-        current_line += 1;
-    }
-    return false;
-}
-
-fn checkDisableComment(line: []const u8, rule: []const u8) bool {
-    const patterns = [_][]const u8{
-        "// ephor-disable",
-        "// zig-lint-disable",
-        "// nolint",
-    };
-
-    for (patterns) |pattern| {
-        const idx = mem.indexOf(u8, line, pattern) orelse continue;
-        const rest = line[idx + pattern.len ..];
-        // Disabled all rules
-        if (rest.len == 0 or rest[0] == '\n' or rest[0] == '\r') {
-            return true;
-        }
-        // Check specific rule
-        if (mem.indexOf(u8, rest, rule) != null) return true;
-        // "next-line" applies to next line
-        if (mem.indexOf(u8, rest, "next-line") != null) return true;
-    }
-    return false;
-}
-
+/// Skip blank bytes (space, tab, CR, LF) from `start`, returning the
+/// index of the first non-blank byte. The dead isInlineDisabled/
+/// checkDisableComment pair that once sat here was deleted (EPH-I0581):
+/// production suppression uses main.zig's scope-aware implementation.
 pub fn skipWhitespace(
     content: []const u8,
     start: usize,
-    skip_comma: bool,
 ) usize {
     var i = start;
     while (i < content.len) : (i += 1) {
         const c = content[i];
         if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
-        if (skip_comma and c == ',') continue;
         break;
     }
     return i;
@@ -1322,6 +1378,153 @@ test "sanitizeSnippet keeps short backtick runs and filters controls" {
     var result = try sanitizeSnippet(std.testing.allocator, "a `b` ``c`` \x07d");
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("a `b` ``c`` ?d", result.slice);
+}
+
+/// The hostile-set battery (EPH-I0579): every codepoint the filter claims,
+/// expressed as inclusive ranges. The U+2060 range spans the unassigned
+/// U+2065, which the filter covers conservatively.
+const hostile_ranges = [_]struct { from: u21, to: u21 }{
+    .{ .from = 0x061C, .to = 0x061C },
+    .{ .from = 0x00AD, .to = 0x00AD },
+    .{ .from = 0x200B, .to = 0x200F },
+    .{ .from = 0x2028, .to = 0x202E },
+    .{ .from = 0x2060, .to = 0x206F },
+    .{ .from = 0xFEFF, .to = 0xFEFF },
+    .{ .from = 0xFFF9, .to = 0xFFFB },
+    .{ .from = 0xE0001, .to = 0xE0001 },
+    .{ .from = 0xE0020, .to = 0xE007F },
+};
+
+/// Feed every hostile codepoint through one placeholder sanitizer and
+/// assert the whole character collapses to `want`.
+fn expectHostileSet(
+    sanitize: fn (Allocator, []const u8) error{OutOfMemory}!Sanitized,
+    want: []const u8,
+    allocator: Allocator,
+) !void {
+    for (hostile_ranges) |r| {
+        var cp = r.from;
+        while (cp <= r.to) : (cp += 1) {
+            const input = try std.fmt.allocPrint(allocator, "a{u}b", .{cp});
+            defer allocator.free(input);
+            var result = try sanitize(allocator, input);
+            defer result.deinit(allocator);
+            try std.testing.expectEqualStrings(want, result.slice);
+        }
+    }
+}
+
+test "sanitizeTerminal filters the full hostile set (EPH-I0579)" {
+    try expectHostileSet(sanitizeTerminal, "a?b", std.testing.allocator);
+}
+
+test "sanitizeMarkdown filters the full hostile set (EPH-I0579)" {
+    try expectHostileSet(sanitizeMarkdown, "a?b", std.testing.allocator);
+}
+
+test "sanitizeSnippet filters the full hostile set (EPH-I0579)" {
+    try expectHostileSet(sanitizeSnippet, "a?b", std.testing.allocator);
+}
+
+test "escapeJson escapes the full hostile set (EPH-I0579)" {
+    const allocator = std.testing.allocator;
+    for (hostile_ranges) |r| {
+        var cp = r.from;
+        while (cp <= r.to) : (cp += 1) {
+            const input = try std.fmt.allocPrint(allocator, "a{u}b", .{cp});
+            defer allocator.free(input);
+            var result = try escapeJson(allocator, input);
+            defer result.deinit(allocator);
+            // BMP members escape as \uXXXX; astral members as the RFC
+            // 8259 section 7 surrogate pair.
+            if (cp <= 0xFFFF) {
+                const want = try std.fmt.allocPrint(allocator, "a\\u{X:0>4}b", .{cp});
+                defer allocator.free(want);
+                try std.testing.expectEqualStrings(want, result.slice);
+            } else {
+                const pair = cp - 0x10000;
+                const hi: u16 = @intCast(0xD800 + (pair >> 10));
+                const lo: u16 = @intCast(0xDC00 + (pair & 0x3FF));
+                const want = try std.fmt.allocPrint(allocator, "a\\u{X:0>4}\\u{X:0>4}b", .{ hi, lo });
+                defer allocator.free(want);
+                try std.testing.expectEqualStrings(want, result.slice);
+            }
+        }
+    }
+}
+
+test "escapeJson astral escapes re-parse to the original text (EPH-I0579)" {
+    // The surrogate-pair escape must decode back to the original astral
+    // codepoint in a strict JSON consumer.
+    const allocator = std.testing.allocator;
+    for ([_]u21{ 0xE0001, 0xE0020, 0xE003F, 0xE0040, 0xE007F }) |cp| {
+        const input = try std.fmt.allocPrint(allocator, "a{u}b", .{cp});
+        defer allocator.free(input);
+        var result = try escapeJson(allocator, input);
+        defer result.deinit(allocator);
+        const wrapped = try std.fmt.allocPrint(allocator, "\"{s}\"", .{result.slice});
+        defer allocator.free(wrapped);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wrapped, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(input, parsed.value.string);
+    }
+}
+
+test "escapeJson replaces invalid lead bytes with U+FFFD (EPH-I0580)" {
+    // Bare lead bytes followed by non-matching bytes must not pass raw:
+    // the lead becomes one \uFFFD and the trailing bytes classify on
+    // their own, matching the truncated-tail behavior.
+    const cases = [_]struct { input: []const u8, want: []const u8 }{
+        .{ .input = "\xE2\x41\x42", .want = "\\uFFFDAB" },
+        .{ .input = "x\xC2\x41y", .want = "x\\uFFFDAy" },
+        .{ .input = "\xC2\x41\xC2\x85", .want = "\\uFFFDA\\u0085" },
+        .{ .input = "\x80", .want = "\\uFFFD" },
+        .{ .input = "a\x80b", .want = "a\\uFFFDb" },
+        .{ .input = "\xC0\x41", .want = "\\uFFFDA" },
+        .{ .input = "\xF5\x80\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
+        .{ .input = "\xE0\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD" },
+        .{ .input = "\xED\xA0\x80", .want = "\\uFFFD\\uFFFD\\uFFFD" },
+        .{ .input = "\xF0\x80\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
+        .{ .input = "\xF4\x90\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
+        .{ .input = "\xE1\x80", .want = "\\uFFFD\\uFFFD" },
+        // Truncated hostile tails consume the rest as one U+FFFD, the
+        // long-standing terminal-filter behavior on the JSON side.
+        .{ .input = "ab\xE2\x80", .want = "ab\\uFFFD" },
+        .{ .input = "x\xC2", .want = "x\\uFFFD" },
+        .{ .input = "\xEF\xBB", .want = "\\uFFFD" },
+        .{ .input = "\xF3\xA0\x80", .want = "\\uFFFD" },
+    };
+    for (cases) |case| {
+        var result = try escapeJson(std.testing.allocator, case.input);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.want, result.slice);
+    }
+}
+
+test "escapeJson passes valid multi-byte UTF-8 through raw (EPH-I0580)" {
+    // Well-formed sequences stay byte-identical and borrow the input.
+    const cases = [_][]const u8{
+        "\xC2\xA9", // U+00A9 copyright
+        "\xC2\xA0", // U+00A0 no-break space
+        "\xE2\x82\xAC", // U+20AC euro
+        "\xE1\x80\x80", // U+1000
+        "\xE2\x80\x90", // U+2010 hyphen (hostile-set neighbor)
+        "\xF0\x9F\x98\x80", // U+1F600 emoji
+        "\xF3\xA0\x80\x82", // U+E0002 unassigned tag gap
+    };
+    for (cases) |input| {
+        var result = try escapeJson(std.testing.allocator, input);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.owned);
+        try std.testing.expectEqual(input.ptr, result.slice.ptr);
+    }
+}
+
+test "skipWhitespace skips blanks and stops at code" {
+    try std.testing.expectEqual(@as(usize, 5), skipWhitespace("  \t\r\nab", 0));
+    try std.testing.expectEqual(@as(usize, 0), skipWhitespace("ab  ", 0));
+    try std.testing.expectEqual(@as(usize, 2), skipWhitespace("  x", 1));
+    try std.testing.expectEqual(@as(usize, 3), skipWhitespace("abc", 3));
 }
 
 test "formatText sanitizes hostile file and message bytes" {

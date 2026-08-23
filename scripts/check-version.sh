@@ -22,8 +22,10 @@
 
 set -e
 
-# Source of truth: build.zig.zon
-ZON_VERSION=$(grep '\.version' build.zig.zon | head -1 | sed 's/.*"\([0-9][0-9.]*\)".*/\1/')
+# Source of truth: build.zig.zon. EPH-I0659: anchor the extraction to the
+# field assignment, as release.py does. A comment or string elsewhere in
+# the zon that gains the substring ".version" must not capture the field.
+ZON_VERSION=$(grep '^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"' build.zig.zon | head -1 | sed 's/.*"\([0-9][0-9.]*\)".*/\1/')
 
 EXPECTED="${1:-$ZON_VERSION}"
 
@@ -62,8 +64,10 @@ else
     echo "ok       build.zig.zon .version: ${ZON_VERSION}"
 fi
 
-# 2. src/main.zig EPHOR_VERSION
-MAIN_VERSION=$(grep 'EPHOR_VERSION = ' src/main.zig | head -1 | sed 's/.*"\([0-9][0-9.]*\)".*/\1/')
+# 2. src/main.zig EPHOR_VERSION. Anchored to the declaration line, the
+# same shape release.py anchors (EPH-I0659, same unanchored class as the
+# zon extraction: a comment that mentions the const must not win).
+MAIN_VERSION=$(grep '^[[:space:]]*const EPHOR_VERSION[[:space:]]*=[[:space:]]*"' src/main.zig | head -1 | sed 's/.*"\([0-9][0-9.]*\)".*/\1/')
 if [ -z "$MAIN_VERSION" ]; then
     echo "MISSING  src/main.zig: EPHOR_VERSION not found"
     ERRORS=$((ERRORS + 1))
@@ -104,7 +108,7 @@ fi
 # 4. Every README.md example config version matches the expected version.
 # A "version" line belongs to the ephor.json example when it sits directly
 # above the example's "path_dir" line. The VS Code tasks.json example
-# (README.md:797, "version": "2.0.0") has no path_dir line and stays out of
+# (README.md:838, "version": "2.0.0") has no path_dir line and stays out of
 # the check by context, never by a magic version literal. EPH-I0252: every
 # example is checked, not just the first; the pairing must stay adjacent or
 # the section fails closed with MISSING.

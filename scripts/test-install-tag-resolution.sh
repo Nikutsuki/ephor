@@ -44,6 +44,18 @@ if [ -z "$EPHOR_FALLBACK_TAG" ]; then
     exit 1
 fi
 
+# EPH-I0661: a fake curl records its arguments so the https clamp branch in
+# latest_ephor_tag gets an assertion. The real curl keeps serving the
+# file:// fixtures. The fake reads the body from CURL_BODY_FILE and never
+# touches the network.
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/curl" <<'CURLEOF'
+#!/bin/sh
+printf '%s\n' "$*" > "$CURL_ARGS_FILE"
+cat "$CURL_BODY_FILE"
+CURLEOF
+chmod +x "$WORK/bin/curl"
+
 printf '[{"name":"v0.14.2","message":"x"}]' > "$WORK/valid.json"
 printf '[{\n  "name": "v0.14.2",\n  "message": "x"\n}]' > "$WORK/pretty.json"
 printf '[{"name":"v0.15.0-beta.1","message":"x"},{"name":"v0.14.2","message":"x"}]' \
@@ -57,6 +69,12 @@ printf '[{"name":"v0.14.2","message":"x"},{"name":"v0.14.10","message":"x"}]' \
 # v0.14.1 is older than every fallback this repo has pinned (v0.14.2+).
 printf '[{"name":"v0.14.1","message":"x"}]' > "$WORK/older-than-fallback.json"
 printf '[{"name":"%s","message":"x"}]' "$EPHOR_FALLBACK_TAG" > "$WORK/equal-fallback.json"
+# EPH-I0661: a tag string in a sibling message field must not leak into
+# the resolution. The fixture embeds a plain tag and an escaped "name" key,
+# both newer than every real tag, so a JSON-unaware tag grep would pick
+# v9.9.9 over the real name v0.14.2.
+printf '[{"name":"v0.14.2","message":"see v9.9.9 or \\"name\\":\\"v9.9.9\\" in the docs"}]' \
+    > "$WORK/message-injection.json"
 
 TESTS=0
 FAILS=0
@@ -92,6 +110,35 @@ expect_no_warning() {
         echo "ok   $1"
     else
         echo "FAIL $1: unexpected stderr output"
+        FAILS=$((FAILS + 1))
+    fi
+}
+
+# Assert that the recorded curl arguments carry the https clamp flags.
+# A missing args file is a FAIL: the fake curl must have run.
+expect_curl_clamp() {
+    TESTS=$((TESTS + 1))
+    if [ -s "$2" ] \
+        && grep -q -- '--proto =https' "$2" \
+        && grep -q -- '--proto-redir =https' "$2" \
+        && grep -q -- '--max-filesize 1048576' "$2"; then
+        echo "ok   $1"
+    else
+        echo "FAIL $1: curl args lack the https clamp flags"
+        echo "  args: $(cat "$2" 2>/dev/null)"
+        FAILS=$((FAILS + 1))
+    fi
+}
+
+# Assert that the recorded curl arguments carry no --proto flag.
+# A missing args file is a FAIL: the fake curl must have run.
+expect_curl_no_clamp() {
+    TESTS=$((TESTS + 1))
+    if [ -s "$2" ] && ! grep -q -- '--proto' "$2"; then
+        echo "ok   $1"
+    else
+        echo "FAIL $1: curl args missing, or they carry --proto on a non-https URL"
+        echo "  args: $(cat "$2" 2>/dev/null)"
         FAILS=$((FAILS + 1))
     fi
 }
@@ -164,6 +211,60 @@ ACTUAL_OUT=$(max_stable_version < "$WORK/invalid.json"); ACTUAL_RC=$?
 expect "check-version invalid payload prints nothing" "" "0"
 ACTUAL_OUT=$(max_stable_version < "$WORK/empty.json"); ACTUAL_RC=$?
 expect "check-version empty payload prints nothing" "" "0"
+
+# 13. EPH-I0661: a tag in the message text must not leak into the result.
+# The message tags are newer than every real tag, so a JSON-unaware tag
+# grep would resolve v9.9.9.
+ACTUAL_OUT=$(TAGS_API="file://$WORK/message-injection.json"; latest_ephor_tag); ACTUAL_RC=$?
+expect "message tag does not leak into resolution" "v0.14.2" "0"
+ACTUAL_OUT=$(max_stable_version < "$WORK/message-injection.json"); ACTUAL_RC=$?
+expect "check-version message tag does not leak" "0.14.2" "0"
+
+# 14. EPH-I0661: an https TAGS_API gets the proto clamp and the 1 MiB body
+# cap (install.sh latest_ephor_tag). The fake curl records the arguments.
+# The assignments are statements plus export: a prefix assignment before a
+# function call does not export to the function's child processes, so the
+# fake curl would never see the file paths.
+ACTUAL_OUT=$(
+    PATH="$WORK/bin:$PATH"
+    CURL_ARGS_FILE="$WORK/curl-args-https"
+    CURL_BODY_FILE="$WORK/valid.json"
+    TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50"
+    export CURL_ARGS_FILE CURL_BODY_FILE
+    latest_ephor_tag
+); ACTUAL_RC=$?
+expect "https fetch resolves through the clamped curl" "v0.14.2" "0"
+expect_curl_clamp "https fetch carries the clamp flags" "$WORK/curl-args-https"
+
+# 15. EPH-I0661: the operator-picked http test channel skips the clamp
+# (install.sh comment at latest_ephor_tag).
+ACTUAL_OUT=$(
+    PATH="$WORK/bin:$PATH"
+    CURL_ARGS_FILE="$WORK/curl-args-http"
+    CURL_BODY_FILE="$WORK/valid.json"
+    TAGS_API="http://127.0.0.1:9/x"
+    export CURL_ARGS_FILE CURL_BODY_FILE
+    latest_ephor_tag
+); ACTUAL_RC=$?
+expect "http test channel resolves without the clamp" "v0.14.2" "0"
+expect_curl_no_clamp "http test channel carries no clamp flags" "$WORK/curl-args-http"
+
+# 16. EPH-I0662: known-answer pins for the extracted functions the cases
+# above never drive directly. A truncated extraction still sources, so a
+# presence guard alone cannot catch it.
+ACTUAL_OUT=$(printf 'v0.14.2\nv0.14.10\nv0.14.1\n' | max_stable_tag); ACTUAL_RC=$?
+expect "max_stable_tag resolves the numeric max" "v0.14.10" "0"
+ACTUAL_OUT=$(printf '' | max_stable_tag); ACTUAL_RC=$?
+expect "max_stable_tag on empty input prints nothing" "" "0"
+
+# 17. EPH-I0662: version_older known answers. The compare must stay numeric
+# (EPH-I0193): a string compare sorts 0.14.10 below 0.14.1.
+ACTUAL_OUT=$(version_older v0.14.1 v0.14.10); ACTUAL_RC=$?
+expect "version_older compares numerically" "" "0"
+ACTUAL_OUT=$(version_older v0.14.10 v0.14.1); ACTUAL_RC=$?
+expect "version_older rejects a higher first" "" "1"
+ACTUAL_OUT=$(version_older v0.14.2 v0.14.2); ACTUAL_RC=$?
+expect "version_older rejects equal versions" "" "1"
 
 echo ""
 echo "${TESTS} tests, ${FAILS} failed"

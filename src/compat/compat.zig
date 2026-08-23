@@ -257,7 +257,7 @@ fn fallbackTablesFor(version: VersionInfo) Tables {
 /// worker (spawn at ast_tier.zig:147), which spawns per file, calls only
 /// Ast.parse (never compat), and joins before analysis resumes
 /// (ast_tier.zig:161); a test-only chain-walk thread (spawn at
-/// main.zig:42705) joins before any compat access and never touches
+/// main.zig:42716) joins before any compat access and never touches
 /// compat either. The worker-side pin of the same contract lives at the
 /// spawn site (F10, EPH-I0697).
 var cached_tables: ?Tables = null;

@@ -288,6 +288,9 @@ const DiagCtx = struct {
     untrusted_ignore_skip_count: usize = 0,
     /// AST-tier skip notes (EPH-I0200).
     ast_skip_note_count: usize = 0,
+    /// Depth-cap truncation notes (EPH-I0667, trust-model F-5). One note
+    /// per run, the first time any directory-depth cap truncates a subtree.
+    depth_cap_note_count: usize = 0,
     /// Entries-widen-scan notes (EPH-I0784).
     entries_widen_note_count: usize = 0,
     /// Resident-content budget for the corpus warning (EPH-I0199). Real
@@ -12983,7 +12986,12 @@ const ImportGraph = struct {
     }
 
     fn scanRecursive(self: *ImportGraph, dir: std.Io.Dir, base: []const u8, depth: u16) !void {
-        if (depth > 32) return;
+        if (depth > 32) {
+            // EPH-I0667 (trust-model F-5): the cap truncates the analyzed
+            // set. Disclose once per run instead of burying code silently.
+            noteDepthCapTruncation(self.diag, 32);
+            return;
+        }
         var iter = dir.iterate();
         while (try iter.next(self.diag.io)) |entry| {
             const path = try std.fmt.allocPrint(
@@ -13764,7 +13772,9 @@ const ImportGraph = struct {
     fn scanForNestedBuildZig(self: *ImportGraph, dir_path: []const u8, depth: u16) !void {
         // Bound the recursion (RED1-8): a generated deep tree would
         // overflow the stack. 64 doubles scanRecursive's 32 so discovery
-        // never truncates a tree the main walk can still scan.
+        // never truncates a tree the main walk can still scan. No
+        // truncation note here: the main walk's 32 cap fires first on
+        // every tree this cap could truncate (EPH-I0667, F-5).
         if (depth > 64) return;
         var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
         defer dir.close(self.diag.io);
@@ -13932,6 +13942,21 @@ const ImportGraph = struct {
         return imported.contains(a.resolved_path);
     }
 
+    /// One unreachable candidate's orphan disposition: report it, count it
+    /// as a config orphan_exclude suppression (EPH-I0666, F-4), or skip
+    /// it silently (built-in default — tool posture, never an accounting
+    /// bucket).
+    const OrphanDisposition = enum { report, counted, skipped };
+
+    fn orphanDisposition(path: []const u8, cfg: *const Config) OrphanDisposition {
+        if (cfg.orphan_exclude.items.len > 0) {
+            if (isOrphanExcludedByConfig(path, cfg)) return .counted;
+            return .report;
+        }
+        if (isOrphanExcludedDefault(path)) return .skipped;
+        return .report;
+    }
+
     fn getOrphanIssues(
         self: *ImportGraph,
         allocator: Allocator,
@@ -13954,25 +13979,36 @@ const ImportGraph = struct {
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;
 
-            // Skip files matching orphan_exclude patterns
-            if (isOrphanExcluded(key, cfg)) continue;
-
             // Use cached resolved_path instead of per-iteration realpath.
             if (self.reachable.contains(entry.value_ptr.resolved_path)) continue;
             if (!self.build_zig_read and
                 conservativeLiveness(entry.value_ptr.*, &imported_targets))
                 continue;
-            try issues.append(allocator, .{
-                .file = key,
-                .line = 1,
-                .col = 1,
-                .severity = .warning,
-                .rule = RULE_ORPHAN_FILE,
-                .message = "file not imported",
-                .help = "add @import() or remove if unused",
-            });
+            // A config orphan_exclude match hides a finding that WOULD
+            // exist: the candidate still becomes an Issue so classifyIssue
+            // counts it under the RED3-3 accounting instead of vanishing
+            // (EPH-I0666, trust-model F-4). The built-in defaults stay
+            // tool posture: a silent filter, never an accounting bucket.
+            switch (orphanDisposition(key, cfg)) {
+                .skipped => continue,
+                .counted, .report => try issues.append(allocator, orphanIssue(key)),
+            }
         }
         return issues;
+    }
+
+    /// One ZA501 candidate's shape, shared by the plain and the
+    /// config-excluded arms of getOrphanIssues (EPH-I0666).
+    fn orphanIssue(file: []const u8) Issue {
+        return .{
+            .file = file,
+            .line = 1,
+            .col = 1,
+            .severity = .warning,
+            .rule = RULE_ORPHAN_FILE,
+            .message = "file not imported",
+            .help = "add @import() or remove if unused",
+        };
     }
 
     /// Tally the graph's per-file counters into ProjectStats. The count
@@ -34303,25 +34339,37 @@ fn matchesOrphanDirPattern(path: []const u8) bool {
     return false;
 }
 
-/// Check if file path should be excluded from orphan detection.
-/// A non-empty config "orphan_exclude" list REPLACES the built-in
-/// defaults (build.zig, _test.zig, and the directory patterns below) —
-/// it does not extend them (B13-15, EPH-I0519). To keep a built-in, list
-/// it in the config; the default config template lists the _test.zig and
-/// directory-pattern defaults (build.zig is an entry, never an orphan).
-fn isOrphanExcluded(path: []const u8, cfg: *const Config) bool {
-    if (cfg.orphan_exclude.items.len > 0) {
-        for (cfg.orphan_exclude.items) |pattern| {
-            if (mem.endsWith(u8, path, pattern)) return true;
-            if (mem.indexOf(u8, path, pattern) != null) return true;
-        }
-        return false;
-    }
+/// True when `path` matches the built-in orphan exclusion defaults
+/// (build.zig, _test.zig, build_options.zig, and the directory patterns).
+/// Tool posture, not config suppression: these never count against the
+/// RED3-3 accounting (EPH-I0666, trust-model F-4).
+fn isOrphanExcludedDefault(path: []const u8) bool {
     if (mem.endsWith(u8, path, "_test.zig")) return true;
     if (mem.endsWith(u8, path, "/build.zig")) return true;
     if (mem.eql(u8, path, "build.zig")) return true;
     if (mem.endsWith(u8, path, "/build_options.zig")) return true;
     return matchesOrphanDirPattern(path);
+}
+
+/// True when a config "orphan_exclude" pattern matches `path` (contains or
+/// endsWith). An empty config list matches nothing: a non-empty list
+/// REPLACES the built-in defaults (B13-15, EPH-I0519), it does not extend
+/// them. A config-pattern match is a suppression channel, so the caller
+/// records it for the RED3-3 accounting (EPH-I0666).
+fn isOrphanExcludedByConfig(path: []const u8, cfg: *const Config) bool {
+    if (cfg.orphan_exclude.items.len == 0) return false;
+    for (cfg.orphan_exclude.items) |pattern| {
+        if (mem.endsWith(u8, path, pattern)) return true;
+        if (mem.indexOf(u8, path, pattern) != null) return true;
+    }
+    return false;
+}
+
+/// Check if file path should be excluded from orphan detection. Config
+/// patterns when present, else the built-in defaults (B13-15).
+fn isOrphanExcluded(path: []const u8, cfg: *const Config) bool {
+    if (cfg.orphan_exclude.items.len > 0) return isOrphanExcludedByConfig(path, cfg);
+    return isOrphanExcludedDefault(path);
 }
 
 /// Count leading whitespace (indentation level)
@@ -35192,6 +35240,14 @@ fn tryLoadConfigFromDir(
         // (EPH-I0513, B13-5). Roll them back before the caller falls
         // back to the parent config.
         rollbackConfigLists(cfg, allocator, list_snapshot);
+        // EPH-I0665 (trust-model F-1): the parse may also have applied a
+        // path_dir value, freeing the operator's original cfg.path buffer
+        // mid-parse. Restore the operator's path as an OWNED copy so a
+        // mid-parse failure cannot leave the scan root steered. An OOM in
+        // the parse is the only reachable error from an untrusted config;
+        // the gate-class errors are fatal by design and never take this
+        // path. The restore must run on every false exit regardless.
+        try setOwnedPath(allocator, cfg, saved_path);
         return false;
     }
 
@@ -36879,9 +36935,33 @@ fn updateBuildFnScanBraces(scan: *BuildFnScan, line: []const u8, idx: usize) voi
     }
 }
 
+/// True when the project's build.zig is a symlink or reparse point
+/// (EPH-I0670). The install/upgrade readers must not follow a
+/// planted link: the splice would re-emit the victim file's content into
+/// the repo tree. A stat failure reads as "not a link": the caller's read
+/// then fails or proceeds on a regular file (fail-open only on shapes
+/// that cannot be read anyway). Mirrors the EPH-I0284 zon-writer pre-flight
+/// done-when.
+fn buildZigIsSymlink(io: std.Io, dir: std.Io.Dir) bool {
+    const stat = dir.statFile(io, "build.zig", .{ .follow_symlinks = false }) catch return false;
+    return stat.kind == .sym_link;
+}
+
 /// Patch build.zig to add ephor step. Returns line number
 /// where inserted, or null if already exists.
 fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) !?usize {
+    // EPH-I0670: never read build.zig through a planted symlink —
+    // the splice would copy the victim's content into the repo tree. The
+    // installer refuses with a named error; the caller prints the manual
+    // integration block and fails the install.
+    if (buildZigIsSymlink(diag.io, project_dir)) {
+        cliDiag(
+            diag,
+            "error: build.zig is a symlink. Replace it with a regular file before installing ephor.\n",
+            .{},
+        );
+        return error.BuildZigIsSymlink;
+    }
     const content = project_dir.readFileAlloc(
         diag.io,
         "build.zig",
@@ -36894,8 +36974,14 @@ fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) 
     };
     defer allocator.free(content);
 
-    if (mem.indexOf(u8, content, "b.dependency(\"ephor\"") != null or
-        mem.indexOf(u8, content, "b.dependency( \"ephor\"") != null) return null;
+    // The duplicate-dependency precheck is masked to code positions
+    // (EPH-I0669): the marker text inside a comment or a string is
+    // not a real dependency declaration. Pre-fix, a hostile build.zig
+    // carrying the text in a comment made the patch return null, so the
+    // install reported "already exists" and exited 0 with the zon saved
+    // but no build steps — a half-integrated success.
+    if (indexOfCode(content, 0, "b.dependency(\"ephor\"") != null or
+        indexOfCode(content, 0, "b.dependency( \"ephor\"") != null) return null;
 
     var line_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer line_list.deinit(allocator);
@@ -37091,8 +37177,8 @@ fn printRecordedHash(io: std.Io, allocator: Allocator, ver: []const u8) void {
 /// the zig-fetch spawn: the hermetic upgrade tests rely on that order
 /// (band-T05 F5, EPH-I0572 — the pin lives at runZigFetchSave). The
 /// implicit-version fetch (fetchLatestVersion) is exempt from that order:
-/// the floor must compare the resolved target (B13-20), and no test
-/// reaches it.
+/// the floor must compare the resolved target (B13-20), and the hermetic
+/// suite reaches it only through the fetch seam below.
 /// CLI options for one upgrade run: an optional explicit version pin plus
 /// the downgrade-override latch (--force, EPH-I0193).
 const UpgradeOptions = struct {
@@ -37106,67 +37192,129 @@ fn runUpgradeCommand(
     project_dir: std.Io.Dir,
     opts: UpgradeOptions,
 ) !void {
-    const install_version = opts.install_version;
-    // Validate before the fetch: an explicit version reaches the URL below
-    // unchecked without this gate (EPH-I0155).
-    try requireStrictExplicitVersion(diag, install_version);
-    // If no explicit version, fetch the latest from Codeberg tags API
-    const fetched_ver = if (install_version == null)
-        fetchLatestVersion(diag.io, allocator)
-    else
-        null;
-    defer if (fetched_ver) |fv| allocator.free(fv);
-    const ver = install_version orelse (fetched_ver orelse EPHOR_VERSION);
+    const run: UpgradeRun = .{
+        .diag = diag,
+        .allocator = allocator,
+        .project_dir = project_dir,
+        .opts = opts,
+        .fetch_fn = fetchLatestVersion,
+    };
+    try run.run();
+}
 
-    // Floor: a downgrade needs --force. Applies to an explicit --version
-    // too (EPH-I0193). Refuse before any write; the implicit-version
-    // fetch above already ran — it must, to resolve the upgrade target
-    // the floor compares (B13-20).
-    if (!upgradeFloorAllows(EPHOR_VERSION, ver, opts.force)) {
+/// One upgrade run's context. fetch_fn is the version fetcher — a seam
+/// (mirroring resolveLatestVersion's) so tests exercise the implicit-version
+/// branch hermetically, which production never reaches without a network
+/// fetch. Production passes fetchLatestVersion. The methods split the run
+/// so each step stays inside the line/parameter budgets.
+const UpgradeRun = struct {
+    diag: *DiagCtx,
+    allocator: Allocator,
+    project_dir: std.Io.Dir,
+    opts: UpgradeOptions,
+    fetch_fn: *const fn (std.Io, Allocator) ?[]const u8,
+
+    fn run(self: *const UpgradeRun) !void {
+        // Validate before the fetch: an explicit version reaches the URL
+        // below unchecked without this gate (EPH-I0155).
+        try requireStrictExplicitVersion(self.diag, self.opts.install_version);
+        // If no explicit version, fetch the latest from Codeberg tags API.
+        const fetched_ver = if (self.opts.install_version == null)
+            self.fetch_fn(self.diag.io, self.allocator)
+        else
+            null;
+        defer if (fetched_ver) |fv| self.allocator.free(fv);
+        const ver = self.opts.install_version orelse (fetched_ver orelse EPHOR_VERSION);
+        try self.refuseUnparseableTarget(ver);
+        try self.refuseDowngrade(ver);
+        const package_url = try buildPackageUrl(self.allocator, ver);
+        defer self.allocator.free(package_url);
+        try self.completeUpgrade(ver, package_url);
+    }
+
+    /// Pins the splice-boundary contract (EPH-I0668): every source of
+    /// `ver` is strict-gated at its ingest point (explicit --version,
+    /// tags API, zon fallback). An unparseable target must never reach
+    /// buildPackageUrl, the ephor.json splice, the cache write, or the
+    /// printed banner.
+    fn refuseUnparseableTarget(self: *const UpgradeRun, ver: []const u8) !void {
+        if (isStrictSemverTag(ver)) return;
         cliDiag(
-            diag,
+            self.diag,
+            "error: refusing unparseable upgrade target '{s}' (expected X.Y.Z).\n",
+            .{ver},
+        );
+        return error.UpgradeFailed;
+    }
+
+    /// Floor: a downgrade needs --force. Applies to an explicit --version
+    /// too (EPH-I0193). Refuse before any write; the implicit-version
+    /// fetch already ran — it must, to resolve the upgrade target the
+    /// floor compares (B13-20).
+    fn refuseDowngrade(self: *const UpgradeRun, ver: []const u8) !void {
+        if (upgradeFloorAllows(EPHOR_VERSION, ver, self.opts.force)) return;
+        cliDiag(
+            self.diag,
             "ERROR: refusing to downgrade ephor from v{s} to v{s}. Use --force to override.\n",
             .{ EPHOR_VERSION, ver },
         );
         return error.UpgradeFailed;
     }
 
-    const package_url = try buildPackageUrl(allocator, ver);
-    defer allocator.free(package_url);
+    /// The post-gate upgrade steps: dependency check, zig fetch, config
+    /// version, and the build.zig integration.
+    fn completeUpgrade(
+        self: *const UpgradeRun,
+        ver: []const u8,
+        package_url: []const u8,
+    ) !void {
+        if (!projectHasEphorDependency(self.diag.io, self.allocator, self.project_dir)) {
+            cliDiag(self.diag,
+                \\No ephor dependency found in build.zig.zon.
+                \\
+                \\Run 'ephor install' first to add ephor to your project.
+                \\
+            , .{});
+            return error.UpgradeFailed;
+        }
 
-    if (!projectHasEphorDependency(diag.io, allocator, project_dir)) {
-        cliDiag(diag,
-            \\No ephor dependency found in build.zig.zon.
+        std.debug.print("Upgrading ephor to v{s}...\n", .{ver});
+
+        const url_z = try self.allocator.dupeZ(u8, package_url);
+        defer self.allocator.free(url_z);
+
+        // Run zig fetch --save to update the dependency
+        try upgradeFetchOutcome(
+            self.diag,
+            try runZigFetchSave(self.diag, self.project_dir, url_z),
+            ver,
+        );
+
+        printRecordedHash(self.diag.io, self.allocator, ver);
+
+        // Update version in ephor.json if it exists
+        updateConfigVersion(self.diag.io, self.allocator, ver);
+
+        // Update build.zig integration to match current canonical block.
+        // Only the symlink refusal errors here (EPH-I0670); every
+        // other miss is best-effort by the function's contract.
+        updateBuildZigIntegration(self.diag, self.allocator) catch {
+            cliDiag(
+                self.diag,
+                "error: build.zig is a symlink. Replace it with a regular file and re-run the upgrade.\n",
+                .{},
+            );
+            return error.UpgradeFailed;
+        };
+
+        std.debug.print(
+            \\Done! Ephor updated to v{s}.
             \\
-            \\Run 'ephor install' first to add ephor to your project.
+            \\Run 'zig build ephor' to verify.
             \\
-        , .{});
-        return error.UpgradeFailed;
+        , .{ver});
     }
-
-    std.debug.print("Upgrading ephor to v{s}...\n", .{ver});
-
-    const url_z = try allocator.dupeZ(u8, package_url);
-    defer allocator.free(url_z);
-
-    // Run zig fetch --save to update the dependency
-    try upgradeFetchOutcome(diag, try runZigFetchSave(diag, project_dir, url_z), ver);
-
-    printRecordedHash(diag.io, allocator, ver);
-
-    // Update version in ephor.json if it exists
-    updateConfigVersion(diag.io, allocator, ver);
-
-    // Update build.zig integration to match current canonical block
-    updateBuildZigIntegration(diag, allocator);
-
-    std.debug.print(
-        \\Done! Ephor updated to v{s}.
-        \\
-        \\Run 'zig build ephor' to verify.
-        \\
-    , .{ver});
-}
+};
 
 /// Map a finished zig-fetch child to the upgrade outcome (EPH-I0235). A
 /// nonzero exit reports the failure, then fails the upgrade.
@@ -37514,7 +37662,12 @@ fn zigContentParses(io: std.Io, allocator: Allocator, dir: std.Io.Dir, content: 
 /// live file (EPH-I0168): a marker cut that landed mid-expression would
 /// leave the project unbuildable, so a parse failure aborts the replace
 /// and keeps the old content.
-fn updateBuildZigIntegration(diag: *DiagCtx, allocator: Allocator) void {
+/// A symlinked build.zig refuses the update (EPH-I0670): the
+/// splice must never copy a victim file's content into the repo tree.
+/// The caller turns the refusal into an UpgradeFailed exit.
+fn updateBuildZigIntegration(diag: *DiagCtx, allocator: Allocator) !void {
+    if (buildZigIsSymlink(diag.io, std.Io.Dir.cwd()))
+        return error.BuildZigIsSymlink;
     const content = Fs.cwd(diag.io).readFileAlloc(allocator, "build.zig", 512 * 1024) catch return;
     defer allocator.free(content);
 
@@ -37881,6 +38034,12 @@ fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
 }
 
 /// Parse `.version = "X.Y.Z"` from build.zig.zon content.
+/// The value must pass isStrictSemverTag (EPH-I0668): this ingest
+/// is the zon-fallback of the implicit upgrade target, and the value
+/// reaches buildPackageUrl, the ephor.json splice, the update cache, and
+/// the render path. Strict X.Y.Z only — suffix bytes, a newline, and
+/// dot-segment payloads must not steer any sink. A non-strict occurrence
+/// is skipped so a later real key can still win.
 fn parseVersionFromZon(allocator: Allocator, content: []const u8) ?[]const u8 {
     const marker = ".version";
     var pos: usize = 0;
@@ -37896,6 +38055,7 @@ fn parseVersionFromZon(allocator: Allocator, content: []const u8) ?[]const u8 {
         const end = mem.indexOfPos(u8, content, pos, "\"") orelse return null;
         const ver = content[pos..end];
         if (ver.len == 0) return null;
+        if (!isStrictSemverTag(ver)) continue;
         return allocator.dupe(u8, ver) catch null;
     }
     return null;
@@ -38573,7 +38733,12 @@ fn extractDotPathEntry(ctx: EntryScanCtx, line: []const u8) !void {
 /// Extract entry points from a build.zig file at a specific path
 fn extractBuildZigEntriesFromPath(ctx: EntryScanCtx) !void {
     // Prevent stack overflow from circular @import chains (e.g., A imports B imports A)
-    if (ctx.depth > 4) return;
+    if (ctx.depth > 4) {
+        // EPH-I0667 (trust-model F-5): the nested-module chain truncates.
+        // Disclose once per run.
+        noteDepthCapTruncation(ctx.diag, 4);
+        return;
+    }
 
     const max_bytes = 1024 * 1024;
     // EPH-I0526: OOM is not "no build.zig here" — it propagates. The
@@ -38647,7 +38812,12 @@ fn addDirEntry(ctx: EntryScanCtx, dir_path: []const u8, name: []const u8) !void 
 /// *_test.zig), recursing up to depth 16. When ctx.check_access is set, each
 /// candidate is probed with access() before being added (target-path scans).
 fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
-    if (ctx.depth > 16) return;
+    if (ctx.depth > 16) {
+        // EPH-I0667 (trust-model F-5): entry discovery truncates. Disclose
+        // once per run; the cap names this walk's depth.
+        noteDepthCapTruncation(ctx.diag, 16);
+        return;
+    }
     var dir = Fs.cwd(ctx.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
     defer dir.close(ctx.diag.io);
     var iter = dir.iterate();
@@ -39841,7 +40011,8 @@ fn writeExportIssue(
 /// not suppression: the first is scan scope, the second is ephor's own
 /// off-by-default rule posture. The remaining verdicts are suppression
 /// channels. Attribution tries them most specific first: inline
-/// directive, known-issues, config disable, config exclude.
+/// directive, known-issues, config disable, config orphan_exclude, config
+/// exclude.
 const FilterDecision = enum {
     print,
     path_scope,
@@ -39850,12 +40021,14 @@ const FilterDecision = enum {
     known_issue,
     config_disable,
     config_exclude,
+    orphan_exclude,
 };
 
 /// Channel match facts for one in-scope finding, computed once and shared
 /// by the bucket attribution and the print decision. Soft channels
 /// (inline directive, known-issues) yield to --no-suppression. Hard
-/// channels (explicit disable, exclude, rule not enabled) never do.
+/// channels (explicit disable, exclude, orphan_exclude, rule not enabled)
+/// never do.
 const ChannelHits = struct {
     /// inline_directive or known_issue when a soft channel matched.
     soft: FilterDecision,
@@ -39865,6 +40038,10 @@ const ChannelHits = struct {
     rule_blocked: bool,
     /// A config exclude pattern matches the finding's path.
     excluded: bool,
+    /// A config orphan_exclude pattern hides this orphan finding
+    /// (EPH-I0666). Only ZA501 candidates reach this fact: the graph
+    /// filters the built-in defaults before the Issue exists.
+    orphan_hidden: bool,
 
     /// First-match bucket attribution: soft channels outrank hard ones,
     /// so a finding hidden by two channels counts once, under the most
@@ -39872,6 +40049,7 @@ const ChannelHits = struct {
     fn attribution(self: ChannelHits) FilterDecision {
         if (self.soft != .print) return self.soft;
         if (self.explicit_disable) return .config_disable;
+        if (self.orphan_hidden) return .orphan_exclude;
         if (self.excluded) return .config_exclude;
         if (self.rule_blocked) return .default_off;
         return .print;
@@ -39880,7 +40058,7 @@ const ChannelHits = struct {
     /// True when a hard channel matched. Hard channels drop the finding
     /// under every mode, including --no-suppression.
     fn hardBlocked(self: ChannelHits) bool {
-        return self.rule_blocked or self.excluded;
+        return self.rule_blocked or self.excluded or self.orphan_hidden;
     }
 };
 
@@ -39898,7 +40076,7 @@ const FilterVerdict = struct {
         if (self.hard_blocked) return false;
         return switch (self.decision) {
             .print => true,
-            .path_scope, .default_off, .config_disable, .config_exclude => false,
+            .path_scope, .default_off, .config_disable, .config_exclude, .orphan_exclude => false,
             .inline_directive, .known_issue => cfg.no_suppression,
         };
     }
@@ -39912,10 +40090,11 @@ const SuppressionStats = struct {
     known_issues: usize = 0,
     config_disable: usize = 0,
     config_exclude: usize = 0,
+    orphan_exclude: usize = 0,
 
     fn total(self: SuppressionStats) usize {
         return self.inline_directive + self.known_issues +
-            self.config_disable + self.config_exclude;
+            self.config_disable + self.config_exclude + self.orphan_exclude;
     }
 
     /// Record one finding's verdict. Only suppression channels count.
@@ -39927,6 +40106,7 @@ const SuppressionStats = struct {
             .known_issue => self.known_issues += 1,
             .config_disable => self.config_disable += 1,
             .config_exclude => self.config_exclude += 1,
+            .orphan_exclude => self.orphan_exclude += 1,
         }
     }
 };
@@ -40007,7 +40187,7 @@ fn exportIssues(
     // The printIssues passes already counted the suppression. This
     // section only reports the totals.
     if (out.suppression.total() > 0) {
-        var buf: [160]u8 = undefined;
+        var buf: [192]u8 = undefined;
         try output.print(allocator, "## Suppression accounting\n\n" ++
             "note: {d} finding{s} suppressed ({s})\n", .{
             out.suppression.total(),
@@ -40051,6 +40231,15 @@ fn classifySoftChannel(issue: Issue, out: ReportOutCtx) FilterDecision {
     return .print;
 }
 
+/// True when a config orphan_exclude pattern hides this orphan finding
+/// (EPH-I0666, trust-model F-4). Only RULE_ORPHAN_FILE candidates the
+/// graph carried past the default filter reach this fact; the built-in
+/// defaults are tool posture and never count.
+fn isOrphanHiddenIssue(issue: Issue, cfg: *const Config) bool {
+    if (!mem.eql(u8, issue.rule, RULE_ORPHAN_FILE)) return false;
+    return isOrphanExcludedByConfig(issue.file, cfg);
+}
+
 /// Classify a finding against every output filter. The verdict carries
 /// the first-match bucket attribution for accounting and the hard-channel
 /// flag for the print decision, so tallyIssues and the print loops share
@@ -40066,6 +40255,7 @@ fn classifyIssue(issue: Issue, out: ReportOutCtx) FilterVerdict {
         .explicit_disable = isExplicitlyDisabled(issue.rule, out.cfg),
         .rule_blocked = out.cfg.isRuleDisabled(issue.rule),
         .excluded = !is_runtime_issue and out.cfg.isPathExcluded(issue.file),
+        .orphan_hidden = isOrphanHiddenIssue(issue, out.cfg),
     };
     return .{
         .decision = hits.attribution(),
@@ -40079,14 +40269,15 @@ fn shouldPrintIssue(issue: Issue, out: ReportOutCtx) bool {
 }
 
 /// Format the per-channel breakdown of the suppression note, omitting zero
-/// buckets: "3 inline, 1 known-issues". Worst case is 138 bytes (four
-/// labels, four 20-digit usize values, three separators). 160 covers it.
+/// buckets: "3 inline, 1 known-issues". Worst case is 173 bytes (five
+/// labels, five 20-digit usize values, four separators). 192 covers it.
 fn formatSuppressionBreakdown(buf: []u8, stats: SuppressionStats) []const u8 {
     const buckets = [_]struct { n: usize, label: []const u8 }{
         .{ .n = stats.inline_directive, .label = "inline" },
         .{ .n = stats.known_issues, .label = "known-issues" },
         .{ .n = stats.config_disable, .label = "config disable" },
         .{ .n = stats.config_exclude, .label = "config exclude" },
+        .{ .n = stats.orphan_exclude, .label = "orphan exclude" },
     };
     var len: usize = 0;
     for (buckets) |bucket| {
@@ -40101,15 +40292,18 @@ fn formatSuppressionBreakdown(buf: []u8, stats: SuppressionStats) []const u8 {
 }
 
 /// Format the "suppressed" JSON object literal:
-/// {"inline": M, "known_issues": K, "config_disable": J, ... "total": N}
-/// Callers pass a 256-byte buffer (worst case is 192 bytes).
+/// {"inline": M, "known_issues": K, "config_disable": J, "config_exclude": L,
+///  "orphan_exclude": O, "total": N}
+/// Callers pass a 256-byte buffer (worst case is 221 bytes).
 fn formatSuppressedJson(buf: []u8, stats: SuppressionStats) ![]const u8 {
     return std.fmt.bufPrint(buf, "{{\"inline\": {d}, \"known_issues\": {d}, " ++
-        "\"config_disable\": {d}, \"config_exclude\": {d}, \"total\": {d}}}", .{
+        "\"config_disable\": {d}, \"config_exclude\": {d}, \"orphan_exclude\": {d}, " ++
+        "\"total\": {d}}}", .{
         stats.inline_directive,
         stats.known_issues,
         stats.config_disable,
         stats.config_exclude,
+        stats.orphan_exclude,
         stats.total(),
     });
 }
@@ -40117,13 +40311,13 @@ fn formatSuppressedJson(buf: []u8, stats: SuppressionStats) ![]const u8 {
 /// Print the suppressed counts as a standalone trailing JSON object. JSON
 /// mode emits a stream of top-level objects, so a run without --summary
 /// still carries the accounting for machine consumers. On the impossible
-/// overflow (256-byte buffer, 192-byte worst case) the object drops
+/// overflow (256-byte buffer, 221-byte worst case) the object drops
 /// silently: a bare-text notice would break the machine stream
 /// (EPH-I0213, EPH-I0540).
 fn printSuppressedJsonObject(stats: SuppressionStats) void {
     var buf: [256]u8 = undefined;
-    // Overflow is impossible: 92 fixed bytes + 5 usize values (<=20 digits
-    // each) = 192 bytes worst case. No catch unreachable (ZA202 dogfood).
+    // Overflow is impossible: 101 fixed bytes + 6 usize values (<=20 digits
+    // each) = 221 bytes worst case. No catch unreachable (ZA202 dogfood).
     const member = formatSuppressedJson(&buf, stats) catch return;
     std.debug.print("{{\n  \"suppressed\": {s}\n}}\n", .{member});
 }
@@ -40141,7 +40335,7 @@ fn reportSuppression(diag: *DiagCtx, stats: *const SuppressionStats, cfg: *const
     // accounting; the bare note would break the machine stream (EPH-I0213).
     if (diag.json_stream) return;
     diag.suppression_note_count += 1;
-    var buf: [160]u8 = undefined;
+    var buf: [192]u8 = undefined;
     cliDiag(diag, "note: {d} finding{s} suppressed ({s})\n", .{
         n,
         if (n == 1) @as([]const u8, "") else "s",
@@ -40620,6 +40814,21 @@ fn noteAstTierSkips(diag: *DiagCtx, stats: ast_tier.Stats) void {
         "note: {d} file{s} skipped by the AST tier (parse errors, byte " ++
             "cap, or grammar pre-scan). ZA111 coverage is partial for those files.\n",
         .{ stats.skipped, if (stats.skipped == 1) @as([]const u8, "") else "s" },
+    );
+}
+
+/// Surface scan-depth truncation (EPH-I0667, trust-model F-5): a depth cap
+/// silently stops the analyzed set otherwise. Fires once per run, the
+/// first time any cap truncates a subtree, and names that cap's depth.
+/// JSON mode skips the note so the machine stream stays pure (EPH-I0213).
+fn noteDepthCapTruncation(diag: *DiagCtx, cap: usize) void {
+    if (diag.depth_cap_note_count > 0 or diag.json_stream) return;
+    diag.depth_cap_note_count += 1;
+    cliDiag(
+        diag,
+        "note: scan depth cap of {d} reached; deeper subtrees are not analyzed. " ++
+            "Scan deep subtrees separately to include them.\n",
+        .{cap},
     );
 }
 
@@ -71143,6 +71352,60 @@ test "parseVersionFromZon returns null for missing version" {
 
     const bad_content = ".{ .name = .ephor }";
     try std.testing.expect(parseVersionFromZon(allocator, bad_content) == null);
+}
+
+test "parseVersionFromZon rejects a dot-segment payload (EPH-I0668)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Regression: the value reached buildPackageUrl unchecked, so a
+    // dot-segment version steered the fetch URL into another repo's
+    // archive path. The strict gate must refuse it at the ingest point.
+    const dot_segment =
+        \\.{
+        \\    .name = .ephor,
+        \\    .version = "x/../../../../org/repo/archive/v9.9.9",
+        \\}
+    ;
+    // The pre-fix parser dupes the payload; the free keeps the RED probe
+    // (gate removed) a clean assertion failure, not a leak panic.
+    const ver = parseVersionFromZon(allocator, dot_segment);
+    if (ver) |v| allocator.free(v);
+    try std.testing.expect(ver == null);
+}
+
+test "parseVersionFromZon rejects a newline payload (EPH-I0668)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Regression: a newline inside the value sailed into the URL splice,
+    // the config splice, the cache write, and the render path. Strict
+    // X.Y.Z only: the newline byte fails the digit grammar.
+    const newline_payload = ".{ .version = \"0.15.0\nmore\" }";
+    const ver = parseVersionFromZon(allocator, newline_payload);
+    if (ver) |v| allocator.free(v);
+    try std.testing.expect(ver == null);
+}
+
+test "parseVersionFromZon skips a non-strict occurrence and keeps the real key (EPH-I0668)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A commented marker whose value is not strict must not shadow the
+    // live key: the loop continues to the next .version occurrence.
+    const content =
+        \\.{
+        \\    // .version = "9.9.9-beta.1"
+        \\    .name = .ephor,
+        \\    .version = "0.9.0",
+        \\}
+    ;
+    const ver = parseVersionFromZon(allocator, content).?;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.9.0", ver);
 }
 
 // --- Update cache test seam ---
@@ -102158,6 +102421,56 @@ test "partial target-config parse rolls back its entries before the parent fallb
     }
 }
 
+test "loadConfigFromTargetPath OOM mid-parse keeps the operator's path (EPH-I0665)" {
+    var diag = testDiagCtx();
+    // Regression: an OOM after the path_dir key freed the operator's
+    // cfg.path buffer, and with no parent config to commit the saved
+    // path the steered value survived as the scan root. The sweep proves
+    // every completed load restores the operator's path.
+    const parent = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root/sub");
+    const tmp_path = try tmpDirPath(parent, &tmp);
+    defer parent.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(parent, "{s}/root", .{tmp_path});
+    defer parent.free(root_path);
+    // No parent config: only the loader's restore can recover the path.
+    try writeTestConfig(root_path, "{\"path_dir\": \"sub\", \"entries\": [\"a.zig\"]}");
+
+    diag.cli_diagnostics_enabled = false;
+    // Measure the load's allocation count so the sweep covers every
+    // induced failure point plus one no-failure run.
+    var probe = SingleFailureAllocator{ .parent = parent };
+    var probe_cfg = testConfig();
+    try setOwnedPath(probe.allocator(), &probe_cfg, root_path);
+    try loadConfigFromTargetPath(&diag, probe.allocator(), &probe_cfg, root_path);
+    probe_cfg.deinit(probe.allocator());
+    const total_allocs = probe.alloc_count;
+
+    var fail_at: usize = 0;
+    while (fail_at <= total_allocs) : (fail_at += 1) {
+        var failing = SingleFailureAllocator{ .parent = parent };
+        var cfg = testConfig();
+        try setOwnedPath(failing.allocator(), &cfg, root_path);
+        failing.fail_at = failing.alloc_count + fail_at;
+        if (loadConfigFromTargetPath(&diag, failing.allocator(), &cfg, root_path)) |_| {
+            // A completed load never leaves the steered path: either the
+            // target config committed (success), or the parse failed and
+            // the loader restored the operator's path. Entries never mix:
+            // the parse-failed path rolls them back (EPH-I0513).
+            try std.testing.expectEqualStrings(root_path, cfg.path);
+            try std.testing.expect(cfg.path_owned);
+            try std.testing.expect(
+                cfg.entries.items.len == 0 or cfg.entries.items.len == 1,
+            );
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        cfg.deinit(failing.allocator());
+    }
+}
+
 test "skipJsonValue skips brackets inside strings (untrusted skip stays aligned)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -103401,6 +103714,121 @@ test "patchBuildZig rejects a mid-expression splice and keeps the file (EPH-I051
     try std.testing.expectEqualStrings(original, after);
 }
 
+test "patchBuildZig ignores a comment-only dependency mention (EPH-I0669)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Regression: the raw-substring precheck matched the marker text
+    // inside a comment and returned null, so the install reported
+    // "already exists" and exited 0 with the zon saved but no build
+    // steps. The masked precheck must see no real dependency and patch.
+    const original =
+        \\const std = @import("std");
+        \\// b.dependency("ephor", .{}) mentioned only in a comment
+        \\pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+        \\    const exe = b.addExecutable(.{ .name = "x", .root_source_file = b.path("src/main.zig") });
+        \\    _ = exe;
+        \\    _ = optimize;
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = original,
+    });
+    const inserted = try patchBuildZig(&diag, allocator, tmp.dir);
+    try std.testing.expect(inserted != null);
+    const after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(after);
+    try std.testing.expect(mem.indexOf(u8, after, EPHOR_BUILD_BLOCK) != null);
+}
+
+test "patchBuildZig keeps a real code-position dependency (EPH-I0669)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Positive control for the masked precheck: a real b.dependency
+    // declaration in code still reads as "already exists".
+    const original =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    const dep = b.dependency("ephor", .{});
+        \\    _ = dep;
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = original,
+    });
+    const inserted = try patchBuildZig(&diag, allocator, tmp.dir);
+    try std.testing.expectEqual(@as(?usize, null), inserted);
+}
+
+test "buildZigIsSymlink detects a planted link and ignores regular files (EPH-I0670)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "victim", .data = "victim" });
+    try tmp.dir.symLink(std.testing.io, "victim", "build.zig", .{});
+    try std.testing.expect(buildZigIsSymlink(std.testing.io, tmp.dir));
+
+    // A regular file is not a link, and a missing file reads as "not a
+    // link" (the caller's read then fails on its own).
+    try tmp.dir.deleteFile(std.testing.io, "build.zig");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "x" });
+    try std.testing.expect(!buildZigIsSymlink(std.testing.io, tmp.dir));
+    try tmp.dir.deleteFile(std.testing.io, "build.zig");
+    try std.testing.expect(!buildZigIsSymlink(std.testing.io, tmp.dir));
+}
+
+test "patchBuildZig refuses a symlinked build.zig and spares the victim (EPH-I0670)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Regression: the reader followed the planted link and re-emitted the
+    // victim content plus the ephor block into the repo tree. The lstat
+    // pre-flight refuses with a named error, and the victim keeps its bytes.
+    const victim_content =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    _ = b;
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "victim.zig",
+        .data = victim_content,
+    });
+    try tmp.dir.symLink(std.testing.io, "victim.zig", "build.zig", .{});
+    try std.testing.expectError(
+        error.BuildZigIsSymlink,
+        patchBuildZig(&diag, allocator, tmp.dir),
+    );
+    const victim = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "victim.zig",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(victim);
+    try std.testing.expectEqualStrings(victim_content, victim);
+}
+
 test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {
     var diag = testDiagCtx();
     // Regression: an explicit --version reached the fetch URL unvalidated.
@@ -103478,6 +103906,51 @@ test "upgrade without ephor dependency returns UpgradeFailed (EPH-I0235)" {
             tmp.dir,
             .{ .install_version = EPHOR_VERSION, .force = false },
         ),
+    );
+}
+
+test "upgrade refuses an unparseable implicit target before the URL splice (EPH-I0668)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The fetch seam returns a hostile implicit target. The refusal must
+    // fire before buildPackageUrl and before any spawn, so the hermetic
+    // property holds (band-T05 F5). The garbage shape passes the floor by
+    // design (upgradeFloorAllows pins that), so the refusal is the only
+    // gate that can stop it at the splice boundary.
+    resetFetchSeam("x/../../../../org/repo/archive/v9.9.9");
+    const hostile_run: UpgradeRun = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .project_dir = tmp.dir,
+        .opts = .{ .install_version = null, .force = false },
+        .fetch_fn = testFetchFn,
+    };
+    try std.testing.expectError(error.UpgradeFailed, hostile_run.run());
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "refusing unparseable upgrade target") != null,
+    );
+
+    // A strict implicit target still flows through the seam to the floor:
+    // the downgrade refusal proves the wiring end to end.
+    capture = .{};
+    diag.diag_sink = capture.sink();
+    resetFetchSeam("0.0.1");
+    const downgrade_run: UpgradeRun = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .project_dir = tmp.dir,
+        .opts = .{ .install_version = null, .force = false },
+        .fetch_fn = testFetchFn,
+    };
+    try std.testing.expectError(error.UpgradeFailed, downgrade_run.run());
+    try std.testing.expectEqual(@as(usize, 1), test_fetch_calls);
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "refusing to downgrade") != null,
     );
 }
 
@@ -104243,6 +104716,7 @@ test "suppression: JSON member parses and the total stays consistent" {
         .known_issues = 1,
         .config_disable = 3,
         .config_exclude = 4,
+        .orphan_exclude = 5,
     };
     const member = try formatSuppressedJson(&buf, stats);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, member, .{});
@@ -104252,7 +104726,167 @@ test "suppression: JSON member parses and the total stays consistent" {
     try std.testing.expectEqual(@as(i64, 1), obj.get("known_issues").?.integer);
     try std.testing.expectEqual(@as(i64, 3), obj.get("config_disable").?.integer);
     try std.testing.expectEqual(@as(i64, 4), obj.get("config_exclude").?.integer);
-    try std.testing.expectEqual(@as(i64, 10), obj.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), obj.get("orphan_exclude").?.integer);
+    try std.testing.expectEqual(@as(i64, 15), obj.get("total").?.integer);
+}
+
+test "config orphan_exclude feeds the suppression accounting (EPH-I0666)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // Regression: the config orphan_exclude filter ran before an Issue
+    // existed, so the only suppression-gate channel with zero RED3-3
+    // accounting hid orphan findings silently. Now the excluded candidate
+    // becomes an Issue and classifyIssue counts it under orphan_exclude.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "entry.zig", .data = "pub fn f() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hidden.zig", .data = "pub fn g() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "util_test.zig", .data = "pub fn h() void {}\n" });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const entry = try std.fmt.allocPrint(allocator, "{s}/entry.zig", .{tmp_path});
+    defer allocator.free(entry);
+    const hidden = try std.fmt.allocPrint(allocator, "{s}/hidden.zig", .{tmp_path});
+    defer allocator.free(hidden);
+    const util_test = try std.fmt.allocPrint(allocator, "{s}/util_test.zig", .{tmp_path});
+    defer allocator.free(util_test);
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.analyzeFile(entry);
+    try graph.analyzeFile(hidden);
+    try graph.analyzeFile(util_test);
+    try graph.markReachable(entry);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, tmp_path);
+    try cfg.orphan_exclude.append(allocator, try allocator.dupe(u8, "hidden.zig"));
+
+    // The config list REPLACES the defaults (B13-15): hidden.zig matches
+    // the config pattern, util_test.zig loses the built-in _test.zig
+    // exclusion and reports as a normal orphan.
+    var issues = try graph.getOrphanIssues(allocator, &cfg);
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+
+    var stats = SuppressionStats{};
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    const out: ReportOutCtx = .{
+        .diag = &diag,
+        .base_path = tmp_path,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .graph = &graph,
+        .ignore_cache = &cache,
+        .suppression = &stats,
+    };
+    const counts = tallyIssues(issues.items, out);
+    // Only the config-excluded candidate counts: one suppressed, one print.
+    try std.testing.expectEqual(@as(usize, 1), counts.warnings);
+    try std.testing.expectEqual(@as(usize, 1), stats.orphan_exclude);
+    try std.testing.expectEqual(@as(usize, 1), stats.total());
+    var bbuf: [192]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "1 orphan exclude",
+        formatSuppressionBreakdown(&bbuf, stats),
+    );
+    const hidden_verdict = classifyIssue(
+        blk: {
+            for (issues.items) |issue| {
+                if (mem.eql(u8, issue.file, hidden)) break :blk issue;
+            }
+            return error.TestUnexpectedResult;
+        },
+        out,
+    );
+    try std.testing.expectEqual(FilterDecision.orphan_exclude, hidden_verdict.decision);
+    try std.testing.expect(!hidden_verdict.allowsPrint(&cfg));
+
+    // With no config patterns the built-in defaults filter _test.zig
+    // before the Issue exists: tool posture, never an accounting bucket.
+    var plain = testConfig();
+    defer plain.deinit(allocator);
+    try setOwnedPath(allocator, &plain, tmp_path);
+    var plain_issues = try graph.getOrphanIssues(allocator, &plain);
+    defer deinitIssues(&plain_issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), plain_issues.items.len);
+    try std.testing.expect(mem.eql(u8, plain_issues.items[0].file, hidden));
+}
+
+/// Build a path of `levels` one-char directory names under `base` (the
+/// depth-cap tests' fixture: a hostile tree burying files past the cap).
+fn deepTreePath(allocator: Allocator, base: []const u8, levels: usize) ![]const u8 {
+    var path = std.ArrayListUnmanaged(u8).empty;
+    errdefer path.deinit(allocator);
+    try path.appendSlice(allocator, base);
+    var i: usize = 0;
+    while (i < levels) : (i += 1) try path.appendSlice(allocator, "/d");
+    return path.toOwnedSlice(allocator);
+}
+
+test "scan depth cap truncation notes once per run (EPH-I0667, F-5)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // Regression: the 32-depth main-walk cap truncated the analyzed set
+    // silently — a hostile tree buried code past it and the run showed a
+    // clean status. The note must fire once, and the buried file must
+    // never join the graph.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const deep = try deepTreePath(allocator, tmp_path, 40);
+    defer allocator.free(deep);
+    try tmp.dir.createDirPath(std.testing.io, deep[tmp_path.len + 1 ..]);
+    const buried_rel = try std.fmt.allocPrint(allocator, "{s}/x.zig", .{deep[tmp_path.len + 1 ..]});
+    defer allocator.free(buried_rel);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = buried_rel,
+        .data = "pub fn f() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.scanDirectory(tmp_path);
+    try std.testing.expectEqual(@as(usize, 1), diag.depth_cap_note_count);
+    try std.testing.expectEqual(@as(usize, 0), graph.files.count());
+}
+
+test "entry-discovery depth cap truncation notes once per run (EPH-I0667, F-5)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // The 16-depth entry-discovery walk truncates silently too: a
+    // main.zig buried past the cap never becomes an entry. The note
+    // fires once and the entry set stays empty.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const deep = try deepTreePath(allocator, tmp_path, 20);
+    defer allocator.free(deep);
+    try tmp.dir.createDirPath(std.testing.io, deep[tmp_path.len + 1 ..]);
+    const rel = deep[tmp_path.len + 1 ..];
+    const buried_main = try std.fmt.allocPrint(allocator, "{s}/main.zig", .{rel});
+    defer allocator.free(buried_main);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = buried_main, .data = "pub fn main() void {}\n" });
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    const ctx: EntryScanCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .added = &added,
+    };
+    try scanDirForEntries(ctx, tmp_path);
+    try std.testing.expectEqual(@as(usize, 1), diag.depth_cap_note_count);
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
 }
 
 test "suppression: known-issues load works outside check and only once" {

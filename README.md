@@ -583,8 +583,8 @@ space-separated ids.
 ### Suppression Accounting
 
 Suppression is never silent. When an inline directive, the known-issues
-list, a config `disable`, or a config `exclude` hides a finding, ephor
-prints one note to stderr before the status line:
+list, a config `disable`, a config `exclude`, or a config `orphan_exclude`
+hides a finding, ephor prints one note to stderr before the status line:
 
 ```
 note: 3 findings suppressed (2 inline, 1 config disable)
@@ -592,17 +592,19 @@ note: 3 findings suppressed (2 inline, 1 config disable)
 
 The note omits zero-count channels. A finding hidden by two channels counts
 once, under the most specific channel: inline directive, known-issues,
-config disable, config exclude (in that order). Findings outside the
-scanned path are scope, not suppression. Rules that ephor ships OFF by
-default (for example ZA305) are ephor's own posture, not suppression.
-Neither one counts.
+config disable, orphan exclude, config exclude (in that order). Findings
+outside the scanned path are scope, not suppression. Rules that ephor
+ships OFF by default (for example ZA305) are ephor's own posture, not
+suppression. Neither one counts. The built-in orphan exclusions
+(`_test.zig`, `build.zig`, the directory patterns) are the same posture —
+only a config `orphan_exclude` match counts.
 
 `--format=json` adds a `"suppressed"` object for machine consumers. With
 `--summary`, ephor embeds it in the summary object. Without `--summary`,
 ephor prints it as a trailing top-level object:
 
 ```json
-"suppressed": {"inline": 2, "known_issues": 0, "config_disable": 1, "config_exclude": 0, "total": 3}
+"suppressed": {"inline": 2, "known_issues": 0, "config_disable": 1, "config_exclude": 0, "orphan_exclude": 0, "total": 3}
 ```
 
 `--export` appends the same note to the markdown export as a final
@@ -611,7 +613,8 @@ ephor prints it as a trailing top-level object:
 **Audit mode** — `--no-suppression` stops inline directives and the
 known-issues list from hiding findings. The findings print as if
 unsuppressed, and the note counts what would have been hidden. Config
-`disable` and `exclude` still apply — they are your own explicit config.
+`disable`, `exclude`, and `orphan_exclude` still apply — they are your own
+explicit config.
 Use it in CI to audit a repo you do not trust.
 
 A `.ephor-ignore` file in the scanned path auto-loads as the known-issues

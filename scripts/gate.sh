@@ -118,19 +118,27 @@ TESTS_TOTAL="$(printf '%s\n' "$TESTS_LINE" | sed -nE 's/.*; ([0-9]+)\/([0-9]+) t
 STEPS_OK="$(printf '%s\n' "$TESTS_LINE" | sed -nE 's/^Build Summary: ([0-9]+)\/([0-9]+) steps succeeded.*/\1/p')"
 STEPS_TOTAL="$(printf '%s\n' "$TESTS_LINE" | sed -nE 's/^Build Summary: ([0-9]+)\/([0-9]+) steps succeeded.*/\2/p')"
 TESTS_BASE="$(awk '$1 == "tests" {print $2}' "$BASELINES")"
-if [ -z "$TESTS_PASSED" ] || [ -z "$STEPS_OK" ]; then
-    fail "test ratchet (cannot parse the Build Summary line)"
-elif [ -z "$TESTS_BASE" ]; then
-    fail "test ratchet (baseline missing or malformed in $BASELINES)"
-elif [ "$STEPS_OK" != "$STEPS_TOTAL" ]; then
-    fail "test ratchet ($STEPS_OK/$STEPS_TOTAL steps succeeded)"
-elif [ "$TESTS_PASSED" != "$TESTS_TOTAL" ]; then
-    fail "test ratchet ($TESTS_PASSED/$TESTS_TOTAL tests passed)"
-elif [ "$TESTS_PASSED" -lt "$TESTS_BASE" ]; then
-    fail "test ratchet ($TESTS_PASSED below baseline $TESTS_BASE)"
-else
-    ok "test ratchet ($TESTS_PASSED/$TESTS_TOTAL passed, baseline $TESTS_BASE)"
-fi
+# The baseline must be exactly one decimal token before any arithmetic
+# comparison: the glob rejects empty, non-numeric (the "tests abc" typo
+# class), and multi-line values from duplicated keys in one test.
+case "$TESTS_BASE" in
+    '' | *[!0-9]*)
+        fail "test ratchet (baseline missing or malformed in $BASELINES)"
+        ;;
+    *)
+        if [ -z "$TESTS_PASSED" ] || [ -z "$STEPS_OK" ]; then
+            fail "test ratchet (cannot parse the Build Summary line)"
+        elif [ "$STEPS_OK" != "$STEPS_TOTAL" ]; then
+            fail "test ratchet ($STEPS_OK/$STEPS_TOTAL steps succeeded)"
+        elif [ "$TESTS_PASSED" != "$TESTS_TOTAL" ]; then
+            fail "test ratchet ($TESTS_PASSED/$TESTS_TOTAL tests passed)"
+        elif [ "$TESTS_PASSED" -lt "$TESTS_BASE" ]; then
+            fail "test ratchet ($TESTS_PASSED below baseline $TESTS_BASE)"
+        else
+            ok "test ratchet ($TESTS_PASSED/$TESTS_TOTAL passed, baseline $TESTS_BASE)"
+        fi
+        ;;
+esac
 
 # --- 4. dogfood ratchet ----------------------------------------------------
 # fail_on: warning is the intended posture: the check exits 1 while
@@ -148,13 +156,20 @@ DOGFOOD_EXIT=$?
 set -e
 DOG_COUNT="$(sed -nE 's/^ephor: ([0-9]+) warnings?(, [0-9]+ notes?)? found$/\1/p' "$GATE_DIR/dogfood.log" | tail -1 || true)"
 DOG_BASE="$(awk '$1 == "dogfood" {print $2}' "$BASELINES")"
-if [ -z "$DOG_BASE" ]; then
-    fail "dogfood ratchet (baseline missing or malformed in $BASELINES)"
-elif [ -n "$DOG_COUNT" ] && [ "$DOG_COUNT" -gt "$DOG_BASE" ]; then
-    fail "dogfood ratchet ($DOG_COUNT above baseline $DOG_BASE)"
-else
-    ok "dogfood ratchet (${DOG_COUNT:-0} <= baseline $DOG_BASE)"
-fi
+# Same token validation as the test ratchet: empty, non-numeric, or
+# multi-line values must fail before any -gt comparison.
+case "$DOG_BASE" in
+    '' | *[!0-9]*)
+        fail "dogfood ratchet (baseline missing or malformed in $BASELINES)"
+        ;;
+    *)
+        if [ -n "$DOG_COUNT" ] && [ "$DOG_COUNT" -gt "$DOG_BASE" ]; then
+            fail "dogfood ratchet ($DOG_COUNT above baseline $DOG_BASE)"
+        else
+            ok "dogfood ratchet (${DOG_COUNT:-0} <= baseline $DOG_BASE)"
+        fi
+        ;;
+esac
 if [ -z "$DOG_COUNT" ]; then
     # Zero warnings: the notes-only footer or the clean form (no footer).
     # A completed --summary scan always prints the STATUS line; its absence

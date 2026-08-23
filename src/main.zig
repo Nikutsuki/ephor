@@ -34555,9 +34555,9 @@ fn isRuleToken(tok: []const u8) bool {
 /// id buried in trailing prose does not count.
 /// B13-14 (EPH-I0519): directives match rule ids EXACTLY — `ZA3` does not
 /// suppress ZA301. The config disable/enable lists additionally accept
-/// category prefixes (`"disable": ["ZA3"]` kills the whole category); the
-/// asymmetry is documented in printHelp; the README coverage is pending
-/// EPH-I1050 (README lag). A directive is a surgical, in-code decision; a
+/// category prefixes (`"disable": ["ZA3"]` kills the whole category). The
+/// asymmetry is documented in printHelp and the README (README coverage
+/// landed in EPH-I1050). A directive is a surgical, in-code decision; a
 /// config list is run-wide policy.
 fn ruleListMatches(rest: []const u8, rule: []const u8) bool {
     var tokens = mem.tokenizeAny(u8, rest, " \t\r");
@@ -35534,7 +35534,7 @@ fn entryPassesTrust(io: std.Io, trusted: bool, root_real: ?[]const u8, abs: []co
 /// mutated DURING the scan could swap a symlink between gate and open
 /// (TOCTOU). The no-active-adversary-during-scan assumption is the
 /// accepted posture for a batch scanner; the README trust-model section
-/// (B83) lacks the statement — see EPH-I1050 (README lag).
+/// documents the statement (README coverage landed in EPH-I1050).
 fn realpathContained(io: std.Io, root_real: []const u8, candidate: []const u8) bool {
     var cand_buf: [Fs.max_path_bytes]u8 = undefined;
     const cand_real = Fs.cwd(io).realpath(candidate, &cand_buf) catch return false;
@@ -36406,8 +36406,8 @@ fn parseConfigJson(diag: *DiagCtx, allocator: Allocator, content: []const u8, cf
 /// Keys parse in file order. A repeated scalar key resolves last-wins
 /// (setOwnedPath, setFailOn, error_naming overwrite); a repeated list key
 /// accumulates (each value appends) (B13-12, EPH-I0518). The duplicate
-/// semantics are documented in printHelp; the README coverage is pending
-/// EPH-I1050 (README lag). There is no duplicate detection.
+/// semantics are documented in printHelp and the README (README coverage
+/// landed in EPH-I1050). There is no duplicate detection.
 fn parseConfigJsonSource(ctx: ConfigParseCtx) !void {
     const content = ctx.content;
     var i: usize = 0;
@@ -59957,7 +59957,7 @@ test "module doc comment //! does not suppress (B13-13)" {
 test "directive rule ids are exact, config disable prefixes are not (B13-14)" {
     // A directive matches the rule id exactly: `ZA3` suppresses nothing.
     // The config disable list matches prefixes: "ZA3" kills the category.
-    // The asymmetry is documented in printHelp (README lag EPH-I1050).
+    // The asymmetry is documented in printHelp and the README (EPH-I1050).
     const content =
         \\// ephor:ignore ZA3
         \\const x = foo() catch {};
@@ -101361,7 +101361,7 @@ test "same source resolves last-wins" {
 }
 
 test "duplicate list keys accumulate, duplicate scalars last-win (B13-12)" {
-    // Documented semantics (printHelp; README lag EPH-I1050): a repeated
+    // Documented semantics (printHelp and README, EPH-I1050): a repeated
     // list key appends every value; a repeated scalar key resolves
     // last-wins.
     var diag = testDiagCtx();

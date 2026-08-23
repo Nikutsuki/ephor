@@ -174,6 +174,57 @@ src/main.zig:506:25: warning[ZA201]: silent catch {} discards error without hand
 ephor check --format=json
 ```
 
+`--format=json` writes one stream of top-level JSON objects to stderr: one
+object per analyzer (orphans, memory, errors, null-safety, panic, unused,
+complexity, format, naming, style, tests, concurrency), then the summary
+object when `--summary` is set, and the suppression-accounting object. The
+stream serves machine consumers, so JSON mode suppresses every human
+diagnostic: the footer, the strict-failure notice, the
+suppression-accounting note, the AST-skip note, the update-check
+notification and fetch warning, the export confirmation, and the runtime
+band's "Running:" line. The suppressed counts ride the `"suppressed"`
+object. The AST-skipped count rides the summary's `ast_skipped` member.
+The export file itself confirms the export. See [Suppression
+Accounting](#suppression-accounting) for the `"suppressed"` object shape.
+
+The summary `issues` member gained `"notes"`. Each per-category bucket
+counts warnings, and error-severity findings ride inside the warning
+count. `"total"` counts every printed finding: warnings, errors, and
+notes. `"status"` reflects that total, so a notes-only run never reports
+`"ok"`.
+
+The two error-family lists (error-handling findings and discarded error
+unions) merge into one `"errors"` analyzer object. Each analyzer name
+appears at most once in the stream.
+
+The strict gate prints no human notice in JSON mode. The exit code
+carries the gate. A failed run closes the stream with one machine error
+object and exits 1:
+
+```
+{
+  "error": "RunFailed",
+  "message": ""
+}
+```
+
+On a usage error the diagnostic rides the `message` member. For example,
+an unknown flag emits:
+
+```
+{"error": "UnknownFlag", "message": "error: unknown flag '--bogus' (see ephor --help)"}
+```
+
+A mid-run or gate failure carries an empty message.
+
+Boundaries: `--verbose` is a no-op in JSON mode. The machine latch arms
+before the config load and the tool-path resolution, so diagnostics from
+either stay off the stream. The `init`, `install`, and `upgrade` commands
+reject `--format=json` with a hard error and one machine error object,
+because their human progress text has no machine equivalent. The `help`
+and `version` commands are not analysis commands and print their human
+text regardless of `--format=json`.
+
 ## Configuration
 
 Create `ephor.json` in your project root:
@@ -222,6 +273,8 @@ Example config:
 | `error_naming` | ZA703 convention for error set member declarations: `TitleCase` (default; `PascalCase` accepted as an alias) or `snake_case` |
 | `thresholds` | Complexity and style thresholds. Values clamp at documented maxima (see Config trust model) |
 
+Keys parse in file order. A repeated scalar key (`path_dir`, `strict`, `fail_on`, `error_naming`) resolves last-wins. A repeated list key (`entries`, `exclude`, `orphan_exclude`, `disable`, `enable`) accumulates. `fail_on` outranks `strict` regardless of key order (see Exit Codes).
+
 ### Config trust model
 
 A config file is trusted when its directory is the working directory or an ancestor of it (realpath compare). Every other config is untrusted. `--trust-target-config` declares a scanned target's config trusted.
@@ -246,6 +299,8 @@ note: ignoring <N> outside-root entries extracted from target tree <path>
 
 Operator channels stay exempt: `--entry`, a trusted config's `entries`, and the working directory's own build.zig may point outside the scan root. Orphan detection then stays complete for files the scan root does not cover.
 
+The containment gates realpath a path to decide, then open the original textual path. A tree mutated during the scan could swap a symlink between the check and the open. The scanner assumes no active adversary during the scan.
+
 The `check` scan covers the CLI path and every honored entry point. An entry outside the CLI path joins the scan as an extra root. A targeted run such as `ephor check src/foo.zig` also scans those entry files. The summary's Files count reflects the union. Ephor prints one note when the entries widen the scan:
 
 ```
@@ -262,7 +317,7 @@ The `.ephor-ignore` auto-load honors the same trust decision. Ephor refuses an u
 note: ignoring untrusted .ephor-ignore at <path> (use --trust-target-config to honor)
 ```
 
-Ephor always honors an explicit `--known-issues=<file>`, and the load stays silent.
+Ephor always honors an explicit `--known-issues=<file>`, and the load stays silent. An explicit file that cannot be read is a hard usage error: a mistyped path never silently un-filters the known-issue list.
 
 Residual: running ephor inside a tree trusts that tree's config. To audit an untrusted repo, run `ephor check <path>` from outside it, or review its `ephor.json` first.
 
@@ -271,6 +326,7 @@ Validation rules:
 - Every config `path_dir` resolves relative to the config's directory and must stay inside it. Ephor ignores an escaping value (for example `..` or `/`) with a warning.
 - An honored `exclude` list rejects an empty pattern with a hard usage error. Ephor ignores the over-broad patterns `/` and `.zig` with a warning. Untrusted configs skip `exclude` before validation.
 - Threshold values clamp at documented maxima with a warning: 100000 (lines, nesting, params, branches, line length), 10000 (cyclomatic, cognitive), 100000000 (file bytes). Config files and CLI flags clamp alike.
+- CLI threshold flags reject a zero or non-integer value as a hard usage error ("expected a positive integer"). A zero threshold would flag every function, so the flag fails closed instead of silently contradicting the value you typed.
 
 ### Subprocess trust
 
@@ -335,7 +391,7 @@ An override that is not absolute or does not resolve prints a warning and falls 
 
 ### Cyclomatic Complexity (ZA305)
 
-McCabe's cyclomatic complexity counts independent execution paths. Every `if`, `while`, `for`, `switch`, `catch`, `try`, `orelse`, `and`, and `or` adds 1 to the count. Each `=>` switch arm also adds 1 to the count. A function with no branching has a CCN of 1. Default threshold: 10.
+McCabe's cyclomatic complexity counts independent execution paths. Every `if`, `while`, `for`, `switch`, `catch`, `try`, `orelse`, `and`, and `or` adds 1 to the count. Each `=>` switch arm adds 1 to the count. A standalone `else` adds nothing: it is the alternative of an already-counted predicate (an `else if` line counts once, for its `if`). A function with no branching has a CCN of 1. Default threshold: 10.
 
 ### Cognitive Complexity (ZA306)
 
@@ -570,8 +626,11 @@ fn legacy_handler() void {
 Omit the rule to suppress all rules: `// ephor:ignore`
 
 Directives are anchored: the keyword must be the first token of a plain `//`
-comment — keywords mentioned inside prose or in `///` doc comments are
-ignored. List multiple rules separated by whitespace, e.g.
+comment — keywords mentioned inside prose or in `///` and `//!` doc comments
+are ignored. Directives match rule ids exactly: `ZA3` does not suppress
+`ZA301`. The config `disable`/`enable` lists accept category prefixes.
+Directives do not. A directive is a surgical, in-code decision. A config
+list is run-wide policy. List multiple rules separated by whitespace, e.g.
 `// ephor:ignore ZA201 ZA305`. The rule list ends at the first non-rule word,
 so trailing prose is fine, but a rule id following other words is not part
 of the list. Rule ids must be whole tokens: `ZA201,` (trailing comma) is not
@@ -636,7 +695,7 @@ Commands:
   check       Run all static checks (default)
   runtime     Run tests with memory diagnostics (dynamic analysis)
   orphans     Files not imported from entry points
-  memory      Stdlib allocation without defer patterns (50+ patterns)
+  memory      Stdlib allocation without defer patterns (21 patterns: 18 method + 3 qualified)
   errors      Error handling patterns (ZA201-ZA210)
   unused      Unused imports/const/var declarations
   complexity  Function complexity metrics
@@ -645,6 +704,8 @@ Commands:
   upgrade     Upgrade ephor to latest version (alias: update)
   install     Add ephor to project's build.zig (version-pinned)
   init        Create ephor.json config file
+  help        Print the usage text
+  version     Print the version banner
 
 Options:
   --entry=<file>       Entry point (default: src/main.zig)
@@ -676,6 +737,9 @@ Options:
                        The findings print, and the suppression note
                        counts what would have been hidden. Config
                        disable/exclude still apply.
+  --                  Stop flag parsing: the rest of the arguments
+                      are scan paths (use for a path that starts
+                      with '-')
   -b, --build          With 'init': also show build.zig integration
   --export=<file>      Export issues to file with code snippets
   --known-issues=<file> Filter out known true positives (file:line format)
@@ -979,8 +1043,10 @@ Ephor uses a modular compatibility layer to support Zig 0.16.x API patterns. The
 
 ```
 src/compat/
-├── compat.zig     # Main module: version detection, table dispatch
-└── v0_16.zig      # Zig 0.16.x specific implementations
+├── compat.zig     # Main module: version detection, table dispatch, getters
+├── vocab.zig      # Shared vocabulary types (AllocMethod, AllocatorType, etc.)
+├── v0_15.zig      # Zig 0.15.x pattern and predicate tables
+└── v0_16.zig      # Zig 0.16.x pattern and predicate tables
 ```
 
 **Adding support for a new Zig version:**
@@ -1004,7 +1070,7 @@ Ephor has four analysis entry points:
 |-------------|-------|-------|---------|
 | `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA208, ZA210 (in `checkLineErrors`), ZA209 (whole-body scan) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
-| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA110, ZA607, ZA8xx, ZA9xx | `CFGState` with file-level `no_free_fields` |
+| `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA110, ZA607, ZA8xx, ZA901/ZA903 (ZA904 runs standalone) | `CFGState` with file-level `no_free_fields` |
 | `analyzeAstTier` | Project import graph, per-file AST | ZA111 | `std.Ast` parse per file (`src/ast_tier.zig`); files with parse errors are skipped |
 
 Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression. ZA103 is the one exception: its errdefer verdict uses a line-interval model, not the CFG (see the Memory Analysis Path section).
@@ -1150,7 +1216,7 @@ Memory analysis runs three specialized analyzers. ZA101, ZA102, ZA105, and ZA106
 
 1. **File-level setup**: Compute `no_free_fields` by scanning struct field declarations for no-free allocator types (e.g., `arena: std.heap.ArenaAllocator`)
 2. **Function extraction**: Split file into individual functions
-3. **Per-function analysis** (`processFunction`): Run `runCFGMemoryAnalyses` (ZA101-ZA106), `runCFGSafetyAnalyses` (ZA8xx, ZA9xx), and `runDefiniteAssignmentAnalysis`
+3. **Per-function analysis** (`processFunction`): Run `runCFGMemoryAnalyses` (ZA101-ZA106), `runCFGSafetyAnalyses` (ZA8xx, ZA901/ZA903 — ZA904 runs standalone), and `runDefiniteAssignmentAnalysis`
 
 **No-free allocator suppression** — allocations that don't need per-allocation free:
 

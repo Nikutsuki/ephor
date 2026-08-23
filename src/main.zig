@@ -70,6 +70,36 @@ const Fs = struct {
             const limit: std.Io.Limit = .limited(max_bytes);
             return std.Io.Dir.cwd().readFileAlloc(self.io, sub_path, allocator, limit);
         }
+        /// readFileAlloc with the final path component opened no-follow
+        /// (RED4-7, EPH-I0210): the scan reads a file the walk recorded
+        /// from its dirent kind, so a symlink swapped in between must fail
+        /// the open instead of redirecting the read outside the tree. The
+        /// bounded-read body mirrors std readFileAllocOptions (no
+        /// follow_symlinks option exists there), and allow_directory=false
+        /// fails a swapped directory at open instead of mid-read.
+        pub fn readFileAllocNoFollow(
+            self: CompatDir,
+            allocator: Allocator,
+            sub_path: []const u8,
+            max_bytes: usize,
+        ) std.Io.Dir.ReadFileAllocError![]u8 {
+            var file = try std.Io.Dir.cwd().openFile(self.io, sub_path, .{
+                .follow_symlinks = false,
+                .allow_directory = false,
+            });
+            defer file.close(self.io);
+            var file_reader = file.reader(self.io, &.{});
+            const limit: std.Io.Limit = .limited(max_bytes);
+            return file_reader.interface.allocRemainingAlignedSentinel(
+                allocator,
+                limit,
+                .of(u8),
+                null,
+            ) catch |err| switch (err) {
+                error.ReadFailed => return file_reader.err.?,
+                error.OutOfMemory, error.StreamTooLong => |e| return e,
+            };
+        }
         pub fn createFile(
             self: CompatDir,
             sub_path: []const u8,
@@ -258,6 +288,17 @@ const DiagCtx = struct {
     /// "ignoring suppression/gate keys from untrusted" notes printed. One
     /// per offending config file.
     untrusted_config_note_count: usize = 0,
+    /// "trusting config at" notes printed (RED3-4, EPH-I0209). One per
+    /// trusted config file whose directory covers the scan target.
+    trusted_config_note_count: usize = 0,
+    /// "honoring N entries ... as reachability hints" notes printed
+    /// (RED3-10, EPH-I0170). One per untrusted config file that contributed
+    /// surviving entries.
+    untrusted_entries_hint_note_count: usize = 0,
+    /// Error-naming convention disclosure notes (RED3-9, EPH-I0169). One
+    /// per run, when the applied convention came from a config at or
+    /// inside the scan target.
+    error_naming_note_count: usize = 0,
     /// Config read failures that are not a missing file (B13-9, EPH-I0517):
     /// an unreadable or oversized config must never silently read as "no
     /// config here".
@@ -12969,7 +13010,15 @@ const ImportGraph = struct {
     }
 
     fn scanDirectory(self: *ImportGraph, dir_path: []const u8) !void {
-        var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch |err| {
+        // RED4-7 (EPH-I0210): no-follow on the root open. The containment
+        // gates realpath the root at check time; an actor swapping it for
+        // a symlink between that realpath and this open must fail here
+        // instead of walking a different tree than the one gated. A
+        // symlinked scan root now fails closed with the open error below.
+        var dir = Fs.cwd(self.diag.io).openDir(
+            dir_path,
+            .{ .iterate = true, .follow_symlinks = false },
+        ) catch |err| {
             reportScanOpenError(self.diag, self.allocator, dir_path, err);
             return err;
         };
@@ -13058,9 +13107,12 @@ const ImportGraph = struct {
     /// skip it (skip-list name) or cannot open it (EPH-I0761). The main
     /// walk prunes with the same predicate as the nested discovery walks
     /// (band-B03 F23, EPH-I0377): one skip set keeps coverage consistent.
+    /// RED4-7 (EPH-I0210): no-follow on the final component — a directory
+    /// swapped for a symlink after the dirent kind check fails the open
+    /// and reads as a skip, never as a descent into its target.
     fn openSubdir(io: std.Io, dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
         if (isSkippableDir(name)) return null;
-        return dir.openDir(io, name, .{ .iterate = true }) catch null;
+        return dir.openDir(io, name, .{ .iterate = true, .follow_symlinks = false }) catch null;
     }
 
     /// Edge-triggered corpus-size warning (EPH-I0199). The graph holds
@@ -13111,7 +13163,12 @@ const ImportGraph = struct {
     }
 
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
-        const content = Fs.cwd(self.diag.io).readFileAlloc(
+        // RED4-7 (EPH-I0210): no-follow on the open. The walk records
+        // files from their dirent kind; a file swapped for a symlink
+        // between the dirent read and this open must fail the open (the
+        // silent skip below) instead of redirecting the read outside the
+        // scanned tree.
+        const content = Fs.cwd(self.diag.io).readFileAllocNoFollow(
             self.allocator,
             file_path,
             max_source_file_bytes,
@@ -13620,7 +13677,9 @@ const ImportGraph = struct {
         }
 
         for (to_scan.items) |path| {
-            const content = Fs.cwd(self.diag.io).readFileAlloc(
+            // RED4-7 (EPH-I0210): no-follow, same posture as the main
+            // analysis read.
+            const content = Fs.cwd(self.diag.io).readFileAllocNoFollow(
                 self.allocator,
                 path,
                 max_source_file_bytes,
@@ -13747,7 +13806,8 @@ const ImportGraph = struct {
         if (depth == 0) return;
         var dir = Fs.cwd(self.diag.io).openDir(
             search_dir,
-            .{ .iterate = true },
+            // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
+            .{ .iterate = true, .follow_symlinks = false },
         ) catch return;
         defer dir.close(self.diag.io);
         var iter = dir.iterate();
@@ -13834,7 +13894,11 @@ const ImportGraph = struct {
         // truncation note here: the main walk's 32 cap fires first on
         // every tree this cap could truncate (EPH-I0667, F-5).
         if (depth > 64) return;
-        var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
+        // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
+        var dir = Fs.cwd(self.diag.io).openDir(
+            dir_path,
+            .{ .iterate = true, .follow_symlinks = false },
+        ) catch return;
         defer dir.close(self.diag.io);
         var iter = dir.iterate();
         while (try iter.next(self.diag.io)) |entry| {
@@ -13908,7 +13972,11 @@ const ImportGraph = struct {
         // can still cover it — pre-memo coverage semantics preserved.
         if (depth > 64) return;
         if (try self.memoInsertMarkedDir(dir_path)) return;
-        var dir = Fs.cwd(self.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
+        // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
+        var dir = Fs.cwd(self.diag.io).openDir(
+            dir_path,
+            .{ .iterate = true, .follow_symlinks = false },
+        ) catch return;
         defer dir.close(self.diag.io);
         var iter = dir.iterate();
         while (try iter.next(self.diag.io)) |entry| {
@@ -34962,6 +35030,14 @@ const Config = struct {
     // ZA703 error-name convention. Absent config key = TitleCase (the
     // community standard); "snake_case" restores the pre-flip behavior.
     error_naming: ErrorNaming = .title_case,
+    // The config file that last applied error_naming (owned; freed in
+    // deinit). The disclosure note (RED3-9, EPH-I0169) prints from this
+    // record once the scan root settles.
+    error_naming_from_path: ?[]const u8 = null,
+    // The cwd ephor.json parsed successfully (RED3-4, EPH-I0209). Its
+    // trust note fires from the check handler, after the CLI path and the
+    // target-config load settle the final scan root.
+    cwd_config_loaded: bool = false,
     // --trust-target-config: honor suppression and CI-gate keys from a
     // scanned target's ephor.json. Default: untrusted configs set only
     // entries and path_dir (see isConfigDirTrusted).
@@ -34996,6 +35072,7 @@ const Config = struct {
         for (self.known_issues.items) |k| allocator.free(k);
         self.known_issues.deinit(allocator);
         if (self.runtime_command) |c| allocator.free(c);
+        if (self.error_naming_from_path) |p| allocator.free(p);
         if (self.install_version) |v| allocator.free(v);
     }
 
@@ -35190,7 +35267,12 @@ fn loadConfigFile(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // Simple JSON parsing for config format
     parseConfigJson(diag, allocator, content, cfg) catch |err| {
         try reportConfigParseError(diag, allocator, err, CONFIG_FILENAME);
+        return;
     };
+    // RED3-4 (EPH-I0209): the cwd config loads trusted and
+    // unconditionally. Record the successful load so the check handler
+    // discloses the decision once the scan root settles.
+    cfg.cwd_config_loaded = true;
 }
 
 /// Parse one candidate config file's content and emit its parse
@@ -35285,6 +35367,61 @@ fn readConfigFile(
     return content;
 }
 
+/// Parameter bundle for the post-parse commit of one loaded config
+/// (ZA303): the loader passes one struct instead of six scalars.
+const LoadedConfigCommit = struct {
+    lctx: ConfigLoadCtx,
+    trusted: bool,
+    config_path: []const u8,
+    dir_copy: []const u8,
+    saved_path: []const u8,
+    entries_before: usize,
+};
+
+/// Commit a successfully loaded config file (EPH-I0689): absolutize and
+/// gate its entries, print the per-file notes, and transfer the scan
+/// root. Split from tryLoadConfigFromDir to keep that function under the
+/// ZA301 cap; the note emission splits again to keep the branch count
+/// under the ZA305 cap.
+fn commitLoadedConfig(c: LoadedConfigCommit) !void {
+    const allocator = c.lctx.allocator;
+    const cfg = c.lctx.cfg;
+    const roots: EntriesRoots = .{ .base = c.dir_copy, .scan_root = c.saved_path };
+    const dropped_entries = try makeEntriesAbsolute(c.lctx, roots, c.trusted);
+    if (dropped_entries > 0) try noteEntriesRejected(
+        c.lctx.diag,
+        allocator,
+        "note: ignoring {d} outside-root entries from untrusted {s} " ++
+            "(use --trust-target-config to honor)\n",
+        .{ .path = c.config_path, .dropped = dropped_entries },
+    );
+    try noteLoadedConfigDisclosures(c);
+    if (cfg.path_owned) allocator.free(cfg.path);
+    cfg.path = c.saved_path;
+    cfg.path_owned = true;
+}
+
+/// Emit the per-config disclosure notes for a committed load
+/// (RED3-4/RED3-10, EPH-I0209/I0170). The trust note fires for a trusted
+/// config whose directory covers the scan target — the cwd config is
+/// exempt here, its note fires from the check handler after the CLI path
+/// settles the final scan root. The entries-hint note reports the
+/// surviving entries of an untrusted config, so a target that lists
+/// every file to hide dead code is visible.
+fn noteLoadedConfigDisclosures(c: LoadedConfigCommit) !void {
+    if (c.trusted) {
+        if (!isCwdDir(c.lctx.diag, c.dir_copy) and
+            configDirCoversScanRoot(c.lctx.diag.io, c.dir_copy, c.saved_path))
+        {
+            try noteTrustedConfig(c.lctx.diag, c.lctx.allocator, c.config_path);
+        }
+        return;
+    }
+    const honored = c.lctx.cfg.entries.items.len - c.entries_before;
+    if (honored > 0)
+        try noteUntrustedEntriesHints(c.lctx.diag, c.lctx.allocator, c.config_path, honored);
+}
+
 /// Try to load ephor.json config from a directory, returning true if found
 fn tryLoadConfigFromDir(
     lctx: ConfigLoadCtx,
@@ -35341,19 +35478,17 @@ fn tryLoadConfigFromDir(
     }
 
     // Commit saved_path only AFTER its fallible consumers: until then the
-    // caller's errdefer owns it, so a mid-load OOM frees it once (EPH-I0689).
-    const roots: EntriesRoots = .{ .base = dir_copy, .scan_root = saved_path };
-    const dropped_entries = try makeEntriesAbsolute(lctx, roots, trusted);
-    if (dropped_entries > 0) try noteEntriesRejected(
-        lctx.diag,
-        allocator,
-        "note: ignoring {d} outside-root entries from untrusted {s} " ++
-            "(use --trust-target-config to honor)\n",
-        .{ .path = config_path, .dropped = dropped_entries },
-    );
-    if (cfg.path_owned) allocator.free(cfg.path);
-    cfg.path = saved_path;
-    cfg.path_owned = true;
+    // caller's errdefer owns it, so a mid-load OOM frees it once
+    // (EPH-I0689). The commit helper keeps this function under the ZA301
+    // line cap.
+    try commitLoadedConfig(.{
+        .lctx = lctx,
+        .trusted = trusted,
+        .config_path = config_path,
+        .dir_copy = dir_copy,
+        .saved_path = saved_path,
+        .entries_before = list_snapshot.entries,
+    });
     return true;
 }
 
@@ -35371,6 +35506,57 @@ fn noteSuppressionKeysIgnored(diag: *DiagCtx, allocator: Allocator, config_path:
         "note: ignoring suppression/gate keys from untrusted {s} " ++
             "(use --trust-target-config to honor)\n",
         .{safe_config.slice},
+    );
+}
+
+/// Print the trust-decision disclosure note (RED3-4, EPH-I0209). The path
+/// crosses the terminal sanitizer: a trusted config covering the scan
+/// target can still carry hostile bytes (the `ephor check .` shape)
+/// (EPH-I0147).
+fn noteTrustedConfig(diag: *DiagCtx, allocator: Allocator, config_path: []const u8) !void {
+    var safe = try types.sanitizeTerminal(allocator, config_path);
+    defer safe.deinit(allocator);
+    diag.trusted_config_note_count += 1;
+    cliDiag(diag, "note: trusting config at {s}\n", .{safe.slice});
+}
+
+/// Print the untrusted-entries hint note (RED3-10, EPH-I0170). One note
+/// per config file, naming the entries that survived the containment
+/// gates. The path crosses the terminal sanitizer (EPH-I0147).
+fn noteUntrustedEntriesHints(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    config_path: []const u8,
+    count: usize,
+) !void {
+    var safe = try types.sanitizeTerminal(allocator, config_path);
+    defer safe.deinit(allocator);
+    diag.untrusted_entries_hint_note_count += 1;
+    cliDiag(
+        diag,
+        "note: honoring {d} {s} from untrusted {s} as reachability hints\n",
+        .{ count, if (count == 1) @as([]const u8, "entry") else "entries", safe.slice },
+    );
+}
+
+/// Print the error-naming convention disclosure (RED3-9, EPH-I0169): the
+/// ZA703 standard for this run came from a config at or inside the scan
+/// target, so the target defined the standard its own code satisfies. The
+/// convention is an ErrorNaming.str() literal (config-parse validated);
+/// the path crosses the terminal sanitizer (EPH-I0147).
+fn noteErrorNamingSource(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    config_path: []const u8,
+    mode: ErrorNaming,
+) !void {
+    var safe = try types.sanitizeTerminal(allocator, config_path);
+    defer safe.deinit(allocator);
+    diag.error_naming_note_count += 1;
+    cliDiag(
+        diag,
+        "note: error naming convention {s} comes from config {s}\n",
+        .{ mode.str(), safe.slice },
     );
 }
 
@@ -35972,16 +36158,39 @@ const ConfigParseCtx = struct {
     source: ConfigSource,
 };
 
-/// True for exclude patterns so broad they hide the whole tree (RED3-2).
-fn isOverbroadExcludePattern(pattern: []const u8) bool {
-    return mem.eql(u8, pattern, "/") or mem.eql(u8, pattern, ".zig");
+/// True for exclude patterns so broad they hide the whole tree (RED3-2,
+/// RED3-3, EPH-I0208). `scan_root_first` is the scan root's first path
+/// component: a pattern equal to it substring-matches every path the scan
+/// reports. The empty pattern never reaches this gate — checkConfigListValue
+/// rejects it as a hard usage error.
+fn isOverbroadExcludePattern(pattern: []const u8, scan_root_first: ?[]const u8) bool {
+    if (mem.eql(u8, pattern, "/")) return true;
+    if (mem.eql(u8, pattern, ".zig")) return true;
+    if (mem.eql(u8, pattern, ".")) return true;
+    if (mem.eql(u8, pattern, "zig")) return true;
+    if (scan_root_first) |first| {
+        if (mem.eql(u8, pattern, first)) return true;
+    }
+    return false;
+}
+
+/// First path component of the scan root, for the over-broad exclude gate
+/// (RED3-3, EPH-I0208): a pattern equal to it matches every reported path.
+/// Null for the dot-root (the literal "." entry covers it) and the parent
+/// spellings. A leading "/" or "./" sheds before the component read.
+fn scanRootFirstComponent(scan_root: []const u8) ?[]const u8 {
+    var root = mem.trimStart(u8, scan_root, "/");
+    while (mem.startsWith(u8, root, "./")) root = root[2..];
+    const end = mem.indexOfScalar(u8, root, '/') orelse root.len;
+    const first = root[0..end];
+    if (first.len == 0 or mem.eql(u8, first, ".") or mem.eql(u8, first, "..")) return null;
+    return first;
 }
 
 /// Validate one array value before it joins a config list (RED3-2,
-/// EPH-I0236). An empty exclude pattern or rule pattern is a hard usage
-/// error: each one matches everything it gates. The over-broad exclude
-/// patterns "/" and ".zig" warn and are skipped. Returns false when the
-/// value must not be appended.
+/// EPH-I0236, RED3-3, EPH-I0208). An empty exclude pattern or rule pattern
+/// is a hard usage error: each one matches everything it gates. The
+/// over-broad exclude patterns warn and are skipped.
 fn checkConfigListValue(ctx: ConfigParseCtx, key: []const u8, val: []const u8) !bool {
     const is_rule_list = mem.eql(u8, key, "disable") or mem.eql(u8, key, "enable");
     if (is_rule_list) {
@@ -35992,7 +36201,7 @@ fn checkConfigListValue(ctx: ConfigParseCtx, key: []const u8, val: []const u8) !
         mem.eql(u8, key, "orphan_exclude");
     if (!is_exclude_list) return true;
     if (val.len == 0) return error.EmptyExcludePattern;
-    if (!isOverbroadExcludePattern(val)) return true;
+    if (!isOverbroadExcludePattern(val, scanRootFirstComponent(ctx.cfg.path))) return true;
     cliDiag(
         ctx.diag,
         "warning: ignoring over-broad exclude pattern '{s}' in {s}. " ++
@@ -36172,7 +36381,7 @@ fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
         return parseThresholdsObject(ctx, start);
     }
     if (try parseFailOnConfigKey(ctx, start, key)) |end| return end;
-    if (parseErrorNamingConfigKey(ctx, start, key)) |end| return end;
+    if (try parseErrorNamingConfigKey(ctx, start, key)) |end| return end;
     return skipJsonValue(content, start);
 }
 
@@ -36201,8 +36410,10 @@ fn formatBadErrorNaming(
 /// Handle the "error_naming" config key (null if not that key). Unlike
 /// fail_on, an unknown value is warn-and-default, not a hard error: a
 /// misspelled style preference must not abort the run (same policy as
-/// reportConfigParseError for non-gate keys).
-fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) ?usize {
+/// reportConfigParseError for non-gate keys). The applying config is
+/// recorded (owned) so the check handler can disclose a convention that
+/// comes from a config at or inside the scan target (RED3-9, EPH-I0169).
+fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?usize {
     const content = ctx.content;
     if (!mem.eql(u8, key, "error_naming") or content[start] != '"') return null;
     const result = parseJsonString(content, start);
@@ -36224,6 +36435,8 @@ fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8)
         return result.end;
     };
     ctx.cfg.error_naming = mode;
+    if (ctx.cfg.error_naming_from_path) |old| ctx.allocator.free(old);
+    ctx.cfg.error_naming_from_path = try ctx.allocator.dupe(u8, ctx.source.path);
     return result.end;
 }
 
@@ -36382,6 +36595,44 @@ fn isConfigDirTrusted(io: std.Io, config_dir: []const u8) bool {
     const dir_real = Fs.cwd(io).realpath(config_dir, &dir_buf) catch return false;
     const cwd_real = Fs.cwd(io).realpath(".", &cwd_buf) catch return false;
     return isPathAncestorOrEqual(dir_real, cwd_real);
+}
+
+/// The config file's directory: dirname, with a bare filename reading as
+/// the dot-root (RED3-9 geometry input).
+fn configPathDirname(path: []const u8) []const u8 {
+    const dir = std.fs.path.dirname(path) orelse ".";
+    return if (dir.len == 0) "." else dir;
+}
+
+/// True when the config directory at `config_dir` covers the scan target
+/// at `scan_root`: the config sits at or above the scanned tree, so its
+/// keys govern the scan (RED3-4 disclosure geometry, EPH-I0209). Realpath
+/// decides when both sides resolve (the EPH-I0812 pattern); the textual
+/// ancestor test decides otherwise.
+fn configDirCoversScanRoot(io: std.Io, config_dir: []const u8, scan_root: []const u8) bool {
+    var dir_buf: [Fs.max_path_bytes]u8 = undefined;
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const dir_real = Fs.cwd(io).realpath(config_dir, &dir_buf) catch null;
+    const root_real = Fs.cwd(io).realpath(scan_root, &root_buf) catch null;
+    if (dir_real) |dr| {
+        if (root_real) |rr| return isPathAncestorOrEqual(dr, rr);
+    }
+    return isPathAncestorOrEqual(config_dir, scan_root);
+}
+
+/// True when the config directory at `config_dir` sits at or inside the
+/// scanned tree at `scan_root`: the convention then comes from the target
+/// itself (RED3-9 disclosure geometry, EPH-I0169). Same realpath-first
+/// shape as configDirCoversScanRoot.
+fn configDirInsideScanRoot(io: std.Io, config_dir: []const u8, scan_root: []const u8) bool {
+    var dir_buf: [Fs.max_path_bytes]u8 = undefined;
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const dir_real = Fs.cwd(io).realpath(config_dir, &dir_buf) catch null;
+    const root_real = Fs.cwd(io).realpath(scan_root, &root_buf) catch null;
+    if (dir_real) |dr| {
+        if (root_real) |rr| return isPathAncestorOrEqual(rr, dr);
+    }
+    return isPathAncestorOrEqual(scan_root, config_dir);
 }
 
 /// Parse a config file's contents as a trusted source (cwd ephor.json and
@@ -38907,7 +39158,11 @@ fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
         noteDepthCapTruncation(ctx.diag, 16);
         return;
     }
-    var dir = Fs.cwd(ctx.diag.io).openDir(dir_path, .{ .iterate = true }) catch return;
+    // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
+    var dir = Fs.cwd(ctx.diag.io).openDir(
+        dir_path,
+        .{ .iterate = true, .follow_symlinks = false },
+    ) catch return;
     defer dir.close(ctx.diag.io);
     var iter = dir.iterate();
     while (try iter.next(ctx.diag.io)) |entry| {
@@ -38972,7 +39227,11 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
     }
 
     // Auto-discover test files in src/
-    var dir = Fs.cwd(diag.io).openDir("src", .{ .iterate = true }) catch return;
+    // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
+    var dir = Fs.cwd(diag.io).openDir(
+        "src",
+        .{ .iterate = true, .follow_symlinks = false },
+    ) catch return;
     defer dir.close(diag.io);
     var iter = dir.iterate();
     while (try iter.next(diag.io)) |entry| {
@@ -39768,17 +40027,23 @@ fn printHelp() void {
         \\  A config file is trusted when its directory is the working
         \\  directory or an ancestor of it (realpath compare).
         \\  --trust-target-config declares a scanned target's config trusted.
-        \\  From an untrusted config ephor honors only "entries"; it ignores
-        \\  disable, enable, exclude, orphan_exclude, strict, fail_on,
-        \\  thresholds, and error_naming, with one note per file. A target
-        \\  config's "path_dir" is containment-checked but discarded. The
-        \\  scan root comes from the CLI path, a trusted working-directory
-        \\  config, or auto-detection. Every config "path_dir" must
-        \\  resolve inside the config's own directory. An empty "exclude"
-        \\  pattern in a trusted config is a hard usage error.
+        \\  From an untrusted config ephor honors only "entries", as
+        \\  reachability hints, and ignores disable, enable, exclude,
+        \\  orphan_exclude, strict, fail_on, thresholds, and error_naming,
+        \\  with one note per file. A target config's "path_dir" is
+        \\  containment-checked but discarded. The scan root comes from the
+        \\  CLI path, a trusted working-directory config, or auto-detection.
+        \\  Every config "path_dir" must resolve inside the config's own
+        \\  directory. An empty "exclude" pattern in a trusted config is a
+        \\  hard usage error; the over-broad patterns "/", ".zig", ".",
+        \\  "zig", and the scan root's first path component warn and are
+        \\  skipped.
         \\
-        \\  Residual: running ephor inside a tree trusts that tree's config.
-        \\  To audit an untrusted repo, run "ephor check <path>" from outside
+        \\  The trust decision is visible: a config ephor trusts prints
+        \\  "note: trusting config at <path>" whenever its directory covers
+        \\  the scan target. A non-default "error_naming" that comes from a
+        \\  config at or inside the scan target prints its own note. To
+        \\  audit an untrusted repo, run "ephor check <path>" from outside
         \\  it, or review its ephor.json first.
         \\
         \\INLINE IGNORE (in source code):
@@ -41381,6 +41646,27 @@ const CheckCounts = struct {
     }
 };
 
+/// Emit the post-load trust disclosures (RED3-4/RED3-9, EPH-I0209/I0169)
+/// from the check handler, after the CLI path and the target-config load
+/// settle the final scan root. Target-dir configs print their own trust
+/// notes from the loader; this helper covers the cwd channel and the
+/// error-naming convention, whose source config path was recorded during
+/// the parse.
+fn notePostLoadTrust(diag: *DiagCtx, allocator: Allocator, cfg: *const Config) !void {
+    // The cwd config loads trusted and unconditionally; disclose the
+    // decision whenever its directory covers the scan target.
+    if (cfg.cwd_config_loaded and configDirCoversScanRoot(diag.io, ".", cfg.path))
+        try noteTrustedConfig(diag, allocator, CONFIG_FILENAME);
+    // A non-default error-naming convention that comes from a config at
+    // or inside the scanned tree.
+    if (cfg.error_naming != .title_case) {
+        if (cfg.error_naming_from_path) |src| {
+            if (configDirInsideScanRoot(diag.io, configPathDirname(src), cfg.path))
+                try noteErrorNamingSource(diag, allocator, src, cfg.error_naming);
+        }
+    }
+}
+
 /// `check` command: run every analyzer over the import graph and print the
 /// merged report. The pipeline splits into scan → collect → report so each
 /// stage stays a flat orchestration.
@@ -41390,6 +41676,7 @@ fn handleCheck(ctx: *RunCtx) !void {
         ctx.should_exit_error = true;
     }
     if (ctx.should_exit_error) return;
+    try notePostLoadTrust(ctx.diag, ctx.alloc, ctx.cfg);
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
     var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
@@ -101090,6 +101377,7 @@ test "config error_naming defaults to TitleCase when absent" {
 test "config error_naming parses snake_case" {
     var diag = testDiagCtx();
     var cfg = testConfig();
+    defer cfg.deinit(std.testing.allocator);
     try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"snake_case\"}", &cfg);
     try std.testing.expectEqual(ErrorNaming.snake_case, cfg.error_naming);
 }
@@ -101097,10 +101385,12 @@ test "config error_naming parses snake_case" {
 test "config error_naming parses TitleCase and the PascalCase alias" {
     var diag = testDiagCtx();
     var cfg_title = testConfig();
+    defer cfg_title.deinit(std.testing.allocator);
     try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"TitleCase\"}", &cfg_title);
     try std.testing.expectEqual(ErrorNaming.title_case, cfg_title.error_naming);
 
     var cfg_pascal = testConfig();
+    defer cfg_pascal.deinit(std.testing.allocator);
     try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"PascalCase\"}", &cfg_pascal);
     try std.testing.expectEqual(ErrorNaming.title_case, cfg_pascal.error_naming);
 }
@@ -102018,6 +102308,8 @@ test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
     try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
     // No suppression keys in the fixture: that note must not fire.
     try std.testing.expectEqual(@as(usize, 0), diag.untrusted_config_note_count);
+    // One surviving entry produces the reachability-hints note (EPH-I0170).
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_entries_hint_note_count);
 }
 
 test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
@@ -102043,12 +102335,142 @@ test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
     cfg.trust_target_config = true;
     try setOwnedPath(allocator, &cfg, root_path);
 
+    diag.cli_diagnostics_enabled = false;
     try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
 
     try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
     try std.testing.expectEqualStrings("/etc/passwd", cfg.entries.items[1]);
     try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_count);
     try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_note_count);
+    // Trusted configs print no entries-hint note; the trust note fires.
+    try std.testing.expectEqual(@as(usize, 0), diag.untrusted_entries_hint_note_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.trusted_config_note_count);
+}
+
+test "trusted target config covering the scan root prints the trust note (EPH-I0209)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/inside.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/root", .{tmp_path});
+    defer allocator.free(root_path);
+    try writeTestConfig(root_path, "{\"entries\": [\"inside.zig\"]}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.trust_target_config = true;
+    try setOwnedPath(allocator, &cfg, root_path);
+    diag.cli_diagnostics_enabled = false;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
+    try std.testing.expectEqual(@as(usize, 1), diag.trusted_config_note_count);
+
+    // The untrusted shape prints no trust note.
+    var diag2 = testDiagCtx();
+    diag2.cli_diagnostics_enabled = false;
+    var cfg2 = testConfig();
+    defer cfg2.deinit(allocator);
+    try setOwnedPath(allocator, &cfg2, root_path);
+    try loadConfigFromTargetPath(&diag2, allocator, &cfg2, cfg2.path);
+    try std.testing.expectEqual(@as(usize, 0), diag2.trusted_config_note_count);
+}
+
+test "untrusted entries print the reachability-hints note (EPH-I0170)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/inside.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/root", .{tmp_path});
+    defer allocator.free(root_path);
+    // The hostile shape (RED3-10): an untrusted config that lists every
+    // file as an entry neuters orphan detection. The hint note discloses
+    // that the entries steer reachability.
+    try writeTestConfig(root_path, "{\"entries\": [\"inside.zig\"]}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, root_path);
+    diag.cli_diagnostics_enabled = false;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_entries_hint_note_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.untrusted_config_note_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.trusted_config_note_count);
+}
+
+test "error_naming from a target config discloses its source (EPH-I0169)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "root");
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const root_path = try std.fmt.allocPrint(allocator, "{s}/root", .{tmp_path});
+    defer allocator.free(root_path);
+    try writeTestConfig(root_path, "{\"error_naming\": \"snake_case\"}");
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.trust_target_config = true;
+    try setOwnedPath(allocator, &cfg, root_path);
+    diag.cli_diagnostics_enabled = false;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
+    try std.testing.expectEqual(ErrorNaming.snake_case, cfg.error_naming);
+    try notePostLoadTrust(&diag, allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.error_naming_note_count);
+
+    // The default convention never discloses, and a scan root the config
+    // does not cover stays silent.
+    var diag2 = testDiagCtx();
+    diag2.cli_diagnostics_enabled = false;
+    var cfg2 = testConfig();
+    defer cfg2.deinit(allocator);
+    cfg2.trust_target_config = true;
+    // cfg2.path stays the "src" default: the tmp config does not sit at
+    // or inside it, so the disclosure must not fire.
+    try loadConfigFromTargetPath(&diag2, allocator, &cfg2, root_path);
+    try std.testing.expectEqual(ErrorNaming.snake_case, cfg2.error_naming);
+    try notePostLoadTrust(&diag2, allocator, &cfg2);
+    try std.testing.expectEqual(@as(usize, 0), diag2.error_naming_note_count);
+}
+
+test "cwd config trust note fires only when the cwd covers the scan target (EPH-I0209)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    diag.cli_diagnostics_enabled = false;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.cwd_config_loaded = true;
+    // The scan target at or under the cwd fires the note.
+    try setOwnedPath(allocator, &cfg, ".");
+    try notePostLoadTrust(&diag, allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.trusted_config_note_count);
+
+    // A scan target outside the cwd stays silent (the cwd config does not
+    // govern it). The unresolvable path exercises the textual fallback.
+    var diag2 = testDiagCtx();
+    diag2.cli_diagnostics_enabled = false;
+    var cfg2 = testConfig();
+    defer cfg2.deinit(allocator);
+    cfg2.cwd_config_loaded = true;
+    try setOwnedPath(allocator, &cfg2, "/nonexistent/ephor-b85-target");
+    try notePostLoadTrust(&diag2, allocator, &cfg2);
+    try std.testing.expectEqual(@as(usize, 0), diag2.trusted_config_note_count);
 }
 
 test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
@@ -103065,16 +103487,35 @@ test "empty exclude pattern is a hard usage error (RED3-2)" {
     );
 }
 
-test "over-broad exclude patterns warn and are skipped (RED3-2)" {
+test "over-broad exclude patterns warn and are skipped (RED3-2, RED3-3)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     diag.cli_diagnostics_enabled = false;
     var cfg = testConfig();
     defer cfg.deinit(allocator);
-    try parseConfigJson(&diag, allocator, "{\"exclude\": [\"/\", \".zig\", \"vendor\"]}", &cfg);
+    // The scan root is "src" (testConfig default), so its first path
+    // component joins the blocklist (EPH-I0208): "src" substring-matches
+    // every reported path. "." and "zig" match every path too (".zig"
+    // suffixes and dot-prefixed names).
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"exclude\": [\"/\", \".zig\", \".\", \"zig\", \"src\", \"vendor\"]}",
+        &cfg,
+    );
     // Only the specific pattern survives.
     try std.testing.expectEqual(@as(usize, 1), cfg.exclude.items.len);
     try std.testing.expectEqualStrings("vendor", cfg.exclude.items[0]);
+}
+
+test "scanRootFirstComponent reads the first scan-root path segment (EPH-I0208)" {
+    try std.testing.expectEqualStrings("src", scanRootFirstComponent("src").?);
+    try std.testing.expectEqualStrings("src", scanRootFirstComponent("./src").?);
+    try std.testing.expectEqualStrings("src", scanRootFirstComponent("src/main.zig").?);
+    try std.testing.expectEqualStrings("Users", scanRootFirstComponent("/Users/x/ephor").?);
+    try std.testing.expect(scanRootFirstComponent(".") == null);
+    try std.testing.expect(scanRootFirstComponent("..") == null);
+    try std.testing.expectEqualStrings("src", scanRootFirstComponent("././src").?);
 }
 
 test "config thresholds clamp at the documented maxima (RED3-6)" {
@@ -105582,6 +106023,76 @@ test "Fs.createFile creates a tmp file that holds the written bytes" {
     const read_back = try tmp.dir.readFileAlloc(std.testing.io, "out.txt", allocator, limit);
     defer allocator.free(read_back);
     try std.testing.expectEqualStrings(content, read_back);
+}
+
+test "Fs.readFileAllocNoFollow reads regular files and refuses symlinks (EPH-I0210)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = "no-follow body\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real.zig", .data = content });
+    try tmp.dir.symLink(std.testing.io, "real.zig", "link.zig", .{});
+    const real_path = try tmpFilePath(allocator, &tmp, "real.zig");
+    defer allocator.free(real_path);
+    const link_path = try tmpFilePath(allocator, &tmp, "link.zig");
+    defer allocator.free(link_path);
+
+    const read = try Fs.cwd(std.testing.io).readFileAllocNoFollow(allocator, real_path, 1024);
+    defer allocator.free(read);
+    try std.testing.expectEqualStrings(content, read);
+    // O_NOFOLLOW on a file: ELOOP on macOS and Linux alike.
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        Fs.cwd(std.testing.io).readFileAllocNoFollow(allocator, link_path, 1024),
+    );
+}
+
+test "scan reads refuse a symlink swapped in for a recorded file (EPH-I0210)" {
+    // The discriminating RED: an entry that IS a symlink. The pre-fix
+    // read followed the link and analyzed its target; the no-follow read
+    // skips it, so the graph stays empty.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "real.zig",
+        .data = "pub fn r() void {}\n",
+    });
+    try tmp.dir.symLink(std.testing.io, "real.zig", "link.zig", .{});
+    const link_path = try tmpFilePath(allocator, &tmp, "link.zig");
+    defer allocator.free(link_path);
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.scanSingleFile(link_path);
+    try std.testing.expectEqual(@as(usize, 0), graph.files.count());
+}
+
+test "scanDirectory refuses a symlinked scan root instead of following it (EPH-I0210)" {
+    // The root open carries no-follow, so a symlinked scan root fails
+    // closed instead of walking a tree the containment gates never saw.
+    // The error name is platform-dependent (ELOOP on macOS, ENOTDIR on
+    // Linux), so the pin asserts failure, not the error kind.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "target");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "target/a.zig",
+        .data = "pub fn a() void {}\n",
+    });
+    try tmp.dir.symLink(std.testing.io, "target", "linkdir", .{ .is_directory = true });
+    const link_path = try tmpFilePath(allocator, &tmp, "linkdir");
+    defer allocator.free(link_path);
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    if (graph.scanDirectory(link_path)) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), graph.files.count());
 }
 
 test "Fs.statFile reports the size and kind of a tmp file" {

@@ -31,6 +31,12 @@ $installExitCode = & {
     }
 
     $REPO = "https://codeberg.org/RhyosLabs/ephor"
+    # EPH-I0205: EPHOR_TAGS_API and EPHOR_ARCHIVE_URL are test hooks. They
+    # steer the install's trust anchor, so ambient environment must not
+    # activate them: an override takes effect only when EPHOR_TEST_MODE=1
+    # is set explicitly. An override set without the marker is ignored
+    # with a warning (install.sh parity).
+    $testModeActive = ($env:EPHOR_TEST_MODE -eq "1")
     # Fetch the newest stable tags from the Codeberg tags API (not cached
     # raw files). 30s: observed answers from the Codeberg API take 20s+ on
     # slow days. Refusals still fail fast.
@@ -42,8 +48,13 @@ $installExitCode = & {
     # EPH-I0652: tests override this URL through EPHOR_TAGS_API to
     # simulate an API failure (install.sh channel). Empty or unset takes
     # the default, like install.sh's ${EPHOR_TAGS_API:-...} expansion.
-    $TAGS_API = $env:EPHOR_TAGS_API
-    if (-not $TAGS_API) {
+    $TAGS_API = $null
+    if ($testModeActive -and $env:EPHOR_TAGS_API) {
+        $TAGS_API = $env:EPHOR_TAGS_API
+    } else {
+        if ($env:EPHOR_TAGS_API) {
+            Write-Stderr "warning: EPHOR_TAGS_API is ignored without EPHOR_TEST_MODE=1."
+        }
         $TAGS_API = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50"
     }
     # This tag is the fallback when the Codeberg tags API fails. Refresh it
@@ -171,6 +182,29 @@ error: zig is not installed or not on PATH.
         return $tag
     }
 
+    # The words Zig reserves in the .name field of build.zig.zon
+    # (EPH-I0629, install.sh parity — EPH-I0206). The field must be a
+    # bare identifier, and Zig rejects every keyword, primitive type, and
+    # literal there even though the words look like identifiers. The list
+    # mirrors install.sh's ZON_RESERVED_WORDS, verified against zig
+    # 0.16.0.
+    $ZON_RESERVED_WORDS = @(
+        "addrspace", "align", "allowzero", "and", "anyframe", "anytype",
+        "asm", "break", "callconv", "catch", "comptime", "const",
+        "continue", "defer", "else", "enum", "errdefer", "error",
+        "export", "extern", "fn", "for", "if", "inline", "noalias",
+        "noinline", "nosuspend", "opaque", "or", "orelse", "packed",
+        "pub", "resume", "return", "linksection", "struct", "suspend",
+        "switch", "test", "threadlocal", "try", "union", "unreachable",
+        "var", "volatile", "while", "bool", "f16", "f32", "f64", "f80",
+        "f128", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16",
+        "u32", "u64", "u128", "usize", "void", "noreturn", "type",
+        "anyerror", "anyopaque", "comptime_int", "comptime_float",
+        "c_short", "c_ushort", "c_int", "c_uint", "c_long", "c_ulong",
+        "c_longlong", "c_ulonglong", "c_longdouble", "true", "false",
+        "null", "undefined"
+    )
+
     # Check that this directory is a Zig project.
     if (-not (Test-Path "build.zig")) {
         Write-Stderr @"
@@ -190,10 +224,36 @@ error: no build.zig found in current directory
     if (-not (Test-Path "build.zig.zon")) {
         $projectName = (Split-Path -Leaf (Get-Location)) -replace '-', '_'
         $projectName = $projectName.ToLower()
+        # EPH-I0206 (install.sh EPH-I0629 parity): .name must be a valid
+        # bare Zig identifier, so a hostile directory name cannot inject
+        # zon syntax. Characters outside a-z0-9_ become underscores, a
+        # leading digit gets an underscore prefix, and a reserved word
+        # falls back to a fixed name. Both fallbacks warn, like the sh
+        # installer. A PowerShell regex match reads as a truthy array or
+        # null, so the arms must cast through -not explicitly.
+        $nameExpr = ""
+        if (-not ($projectName -match '^[a-z_][a-z0-9_]*$') -or
+            ($projectName -match '^[0-9]')) {
+            $sanitized = $projectName -replace '[^a-z0-9_]', '_'
+            # Split-Path -Leaf is empty at a drive root, which sh's
+            # basename can never produce: fall back to the fixed name.
+            if (-not $sanitized) { $sanitized = "project" }
+            if ($sanitized -match '^[0-9]') { $sanitized = "_$sanitized" }
+            $nameExpr = ".$sanitized"
+            Write-Stderr "warning: '$projectName' is not a valid Zig identifier for the zon name."
+            Write-Stderr "The zon uses the name '$sanitized'. Edit build.zig.zon to rename it."
+        } else {
+            $nameExpr = ".$projectName"
+        }
+        if ($ZON_RESERVED_WORDS -contains $nameExpr.Substring(1)) {
+            Write-Stderr "warning: '$($nameExpr.Substring(1))' is a reserved word in Zig and cannot be the zon name."
+            Write-Stderr "The zon uses the name 'project'. Edit build.zig.zon to rename it."
+            $nameExpr = ".project"
+        }
         Write-Host "No build.zig.zon found, creating one..."
         Set-ContentNoFollow -Path "build.zig.zon" -Value @"
 .{
-    .name = .$projectName,
+    .name = $nameExpr,
     .version = "0.0.0",
     .fingerprint = 0x0,
     .paths = .{ "build.zig", "build.zig.zon", "src" },
@@ -243,11 +303,18 @@ error: no build.zig found in current directory
     }
     if (-not $EPHOR_URL) {
         # EPH-I0652: tests override the archive URL through
-        # EPHOR_ARCHIVE_URL (install.sh channel). The Zig 0.15 pin path
-        # above sets $EPHOR_URL directly and never takes the override,
-        # matching install.sh's ordering.
-        $EPHOR_URL = $env:EPHOR_ARCHIVE_URL
-        if (-not $EPHOR_URL) { $EPHOR_URL = "$REPO/archive/$EPHOR_TAG.tar.gz" }
+        # EPHOR_ARCHIVE_URL (install.sh channel), gated by EPHOR_TEST_MODE
+        # like EPHOR_TAGS_API (EPH-I0205). The Zig 0.15 pin path above
+        # sets $EPHOR_URL directly and never takes the override, matching
+        # install.sh's ordering.
+        if ($testModeActive -and $env:EPHOR_ARCHIVE_URL) {
+            $EPHOR_URL = $env:EPHOR_ARCHIVE_URL
+        } else {
+            if ($env:EPHOR_ARCHIVE_URL) {
+                Write-Stderr "warning: EPHOR_ARCHIVE_URL is ignored without EPHOR_TEST_MODE=1."
+            }
+            $EPHOR_URL = "$REPO/archive/$EPHOR_TAG.tar.gz"
+        }
     }
 
     Write-Host "Adding ephor dependency..."

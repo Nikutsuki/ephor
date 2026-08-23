@@ -1,7 +1,7 @@
 #!/bin/sh
 # Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630;
 # batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
-# EPH-I0642).
+# EPH-I0642; batch B85: EPH-I0205).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -69,6 +69,10 @@ PATH="$TEST_ROOT/bin:$PATH"
 export PATH
 export EPHOR_TAGS_API="file://$TEST_ROOT/tags.json"
 export EPHOR_ARCHIVE_URL="file://$TEST_ROOT/archive.tar.gz"
+# EPH-I0205: the URL overrides are test hooks gated behind an explicit
+# test-mode marker. The suite is the sanctioned test channel, so it sets
+# the marker for every run. t38 covers the no-marker production shape.
+export EPHOR_TEST_MODE=1
 export FAKE_ZIG_VERSION="0.16.0"
 
 PASS_COUNT=0
@@ -878,6 +882,37 @@ rc=0
 assert_rc 0
 [ -n "$(ls "$D"/y.* 2>/dev/null || true)" ] || fail "clean arm created no temp file"
 pass "t37 INSTALL_TMP slot guard (F-18)"
+
+# --- t38 (EPH-I0205): ambient URL overrides without EPHOR_TEST_MODE=1
+# must be ignored with warnings. The install resolves through the real
+# API URL, which the fake curl serves as a failure so the run stays
+# hermetic, and takes the pinned fallback tag.
+D="$TEST_ROOT/t38"
+BINDIR="$TEST_ROOT/t38-bin"
+mkdir -p "$D" "$BINDIR"
+cat > "$BINDIR/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" > "$CURL_ARGS_FILE"
+cat "$CURL_BODY_FILE" 2>/dev/null
+exit 1
+EOF
+chmod +x "$BINDIR/curl"
+write_fresh_build_zig "$D"
+CURL_ARGS_FILE="$D/curl-args"
+CURL_BODY_FILE="$D/no-body"
+export CURL_ARGS_FILE CURL_BODY_FILE
+OLD_TEST_MODE=$EPHOR_TEST_MODE
+unset EPHOR_TEST_MODE
+run_installer_with_bin "$BINDIR" "$D"
+export EPHOR_TEST_MODE="$OLD_TEST_MODE"
+unset CURL_ARGS_FILE CURL_BODY_FILE
+assert_rc 0
+assert_grep "$D/err.log" 'EPHOR_TAGS_API is ignored without EPHOR_TEST_MODE=1' 'missing tags-override warning'
+assert_grep "$D/err.log" 'EPHOR_ARCHIVE_URL is ignored without EPHOR_TEST_MODE=1' 'missing archive-override warning'
+assert_grep "$D/out.log" 'v0.14.2' 'fallback tag not chosen'
+assert_grep "$D/curl-args" 'codeberg.org/api/v1/repos/RhyosLabs/ephor/tags' 'override URL used without the marker'
+assert_grep "$D/out.log" 'Done!' 'install did not complete'
+pass "t38 ambient overrides ignored without EPHOR_TEST_MODE (F-19)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

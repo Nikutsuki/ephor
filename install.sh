@@ -57,14 +57,28 @@ preserve_mode() { # original file
 }
 
 REPO="https://codeberg.org/RhyosLabs/ephor"
-# Tests override this URL through EPHOR_TAGS_API to simulate an API failure.
+# Tests override these URLs through EPHOR_TAGS_API and EPHOR_ARCHIVE_URL to
+# simulate an API failure and serve a local archive. EPH-I0205: the
+# overrides steer the install's trust anchor, so ambient environment
+# (direnv, .envrc) must not activate them. Each override takes effect only
+# when EPHOR_TEST_MODE=1 is set explicitly; an override set without the
+# marker is ignored with a warning.
+test_mode_active() {
+    [ "${EPHOR_TEST_MODE:-}" = "1" ]
+}
+
 # EPH-I0637: the API orders tags by date, so limit=10 left a window: ten
 # re-dated old tags could evict the true max from the page. limit=50 is
 # the API's per-page maximum and holds every tag the repo has released
 # so far (15, verified 2026-08-22), so the window is closed today. When
 # the repo grows past 50 tags it reopens, and the fallback floor in
 # resolve_ephor_tag caps the damage at the pinned tag.
-TAGS_API="${EPHOR_TAGS_API:-https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50}"
+TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50"
+if test_mode_active; then
+    TAGS_API="${EPHOR_TAGS_API:-$TAGS_API}"
+elif [ -n "${EPHOR_TAGS_API:-}" ]; then
+    echo "warning: EPHOR_TAGS_API is ignored without EPHOR_TEST_MODE=1." >&2
+fi
 # This tag is the fallback when the Codeberg tags API fails. Refresh it on every release.
 EPHOR_FALLBACK_TAG="v0.14.2"
 # Pin for Zig 0.15.x. Every remote tag (v0.12.3 and later) declares
@@ -381,8 +395,14 @@ else
     echo "${ACTION} ephor ${EPHOR_TAG}..."
 fi
 if [ -z "$EPHOR_URL" ]; then
-    # Tests override the archive URL through EPHOR_ARCHIVE_URL.
-    EPHOR_URL="${EPHOR_ARCHIVE_URL:-${REPO}/archive/${EPHOR_TAG}.tar.gz}"
+    # Tests override the archive URL through EPHOR_ARCHIVE_URL, gated by
+    # EPHOR_TEST_MODE like EPHOR_TAGS_API (EPH-I0205).
+    EPHOR_URL="${REPO}/archive/${EPHOR_TAG}.tar.gz"
+    if test_mode_active; then
+        EPHOR_URL="${EPHOR_ARCHIVE_URL:-$EPHOR_URL}"
+    elif [ -n "${EPHOR_ARCHIVE_URL:-}" ]; then
+        echo "warning: EPHOR_ARCHIVE_URL is ignored without EPHOR_TEST_MODE=1." >&2
+    fi
 fi
 
 echo "Adding ephor dependency..."

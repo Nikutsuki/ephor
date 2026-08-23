@@ -739,7 +739,7 @@ pub const safe_methods = [_]vocab.SafeMethod{
 
 // ============================================================================
 // Comptime Flat Arrays - for fast substring matching in main.zig
-// Derived from structured data above
+// Hand-maintained; keep in sync with the structured tables above (F14)
 // ============================================================================
 
 /// Init patterns for allocator types that don't need per-allocation free
@@ -1104,35 +1104,6 @@ pub fn checkDeprecated(line: []const u8) ?DeprecatedPattern {
 }
 
 // ============================================================================
-// API Wrappers for consistent interface across versions
-// ============================================================================
-
-/// ArrayList wrapper for consistent API across versions
-pub fn arrayListAppend(
-    comptime T: type,
-    list: *std.ArrayListUnmanaged(T),
-    allocator: std.mem.Allocator,
-    item: T,
-) !void {
-    // In 0.15.x, allocator must be passed to append
-    return list.append(allocator, item);
-}
-
-/// ArrayList deinit wrapper
-pub fn arrayListDeinit(
-    comptime T: type,
-    list: *std.ArrayListUnmanaged(T),
-    allocator: std.mem.Allocator,
-) void {
-    list.deinit(allocator);
-}
-
-/// Create a test allocator with leak detection
-pub fn createTestAllocator() std.heap.DebugAllocator(.{}) {
-    return std.heap.DebugAllocator(.{}){};
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1215,19 +1186,6 @@ test "checkDeprecated flags the deprecated ArrayListUnmanaged alias (F5)" {
     try std.testing.expect(checkDeprecated(canonical) == null);
 }
 
-test "ArrayListAppend works with ArrayListUnmanaged" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var list: std.ArrayListUnmanaged(u32) = .empty;
-    defer arrayListDeinit(u32, &list, allocator);
-
-    try arrayListAppend(u32, &list, allocator, 42);
-    try std.testing.expectEqual(@as(usize, 1), list.items.len);
-    try std.testing.expectEqual(@as(u32, 42), list.items[0]);
-}
-
 test "vocabulary allocator_types has expected count" {
     try std.testing.expectEqual(@as(usize, 8), allocator_types.len);
 }
@@ -1295,12 +1253,4 @@ test "managed_container_type_patterns: heap-backed in, inline-storage out" {
     }
     try std.testing.expect(found_arraylist);
     try std.testing.expect(found_hashmap);
-}
-
-test "createTestAllocator returns a working leak-detecting allocator" {
-    var da = createTestAllocator();
-    const allocator = da.allocator();
-    const buf = try allocator.alloc(u8, 16);
-    allocator.free(buf);
-    try std.testing.expect(da.deinit() == .ok);
 }

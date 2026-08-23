@@ -13,6 +13,11 @@
 // clamps to the newest, an older version clamps to the oldest — and ephor
 // warns once per process when the fallback applies.
 //
+// Table selection depends on the compiler that BUILT ephor
+// (getCurrentVersion reads the build toolchain's version at comptime),
+// never the scanned project's toolchain: the resolved tables serve every
+// scanned project (F17).
+//
 // Each version module exports:
 //   - builtins: All @builtin functions
 //   - optional_methods: Methods returning ?T (safe to discard)
@@ -54,15 +59,22 @@ pub const VersionInfo = struct {
     }
 };
 
-/// Parse version string like "0.15.2" or "0.16.0-dev"
+/// Parse a Zig version string like "0.15.2" or "0.16.0-dev.1645+<commit>".
+/// A dev toolchain reports "X.Y.Z-dev.N+<commit>" (builtin.zig_version_string):
+/// everything from the first "-dev" is build metadata, so it sets dev and
+/// never reaches the numeric parts. A malformed numeric component clamps to
+/// zero by design: the dispatch consumes only major and minor, and every
+/// real toolchain string has them well-formed (F12).
 pub fn parseVersion(version_str: []const u8) VersionInfo {
     var info = VersionInfo{ .major = 0, .minor = 0, .patch = 0, .dev = false };
 
-    // Check for -dev suffix
+    // Cut the dev metadata: "0.16.0-dev.1645+<commit>" parses as 0.16.0
+    // with dev set. indexOf (not endsWith) matches the real dev-string
+    // shape, where metadata follows "-dev" (F12).
     var str = version_str;
-    if (std.mem.endsWith(u8, str, "-dev")) {
+    if (std.mem.indexOf(u8, str, "-dev")) |dev_at| {
         info.dev = true;
-        str = str[0 .. str.len - 4];
+        str = str[0..dev_at];
     }
 
     var parts = std.mem.splitScalar(u8, str, '.');
@@ -79,7 +91,11 @@ pub fn parseVersion(version_str: []const u8) VersionInfo {
     return info;
 }
 
-/// Get the current Zig version at comptime
+/// The Zig version of the compiler that BUILT ephor, not the version of
+/// the project being scanned. The value is a comptime constant of the
+/// build toolchain, and the resolved tables then serve every scanned
+/// project regardless of its own toolchain. Table selection is build-time
+/// by design; per-target selection would start here (F17).
 pub fn getCurrentVersion() VersionInfo {
     return comptime parseVersion(builtin.zig_version_string);
 }
@@ -267,10 +283,39 @@ pub fn takeUnknownVersionWarning() bool {
     return pending;
 }
 
+// Comptime-built "X.Y.x, ..." list enumerated from the dispatch itself:
+// each arm of knownTablesFor contributes its version_label, so the
+// supported-versions string can never drift from the switch (F11).
+// newest_supported_minor bounds the probe loop (checklist item 4). The
+// by-value struct copy clears the comptime-var provenance: a
+// container-scope const must not slice a comptime var's storage directly.
+const BuiltVersionsString = struct { bytes: [256]u8, len: usize };
+const built_versions_string = blk: {
+    var buf: [256]u8 = undefined;
+    var pos: usize = 0;
+    var minor: u16 = 0;
+    while (minor <= newest_supported_minor) : (minor += 1) {
+        const version = VersionInfo{ .major = 0, .minor = minor, .patch = 0, .dev = false };
+        if (knownTablesFor(version)) |tables| {
+            if (pos > 0) {
+                @memcpy(buf[pos..][0..2], ", ");
+                pos += 2;
+            }
+            @memcpy(buf[pos..][0..tables.version_label.len], tables.version_label);
+            pos += tables.version_label.len;
+            @memcpy(buf[pos..][0..2], ".x");
+            pos += 2;
+        }
+    }
+    break :blk BuiltVersionsString{ .bytes = buf, .len = pos };
+};
+const supported_versions_string = built_versions_string.bytes[0..built_versions_string.len];
+
 /// Human-readable list of the supported Zig versions.
-/// Feeds the unknown-version warning.
+/// Feeds the unknown-version warning. Derived from the dispatch arms, so
+/// a new version appears here when its switch arm lands (F11).
 pub fn getSupportedVersionsString() []const u8 {
-    return "0.15.x, 0.16.x";
+    return supported_versions_string;
 }
 
 /// Build the fallback warning text. Parameterized so tests can pin the
@@ -509,6 +554,26 @@ test "parseVersion parses dev version" {
     try std.testing.expect(v.dev);
 }
 
+test "parseVersion parses a real dev toolchain string (EPH-I0611)" {
+    // builtin.zig_version_string's shape on a dev build: metadata after
+    // "-dev" must set dev and must not leak into the numeric parts.
+    const v = parseVersion("0.16.0-dev.1645+abcdef0123456789");
+    try std.testing.expectEqual(@as(u16, 0), v.major);
+    try std.testing.expectEqual(@as(u16, 16), v.minor);
+    try std.testing.expectEqual(@as(u16, 0), v.patch);
+    try std.testing.expect(v.dev);
+}
+
+test "parseVersion clamps a malformed component to zero (EPH-I0611)" {
+    // Documented behavior: a bad numeric component becomes 0, never an
+    // error. The dispatch consumes only major and minor.
+    const v = parseVersion("0.16.notanumber");
+    try std.testing.expectEqual(@as(u16, 0), v.major);
+    try std.testing.expectEqual(@as(u16, 16), v.minor);
+    try std.testing.expectEqual(@as(u16, 0), v.patch);
+    try std.testing.expect(!v.dev);
+}
+
 test "getCurrentVersion returns valid version" {
     const v = getCurrentVersion();
     try std.testing.expect(v.major == 0);
@@ -644,10 +709,9 @@ test "getStdlibContainerInitPatterns returns non-empty list" {
     try std.testing.expect(found_arraylist);
 }
 
-test "getSupportedVersionsString names the supported minor versions" {
-    const s = getSupportedVersionsString();
-    try std.testing.expect(std.mem.indexOf(u8, s, "0.15") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "0.16") != null);
+test "getSupportedVersionsString derives from the dispatch arms (EPH-I0610)" {
+    // Exact content, not substrings: the string must track the dispatch.
+    try std.testing.expectEqualStrings("0.15.x, 0.16.x", getSupportedVersionsString());
 }
 
 test "unknown-version warning is pending until taken once (EPH-I1054)" {

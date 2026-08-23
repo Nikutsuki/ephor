@@ -732,9 +732,11 @@ pub const safe_methods = [_]vocab.SafeMethod{
 
 // ============================================================================
 // Comptime Flat Arrays - for fast substring matching in main.zig
-// Derived from structured data above
+// Hand-maintained; keep in sync with the structured tables above (F14)
 // ============================================================================
 
+/// Init patterns for allocator types that don't need per-allocation free
+/// (ArenaAllocator, FixedBufferAllocator, StackFallbackAllocator)
 pub const no_free_init_patterns: []const []const u8 = &.{
     "ArenaAllocator.init(",
     "ArenaAllocator.State",
@@ -763,6 +765,7 @@ pub const no_free_field_type_patterns: []const []const u8 = &.{
     "*FixedBufferAllocator",
 };
 
+/// Init patterns for ALL allocator types (no-free + needs-free)
 pub const all_init_patterns: []const []const u8 = &.{
     "ArenaAllocator.init(",
     "FixedBufferAllocator.init(",
@@ -773,6 +776,7 @@ pub const all_init_patterns: []const []const u8 = &.{
     "MemoryPool(",
 };
 
+/// Names of global singleton allocators
 pub const global_alloc_names: []const []const u8 = &.{
     "page_allocator",
     "c_allocator",
@@ -782,6 +786,7 @@ pub const global_alloc_names: []const []const u8 = &.{
     "testing.allocator",
 };
 
+/// Allocation method patterns for line matching (e.g. ".alloc(")
 pub const alloc_method_patterns: []const []const u8 = &.{
     // std.mem.Allocator interface
     ".alloc(",
@@ -811,6 +816,7 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".concatWithSentinel(",
 };
 
+/// Short names for allocation methods (identifier matching, e.g. "alloc")
 pub const alloc_method_short_names: []const []const u8 = &.{
     "alloc",
     "alignedAlloc",
@@ -844,12 +850,14 @@ pub const qualified_alloc_fn_patterns: []const []const u8 = &.{
     "mem.joinZ(",
 };
 
+/// Cleanup/deallocation patterns
 pub const cleanup_pattern_strs: []const []const u8 = &.{
     ".free(",
     ".destroy(",
     ".deinit(",
 };
 
+/// Container methods that transfer ownership (store/consume passed values)
 pub const container_ownership_methods: []const []const u8 = &.{
     ".put(",
     ".putNoClobber(",
@@ -897,6 +905,8 @@ pub const void_method_patterns: []const []const u8 = &.{
     "assert(",
 };
 
+/// Pointer type patterns for no-free allocator parameter detection
+/// Used to check if a function parameter is typed as a no-free allocator pointer
 pub const no_free_type_ptrs: []const []const u8 = &.{
     "*ArenaAllocator",
     "*std.heap.ArenaAllocator",
@@ -1073,43 +1083,11 @@ pub fn containsBuiltin(line: []const u8) bool {
 /// Check for deprecated patterns, returns replacement suggestion if found
 pub fn checkDeprecated(line: []const u8) ?DeprecatedPattern {
     for (deprecated_patterns) |dep| {
-        // Skip placeholder
-        if (std.mem.eql(u8, dep.pattern, "TBD")) continue;
         if (std.mem.indexOf(u8, line, dep.pattern) != null) {
             return dep;
         }
     }
     return null;
-}
-
-// ============================================================================
-// API Wrappers for consistent interface across versions
-// NOTE: 0.16.0 is released - update if APIs change
-// ============================================================================
-
-/// ArrayList wrapper for consistent API across versions
-pub fn arrayListAppend(
-    comptime T: type,
-    list: *std.ArrayListUnmanaged(T),
-    allocator: std.mem.Allocator,
-    item: T,
-) !void {
-    // Assuming same API as 0.15 until 0.16 is released
-    return list.append(allocator, item);
-}
-
-/// ArrayList deinit wrapper
-pub fn arrayListDeinit(
-    comptime T: type,
-    list: *std.ArrayListUnmanaged(T),
-    allocator: std.mem.Allocator,
-) void {
-    list.deinit(allocator);
-}
-
-/// Create a test allocator with leak detection
-pub fn createTestAllocator() std.heap.DebugAllocator(.{}) {
-    return std.heap.DebugAllocator(.{}){};
 }
 
 // ============================================================================
@@ -1212,7 +1190,20 @@ test "vocabulary alloc_methods includes dupe and dupeZ" {
     try std.testing.expect(found_dupez);
 }
 
-// Note: Add deprecated pattern tests as 0.16 API changes are identified
+// The deprecated-pattern predicates are pinned here per version. The
+// table differs from v0_15's, so the test names a 0.16-only pattern.
+
+test "checkDeprecated flags the removed GeneralPurposeAllocator (EPH-I0612)" {
+    // 0.16 removed GeneralPurposeAllocator: the deprecated form must flag
+    // with the ZAV202 replacement.
+    const line = "var gpa = std.heap.GeneralPurposeAllocator(.{}){};";
+    const result = checkDeprecated(line);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("ZAV202", result.?.rule);
+    // The current form must NOT be flagged.
+    const canonical = "var gpa = std.heap.DebugAllocator(.{}){};";
+    try std.testing.expect(checkDeprecated(canonical) == null);
+}
 
 test "managed_container_type_patterns: heap-backed in, inline-storage out" {
     var found_arraylist = false;
@@ -1228,12 +1219,4 @@ test "managed_container_type_patterns: heap-backed in, inline-storage out" {
     }
     try std.testing.expect(found_arraylist);
     try std.testing.expect(found_hashmap);
-}
-
-test "createTestAllocator returns a working leak-detecting allocator" {
-    var da = createTestAllocator();
-    const allocator = da.allocator();
-    const buf = try allocator.alloc(u8, 16);
-    allocator.free(buf);
-    try std.testing.expect(da.deinit() == .ok);
 }

@@ -34084,8 +34084,10 @@ fn runRuntimeAnalysis(
     const argv_len = try buildRuntimeArgv(opts, &argv_buf, &argv_scratch, allocator);
 
     // One containment root and one dedup/cap state for every parse pass
-    // (EPH-I0171, EPH-I0211). A null root (unresolvable scan path) keeps
-    // the location gate off, matching the pre-fix behavior.
+    // (EPH-I0171, EPH-I0211). A null root fails the location gate closed
+    // (EPH-I1140): the resolution attempt is recorded, so a
+    // realpath/statFile-vs-chdir race can never open the gate for
+    // unanchored child output.
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
     const root_real = scanRootRealpath(io, path, &root_buf);
     var parse_state = RuntimeParseState{};
@@ -34095,6 +34097,7 @@ fn runRuntimeAnalysis(
         .allocator = allocator,
         .io = io,
         .root_real = root_real,
+        .root_attempted = true,
         .state = &parse_state,
     };
 
@@ -34175,10 +34178,14 @@ const RuntimeEmitCtx = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
     /// Containment gate inputs for located findings (EPH-I0171). A null
-    /// root_real disables the gate (legacy test callers), and io then
-    /// stays unread. Production always sets both.
+    /// root_real with root_attempted set fails the gate closed
+    /// (EPH-I1140): the caller tried to resolve the containment root and
+    /// failed, so no unanchored child location may print. A null root
+    /// without an attempt is the legacy permissive test path, and io
+    /// then stays unread. Production always sets all three.
     io: std.Io = undefined,
     root_real: ?[]const u8 = null,
+    root_attempted: bool = false,
     /// Dedup/cap state (EPH-I0211). Null disables both (legacy test
     /// callers); production passes the run-scoped state.
     state: ?*RuntimeParseState = null,
@@ -34255,12 +34262,14 @@ fn tryAppendRuntimeIssue(ctx: RuntimeEmitCtx, issue: Issue) !void {
 
 /// Containment gate for a located runtime finding (EPH-I0171): the bytes
 /// come from child output, so the file must be printable ASCII and must
-/// resolve at or under the scan-root realpath. A null ctx.root_real
-/// disables the gate (legacy callers without a containment root).
+/// resolve at or under the scan-root realpath. A null root fails closed
+/// when the caller attempted the resolution (EPH-I1140): a realpath that
+/// failed must not open the gate for unanchored child locations. Legacy
+/// callers that never attempt a root keep the permissive gate.
 fn runtimeLocationAllowed(ctx: RuntimeEmitCtx, loc: FileLocation) bool {
-    if (ctx.root_real == null) return true;
+    const root = ctx.root_real orelse return !ctx.root_attempted;
     if (!isPrintableAscii(loc.file)) return false;
-    return resolvesInRoot(ctx.io, loc.file, ctx.root_real.?);
+    return resolvesInRoot(ctx.io, loc.file, root);
 }
 
 /// Append a runtime finding with a location that already passed the
@@ -36447,6 +36456,15 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     const cap = thresholdCapFor(key_result.val) orelse return i;
     // A CLI-locked field discards this value; clamping it would warn falsely.
     if (thresholdCliLocked(ctx.cfg.threshold_cli_mask, key_result.val)) return i;
+    // EPH-I1135: the CLI channel rejects zero as a hard usage error
+    // (EPH-I0522), so the config channel must reject it too — a zero
+    // threshold flags every function and the two channels cannot
+    // disagree on the same typo class. Warn and keep the default, the
+    // B13-11 shape for an unparseable value.
+    if (raw == 0) {
+        warnBadThresholdValue(ctx, key_result.val, content[num_start..i]);
+        return i;
+    }
     const num = clampThreshold(
         ctx.diag,
         ctx.source.path,
@@ -37309,17 +37327,19 @@ fn createInstallConfig(diag: *DiagCtx, allocator: Allocator, ver: []const u8) !v
         entries.deinit(allocator);
     }
 
-    // Build entries JSON array string
-    var entries_json: std.ArrayListUnmanaged(u8) = .empty;
+    // Build entries JSON array string. Every entry is repo-derived
+    // (root_dir comes from the build.zig scan), so each one crosses
+    // escapeJson (EPH-I1139): hostile bytes must not break the document.
+    var entries_json = try buildEntriesJsonArray(allocator, entries.items);
     defer entries_json.deinit(allocator);
-    try entries_json.append(allocator, '[');
-    for (entries.items, 0..) |entry, i| {
-        if (i > 0) try entries_json.appendSlice(allocator, ", ");
-        try entries_json.append(allocator, '"');
-        try entries_json.appendSlice(allocator, entry);
-        try entries_json.append(allocator, '"');
-    }
-    try entries_json.append(allocator, ']');
+
+    // EPH-I1139: the detected dir is repo-derived too. The written config
+    // splices it JSON-escaped so the document stays valid JSON, and the
+    // Created echo renders it through the terminal sanitizer (EPH-I0147)
+    // so hostile bytes cannot forge the operator's terminal. Clean paths
+    // borrow unchanged, so ordinary installs write byte-identical configs.
+    var safe_root = try types.escapeJson(allocator, root_dir);
+    defer safe_root.deinit(allocator);
 
     // Write config with version field
     const config_content = try std.fmt.allocPrint(allocator,
@@ -37358,14 +37378,45 @@ fn createInstallConfig(diag: *DiagCtx, allocator: Allocator, ver: []const u8) !v
         \\  }}
         \\}}
         \\
-    , .{ ver, root_dir, entries_json.items });
+    , .{ ver, safe_root.slice, entries_json.items });
     defer allocator.free(config_content);
 
     try writeFileAtomic(diag.io, std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
 
-    std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
-        CONFIG_FILENAME, ver, root_dir,
-    });
+    if (types.sanitizeTerminal(allocator, root_dir)) |safe_val| {
+        var safe_echo = safe_val;
+        defer safe_echo.deinit(allocator);
+        std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
+            CONFIG_FILENAME, ver, safe_echo.slice,
+        });
+    } else |_| {
+        // Sanitize OOM: drop the path rather than print it raw (the
+        // unresolvedScanRootExit policy).
+        std.debug.print("Created {s} (version: {s})\n", .{ CONFIG_FILENAME, ver });
+    }
+}
+
+/// Render the install config's entries array (EPH-I1139). Every entry is
+/// repo-derived (the detected root_dir joins into the main.zig path), so
+/// each one crosses escapeJson: a hostile build.zig must not plant
+/// control bytes or a broken string inside the written ephor.json.
+fn buildEntriesJsonArray(
+    allocator: Allocator,
+    entries: []const []const u8,
+) !std.ArrayListUnmanaged(u8) {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (entries, 0..) |entry, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        var safe_entry = try types.escapeJson(allocator, entry);
+        defer safe_entry.deinit(allocator);
+        try out.append(allocator, '"');
+        try out.appendSlice(allocator, safe_entry.slice);
+        try out.append(allocator, '"');
+    }
+    try out.append(allocator, ']');
+    return out;
 }
 
 /// Base URL for ephor repository (used to construct versioned package URLs)
@@ -40158,22 +40209,55 @@ fn silenceVerboseInJson(cfg: *Config) void {
     cfg.verbose = false;
 }
 
-/// Name of the command that must reject JSON output (EPH-I1070), or null
-/// when the command may run under --format=json. init, install, and
-/// upgrade emit human progress text and carry no machine result, so a
-/// JSON run has nothing honest to emit: routing their lines through
-/// cliDiag would leave the machine stream empty on success, an
-/// unreadable result for a consumer. They reject --format=json instead,
-/// and the abort object carries the stashed diagnostic. The "update"
-/// alias parses to .upgrade, so one arm covers both spellings.
+/// Name of the command that must reject JSON output (EPH-I1070,
+/// EPH-I1097), or null when the command may run under --format=json.
+/// init, install, and upgrade emit human progress text and carry no
+/// machine result, so a JSON run has nothing honest to emit: routing
+/// their lines through cliDiag would leave the machine stream empty on
+/// success, an unreadable result for a consumer. help and version print
+/// the human banner/help (EPH-I1097): same class, same rejection. They
+/// reject --format=json instead, and the abort object carries the
+/// stashed diagnostic. The "update" alias parses to .upgrade, so one
+/// arm covers both spellings.
 fn jsonRejectedCommandName(cfg: *const Config) ?[]const u8 {
     if (cfg.format != .json) return null;
     return switch (cfg.command) {
         .init => "init",
         .install => "install",
         .upgrade => "upgrade",
+        .help => "help",
+        .version => "version",
         else => null,
     };
+}
+
+/// Parse the tail arguments after the command position (EPH-I1098): a
+/// bare word still names the command when none was set yet, so a
+/// flag-first spelling (ephor --format=json upgrade) parses the upgrade
+/// command exactly like the argv[1] position. Once a command or a scan
+/// path latches, every bare word is a scan path, and `--` ends the
+/// command window like it ends flag parsing.
+fn parseTailArgs(
+    args: *std.process.Args.Iterator,
+    ctx: CliParseCtx,
+    cmd_seen: *bool,
+) !void {
+    while (args.next()) |arg| {
+        if (parseCommandWord(ctx, arg, cmd_seen)) continue;
+        try parseCliArg(ctx, arg);
+    }
+}
+
+/// Consume one bare command word in the flag loop (EPH-I1098). Returns
+/// true when the word named a command and the caller must move on: the
+/// command window closes on a command, on a latched scan path, or on
+/// the `--` end-of-flags marker.
+fn parseCommandWord(ctx: CliParseCtx, arg: []const u8, cmd_seen: *bool) bool {
+    if (ctx.no_more_flags.* or ctx.cli_path.* or cmd_seen.*) return false;
+    const c = parseCommand(arg) orelse return false;
+    ctx.cfg.command = c;
+    cmd_seen.* = true;
+    return true;
 }
 
 fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) !Config {
@@ -40191,6 +40275,7 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     var cli_entries = false;
     var cli_path = false;
     var no_more_flags = false;
+    var cmd_seen = false;
     const cli_ctx: CliParseCtx = .{
         .diag = diag,
         .allocator = allocator,
@@ -40202,6 +40287,7 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     if (args.next()) |cmd| {
         if (parseCommand(cmd)) |c| {
             cfg.command = c;
+            cmd_seen = true;
         } else if (cmd.len == 0 or cmd[0] == '-') {
             // A flag — or the invalid empty element — goes through the flag
             // parser, which rejects what it cannot match (EPH-I0233/34).
@@ -40213,19 +40299,16 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
             cfg.command = .check;
         }
     }
-    while (args.next()) |arg| try parseCliArg(cli_ctx, arg);
+    try parseTailArgs(&args, cli_ctx, &cmd_seen);
     // JSON mode makes verbose a no-op: settled after the flag loop so
     // either flag order lands on the same outcome (EPH-I0213).
     silenceVerboseInJson(&cfg);
-    // The interactive commands reject --format=json (EPH-I1070): their
-    // progress lines would leak raw text onto the machine stream, and
-    // routing them through cliDiag would leave the stream empty. The
-    // stashed diagnostic rides the abort object, and the run exits 1.
-    // The rejection fires only when the command word parses as an
-    // interactive command, and argv[1] is the only command position in
-    // ephor's grammar. A flag-first spelling leaves that word to the
-    // path latch, so the run takes the check path instead; its failure
-    // shape is covered by the epilogue abort.
+    // The human-output commands reject --format=json (EPH-I1070,
+    // EPH-I1097): their lines would leak raw text onto the machine
+    // stream, and routing them through cliDiag would leave the stream
+    // empty. The stashed diagnostic rides the abort object, and the run
+    // exits 1. parseTailArgs parses the command word in flag-first
+    // order too (EPH-I1098), so either spelling reaches this rejection.
     if (jsonRejectedCommandName(&cfg)) |name| {
         cliDiag(
             diag,
@@ -41031,22 +41114,38 @@ fn formatSuppressedJson(buf: []u8, stats: SuppressionStats) ![]const u8 {
 /// still carries the accounting for machine consumers. On the impossible
 /// overflow (256-byte buffer, 221-byte worst case) the object drops
 /// silently: a bare-text notice would break the machine stream
-/// (EPH-I0213, EPH-I0540).
-fn printSuppressedJsonObject(stats: SuppressionStats) void {
+/// (EPH-I0213, EPH-I0540). The writer seam (EPH-I1130, the EPH-I0687
+/// shape): tests pass a capture writer so the object never reaches the
+/// green-run stderr (the EPH-I0288 noise class); production passes null
+/// for the raw stderr path, byte-identical with the pre-seam output.
+fn printSuppressedJsonObject(stats: SuppressionStats, writer: ?*std.Io.Writer) void {
     var buf: [256]u8 = undefined;
     // Overflow is impossible: 101 fixed bytes + 6 usize values (<=20 digits
     // each) = 221 bytes worst case. No catch unreachable (ZA202 dogfood).
     const member = formatSuppressedJson(&buf, stats) catch return;
-    std.debug.print("{{\n  \"suppressed\": {s}\n}}\n", .{member});
+    if (writer) |w| {
+        w.print("{{\n  \"suppressed\": {s}\n}}\n", .{member}) catch |err| switch (err) {
+            error.WriteFailed => {},
+        };
+    } else {
+        std.debug.print("{{\n  \"suppressed\": {s}\n}}\n", .{member});
+    }
 }
 
 /// RED3-3 disclosure for every output path. The stderr note lands before
 /// any STATUS/summary/footer line, so a suppressed repo never shows a bare
 /// clean status. JSON mode also gets the standalone object whenever no
 /// summary object will carry the member (the summary object is check-only).
-fn reportSuppression(diag: *DiagCtx, stats: *const SuppressionStats, cfg: *const Config) void {
+/// `writer` is the EPH-I0687 seam: null is the production stderr path,
+/// a capture writer keeps the test caller off the runner log (EPH-I1130).
+fn reportSuppression(
+    diag: *DiagCtx,
+    stats: *const SuppressionStats,
+    cfg: *const Config,
+    writer: ?*std.Io.Writer,
+) void {
     const summary_prints = cfg.command == .check and cfg.show_summary;
-    if (cfg.format == .json and !summary_prints) printSuppressedJsonObject(stats.*);
+    if (cfg.format == .json and !summary_prints) printSuppressedJsonObject(stats.*, writer);
     const n = stats.total();
     if (n == 0) return;
     // JSON mode: the suppressed object/member already carries the
@@ -41773,7 +41872,7 @@ fn handleOrphans(ctx: *RunCtx) !void {
     try mergeSkippedIssues(ctx.alloc, &g, &issues);
     sortIssuesByFile(issues.items);
     const c = printIssues(issues.items, "orphans", ctx.reportOut(&g));
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
@@ -41800,7 +41899,7 @@ fn handleMemory(ctx: *RunCtx) !void {
     ast_issues.deinit(ctx.alloc);
     ast_issues = .empty;
     const c = printIssues(issues.items, "memory", ctx.reportOut(&g));
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
@@ -41825,7 +41924,7 @@ fn handleErrors(ctx: *RunCtx) !void {
     ignored.deinit(ctx.alloc);
     ignored = .empty;
     const c = printIssues(issues.items, "errors", ctx.reportOut(&g));
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
@@ -41839,7 +41938,7 @@ fn handleUnused(ctx: *RunCtx) !void {
     var issues = try analyzeUnused(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "unused", ctx.reportOut(&g));
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
@@ -41853,7 +41952,7 @@ fn handleComplexity(ctx: *RunCtx) !void {
     var issues = try analyzeComplexity(ctx.alloc, &g, ctx.cfg.thresholds);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "complexity", ctx.reportOut(&g));
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
@@ -41863,7 +41962,7 @@ fn handleFmtCheck(ctx: *RunCtx) !void {
     var issues = try runFmtCheck(ctx.diag, ctx.alloc, ctx.cfg.path);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "format", ctx.reportOut(null));
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
@@ -41905,9 +42004,13 @@ fn runtimePromptText(
 
 /// Interactive gate for `runtime`: the analysis compiles and executes the
 /// target, so the user confirms unless --yes was passed. Returns false on
-/// any answer other than y/Y (EOF included).
+/// any answer other than y/Y (EOF included). JSON mode owns the stream as
+/// a machine contract (EPH-I1099): no prompt text may print and no silent
+/// stdin read may hang a machine consumer, so the call declines without
+/// printing or reading; the caller routes the decline to the abort object.
 fn confirmRuntime(ctx: *const RunCtx) !bool {
     if (ctx.cfg.auto_approve) return true;
+    if (ctx.cfg.format == .json) return false;
     const cmd_str = ctx.cfg.runtime_command orelse "zig build test";
     const prompt = try runtimePromptText(ctx.alloc, ctx.base_path, cmd_str);
     defer ctx.alloc.free(prompt);
@@ -41926,6 +42029,19 @@ fn confirmRuntime(ctx: *const RunCtx) !bool {
 /// A declined prompt skips the epilogue (the pre-split bare return).
 fn handleRuntime(ctx: *RunCtx) !void {
     if (!try confirmRuntime(ctx)) {
+        // JSON mode: the decline rides the epilogue abort object
+        // (EPH-I1099). The stashed diagnostic names the --yes remedy,
+        // and the run exits 1, so the armed machine stream carries one
+        // document instead of ending empty.
+        if (ctx.cfg.format == .json) {
+            cliDiag(
+                ctx.diag,
+                "error: runtime analysis needs interactive confirmation. Pass --yes to run it\n",
+                .{},
+            );
+            ctx.should_exit_error = true;
+            return;
+        }
         ctx.abort_epilogue = true;
         return;
     }
@@ -41953,7 +42069,7 @@ fn handleRuntime(ctx: *RunCtx) !void {
             .{suppressed},
         );
     }
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
 
@@ -42307,7 +42423,7 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
     const counts = try printCheckReports(out, findings, &filtered);
     // RED3-3: the suppression note lands before STATUS/summary/footer so a
     // suppressed repo never shows a bare clean status.
-    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
+    reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     if (ctx.cfg.show_summary) printCheckSummary(ctx, g, findings, &counts);
     printResultFooter(counts.total(), ctx.cfg.format);
     // Findings are informational unless --strict/--fail-on gates them.
@@ -43157,6 +43273,36 @@ test "collectInstallEntries leaks nothing under allocation failure (B13-18)" {
         for (entries.items) |e| failing.allocator().free(e);
         entries.deinit(failing.allocator());
     }
+}
+
+test "install entries JSON escapes hostile repo-derived bytes (EPH-I1139)" {
+    // A hostile build.zig plants control bytes in the detected dir, and
+    // the entry paths inherit them. The written config must stay valid
+    // JSON: every entry crosses escapeJson, so no raw control byte rides
+    // into the document (RFC 8259 escapes control bytes as \uXXXX).
+    const allocator = std.testing.allocator;
+    const entries = [_][]const u8{ "src\x1b[31m/main.zig", "build.zig" };
+    var json = try buildEntriesJsonArray(allocator, &entries);
+    defer json.deinit(allocator);
+    try std.testing.expect(mem.indexOfScalar(u8, json.items, 0x1b) == null);
+    try std.testing.expect(mem.indexOf(u8, json.items, "\\u001B") != null);
+    // The escaped array parses as a JSON document and round-trips the
+    // original bytes through the strict parser.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings(
+        "src\x1b[31m/main.zig",
+        parsed.value.array.items[0].string,
+    );
+    // Clean entries borrow unchanged: the array is byte-identical with
+    // the pre-fix raw splice for the ordinary install.
+    var clean = try buildEntriesJsonArray(allocator, &.{ "src/main.zig", "build.zig" });
+    defer clean.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "[\"src/main.zig\", \"build.zig\"]",
+        clean.items,
+    );
 }
 
 test "ImportGraph.deinit frees reachable keys when the key list append fails (EPH-I0375)" {
@@ -45884,6 +46030,45 @@ test "runtimePromptText sanitizes the command and the scan path (EPH-I0173, EPH-
     try std.testing.expect(mem.indexOf(u8, clean, "zig build test") != null);
 }
 
+test "runtime JSON decline stashes the remedy and fails the run (EPH-I1099)" {
+    // JSON mode owns the stream as a machine contract: the prompt text
+    // must never print and the decline must not end the armed stream
+    // empty. confirmRuntime declines without a prompt read, handleRuntime
+    // stashes the --yes remedy, and the epilogue abort object rides the
+    // exit code (should_exit_error, the failedRunExitCode path).
+    var diag = testDiagCtx();
+    diag.json_stream = true;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.format = .json;
+    cfg.auto_approve = false;
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &cache,
+    };
+    try std.testing.expect(!try confirmRuntime(&ctx));
+    try handleRuntime(&ctx);
+    try std.testing.expect(ctx.should_exit_error);
+    try std.testing.expect(!ctx.abort_epilogue);
+    const stashed = diag.last_muted_diag[0..diag.last_muted_diag_len];
+    try std.testing.expectEqualStrings(
+        "error: runtime analysis needs interactive confirmation. Pass --yes to run it\n",
+        stashed,
+    );
+    // The abort object that rides the exit code carries the stashed
+    // message (the I1067 render, already pinned by the I1137 tests).
+    var obj = types.OutBuf{ .allocator = allocator };
+    defer obj.deinit();
+    try buildAbortJson(&obj, allocator, error.RunFailed, stashed);
+    try std.testing.expect(mem.indexOf(u8, obj.buf.items, "RunFailed") != null);
+}
+
 test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171)" {
     // The verbose band prints raw child lines; this seam must strip
     // control bytes. The sanitized output lands in the test log, where
@@ -46267,6 +46452,48 @@ test "emitRuntimeIssue appends a file-less runtime finding" {
     try std.testing.expectEqualStrings("m", issues.items[0].message);
     try std.testing.expectEqualStrings("h", issues.items[0].help.?);
     try std.testing.expect(!issues.items[0].message_owned);
+}
+
+test "null containment root fails the located-finding gate closed (EPH-I1140)" {
+    // A null root_real with a recorded resolution attempt is the
+    // runRuntimeAnalysis state when the scan-root realpath failed: the
+    // gate must deny every located finding instead of printing unanchored
+    // child output (the realpath/statFile-vs-chdir TOCTOU window). The
+    // legacy no-attempt ctx keeps its permissive gate (pinned by the
+    // located-class tests above), so this pin covers only the new state.
+    const allocator = std.testing.allocator;
+    const spec = RuntimeIssueSpec{ .rule = RULE_RUNTIME_PANIC, .message = "m", .help = "h" };
+    {
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        defer deinitIssues(&issues, allocator);
+        const ctx = RuntimeEmitCtx{
+            .issues = &issues,
+            .allocator = allocator,
+            .root_attempted = true,
+        };
+        try emitLocatedIssue(ctx, spec, "/forged/x.zig:7");
+        try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+        try std.testing.expectEqualStrings("unknown", issues.items[0].file);
+        try std.testing.expectEqual(@as(usize, 0), issues.items[0].line);
+    }
+    {
+        // The same state denies the leak-message location: the generic
+        // text survives, never the forged path.
+        var issues: std.ArrayListUnmanaged(Issue) = .empty;
+        defer deinitIssues(&issues, allocator);
+        const ctx = RuntimeEmitCtx{
+            .issues = &issues,
+            .allocator = allocator,
+            .root_attempted = true,
+        };
+        var iter = mem.splitScalar(u8, "/forged/x.zig:7:5: 0xabc in foo", '\n');
+        try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+        try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+        try std.testing.expectEqualStrings(
+            "memory leak detected at runtime",
+            issues.items[0].message,
+        );
+    }
 }
 
 test "reportCommandFailure varies help by command kind" {
@@ -104367,6 +104594,27 @@ test "config thresholds overflow warns and keeps the default (B13-11)" {
     try std.testing.expectEqual(@as(usize, 1), diag.threshold_invalid_count);
 }
 
+test "config threshold zero warns and keeps the default (EPH-I1135)" {
+    // The CLI channel rejects zero as a hard usage error (EPH-I0522).
+    // A zero threshold flags every function, so the config channel must
+    // reject the same typo class: warn and keep the default (the B13-11
+    // shape), never apply the zero.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    diag.cli_diagnostics_enabled = false;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try parseConfigJson(
+        &diag,
+        allocator,
+        "{\"thresholds\": {\"max_function_lines\": 0, \"max_cognitive\": 0}}",
+        &cfg,
+    );
+    try std.testing.expectEqual(@as(usize, 50), cfg.thresholds.max_function_lines);
+    try std.testing.expectEqual(@as(usize, 15), cfg.thresholds.max_cognitive);
+    try std.testing.expectEqual(@as(usize, 2), diag.threshold_invalid_count);
+}
+
 test "config path_dir rejection warning sanitizes hostile value bytes" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -104902,7 +105150,7 @@ test "isJsonFormatToken matches only the two JSON format spellings (EPH-I0213)" 
     try std.testing.expect(!isJsonFormatToken("json"));
 }
 
-test "jsonRejectedCommandName rejects only the interactive commands in JSON mode (EPH-I1070)" {
+test "jsonRejectedCommandName rejects only the human-output commands in JSON mode (EPH-I1070, EPH-I1097)" {
     var cfg = testConfig();
     defer cfg.deinit(std.testing.allocator);
     cfg.format = .json;
@@ -104912,6 +105160,12 @@ test "jsonRejectedCommandName rejects only the interactive commands in JSON mode
     try std.testing.expectEqualStrings("install", jsonRejectedCommandName(&cfg).?);
     cfg.command = .init;
     try std.testing.expectEqualStrings("init", jsonRejectedCommandName(&cfg).?);
+    // help/version print the human banner on the armed stream (EPH-I1097):
+    // same class, same rejection.
+    cfg.command = .help;
+    try std.testing.expectEqualStrings("help", jsonRejectedCommandName(&cfg).?);
+    cfg.command = .version;
+    try std.testing.expectEqualStrings("version", jsonRejectedCommandName(&cfg).?);
     // Analysis commands keep their machine output.
     cfg.command = .check;
     try std.testing.expect(jsonRejectedCommandName(&cfg) == null);
@@ -104924,6 +105178,92 @@ test "jsonRejectedCommandName rejects only the interactive commands in JSON mode
     cfg.format = .text;
     cfg.command = .upgrade;
     try std.testing.expect(jsonRejectedCommandName(&cfg) == null);
+}
+
+test "parseArgs parses a command word after flags (EPH-I1098)" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi)
+        return error.SkipZigTest;
+    // Flag-first ordering: upgrade is a command, not a scan path. The
+    // rejection fires with the stashed diagnostic, exactly like the
+    // command-first spelling (EPH-I1070).
+    {
+        var diag = testDiagCtx();
+        const args = std.process.Args{ .vector = &.{
+            @as([*:0]const u8, "ephor"),
+            @as([*:0]const u8, "--format=json"),
+            @as([*:0]const u8, "upgrade"),
+        } };
+        try std.testing.expectError(
+            error.JsonCommandUnsupported,
+            parseArgs(&diag, std.testing.allocator, args),
+        );
+        try std.testing.expect(diag.json_stream);
+        const stashed = diag.last_muted_diag[0..diag.last_muted_diag_len];
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            stashed,
+            "upgrade command has no machine-readable output",
+        ) != null);
+    }
+    // Text mode: the flag-first command parses and the run proceeds with
+    // the command's own path rules. The mute keeps the success-path
+    // config/detection notes off the green-run log.
+    {
+        var diag = testDiagCtx();
+        diag.cli_diagnostics_enabled = false;
+        const args = std.process.Args{ .vector = &.{
+            @as([*:0]const u8, "ephor"),
+            @as([*:0]const u8, "--verbose"),
+            @as([*:0]const u8, "stats"),
+        } };
+        var cfg = try parseArgs(&diag, std.testing.allocator, args);
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Command.stats, cfg.command);
+    }
+    // A consumed command word does not claim the next bare word: the
+    // command-first position still wins over the path latch.
+    {
+        var diag = testDiagCtx();
+        diag.cli_diagnostics_enabled = false;
+        const args = std.process.Args{ .vector = &.{
+            @as([*:0]const u8, "ephor"),
+            @as([*:0]const u8, "check"),
+            @as([*:0]const u8, "upgrade"),
+        } };
+        var cfg = try parseArgs(&diag, std.testing.allocator, args);
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Command.check, cfg.command);
+        try std.testing.expectEqualStrings("upgrade", cfg.path);
+    }
+    // `--` ends the command window: the word stays a scan path.
+    {
+        var diag = testDiagCtx();
+        diag.cli_diagnostics_enabled = false;
+        const args = std.process.Args{ .vector = &.{
+            @as([*:0]const u8, "ephor"),
+            @as([*:0]const u8, "--"),
+            @as([*:0]const u8, "upgrade"),
+        } };
+        var cfg = try parseArgs(&diag, std.testing.allocator, args);
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Command.check, cfg.command);
+        try std.testing.expectEqualStrings("upgrade", cfg.path);
+    }
+    // A latched scan path ends the command window: the command word is
+    // an extra scan path, the hard usage error (EPH-I0807).
+    {
+        var diag = testDiagCtx();
+        diag.cli_diagnostics_enabled = false;
+        const args = std.process.Args{ .vector = &.{
+            @as([*:0]const u8, "ephor"),
+            @as([*:0]const u8, "src/"),
+            @as([*:0]const u8, "upgrade"),
+        } };
+        try std.testing.expectError(
+            error.ExtraScanPath,
+            parseArgs(&diag, std.testing.allocator, args),
+        );
+    }
 }
 
 test "pre-scan scans the raw POSIX argv vector infallibly (EPH-I1056)" {
@@ -106280,11 +106620,11 @@ test "suppression: ignore-file directive drops the finding and counts inline" {
     try std.testing.expectEqualStrings(expected, formatSuppressionBreakdown(&buf, h.stats));
 
     diag.cli_diagnostics_enabled = false;
-    reportSuppression(&diag, &h.stats, &h.cfg);
+    reportSuppression(&diag, &h.stats, &h.cfg, null);
     try std.testing.expectEqual(@as(usize, 1), diag.suppression_note_count);
 }
 
-test "suppression: JSON mode carries the accounting without the bare note (EPH-I0213)" {
+test "suppression: JSON mode carries the accounting without the bare note (EPH-I0213, EPH-I1130)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     const content = "// ephor:ignore-file\n" ++ suppress_leak_source;
@@ -106296,9 +106636,22 @@ test "suppression: JSON mode carries the accounting without the bare note (EPH-I
     try std.testing.expectEqual(@as(usize, 0), counts.warnings);
     try std.testing.expect(h.stats.total() > 0);
     // The suppressed object (or summary member) carries the accounting in
-    // JSON mode; the bare note must not reach the machine stream.
-    reportSuppression(&diag, &h.stats, &h.cfg);
+    // JSON mode; the bare note must not reach the machine stream. The
+    // object renders through the capture writer (EPH-I1130): the green-run
+    // log stays clean (EPH-I0288), and the pin asserts the exact bytes.
+    var capture_buf: [384]u8 = undefined;
+    var capture: std.Io.Writer = .fixed(&capture_buf);
+    reportSuppression(&diag, &h.stats, &h.cfg, &capture);
     try std.testing.expectEqual(@as(usize, 0), diag.suppression_note_count);
+    var member_buf: [256]u8 = undefined;
+    const member = try formatSuppressedJson(&member_buf, h.stats);
+    var expected_buf: [384]u8 = undefined;
+    const expected = try std.fmt.bufPrint(
+        &expected_buf,
+        "{{\n  \"suppressed\": {s}\n}}\n",
+        .{member},
+    );
+    try std.testing.expectEqualStrings(expected, capture.buffered());
 }
 
 test "suppression: known-issues entry drops the finding and counts known_issues" {
@@ -106364,7 +106717,7 @@ test "suppression: zero suppression emits no note" {
     try std.testing.expectEqual(h.run.issues.items.len, counts.warnings);
     try std.testing.expectEqual(@as(usize, 0), h.stats.total());
 
-    reportSuppression(&diag, &h.stats, &h.cfg);
+    reportSuppression(&diag, &h.stats, &h.cfg, null);
     try std.testing.expectEqual(@as(usize, 0), diag.suppression_note_count);
 }
 

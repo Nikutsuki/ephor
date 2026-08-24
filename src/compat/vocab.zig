@@ -65,15 +65,6 @@ pub const ContainerMethod = struct {
     is_void: bool,
 };
 
-/// Stdlib method whose return value is safe to discard (void, T, or ?T — not !T)
-/// Used by isSafeToDiscard and isSafeBuiltin
-pub const SafeMethod = struct {
-    /// Pattern for line matching: ".clear("
-    pattern: []const u8,
-    /// true if method returns void (known void)
-    is_void: bool,
-};
-
 /// A deprecated pattern and its modern replacement.
 /// Shared so every version module's checkDeprecated returns the same type.
 pub const DeprecatedPattern = struct {

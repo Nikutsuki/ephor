@@ -8600,7 +8600,13 @@ fn hasElseBranchMarker(t: []const u8) bool {
 /// pair (EPH-I0791 for `=>`, EPH-I0806 for else/orelse). A line-starting
 /// `orelse {` cannot sit inside a literal or comment (the first char of a
 /// masked region would have to open it); the `} orelse` and `} else` forms
-/// scan code positions only (EPH-I0342).
+/// scan code positions only (EPH-I0342). An own-line `else {` separator
+/// line is deliberately NOT a marker (EPH-I1087 residual): the mid-line
+/// `} else {` marker's suppression of the else-arm pair is the
+/// accepted-FN side (the EPH-I0806 marker-suppression class), while the
+/// branch_false sibling gate (EPH-I1086) upgrades the own-line twin's
+/// pair to err — recognizing the own-line separator would silence that
+/// err. The asymmetry is pinned by the EPH-I1087 test.
 fn hasElseOrOrelseMarker(t: []const u8) bool {
     if (mem.startsWith(u8, t, "orelse {")) return true;
     if (hasCodeToken(t, "} orelse {")) return true;
@@ -10055,46 +10061,93 @@ const SiblingArm = struct {
 
 /// True when the skip path's sibling arm of the block at bid also frees
 /// the variable: the cross-block mirror of the same-line
-/// elsePrecedesSecondFree gate (EPH-I1017 F1). The branch_true edge into
-/// bid names the construct header; the header's branch_false target is
-/// the sibling (the else body of an if, the loop-else body of a
-/// while/for). The sibling counts only when it is a genuine arm: a
-/// multi-line else/loop-else body opens with its `} else {` arm-header
-/// line, and an inline single-line arm shares the construct header's
-/// start line. A post-join merge — the branch_false target of an
-/// else-less construct — starts on the line after the construct close
-/// (finishPendingElse or handleBlockEnd), so it normally matches neither
-/// test, even when its first line carries an unrelated else token (an
-/// if-expression, a single-line if-else, a switch else prong)
-/// (EPH-I1031). One merge shape passes the `}`-prefix test: a nested
-/// construct that is the last statement of an enclosing arm closes onto
-/// the enclosing `} else {` line, and finishPendingElse sets the inner
-/// merge's start there. The else-claim mark closes it: handleElse sets
-/// the mark on the claimed entry's else body, the close paths never do,
-/// so the gate rejects the enclosing-close merge (EPH-I1032). When the
-/// sibling arm also frees, every path through the construct runs a
-/// second free: the pair is definite, never conditional — the severity
-/// mirror of the same-line both-arms form, which the
+/// elsePrecedesSecondFree gate (EPH-I1017 F1, EPH-I1086). Two directions.
+/// Forward: the branch_true edge into bid names the construct header;
+/// the header's branch_false target is the sibling (the else body of an
+/// if, the loop-else body of a while/for). The sibling counts only when
+/// it is a genuine arm: a multi-line else/loop-else body opens with its
+/// `} else {` arm-header line, and an inline single-line arm shares the
+/// construct header's start line. A post-join merge — the branch_false
+/// target of an else-less construct — starts on the line after the
+/// construct close (finishPendingElse or handleBlockEnd), so it normally
+/// matches neither test, even when its first line carries an unrelated
+/// else token (an if-expression, a single-line if-else, a switch else
+/// prong) (EPH-I1031). One merge shape passes the `}`-prefix test: a
+/// nested construct that is the last statement of an enclosing arm
+/// closes onto the enclosing `} else {` line, and finishPendingElse sets
+/// the inner merge's start there. The else-claim mark closes it:
+/// handleElse sets the mark on the claimed entry's else body, the close
+/// paths never do, so the gate rejects the enclosing-close merge
+/// (EPH-I1032).
+/// Reverse (EPH-I1086): the branch_false edge into bid names the
+/// construct header; the header's branch_true target is the sibling (the
+/// then body of an if). The reverse direction requires multi-line arms
+/// (a single-line arm shares the header line and the span scan cannot
+/// tell the arms apart), excludes loop headers (a break path skips the
+/// loop's else body, so the else-arm pair stays conditional), checks the
+/// sibling's frees against the tracked var, and requires the construct
+/// header to sit on every continuing path (a nested construct skips on
+/// the enclosing arm's other paths, and the else-arm pair is conditional
+/// there).
+/// When the sibling arm also frees, every path through the construct
+/// runs a second free: the pair is definite, never conditional — the
+/// severity mirror of the same-line both-arms form, which the
 /// elsePrecedesSecondFree gate already reads as definite.
-/// Residuals, mirroring elsePrecedesSecondFree: the gate does not check
-/// that the sibling pattern targets the same variable, an else-if chain's
-/// final else body is not the direct sibling of the first arm (the chain
-/// grades arm-by-arm, and an intermediate arm's sibling is the next
-/// condition block, which carries no else-claim mark and spans only its
-/// condition line — an inline same-line else-if body free keeps the
-/// conditional grade, the safe direction), a free
-/// nested inside a construct within the sibling arm lies in a deeper
-/// block, outside the sibling's own span, a top-level single-line arm
-/// whose header block starts on an earlier line (the usual fn-body
-/// shape) does not share the header's start line and stays at the
-/// non-upgraded grade — the single-line both-arms shape with a
-/// dominating pre-free reads definite through the own-line escape
-/// (isSameLineBothArmsFree, EPH-I1030) instead. An own-line `else {`
-/// header (the line-start else body) counts as a genuine arm start like
-/// the `}`-prefixed form: its else-claim mark proves the body
-/// (EPH-I1063).
-fn siblingArmAlsoFrees(ctx: *const FreeScanCtx, bid: usize) bool {
-    const arm = branchSibling(ctx.cfg, bid) orelse return false;
+/// Residuals, mirroring elsePrecedesSecondFree: the forward direction
+/// does not check that the sibling pattern targets the same variable, an
+/// else-if chain's final else body is not the direct sibling of the
+/// first arm (the chain grades arm-by-arm, and an intermediate arm's
+/// sibling is the next condition block, which carries no else-claim mark
+/// and spans only its condition line — an inline same-line else-if body
+/// free keeps the conditional grade, the safe direction), a free nested
+/// inside a construct within the sibling arm lies in a deeper block,
+/// outside the sibling's own span, a top-level single-line arm whose
+/// header block starts on an earlier line (the usual fn-body shape) does
+/// not share the header's start line and stays at the non-upgraded grade
+/// — the single-line both-arms shape with a dominating pre-free reads
+/// definite through the own-line escape (isSameLineBothArmsFree,
+/// EPH-I1030) instead. An own-line `else {` header (the line-start else
+/// body) counts as a genuine arm start like the `}`-prefixed form: its
+/// else-claim mark proves the body (EPH-I1063). The mid-line `} else {`
+/// marker still suppresses the else-arm pair before this gate runs: the
+/// mid-line twin stays silent while the own-line twin grades err — the
+/// accepted-FN asymmetry, pinned by the EPH-I1087 test.
+fn siblingArmAlsoFrees(ctx: *const FreeScanCtx, bid: usize) !bool {
+    if (branchSibling(ctx.cfg, bid)) |arm| return elseBodyArmFrees(ctx, arm);
+    if (elseArmSibling(ctx.cfg, bid)) |arm| return thenBodyArmAlsoFrees(ctx, bid, arm);
+    return false;
+}
+
+/// The branch_false in-edge pair of the block at bid (EPH-I1086): the
+/// sibling arm the construct header's branch_true edge enters, and the
+/// header block. Null when bid is not a branch_false arm target or the
+/// header wires no usable pair.
+fn elseArmSibling(cfg: *const ControlFlowGraph, bid: usize) ?SiblingArm {
+    for (cfg.edges.items) |edge| {
+        if (edge.to != bid or edge.kind != .branch_false) continue;
+        return reverseArmPair(cfg, edge.from);
+    }
+    return null;
+}
+
+/// The reverse pair of the construct header at `from`: its branch_true
+/// target as the sibling. Null when the header wires no branch_true or
+/// is a loop header (a break path skips the loop's else body, so the
+/// else-arm pair stays conditional).
+fn reverseArmPair(cfg: *const ControlFlowGraph, from: usize) ?SiblingArm {
+    for (cfg.edges.items) |edge| {
+        if (edge.to == from and edge.kind == .loop_back) return null;
+    }
+    for (cfg.edges.items) |edge| {
+        if (edge.from == from and edge.kind == .branch_true)
+            return .{ .sibling = edge.to, .header = from };
+    }
+    return null;
+}
+
+/// The forward-direction sibling test: the then-arm free pairs with a
+/// genuine else body that also frees.
+fn elseBodyArmFrees(ctx: *const FreeScanCtx, arm: SiblingArm) bool {
     const block = ctx.cfg.blocks.items[arm.sibling];
     if (block.start_line == 0 or block.end_line < block.start_line or
         block.start_line < ctx.scan.func_line) return false;
@@ -10130,6 +10183,46 @@ fn siblingArmAlsoFrees(ctx: *const FreeScanCtx, bid: usize) bool {
     var idx = first_idx;
     while (idx <= last_idx) : (idx += 1) {
         if (freePatternAfter(lines[idx], 0)) return true;
+    }
+    return false;
+}
+
+/// The reverse-direction sibling test (EPH-I1086): the second free sits
+/// in the construct's else body, and the then body also frees the
+/// tracked var, so every path through the construct runs a second free.
+/// Only a genuine multi-line if/else qualifies: bid must carry the
+/// else-claim mark, both arms must extend past the header line, and the
+/// construct header must sit on every continuing path (a nested
+/// construct skips on the enclosing arm's other paths). Loops never
+/// reach this test (elseArmSibling rejects their headers).
+fn thenBodyArmAlsoFrees(ctx: *const FreeScanCtx, bid: usize, arm: SiblingArm) !bool {
+    if (!ctx.cfg.blocks.items[bid].is_else_body) return false;
+    const header_start = ctx.cfg.blocks.items[arm.header].start_line;
+    if (ctx.cfg.blocks.items[bid].start_line <= header_start) return false;
+    const sibling = ctx.cfg.blocks.items[arm.sibling];
+    if (sibling.end_line <= header_start) return false;
+    if (!try blockOnEveryContinuingPath(ctx.allocator, ctx.cfg, arm.header)) return false;
+    if (sibling.start_line < ctx.scan.func_line) return false;
+    const first_idx = sibling.start_line - ctx.scan.func_line;
+    if (first_idx >= ctx.scan.lines.len) return false;
+    const last_idx = @min(sibling.end_line - ctx.scan.func_line, ctx.scan.lines.len - 1);
+    return spanFreesTrackedVar(ctx, first_idx, last_idx);
+}
+
+/// True when the line span first_idx..last_idx holds a cleanup call
+/// targeting the tracked var or an alias at a code position (the
+/// var-aware span scan of the reverse sibling test, EPH-I1086).
+fn spanFreesTrackedVar(ctx: *const FreeScanCtx, first_idx: usize, last_idx: usize) bool {
+    var idx = first_idx;
+    while (idx <= last_idx) : (idx += 1) {
+        const t = ctx.scan.lines[idx];
+        var lit = types.LiteralState.forLine(t) orelse continue;
+        var i: usize = 0;
+        while (i < t.len) : (i += 1) {
+            const pos = lit.updateForChar(t, i) orelse continue;
+            if (!isFreePatternAt(t, pos)) continue;
+            if (freeTargetsTrackedVar(t, pos, ctx.scan.var_name, ctx.scan.aliases)) return true;
+        }
     }
     return false;
 }
@@ -10191,12 +10284,14 @@ fn detectCrossBlockDoubleFree(
     // the variable, the second free runs on every path through the
     // construct — definite even though the block itself is
     // conditionally reached (EPH-I1017 F1, the cross-block mirror of the
-    // same-line elsePrecedesSecondFree gate). The own-line escape
-    // (EPH-I1030) reads the both-arms shape directly off the second
-    // free's line; only the definite verdict upgrades (a conditional
-    // verdict falls through to the warning grade).
-    const both_arms = (pa.def_freed and !definite_reach and
-        siblingArmAlsoFrees(ctx, bid)) or own_line_arms == .definite;
+    // same-line elsePrecedesSecondFree gate; EPH-I1086 extends it to the
+    // branch_false direction). The own-line escape (EPH-I1030) reads the
+    // both-arms shape directly off the second free's line; only the
+    // definite verdict upgrades (a conditional verdict falls through to
+    // the warning grade).
+    const sibling_both = pa.def_freed and try siblingArmAlsoFrees(ctx, bid);
+    const both_arms = (sibling_both and !definite_reach) or
+        own_line_arms == .definite;
 
     try emitCrossBlockDoubleFree(ctx, .{
         .t = t,
@@ -16229,14 +16324,17 @@ fn isNonAllocFnCallAt(t: []const u8, paren_pos: usize) bool {
     return true;
 }
 
-/// Control-flow keywords can precede '(' without naming a call
-/// (EPH-I0402). `if (name == x)`, `while (name)`, `switch (name)`,
-/// `return (name)`, `catch (name)`, and `orelse (name)` leave ownership
-/// with the current function. The ident walk in isNonAllocFnCallAt
-/// cannot tell these keywords from call names.
+/// Control-flow and expression keywords can precede '(' without naming a
+/// call (EPH-I0402, EPH-I1100). `if (name == x)`, `while (name)`,
+/// `switch (name)`, `return (name)`, `catch (name)`, and `orelse (name)`
+/// leave ownership with the current function. The expression keywords
+/// `and`, `or`, `fn` (fn-pointer types), `comptime`, and `nosuspend`
+/// accept a parenthesized expression operand. The ident walk in
+/// isNonAllocFnCallAt cannot tell these keywords from call names.
 fn isControlFlowKeyword(fname: []const u8) bool {
     const keywords = [_][]const u8{
-        "if", "while", "for", "switch", "return", "catch", "orelse",
+        "if",  "while", "for", "switch",   "return",    "catch", "orelse",
+        "and", "or",    "fn",  "comptime", "nosuspend",
     };
     for (keywords) |kw| {
         if (mem.eql(u8, fname, kw)) return true;
@@ -27103,12 +27201,13 @@ fn intersectPredChecks(ctx: NullMeetCtx, bid: usize) !bool {
     return any_changed;
 }
 
-/// True when the `.?` trigger at `col` sits in prose, not code: inside a
-/// string/char literal, or at or after the comment start (EPH-I0672).
-/// One classifier walk plus one comment-start walk per call (EPH-I0153);
-/// the comment start is string-aware, so a `//` inside a string never
-/// fakes a comment (EPH-I0412). A missing comment start clamps to the
-/// line length: no column reaches it.
+/// True when an optional-suffix trigger (`.?` or `.*`) at `col` sits in
+/// prose, not code: inside a string/char literal, or at or after the
+/// comment start (EPH-I0672, EPH-I1131). One classifier walk plus one
+/// comment-start walk per call (EPH-I0153); the comment start is
+/// string-aware, so a `//` inside a string never fakes a comment
+/// (EPH-I0412). A missing comment start clamps to the line length: no
+/// column reaches it.
 fn isProseDotQTrigger(t: []const u8, col: usize) bool {
     var cls = LineClassifier.init(t);
     const comment_pos = findCommentStart(t) orelse t.len;
@@ -27155,6 +27254,10 @@ fn checkOptionalDeref(ctx: NullSafetyCtx, line: NullLineCtx) !void {
     var pos: usize = 0;
     while (mem.indexOfPos(u8, line.t, pos, ".*")) |col| {
         pos = col + 2;
+        // Trigger masking (EPH-I1131): a .* inside a string literal or a
+        // trailing comment is prose, never a deref (the I0672 sibling
+        // class, masked for .? through the same gate in B82).
+        if (isProseDotQTrigger(line.t, col)) continue;
         const var_name = extractDerefVar(line.t, col) orelse continue;
         if (!ctx.nullable_ptrs.contains(var_name)) continue;
         if (line.checked_set.contains(var_name)) continue;
@@ -49803,11 +49906,11 @@ test "ZA106: line-start else claims the deferred entry — both-arms err, same-l
     // inline-arm pair graded a false err, and the post-chain use
     // mis-attributed its first free. Post-fix the chain splits and
     // the grades match the mid-line twin: the inline-arm pair is
-    // conditional, the else-line pair grades conditional (the
-    // own-line separator residual — the arms are exclusive and the
-    // mid-line twin goes silent), and the use keeps its err. The
-    // else-arm pair of own_else stays conditional: it double-frees
-    // only on the else path.
+    // conditional and the use keeps its err. The else-arm pairs of
+    // own_else and same_line_else grade err (EPH-I1086): the
+    // branch_false sibling gate reads the then-arm free, and every
+    // path through the construct runs a second free — pre-fix both
+    // pairs stayed warning.
     const content =
         \\fn use(d: []u8) void {
         \\    _ = d;
@@ -49846,30 +49949,70 @@ test "ZA106: line-start else claims the deferred entry — both-arms err, same-l
     const file = "test_line_start_else.zig";
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 6);
     var own_err = false;
-    var own_warning = false;
+    var own_else_err = false;
     var chain_if_warning = false;
     var chain_inline_warning = false;
     var else_err = false;
-    var else_warning = false;
+    var else_line_err = false;
     var use_err = false;
     for (run.issues.items) |issue| {
         if (issue.line == 21 and mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
             use_err = issue.severity == .err;
         if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
         if (issue.line == 8) own_err = issue.severity == .err;
-        if (issue.line == 11) own_warning = issue.severity == .warning;
+        if (issue.line == 11) own_else_err = issue.severity == .err;
         if (issue.line == 18) chain_if_warning = issue.severity == .warning;
         if (issue.line == 20) chain_inline_warning = issue.severity == .warning;
         if (issue.line == 27) else_err = issue.severity == .err;
-        if (issue.line == 29) else_warning = issue.severity == .warning;
+        if (issue.line == 29) else_line_err = issue.severity == .err;
     }
     try std.testing.expect(own_err);
-    try std.testing.expect(own_warning);
+    try std.testing.expect(own_else_err);
     try std.testing.expect(chain_if_warning);
     try std.testing.expect(chain_inline_warning);
     try std.testing.expect(else_err);
-    try std.testing.expect(else_warning);
+    try std.testing.expect(else_line_err);
     try std.testing.expect(use_err);
+}
+
+test "ZA106: mid-line marker suppression keeps the else-arm pair silent (EPH-I1087)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The I1087 accepted-residual pin: the mid-line `} else {` marker
+    // reads as a path separator between the dominating first free and
+    // the else-arm free, so the else-arm pair stays silent (the
+    // EPH-I0806 marker-suppression class) while the own-line twin
+    // grades err through the branch_false sibling gate (EPH-I1086).
+    // The then-arm pair keeps its err grade. Count: one ZA106 err
+    // (the then-arm free); no issue fires on the else-arm line.
+    const content =
+        \\fn mid_line(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_i1087_mid_line.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_i1087_mid_line.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    var then_err = false;
+    var else_silent = true;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 5) then_err = issue.severity == .err;
+        if (issue.line == 7) else_silent = false;
+    }
+    try std.testing.expect(then_err);
+    try std.testing.expect(else_silent);
 }
 
 test "ZA106: same-line both-arms escape matches the tracked var — other-var and nested arm frees cap at warning (EPH-I1064)" {
@@ -57079,6 +57222,33 @@ test "analyzeCFGMemory ZA802 silent on plain pointer with maybe_ name (EPH-I0219
     try std.testing.expect(countRuleIssues(
         run.issues.items,
         "test_za802_plain.zig",
+        RULE_ORELSE_QUESTION_UNSAFE,
+    ) == 0);
+}
+
+test "analyzeCFGMemory ZA802 masks .* inside string and comment prose (EPH-I1131)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The .* trigger scanned raw bytes with no prose gate (the I0672
+    // sibling class, fixed for .? in B82): a .* whose preceding ident
+    // names a declared nullable pointer fired a phantom ZA802 from a
+    // string literal or a trailing comment. Pre-fix both lines fire.
+    const content =
+        \\fn prose_deref(p: ?*u32) void {
+        \\    const s = "p.*";
+        \\    _ = s;
+        \\    _ = p; // p.*
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za802_prose.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za802_prose.zig",
         RULE_ORELSE_QUESTION_UNSAFE,
     ) == 0);
 }
@@ -99043,6 +99213,23 @@ test "transfer predicate: control-flow keywords are not call evidence (EPH-I0402
     try std.testing.expect(isFunctionArgTransfer("pool.put\t(name);", "name"));
     // Positive control: a real call argument still transfers.
     try std.testing.expect(isFunctionArgTransfer("pool.put(name);", "name"));
+}
+
+test "transfer predicate: expression keywords are not call evidence (EPH-I1100)" {
+    // Regression pins on the live helper chain. Pre-fix the and/or/fn/
+    // comptime/nosuspend arms returned true: the ident walk read the
+    // keyword before the '(' as a call name and the parenthesized
+    // expression counted as ownership-transfer evidence (the I0402
+    // residual). A keyword-guarded operand keeps ownership with the
+    // current function; a fn-pointer parameter list never names a call.
+    try std.testing.expect(!isFunctionArgTransfer("if (a and (name)) return;", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("if (a or (name)) return;", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("var cb: *const fn (name) void = undefined;", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("const x = comptime (name);", "name"));
+    try std.testing.expect(!isFunctionArgTransfer("const x = nosuspend (name);", "name"));
+    // Positive controls: a real call argument still transfers.
+    try std.testing.expect(isFunctionArgTransfer("pool.put(name);", "name"));
+    try std.testing.expect(isFunctionArgTransfer("return take(name);", "name"));
 }
 
 test "ZC101: wrapped signature with .{} default opens the record at the real body (EPH-I0447)" {

@@ -473,6 +473,8 @@ pub const keywords = [_][]const u8{
 
 pub const breaking_changes = [_][]const u8{
     "raw_c_allocator removed (c_allocator handles alignment directly)",
+    "GeneralPurposeAllocator removed -> DebugAllocator",
+    "ThreadSafeAllocator removed -> SmpAllocator",
     "MemoryPool API rewrite: .init(alloc) -> .empty, .deinit() -> .deinit(alloc)",
     "MemoryPool.create() -> .create(alloc), .preheat() -> .addCapacity(alloc)",
     "MemoryPool.initPreheated() -> .initCapacity()",
@@ -480,7 +482,6 @@ pub const breaking_changes = [_][]const u8{
     "MemoryPoolExtra deprecated -> memory_pool.Extra",
     "DebugAllocator.detectLeaks() returns usize (was bool)",
     "DebugAllocator.Config.MutexType field removed",
-    "SinglyLinkedList de-genericified (no type parameter)",
     "std.Io.Mutex replaces std.Thread.Mutex in stdlib",
 };
 
@@ -696,40 +697,6 @@ pub const container_methods = [_]vocab.ContainerMethod{
     .{ .pattern = ".clone(", .takes_ownership = true, .is_void = false },
 };
 
-/// Stdlib methods safe to discard (void or value-returning, not error-returning).
-/// Used by isSafeToDiscard and isSafeBuiltin in main.zig. The .write(, .print(,
-/// and expect( forms are NOT here: all three return error unions (!usize,
-/// !void, !void) and discarding them is exactly what ZA205 exists to catch
-/// (B71 F7, r2 F2 — testing.zig:614).
-pub const safe_methods = [_]vocab.SafeMethod{
-    // Void methods (container lifecycle)
-    .{ .pattern = ".clear(", .is_void = true },
-    .{ .pattern = ".clearAndFree(", .is_void = true },
-    .{ .pattern = ".clearRetainingCapacity(", .is_void = true },
-    .{ .pattern = ".reset(", .is_void = true },
-    .{ .pattern = ".close(", .is_void = true },
-    // process.Args.Iterator.skip returns bool (Args.zig:68)
-    .{ .pattern = ".skip(", .is_void = false },
-    // Value-returning methods (T or ?T, not !T)
-    .{ .pattern = ".pop(", .is_void = false },
-    .{ .pattern = ".remove(", .is_void = false },
-    .{ .pattern = ".swapRemove(", .is_void = false },
-    .{ .pattern = ".orderedRemove(", .is_void = false },
-    .{ .pattern = ".get(", .is_void = false },
-    .{ .pattern = ".getLastOrNull()", .is_void = false },
-    .{ .pattern = ".count()", .is_void = false },
-    .{ .pattern = ".next()", .is_void = false },
-    .{ .pattern = ".peek()", .is_void = false },
-    // Validation/check (returns diagnostic info)
-    .{ .pattern = ".check(", .is_void = false },
-    // std.debug and std.testing void calls. "expect(" is NOT safe:
-    // std.testing.expect returns !void (testing.zig:614) — an error union,
-    // so discarding it is the ZA205 class, same as .write( and .print(
-    // (B71 r2 F2).
-    .{ .pattern = "debug.print", .is_void = true },
-    .{ .pattern = "assert(", .is_void = true },
-};
-
 // ============================================================================
 // Comptime Flat Arrays - for fast substring matching in main.zig
 // Hand-maintained; keep in sync with the structured tables above (F14)
@@ -799,6 +766,7 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".allocWithOptions(",
     // std.fmt (allocator as first arg)
     ".allocPrint(",
+    ".allocPrintSentinel(",
     // Container methods that produce owned memory
     ".toOwnedSlice(",
     ".toOwnedSliceSentinel(",
@@ -808,6 +776,10 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".readFileAllocOptions(",
     ".readAlloc(",
     ".allocRemaining(",
+    // Sentinel-terminated read of the rest of the stream
+    // (Io/Reader.zig:299 — allocator is the first arg after the receiver,
+    // the same shape as .readAlloc/.allocRemaining)
+    ".allocRemainingAlignedSentinel(",
     // Path operations (0.15's realpathAlloc moved and renamed to
     // Io.Dir.realPathFileAlloc, where the allocator is the third argument —
     // the first-arg extractor cannot model it, so it is deliberately absent)
@@ -827,6 +799,7 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "dupeZ",
     "allocWithOptions",
     "allocPrint",
+    "allocPrintSentinel",
     "toOwnedSlice",
     "toOwnedSliceSentinel",
     "cloneWithAllocator",
@@ -834,6 +807,7 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "readFileAllocOptions",
     "readAlloc",
     "allocRemaining",
+    "allocRemainingAlignedSentinel",
     "replaceOwned",
     "concatWithSentinel",
 };
@@ -872,7 +846,12 @@ pub const container_ownership_methods: []const []const u8 = &.{
     ".clone(",
 };
 
-/// Stdlib methods safe to discard (all patterns from safe_methods)
+/// Stdlib methods safe to discard (void or value-returning, not error-returning).
+/// This flat array is the consumed surface: isSafeToDiscard and isSafeBuiltin
+/// in main.zig read it through compat.getSafeMethodPatterns(). The .write(,
+/// .print(, and expect( forms are NOT here: all three return error unions
+/// (!usize, !void, !void) and discarding them is exactly what ZA205 exists
+/// to catch (B71 F7, r2 F2 — testing.zig:614).
 pub const safe_method_patterns: []const []const u8 = &.{
     ".clear(",
     ".clearAndFree(",
@@ -894,7 +873,7 @@ pub const safe_method_patterns: []const []const u8 = &.{
     "assert(",
 };
 
-/// Stdlib void methods (subset of safe_methods where is_void == true)
+/// Stdlib void methods (the void-returning subset of safe_method_patterns)
 pub const void_method_patterns: []const []const u8 = &.{
     ".clear(",
     ".clearAndFree(",
@@ -1188,6 +1167,28 @@ test "vocabulary alloc_methods includes dupe and dupeZ" {
     }
     try std.testing.expect(found_dupe);
     try std.testing.expect(found_dupez);
+}
+
+test "alloc tables include allocPrintSentinel and allocRemainingAlignedSentinel (EPH-I1114)" {
+    // findAllocCall/hasAllocCallPattern read the flat pattern table and
+    // isNonAllocFnCallAt reads the short-name table; both names must land
+    // in both (pinned 0.16 std: fmt.zig:639, Io/Reader.zig:299).
+    var found_pattern_print = false;
+    var found_pattern_remaining = false;
+    for (alloc_method_patterns) |p| {
+        if (std.mem.eql(u8, p, ".allocPrintSentinel(")) found_pattern_print = true;
+        if (std.mem.eql(u8, p, ".allocRemainingAlignedSentinel(")) found_pattern_remaining = true;
+    }
+    try std.testing.expect(found_pattern_print);
+    try std.testing.expect(found_pattern_remaining);
+    var found_name_print = false;
+    var found_name_remaining = false;
+    for (alloc_method_short_names) |n| {
+        if (std.mem.eql(u8, n, "allocPrintSentinel")) found_name_print = true;
+        if (std.mem.eql(u8, n, "allocRemainingAlignedSentinel")) found_name_remaining = true;
+    }
+    try std.testing.expect(found_name_print);
+    try std.testing.expect(found_name_remaining);
 }
 
 // The deprecated-pattern predicates are pinned here per version. The

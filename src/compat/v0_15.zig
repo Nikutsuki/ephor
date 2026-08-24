@@ -6,7 +6,8 @@
 // API Characteristics (0.15.x):
 //   - HashMap.put(key, value) - no allocator argument
 //   - ArrayList.append(allocator, item) - allocator required
-//   - ArrayListUnmanaged - preferred for embedded use
+//   - ArrayList - unmanaged by default (0.15.1 "ArrayList: make unmanaged
+//     the default"); the ArrayListUnmanaged spelling is the deprecated alias
 //   - std.mem.Allocator passed to methods, not stored in containers
 //   - zig-cache renamed to .zig-cache
 
@@ -27,10 +28,10 @@ pub const max_version = "0.15.255";
 pub const notes =
     \\Zig 0.15.x API Notes:
     \\  - std.StringHashMap.put(key, value) - allocator stored in struct
-    \\  - std.ArrayListUnmanaged.append(allocator, item)
-    \\  - std.ArrayListUnmanaged.deinit(allocator)
-    \\  - std.ArrayListUnmanaged.toOwnedSlice(allocator)
-    \\  - Use GeneralPurposeAllocator for leak detection
+    \\  - std.ArrayList.append(allocator, item)
+    \\  - std.ArrayList.deinit(allocator)
+    \\  - std.ArrayList.toOwnedSlice(allocator)
+    \\  - Use DebugAllocator for leak detection
     \\  - StaticStringMap replaces ComptimeStringMap
     \\  - std.process.Child replaces std.ChildProcess
 ;
@@ -526,6 +527,19 @@ pub const deprecated_patterns = [_]DeprecatedPattern{
         .replacement = ".zig-cache/",
         .rule = "ZAV106",
     },
+    .{
+        // 0.15 de-genericified the linked lists (0.15.1 release notes,
+        // "De-Genericify Linked Lists"): the generic `SinglyLinkedList(T)`
+        // spelling is the deprecated form.
+        .pattern = "SinglyLinkedList(",
+        .replacement = "SinglyLinkedList (non-generic since 0.15)",
+        .rule = "ZAV107",
+    },
+    .{
+        .pattern = "DoublyLinkedList(",
+        .replacement = "DoublyLinkedList (non-generic since 0.15)",
+        .rule = "ZAV108",
+    },
 };
 
 // ============================================================================
@@ -706,37 +720,6 @@ pub const container_methods = [_]vocab.ContainerMethod{
     .{ .pattern = ".clone(", .takes_ownership = true, .is_void = false },
 };
 
-/// Stdlib methods safe to discard (void or value-returning, not error-returning).
-/// Used by isSafeToDiscard and isSafeBuiltin in main.zig. The .write(, .print(,
-/// and expect( forms are NOT here: all three return error unions (!usize,
-/// !void, !void) and discarding them is exactly what ZA205 exists to catch
-/// (B71 F7, r2 F2 — testing.zig:614).
-pub const safe_methods = [_]vocab.SafeMethod{
-    // Void methods (container lifecycle)
-    .{ .pattern = ".clear(", .is_void = true },
-    .{ .pattern = ".clearAndFree(", .is_void = true },
-    .{ .pattern = ".clearRetainingCapacity(", .is_void = true },
-    .{ .pattern = ".reset(", .is_void = true },
-    .{ .pattern = ".close(", .is_void = true },
-    // Value-returning methods (T or ?T, not !T)
-    .{ .pattern = ".pop(", .is_void = false },
-    .{ .pattern = ".remove(", .is_void = false },
-    .{ .pattern = ".swapRemove(", .is_void = false },
-    .{ .pattern = ".orderedRemove(", .is_void = false },
-    .{ .pattern = ".get(", .is_void = false },
-    .{ .pattern = ".getLastOrNull()", .is_void = false },
-    .{ .pattern = ".count()", .is_void = false },
-    .{ .pattern = ".next()", .is_void = false },
-    .{ .pattern = ".peek()", .is_void = false },
-    // Validation/check (returns diagnostic info)
-    .{ .pattern = ".check(", .is_void = false },
-    // std.debug and std.testing void calls. "expect(" is NOT safe:
-    // std.testing.expect returns !void (testing.zig:614) — an error union,
-    // so discarding it is the ZA205 class, same as .write( and .print(.
-    .{ .pattern = "debug.print", .is_void = true },
-    .{ .pattern = "assert(", .is_void = true },
-};
-
 // ============================================================================
 // Comptime Flat Arrays - for fast substring matching in main.zig
 // Hand-maintained; keep in sync with the structured tables above (F14)
@@ -811,6 +794,7 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".allocWithOptions(",
     // std.fmt (allocator as first arg)
     ".allocPrint(",
+    ".allocPrintSentinel(",
     // Container methods that produce owned memory
     ".toOwnedSlice(",
     ".toOwnedSliceSentinel(",
@@ -820,6 +804,10 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".readFileAllocOptions(",
     ".readAlloc(",
     ".allocRemaining(",
+    // Sentinel-terminated read of the rest of the stream
+    // (Io/Reader.zig:299 — allocator is the first arg after the receiver,
+    // the same shape as .readAlloc/.allocRemaining)
+    ".allocRemainingAlignedSentinel(",
     // Path operations (fs.zig:521/656/683)
     ".selfExePathAlloc(",
     ".selfExeDirPathAlloc(",
@@ -840,6 +828,7 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "dupeZ",
     "allocWithOptions",
     "allocPrint",
+    "allocPrintSentinel",
     "toOwnedSlice",
     "toOwnedSliceSentinel",
     "cloneWithAllocator",
@@ -847,6 +836,7 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "readFileAllocOptions",
     "readAlloc",
     "allocRemaining",
+    "allocRemainingAlignedSentinel",
     "selfExePathAlloc",
     "selfExeDirPathAlloc",
     "realpathAlloc",
@@ -887,7 +877,12 @@ pub const container_ownership_methods: []const []const u8 = &.{
     ".clone(",
 };
 
-/// Stdlib methods safe to discard (all patterns from safe_methods)
+/// Stdlib methods safe to discard (void or value-returning, not error-returning).
+/// This flat array is the consumed surface: isSafeToDiscard and isSafeBuiltin
+/// in main.zig read it through compat.getSafeMethodPatterns(). The .write(,
+/// .print(, and expect( forms are NOT here: all three return error unions
+/// (!usize, !void, !void) and discarding them is exactly what ZA205 exists
+/// to catch (B71 F7, r2 F2 — testing.zig:614).
 pub const safe_method_patterns: []const []const u8 = &.{
     ".clear(",
     ".clearAndFree(",
@@ -908,7 +903,7 @@ pub const safe_method_patterns: []const []const u8 = &.{
     "assert(",
 };
 
-/// Stdlib void methods (subset of safe_methods where is_void == true)
+/// Stdlib void methods (the void-returning subset of safe_method_patterns)
 pub const void_method_patterns: []const []const u8 = &.{
     ".clear(",
     ".clearAndFree(",
@@ -1186,6 +1181,22 @@ test "checkDeprecated flags the deprecated ArrayListUnmanaged alias (F5)" {
     try std.testing.expect(checkDeprecated(canonical) == null);
 }
 
+test "checkDeprecated flags the generic linked-list spellings (EPH-I1118)" {
+    // 0.15 de-genericified the linked lists, so the generic `(T)` spelling
+    // is the deprecated form (mirrors v0_16's ZAV205/ZAV206).
+    const singly = "const node = std.SinglyLinkedList(u32).Node{};";
+    const singly_result = checkDeprecated(singly);
+    try std.testing.expect(singly_result != null);
+    try std.testing.expectEqualStrings("ZAV107", singly_result.?.rule);
+    const doubly = "var list = std.DoublyLinkedList(u8){};";
+    const doubly_result = checkDeprecated(doubly);
+    try std.testing.expect(doubly_result != null);
+    try std.testing.expectEqualStrings("ZAV108", doubly_result.?.rule);
+    // The non-generic form must NOT be flagged.
+    const canonical = "var list = std.SinglyLinkedList{};";
+    try std.testing.expect(checkDeprecated(canonical) == null);
+}
+
 test "vocabulary allocator_types has expected count" {
     try std.testing.expectEqual(@as(usize, 8), allocator_types.len);
 }
@@ -1210,6 +1221,28 @@ test "vocabulary alloc_methods includes dupe and dupeZ" {
     }
     try std.testing.expect(found_dupe);
     try std.testing.expect(found_dupez);
+}
+
+test "alloc tables include allocPrintSentinel and allocRemainingAlignedSentinel (EPH-I1114)" {
+    // findAllocCall/hasAllocCallPattern read the flat pattern table and
+    // isNonAllocFnCallAt reads the short-name table; both names must land
+    // in both (pinned 0.16 std: fmt.zig:639, Io/Reader.zig:299).
+    var found_pattern_print = false;
+    var found_pattern_remaining = false;
+    for (alloc_method_patterns) |p| {
+        if (std.mem.eql(u8, p, ".allocPrintSentinel(")) found_pattern_print = true;
+        if (std.mem.eql(u8, p, ".allocRemainingAlignedSentinel(")) found_pattern_remaining = true;
+    }
+    try std.testing.expect(found_pattern_print);
+    try std.testing.expect(found_pattern_remaining);
+    var found_name_print = false;
+    var found_name_remaining = false;
+    for (alloc_method_short_names) |n| {
+        if (std.mem.eql(u8, n, "allocPrintSentinel")) found_name_print = true;
+        if (std.mem.eql(u8, n, "allocRemainingAlignedSentinel")) found_name_remaining = true;
+    }
+    try std.testing.expect(found_name_print);
+    try std.testing.expect(found_name_remaining);
 }
 
 test "vocabulary no_free_init_patterns is non-empty" {

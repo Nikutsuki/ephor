@@ -547,6 +547,10 @@ const RULE_TEST_NO_ASSERTIONS = types.RULE_TEST_NO_ASSERTIONS;
 const RULE_TEST_TRIVIAL_ASSERT = types.RULE_TEST_TRIVIAL_ASSERT;
 const RULE_TEST_SWALLOWED_ERROR = types.RULE_TEST_SWALLOWED_ERROR;
 const RULE_TEST_UNTESTED_PUBLIC_FN = types.RULE_TEST_UNTESTED_PUBLIC_FN;
+// ZT106 is main.zig-local: the batch's file set excludes types.zig, where
+// the sibling ZT constants live. Move it into types.zig when a batch owns
+// that file (the tracker note on EPH-I1089 carries the follow-up).
+const RULE_TEST_NO_CALLS = "ZT106";
 const RULE_LOCK_NO_DEFER_UNLOCK = types.RULE_LOCK_NO_DEFER_UNLOCK;
 const RULE_DOUBLE_LOCK = types.RULE_DOUBLE_LOCK;
 const RULE_UNLOCK_WITHOUT_LOCK = types.RULE_UNLOCK_WITHOUT_LOCK;
@@ -9875,6 +9879,23 @@ fn braceGroupEndLine(
 /// Inclusive actual-line span of a loop body's text.
 const BodyExtent = struct { first: usize, last: usize };
 
+/// The resume position past a while/for continue expression's paren group
+/// (EPH-I0749): `rest` is the comment-stripped text after the `:`, `base`
+/// its offset on line `idx`. Null when the group cannot be bounded — the
+/// extent stays silent rather than guessing. Position semantics mirror
+/// parenGroupEnd (just past the close paren).
+fn continueTailEnd(
+    lines: []const []const u8,
+    idx: usize,
+    base: usize,
+    rest: []const u8,
+) ?AssignEffect {
+    const after_colon = mem.trimStart(u8, rest[1..], " \t");
+    if (after_colon.len == 0 or after_colon[0] != '(') return null;
+    const open_rel = rest.len - after_colon.len;
+    return parenGroupEnd(lines, idx, base + open_rel);
+}
+
 /// The extent of a braced loop body whose `{` sits at (idx, base): the
 /// lines strictly between the braces. Null when the braces never balance or
 /// the body shares one line (`{ ... }` fused: no inner lines).
@@ -9895,7 +9916,14 @@ fn bracedBodyExtent(
 /// its brace lines; a brace-less body spans only its statement's line, so a
 /// statement after the loop never reads as loop-carried (EPH-I0676
 /// reviewer F1: the CFG merges that statement into the back-edge block).
-/// A while-continue tail (`: (expr)`) is unhandled by design: null.
+/// A while/for continue tail (`: (expr)`) is skipped and the scan resumes
+/// past its paren group, so the idiomatic while-continue loop keeps its
+/// body extent (EPH-I0749). A multi-line continue expression is handled
+/// by the same paren-group walk. Accepted bound (EPH-I0749): a fused
+/// single-line braced body (`while (c) { f(); }`) still yields null —
+/// the column-aware arm proved disproportionate (the CFG leaves same-line
+/// body blocks without a line span, and the free's block includes the
+/// declaration line), so the vote stays silent on the fused shape.
 fn loopBodyLineExtent(
     lines: []const []const u8,
     func_line: usize,
@@ -9926,7 +9954,16 @@ fn loopBodyLineExtent(
             idx -|= 1;
             continue;
         }
-        if (rest[0] == ':') return null; // while/for continue expression
+        if (rest[0] == ':') {
+            // While/for continue expression: skip its paren group and keep
+            // scanning for the body (EPH-I0749). The group can span lines;
+            // a missing paren yields no extent (fail open toward silence).
+            const g = continueTailEnd(lines, idx, base, rest) orelse return null;
+            pos.line = g.line;
+            pos.col = g.col;
+            idx -|= 1;
+            continue;
+        }
         if (rest[0] == '{') return bracedBodyExtent(lines, func_line, idx, base);
         // Brace-less body: its statement shares this line (fused) or is this
         // next-line statement; either way the body spans this line only.
@@ -9952,7 +9989,11 @@ fn loopBodyLineExtent(
 /// grounds the MUST meet and the MAY reach — and is pinned by "ZA105: use
 /// before free in a loop body stays silent (EPH-I0676)". The double-free
 /// direction stays loud through this vote (pinned by "ZA106: loop-body
-/// free double-frees on the next iteration (EPH-I0676)").
+/// free double-frees on the next iteration (EPH-I0676)"). Since EPH-I0749
+/// the vote covers the while/for continue tail (`: (expr)`); the fused
+/// single-line body stays silent — the documented bound of
+/// loopBodyLineExtent (EPH-I0749), pinned by "ZA106: fused single-line
+/// loop body stays silent (EPH-I0749)".
 fn loopCarriedFreeVote(ctx: *const FreeScanCtx, bid: usize, actual_line: usize) !bool {
     for (ctx.cfg.edges.items) |edge| {
         if (edge.kind != .loop_back) continue;
@@ -21133,6 +21174,131 @@ fn reportUntestedPubFns(
     return unreached;
 }
 
+// --- ZT106: test blocks that invoke nothing (EPH-I1089) ---
+// The listing stage (collectTestBlocks) enumerates the test blocks the
+// runner executes — the static half of the reconciliation. The dynamic
+// half: what one run of a block can exercise. A block whose body carries
+// no call site invokes no function, so executing it covers no function
+// body: the runner counts it as a passing test while it verifies nothing
+// dynamic. ZT105 names the pub fns no test reaches; ZT106 names the tests
+// that reach nothing — the two directions of the golden rule's mechanical
+// floor. Note severity and FN-tolerant by design (EPH-I1089): anything
+// that could hide an invocation counts as one — `if (`/`while (`/`switch (`
+// condition parens read as call sites, and any @builtin like @compileError
+// does too — so a block fires only when its body provably calls nothing.
+// Accepted FN bounds: the two unhandled Allman shapes and same-line double
+// test decls the listing skips stay silent; a body that only declares
+// items (nested consts, comptime blocks without calls) fires — the block
+// executes no call either way; a body whose brace group never balances
+// stays silent (fail open).
+
+/// The first code-position `{` of a test block's body, starting at the
+/// opener line `start` (0-based): literal contents blank so a brace inside
+/// the test's name string is data, not the body open (EPH-I1089). The
+/// scan is bounded — an opener whose body brace never appears yields null
+/// and the block stays silent.
+fn testBodyOpenPos(
+    lines: []const []const u8,
+    start: usize,
+    blank_buf: []u8,
+) ?struct { idx: usize, col: usize } {
+    const cap = @min(start + test_body_open_scan, lines.len);
+    var idx = start;
+    while (idx < cap) : (idx += 1) {
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(lines[idx]) orelse lines[idx].len;
+        const code = lines[idx][0..code_end];
+        // The trimmed blanked line keeps braceGroupEndLine's column frame
+        // (trimmed, literal-blanked); blanking preserves length.
+        const neutral = mem.trim(u8, blankLiteralContents(code, blank_buf), " \t\r");
+        const col = mem.indexOfScalar(u8, neutral, '{') orelse continue;
+        return .{ .idx = idx, .col = col };
+    }
+    return null;
+}
+
+/// The body-open scan bound (EPH-I1089): the Allman opener's brace sits on
+/// the next line at most; the bound also caps a hostile broken file.
+const test_body_open_scan = 8;
+
+/// ZT106: report each discovered test block whose body carries no call
+/// site (EPH-I1089). The body span runs from the block's opener through
+/// its brace group's close line; an unbounded body stays silent. Blocks
+/// arrive sorted by file, so the per-file line split runs once per file.
+fn reportInvocationlessTestBlocks(
+    allocator: Allocator,
+    graph: *ImportGraph,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var blocks = try collectTestBlocks(allocator, graph);
+    defer blocks.deinit(allocator);
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var current_file: []const u8 = "";
+    const sink: NoCallSink = .{ .allocator = allocator, .issues = issues };
+    for (blocks.items) |block| {
+        if (!mem.eql(u8, block.file, current_file)) {
+            current_file = block.file;
+            lines.clearRetainingCapacity();
+            const content = graph.files.get(block.file).?.content;
+            var split = mem.splitScalar(u8, content, '\n');
+            while (split.next()) |l| try lines.append(allocator, l);
+        }
+        try reportBlockIfCallless(sink, block, lines.items, &blank_buf);
+    }
+}
+
+/// Emission context for one ZT106 block (bundled for param counts).
+const NoCallSink = struct {
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+};
+
+/// Judge one discovered test block for ZT106 and emit its note when the
+/// body carries no call site (EPH-I1089). An unbounded body stays silent.
+fn reportBlockIfCallless(
+    sink: NoCallSink,
+    block: TestBlockInfo,
+    lines: []const []const u8,
+    blank_buf: []u8,
+) !void {
+    const start = block.line - 1;
+    if (start >= lines.len) return;
+    const open = testBodyOpenPos(lines, start, blank_buf) orelse return;
+    const close_idx = braceGroupEndLine(lines, open.idx, open.col) orelse return;
+    if (spanHasCallSite(lines, open.idx, close_idx)) return;
+    const name = if (block.name.len > 0) block.name else "(unnamed)";
+    const msg = try std.fmt.allocPrint(
+        sink.allocator,
+        "test block '{s}' invokes no function: its body carries no call site",
+        .{name},
+    );
+    errdefer sink.allocator.free(msg);
+    try sink.issues.append(sink.allocator, .{
+        .file = block.file,
+        .line = block.line,
+        .col = 1,
+        .severity = .note,
+        .rule = RULE_TEST_NO_CALLS,
+        .message = msg,
+        .message_owned = true,
+        .help = "call a real function so the test exercises behavior; " ++
+            "a call-less block passes while it verifies nothing dynamic",
+    });
+}
+
+/// True when any line in the body span carries a call site (comment text
+/// stripped first — nextCallSite skips string literals itself).
+fn spanHasCallSite(lines: []const []const u8, from: usize, to: usize) bool {
+    for (lines[from..@min(to + 1, lines.len)]) |raw| {
+        const code_end = findCommentStart(raw) orelse raw.len;
+        if (nextCallSite(raw[0..code_end], 0) != null) return true;
+    }
+    return false;
+}
+
 /// Project-level ZT105 pass: gather test-corpus and alias evidence across
 /// every analyzed file, fold the project-wide call-graph reachability
 /// (EPH-I0429) into the tested set, then judge each pub fn declaration
@@ -21221,6 +21387,9 @@ fn analyzeTests(
     // runs as a second, project-level pass after the per-file scans.
     const coverage = try analyzeUntestedPubFns(allocator, graph, &project.cache, &issues);
     if (out_coverage) |out| out.* = coverage;
+    // ZT106 reconciles the listing stage against invocation: every
+    // discovered test block whose body calls nothing (EPH-I1089).
+    try reportInvocationlessTestBlocks(allocator, graph, &issues);
     return issues;
 }
 
@@ -21496,7 +21665,19 @@ fn trackConcurrencyDefer(
     // leading `}` closes the block and in_defer cannot leak to the next
     // line (EPH-I0926).
     const walk_start = if (armed) keyword_code_pos.? else 0;
-    var walk_depth = if (armed) 0 else state.defer_depth;
+    // The walk carries the open defer depth for armed lines too
+    // (EPH-I0928): a nested `defer { ... }` inside an open defer block
+    // counts its braces on TOP of the outer depth, so the inner close
+    // returns the walk to the carried depth and in_defer stays true —
+    // the outer block is still open. Pre-fix the armed walk restarted at
+    // zero, the inner close hit 0, and the outer block disarmed one line
+    // early: an acquire after the inner close recorded plain and could
+    // draw a ZC101 warning the defer block should cover. Residual: the
+    // statement depth attributed to lines after the inner close is the
+    // inner keyword's (the closer of two stacked depths) — a ZC102
+    // depth-attribution residual on this pathological shape, disclosed
+    // here.
+    var walk_depth = state.defer_depth;
     for (blanked[walk_start..]) |c| {
         if (c == '{') walk_depth += 1;
         if (c == '}') {
@@ -28363,22 +28544,6 @@ fn extractOrelseVar(t: []const u8, orelse_col: usize) ?[]const u8 {
     return stripTransparentParens(name);
 }
 
-/// Check if a variable has a null guard earlier in the function
-/// Patterns: "if (name == null) return/continue/break"
-///           "if (name == null) { return/continue/break"
-/// Check if a line or its successor has an early exit after a null check.
-/// The same-line exit is judged at the guard's own depth (EPH-I0859): a
-/// nested same-line conditional exit (`{ if (q) return; }`) does not
-/// qualify. The successor check keeps the pre-walk depth-blind
-/// approximation: a `return`/`continue`/`break` opener on the next line
-/// counts whether or not the guard block closed on the guard line
-/// (accepted, EPH-I0861).
-///
-/// Tier split (EPH-I0861 closure, EPH-I0864): this guard query feeds the
-/// CFG-tier ZA203 emitter (checkOrelseUnreachable). The line-based ZA203
-/// emitter (checkLineOrelseUnreachable, the errors subcommand) routes
-/// through the same guard verdict since EPH-I0864; its lookback is
-/// fn-bounded through the error scan's function-start tracking.
 /// Lookback context for hasNullCheckExit: the full line array, the
 /// candidate guard line's index, and the exclusive scan limit (the orelse
 /// site's index, from hasNullGuard).
@@ -28465,6 +28630,22 @@ fn parenCloseAt(t: []const u8, open: usize) ?usize {
     return null;
 }
 
+/// Check if a variable has a null guard earlier in the function
+/// Patterns: "if (name == null) return/continue/break"
+///           "if (name == null) { return/continue/break"
+/// Check if a line or its successor has an early exit after a null check.
+/// The same-line exit is judged at the guard's own depth (EPH-I0859): a
+/// nested same-line conditional exit (`{ if (q) return; }`) does not
+/// qualify. The successor check keeps the pre-walk depth-blind
+/// approximation: a `return`/`continue`/`break` opener on the next line
+/// counts whether or not the guard block closed on the guard line
+/// (accepted, EPH-I0861).
+///
+/// Tier split (EPH-I0861 closure, EPH-I0864): this guard query feeds the
+/// CFG-tier ZA203 emitter (checkOrelseUnreachable). The line-based ZA203
+/// emitter (checkLineOrelseUnreachable, the errors subcommand) routes
+/// through the same guard verdict since EPH-I0864; its lookback is
+/// fn-bounded through the error scan's function-start tracking.
 fn hasNullGuard(
     lines: []const []const u8,
     current_idx: usize,
@@ -41016,7 +41197,8 @@ fn printHelp() void {
         \\                     ZR105: panic, ZR106: signal-death)
         \\  ZT1xx  Tests      (ZT101: lie-test, ZT102: no-assertions (note for
         \\                     try-only smoke tests), ZT103: trivially-true-assert,
-        \\                     ZT104: swallowed-error, ZT105: untested-pub-fn (note))
+        \\                     ZT104: swallowed-error, ZT105: untested-pub-fn (note),
+        \\                     ZT106: no-call-test-block (note))
         \\  ZC1xx  Concurrency (ZC101: lock-no-defer-unlock, ZC102: double-lock,
         \\                     ZC103: unlock-without-lock, ZC104: thread-no-join)
         \\
@@ -48295,6 +48477,42 @@ test "ZA105: runCFGMemoryAnalyses frees r1 payloads when appendSlice OOMs (EPH-I
     }
 }
 
+test "scanBlocksForPatterns frees a partial alloc set on alloc failure (EPH-I0241)" {
+    // The four array allocs were one struct literal pre-fix: a failure at
+    // alloc N leaked allocs 1..N-1 (no errdefer could run before the
+    // state bound). The sequential form with the errdefer deinit frees
+    // the slices bound so far — the errdefer reads the CURRENT state at
+    // scope exit (verified live on zig 0.16.0), and the still-empty
+    // slices free as no-ops. SingleFailureAllocator fails exactly ONE
+    // allocation and passes the rest through to the leak-checking
+    // parent, so a single induced failure inside the alloc sequence is
+    // the discriminating shape (std.testing.FailingAllocator latches and
+    // would fail every later alloc too).
+    const parent = std.testing.allocator;
+    var cfg = ControlFlowGraph.init(parent, "probe", 0);
+    defer cfg.deinit();
+    _ = try cfg.addBlock();
+    cfg.blocks.items[0].start_line = 1;
+    cfg.blocks.items[0].end_line = 1;
+    const lines = [_][]const u8{"allocator.free(buf);"};
+
+    // fail_at is 0-indexed: 0..3 fails each of the four allocs in turn.
+    var fail_at: usize = 0;
+    while (fail_at < 4) : (fail_at += 1) {
+        var single = SingleFailureAllocator{ .parent = parent, .fail_at = fail_at };
+        const state = scanBlocksForPatterns(single.allocator(), &cfg, .{
+            .lines = &lines,
+            .func_line = 1,
+            .alloc_name = "buf",
+            .owner_vars = &.{},
+            .managed_ptr = false,
+        }, 1);
+        try std.testing.expectError(error.OutOfMemory, state);
+        // The leak detector on the parent fires the test when an earlier
+        // alloc leaked — the ownership proof, no explicit count needed.
+    }
+}
+
 test "ZA105: runCFGMemoryAnalyses frees r2 payloads when appendSlice OOMs (EPH-I0895, B45-1)" {
     const allocator = std.testing.allocator;
     const path = "sweep_defer_cap.zig";
@@ -52508,6 +52726,58 @@ test "ZA106: loop-body free double-frees on the next iteration (EPH-I0676)" {
         // (EPH-I0676 reviewer F3).
         try std.testing.expect(mem.indexOf(u8, issue.message, "previous iteration") != null);
     }
+}
+
+test "ZA106: while-continue loop body free fires the loop-carried vote (EPH-I0749)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The idiomatic while-continue tail: loopBodyLineExtent returned null
+    // on the `: (i += 1)` tail by design, so this genuine loop-carried
+    // double-free stayed silent. The extent now skips the continue
+    // expression's paren group and bounds the braced body.
+    const content =
+        \\fn loop_continue(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    var i: usize = 0;
+        \\    while (c) : (i += 1) {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_continue.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(
+        countRuleIssues(run.issues.items, "test_loop_continue.zig", RULE_DOUBLE_FREE) == 1,
+    );
+}
+
+test "ZA106: fused single-line loop body stays silent (EPH-I0749 documented bound)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The accepted-FN bound of the EPH-I0749 fused shape: the column-aware
+    // arm proved disproportionate — the CFG leaves a same-line body block
+    // without a line span, and the free's block includes the declaration
+    // line, so the vote never reaches the extent. The shape stays silent
+    // (fail open) and the bound is documented on loopBodyLineExtent.
+    const content =
+        \\fn loop_fused(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    while (c) { allocator.free(buf); }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_fused.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(
+        countRuleIssues(run.issues.items, "test_loop_fused.zig", RULE_DOUBLE_FREE) == 0,
+    );
 }
 
 test "ZA106: free two blocks past a dominating free is a definite double-free (EPH-I0676)" {
@@ -97672,6 +97942,111 @@ test "ZT105: Allman test opener covers the pub fn it calls (EPH-I0435)" {
 }
 
 // ============================================================================
+// Test Quality Analysis Tests (ZT106)
+// ============================================================================
+
+/// Count ZT106 notes naming `block_name` (the block name the message
+/// quotes), so a note about a different block cannot satisfy a count.
+fn countNoCallNotes(
+    issues: []const Issue,
+    block_name: []const u8,
+) usize {
+    var n: usize = 0;
+    for (issues) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_TEST_NO_CALLS)) continue;
+        const open = mem.indexOfScalar(u8, issue.message, '\'') orelse continue;
+        const rest = issue.message[open + 1 ..];
+        const close = mem.indexOfScalar(u8, rest, '\'') orelse continue;
+        if (mem.eql(u8, rest[0..close], block_name)) n += 1;
+    }
+    return n;
+}
+
+test "ZT106: test block whose body calls nothing is a note (EPH-I1089)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The static/dynamic reconciliation floor: the runner counts the
+    // call-less block as a passing test while executing it covers no
+    // function body. real_work calls expectEqual — the control that
+    // proves the call-site scan silences correctly. The fused single-line
+    // body shape is the second covered form.
+    const content =
+        \\pub fn helper() void {}
+        \\test "static_only" {
+        \\    var x: u32 = 0;
+        \\    x += 1;
+        \\}
+        \\test "fused_static" { var y: u32 = 1; y += 1; }
+        \\test "real_work" {
+        \\    helper();
+        \\    try std.testing.expectEqual(@as(u32, 4), 2 + 2);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt106_callless.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countBySeverity(run.issues.items, RULE_TEST_NO_CALLS, .note),
+    );
+    try std.testing.expectEqual(@as(usize, 1), countNoCallNotes(run.issues.items, "static_only"));
+    try std.testing.expectEqual(@as(usize, 1), countNoCallNotes(run.issues.items, "fused_static"));
+    try std.testing.expectEqual(@as(usize, 0), countNoCallNotes(run.issues.items, "real_work"));
+}
+
+test "ZT106: a call site in any body line silences the note (EPH-I1089)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A `while (`/`if (` condition paren reads as a call site — the
+    // FN-tolerant over-count — so a loop-carrying body is never flagged.
+    // The Allman opener keeps its body through the brace group walk.
+    const content =
+        \\test "loops only"
+        \\{
+        \\    var i: usize = 0;
+        \\    while (i < 3) {
+        \\        i += 1;
+        \\    }
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt106_loops.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_CALLS, .note),
+    );
+}
+
+test "ZT106: an unbalanced body stays silent (fail open, EPH-I1089)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A broken file's block never closes: the extent cannot be bounded, so
+    // the block stays silent rather than guessing — the FN-tolerant bound.
+    const content =
+        \\test "broken" {
+        \\    var x: u32 = 0;
+        \\    x += 1;
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt106_broken.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countBySeverity(run.issues.items, RULE_TEST_NO_CALLS, .note),
+    );
+}
+
+// ============================================================================
 // Concurrency Analysis Tests (ZC101)
 // ============================================================================
 
@@ -97842,6 +98217,42 @@ test "ZC101: multi-line } defer { body releases at the defer depth (EPH-I0926)" 
     // f is silent (deferred coverage); g still warns. ZC102 has nothing
     // to flag: f holds no re-acquire, and the deferred release fires at
     // the fn's close, after the last event.
+    try expectZC101Counts(run.issues.items, 1, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: nested defer block keeps the outer defer context armed (EPH-I0928)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The nested-defer disarm residual: the inner block's close line
+    // returned the armed walk to zero and disarmed the outer defer
+    // context, so the acquire after the inner close recorded plain and
+    // drew a ZC101 warning the outer defer block should cover. The walk
+    // now carries the open defer depth for armed lines, so the inner
+    // close returns to the carried depth and in_defer stays true.
+    const content =
+        \\fn foo() void {}
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    defer {
+        \\        defer { foo(); }
+        \\        mutex.lock();
+        \\    }
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_nested_defer.zig", content);
+    defer run.deinit(allocator);
+
+    // f is silent (the acquire sits in the outer defer block); g still
+    // warns — the control proves the flag path ran.
     try expectZC101Counts(run.issues.items, 1, 0);
     try expectZC102Counts(run.issues.items, 0, 0);
 }
@@ -107472,10 +107883,12 @@ test "setOptionalPath OOM keeps the old value freeable exactly once" {
     try std.testing.expectEqualStrings("old", field.?);
 }
 
+// Test-reference idiom: pull the AST tier's tests into `zig build test`.
+// ast_tier is only referenced from inside function bodies, which does not
+// force analysis of its test declarations. The suite-join shim calls
+// nothing by design (EPH-I0601); the block is an include, not a test.
+// ephor:ignore ZT106
 test {
-    // Test-reference idiom: pull the AST tier's tests into `zig build test`.
-    // ast_tier is only referenced from inside function bodies, which does
-    // not force analysis of its test declarations.
     _ = ast_tier;
 }
 

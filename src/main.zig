@@ -48551,13 +48551,11 @@ test "ZA105/ZA106/ZA101: over-line-cap function skips memory analysis with a not
     var run = try runCFGMemoryTest(&diag, allocator, "test_over_line_cap.zig", content.items);
     defer run.deinit(allocator);
 
-    const file = "test_over_line_cap.zig";
     // The skip note rides the family rule: count findings by severity, so
     // the note does not read as a fired ZA105.
     var findings: usize = 0;
     var noted = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, file)) continue;
         const in_family = mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) or
             mem.eql(u8, issue.rule, RULE_DOUBLE_FREE) or
             mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER);
@@ -48600,13 +48598,11 @@ test "ZA105/ZA106/ZA101: over-alloc-cap function skips memory analysis with a no
     var run = try runCFGMemoryTest(&diag, allocator, "test_over_alloc_cap.zig", content.items);
     defer run.deinit(allocator);
 
-    const file = "test_over_alloc_cap.zig";
     // The skip notes ride the family rules: count findings by severity, so
     // the notes do not read as fired ZA105/ZA101.
     var findings: usize = 0;
     var noted = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, file)) continue;
         const in_family = mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) or
             mem.eql(u8, issue.rule, RULE_DOUBLE_FREE) or
             mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER);
@@ -48646,11 +48642,9 @@ test "ZA103: over-line-cap function skips errdefer coverage with a note (EPH-I10
     var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_line_cap.zig", content.items);
     defer run.deinit(allocator);
 
-    const file = "test_errdefer_line_cap.zig";
     var z103_findings: usize = 0;
     var noted = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, file)) continue;
         if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and issue.severity != .note)
             z103_findings += 1;
         if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
@@ -48695,11 +48689,9 @@ test "ZA103: over-alloc-cap function skips errdefer coverage with a note (EPH-I1
     var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_alloc_cap.zig", content.items);
     defer run.deinit(allocator);
 
-    const file = "test_errdefer_alloc_cap.zig";
     var z103_findings: usize = 0;
     var noted = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, file)) continue;
         if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and issue.severity != .note)
             z103_findings += 1;
         if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
@@ -48773,7 +48765,6 @@ test "ZA101: third-arg allocator tracks realPathFileAlloc with arena suppression
     var gpa_line = false;
     var arena_line = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, file)) continue;
         if (!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) continue;
         if (issue.line == 2) gpa_line = true;
         if (issue.line == 6) arena_line = true;
@@ -50685,7 +50676,6 @@ test "ZA106: all-arms chain intermediate grades err, skip paths stay conditional
     var prefix_intermediate_warning = false;
     var loop_intermediate_warning = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, file)) continue;
         if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
         if (issue.line == 8) own_then_warning = issue.severity == .warning;
         if (issue.line == 11) own_intermediate_err = issue.severity == .err;
@@ -55994,8 +55984,7 @@ test "ZA103: split-RHS try-alloc fires with the decl name (EPH-I0675)" {
 
     var found: ?usize = null;
     for (run.issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER) and
-            mem.eql(u8, issue.file, "test_split_rhs.zig"))
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER))
             found = issue.line;
     }
     // The verdict names the DECL line: the alloc belongs to `buf`.
@@ -62711,9 +62700,7 @@ test "integration: use-after-free patterns" {
 
     var uaf_count: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "uaf_test.zig") and
-            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
-        {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) {
             uaf_count += 1;
         }
     }
@@ -62751,9 +62738,7 @@ test "integration: double-free patterns" {
 
     var df_count: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "df_test.zig") and
-            mem.eql(u8, issue.rule, RULE_DOUBLE_FREE))
-        {
+        if (mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) {
             df_count += 1;
         }
     }
@@ -66449,7 +66434,6 @@ test "ZA607: single-branch if assignment is detected" {
 
     var found = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, "da_single.zig")) continue;
         if (!mem.eql(u8, issue.rule, RULE_DEFINITE_ASSIGNMENT)) continue;
         try std.testing.expectEqual(@as(usize, 6), issue.line);
         try std.testing.expect(mem.indexOf(u8, issue.message, "'x'") != null);
@@ -66533,7 +66517,6 @@ test "ZA607: else-arm-only assignment is detected" {
 
     var found = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, "da_else_only.zig")) continue;
         if (!mem.eql(u8, issue.rule, RULE_DEFINITE_ASSIGNMENT)) continue;
         try std.testing.expectEqual(@as(usize, 7), issue.line);
         try std.testing.expect(mem.indexOf(u8, issue.message, "'x'") != null);
@@ -78884,9 +78867,9 @@ test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_dupe_good_errdefer.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79056,9 +79039,9 @@ test "analyzeCFGDeferCoverage no false positive for arena allocator (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_skip.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -79098,9 +79081,9 @@ test "analyzeCFGDeferCoverage no false positive for ownership transfer via retur
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_return_transfer.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -79133,9 +79116,7 @@ test "analyzeCFGDeferCoverage no false positive for return toOwnedSlice (ZA101)"
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_owned_return.zig") and
-            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
             std.debug.print("unexpected ZA101: {s} line {d}\n", .{ issue.message, issue.line });
             try std.testing.expect(false);
         }
@@ -79172,9 +79153,7 @@ test "analyzeCFGDeferCoverage no false positive for const + return toOwnedSlice 
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_owned_const.zig") and
-            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
             std.debug.print("unexpected ZA101: {s} line {d}\n", .{ issue.message, issue.line });
             try std.testing.expect(false);
         }
@@ -79243,9 +79222,9 @@ test "analyzeCFGDeferCoverage no false positive for create with defer destroy (Z
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_create_good.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
     }
 }
 
@@ -79286,9 +79265,9 @@ test "analyzeCFGDeferCoverage no false positive for create with ownership transf
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_create_return.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
     }
 }
 
@@ -79319,9 +79298,9 @@ test "analyzeCFGDeferCoverage no false positive for create on arena allocator (Z
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_create.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
     }
 }
 
@@ -79393,10 +79372,10 @@ test "analyzeCFGErrdeferCoverage no false positive for arena allocator (ZA103)" 
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_errdefer.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -79431,9 +79410,7 @@ test "analyzeCFGMemory detects use-after-free with subscript access (ZA105)" {
 
     var found_za105 = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_subscript_uaf.zig") and
-            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
-        {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) {
             found_za105 = true;
             break;
         }
@@ -79467,9 +79444,9 @@ test "analyzeCFGMemory no false positive for defer free (ZA105)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_defer_safe.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
     }
 }
 
@@ -79501,9 +79478,7 @@ test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
 
     var found_za105 = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_alias_uaf.zig") and
-            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
-        {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) {
             found_za105 = true;
             break;
         }
@@ -79548,11 +79523,11 @@ test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
 
     // No ZA101/ZA102/ZA103 should fire for arena field chain allocations
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_field.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79586,11 +79561,11 @@ test "analyzeCFGMemory no FP for FixedBufferAllocator field chain (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_fba_field.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79631,11 +79606,11 @@ test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_name_field.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79666,10 +79641,10 @@ test "no FP for function parameter arena: Allocator (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_param.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79706,10 +79681,10 @@ test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_deep_chain.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79739,10 +79714,10 @@ test "no FP for allocPrint with arena param (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_allocprint.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79775,13 +79750,12 @@ test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
     // Should find at least one ZA101 or ZA103 for the non-arena allocator
     var found_memory_issue = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_non_arena_param.zig")) {
-            if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER) or
-                mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER))
-            {
-                found_memory_issue = true;
-                break;
-            }
+        // Single-file fixture: the file filter is a no-op (EPH-I1147).
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER) or
+            mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER))
+        {
+            found_memory_issue = true;
+            break;
         }
     }
     try std.testing.expect(found_memory_issue);
@@ -79846,10 +79820,10 @@ test "arena param no FP for ZA103 errdefer (name-based)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_za103.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
     }
 }
 
@@ -79883,9 +79857,9 @@ test "anonymous init syntax for FixedBufferAllocator (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_anon_init_fba.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -79919,11 +79893,11 @@ test "no FP for arena param used as receiver and first-arg (ZA103)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_param_mixed.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_CREATE_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79956,10 +79930,10 @@ test "no FP for arena as non-first parameter (ZA103)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_third_param.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -79996,10 +79970,10 @@ test "no FP for multiline allocPrint with arena (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_multiline_allocprint.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80032,10 +80006,10 @@ test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_arena_alias_allocprint.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80072,9 +80046,9 @@ test "no FP for local arena alias from struct field access (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_local_arena_alias.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -80105,10 +80079,10 @@ test "no FP for custom-receiver dupe with arena first arg (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_custom_receiver_dupe_arena.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80141,10 +80115,10 @@ test "no FP for multiline custom-receiver dupe with arena first arg (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_multiline_receiver_dupe_arena.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80175,10 +80149,10 @@ test "no FP for replaceOwned with arena-named second arg (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_replace_owned_arena_second.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80210,10 +80184,10 @@ test "no FP for replaceOwned with dotted arena field second arg (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_replace_owned_dotted_arena.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80246,9 +80220,7 @@ test "ZA101 fires for allocator-receiver dupe with arena-named source (lock)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_dupe_arena_source_lock.zig") and
-            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
             found = true;
             break;
         }
@@ -80284,9 +80256,7 @@ test "ZA101 fires for allocator-receiver dupe with plain source (lock)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_dupe_plain_source_lock.zig") and
-            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
             found = true;
             break;
         }
@@ -80322,9 +80292,7 @@ test "ZA101 fires for replaceOwned with real allocator second arg (lock)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_replace_owned_real_alloc_lock.zig") and
-            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
             found = true;
             break;
         }
@@ -80366,9 +80334,7 @@ test "ZA101 fires for custom-receiver dupe with non-arena first arg (lock)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_custom_receiver_dupe_lock.zig") and
-            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
             found = true;
             break;
         }
@@ -80404,10 +80370,10 @@ test "no FP for multiline replaceOwned with arena second arg (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_multiline_replace_owned.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80439,10 +80405,10 @@ test "no FP for replaceOwned with comma-bearing fn-pointer type param (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_replace_owned_fn_type.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80504,11 +80470,11 @@ test "no FP for non-memory alloc method (ZA103)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_nonmem_alloc.zig")) {
-            // Non-memory .alloc() should NOT trigger memory warnings
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        // Non-memory .alloc() should NOT trigger memory warnings
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -80539,9 +80505,7 @@ test "real alloc with type arg still triggers (ZA101)" {
 
     var found_memory_warning = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_real_alloc.zig") and
-            mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) {
             found_memory_warning = true;
         }
     }
@@ -80578,9 +80542,7 @@ test "ZA204 fires for unfilled var undefined" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
-            mem.eql(u8, issue.file, "test_za204.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE)) {
             found = true;
             break;
         }
@@ -80616,9 +80578,7 @@ test "ZA204 fires when only a different longer var is assigned" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
-            mem.eql(u8, issue.file, "test_za204_box.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE)) {
             found = true;
             break;
         }
@@ -80651,9 +80611,9 @@ test "ZA204 no FP for memset after undefined" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_za204_fill.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
     }
 }
 
@@ -80685,9 +80645,9 @@ test "ZA204 no FP when modifying method call follows other-var receiver" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_za204_occur.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
     }
 }
 
@@ -80720,9 +80680,7 @@ test "ZA202 catch unreachable fires via analyzeErrors" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE) and
-            mem.eql(u8, issue.file, "test_za202.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNREACHABLE)) {
             try std.testing.expect(issue.severity == .warning);
             found = true;
             break;
@@ -80956,9 +80914,7 @@ test "ZA203 orelse unreachable fires via analyzeErrors" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE) and
-            mem.eql(u8, issue.file, "test_za203.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_ORELSE_UNREACHABLE)) {
             try std.testing.expect(issue.severity == .warning);
             found = true;
             break;
@@ -81112,9 +81068,7 @@ test "ZA207 catch undefined fires" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED) and
-            mem.eql(u8, issue.file, "test_za207.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED)) {
             found = true;
             break;
         }
@@ -81150,9 +81104,7 @@ test "ZA207 catch |_| undefined fires" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED) and
-            mem.eql(u8, issue.file, "test_za207_payload.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_CATCH_UNDEFINED)) {
             found = true;
             break;
         }
@@ -81188,9 +81140,7 @@ test "ZA208 @panic fires in non-test context" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_PANIC) and
-            mem.eql(u8, issue.file, "test_za208.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_PANIC)) {
             found = true;
             break;
         }
@@ -81221,9 +81171,9 @@ test "ZA208 @panic does NOT fire in test block" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_za208_test.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_PANIC));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_PANIC));
     }
 }
 
@@ -81256,9 +81206,7 @@ test "ZA206 std.posix.exit fires" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
-            mem.eql(u8, issue.file, "test_za206_posix.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER)) {
             found = true;
             break;
         }
@@ -81318,9 +81266,7 @@ test "ZA206: trailing-comment exit prose never fires (EPH-I0416)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
-            mem.eql(u8, issue.file, "test_za206_comprose.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER)) {
             found = true;
             break;
         }
@@ -81354,9 +81300,7 @@ test "ZA206: string-bearing exit( never suppresses the real call (EPH-I0416)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
-            mem.eql(u8, issue.file, "test_za206_strpre.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER)) {
             found = true;
             break;
         }
@@ -81389,9 +81333,7 @@ test "ZA206: mid-line defer arms exit-bypasses-defer (EPH-I0416)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
-            mem.eql(u8, issue.file, "test_za206_middefer.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER)) {
             found = true;
             break;
         }
@@ -81425,9 +81367,7 @@ test "ZA206: trailing-comment fn name never resets the fn context (EPH-I0416)" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER) and
-            mem.eql(u8, issue.file, "test_za206_fncom.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_EXIT_BYPASSES_DEFER)) {
             found = true;
             break;
         }
@@ -81466,9 +81406,7 @@ test "ZA105: no false positive on variable reassignment after free" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
-            mem.eql(u8, issue.file, "test_reassign.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) {
             // The finding text is the failure payload: the runner's
             // expected/found diff carries it, so no stderr print is needed
             // (band-T05 F9, EPH-I0577).
@@ -81510,9 +81448,7 @@ test "ZA105: no false positive on for-loop capture variable" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
-            mem.eql(u8, issue.file, "test_capture.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) {
             // The finding text is the failure payload: the runner's
             // expected/found diff carries it, so no stderr print is needed
             // (band-T05 F9, EPH-I0577).
@@ -81551,9 +81487,7 @@ test "ZA105: still detects real use-after-free with reassignment check" {
 
     var uaf_found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE) and
-            mem.eql(u8, issue.file, "test_real_uaf.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE)) {
             uaf_found = true;
             break;
         }
@@ -83235,9 +83169,7 @@ test "ZA304 suppressed for fromJson with many branches" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_BRANCHES) and
-            mem.eql(u8, issue.file, "test_dispatch.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_BRANCHES)) {
             // The finding text is the failure payload: the runner's
             // expected/found diff carries it, so no stderr print is needed
             // (band-T05 F9, EPH-I0577).
@@ -83309,8 +83241,7 @@ test "ZA303 fires on multi-line signature with too many params" {
 
     var za303_count: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS) and
-            mem.eql(u8, issue.file, "test_multiline_params.zig")) za303_count += 1;
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS)) za303_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), za303_count);
 }
@@ -83383,8 +83314,7 @@ test "ZA303 exempts extern and callconv(.c) declarations (EPH-I1059)" {
 
     var za303_count: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS) and
-            mem.eql(u8, issue.file, "test_c_abi.zig")) za303_count += 1;
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS)) za303_count += 1;
     }
     // The three C-ABI shapes are exempt; plainFive and decoy still fire
     // (the EntryPoint callconv on a later declaration exempts neither).
@@ -83435,8 +83365,7 @@ test "ZA303 exempts callconv(.Stdcall) and export declarations (EPH-I1093, EPH-I
 
     var za303_count: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS) and
-            mem.eql(u8, issue.file, "test_abi_pinned.zig")) za303_count += 1;
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS)) za303_count += 1;
     }
     // The four pinned shapes are exempt; sysvFive and plainFive still fire.
     try std.testing.expectEqual(@as(usize, 2), za303_count);
@@ -83528,6 +83457,7 @@ test "generated-file banner silences ZA701 and ZA703 (EPH-I1062)" {
     defer deinitIssues(&naming, allocator);
 
     for (style.items) |issue| {
+        // Multi-file fixture: per-file assertion legitimate (EPH-I1147).
         try std.testing.expect(!mem.eql(u8, issue.file, "gen.zig"));
     }
     for (naming.items) |issue| {
@@ -85113,7 +85043,7 @@ test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC) and mem.eql(u8, issue.file, "too_many.zig")) {
+        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC)) {
             found = true;
             try std.testing.expect(mem.containsAtLeast(u8, issue.message, 1, "cyclomatic complexity"));
         }
@@ -85228,7 +85158,7 @@ test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "very_deep.zig")) {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             found = true;
             try std.testing.expect(mem.containsAtLeast(u8, issue.message, 1, "cognitive complexity"));
         }
@@ -85297,7 +85227,6 @@ test "ZA305/ZA306: orelse is cyclomatic but low cognitive" {
     var found_cyclo = false;
     var found_cog = false;
     for (issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, "orelse.zig")) continue;
         if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC)) found_cyclo = true;
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) found_cog = true;
     }
@@ -85349,7 +85278,6 @@ test "ZA305/ZA306: switch arms count as decision points" {
     var found_cyclo = false;
     var found_cog = false;
     for (issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, "switch.zig")) continue;
         if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC)) found_cyclo = true;
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) found_cog = true;
     }
@@ -91792,7 +91720,6 @@ test "ZA301: outer fn with local struct method is reported" {
     var found = false;
     for (issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
-        if (!mem.eql(u8, issue.file, "outer_struct.zig")) continue;
         found = true;
         try std.testing.expectEqual(@as(usize, 1), issue.line);
         try std.testing.expect(mem.indexOf(u8, issue.message, "outer_with_struct") != null);
@@ -91825,9 +91752,9 @@ test "ZA301: short outer fn with local struct stays silent" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "short_outer.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG));
     }
 }
 
@@ -91865,7 +91792,6 @@ test "ZA304: outer fn branches reported despite local struct" {
     var found = false;
     for (issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_TOO_MANY_BRANCHES)) continue;
-        if (!mem.eql(u8, issue.file, "branchy_outer.zig")) continue;
         found = true;
         try std.testing.expect(mem.indexOf(u8, issue.message, "branchy_outer") != null);
     }
@@ -91963,9 +91889,7 @@ test "ZA305: unspaced if-chain trips cyclomatic threshold" {
 
     var found = false;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC) and
-            mem.eql(u8, issue.file, "unspaced_chain.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC)) {
             found = true;
         }
     }
@@ -92066,9 +91990,7 @@ test "ZA204: multi-line undefined declaration is tracked" {
 
     var found_line: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
-            mem.eql(u8, issue.file, "za204_multiline.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE)) {
             found_line = issue.line;
         }
     }
@@ -92409,9 +92331,7 @@ test "ZA204: unfilled struct field reports at the fn closing line (EPH-I0421)" {
     ));
     var found_line: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
-            mem.eql(u8, issue.file, "za204_close.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE)) {
             found_line = issue.line;
         }
     }
@@ -92773,9 +92693,7 @@ test "ZA204: single-line struct literal undefined field is reported (EPH-I0413)"
     );
     var found_line: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
-            mem.eql(u8, issue.file, "za204_single.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE)) {
             found_line = issue.line;
         }
     }
@@ -92821,9 +92739,7 @@ test "ZA204: later anonymous literal field is not misattributed (EPH-I0413)" {
     );
     var found_line: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE) and
-            mem.eql(u8, issue.file, "za204_anon.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE)) {
             found_line = issue.line;
         }
     }
@@ -93423,9 +93339,7 @@ test "ZA302: poisoned arrow line does not hide a deeply nested tail" {
 
     var nesting_findings: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "arrow.zig") and
-            mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP))
-        {
+        if (mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP)) {
             nesting_findings += 1;
         }
     }
@@ -93463,9 +93377,9 @@ test "ZA302: char-literal braces do not inflate nesting depth" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "char_lit.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
     }
 }
 
@@ -93512,7 +93426,7 @@ test "ZA306: else-prong second same-line brace adds no cognitive nest (EPH-I0884
 
     var cog_findings: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cog_prong.zig")) {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             cog_findings += 1;
             // Pin the measured value: 9 is the true cognitive weight, 10
             // the leaked one (EPH-I0884).
@@ -93557,9 +93471,9 @@ test "ZA302: same-line struct literals do not inflate nesting depth (EPH-I0811)"
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "lit.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
     }
 }
 
@@ -93599,9 +93513,9 @@ test "ZA302: multiline initializers do not inflate nesting depth (EPH-I0811, EPH
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "mlit.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
-        }
+        // Single-file fixture: the file filter is a no-op —
+        // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP));
     }
 }
 
@@ -93637,9 +93551,7 @@ test "ZA302: genuine control-flow nesting at depth 4 still fires (EPH-I0811)" {
 
     var nesting_findings: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "deep.zig") and
-            mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP))
-        {
+        if (mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP)) {
             nesting_findings += 1;
         }
     }
@@ -93713,12 +93625,14 @@ test "ZA306: keyword+literal lines do not leak cognitive nesting (EPH-I0818)" {
 
     var cog_findings: usize = 0;
     for (issues.items) |issue| {
+        // Multi-file fixture: per-file assertion legitimate (EPH-I1147).
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cog_leak.zig")) {
             cog_findings += 1;
             // Pin the measured value, not just rule silence: 12 is the
             // true cognitive weight of the shape, 21 the leaked one.
             try std.testing.expect(mem.indexOf(u8, issue.message, "has 12 cognitive complexity (max 10)") != null);
         }
+        // Multi-file fixture: per-file assertion legitimate (EPH-I1147).
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cog_ctl.zig")) {
             try std.testing.expect(false);
         }
@@ -93771,7 +93685,7 @@ test "ZA306: else-family chains measure at the if's level with no residue (EPH-I
 
     var cog_findings: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "chain.zig")) {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             cog_findings += 1;
             try std.testing.expect(mem.indexOf(u8, issue.message, "has 9 cognitive complexity (max 4)") != null);
         }
@@ -93877,7 +93791,7 @@ test "ZA306: catch after a labeled block closes costs 1+0 and leaks nothing (EPH
 
     var cog_findings: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "guarded.zig")) {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             cog_findings += 1;
             try std.testing.expect(mem.indexOf(u8, issue.message, "has 5 cognitive complexity (max 4)") != null);
         }
@@ -93919,7 +93833,7 @@ test "ZA306: trailing-comment brace line leaks no cognitive nesting (EPH-I0452)"
 
     var cog_findings: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cbrace.zig")) {
+        if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             cog_findings += 1;
             try std.testing.expect(mem.indexOf(u8, issue.message, "has 4 cognitive complexity (max 3)") != null);
         }
@@ -93974,6 +93888,7 @@ test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457
     var plain_findings: usize = 0;
     for (issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        // Multi-file fixture: per-file assertion legitimate (EPH-I1147).
         if (mem.eql(u8, issue.file, "factory.zig")) {
             factory_findings += 1;
         } else if (mem.eql(u8, issue.file, "plain.zig")) {
@@ -94052,6 +93967,7 @@ test "ZA301: blank lines inside a fn stay out of fn_lines (EPH-I0458)" {
     var tight_findings: usize = 0;
     for (issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        // Multi-file fixture: per-file assertion legitimate (EPH-I1147).
         if (mem.eql(u8, issue.file, "padded.zig")) {
             padded_findings += 1;
         } else if (mem.eql(u8, issue.file, "tight.zig")) {
@@ -94211,9 +94127,7 @@ test "ZA301: wrapped real fn def counts its signature lines (EPH-I0756)" {
 
     var za301_count: usize = 0;
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG) and
-            mem.eql(u8, issue.file, "wrapped_def.zig"))
-        {
+        if (mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) {
             za301_count += 1;
             try std.testing.expectEqual(@as(usize, 1), issue.line);
         }
@@ -94300,6 +94214,7 @@ test "ZA301: full-line comments in a wrapped signature stay out of fn_lines (EPH
     var plain_count: usize = 0;
     for (issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_FUNC_TOO_LONG)) continue;
+        // Multi-file fixture: per-file assertion legitimate (EPH-I1147).
         if (mem.eql(u8, issue.file, "i0788_commented.zig")) {
             commented_count += 1;
         } else if (mem.eql(u8, issue.file, "i0788_plain.zig")) {
@@ -101182,7 +101097,6 @@ test "ZA110: close-armed defer fires with a close-accurate message (EPH-I1117)" 
     var opened_closed_msg = false;
     var deinit_msg = false;
     for (run.issues.items) |issue| {
-        if (!mem.eql(u8, issue.file, "za110_close.zig")) continue;
         if (!mem.eql(u8, issue.rule, RULE_MUST_RETURN_REF)) continue;
         if (issue.line == 5 and mem.indexOf(u8, issue.message, "closed by an armed defer") != null)
             opened_closed_msg = true;
@@ -101889,7 +101803,6 @@ test "ZA209: fn-pointer ret leaves the outer fn silent, inner noted (EPH-I1042 r
     var victim_on_outer = false;
     for (run.issues.items) |issue| {
         if (!mem.eql(u8, issue.rule, RULE_USELESS_ERROR_RETURN)) continue;
-        if (!mem.eql(u8, issue.file, "za209_fnptr_ret.zig")) continue;
         if (mem.indexOf(u8, issue.message, "get") != null and issue.line == 3) {
             victim_on_get = true;
         }
@@ -102081,7 +101994,6 @@ test "ZA209: quoted-name error-union fn reports the quoted name (EPH-I0922)" {
     var found_name = false;
     for (run.issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_USELESS_ERROR_RETURN) and
-            mem.eql(u8, issue.file, "za209_quoted.zig") and
             mem.indexOf(u8, issue.message, "never-fails") != null)
         {
             found_name = true;
@@ -108328,6 +108240,7 @@ test "config orphan_exclude feeds the suppression accounting (EPH-I0666)" {
     const hidden_verdict = classifyIssue(
         blk: {
             for (issues.items) |issue| {
+                // Multi-file fixture: per-file lookup legitimate (EPH-I1147).
                 if (mem.eql(u8, issue.file, hidden)) break :blk issue;
             }
             return error.TestUnexpectedResult;

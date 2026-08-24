@@ -6,6 +6,7 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
+const sanitize = @import("sanitize.zig");
 
 // ============================================================================
 // Rule IDs (for suppression and documentation)
@@ -284,15 +285,13 @@ pub const Issue = struct {
         }
     }
 
-    /// Render the JSON object form into `out`. Every repo-derived field
-    /// passes through escapeJson so quote, backslash, and control bytes in
-    /// filenames or messages cannot break the document (EPH-I0146).
-    pub fn formatJson(
-        self: Issue,
-        base_path: []const u8,
-        is_last: bool,
-        out: *OutBuf,
-    ) !void {
+    /// Render the JSON object core through the closing brace. Every
+    /// repo-derived field passes through escapeJson so quote, backslash,
+    /// and control bytes in filenames or messages cannot break the
+    /// document (EPH-I0146). The two public entry points differ only in
+    /// the terminator (EPH-I1121): the last array element closes the
+    /// object, every other element carries the array comma.
+    fn formatJsonObject(self: Issue, base_path: []const u8, out: *OutBuf) !void {
         const rel_path = relativePath(self.file, base_path);
         var rel = try escapeJson(out.allocator, rel_path);
         defer rel.deinit(out.allocator);
@@ -312,11 +311,21 @@ pub const Issue = struct {
         } else {
             try out.print("\n", .{});
         }
-        if (is_last) {
-            try out.print("  }}\n", .{});
-        } else {
-            try out.print("  }},\n", .{});
-        }
+        try out.print("  }}", .{});
+    }
+
+    /// Render the JSON object for the last array element: no trailing
+    /// comma, so the array close follows it directly.
+    pub fn formatJsonLast(self: Issue, base_path: []const u8, out: *OutBuf) !void {
+        try self.formatJsonObject(base_path, out);
+        try out.print("\n", .{});
+    }
+
+    /// Render the JSON object for a non-last array element: the trailing
+    /// comma separates it from the next object.
+    pub fn formatJsonEntry(self: Issue, base_path: []const u8, out: *OutBuf) !void {
+        try self.formatJsonObject(base_path, out);
+        try out.print(",\n", .{});
     }
 
     /// Print the text form to stderr. Buffers through formatText so each
@@ -361,19 +370,16 @@ fn printWriteFallback(comptime fmt: []const u8, args: anytype, writer: ?*std.Io.
 // ============================================================================
 // Output Sanitization (RED5: EPH-I0146, I0147, I0148, I0149, I0162)
 // ============================================================================
+// The sanitizers moved to sanitize.zig so each file stays under the
+// 64 KiB ZA111 input cap (EPH-I1123). The re-exports keep the types.*
+// API surface unchanged for main.zig and the compat layer. OutBuf stays
+// here: the Issue format cores own its private print helper.
 
-/// Sanitized output: borrows the input when it was clean, owns an allocated
-/// copy when any byte was replaced. deinit frees only the owned copy.
-pub const Sanitized = struct {
-    slice: []const u8,
-    owned: bool,
-
-    /// Free the owned copy, if any. Safe to call on borrowed results.
-    pub fn deinit(self: *Sanitized, allocator: Allocator) void {
-        if (self.owned) allocator.free(self.slice);
-        self.owned = false;
-    }
-};
+pub const Sanitized = sanitize.Sanitized;
+pub const sanitizeTerminal = sanitize.sanitizeTerminal;
+pub const escapeJson = sanitize.escapeJson;
+pub const sanitizeMarkdown = sanitize.sanitizeMarkdown;
+pub const sanitizeSnippet = sanitize.sanitizeSnippet;
 
 /// Buffered byte sink for the issue format cores: pairs the output list
 /// with its allocator so formatter signatures stay within the param cap.
@@ -390,483 +396,6 @@ pub const OutBuf = struct {
         self.buf.deinit(self.allocator);
     }
 };
-
-/// One hostile format unit: the input bytes it spans and the codepoint it
-/// carries. A clean sequence reports len 0.
-const HostileUnit = struct {
-    len: usize,
-    cp: u21,
-};
-
-/// Inclusive window for a lead byte's first continuation byte.
-const ByteWindow = struct {
-    min: u8,
-    max: u8,
-};
-
-/// Byte length of the hostile sequence starting at `s[0]`, or 0 when the
-/// byte is safe to print. Multi-byte format characters consume their full
-/// UTF-8 sequence so one placeholder replaces the whole character.
-fn hostileSeqLen(s: []const u8) usize {
-    const b = s[0];
-    if (b < 0x20 or b == 0x7F) return 1;
-    return hostileUnit(s).len;
-}
-
-/// Classify the byte at `s[0]` against the hostile bidi and invisible
-/// format set (EPH-I0579): U+061C Arabic Letter Mark, U+00AD soft hyphen,
-/// U+200B..U+200F zero-width and bidi marks, U+2028/U+2029 line and
-/// paragraph separators, U+202A..U+202E bidi embeddings and overrides,
-/// U+2060..U+206F invisible operators, bidi isolates, and deprecated
-/// shaping marks (the unassigned U+2065 included: filtering it is free
-/// and conservative), U+FEFF BOM, U+FFF9..U+FFFB interlinear
-/// annotation anchors, and the tag characters U+E0001 and
-/// U+E0020..U+E007F. A truncated lead consumes the rest (invalid UTF-8
-/// regardless) and reports U+FFFD. Shared by the terminal filter and the
-/// JSON escaper so both reject the same set.
-fn hostileUnit(s: []const u8) HostileUnit {
-    switch (s[0]) {
-        0xC2 => return c2Unit(s),
-        0xD8 => return almUnit(s),
-        0xE2 => return formatUnit(s),
-        0xEF => return efUnit(s),
-        0xF3 => return tagUnit(s),
-        else => return .{ .len = 0, .cp = 0 },
-    }
-}
-
-/// C1 controls (U+0080..U+009F) and U+00AD soft hyphen under the 0xC2
-/// lead. U+0085 NEL is a line terminator and a log-forgery vector on its
-/// own. A truncated lead consumes the rest: it is invalid UTF-8 regardless.
-fn c2Unit(s: []const u8) HostileUnit {
-    if (s.len < 2) return .{ .len = s.len, .cp = 0xFFFD };
-    if (s[1] >= 0x80 and s[1] <= 0x9F) return .{ .len = 2, .cp = s[1] };
-    if (s[1] == 0xAD) return .{ .len = 2, .cp = 0xAD };
-    return .{ .len = 0, .cp = 0 };
-}
-
-/// U+061C Arabic Letter Mark (bidi) under the 0xD8 lead.
-fn almUnit(s: []const u8) HostileUnit {
-    if (s.len < 2) return .{ .len = s.len, .cp = 0xFFFD };
-    if (s[1] == 0x9C) return .{ .len = 2, .cp = 0x061C };
-    return .{ .len = 0, .cp = 0 };
-}
-
-/// Hostile U+20xx format characters under the 0xE2 lead.
-fn formatUnit(s: []const u8) HostileUnit {
-    if (s.len < 3) return .{ .len = s.len, .cp = 0xFFFD };
-    if (s[1] == 0x80) return format80Unit(s);
-    if (s[1] == 0x81 and s[2] >= 0xA0 and s[2] <= 0xAF)
-        return .{ .len = 3, .cp = 0x2060 + @as(u21, s[2] - 0xA0) };
-    return .{ .len = 0, .cp = 0 };
-}
-
-/// U+200B..U+200F and U+2028..U+202E under 0xE2 0x80.
-fn format80Unit(s: []const u8) HostileUnit {
-    if (s[2] >= 0x8B and s[2] <= 0x8F)
-        return .{ .len = 3, .cp = 0x200B + @as(u21, s[2] - 0x8B) };
-    if (s[2] >= 0xA8 and s[2] <= 0xAE)
-        return .{ .len = 3, .cp = 0x2028 + @as(u21, s[2] - 0xA8) };
-    return .{ .len = 0, .cp = 0 };
-}
-
-/// U+FEFF BOM and U+FFF9..U+FFFB interlinear annotation anchors under the
-/// 0xEF lead.
-fn efUnit(s: []const u8) HostileUnit {
-    if (s.len < 3) return .{ .len = s.len, .cp = 0xFFFD };
-    if (s[1] == 0xBB and s[2] == 0xBF) return .{ .len = 3, .cp = 0xFEFF };
-    if (s[1] == 0xBF and s[2] >= 0xB9 and s[2] <= 0xBB)
-        return .{ .len = 3, .cp = 0xFFF9 + @as(u21, s[2] - 0xB9) };
-    return .{ .len = 0, .cp = 0 };
-}
-
-/// Tag characters under the 0xF3 lead: U+E0001 and U+E0020..U+E007F. The
-/// unassigned gap U+E0002..U+E001F passes clean: no assigned character
-/// exists there to attack with.
-fn tagUnit(s: []const u8) HostileUnit {
-    if (s.len < 4) return .{ .len = s.len, .cp = 0xFFFD };
-    if (s[1] != 0xA0) return .{ .len = 0, .cp = 0 };
-    if (s[2] == 0x80 and s[3] == 0x81) return .{ .len = 4, .cp = 0xE0001 };
-    return tagRangeUnit(s);
-}
-
-/// U+E0020..U+E007F under 0xF3 0xA0, each bounded to valid continuation
-/// bytes (0x80..0xBF): an out-of-range fourth byte is invalid UTF-8 and
-/// passes clean here, so the JSON validator turns it into U+FFFD
-/// (EPH-I1120).
-fn tagRangeUnit(s: []const u8) HostileUnit {
-    if (s[2] == 0x80 and s[3] >= 0xA0 and s[3] <= 0xBF)
-        return .{ .len = 4, .cp = 0xE0020 + @as(u21, s[3] - 0xA0) };
-    if (s[2] == 0x81 and s[3] >= 0x80 and s[3] <= 0xBF)
-        return .{ .len = 4, .cp = 0xE0040 + @as(u21, s[3] - 0x80) };
-    return .{ .len = 0, .cp = 0 };
-}
-
-/// Filter terminal-hostile bytes from attacker-derived text: C0 controls
-/// (CR and LF included, so no byte forges a new log line), DEL, C1
-/// controls, and the hostile bidi and invisible format set that
-/// hostileUnit enumerates. Each hostile sequence becomes one visible '?'
-/// so redaction gaps stay visible. Clean input borrows without
-/// allocation. The filter assumes valid UTF-8: bare 0x80..0x9F bytes and
-/// overlong lead bytes pass through, which is inert to a UTF-8 decoder.
-pub fn sanitizeTerminal(
-    allocator: Allocator,
-    input: []const u8,
-) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip == 0) {
-            i += 1;
-        } else {
-            dirty = true;
-            i += skip;
-        }
-        out_len += 1;
-    }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip == 0) {
-            buf[o] = input[i];
-            i += 1;
-        } else {
-            buf[o] = '?';
-            i += skip;
-        }
-        o += 1;
-    }
-    return .{ .slice = buf, .owned = true };
-}
-
-/// One classified input unit for JSON escaping: how many input bytes it
-/// spans, how many output bytes it emits, and which escaped form to
-/// write. The classifier owns both counts so the two passes cannot drift.
-const JsonEscape = struct {
-    consumed: usize,
-    emitted: usize,
-    kind: Kind,
-    named_char: u8 = 0,
-    codepoint: u21 = 0,
-
-    const Kind = enum {
-        clean, // copy the bytes raw
-        named, // two-character escape: backslash plus named_char
-        unicode, // \uXXXX (BMP) or the \uDXXX\uDXXX surrogate pair
-    };
-};
-
-/// The escape letter for bytes with a two-character JSON escape.
-fn jsonNamedEscape(b: u8) ?u8 {
-    return switch (b) {
-        '"' => '"',
-        '\\' => '\\',
-        0x08 => 'b',
-        0x09 => 't',
-        0x0A => 'n',
-        0x0C => 'f',
-        0x0D => 'r',
-        else => null,
-    };
-}
-
-/// Classify the unit at `s[0]` for JSON escaping.
-fn classifyJsonUnit(s: []const u8) JsonEscape {
-    const b = s[0];
-    if (jsonNamedEscape(b)) |c| {
-        return .{ .consumed = 1, .emitted = 2, .kind = .named, .named_char = c };
-    }
-    if (b < 0x20 or b == 0x7F) {
-        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = b };
-    }
-    if (b < 0x80) return .{ .consumed = 1, .emitted = 1, .kind = .clean };
-    // Hostile format characters escape as their codepoint: \uXXXX inside
-    // the BMP, the RFC 8259 surrogate pair beyond it.
-    const hostile = hostileUnit(s);
-    if (hostile.len != 0) {
-        return .{
-            .consumed = hostile.len,
-            .emitted = jsonEscapeBytes(hostile.cp),
-            .kind = .unicode,
-            .codepoint = hostile.cp,
-        };
-    }
-    // Other multi-byte bytes: well-formed sequences pass through whole;
-    // invalid bytes become U+FFFD so the document stays strict UTF-8
-    // (RFC 8259 section 8.1, EPH-I0580).
-    const expect = utf8ExpectLen(b) orelse
-        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = 0xFFFD };
-    if (!utf8Valid(s, expect))
-        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = 0xFFFD };
-    return .{ .consumed = expect, .emitted = expect, .kind = .clean };
-}
-
-/// Output bytes of a codepoint's JSON escape: 6 for the BMP \uXXXX form,
-/// 12 for the astral surrogate pair (RFC 8259 section 7).
-fn jsonEscapeBytes(cp: u21) usize {
-    return if (cp <= 0xFFFF) 6 else 12;
-}
-
-/// Expected UTF-8 sequence length for the lead byte `b` (b >= 0x80), or
-/// null when `b` can never start a valid sequence: stray continuation
-/// bytes, overlong leads 0xC0/0xC1, and out-of-range leads 0xF5..0xFF.
-fn utf8ExpectLen(b: u8) ?usize {
-    if (b >= 0xC2 and b <= 0xDF) return 2;
-    if (b >= 0xE0 and b <= 0xEF) return 3;
-    if (b >= 0xF0 and b <= 0xF4) return 4;
-    return null;
-}
-
-/// Valid window for the first continuation byte of lead `b`. The narrow
-/// entries pin the RFC 3629 range guards: 0xE0 rejects overlong forms,
-/// 0xED rejects surrogates, 0xF0 rejects overlong forms, 0xF4 rejects
-/// values beyond U+10FFFF.
-fn utf8SecondWindow(lead: u8) ByteWindow {
-    return switch (lead) {
-        0xE0 => .{ .min = 0xA0, .max = 0xBF },
-        0xED => .{ .min = 0x80, .max = 0x9F },
-        0xF0 => .{ .min = 0x90, .max = 0xBF },
-        0xF4 => .{ .min = 0x80, .max = 0x8F },
-        else => .{ .min = 0x80, .max = 0xBF },
-    };
-}
-
-/// True when the bytes at `s` form a well-formed UTF-8 sequence of
-/// `expect` bytes: enough input, every continuation byte inside
-/// 0x80..0xBF, and the first continuation inside the lead's window.
-fn utf8Valid(s: []const u8, expect: usize) bool {
-    if (s.len < expect) return false;
-    const window = utf8SecondWindow(s[0]);
-    if (s[1] < window.min or s[1] > window.max) return false;
-    var i: usize = 2;
-    while (i < expect) : (i += 1) {
-        if (s[i] < 0x80 or s[i] > 0xBF) return false;
-    }
-    return true;
-}
-
-/// Write one escaped unit into `dst`, returning the bytes written. The
-/// caller sized `dst` for exactly this unit.
-fn writeJsonUnit(dst: []u8, unit: JsonEscape, src: []const u8) usize {
-    switch (unit.kind) {
-        .clean => {
-            @memcpy(dst[0..unit.consumed], src[0..unit.consumed]);
-            return unit.consumed;
-        },
-        .named => {
-            dst[0] = '\\';
-            dst[1] = unit.named_char;
-            return 2;
-        },
-        .unicode => return writeJsonUnicode(dst, unit.codepoint),
-    }
-}
-
-/// Write the JSON escape of `cp` into `dst`: `\uXXXX` (uppercase hex) for
-/// a BMP codepoint, the `\uDXXX\uDXXX` surrogate pair for an astral one
-/// (RFC 8259 section 7). Returns the bytes written.
-fn writeJsonUnicode(dst: []u8, cp: u21) usize {
-    if (cp <= 0xFFFF) {
-        dst[0] = '\\';
-        dst[1] = 'u';
-        writeHex4(dst[2..6], @intCast(cp));
-        return 6;
-    }
-    const pair = cp - 0x10000;
-    dst[0] = '\\';
-    dst[1] = 'u';
-    writeHex4(dst[2..6], @intCast(0xD800 + (pair >> 10)));
-    dst[6] = '\\';
-    dst[7] = 'u';
-    writeHex4(dst[8..12], @intCast(0xDC00 + (pair & 0x3FF)));
-    return 12;
-}
-
-/// Write four uppercase hex digits of `v` into `dst`.
-fn writeHex4(dst: []u8, v: u16) void {
-    const hex = "0123456789ABCDEF";
-    dst[0] = hex[(v >> 12) & 0xF];
-    dst[1] = hex[(v >> 8) & 0xF];
-    dst[2] = hex[(v >> 4) & 0xF];
-    dst[3] = hex[v & 0xF];
-}
-
-/// Escape a string for embedding in JSON output: quotes, backslashes, and
-/// control bytes use the standard escapes, bidi or invisible format
-/// characters escape as \uXXXX (the surrogate-pair form beyond the BMP;
-/// legal raw in JSON but hostile to humans and downstream tools), and
-/// invalid UTF-8 bytes become \uFFFD so the document always satisfies
-/// RFC 8259 section 8.1. Clean input borrows without allocation.
-pub fn escapeJson(
-    allocator: Allocator,
-    input: []const u8,
-) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const unit = classifyJsonUnit(input[i..]);
-        if (unit.kind != .clean) dirty = true;
-        out_len += unit.emitted;
-        i += unit.consumed;
-    }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const unit = classifyJsonUnit(input[i..]);
-        o += writeJsonUnit(buf[o..], unit, input[i..]);
-        i += unit.consumed;
-    }
-    return .{ .slice = buf, .owned = true };
-}
-
-/// ASCII punctuation with markdown meaning. Export fields backslash-escape
-/// these so attacker filenames and prose cannot forge emphasis, links,
-/// code spans, images, raw HTML, headings, or tables in issues.md
-/// (EPH-I0162).
-const markdown_escape_chars = "\\`*_[]<>#!|";
-
-/// True when `b` carries markdown meaning in export fields.
-fn isMarkdownMeta(b: u8) bool {
-    return mem.indexOfScalar(u8, markdown_escape_chars, b) != null;
-}
-
-/// Filter terminal-hostile bytes and backslash-escape markdown
-/// metacharacters for the markdown export fields, so attacker filenames
-/// and prose cannot forge emphasis, links, code spans, images, raw HTML,
-/// headings, or tables (EPH-I0162). Clean input borrows without allocation.
-pub fn sanitizeMarkdown(
-    allocator: Allocator,
-    input: []const u8,
-) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip != 0) {
-            dirty = true;
-            out_len += 1;
-            i += skip;
-        } else if (isMarkdownMeta(input[i])) {
-            dirty = true;
-            out_len += 2;
-            i += 1;
-        } else {
-            out_len += 1;
-            i += 1;
-        }
-    }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip != 0) {
-            buf[o] = '?';
-            o += 1;
-            i += skip;
-        } else if (isMarkdownMeta(input[i])) {
-            buf[o] = '\\';
-            buf[o + 1] = input[i];
-            o += 2;
-            i += 1;
-        } else {
-            buf[o] = input[i];
-            o += 1;
-            i += 1;
-        }
-    }
-    return .{ .slice = buf, .owned = true };
-}
-
-/// Length of the backtick run at `s[0]` (s[0] == '`').
-fn backtickRun(s: []const u8) usize {
-    var n: usize = 0;
-    while (n < s.len and s[n] == '`') n += 1;
-    return n;
-}
-
-/// Sanitize one source line for export snippet embedding: the
-/// sanitizeTerminal control filter plus each backtick of a fence-capable
-/// run (three or more) replaced with '?'. Shorter runs stay readable
-/// because they cannot close the export fence (EPH-I0162).
-pub fn sanitizeSnippet(
-    allocator: Allocator,
-    input: []const u8,
-) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const unit = snippetUnit(input[i..]);
-        dirty = dirty or unit.dirty;
-        out_len += unit.emitted;
-        i += unit.consumed;
-    }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip != 0) {
-            buf[o] = '?';
-            o += 1;
-            i += skip;
-            continue;
-        }
-        if (input[i] == '`') {
-            const run = backtickRun(input[i..]);
-            if (run >= 3) {
-                @memset(buf[o .. o + run], '?');
-            } else {
-                @memcpy(buf[o .. o + run], input[i .. i + run]);
-            }
-            o += run;
-            i += run;
-            continue;
-        }
-        buf[o] = input[i];
-        o += 1;
-        i += 1;
-    }
-    return .{ .slice = buf, .owned = true };
-}
-
-/// One classified input unit for sanitizeSnippet pass one: input bytes
-/// consumed, output bytes emitted, and whether the unit changes under
-/// sanitization. Hostile sequences collapse to one placeholder; backtick
-/// runs keep their length either way.
-const SnippetUnit = struct {
-    consumed: usize,
-    emitted: usize,
-    dirty: bool,
-};
-
-/// Classify the unit at `s[0]` for sanitizeSnippet.
-fn snippetUnit(s: []const u8) SnippetUnit {
-    const skip = hostileSeqLen(s);
-    if (skip != 0) {
-        return .{ .consumed = skip, .emitted = 1, .dirty = true };
-    }
-    if (s[0] != '`') return .{ .consumed = 1, .emitted = 1, .dirty = false };
-    const run = backtickRun(s);
-    return .{ .consumed = run, .emitted = run, .dirty = run >= 3 };
-}
-
 pub const Thresholds = struct {
     max_function_lines: usize = 50,
     max_nesting_depth: usize = 3,
@@ -1465,260 +994,6 @@ test "ReturnKind has all expected variants" {
     try std.testing.expect(ReturnKind.unknown != .noreturn_type);
 }
 
-// ============================================================================
-// Output Sanitization Tests (EPH-I0146, I0147, I0148, I0149, I0162)
-// ============================================================================
-
-test "sanitizeTerminal borrows clean input without allocation" {
-    const input = "clean-ascii/path.zig";
-    var result = try sanitizeTerminal(std.testing.allocator, input);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.owned);
-    try std.testing.expectEqual(input.ptr, result.slice.ptr);
-}
-
-test "sanitizeTerminal replaces C0 controls and DEL with placeholders" {
-    var result = try sanitizeTerminal(std.testing.allocator, "a\x00b\x1Bc\x7Fd");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.owned);
-    try std.testing.expectEqualStrings("a?b?c?d", result.slice);
-}
-
-test "sanitizeTerminal never lets CR or LF survive" {
-    var result = try sanitizeTerminal(std.testing.allocator, "one\ntwo\rthree\r\n");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("one?two?three??", result.slice);
-    try std.testing.expect(std.mem.indexOfScalar(u8, result.slice, '\n') == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, result.slice, '\r') == null);
-}
-
-test "sanitizeTerminal strips CSI escape sequences" {
-    var result = try sanitizeTerminal(std.testing.allocator, "ok\x1b[1;31mred\x1b[0m");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("ok?[1;31mred?[0m", result.slice);
-}
-
-test "sanitizeTerminal replaces bidi and separator format characters" {
-    // U+202E RLO, U+2028 LS, U+2066 LRI, U+200E LRM, U+FEFF: one
-    // placeholder each.
-    var result = try sanitizeTerminal(
-        std.testing.allocator,
-        "a\u{202e}\u{2028}\u{2066}\u{200e}\u{feff}b",
-    );
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("a?????b", result.slice);
-}
-
-test "sanitizeTerminal keeps valid UTF-8 but filters C1 controls" {
-    // C2 A9 (copyright) is a clean two-byte character and borrows.
-    var clean = try sanitizeTerminal(std.testing.allocator, "a\xc2\xa9b");
-    defer clean.deinit(std.testing.allocator);
-    try std.testing.expect(!clean.owned);
-    // C2 85 (NEL) is a C1 line terminator and is replaced.
-    var nel = try sanitizeTerminal(std.testing.allocator, "a\xc2\x85b");
-    defer nel.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("a?b", nel.slice);
-}
-
-test "sanitizeTerminal replaces truncated UTF-8 tails" {
-    var result = try sanitizeTerminal(std.testing.allocator, "ab\xe2\x80");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("ab?", result.slice);
-}
-
-test "escapeJson borrows clean input without allocation" {
-    const input = "plain text 123";
-    var result = try escapeJson(std.testing.allocator, input);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.owned);
-    try std.testing.expectEqual(input.ptr, result.slice.ptr);
-}
-
-test "escapeJson escapes quotes, backslashes, and control bytes" {
-    var result = try escapeJson(std.testing.allocator, "a\"b\\c\x1b\nd");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("a\\\"b\\\\c\\u001B\\nd", result.slice);
-}
-
-test "escapeJson escapes bidi and C1 characters as codepoints" {
-    var result = try escapeJson(
-        std.testing.allocator,
-        "x\u{202e}\u{2066}\u{feff}\xc2\x85y",
-    );
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("x\\u202E\\u2066\\uFEFF\\u0085y", result.slice);
-}
-
-test "sanitizeMarkdown escapes metacharacters and filters controls" {
-    var result = try sanitizeMarkdown(std.testing.allocator, "a*b_[c]\n`x`");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("a\\*b\\_\\[c\\]?\\`x\\`", result.slice);
-}
-
-test "sanitizeMarkdown borrows clean input" {
-    const input = "plain-file.zig";
-    var result = try sanitizeMarkdown(std.testing.allocator, input);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.owned);
-}
-
-test "sanitizeSnippet strips fence-capable backtick runs" {
-    var result = try sanitizeSnippet(std.testing.allocator, "code ```zig fence ```");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("code ???zig fence ???", result.slice);
-}
-
-test "sanitizeSnippet keeps short backtick runs and filters controls" {
-    var result = try sanitizeSnippet(std.testing.allocator, "a `b` ``c`` \x07d");
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("a `b` ``c`` ?d", result.slice);
-}
-
-/// The hostile-set battery (EPH-I0579): every codepoint the filter claims,
-/// expressed as inclusive ranges. The U+2060 range spans the unassigned
-/// U+2065, which the filter covers conservatively.
-const hostile_ranges = [_]struct { from: u21, to: u21 }{
-    .{ .from = 0x061C, .to = 0x061C },
-    .{ .from = 0x00AD, .to = 0x00AD },
-    .{ .from = 0x200B, .to = 0x200F },
-    .{ .from = 0x2028, .to = 0x202E },
-    .{ .from = 0x2060, .to = 0x206F },
-    .{ .from = 0xFEFF, .to = 0xFEFF },
-    .{ .from = 0xFFF9, .to = 0xFFFB },
-    .{ .from = 0xE0001, .to = 0xE0001 },
-    .{ .from = 0xE0020, .to = 0xE007F },
-};
-
-/// Feed every hostile codepoint through one placeholder sanitizer and
-/// assert the whole character collapses to `want`.
-fn expectHostileSet(
-    sanitize: fn (Allocator, []const u8) error{OutOfMemory}!Sanitized,
-    want: []const u8,
-    allocator: Allocator,
-) !void {
-    for (hostile_ranges) |r| {
-        var cp = r.from;
-        while (cp <= r.to) : (cp += 1) {
-            const input = try std.fmt.allocPrint(allocator, "a{u}b", .{cp});
-            defer allocator.free(input);
-            var result = try sanitize(allocator, input);
-            defer result.deinit(allocator);
-            try std.testing.expectEqualStrings(want, result.slice);
-        }
-    }
-}
-
-test "sanitizeTerminal filters the full hostile set (EPH-I0579)" {
-    try expectHostileSet(sanitizeTerminal, "a?b", std.testing.allocator);
-}
-
-test "sanitizeMarkdown filters the full hostile set (EPH-I0579)" {
-    try expectHostileSet(sanitizeMarkdown, "a?b", std.testing.allocator);
-}
-
-test "sanitizeSnippet filters the full hostile set (EPH-I0579)" {
-    try expectHostileSet(sanitizeSnippet, "a?b", std.testing.allocator);
-}
-
-test "escapeJson escapes the full hostile set (EPH-I0579)" {
-    const allocator = std.testing.allocator;
-    for (hostile_ranges) |r| {
-        var cp = r.from;
-        while (cp <= r.to) : (cp += 1) {
-            const input = try std.fmt.allocPrint(allocator, "a{u}b", .{cp});
-            defer allocator.free(input);
-            var result = try escapeJson(allocator, input);
-            defer result.deinit(allocator);
-            // BMP members escape as \uXXXX; astral members as the RFC
-            // 8259 section 7 surrogate pair.
-            if (cp <= 0xFFFF) {
-                const want = try std.fmt.allocPrint(allocator, "a\\u{X:0>4}b", .{cp});
-                defer allocator.free(want);
-                try std.testing.expectEqualStrings(want, result.slice);
-            } else {
-                const pair = cp - 0x10000;
-                const hi: u16 = @intCast(0xD800 + (pair >> 10));
-                const lo: u16 = @intCast(0xDC00 + (pair & 0x3FF));
-                const want = try std.fmt.allocPrint(allocator, "a\\u{X:0>4}\\u{X:0>4}b", .{ hi, lo });
-                defer allocator.free(want);
-                try std.testing.expectEqualStrings(want, result.slice);
-            }
-        }
-    }
-}
-
-test "escapeJson astral escapes re-parse to the original text (EPH-I0579)" {
-    // The surrogate-pair escape must decode back to the original astral
-    // codepoint in a strict JSON consumer.
-    const allocator = std.testing.allocator;
-    for ([_]u21{ 0xE0001, 0xE0020, 0xE003F, 0xE0040, 0xE007F }) |cp| {
-        const input = try std.fmt.allocPrint(allocator, "a{u}b", .{cp});
-        defer allocator.free(input);
-        var result = try escapeJson(allocator, input);
-        defer result.deinit(allocator);
-        const wrapped = try std.fmt.allocPrint(allocator, "\"{s}\"", .{result.slice});
-        defer allocator.free(wrapped);
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, wrapped, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqualStrings(input, parsed.value.string);
-    }
-}
-
-test "escapeJson replaces invalid lead bytes with U+FFFD (EPH-I0580)" {
-    // Bare lead bytes followed by non-matching bytes must not pass raw:
-    // the lead becomes one \uFFFD and the trailing bytes classify on
-    // their own, matching the truncated-tail behavior.
-    const cases = [_]struct { input: []const u8, want: []const u8 }{
-        .{ .input = "\xE2\x41\x42", .want = "\\uFFFDAB" },
-        .{ .input = "x\xC2\x41y", .want = "x\\uFFFDAy" },
-        .{ .input = "\xC2\x41\xC2\x85", .want = "\\uFFFDA\\u0085" },
-        .{ .input = "\x80", .want = "\\uFFFD" },
-        .{ .input = "a\x80b", .want = "a\\uFFFDb" },
-        .{ .input = "\xC0\x41", .want = "\\uFFFDA" },
-        .{ .input = "\xF5\x80\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
-        .{ .input = "\xE0\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD" },
-        .{ .input = "\xED\xA0\x80", .want = "\\uFFFD\\uFFFD\\uFFFD" },
-        .{ .input = "\xF0\x80\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
-        .{ .input = "\xF4\x90\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
-        .{ .input = "\xE1\x80", .want = "\\uFFFD\\uFFFD" },
-        // Tag-lead bytes with an out-of-range fourth byte are invalid
-        // UTF-8: the lead falls to the validator and each byte becomes
-        // U+FFFD (EPH-I1120).
-        .{ .input = "\xF3\xA0\x80\xC5", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
-        .{ .input = "\xF3\xA0\x81\xC5", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
-        // Truncated hostile tails consume the rest as one U+FFFD, the
-        // long-standing terminal-filter behavior on the JSON side.
-        .{ .input = "ab\xE2\x80", .want = "ab\\uFFFD" },
-        .{ .input = "x\xC2", .want = "x\\uFFFD" },
-        .{ .input = "\xEF\xBB", .want = "\\uFFFD" },
-        .{ .input = "\xF3\xA0\x80", .want = "\\uFFFD" },
-    };
-    for (cases) |case| {
-        var result = try escapeJson(std.testing.allocator, case.input);
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings(case.want, result.slice);
-    }
-}
-
-test "escapeJson passes valid multi-byte UTF-8 through raw (EPH-I0580)" {
-    // Well-formed sequences stay byte-identical and borrow the input.
-    const cases = [_][]const u8{
-        "\xC2\xA9", // U+00A9 copyright
-        "\xC2\xA0", // U+00A0 no-break space
-        "\xE2\x82\xAC", // U+20AC euro
-        "\xE1\x80\x80", // U+1000
-        "\xE2\x80\x90", // U+2010 hyphen (hostile-set neighbor)
-        "\xF0\x9F\x98\x80", // U+1F600 emoji
-        "\xF3\xA0\x80\x82", // U+E0002 unassigned tag gap
-    };
-    for (cases) |input| {
-        var result = try escapeJson(std.testing.allocator, input);
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expect(!result.owned);
-        try std.testing.expectEqual(input.ptr, result.slice.ptr);
-    }
-}
-
 test "skipWhitespace skips blanks and stops at code" {
     try std.testing.expectEqual(@as(usize, 5), skipWhitespace("  \t\r\nab", 0));
     try std.testing.expectEqual(@as(usize, 0), skipWhitespace("ab  ", 0));
@@ -1852,7 +1127,7 @@ test "formatText sanitizes help and drops position for file-level issues" {
     );
 }
 
-test "formatJson escapes attacker bytes and the result parses" {
+test "formatJsonLast escapes attacker bytes and the result parses" {
     const allocator = std.testing.allocator;
     const raw_file = "quo\"te\\back.zig";
     const issue = Issue{
@@ -1866,7 +1141,7 @@ test "formatJson escapes attacker bytes and the result parses" {
     };
     var out = OutBuf{ .allocator = allocator };
     defer out.deinit();
-    try issue.formatJson("/repo", true, &out);
+    try issue.formatJsonLast("/repo", &out);
     // Hostile bytes must not appear raw: the bidi override stays escaped.
     try std.testing.expect(std.mem.indexOf(u8, out.buf.items, "\u{202e}") == null);
     const parsed = try std.json.parseFromSlice(
@@ -1885,7 +1160,9 @@ test "formatJson escapes attacker bytes and the result parses" {
     try std.testing.expectEqualStrings("fix\x1bit", obj.get("help").?.string);
 }
 
-test "formatJson emits a trailing comma unless last" {
+test "formatJsonLast closes without a comma and formatJsonEntry carries one (EPH-I1121)" {
+    // The byte pin covers both terminator forms: the last element closes
+    // the array, every other element carries the separating comma.
     const issue = Issue{
         .file = "f.zig",
         .line = 1,
@@ -1897,12 +1174,32 @@ test "formatJson emits a trailing comma unless last" {
     };
     var last = OutBuf{ .allocator = std.testing.allocator };
     defer last.deinit();
-    try issue.formatJson("/repo", true, &last);
-    try std.testing.expect(mem.endsWith(u8, last.buf.items, "  }\n"));
+    try issue.formatJsonLast("/repo", &last);
+    try std.testing.expectEqualStrings(
+        "  {\n" ++
+            "    \"file\": \"f.zig\",\n" ++
+            "    \"line\": 1,\n" ++
+            "    \"column\": 1,\n" ++
+            "    \"severity\": \"note\",\n" ++
+            "    \"rule\": \"ZA501\",\n" ++
+            "    \"message\": \"m\"\n" ++
+            "  }\n",
+        last.buf.items,
+    );
     var mid = OutBuf{ .allocator = std.testing.allocator };
     defer mid.deinit();
-    try issue.formatJson("/repo", false, &mid);
-    try std.testing.expect(mem.endsWith(u8, mid.buf.items, "  },\n"));
+    try issue.formatJsonEntry("/repo", &mid);
+    try std.testing.expectEqualStrings(
+        "  {\n" ++
+            "    \"file\": \"f.zig\",\n" ++
+            "    \"line\": 1,\n" ++
+            "    \"column\": 1,\n" ++
+            "    \"severity\": \"note\",\n" ++
+            "    \"rule\": \"ZA501\",\n" ++
+            "    \"message\": \"m\"\n" ++
+            "  },\n",
+        mid.buf.items,
+    );
 }
 
 test "printText renders the sanitized line through the writer seam (EPH-I0687)" {

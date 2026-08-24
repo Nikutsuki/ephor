@@ -39456,11 +39456,26 @@ fn recurseNestedBuildModule(ctx: EntryScanCtx, imp_path: []const u8) Allocator.E
     child.build_path = nested;
     child.depth += 1;
     extractBuildZigEntriesFromPath(child) catch {
-        if (ctx.cfg.verbose) std.debug.print(
-            "note: could not parse nested build module {s}\n",
-            .{nested},
-        );
+        if (!ctx.cfg.verbose) return;
+        // Render OOM drops the note rather than print the path raw
+        // (the EPH-I1139 drop policy): a best-effort verbose line is
+        // not worth an un-sanitized hostile path.
+        if (renderNestedBuildModuleNote(ctx.allocator, nested) catch null) |note| {
+            defer ctx.allocator.free(note);
+            std.debug.print("{s}", .{note});
+        }
     };
+}
+
+/// Render the verbose note for a nested build module whose entry scan
+/// failed. The path derives from build.zig content, so it crosses
+/// sanitizeTerminal before the print (EPH-I1143): hostile bytes must not
+/// forge terminal control sequences or extra log lines. The caller owns
+/// the returned buffer.
+fn renderNestedBuildModuleNote(allocator: Allocator, nested: []const u8) error{OutOfMemory}![]u8 {
+    var safe = try types.sanitizeTerminal(allocator, nested);
+    defer safe.deinit(allocator);
+    return std.fmt.allocPrint(allocator, "note: could not parse nested build module {s}\n", .{safe.slice});
 }
 
 /// Extract the first .path("...") entry from a build.zig line. The match is
@@ -41280,9 +41295,13 @@ fn buildIssuesJson(a: AnalyzerJsonArgs, out: ReportOutCtx, obj: *types.OutBuf) !
     var printed: usize = 0;
     for (a.issues) |issue| {
         if (!shouldPrintIssue(issue, out)) continue;
-        // is_last decides the trailing comma, so the array close always
-        // matches the printed count.
-        try issue.formatJson(out.base_path, printed + 1 == a.printable, obj);
+        // The terminator split keeps the array close matching the printed
+        // count: only the last printed entry omits the comma (EPH-I1121).
+        if (printed + 1 == a.printable) {
+            try issue.formatJsonLast(out.base_path, obj);
+        } else {
+            try issue.formatJsonEntry(out.base_path, obj);
+        }
         printed += 1;
     }
     try obj.buf.print(obj.allocator, "  ]\n}}\n", .{});
@@ -45107,6 +45126,18 @@ test "entry directory scan propagates OOM (EPH-I0526)" {
     try std.testing.expectError(
         error.OutOfMemory,
         scanDirForEntries(ctx, dir_path),
+    );
+}
+
+test "nested build module note sanitizes a hostile path (EPH-I1143)" {
+    // The path derives from build.zig content. Control bytes and the
+    // log-forging newline must render as placeholders before the print;
+    // the quote is not terminal-hostile and stays.
+    const note = try renderNestedBuildModuleNote(std.testing.allocator, "a\x1b[31mred\nnext\"q");
+    defer std.testing.allocator.free(note);
+    try std.testing.expectEqualStrings(
+        "note: could not parse nested build module a?[31mred?next\"q\n",
+        note,
     );
 }
 

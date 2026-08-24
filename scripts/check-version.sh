@@ -50,7 +50,10 @@ max_stable_version() {
 # EPH-I0156: clamp the fetch to the https scheme, redirects included, and
 # cap the body at 1 MiB. A hostile network cannot redirect the fetch into
 # a local file read or spew an unbounded body.
-TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10"
+# EPH-I1105: limit=50 matches the install.sh fix (EPH-I0637). The API
+# orders tags by date, so a small page left a window: re-dated old tags
+# could evict the true max from the page. The per-page clamp is 50.
+TAGS_API="https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50"
 REMOTE_TAG=$(curl -sL --max-time 30 --proto "=https" --proto-redir "=https" \
     --max-filesize 1048576 "$TAGS_API" 2>/dev/null | max_stable_version)
 

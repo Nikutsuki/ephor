@@ -37246,64 +37246,18 @@ fn writeDefaultConfig(io: std.Io) !void {
         \\  // Patterns to exclude from orphan detection only
         \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
         \\
-        \\  // Rules to disable (by ID or category prefix)
-        \\  // Examples: "ZA301" (single rule), "ZA3" (all complexity), "ZA7" (all style)
-        \\  //
-        \\  // Available rules:
-        \\  //   ZA1xx Memory:     ZA101 alloc-no-defer, ZA102 create-no-defer,
-        \\  //                     ZA103 alloc-no-errdefer,
-        \\  //                     ZA105 use-after-free, ZA106 double-free,
-        \\  //                     ZA110 must-return-ref,
-        \\  //                     ZA111 returned-stack-ref (error, AST tier)
-        \\  //   ZA2xx ErrHandle:  ZA201 silent-catch (warning), ZA202 catch-unreachable (warning),
-        \\  //                     ZA203 orelse-unreachable (warning), ZA204 undefined (warning),
-        \\  //                     ZA205 ignored-error (note), ZA206 exit-bypasses-defer,
-        \\  //                     ZA207 catch-undefined, ZA208 panic (note),
-        \\  //                     ZA209 useless-error-return (note),
-        \\  //                     ZA210 no-catch-return (note, OFF by default)
-        \\  //   ZA3xx Complexity: ZA301 func-too-long, ZA302 nesting-too-deep,
-        \\  //                     ZA303 too-many-params, ZA304 too-many-branches,
-        \\  //                     ZA305 cyclomatic (OFF by default), ZA306 cognitive (OFF by default)
-        \\  //   ZA4xx Unused:     ZA401 unused-import, ZA402 unused-const, ZA403 unused-var
-        \\  //   ZA5xx Structure:  ZA501 orphan-file, ZA502 file-too-large
-        \\  //   ZA6xx Format:     ZA601 needs-format,
-        \\  //                     ZA607 read-before-assign (semantic, not formatting)
-        \\  //   ZA7xx Style:      ZA701 line-too-long, ZA702 file-too-long,
-        \\  //                     ZA703 naming
-        \\  //   ZA8xx NullSafety: ZA801 unsafe-optional-unwrap
-        \\  //   ZA9xx Panic:      ZA901 decrement-overflow,
-        \\  //                     ZA903 index-arithmetic,
-        \\  //                     ZA904 intcast-no-bounds (note, OFF by default)
-        \\  //   ZT1xx Tests:      ZT101 lie-test (name promises fn body never calls),
-        \\  //                     ZT102 no-assertions (note for try-only smoke tests),
-        \\  //                     ZT103 trivially-true-assert, ZT104 swallowed-error,
-        \\  //                     ZT105 untested-pub-fn (note)
-        \\  //   ZC1xx Concurrency: ZC101 lock-no-defer-unlock, ZC102 double-lock,
-        \\  //                     ZC103 unlock-without-lock, ZC104 thread-no-join
-        \\  "disable": ["ZA305", "ZA306"],
+        \\  // Complexity rules to enable: cyclomatic (ZA305) and cognitive
+        \\  // (ZA306). Both are off unless enabled here — the standard
+        \\  // project posture turns them on (EPH-I1126).
+        \\  "enable": ["ZA305", "ZA306"],
         \\
-        \\  // Rules to explicitly enable (overrides disable)
-        \\  // Examples: "ZA305" (cyclomatic complexity), "ZA306" (cognitive complexity)
-        \\  "enable": [],
-        \\
-        \\  // CI gating: exit 1 when findings reach the level (default: informational)
-        \\  // "strict": true        — fail on any warning or error
-        \\  // "fail_on": "warning"  — finer control: error, warning, note, never
+        \\  // CI gating: exit 1 when findings reach this level.
+        \\  // Values: error, warning, note, never.
+        \\  "fail_on": "warning",
         \\
         \\  // Error naming convention for ZA703 (default: TitleCase, the
         \\  // community standard — error.FileNotFound; "PascalCase" is an alias)
         \\  // "error_naming": "snake_case"  — pre-flip behavior (error.file_not_found)
-        \\
-        \\  // Configurable thresholds
-        \\  "thresholds": {
-        \\    "max_lines": 50,
-        \\    "max_nesting": 3,
-        \\    "max_params": 4,
-        \\    "max_branches": 12,
-        \\    "max_line_length": 100,
-        \\    "max_cyclomatic": 10,
-        \\    "max_cognitive": 15
-        \\  }
         \\}
         \\
     ;
@@ -38170,8 +38124,8 @@ const UpgradeRun = struct {
         return error.UpgradeFailed;
     }
 
-    /// The post-gate upgrade steps: dependency check, zig fetch, config
-    /// version, and the build.zig integration.
+    /// The post-gate upgrade steps: dependency check, symlink pre-flight,
+    /// zig fetch, config version, and the build.zig integration.
     fn completeUpgrade(
         self: *const UpgradeRun,
         ver: []const u8,
@@ -38184,6 +38138,19 @@ const UpgradeRun = struct {
                 \\Run 'ephor install' first to add ephor to your project.
                 \\
             , .{});
+            return error.UpgradeFailed;
+        }
+
+        // Pre-flight the symlink refusal before any mutation (EPH-I1112):
+        // a refusal after the fetch left the zon and ephor.json rewritten
+        // while the integration refused. The integration step keeps its
+        // own check as the backstop (EPH-I0670).
+        if (buildZigIsSymlink(self.diag.io, self.project_dir)) {
+            cliDiag(
+                self.diag,
+                "error: build.zig is a symlink. Replace it with a regular file and re-run the upgrade.\n",
+                .{},
+            );
             return error.UpgradeFailed;
         }
 
@@ -38822,7 +38789,7 @@ fn resolveLatestVersion(
 }
 
 /// Byte cap on a version-fetch curl stdout and stderr (EPH-I0156,
-/// B13-19). The tags API page (limit=10) is a few KiB and the zon page is
+/// B13-19). The tags API page (limit=50) is a few KiB and the zon page is
 /// smaller. 64 KiB is generous. A larger body fails the fetch with
 /// StreamTooLong, which the existing catch routes into the fallback
 /// chain. Both streams are capped: the pre-fix spawns capped stdout only,
@@ -38852,7 +38819,7 @@ fn fetchLatestVersion(io: std.Io, allocator: Allocator) ?[]const u8 {
     // Primary: tags API. The page is date-ordered and tag dates are
     // attacker-influenceable, so the parser takes the semver-max over the
     // page instead of the first entry (EPH-I0193).
-    const api_url = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=10";
+    const api_url = "https://codeberg.org/api/v1/repos/RhyosLabs/ephor/tags?limit=50";
     const api_argv = buildCurlFetchArgv(tool_curl_path, "5", api_url);
     const api_result = std.process.run(allocator, io, .{
         .argv = &api_argv,
@@ -106472,6 +106439,76 @@ test "patchBuildZig refuses a symlinked build.zig and spares the victim (EPH-I06
     );
     defer allocator.free(victim);
     try std.testing.expectEqualStrings(victim_content, victim);
+}
+
+test "upgrade symlink refusal fires before zon and config rewrites (EPH-I1112)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Force the fetch spawn to fail instantly if the pre-flight misses:
+    // the refusal must fire before runZigFetchSave (band-T05 F5). Restore
+    // the global so the rest of the suite sees the real zig.
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = "/nonexistent/ephor-i1112-fetch";
+
+    const zon_content =
+        \\.{
+        \\    .name = .demo,
+        \\    .version = "0.1.0",
+        \\    .dependencies = .{ .ephor = .{ .url = "x", .hash = "x" } },
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = zon_content });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "victim.zig", .data = "victim" });
+    try tmp.dir.symLink(std.testing.io, "victim.zig", "build.zig", .{});
+    const config_content =
+        \\{
+        \\  "version": "0.14.2",
+        \\  "path_dir": "src"
+        \\}
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ephor.json", .data = config_content });
+
+    // Regression: the refusal fired after runZigFetchSave and
+    // updateConfigVersion, leaving a partial state (zon + config on the
+    // target version, build.zig not integrated). The pre-flight refuses
+    // first, so both files keep their pre-upgrade bytes.
+    try std.testing.expectError(
+        error.UpgradeFailed,
+        runUpgradeCommand(
+            &diag,
+            allocator,
+            tmp.dir,
+            .{ .install_version = "9.9.9", .force = false },
+        ),
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "build.zig is a symlink") != null,
+    );
+
+    const zon_after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig.zon",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(zon_after);
+    try std.testing.expectEqualStrings(zon_content, zon_after);
+    const config_after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "ephor.json",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(config_after);
+    try std.testing.expectEqualStrings(config_content, config_after);
 }
 
 test "upgrade with an invalid --version returns InvalidVersion (EPH-I0155)" {

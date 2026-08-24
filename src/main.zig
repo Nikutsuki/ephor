@@ -10107,9 +10107,10 @@ const SiblingArm = struct {
 /// (isSameLineBothArmsFree, EPH-I1030) instead. The forward direction
 /// requires the construct header to sit on every continuing path,
 /// mirroring the reverse gate (EPH-I1141): an else-if chain grades
-/// arm-by-arm, an intermediate arm's sibling is the chain's fallthrough
-/// block (the marked final-else body for a single-link chain, never the
-/// arm's own pair partner), and the reachability check on the chain
+/// arm-by-arm, an intermediate arm's sibling is the marked final-else
+/// body for a single-link chain — never the chain prefix arm's pair
+/// partner (the else-if continuation), and the reachability check on the
+/// chain
 /// header — which the prefix arm's path skips — keeps the intermediate
 /// arm's free at the conditional grade, the safe direction. An own-line
 /// `else {` header (the line-start else body) counts as a genuine arm

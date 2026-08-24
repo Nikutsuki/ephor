@@ -1568,8 +1568,9 @@ as `ephor: coverage: N% of M public functions unreached by tests (limit
 X%)`). `min_tests` and `require_all_passed` evaluate only when the run
 carries `--coverage-evidence=<file>` with the runner's counts
 (`{"passed": N, "total": M}` — the gate writes it from the test ratchet).
-A tripped leg prints an `ephor: coverage gate:` line and exits 1; a
-broken evidence file warns and leaves the runner legs unevaluated. The
+A tripped leg prints an `ephor: coverage gate:` line and exits 1; in text
+mode (the gate-script mode) a broken evidence file warns and leaves the
+runner legs unevaluated, and the gate script fails on that warning. The
 block is optional: an old config without it parses unchanged, and a
 malformed value warns and leaves that key off. Untrusted target configs
 never honor `coverage` (it is a gate key). The coverage block is a

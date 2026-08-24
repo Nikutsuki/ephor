@@ -41750,15 +41750,22 @@ fn coverageGateAppliesToScan(ctx: *const RunCtx) bool {
 }
 
 /// Read the runner-evidence JSON into the run context (EPH-I1091). A
-/// missing or broken file warns and leaves the runner legs unevaluated —
-/// never a silent skip and never a gate trip: the file is operator-
-/// supplied plumbing, and the gate script fails on the warning.
+/// missing or broken file never reads as a clean gate state: text mode
+/// warns and leaves the runner legs unevaluated (the gate script fails
+/// on the warning); JSON mode carries the failure through the machine
+/// contract — the run exits 1 with the abort object, no silent skip.
+/// The file is operator-supplied plumbing.
 fn loadRunCoverageEvidence(ctx: *RunCtx) void {
     const path = ctx.cfg.coverage_evidence_path orelse return;
     if (loadCoverageEvidence(ctx.diag, ctx.alloc, path)) |evidence| {
         ctx.coverage_evidence = evidence;
     } else |err| {
-        if (ctx.cfg.format == .json) return;
+        if (ctx.cfg.format == .json) {
+            // No diagnostics may print on the machine stream: the exit
+            // code and the abort object carry the failure (EPH-I1147 r1).
+            ctx.coverage_fail = true;
+            return;
+        }
         std.debug.print(
             "ephor: coverage: could not read evidence file '{s}': {} — runner legs not evaluated\n",
             .{ path, err },
@@ -41789,16 +41796,29 @@ fn coverageRatio(counts: UntestedFnCounts) f32 {
         @as(f32, @floatFromInt(counts.decls));
 }
 
-/// The informational ratio line (text mode only).
+/// The informational ratio line (text mode only). An unset limit reads
+/// "no limit", never the raw negative sentinel (EPH-I1147 r1).
 fn printCoverageRatio(ctx: *const RunCtx, counts: UntestedFnCounts, ratio: f32) void {
     if (ctx.cfg.format == .json) return;
+    const limit = ctx.cfg.coverage.unreached_pub_fn_ratio_max;
+    if (limit < 0) {
+        std.debug.print(
+            "ephor: coverage: {d:.2}% of {d} public function{s} unreached by tests (no limit)\n",
+            .{
+                ratio,
+                counts.decls,
+                if (counts.decls == 1) "" else "s",
+            },
+        );
+        return;
+    }
     std.debug.print(
         "ephor: coverage: {d:.2}% of {d} public function{s} unreached by tests (limit {d:.2}%)\n",
         .{
             ratio,
             counts.decls,
             if (counts.decls == 1) "" else "s",
-            ctx.cfg.coverage.unreached_pub_fn_ratio_max,
+            limit,
         },
     );
 }
@@ -103592,6 +103612,33 @@ test "coverage gate applies only to the operator's own tree (EPH-I1091)" {
     // Foreign tree: a neighbor project's ratio is not this project's gate.
     ctx.base_path = "/some/foreign/tree";
     try std.testing.expect(!coverageGateAppliesToScan(&ctx));
+}
+
+test "loadRunCoverageEvidence JSON mode fails closed on a broken file (EPH-I1147 r1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg.coverage_evidence_path, "/nonexistent/ephor-jq-scan");
+    cfg.format = .json;
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &ignore_cache,
+    };
+
+    // A broken evidence file must never read as a clean gate state: JSON
+    // mode carries the failure through the exit code (the pre-fix silent
+    // return left coverage_fail unset — a false-clean run).
+    loadRunCoverageEvidence(&ctx);
+    try std.testing.expect(ctx.coverage_fail);
 }
 
 test "computeExitCode: default (never) passes with warnings" {
